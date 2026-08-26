@@ -195,6 +195,21 @@ the acceptance criteria above and to golden-image tests — never an invitation 
 apply an adjustable radius. Radius, shadow and inset controls apply only to
 non-window captures.
 
+**Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
+another, `inner_radius = outer_radius − padding`. Violating it makes corners look
+subtly wrong even when both shapes are "rounded". This belongs in the design
+token layer as an enforced relationship, not a per-surface judgement call.
+
+**Field evidence, 2026-08-26.** The UI spike shipped exactly this class of bug on
+its first pass: a caption scrim painted as an *unrounded* rectangle over a rounded
+thumbnail, squaring off the bottom corners. The maintainer spotted it immediately
+in a screenshot review — which is the whole argument for D9 in miniature. Corner
+defects are invisible to the person who wrote the code and glaring to everyone
+else, so **anything painted over a rounded shape** (scrims, gradients, hover
+fills, pressed and selected states, dividers) must respect that shape's geometry,
+and golden-image tests must assert it at every interaction state rather than only
+at rest.
+
 ---
 
 ## D17 — Competitor UI reference lives outside the repository
