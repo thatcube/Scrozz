@@ -332,6 +332,49 @@ more intuitive than copying to clipboard."*
   budgeted as real work.
 - Swipe needs a **non-trackpad equivalent** on Windows and Linux.
 
+**Chrome model — at rest the capture is the only interface.** A card at rest
+shows the image and nothing else: no icons, no buttons, no handle. **On hover** a
+scrim fades in with **Copy and Save as prominent pill buttons** plus four small
+secondary icons at the corners (pin, close, annotate, upload).
+
+This resolves cleanly against drag-first rather than conflicting with it: **the
+card itself is the drag handle**, so the hero interaction needs no chrome at all.
+Grabbability is communicated through cursor change and a subtle lift on press,
+never a visible handle. Copy and Save are the primary *buttons*; drag is the
+primary *gesture*; they occupy different channels and do not compete.
+
+---
+
+## D19 — Motion is part of the design system, not decoration
+
+**Decision.** Micro-interactions and animation are a **product requirement**.
+Motion lives in the shared token layer alongside colour, spacing and type —
+named duration tokens, named easing curves (including a spring), and per-element
+animation state — never ad-hoc interpolation scattered through drawing code.
+
+**Baseline set:** hover reveal (fade + slight rise, lightly staggered), button
+hover and press feedback, card press lift, swipe-to-dismiss following the pointer
+with rotation and momentum, new-capture entry into the stack, and menu row
+highlight.
+
+**Accessibility gate (per D13):** the OS reduce-motion setting collapses every
+duration to zero. Motion is never load-bearing — it must not be the only carrier
+of meaning.
+
+**Why.** Maintainer: *"things like micro-interactions and animations are also
+really essential IMO to building a great app."* This is the difference between
+an app that works and an app that feels good, and it is judged in the first ten
+seconds of use.
+
+**Known cost, deliberately accepted.** egui has **no built-in animation system** —
+only `animate_bool_with_time` / `animate_value_with_time` primitives. Easing,
+springs and staggering must be built. That is precisely why it is being proven in
+the spike rather than assumed: a stack that cannot animate well fails a stated
+requirement, and better to learn that now than in month three.
+
+**Consequence for review.** Still screenshots cannot convey feel. Any UI work
+that changes interaction must be reviewed as a **screen recording**, not stills.
+
 ---
 
 ## D13 — Accessibility: full commitment, canvas exempted
