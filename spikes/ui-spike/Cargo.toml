@@ -1,0 +1,43 @@
+# THROWAWAY visual spike — see README.md. Not part of the Scrozz app build.
+# This crate is deliberately NOT a workspace member; it stands alone.
+[package]
+name = "scrozz-ui-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Throwaway egui/eframe visual spike de-risking the Scrozz UI toolkit decision."
+
+[[bin]]
+name = "scrozz-ui-spike"
+path = "src/main.rs"
+
+[[test]]
+name = "snapshot"
+path = "tests/snapshot.rs"
+harness = true
+
+# Pinned exact versions — egui is 0.x and churns hard between releases.
+[dependencies]
+eframe = { version = "=0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+egui = "=0.36.1"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+resvg = "=0.45.1"
+
+# window-vibrancy 0.8.0 (crates.io) does NOT yet expose Liquid Glass; the
+# `apply_liquid_glass` / NSGlassEffectViewStyle API lives only on the `dev`
+# branch. Pin an exact commit for reproducibility.
+[target.'cfg(target_os = "macos")'.dependencies]
+window-vibrancy = { git = "https://github.com/tauri-apps/window-vibrancy", rev = "e9f765a4c5a291d8eb636ffabf638b39d9783ebe" }
+
+# egui_kittest proves the headless-CI story: render a surface with no display
+# server and diff it against a committed PNG baseline.
+[dev-dependencies]
+egui_kittest = { version = "=0.36.1", features = ["wgpu", "snapshot"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

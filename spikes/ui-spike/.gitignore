@@ -1,0 +1,12 @@
+# Build output (huge — never commit).
+/target
+
+# egui_kittest transient outputs. The committed baseline is tests/snapshots/*.png
+# (without these suffixes); the runner regenerates these on failure/update.
+tests/snapshots/*.new.png
+tests/snapshots/*.diff.png
+tests/snapshots/*.old.png
+
+# Per-machine fastlane / App Store Connect credentials — never commit.
+.env.fastlane
+*.p8
