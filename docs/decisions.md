@@ -174,12 +174,26 @@ varies by version); Linux requires compositing. Since the technique differs per
 platform, the *tests* are the real specification — and this class of silent
 visual regression is exactly what agents can catch automatically.
 
-**Note from the live CleanShot UI (2026-08-26).** Corner radius there is an
-explicit **slider on the beautify panel**, not a fixed style. That is plausibly
-the whole trick: the radius is a parameter of the *document*, never an inference
-about the source window. Scrozz should do the same — capture true alpha where
-the OS provides it, and otherwise treat radius as explicit, adjustable document
-state rather than something to guess.
+**Note from the live CleanShot UI (2026-08-26) — corrected.** An earlier reading
+of this concluded that CleanShot uses an adjustable corner-radius slider for
+window captures. **That was wrong.** When the capture *is* a window, CleanShot
+**disables Inset, Auto-balance, Shadow and Corners entirely**, showing
+"These options are unavailable for window screenshots." The radius slider exists
+only for non-window screenshots, where a plain rectangle is being composited onto
+a background and the radius is genuinely a design choice.
+
+**The real rule, and it is stronger:** for a window capture the OS output *is*
+the truth. ScreenCaptureKit already returns correct corners, shadow and alpha,
+so CleanShot does not post-process the geometry at all — that is why it is
+flawless. Capso's unclean radii come from doing post-processing that should not
+happen.
+
+**Therefore, for Scrozz:** window captures are sacred. Take what the OS gives and
+composite nothing. Where a platform does *not* give correct corners and alpha
+(Windows, Linux), reconstructing them is a **fidelity gap to be closed**, held to
+the acceptance criteria above and to golden-image tests — never an invitation to
+apply an adjustable radius. Radius, shadow and inset controls apply only to
+non-window captures.
 
 ---
 
@@ -199,6 +213,46 @@ Icons (MIT).
 of them permanently. Keeping the library in a stable location outside any
 worktree also means it survives branch switches and new worktrees, so every
 future agent session can find it.
+
+---
+
+## D18 — Storage and sharing: any folder, plus the one thing folders can't do
+
+**Decision.** Two distinct capabilities, both in the v1 plan:
+
+1. **Arbitrary save location** — the export path accepts *any* mounted path:
+   local folder, network/SMB share, or a synced folder (iCloud Drive, Dropbox,
+   Google Drive, OneDrive). This is a hard requirement regardless of any cloud
+   feature.
+2. **S3-compatible upload → shareable URL** — bring-your-own bucket (R2, S3, B2,
+   generic S3). No hosted service, no accounts, no bills to us.
+
+**Hard architectural constraint:** saving and uploading happen **off the capture
+path** — queued, asynchronous, with visible progress and retry. A capture must
+never block on I/O. Writing straight to a slow SMB share on the capture thread
+would stall the app at the worst possible moment.
+
+**Why.** The maintainer's observation sharpens the scope: *"there's like local
+storage and you point at a folder but you could just select a network drive and
+then bam you're good to go… how ever would they bring it aside from that?"*
+
+A configurable folder target genuinely delivers most of what "cloud" means —
+captures land somewhere synced, on every device, on infrastructure the user
+already pays for. And since a configurable save location is required anyway, that
+capability is nearly free.
+
+The **one thing a folder cannot do is produce a shareable URL at the moment of
+capture.** A synced folder needs a manual trip to get a link. That single gap is
+the entire justification for S3-compatible upload, and it is what CleanShot Cloud
+actually sells.
+
+Deliberately excluded: link expiry, password-protected links, and view analytics
+all need a server or a viewer page — T3 at best, possibly never. Team management
+is a permanent non-goal.
+
+**Sequencing.** In the plan and designed for from the start so the storage
+abstraction is never retrofitted; built after the core capture → annotate → drag
+loop is solid.
 
 ---
 
