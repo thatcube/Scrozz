@@ -1,24 +1,16 @@
-<!doctype html><meta charset=utf-8><title>Scrozz UI spike</title>
-<style>
-:root{color-scheme:dark}
-body{margin:0;padding:32px;background:#0b0d12;color:#e7e9ee;
- font:15px/1.55 -apple-system,BlinkMacSystemFont,'Inter',sans-serif}
-h1{font-size:24px;margin:0 0 4px}
-p.sub{margin:0 0 28px;color:#8b93a7}
+<!doctype html><meta charset=utf-8><title>Scrozz UI spike</title><style>:root{color-scheme:dark}body{margin:0;padding:32px;background:#0b0d12;color:#e7e9ee;font:15px/1.55 -apple-system,BlinkMacSystemFont,Inter,sans-serif}
+h1{font-size:24px;margin:0 0 4px}p.sub{margin:0 0 28px;color:#8b93a7}
 .grid{display:grid;gap:28px;grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
 figure{margin:0;background:#141822;border:1px solid #232a38;border-radius:14px;overflow:hidden}
 figure img{display:block;width:100%;height:auto;background:#0b0d12}
 figcaption{padding:12px 16px;font-size:13px;color:#aab2c5;border-top:1px solid #232a38}
-code{color:#6f7891;font-size:12px}
-</style>
-<h1>Scrozz — egui visual spike</h1>
-<p class=sub>7 surfaces · real running windows captured on macOS 26 · Tabler icons (MIT) · custom theme</p>
-<div class=grid>
-<figure><img src="quick_dark.png" alt="Quick Access Overlay — dark (PRIMARY)"><figcaption><b>Quick Access Overlay — dark (PRIMARY)</b><br><code>quick_dark.png</code></figcaption></figure>
-<figure><img src="quick_light.png" alt="Quick Access Overlay — light variant"><figcaption><b>Quick Access Overlay — light variant</b><br><code>quick_light.png</code></figcaption></figure>
-<figure><img src="menu_dark.png" alt="Menu bar dropdown panel"><figcaption><b>Menu bar dropdown panel</b><br><code>menu_dark.png</code></figcaption></figure>
-<figure><img src="annotate_dark.png" alt="Annotation toolbar strip"><figcaption><b>Annotation toolbar strip</b><br><code>annotate_dark.png</code></figcaption></figure>
-<figure><img src="liquidglass_over_content.png" alt="Liquid Glass material over live desktop content (macOS 26)"><figcaption><b>Liquid Glass material over live desktop content (macOS 26)</b><br><code>liquidglass_over_content.png</code></figcaption></figure>
-<figure><img src="vibrancy_over_content.png" alt="NSVisualEffect vibrancy fallback over content"><figcaption><b>NSVisualEffect vibrancy fallback over content</b><br><code>vibrancy_over_content.png</code></figcaption></figure>
-<figure><img src="transparency_proof.png" alt="Transparent borderless window proof"><figcaption><b>Transparent borderless window proof</b><br><code>transparency_proof.png</code></figcaption></figure>
-</div>
+<code>code{color:#6f7891;font-size:12px}</style><h1>Scrozz &mdash; egui visual spike</h1><p class=sub>10 surfaces &middot; macOS 26 &middot; Tabler icons (MIT)</p><div class=grid><figure><img src="quick_stack_dark.png"><figcaption><b>Quick Access — the drag-first STACK (primary)</b><br><code>quick_stack_dark.png</code></figcaption></figure>
+<figure><img src="quick_drag_dark.png"><figcaption><b>Drag a capture straight into another app (hero interaction)</b><br><code>quick_drag_dark.png</code></figcaption></figure>
+<figure><img src="quick_swipe_dark.png"><figcaption><b>Swipe-to-dismiss — top card flung away</b><br><code>quick_swipe_dark.png</code></figcaption></figure>
+<figure><img src="quick_stack_light.png"><figcaption><b>Quick Access stack — light mode (range)</b><br><code>quick_stack_light.png</code></figcaption></figure>
+<figure><img src="onboard_dark.png"><figcaption><b>Onboarding step — type scale at display sizes</b><br><code>onboard_dark.png</code></figcaption></figure>
+<figure><img src="menu_dark.png"><figcaption><b>Menu bar dropdown</b><br><code>menu_dark.png</code></figcaption></figure>
+<figure><img src="annotate_dark.png"><figcaption><b>Annotation toolbar</b><br><code>annotate_dark.png</code></figcaption></figure>
+<figure><img src="liquidglass_over_content.png"><figcaption><b>NEGATIVE: Liquid Glass frosts the app content into ghosts</b><br><code>liquidglass_over_content.png</code></figcaption></figure>
+<figure><img src="vibrancy_over_content.png"><figcaption><b>NEGATIVE: NSVisualEffect (HUD) fully occludes the app</b><br><code>vibrancy_over_content.png</code></figcaption></figure>
+<figure><img src="transparency_proof.png"><figcaption><b>Transparent / borderless / on-top window proof (earlier card layout)</b><br><code>transparency_proof.png</code></figcaption></figure></div>

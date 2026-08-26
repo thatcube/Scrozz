@@ -10,7 +10,7 @@ use crate::icons::IconStore;
 use crate::theme::{self, cr, Palette};
 use egui::{
     epaint::Shadow, pos2, vec2, Align2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke,
-    StrokeKind, Ui,
+    StrokeKind, Ui, Vec2,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -363,7 +363,7 @@ pub fn wallpaper(painter: &egui::Painter, rect: Rect, is_dark: bool) {
 
 /// A soft radial glow built from stacked translucent rings (egui has no radial
 /// gradient primitive).
-fn soft_blob(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32, peak: u8) {
+pub fn soft_blob(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32, peak: u8) {
     let rings = 26;
     for i in 0..rings {
         let t = i as f32 / rings as f32;
@@ -443,4 +443,384 @@ pub fn thumbnail_mock(painter: &egui::Painter, rect: Rect, radius: f32) {
 
     // Re-assert the rounded border on top so corners stay clean.
     p.rect_stroke(rect, cr(radius), Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 30)), StrokeKind::Inside);
+}
+
+/// An alternate full "capture" face — a dusk photo — so a stack reads as several
+/// *different* screenshots rather than the same one duplicated.
+pub fn face_photo(painter: &egui::Painter, rect: Rect, radius: f32) {
+    let p = painter.with_clip_rect(rect);
+    // Dusk sky base, lightening toward the horizon via stacked bands.
+    p.rect_filled(rect, cr(radius), Color32::from_rgb(0x24, 0x2C, 0x5A));
+    let bands = 10;
+    for k in 0..bands {
+        let t = k as f32 / bands as f32;
+        let y0 = rect.top() + rect.height() * 0.30 * t;
+        let y1 = rect.top() + rect.height() * 0.30 * (t + 1.0 / bands as f32);
+        let col = lerp_col(
+            Color32::from_rgb(0x2C, 0x36, 0x60),
+            Color32::from_rgb(0xE7, 0x9A, 0x7C),
+            t,
+        );
+        p.rect_filled(Rect::from_min_max(pos2(rect.left(), y0), pos2(rect.right(), y1)), cr(0.0), col);
+    }
+    // Sun glow low on the horizon.
+    let sun = pos2(rect.left() + rect.width() * 0.68, rect.top() + rect.height() * 0.42);
+    soft_blob(&p, sun, rect.width() * 0.22, Color32::from_rgb(0xFF, 0xD9, 0xA0), 210);
+    p.circle_filled(sun, 12.0, Color32::from_rgb(0xFF, 0xE8, 0xC8));
+    // Foreground ridge line.
+    let base = rect.top() + rect.height() * 0.62;
+    p.add(Shape::convex_polygon(
+        vec![
+            pos2(rect.left(), rect.bottom()),
+            pos2(rect.left(), base + 8.0),
+            pos2(rect.left() + rect.width() * 0.28, base - 20.0),
+            pos2(rect.left() + rect.width() * 0.5, base + 4.0),
+            pos2(rect.left() + rect.width() * 0.72, base - 26.0),
+            pos2(rect.right(), base + 10.0),
+            pos2(rect.right(), rect.bottom()),
+        ],
+        Color32::from_rgb(0x15, 0x18, 0x2E),
+        Stroke::NONE,
+    ));
+    p.rect_stroke(rect, cr(radius), Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 40)), StrokeKind::Inside);
+}
+
+fn lerp_col(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// A cheap "capture" card for the ones peeking out behind the hero — only their
+/// top and left slivers are visible, so a header band + a content wash in a
+/// distinct hue is enough to read as a different screenshot in the deck.
+pub fn mini_capture_card(
+    painter: &egui::Painter,
+    rect: Rect,
+    radius: f32,
+    header: Color32,
+    body: Color32,
+    dim: u8,
+) {
+    let p = painter.with_clip_rect(rect);
+    p.rect_filled(rect, cr(radius), body);
+    let hb = Rect::from_min_max(rect.left_top(), pos2(rect.right(), rect.top() + 26.0));
+    p.rect_filled(hb, cr(radius), header);
+    // three faux traffic dots
+    for i in 0..3 {
+        p.circle_filled(
+            pos2(rect.left() + 14.0 + i as f32 * 12.0, hb.center().y),
+            3.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 40),
+        );
+    }
+    // a couple of content lines
+    for i in 0..2 {
+        let y = hb.bottom() + 16.0 + i as f32 * 12.0;
+        let w = [rect.width() * 0.5, rect.width() * 0.36][i];
+        p.rect_filled(
+            Rect::from_min_size(pos2(rect.left() + 16.0, y), vec2(w, 6.0)),
+            cr(3.0),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 32),
+        );
+    }
+    // depth veil so cards deeper in the deck recede
+    if dim > 0 {
+        p.rect_filled(rect, cr(radius), Color32::from_black_alpha(dim));
+    }
+    p.rect_stroke(rect, cr(radius), Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 46)), StrokeKind::Inside);
+    p.line_segment(
+        [pos2(rect.left() + radius * 0.7, rect.top() + 1.0), pos2(rect.right() - radius * 0.7, rect.top() + 1.0)],
+        Stroke::new(1.0, Color32::from_white_alpha(if dim > 40 { 12 } else { 26 })),
+    );
+}
+
+/// The caption strip (filename + dimensions) over the bottom of a hero capture.
+pub fn hero_caption(painter: &egui::Painter, rect: Rect, radius: f32, name: &str, dims: &str) {
+    bottom_scrim(painter, rect, 58.0, radius, 205);
+    let cy = rect.bottom() - 15.0;
+    painter.text(
+        pos2(rect.left() + 13.0, cy),
+        Align2::LEFT_CENTER,
+        name,
+        theme::ts_label(),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 236),
+    );
+    painter.text(
+        pos2(rect.right() - 13.0, cy),
+        Align2::RIGHT_CENTER,
+        dims,
+        theme::ts_caption(),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+    );
+}
+
+/// The prominent grab handle at the top of the hero card — the whole point of
+/// the redesign: the card itself is the draggable object, so the affordance is a
+/// visible pill, not a hairline. A soft scrim keeps it legible over any capture.
+pub fn grabber(painter: &egui::Painter, hero: Rect) {
+    // A tab that straddles the top edge, so it reads as a handle on the card
+    // rather than an element floating inside the capture.
+    let pill = Rect::from_center_size(pos2(hero.center().x, hero.top()), vec2(66.0, 20.0));
+    soft_shadow(painter, pill, 10.0, &crate::theme::Palette::dark(), 0.5);
+    painter.rect_filled(pill, cr(10.0), Color32::from_rgb(0x2A, 0x2C, 0x36));
+    painter.rect_stroke(pill, cr(10.0), Stroke::new(1.0, Color32::from_white_alpha(30)), StrokeKind::Inside);
+    // two rows of three dots — an unambiguous "grip".
+    let c = pill.center();
+    for r in 0..2 {
+        for k in 0..3 {
+            let x = c.x - 7.0 + k as f32 * 7.0;
+            let y = c.y - 3.5 + r as f32 * 7.0;
+            painter.circle_filled(pos2(x, y), 1.5, Color32::from_white_alpha(200));
+        }
+    }
+}
+
+/// A small stack-count badge, notification-style, on the hero's top-left corner.
+pub fn count_badge(painter: &egui::Painter, corner: Pos2, n: u32, pal: &Palette) {
+    let r = 12.0;
+    let c = corner + vec2(2.0, 2.0);
+    let key = Shadow { offset: [0, 2], blur: 8, spread: 0, color: pal.key_shadow };
+    painter.add(key.as_shape(Rect::from_center_size(c, vec2(r * 2.0, r * 2.0)), cr(r)));
+    painter.circle_filled(c, r, pal.accent);
+    painter.circle_stroke(c, r, Stroke::new(1.0, Color32::from_white_alpha(40)));
+    painter.text(c + vec2(0.0, 0.5), Align2::CENTER_CENTER, n.to_string(), theme::ts_caption(), pal.on_accent);
+}
+
+// ---------------------------------------------------------------------------
+// Rotation + motion (swipe) and drag-out scene
+// ---------------------------------------------------------------------------
+
+/// Approximate a rounded rectangle as a convex polygon so it can be rotated
+/// (egui's `TSTransform` is translate+scale only — no rotation — so a rotated
+/// card has to be built from points).
+fn rounded_poly(rect: Rect, radius: f32) -> Vec<Pos2> {
+    let r = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    let seg = 5;
+    let mut pts = Vec::with_capacity(seg * 4 + 4);
+    let corners = [
+        (pos2(rect.right() - r, rect.bottom() - r), 0.0_f32),
+        (pos2(rect.left() + r, rect.bottom() - r), 90.0),
+        (pos2(rect.left() + r, rect.top() + r), 180.0),
+        (pos2(rect.right() - r, rect.top() + r), 270.0),
+    ];
+    for (c, a0) in corners {
+        for i in 0..=seg {
+            let a = (a0 + 90.0 * (i as f32 / seg as f32)).to_radians();
+            pts.push(pos2(c.x + r * a.cos(), c.y + r * a.sin()));
+        }
+    }
+    pts
+}
+
+fn rotate_pts(pts: &mut [Pos2], center: Pos2, radians: f32) {
+    let (s, c) = radians.sin_cos();
+    for p in pts.iter_mut() {
+        let dx = p.x - center.x;
+        let dy = p.y - center.y;
+        *p = pos2(center.x + dx * c - dy * s, center.y + dx * s + dy * c);
+    }
+}
+
+fn fill_rot_rect(painter: &egui::Painter, rect: Rect, pivot: Pos2, angle: f32, color: Color32) {
+    let mut pts = vec![rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
+    rotate_pts(&mut pts, pivot, angle);
+    painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+fn scale_a(base: u8, alpha: u8) -> u8 {
+    (base as u32 * alpha as u32 / 255) as u8
+}
+
+/// A capture card mid-swipe: rotated and translucent. Built as a simplified
+/// rotated face (a full `thumbnail_mock` can't rotate) — plenty to read as
+/// "the top screenshot is being flung away".
+pub fn flung_capture(painter: &egui::Painter, rect: Rect, radius: f32, angle: f32, alpha: u8) {
+    let c = rect.center();
+    // soft-ish shadow: a couple of offset rotated dark polys
+    for (dy, a) in [(11.0, 34u8), (5.0, 22u8)] {
+        let mut sh = rounded_poly(rect.translate(vec2(0.0, dy)), radius);
+        rotate_pts(&mut sh, c + vec2(0.0, dy), angle);
+        painter.add(Shape::convex_polygon(sh, Color32::from_black_alpha(scale_a(a, alpha)), Stroke::NONE));
+    }
+    // face
+    let mut face = rounded_poly(rect, radius);
+    rotate_pts(&mut face, c, angle);
+    painter.add(Shape::convex_polygon(
+        face,
+        Color32::from_rgba_unmultiplied(0xF3, 0xF5, 0xFA, alpha),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, scale_a(46, alpha))),
+    ));
+    // window chrome strip + dots
+    let header = Rect::from_min_max(rect.left_top(), pos2(rect.right(), rect.top() + 28.0));
+    fill_rot_rect(painter, header, c, angle, Color32::from_rgba_unmultiplied(0xE4, 0xE7, 0xF0, alpha));
+    for i in 0..3 {
+        let mut d = [pos2(rect.left() + 16.0 + i as f32 * 13.0, rect.top() + 14.0)];
+        rotate_pts(&mut d, c, angle);
+        painter.circle_filled(d[0], 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, scale_a(46, alpha)));
+    }
+    // an accent heading + a few content lines so it reads as an app capture
+    fill_rot_rect(
+        painter,
+        Rect::from_min_size(pos2(rect.left() + 18.0, rect.top() + 46.0), vec2(96.0, 9.0)),
+        c,
+        angle,
+        Color32::from_rgba_unmultiplied(0x5B, 0x57, 0xF0, alpha),
+    );
+    for i in 0..3 {
+        fill_rot_rect(
+            painter,
+            Rect::from_min_size(pos2(rect.left() + 18.0, rect.top() + 66.0 + i as f32 * 13.0), vec2([150.0, 120.0, 92.0][i], 6.0)),
+            c,
+            angle,
+            Color32::from_rgba_unmultiplied(0xCE, 0xD2, 0xDE, alpha),
+        );
+    }
+}
+
+/// A faint rounded, rotated card *outline* — an echo of a moving card's earlier
+/// positions, so a swipe reads as motion in a still frame.
+pub fn ghost_card(painter: &egui::Painter, rect: Rect, radius: f32, angle: f32, alpha: u8) {
+    let mut poly = rounded_poly(rect, radius);
+    rotate_pts(&mut poly, rect.center(), angle);
+    painter.add(Shape::convex_polygon(
+        poly,
+        Color32::TRANSPARENT,
+        Stroke::new(1.5, Color32::from_white_alpha(alpha)),
+    ));
+}
+
+/// A few tapered streaks trailing a moving card, to read motion in a still.
+pub fn motion_streaks(painter: &egui::Painter, from: Pos2, dir: Vec2, count: usize, spread: f32) {
+    let dir = dir.normalized();
+    let perp = vec2(-dir.y, dir.x);
+    for i in 0..count {
+        let off = (i as f32 - (count as f32 - 1.0) / 2.0) * spread;
+        let base = from + perp * off;
+        let len = 26.0 - (off.abs() * 0.25);
+        let a = (70.0 - off.abs() * 1.2).clamp(20.0, 70.0) as u8;
+        painter.line_segment(
+            [base, base - dir * len],
+            Stroke::new(2.4, Color32::from_white_alpha(a)),
+        );
+    }
+}
+
+fn dashed_path(painter: &egui::Painter, pts: &[Pos2], stroke: Stroke, dash: f32, gap: f32) {
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let len = (b - a).length();
+        if len <= 0.01 {
+            continue;
+        }
+        let dir = (b - a) / len;
+        let step = dash + gap;
+        let mut t = 0.0;
+        while t < len {
+            let s = a + dir * t;
+            let e = a + dir * (t + dash).min(len);
+            painter.line_segment([s, e], stroke);
+            t += step;
+        }
+    }
+}
+
+/// A minimal "other app" (a chat window) used as the drag-out drop target, so
+/// the hero interaction — drag a capture straight into another app — reads at a
+/// glance. Deliberately light, to look like a different application than Scrozz.
+pub fn drop_chat(painter: &egui::Painter, rect: Rect, pal: &Palette, active: bool) {
+    soft_shadow(painter, rect, 16.0, pal, 0.8);
+    painter.rect_filled(rect, cr(16.0), Color32::from_rgb(0xFB, 0xFB, 0xFD));
+    // title bar
+    let tb = Rect::from_min_max(rect.left_top(), pos2(rect.right(), rect.top() + 34.0));
+    painter.rect_filled(tb, cr(16.0), Color32::from_rgb(0xEF, 0xF0, 0xF4));
+    for (i, col) in [
+        Color32::from_rgb(0xFF, 0x5F, 0x57),
+        Color32::from_rgb(0xFE, 0xBC, 0x2E),
+        Color32::from_rgb(0x28, 0xC8, 0x40),
+    ]
+    .iter()
+    .enumerate()
+    {
+        painter.circle_filled(pos2(tb.left() + 16.0 + i as f32 * 15.0, tb.center().y), 4.5, *col);
+    }
+    painter.text(tb.center(), Align2::CENTER_CENTER, "Messages", theme::ts_caption(), Color32::from_rgb(0x6A, 0x6E, 0x7A));
+    painter.line_segment(
+        [pos2(rect.left(), tb.bottom()), pos2(rect.right(), tb.bottom())],
+        Stroke::new(1.0, Color32::from_rgb(0xDD, 0xDF, 0xE6)),
+    );
+
+    // incoming + outgoing bubbles
+    let incoming = Rect::from_min_size(pos2(rect.left() + 16.0, tb.bottom() + 18.0), vec2(rect.width() * 0.52, 26.0));
+    painter.rect_filled(incoming, cr(13.0), Color32::from_rgb(0xE9, 0xEA, 0xEE));
+    for i in 0..2 {
+        painter.rect_filled(
+            Rect::from_min_size(pos2(incoming.left() + 12.0, incoming.top() + 8.0 + i as f32 * 8.0), vec2([90.0, 60.0][i], 4.0)),
+            cr(2.0),
+            Color32::from_rgb(0xB6, 0xB9, 0xC2),
+        );
+    }
+    let outgoing = Rect::from_min_size(pos2(rect.right() - 16.0 - rect.width() * 0.46, incoming.bottom() + 12.0), vec2(rect.width() * 0.46, 22.0));
+    painter.rect_filled(outgoing, cr(11.0), Color32::from_rgb(0x36, 0x8A, 0xFF));
+    painter.rect_filled(
+        Rect::from_min_size(pos2(outgoing.left() + 12.0, outgoing.center().y - 2.0), vec2(outgoing.width() - 40.0, 4.0)),
+        cr(2.0),
+        Color32::from_white_alpha(200),
+    );
+
+    // input bar
+    let input = Rect::from_min_size(pos2(rect.left() + 14.0, rect.bottom() - 40.0), vec2(rect.width() - 28.0, 26.0));
+    painter.rect_filled(input, cr(13.0), Color32::from_rgb(0xF0, 0xF1, 0xF4));
+    painter.rect_stroke(input, cr(13.0), Stroke::new(1.0, Color32::from_rgb(0xDD, 0xDF, 0xE6)), StrokeKind::Inside);
+    painter.text(pos2(input.left() + 12.0, input.center().y), Align2::LEFT_CENTER, "iMessage", theme::ts_caption(), Color32::from_rgb(0xA6, 0xAA, 0xB4));
+
+    if active {
+        // accent wash + dashed accent border + a "drop" chip
+        painter.rect_filled(rect, cr(16.0), Color32::from_rgba_unmultiplied(pal.accent.r(), pal.accent.g(), pal.accent.b(), 30));
+        let mut ring = rounded_poly(rect.shrink(5.0), 13.0);
+        ring.push(ring[0]);
+        dashed_path(painter, &ring, Stroke::new(2.0, pal.accent), 7.0, 5.0);
+    }
+}
+
+/// A macOS-style arrow cursor (white fill, dark keyline) with a soft shadow, so
+/// the drag scene obviously depicts a pointer dragging the card.
+pub fn arrow_cursor(painter: &egui::Painter, tip: Pos2) {
+    let s = 1.35;
+    let raw = [
+        (0.0, 0.0),
+        (0.0, 17.0),
+        (4.2, 12.9),
+        (7.0, 18.7),
+        (9.7, 17.5),
+        (6.9, 11.8),
+        (12.0, 11.8),
+    ];
+    let pts: Vec<Pos2> = raw.iter().map(|(x, y)| pos2(tip.x + x * s, tip.y + y * s)).collect();
+    let mut sh: Vec<Pos2> = pts.iter().map(|p| pos2(p.x + 1.0, p.y + 2.0)).collect();
+    sh.push(sh[0]);
+    painter.add(Shape::convex_polygon(sh, Color32::from_black_alpha(60), Stroke::NONE));
+    painter.add(Shape::convex_polygon(pts.clone(), Color32::WHITE, Stroke::new(1.3, Color32::from_rgb(0x1A, 0x1C, 0x24))));
+}
+
+/// The red count pill that macOS shows on a drag proxy ("1" item).
+pub fn drag_badge(painter: &egui::Painter, center: Pos2, n: u32, pal: &Palette) {
+    let r = 11.0;
+    let key = Shadow { offset: [0, 2], blur: 8, spread: 0, color: pal.key_shadow };
+    painter.add(key.as_shape(Rect::from_center_size(center, vec2(r * 2.0, r * 2.0)), cr(r)));
+    painter.circle_filled(center, r, Color32::from_rgb(0xF2, 0x45, 0x3D));
+    painter.circle_stroke(center, r, Stroke::new(1.5, Color32::WHITE));
+    painter.text(center + vec2(0.0, 0.5), Align2::CENTER_CENTER, n.to_string(), theme::ts_caption(), Color32::WHITE);
+}
+
+/// A small floating label chip (accent-filled) for hints like "Drop to send".
+pub fn chip_label(painter: &egui::Painter, center: Pos2, text: &str, pal: &Palette) {
+    let font = theme::ts_caption();
+    let galley = painter.layout_no_wrap(text.to_owned(), font, pal.on_accent);
+    let pad = vec2(11.0, 6.0);
+    let rect = Rect::from_center_size(center, galley.size() + pad * 2.0);
+    let key = Shadow { offset: [0, 3], blur: 12, spread: 0, color: pal.key_shadow };
+    painter.add(key.as_shape(rect, cr(rect.height() / 2.0)));
+    painter.rect_filled(rect, cr(rect.height() / 2.0), pal.accent);
+    painter.galley(rect.min + pad, galley, pal.on_accent);
 }

@@ -63,6 +63,18 @@ pub fn ts_shortcut() -> FontId {
     FontId::new(12.5, font_medium())
 }
 
+// Large end of the ramp — only the onboarding surface exercises these, which is
+// exactly why it's a useful type-scale test.
+pub fn ts_display() -> FontId {
+    FontId::new(30.0, font_bold())
+}
+pub fn ts_subtitle() -> FontId {
+    FontId::new(15.0, font_regular())
+}
+pub fn ts_button() -> FontId {
+    FontId::new(15.0, font_semibold())
+}
+
 /// A resolved set of semantic colors for one appearance (dark or light).
 #[derive(Clone, Copy)]
 pub struct Palette {

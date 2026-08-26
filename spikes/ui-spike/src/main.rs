@@ -15,11 +15,12 @@ mod vibrancy;
 
 use app::Config;
 use eframe::egui;
-use surfaces::Surface;
+use surfaces::{QuickVariant, Surface};
 use vibrancy::Material;
 
 fn parse_args() -> Config {
     let mut surface = Surface::Quick;
+    let mut quick_variant = QuickVariant::Stack;
     let mut theme_dark = true;
     let mut backdrop = true;
     let mut material_override: Option<Material> = None;
@@ -34,8 +35,15 @@ fn parse_args() -> Config {
                 surface = match args.get(i).map(String::as_str) {
                     Some("menu") => Surface::Menu,
                     Some("annotate") => Surface::Annotate,
+                    Some("onboard") => Surface::Onboard,
                     _ => Surface::Quick,
                 };
+            }
+            "--variant" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    quick_variant = QuickVariant::parse(v);
+                }
             }
             "--theme" => {
                 i += 1;
@@ -69,6 +77,7 @@ fn parse_args() -> Config {
 
     Config {
         surface,
+        quick_variant,
         theme_dark,
         backdrop,
         material,

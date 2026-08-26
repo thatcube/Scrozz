@@ -4,22 +4,27 @@
 or is it too ugly to base Scrozz's shared custom-drawn UI on?
 
 **Verdict up front:** **Qualified yes.** egui *can* reach CleanShot-grade polish for
-2D chrome like Scrozz's — the four beauty shots in `screenshots/` are, in my honest
-judgement, at the bar. But "beautiful egui" is almost entirely **egui-as-a-canvas**,
-not egui-as-a-widget-toolkit: you get there by hand-drawing with `Painter`, not by
-styling built-in widgets. And the one thing the maintainer explicitly asked for —
-**real macOS Liquid Glass behind crisp content in a single window** — did *not* work
-out of the box and is the only thing that genuinely fought back. Details below, blunt.
+2D chrome like Scrozz's — the beauty shots in `screenshots/` (the drag-first stack,
+the drag-out, the swipe-to-dismiss, onboarding, menu, annotate, and the light variant)
+are, in my honest judgement, at the bar. But "beautiful egui" is almost entirely
+**egui-as-a-canvas**, not egui-as-a-widget-toolkit: you get there by hand-drawing with
+`Painter`, not by styling built-in widgets. And the one thing the maintainer explicitly
+asked for — **real macOS Liquid Glass behind crisp content in a single window** — did
+*not* work out of the box and is the only thing that genuinely fought back. Details
+below, blunt.
 
 Look at the pixels first; this document is the argument, the screenshots are the evidence:
 
 | Screenshot | What it shows |
 |---|---|
-| `quick_dark.png` | **Primary.** Quick Access Overlay, dark. The headline result. |
-| `quick_light.png` | Light-mode variant — proves the token system has range. |
-| `menu_dark.png` | Menu-bar dropdown, ⇧⌘ shortcut hints, accent pill, dividers. |
+| `quick_stack_dark.png` | **Primary.** Quick Access Overlay as a drag-first **stack** of captures — physical card-stack with depth falloff, a prominent grab tab, a count badge, and the secondary action bar. The headline result. |
+| `quick_drag_dark.png` | **The hero interaction.** A capture dragged straight out of the corner stack into another app (Messages), with a drag-count badge, grab cursor, and motion trail. This is the "almost more intuitive than copy" gesture the maintainer called core. |
+| `quick_swipe_dark.png` | **Swipe-to-dismiss.** The top capture flung downward off the stack, opaque, rotated, with faint ghost echoes tracing its path so the gesture reads in a still frame. |
+| `quick_stack_light.png` | Light-mode stack — proves the token system has range. |
+| `onboard_dark.png` | Onboarding step — big display title, muted subtitle, hero tile, primary pill in a separated footer. Exercises the type scale at large sizes, which nothing else does. |
+| `menu_dark.png` | Menu-bar dropdown, ⇧⌘ shortcut hints, accent pill, hairline dividers. |
 | `annotate_dark.png` | Annotation toolbar — selected / hover / default tool states. |
-| `transparency_proof.png` | Card over the **real** desktop (desktop text bleeds through) — proves transparent/borderless/on-top windows are real. |
+| `transparency_proof.png` | Card over the **real** desktop (desktop text bleeds through) — proves transparent/borderless/on-top windows are real. *(Shows an earlier single-card layout; the exact card is immaterial to what this one proves.)* |
 | `liquidglass_over_content.png` | The failure: NSGlassEffectView frosts the **app** into ghosts. |
 | `vibrancy_over_content.png` | The failure: NSVisualEffectView (HUD) fully occludes the app → flat grey. |
 
@@ -47,6 +52,17 @@ What fought me, roughly in order:
   the shots — the scrim under the thumbnail caption, the wallpaper glow — is faked by
   stacking many translucent rects/circles. It looks right in a still; it is crude
   underneath and would need a real shader for moving gradients.
+- **No rotation — for anything.** This is the cost the drag-first redesign surfaced.
+  epaint can't rotate an image, a rounded rect, or (worst) a text galley. The swipe's
+  flung card and the drag's lifted card are tilted, so *every* tilted element is built
+  by hand: I generate a rounded-rectangle outline as a point list (`rounded_poly`),
+  rotate the points about a pivot (`rotate_pts`), and fill the result with
+  `Shape::convex_polygon`; even the "window chrome" stripes inside a tilted card are
+  individually rotated rects. It works and looks right, but a rotated card is ~40 lines
+  of geometry where a native toolkit is one transform. Rotated **text** I simply avoided
+  — there is no honest way to do it in epaint without rendering text to a texture and
+  rotating that, which I judged out of scope for a still. If Scrozz wants live tilt/spin
+  in motion, budget for a texture-and-transform path.
 - **`CornerRadius` is `u8` per-corner and shadows are a fixed struct.** Fine, but you
   feel egui nudging you toward "good enough" rather than "designed."
 - **This environment ships a *patched* eframe/egui 0.36.1 with a non-standard `App`
@@ -89,7 +105,7 @@ exposes one). That is **not a one-liner**; it's a focused chunk of macOS-native 
 **The workaround I shipped in the beauty shots** is to *draw the glass in egui* — a
 dark translucent panel with hand-painted inner lighting, a hairline top highlight, a
 soft double shadow, and a drawn wallpaper behind it. It looks great in a still (that's
-`quick_dark.png`), and for an opaque-ish card it's arguably indistinguishable. But it
+`quick_stack_dark.png`), and for an opaque-ish card it's arguably indistinguishable. But it
 is **not** real backdrop blur: it can't blur *whatever is actually behind the window*
 on the user's screen. For a screenshot HUD that mostly sits over its own captured
 image that's fine; for a translucent-over-the-live-desktop look it is not the same
@@ -107,7 +123,12 @@ Drawn from scratch with `Painter` (`paint.rs`): the glass panels, all shadows, t
 thumbnail's browser mock and its scrim gradient, the wallpaper, every icon button and
 its hover/press/selected background, the menu rows and their accent pill, the
 right-aligned shortcut chips, the annotation tool cells, the colour swatch, and the
-stroke-width control. Built-in widgets are used only for trivial text runs.
+stroke-width control. The whole drag-first overlay is bespoke painting too: the
+physical **card stack** with per-depth scale/opacity falloff, the grab tab, the count
+badge, the **drop-target app** (Messages mock) with its dashed accent border, the
+**rotated** flung and lifted cards (§1), the drag-count badge, the arrow cursor, and
+the ghost-echo / motion-trail cues that make a gesture read in a still. Built-in widgets
+are used only for trivial text runs.
 
 Interpretation: this is **expected and fine** — it's exactly what the spike was meant
 to test, and it's how Rerun does it too. Immediate-mode + `Painter` is a *pleasant*
@@ -135,23 +156,31 @@ target (modern Macs, mostly Retina) this is a non-issue; it's worth knowing for 
 
 ## 5. Animation / transitions — what did it cost to hand-roll?
 
-**Not proven, and I want to be upfront about that rather than bluff it.** The
-deliverable is static pixels the maintainer can judge, and everything here is rendered
-deterministically for reproducible screenshots — I deliberately did *not* build
-animated transitions, so this spike does **not** demonstrate motion.
+**Not proven for real motion, and I want to be upfront rather than bluff it.** The
+deliverable is static pixels, rendered deterministically for reproducible screenshots —
+I did *not* build animated transitions, so this spike does **not** demonstrate motion.
+What the drag-first surfaces *do* show is that gestures can be made to **read in a
+still**: the swipe is depicted with an opaque flung card plus fading ghost echoes along
+its path, and the drag with a lifted card, a drag-count badge, a grab cursor, and a
+motion trail. That's a static depiction of motion, not motion itself — worth being
+precise about.
 
 What I can say from the primitives: egui is immediate-mode and repaints every frame, so
 value-based animation (egui ships `animate_bool`/`animate_value_with_time` easing
-helpers) is straightforward — hover fades, press scinks, a card slide-in are cheap to
-hand-roll and would be a few lines each. The thing that would *cost* is anything
-gradient- or blur-based in motion (§1 — no gradient primitive, no real backdrop blur),
-which would need custom shaders. Static polish: proven. Motion polish: plausible but
-**unproven by this spike** — if it matters, it deserves its own small spike.
+helpers) is straightforward — hover fades, press sinks, a card slide-in are cheap to
+hand-roll and would be a few lines each. A swipe-to-dismiss fling or a drag follow is a
+position lerp, also cheap. The thing that would *cost* is anything gradient- or
+blur-based in motion, or **rotation in motion** (§1 — no gradient primitive, no real
+backdrop blur, no transform for images/text), which needs custom shaders or a
+render-to-texture path. Static polish: proven. Simple motion: plausible and cheap.
+Rotated/blurred motion: **unproven and not cheap** — if it matters, it deserves its own
+small spike.
 
 ## 6. Did egui_kittest headless snapshot testing work?
 
 **Yes — and this is a genuinely strong positive for the CI/agent story.**
-`tests/snapshot.rs` renders the Quick surface through **offscreen wgpu (Metal here;
+`tests/snapshot.rs` renders the Quick Access overlay (the drag-first stack) through
+**offscreen wgpu (Metal here;
 Vulkan/llvmpipe on Linux CI) with no display server** and diffs it against a committed
 PNG baseline (`tests/snapshots/quick_access.png`). `cargo test --test snapshot` passes
 deterministically; `UPDATE_SNAPSHOTS=1` regenerates the baseline. So an agent *can*
@@ -181,6 +210,15 @@ reach CleanShot-grade by (a) building a real design-token layer and custom `Styl
 took, it works, and for a small bespoke tool like Scrozz it's a *reasonable* amount of
 work — call it the cost of owning a design system plus a hand-built control library.
 
+Worth calling out because it was the maintainer's own steer: the **drag-first stack**
+model — captures physically stacked in the corner, swipe-to-dismiss, and drag-straight-
+into-another-app as the hero action — was entirely depictable at this bar, and is
+arguably where egui-as-canvas *shines*: a bespoke physical metaphor like a card stack
+with depth falloff and a grabbable object is exactly the kind of thing a canvas does
+better than a widget kit, because there's no stock component fighting you. The cost it
+did add is rotation (§1): tilted cards are hand-built from rotated polygons, and rotated
+text is off the table without a texture path.
+
 The costs to price in before committing the whole app:
 
 1. **You will hand-build the entire control library.** No premium components to lean
@@ -189,7 +227,7 @@ The costs to price in before committing the whole app:
    eframe/winit patch or a custom view hierarchy. This is the one item that is *not*
    cheap and *not* a library call. If "true OS glass over the live desktop" is a
    must-have identity feature, budget a dedicated native spike for it; if a drawn
-   glass card over the captured image is acceptable (it looks great — `quick_dark.png`),
+   glass card over the captured image is acceptable (it looks great — `quick_stack_dark.png`),
    you already have it.
 3. **This patched eframe fork diverges from upstream egui's API.** Understand and pin
    it deliberately; it affects every future upgrade and every third-party egui example.

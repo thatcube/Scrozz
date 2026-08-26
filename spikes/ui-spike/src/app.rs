@@ -2,7 +2,7 @@
 //! surface, and — in `--shot` mode — screenshots the real window and quits.
 
 use crate::icons::IconStore;
-use crate::surfaces::Surface;
+use crate::surfaces::{QuickVariant, Surface};
 use crate::theme::{self, Palette};
 use eframe::egui;
 use egui::Rect;
@@ -12,6 +12,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Config {
     pub surface: Surface,
+    pub quick_variant: QuickVariant,
     pub theme_dark: bool,
     pub backdrop: bool,
     pub material: crate::vibrancy::Material,
@@ -32,9 +33,17 @@ impl Config {
             0.0
         }
     }
+    /// The card/scene size for the configured surface (the Quick overlay varies
+    /// by drag-state variant).
+    pub fn card_size(&self) -> egui::Vec2 {
+        match self.surface {
+            Surface::Quick => self.quick_variant.scene(),
+            s => s.size(),
+        }
+    }
     /// Window inner size for a shot: card + shadow margin.
     pub fn shot_window_size(&self) -> egui::Vec2 {
-        self.surface.size() + egui::vec2(self.pad() * 2.0, self.pad() * 2.0)
+        self.card_size() + egui::vec2(self.pad() * 2.0, self.pad() * 2.0)
     }
 }
 
@@ -43,6 +52,7 @@ pub struct SpikeApp {
     icons: IconStore,
     pub material: String,
     live_surface: Surface,
+    live_variant: QuickVariant,
     live_dark: bool,
     live_backdrop: bool,
     frame: u64,
@@ -63,6 +73,7 @@ impl SpikeApp {
 
         Self {
             live_surface: cfg.surface,
+            live_variant: cfg.quick_variant,
             live_dark: cfg.theme_dark,
             live_backdrop: cfg.backdrop,
             cfg,
@@ -93,6 +104,18 @@ impl SpikeApp {
             }
             if i.key_pressed(egui::Key::Num3) {
                 self.live_surface = Surface::Annotate;
+            }
+            if i.key_pressed(egui::Key::Num4) {
+                self.live_surface = Surface::Onboard;
+            }
+            if i.key_pressed(egui::Key::V) {
+                // Cycle the Quick overlay's drag-state variant.
+                self.live_surface = Surface::Quick;
+                self.live_variant = match self.live_variant {
+                    QuickVariant::Stack => QuickVariant::Swipe,
+                    QuickVariant::Swipe => QuickVariant::Drag,
+                    QuickVariant::Drag => QuickVariant::Stack,
+                };
             }
             if i.key_pressed(egui::Key::L) {
                 self.live_dark = !self.live_dark;
@@ -156,13 +179,22 @@ impl eframe::App for SpikeApp {
             crate::paint::wallpaper(ui.painter(), screen, pal.is_dark);
         }
 
+        let card_size = match self.live_surface {
+            Surface::Quick => self.live_variant.scene(),
+            s => s.size(),
+        };
         let card = if self.cfg.interactive() {
-            Rect::from_center_size(screen.center(), self.live_surface.size())
+            Rect::from_center_size(screen.center(), card_size)
         } else {
             screen.shrink(self.cfg.pad())
         };
 
-        self.live_surface.show(ui, &self.icons, &pal, card);
+        match self.live_surface {
+            Surface::Quick => {
+                crate::surfaces::quick(ui, &self.icons, &pal, card, self.live_variant)
+            }
+            s => s.show(ui, &self.icons, &pal, card),
+        }
 
         if self.cfg.interactive() {
             hint_bar(ui, &pal, screen);
@@ -184,7 +216,7 @@ impl eframe::App for SpikeApp {
 
 /// Small live legend so the interactive window explains its own hotkeys.
 fn hint_bar(ui: &mut egui::Ui, pal: &Palette, screen: Rect) {
-    let text = "1 Quick   2 Menu   3 Annotate      L light/dark   G glass/backdrop   Q quit";
+    let text = "1 Quick  2 Menu  3 Annotate  4 Onboard   V drag-state   L light/dark  G glass  Q quit";
     let font = theme::ts_caption();
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, pal.text_muted);
     let size = galley.size() + egui::vec2(20.0, 12.0);
