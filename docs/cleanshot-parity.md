@@ -6,7 +6,14 @@ backlog.
 
 **Sources:**
 - `https://cleanshot.com/features` (rendered 2026-08-26) — authoritative, all 12 categories
+- **Live CleanShot X 4.8.10 UI** — full settings surface, editor, and overlays,
+  captured 2026-08-26. See the reference library below.
 - `lzhgus/Capso` README — the closest existing OSS attempt (macOS-only, Swift 6, **BSL 1.1**)
+
+**UI reference library:** `~/.copilot/scrozz-ui-reference/` (start at `INDEX.md`).
+Competitor screenshots are kept **outside this repository deliberately** — they are
+copyrighted product UI. They are there to calibrate the *quality bar*, never to be
+copied, and no image from that library is ever committed here.
 
 **Scope:** Scrozz targets macOS, Windows, and Linux. CleanShot is macOS-only, so every feature
 below carries a per-platform feasibility note. That column, not the feature list, is what
@@ -138,6 +145,7 @@ non-destructive. This is the single largest surface area in the product.
 | ANN-11 | Pencil / freehand — **auto-smoothing** | T1 | Curve fitting, not raw point dump |
 | ANN-12 | Highlighter | T1 | Multiply blend |
 | ANN-13 | Text tool — **7 predefined styles** | T0 | Text layout + editing is deceptively expensive |
+| ANN-14 | **Redact tool** (shortcut `P`) — separate from blur/pixelate, with a strength slider | **T1** | **Not on the features page; found in the live UI.** Maintainer specifically loves this one. Distinct from blur: redaction must be *irreversible by construction* |
 
 ### Editor capabilities
 
@@ -347,7 +355,101 @@ regions, recording-editor zoom suggestions and cursor smoothing.
 
 ---
 
-## 14. Beyond parity (candidate differentiators)
+## 14. Settings surface — full inventory
+
+Derived from the live CleanShot X 4.8.10 preferences window (10 tabs). The
+features page advertises ~50 features; the settings surface reveals roughly
+twice that in configurable behaviour. **Much of what makes CleanShot feel
+finished lives here, not on the marketing page.**
+
+Screenshots: `~/.copilot/scrozz-ui-reference/cleanshot/settings/`
+
+### Newly discovered — absent from the features page
+
+| ID | Feature | Tier | Notes |
+|---|---|---|---|
+| NEW-01 | **Redact tool** (`P`) with strength slider | T1 | Separate tool from blur/pixelate — see ANN-14 |
+| NEW-02 | **Non-destructive crop** with "Revert to Original" | T1 | Crop is a document operation, not a pixel operation. Falls out of D14's retained model **only if designed in from the start** |
+| NEW-03 | Crop: snap to edges (⌘ to disable), rotate, flip, numeric W×H, live image size | T2 | |
+| NEW-04 | **Canvas auto-expand** — canvas grows so annotations placed outside the image still fit | T2 | Genuinely clever; changes how the document model handles bounds |
+| NEW-05 | **Show colour names** (accessibility option in Annotate) | T2 | Direct support for D13 — colour must never be the sole carrier of meaning |
+| NEW-06 | Draw shadow on annotation objects | T2 | |
+| NEW-07 | Inverse arrow direction (⌥ to invert while drawing) | T3 | |
+| NEW-08 | **Convert to sRGB profile** on export | T2 | Colour management. Captures from P3 displays look wrong pasted into non-managed apps — a real bug class |
+| NEW-09 | Add 1px border to all screenshots | T3 | |
+| NEW-10 | **`@2x` filename suffix for Retina captures** | T2 | Improves how other apps display HiDPI screenshots |
+| NEW-11 | **Clipboard mode: "File & Image"** (configurable) | T1 | **Independent confirmation of D10.** CleanShot puts *both* a file reference and image data on the clipboard, and exposes the choice because some apps and clipboard managers mishandle one or the other |
+| NEW-12 | Pinned screenshot chrome: rounded corners / shadow / border toggles | T2 | |
+| NEW-13 | **Keep history: Never / 1 day / 3 days / 1 week / 1 month** | T1 | Prior art for the retention decision |
+| NEW-14 | OCR: language selection + auto-detect, keep line breaks, **detect links** | T2 | |
+| NEW-15 | **URL scheme API with a master on/off toggle** | T3 | Automation is opt-in — a good security default worth copying |
+| NEW-16 | Dim screen while recording | T2 | Focuses attention on the recorded region |
+| NEW-17 | Show countdown before recording | T2 | |
+| NEW-18 | Remember last recording selection | T2 | |
+| NEW-19 | Quick Access: **close after dragging** (⌥ to keep) | T1 | Directly serves D12's drag-first model |
+| NEW-20 | Quick Access: save-button behaviour — export location, or ⌥ to choose | T2 | |
+| NEW-21 | Quick Access: position on screen, move to active display, overlay size | T2 | |
+| NEW-22 | History: **source-app icon badge per capture** | T2 | "Which app was this from" is often how you find a capture again |
+| NEW-23 | History: filmstrip layout, All / Screenshots / Videos / GIFs filters, relative timestamps | T1 | |
+| NEW-24 | Ask for filename after every capture | T3 | |
+| NEW-25 | Filename template editor | T2 | |
+| NEW-26 | Usage statistics opt-in | — | **Non-goal.** Scrozz collects nothing |
+
+### Modifier-key conventions worth stealing
+
+CleanShot hides power behind modifiers instead of adding more settings:
+
+- **⇧ while capturing a window** → transparent background instead of wallpaper
+- **⌥ while capturing a window** → disable shadow
+- **⇧ while capturing** → bypass the background-tool preset
+- **⌥ while dragging from the overlay** → keep the item instead of closing
+- **⌘ while cropping** → disable edge snapping
+- **⌥ while drawing an arrow** → invert direction
+- **⌥ on the save button** → choose destination
+
+This is a design principle, not a feature list: **the default does the common
+thing; a modifier does the opposite; no configuration required.** Adopt it.
+
+### Shortcut granularity
+
+The Shortcuts tab shows CleanShot binds *composite actions*, not just modes:
+
+- Capture Area & Copy to Clipboard
+- Capture Area & Save
+- **Capture Previous Area** — re-shoot the last region without reselecting
+- **Restore Last Capture** — bring back the overlay you just dismissed
+- Toggle Desktop Icons
+- Open Capture History
+
+> **Implication for Scrozz.** These map one-to-one onto D11's CLI: every
+> composite action is a CLI invocation with flags, and a keybinding is just a way
+> to run it. Designing the CLI command grammar first yields the shortcut list for
+> free — and on wlroots Linux, where no `GlobalShortcuts` portal exists, this is
+> literally the only mechanism available.
+
+### The Background/beautify panel in detail
+
+Far richer than the features page implies
+(`editor/background-tool-panel.png`):
+
+- **Presets** — saveable, with `+` to add; appliable to all screenshots via Settings
+- **Gradients** — ~20 built in, collapsible
+- **Wallpapers** — your actual desktop wallpaper, plus custom images
+- **Blurred** — blurred wallpaper, blurred white, blurred grey
+- **Plain colour** — 18 swatches, custom picker, transparent
+- **Padding**, **Inset**, **Shadow**, **Corners** — independent sliders
+- **Auto-balance** toggle
+- **Alignment** — 3×3 grid
+- **Ratio** — aspect presets for social
+
+Note that **corner radius is a slider on the beautify panel**, not a fixed
+style. That is plausibly how CleanShot gets consistently correct rounded corners
+where Capso does not (D9) — the radius is an explicit parameter of the document,
+never a guess about the source window.
+
+---
+
+## 15. Beyond parity (candidate differentiators)
 
 Parity alone gives no reason to switch. Candidates, none committed:
 
@@ -360,7 +462,7 @@ Parity alone gives no reason to switch. Candidates, none committed:
 
 ---
 
-## 15. Open questions (for the design review)
+## 16. Open questions (for the design review)
 
 1. Which platform ships first, and is Linux X11-only at v1?
 2. One UI toolkit or per-platform shells?

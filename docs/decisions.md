@@ -174,6 +174,32 @@ varies by version); Linux requires compositing. Since the technique differs per
 platform, the *tests* are the real specification — and this class of silent
 visual regression is exactly what agents can catch automatically.
 
+**Note from the live CleanShot UI (2026-08-26).** Corner radius there is an
+explicit **slider on the beautify panel**, not a fixed style. That is plausibly
+the whole trick: the radius is a parameter of the *document*, never an inference
+about the source window. Scrozz should do the same — capture true alpha where
+the OS provides it, and otherwise treat radius as explicit, adjustable document
+state rather than something to guess.
+
+---
+
+## D17 — Competitor UI reference lives outside the repository
+
+**Decision.** Competitor screenshots (CleanShot X, Capso) are kept at
+`~/.copilot/scrozz-ui-reference/`, indexed by `INDEX.md`, and are **never
+committed to this repository**. Documentation references them by path only.
+
+Agents may study them to calibrate the *quality bar* — spacing rhythm, corner
+radii, shadow softness, control density, information hierarchy, and which
+options are worth exposing at all. Agents may **not** copy their designs, icons,
+colour values, or layouts. Scrozz's visual design is original and uses Tabler
+Icons (MIT).
+
+**Why.** These are copyrighted product UI. A GPL-3.0 repository must stay clean
+of them permanently. Keeping the library in a stable location outside any
+worktree also means it survives branch switches and new worktrees, so every
+future agent session can find it.
+
 ---
 
 ## D10 — Clipboard-compatible everywhere, smallest size that looks untouched
