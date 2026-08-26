@@ -80,7 +80,16 @@ background / custom image / plain color / transparent, shadow on/off.
 | REC-07 | Auto-enable Do Not Disturb while recording | T2 | M | M | **XL** | **XL** |
 | REC-08 | Show/hide cursor | T1 | S | S | S | M |
 | REC-09 | Recording time in menu bar / tray | T2 | S | S | M | M |
-| REC-10 | Hide desktop clutter while recording | T2 | M | M | **XL** | **XL** |
+| REC-10 | **Hide desktop icons** | **T1** | M | M | **XL** | **XL** |
+
+> **REC-10 upgraded from T2.** Maintainer calls this out as a favourite feature.
+> In CleanShot it is both an automatic behaviour during capture *and* a standalone
+> menu-bar toggle, and it appears in first-run onboarding — so it is a visible,
+> daily-value feature rather than a recording-only detail. macOS: `CreateDesktop`
+> default plus a Finder restart. Windows: toggle the desktop `SysListView32`.
+> Linux: desktop icons are drawn by the DE (GNOME extension, Plasma desktop
+> containment, Nautilus), so there is no portable mechanism — expect per-DE
+> support or none.
 
 ### Recording overlays
 
@@ -162,20 +171,37 @@ non-destructive. This is the single largest surface area in the product.
 
 The post-capture floating thumbnail. Small surface, enormous share of daily-use satisfaction.
 
+> **Corrected 2026-08-26.** The first pass of this audit under-rated this section
+> badly. Maintainer feedback: *"you can swipe the screenshots that stack in the
+> bottom right down, and also drag them into a chat or wherever you want to send
+> them — which is SICK core functionality, almost more intuitive than copying to
+> clipboard."* Drag-out is a **hero interaction, not a convenience**, the overlay
+> is a **stack** rather than a single card, and swipe-to-dismiss is a primary
+> gesture. Tiers below reflect the correction.
+
 | ID | Feature | Tier | Notes |
 |---|---|---|---|
 | QA-01 | Post-capture floating overlay | T0 | |
 | QA-02 | Copy / save / annotate from overlay | T0 | |
-| QA-03 | Drag & drop to any app | T1 | |
+| QA-03 | **Drag & drop to any app** | **T0** | Hero interaction. See QA-14 — this is harder than it looks |
 | QA-04 | Display file information | T2 | |
 | QA-05 | Restore recently closed overlay | T2 | |
 | QA-06 | Adjust position on screen | T2 | |
 | QA-07 | Adjust overlay size | T2 | |
 | QA-08 | Configurable auto-close behavior | T1 | |
 | QA-09 | Multi-display support | T1 | |
-| QA-10 | Swipe gesture control | T3 | Trackpad-centric; low value on Win/Linux |
+| QA-10 | **Swipe-to-dismiss gesture** | **T1** | Previously mis-tiered T3. Primary dismissal on macOS; needs a non-trackpad equivalent on Windows/Linux |
 | QA-11 | Quick actions | T2 | |
 | QA-12 | Temporarily hide overlays | T2 | |
+| QA-13 | **Capture stack — multiple captures stacked in the corner** | **T0** | **Missing from the first pass entirely.** Card-stack metaphor with per-card actions; changes the overlay's whole data model from one capture to a collection |
+| QA-14 | **Promised-file drag (drag out before saving)** | **T0** | The technical core of QA-03 — see below |
+
+> **QA-14 is the sleeper cost in this section.** Dragging a capture that has never
+> been written to disk requires *promised file* drag on every platform, and the
+> API is different everywhere: `NSFilePromiseProvider` on macOS,
+> `CFSTR_FILEDESCRIPTOR` / delayed rendering on Windows, and XDND with
+> `text/uri-list` plus a temp file on Linux (portal-mediated under Wayland).
+> Budget this as real per-platform work, not a toolkit checkbox.
 
 ---
 

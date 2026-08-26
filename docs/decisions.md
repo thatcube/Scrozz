@@ -61,7 +61,8 @@ app finished.
 
 - Screenshot capture: area, window, fullscreen
 - Screen recording: video and GIF
-- **Clipboard-first** — captures land on the clipboard, ready to paste
+- **Drag-out from the capture stack** — the hero interaction (see D12)
+- **Clipboard** — captures also land on the clipboard, ready to paste
 - Annotation editor, held to a high quality bar
 - Automatic compression to the best codec the destination accepts
 - **Window capture with clean edges** (see D9)
@@ -214,11 +215,132 @@ capture, annotation, or encoding logic of its own**.
 
 ---
 
+## D12 — The capture stack is the primary interface; drag-out is the hero action
+
+**Decision.** The post-capture overlay is a **stack of captures**, not a single
+card. Its primary interaction is **dragging a capture directly into another
+application** — above copy, above save. Swipe-to-dismiss is a primary gesture.
+Clipboard remains essential but is no longer described as "first".
+
+**Why.** Maintainer, on the behaviour that defines the app: *"you can swipe the
+screenshots that stack in the bottom right down, and also drag them into a chat
+or wherever you want to send them — which is SICK core functionality, almost
+more intuitive than copying to clipboard."*
+
+**Consequences.**
+- The overlay's data model is a **collection**, not one capture. Deciding this
+  late would be a rewrite of the surface used most.
+- **Promised-file drag is v1 infrastructure, not polish.** Dragging a capture
+  never written to disk needs `NSFilePromiseProvider` (macOS),
+  `CFSTR_FILEDESCRIPTOR` delayed rendering (Windows), and XDND `text/uri-list`
+  with a temp file (Linux, portal-mediated on Wayland). Three implementations,
+  budgeted as real work.
+- Swipe needs a **non-trackpad equivalent** on Windows and Linux.
+
+---
+
+## D13 — Accessibility: full commitment, canvas exempted
+
+**Decision.** Ship **full accessibility**: screen-reader support across all
+chrome, complete keyboard-only operation, honoring OS reduce-motion, contrast
+and text-size settings, and WCAG AA contrast. The **annotation canvas is
+exempt** from screen-reader semantics — it gets keyboard operation and a
+structured layer list instead, the same compromise Figma makes.
+
+**Why.** Accessibility and custom-drawn UI are **orthogonal**, not opposed —
+this was initially framed wrongly. Assistive technology reads a *semantic tree*
+the app publishes, never the pixels. **AccessKit** exists precisely for
+"toolkits that render their own user interface elements," with shipping adapters
+for macOS NSAccessibility, Windows UI Automation and Linux AT-SPI, under
+MIT/Apache-2.0. Flutter, Figma and Chrome are all fully custom-drawn and
+accessible.
+
+Accessibility imposes only *design constraints* — contrast ratios, no
+meaning-by-colour-alone, visible focus, scalable text — none of which force an
+ugly result. Building the semantic tree from day one is far cheaper than
+retrofitting it.
+
+---
+
+## D14 — Annotations are permanently editable; no user-facing project file
+
+**Decision.** A **retained vector scene graph** from day one — every annotation
+stays a live object. **No `.scrozz` project file is shipped.** Instead,
+**capture history persists the full editable document automatically**, so any
+past capture reopens with its annotations still editable. Exporting a PNG is a
+*render*, not a save.
+
+**Why.** The maintainer's requirement is that annotations are never permanent,
+and his question — "what does the project file even do for the user?" — is the
+right one. A project file solves editability by making the user manage files.
+Persisting documents in history solves the same problem with **no file
+management at all**, which is strictly better UX than CleanShot's `.cleanshot`
+files.
+
+Shipping a public format also means migrating it forever. Keeping serialization
+internal and unadvertised means the format can change freely while tools are
+still being designed. A user-facing export/import format can be added later,
+once the tool set has stabilised, without breaking anyone.
+
+---
+
+## D15 — Attempt everything; gate permissions behind first use
+
+**Decision.** No feature is cut for being hard — effort is not a constraint.
+Features blocked by genuine platform limitations slip to v1.1 rather than being
+abandoned. **But every invasive permission is requested at the moment a feature
+is first used, never during onboarding or at launch.**
+
+Applies to: Screen Recording, Accessibility, Input Monitoring (click and
+keystroke overlays), Camera, Microphone, and Wayland RemoteDesktop.
+
+**Why.** Maintainer: *"required effort should not stop us from trying."* Agreed
+— with one correction. The problem with click and keystroke overlays was never
+effort; it is **trust cost**. Requesting Input Monitoring — a keylogger-class
+grant — during first-run onboarding taxes every user for a feature most never
+use. Deferring the prompt to first use removes that tax entirely and makes
+"attempt everything" safe. Nothing needs to be cut, only sequenced.
+
+---
+
+## D16 — Contract-first crates, and competitive implementation
+
+**Decision.** A Cargo workspace monorepo, one crate per domain, developed
+contract-first:
+
+- **Phase 0:** a single agent defines every crate boundary as Rust traits plus
+  golden test fixtures, with `todo!()` bodies. The whole architecture compiles;
+  every test fails.
+- **Phase 1+:** many agents fill in implementations in parallel, each owning
+  exactly one crate, each verified by tests written before it started.
+
+**Rules that prevent collisions:**
+- One agent owns the workspace manifest and `Cargo.lock`; feature crates never
+  edit them.
+- Crate ownership is exclusive per task — never two agents in one crate.
+- **Specs are agreed before implementation.** Where a spec is undefined, it gets
+  defined and agreed first.
+
+**Competitive implementation.** Where a component is high-stakes or ambiguous,
+run **two agents against the same contract on separate branches and pick the
+better result**. This is the maintainer's idea and it is a good one — but it
+only works *because* of contract-first: the pre-written tests, benchmarks and
+golden images make "better" an objective judgement. Without them it degenerates
+into comparing vibes, and costs double for nothing.
+
+**Why.** The limit on using unlimited agents is **interface stability, not agent
+count**. Agents working against fixed contracts scale nearly linearly; agents
+working against undefined boundaries collide and produce mush. Contract-first
+inverts the usual failure mode — an agent cannot drift, because the contract and
+the test already exist.
+
+---
+
 # Open questions
 
-- **Q11 — Accessibility commitment level.** Gates stack selection.
-- **Stack selection.** Blocked on Q11.
-- **Repository topology and agent-parallelism boundaries.** Blocked on stack.
-- **Annotation document model and project file format.**
-- **Recording scope for v1** — webcam PiP, system audio, click/keystroke
-  overlays each carry permission and platform cost.
+- **Q12 — UI stack (egui).** Provisional, pending the visual spike in
+  `spikes/ui-spike/`. Decided on screenshots, not argument.
+- **Onboarding and first-run flow.** Not yet designed. Interacts with D15's
+  permission sequencing.
+- **Scrozz design language.** Colour ramp, type scale, spacing, elevation, icon
+  set (Tabler, MIT). Being explored by the spike.
