@@ -1,4 +1,43 @@
 //! Text recognition over captured images.
+//!
+//! # The shape of the problem
+//!
+//! Two of Scrozz's three platforms ship a genuinely good text recogniser in the
+//! operating system — Vision on macOS, `Windows.Media.Ocr` on Windows. Using
+//! them instead of a bundled model is not a shortcut: they are better on the
+//! small, antialiased, light-on-dark UI text that screenshots are full of, they
+//! are already localised to whatever languages the user has installed, and they
+//! add nothing to the download. Linux ships no such engine, so per decision D8
+//! that gap is reported honestly rather than papered over with a silent empty
+//! result.
+//!
+//! # What is actually hard
+//!
+//! Not calling the engine. The hard parts are the three things around it, and
+//! all three are platform-independent — which is why they live in [`prepare`]
+//! and [`layout`] where every platform's CI can test them:
+//!
+//! 1. **Resolution.** A screenshot at 1× is roughly 72 DPI. Both system engines
+//!    were tuned on 2× content and both degrade sharply below it. [`prepare`]
+//!    upscales before recognition, and on a 1× display this single step is the
+//!    difference between usable output and an empty list.
+//! 2. **Coordinates.** Vision returns normalised bottom-left-origin rectangles;
+//!    Windows returns top-left pixels in the *upscaled* image. Scrozz's UI needs
+//!    top-left logical points over the original frame. [`layout`] does both
+//!    conversions as pure functions.
+//! 3. **Reading order.** Users copy this text and paste it. Output that pastes as
+//!    a bag of words is a failed feature even when every glyph is right.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use scrozz_ocr::{Ocr, SystemOcr};
+//! # fn demo(frame: &scrozz_core::Frame) -> scrozz_core::Result<()> {
+//! let blocks = SystemOcr::new().recognize(frame)?;
+//! println!("{}", scrozz_ocr::plain_text(&blocks));
+//! # Ok(())
+//! # }
+//! ```
 
 // Platform APIs are reached through objc2 / windows-rs / x11rb, all of which
 // require `unsafe`. It is confined to this crate: every crate above it in the
@@ -6,6 +45,20 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use scrozz_core::{Frame, LogicalRect, Result};
+
+pub mod layout;
+pub mod prepare;
+
+pub use layout::plain_text;
+pub use prepare::UpscalePolicy;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod unsupported;
 
 /// One recognised span of text.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,4 +85,153 @@ pub trait Ocr {
     ///
     /// Returns [`scrozz_core::Error::Unsupported`] if no engine is available.
     fn recognize(&self, frame: &Frame) -> Result<Vec<TextBlock>>;
+}
+
+/// How much time the engine may spend per image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Accuracy {
+    /// Best quality. The right default: a screenshot is one small image and a
+    /// person is waiting for the answer, so tens of milliseconds of extra work
+    /// is invisible while a misread word is not.
+    #[default]
+    Accurate,
+    /// Lower quality, lower latency. Intended for live preview, where results
+    /// are recomputed as a selection is dragged.
+    Fast,
+}
+
+/// Tuning for [`SystemOcr`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Options {
+    /// BCP-47 tags in priority order, e.g. `["en-US", "de-DE"]`.
+    ///
+    /// Empty means "use the languages the user has configured", which is both
+    /// the right default and the only thing Windows can express.
+    pub languages: Vec<String>,
+    /// Quality/latency trade-off.
+    pub accuracy: Accuracy,
+    /// Whether to enlarge small images before recognition. Leave on unless the
+    /// caller has already prepared the pixels.
+    pub upscale: UpscalePolicy,
+    /// Whether to apply the engine's language model to fix up unlikely words.
+    ///
+    /// Off by default, and that is deliberate. Language correction is built for
+    /// prose; screenshots are full of identifiers, paths, hashes and version
+    /// numbers, and "correcting" `libssl.so.1.1` into English is worse than the
+    /// raw read. Turn it on for recognising a photographed document.
+    pub language_correction: bool,
+}
+
+impl Options {
+    /// Default options.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the preferred languages.
+    #[must_use]
+    pub fn with_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets the accuracy level.
+    #[must_use]
+    pub const fn with_accuracy(mut self, accuracy: Accuracy) -> Self {
+        self.accuracy = accuracy;
+        self
+    }
+
+    /// Sets the upscale policy.
+    #[must_use]
+    pub const fn with_upscale(mut self, upscale: UpscalePolicy) -> Self {
+        self.upscale = upscale;
+        self
+    }
+
+    /// Enables or disables the engine's language model.
+    #[must_use]
+    pub const fn with_language_correction(mut self, enabled: bool) -> Self {
+        self.language_correction = enabled;
+        self
+    }
+}
+
+/// The operating system's text recogniser.
+///
+/// Vision on macOS, `Windows.Media.Ocr` on Windows, and an honest
+/// [`scrozz_core::Error::Unsupported`] elsewhere.
+///
+/// # Extending to Linux
+///
+/// [`Ocr`] is a trait precisely so this type is not the only answer. A Tesseract
+/// or ONNX backend belongs behind an optional Cargo feature in this crate,
+/// implementing [`Ocr`] and reusing [`prepare`] and [`layout`] verbatim — those
+/// two modules are the majority of the work and are already platform-independent
+/// and tested. Nothing is bundled by default: a screenshot tool that silently
+/// grows by an 80 MB language model has made a decision on the user's behalf
+/// that it had no right to make.
+#[derive(Debug, Clone, Default)]
+pub struct SystemOcr {
+    options: Options,
+}
+
+impl SystemOcr {
+    /// Creates a recogniser with default options.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a recogniser with explicit options.
+    #[must_use]
+    pub const fn with_options(options: Options) -> Self {
+        Self { options }
+    }
+
+    /// The options in force.
+    #[must_use]
+    pub const fn options(&self) -> &Options {
+        &self.options
+    }
+
+    /// Whether this build has a working engine.
+    ///
+    /// Lets a UI hide or disable the command up front instead of offering
+    /// something that can only fail.
+    #[must_use]
+    pub const fn is_available() -> bool {
+        cfg!(any(target_os = "macos", target_os = "windows"))
+    }
+
+    /// Recognises text and returns it as lines, ready to copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ocr::recognize`].
+    pub fn recognize_text(&self, frame: &Frame) -> Result<String> {
+        Ok(plain_text(&self.recognize(frame)?))
+    }
+}
+
+impl Ocr for SystemOcr {
+    fn recognize(&self, frame: &Frame) -> Result<Vec<TextBlock>> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::recognize(frame, &self.options)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::recognize(frame, &self.options)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            unsupported::recognize(frame, &self.options)
+        }
+    }
 }
