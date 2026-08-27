@@ -1,0 +1,167 @@
+<svg width="1024" height="1024" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#191622"/><stop offset="1" stop-color="#0D0B14"/></linearGradient>
+<radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+<stop offset="0" stop-color="#A292FF" stop-opacity="0.26"/>
+<stop offset="0.30" stop-color="#A292FF" stop-opacity="0.187"/>
+<stop offset="0.55" stop-color="#A292FF" stop-opacity="0.104"/>
+<stop offset="0.78" stop-color="#A292FF" stop-opacity="0.042"/>
+<stop offset="1" stop-color="#A292FF" stop-opacity="0"/></radialGradient>
+<filter id="bloom" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="1.5"/></filter>
+</defs>
+<rect width="32" height="32" rx="7.2" fill="url(#bg)"/>
+<circle cx="16" cy="16" r="17" fill="url(#halo)"/>
+<g transform="translate(16,16) scale(1.06) translate(-16,-16)">
+<g transform="translate(0.6,0.6) scale(0.9625)" filter="url(#bloom)" opacity="0.7">
+<path d="M12 12H15V13H12V12Z" fill="#C0B5FF"/>
+<path d="M17 12H20V13H17V12Z" fill="#C0B5FF"/>
+<path d="M13 13H15V14H13V13Z" fill="#C0B5FF"/>
+<path d="M18 13H20V14H18V13Z" fill="#C0B5FF"/>
+<path d="M12 14H14V15H12V14Z" fill="#C0B5FF"/>
+<path d="M17 14H19V15H17V14Z" fill="#C0B5FF"/>
+<path d="M12 15H15V16H12V15Z" fill="#C0B5FF"/>
+<path d="M17 15H20V16H17V15Z" fill="#C0B5FF"/>
+<path d="M13 18H14V19H13V18Z" fill="#C0B5FF"/>
+<path d="M18 18H19V19H18V18Z" fill="#C0B5FF"/>
+<path d="M14 19H18V20H14V19Z" fill="#C0B5FF"/>
+<rect x="4" y="7" width="1" height="6" fill="#A292FF"/>
+<rect x="5" y="6" width="1" height="7" fill="#A292FF"/>
+<rect x="7" y="4" width="6" height="1" fill="#C0B5FF"/>
+<rect x="6" y="5" width="7" height="1" fill="#A292FF"/>
+<rect x="6" y="6" width="1" height="1" fill="#A292FF"/>
+<rect x="4" y="6" width="1" height="2" fill="#C0B5FF"/>
+<rect x="5" y="5" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="4" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="7" width="1" height="1" fill="#A292FF"/>
+<rect x="7" y="6" width="1" height="1" fill="#A292FF"/>
+<rect x="4" y="7" width="1" height="6" fill="#A292FF"/>
+<rect x="5" y="6" width="1" height="7" fill="#A292FF"/>
+<rect x="7" y="4" width="6" height="1" fill="#C0B5FF"/>
+<rect x="6" y="5" width="7" height="1" fill="#A292FF"/>
+<rect x="6" y="6" width="1" height="1" fill="#A292FF"/>
+<rect x="4" y="6" width="1" height="2" fill="#C0B5FF"/>
+<rect x="5" y="5" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="4" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="7" width="1" height="1" fill="#A292FF"/>
+<rect x="7" y="6" width="1" height="1" fill="#A292FF"/>
+<rect width="1" height="6" transform="matrix(1 0 0 -1 4 25)" fill="#A292FF"/>
+<rect width="1" height="7" transform="matrix(1 0 0 -1 5 26)" fill="#A292FF"/>
+<rect width="6" height="1" transform="matrix(1 0 0 -1 7 28)" fill="#8873FF"/>
+<rect width="7" height="1" transform="matrix(1 0 0 -1 6 27)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 6 26)" fill="#A292FF"/>
+<rect width="1" height="2" transform="matrix(1 0 0 -1 4 26)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 5 27)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 6 28)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 6 25)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 7 26)" fill="#A292FF"/>
+<g clip-path="url(#clip0_930_818)">
+<rect x="25" y="4" width="1" height="6" transform="rotate(90 25 4)" fill="#A292FF"/>
+<rect x="26" y="5" width="1" height="7" transform="rotate(90 26 5)" fill="#A292FF"/>
+<rect x="28" y="7" width="6" height="1" transform="rotate(90 28 7)" fill="#A292FF"/>
+<rect x="27" y="6" width="7" height="1" transform="rotate(90 27 6)" fill="#A292FF"/>
+<rect x="26" y="6" width="1" height="1" transform="rotate(90 26 6)" fill="#A292FF"/>
+<rect x="26" y="4" width="1" height="7" transform="rotate(90 26 4)" fill="#C0B5FF"/>
+<rect x="27" y="5" width="1" height="1" transform="rotate(90 27 5)" fill="#C0B5FF"/>
+<rect x="28" y="6" width="2" height="1" transform="rotate(90 28 6)" fill="#C0B5FF"/>
+<rect x="25" y="6" width="1" height="1" transform="rotate(90 25 6)" fill="#A292FF"/>
+<rect x="26" y="7" width="1" height="1" transform="rotate(90 26 7)" fill="#A292FF"/>
+</g>
+<g clip-path="url(#clip1_930_818)">
+<rect width="1" height="6" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 25 28)" fill="#A292FF"/>
+<rect width="1" height="7" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 27)" fill="#A292FF"/>
+<rect width="6" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 28 25)" fill="#A292FF"/>
+<rect width="7" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 27 26)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 26)" fill="#A292FF"/>
+<rect width="1" height="7" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 28)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 27 27)" fill="#8873FF"/>
+<rect width="2" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 28 26)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 25 26)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 25)" fill="#A292FF"/>
+</g>
+<defs>
+<clipPath id="clip0_930_818">
+<rect width="10" height="10" fill="white" transform="translate(28 4) rotate(90)"/>
+</clipPath>
+<clipPath id="clip1_930_818">
+<rect width="10" height="10" fill="white" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 28 28)"/>
+</clipPath>
+</defs>
+</g>
+<g transform="translate(0.6,0.6) scale(0.9625)">
+<path d="M12 12H15V13H12V12Z" fill="#C0B5FF"/>
+<path d="M17 12H20V13H17V12Z" fill="#C0B5FF"/>
+<path d="M13 13H15V14H13V13Z" fill="#C0B5FF"/>
+<path d="M18 13H20V14H18V13Z" fill="#C0B5FF"/>
+<path d="M12 14H14V15H12V14Z" fill="#C0B5FF"/>
+<path d="M17 14H19V15H17V14Z" fill="#C0B5FF"/>
+<path d="M12 15H15V16H12V15Z" fill="#C0B5FF"/>
+<path d="M17 15H20V16H17V15Z" fill="#C0B5FF"/>
+<path d="M13 18H14V19H13V18Z" fill="#C0B5FF"/>
+<path d="M18 18H19V19H18V18Z" fill="#C0B5FF"/>
+<path d="M14 19H18V20H14V19Z" fill="#C0B5FF"/>
+<rect x="4" y="7" width="1" height="6" fill="#A292FF"/>
+<rect x="5" y="6" width="1" height="7" fill="#A292FF"/>
+<rect x="7" y="4" width="6" height="1" fill="#C0B5FF"/>
+<rect x="6" y="5" width="7" height="1" fill="#A292FF"/>
+<rect x="6" y="6" width="1" height="1" fill="#A292FF"/>
+<rect x="4" y="6" width="1" height="2" fill="#C0B5FF"/>
+<rect x="5" y="5" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="4" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="7" width="1" height="1" fill="#A292FF"/>
+<rect x="7" y="6" width="1" height="1" fill="#A292FF"/>
+<rect x="4" y="7" width="1" height="6" fill="#A292FF"/>
+<rect x="5" y="6" width="1" height="7" fill="#A292FF"/>
+<rect x="7" y="4" width="6" height="1" fill="#C0B5FF"/>
+<rect x="6" y="5" width="7" height="1" fill="#A292FF"/>
+<rect x="6" y="6" width="1" height="1" fill="#A292FF"/>
+<rect x="4" y="6" width="1" height="2" fill="#C0B5FF"/>
+<rect x="5" y="5" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="4" width="1" height="1" fill="#C0B5FF"/>
+<rect x="6" y="7" width="1" height="1" fill="#A292FF"/>
+<rect x="7" y="6" width="1" height="1" fill="#A292FF"/>
+<rect width="1" height="6" transform="matrix(1 0 0 -1 4 25)" fill="#A292FF"/>
+<rect width="1" height="7" transform="matrix(1 0 0 -1 5 26)" fill="#A292FF"/>
+<rect width="6" height="1" transform="matrix(1 0 0 -1 7 28)" fill="#8873FF"/>
+<rect width="7" height="1" transform="matrix(1 0 0 -1 6 27)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 6 26)" fill="#A292FF"/>
+<rect width="1" height="2" transform="matrix(1 0 0 -1 4 26)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 5 27)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 6 28)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 6 25)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(1 0 0 -1 7 26)" fill="#A292FF"/>
+<g clip-path="url(#clip0_930_818)">
+<rect x="25" y="4" width="1" height="6" transform="rotate(90 25 4)" fill="#A292FF"/>
+<rect x="26" y="5" width="1" height="7" transform="rotate(90 26 5)" fill="#A292FF"/>
+<rect x="28" y="7" width="6" height="1" transform="rotate(90 28 7)" fill="#A292FF"/>
+<rect x="27" y="6" width="7" height="1" transform="rotate(90 27 6)" fill="#A292FF"/>
+<rect x="26" y="6" width="1" height="1" transform="rotate(90 26 6)" fill="#A292FF"/>
+<rect x="26" y="4" width="1" height="7" transform="rotate(90 26 4)" fill="#C0B5FF"/>
+<rect x="27" y="5" width="1" height="1" transform="rotate(90 27 5)" fill="#C0B5FF"/>
+<rect x="28" y="6" width="2" height="1" transform="rotate(90 28 6)" fill="#C0B5FF"/>
+<rect x="25" y="6" width="1" height="1" transform="rotate(90 25 6)" fill="#A292FF"/>
+<rect x="26" y="7" width="1" height="1" transform="rotate(90 26 7)" fill="#A292FF"/>
+</g>
+<g clip-path="url(#clip1_930_818)">
+<rect width="1" height="6" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 25 28)" fill="#A292FF"/>
+<rect width="1" height="7" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 27)" fill="#A292FF"/>
+<rect width="6" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 28 25)" fill="#A292FF"/>
+<rect width="7" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 27 26)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 26)" fill="#A292FF"/>
+<rect width="1" height="7" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 28)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 27 27)" fill="#8873FF"/>
+<rect width="2" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 28 26)" fill="#8873FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 25 26)" fill="#A292FF"/>
+<rect width="1" height="1" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 26 25)" fill="#A292FF"/>
+</g>
+<defs>
+<clipPath id="clip0_930_818">
+<rect width="10" height="10" fill="white" transform="translate(28 4) rotate(90)"/>
+</clipPath>
+<clipPath id="clip1_930_818">
+<rect width="10" height="10" fill="white" transform="matrix(-4.37114e-08 -1 -1 4.37114e-08 28 28)"/>
+</clipPath>
+</defs>
+</g></g>
+<rect x="0.25" y="0.25" width="31.5" height="31.5" rx="7.0" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="0.5"/>
+</svg>
