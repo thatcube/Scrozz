@@ -17,6 +17,7 @@ pub mod login;
 pub mod macos;
 pub mod notify;
 pub mod overlay;
+pub mod package;
 pub mod permissions;
 pub mod picker;
 pub mod tray;
@@ -37,6 +38,7 @@ pub use overlay::{
     AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
+pub use package::{PackageKind, package_kind};
 pub use permissions::SystemPermissions;
 pub use picker::{NativeFolderPicker, StubFolderPicker, native_folder_picker};
 pub use tray::{Tray, TrayAction, TrayEntry};

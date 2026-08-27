@@ -24,16 +24,18 @@ objc2-core-graphics.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
+    "ApplicationModel",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
-    # login.rs: the HKCU ...\CurrentVersion\Run launch-at-login registration.
+    # autostart.rs: the HKCU ...\CurrentVersion\Run portable registration.
     "Win32_System_Registry",
     # picker.rs: IFileOpenDialog (FOS_PICKFOLDERS) for the folder picker.
     "Win32_UI_Shell",
     # picker.rs: CoCreateInstance/CoInitializeEx for the folder picker's COM
     # dialog, and (per drag.rs's TODO) the eventual DoDragDrop backend.
     "Win32_System_Com",
+    "Win32_Storage_Packaging_Appx",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

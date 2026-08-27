@@ -70,6 +70,18 @@ pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 /// string is one thing to get wrong.
 pub const AUTOSTART_LABEL: &str = BUNDLE_ID;
 
+/// The package-relative application id used by the Windows MSIX manifest.
+///
+/// This becomes part of the app's AUMID after the first Store release and must
+/// therefore remain stable.
+pub const WINDOWS_APPLICATION_ID: &str = PRODUCT_NAME;
+
+/// The id of the default-off startup task declared by the Windows MSIX package.
+///
+/// Packaged builds use `Windows.ApplicationModel.StartupTask` to mutate this
+/// task. Portable builds continue to own a per-user Run-key value instead.
+pub const WINDOWS_STARTUP_TASK_ID: &str = "ScrozzStartup";
+
 /// The operating system this build targets: `macos`, `windows` or `linux`.
 ///
 /// From [`std::env::consts::OS`], so it is correct for the *target* even when
@@ -142,6 +154,20 @@ mod tests {
         );
         assert!(!URL_SCHEME.contains(':'), "{URL_SCHEME}");
         assert_eq!(URL_SCHEME, EXECUTABLE_STEM);
+    }
+
+    #[test]
+    fn windows_package_ids_are_stable_manifest_tokens() {
+        assert_eq!(WINDOWS_APPLICATION_ID, "Scrozz");
+        assert_eq!(WINDOWS_STARTUP_TASK_ID, "ScrozzStartup");
+        for value in [WINDOWS_APPLICATION_ID, WINDOWS_STARTUP_TASK_ID] {
+            assert!(
+                value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()),
+                "{value}"
+            );
+        }
     }
 
     #[test]

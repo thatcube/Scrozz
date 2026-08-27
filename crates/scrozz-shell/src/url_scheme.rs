@@ -33,6 +33,11 @@ pub enum SchemeTarget {
     DesktopFile(PathBuf),
     /// A per-user Windows class.
     RegistryClass(String),
+    /// The protocol extension owned by an installed MSIX manifest.
+    PackageManifest {
+        /// The registered URI scheme.
+        scheme: String,
+    },
 }
 
 /// A complete scheme-registration plan.
@@ -61,6 +66,22 @@ impl SchemeRegistration {
         executable: &Path,
         bundle: &Path,
         data_home: &Path,
+    ) -> Result<Self> {
+        Self::for_platform_with_windows_package(platform, executable, bundle, data_home, false)
+    }
+
+    /// Computes a registration while explicitly selecting Windows package
+    /// ownership.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_platform`].
+    pub fn for_platform_with_windows_package(
+        platform: SystemPlatform,
+        executable: &Path,
+        bundle: &Path,
+        data_home: &Path,
+        windows_package: bool,
     ) -> Result<Self> {
         let executable = path_text(executable)?;
         match platform {
@@ -121,6 +142,19 @@ impl SchemeRegistration {
                 })
             }
             SystemPlatform::Windows => {
+                if windows_package {
+                    return Ok(Self {
+                        platform,
+                        target: SchemeTarget::PackageManifest {
+                            scheme: URL_SCHEME.to_owned(),
+                        },
+                        contents: None,
+                        apply: Vec::new(),
+                        remove: Vec::new(),
+                        inspect: None,
+                        handler_command: None,
+                    });
+                }
                 if executable.contains('"') {
                     return Err(Error::InvalidRequest(
                         "the Windows executable path cannot contain a quote".to_owned(),
@@ -286,6 +320,7 @@ impl SchemeRegistration {
                 })?;
                 registry_value_status(inspect, "inspect URL-handler registry value")
             }
+            (SchemeTarget::PackageManifest { .. }, None) => Ok(RegistrationStatus::Enabled),
             _ => Err(Error::InvalidRequest(
                 "scheme plan target and contents disagree".to_owned(),
             )),
@@ -403,6 +438,27 @@ mod tests {
             key == "SCROZZ_REGISTRY_EXPECTED"
                 && value == r#""C:\Program Files\Scrozz\scrozz.exe" url handle "%1""#
         }));
+    }
+
+    #[test]
+    fn packaged_windows_registration_is_manifest_owned() {
+        let plan = SchemeRegistration::for_platform_with_windows_package(
+            SystemPlatform::Windows,
+            Path::new(r"C:\Program Files\WindowsApps\Scrozz\scrozz.exe"),
+            Path::new("/unused"),
+            Path::new("/unused"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.target(),
+            &SchemeTarget::PackageManifest {
+                scheme: URL_SCHEME.to_owned()
+            }
+        );
+        assert!(plan.apply_commands().is_empty());
+        assert!(plan.remove_commands().is_empty());
+        assert_eq!(plan.status().unwrap(), RegistrationStatus::Enabled);
     }
 
     #[test]

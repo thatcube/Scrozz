@@ -695,13 +695,17 @@ fn url_command(command: &UrlCommand) -> CliResult<Report> {
             let context = SystemContext::current()?;
             let plan = context.url_scheme()?;
             plan.remove()?;
+            let status = plan.status()?;
             Ok(Report::new(
                 Json::obj([
-                    ("registered", Json::str("disabled")),
+                    ("registered", Json::str(registration_slug(status))),
                     ("enabled", Json::Bool(false)),
                     ("target", Json::str(scheme_target(plan.target()))),
                 ]),
-                "URL automation disabled and handler unregistered.",
+                format!(
+                    "URL automation disabled. URL registration is {}.",
+                    registration_slug(status)
+                ),
             ))
         }
         UrlCommand::Enable => {
@@ -950,6 +954,7 @@ fn system(command: &SystemCommand) -> CliResult<Report> {
                     ("bundle_id", Json::str(scrozz_core::identity::BUNDLE_ID)),
                     ("url_scheme", Json::str(scrozz_core::identity::URL_SCHEME)),
                     ("platform", Json::str(context.platform.slug())),
+                    ("package_kind", Json::str(context.package_kind.slug())),
                     (
                         "platform_key",
                         Json::str(scrozz_core::identity::platform_key()),
@@ -967,10 +972,11 @@ fn system(command: &SystemCommand) -> CliResult<Report> {
                     ("trusted_update_keys", Json::Int(trusted_update_keys as i64)),
                 ]),
                 format!(
-                    "{} {} ({})\nAutostart: {}\nURL registration: {}\nURL automation: {}\nUpdate state: {}\nTrusted update keys: {}",
+                    "{} {} ({})\nPackage: {}\nAutostart: {}\nURL registration: {}\nURL automation: {}\nUpdate state: {}\nTrusted update keys: {}",
                     scrozz_core::identity::PRODUCT_NAME,
                     scrozz_core::identity::VERSION,
                     scrozz_core::identity::platform_key(),
+                    context.package_kind.slug(),
                     registration_slug(autostart_status),
                     registration_slug(scheme_status),
                     if url_enabled { "enabled" } else { "disabled" },
@@ -1025,6 +1031,9 @@ fn autostart_target(target: &AutostartTarget) -> String {
     match target {
         AutostartTarget::File(path) => path.to_string_lossy().into_owned(),
         AutostartTarget::RegistryValue { key, name } => format!("{key}\\{name}"),
+        AutostartTarget::PackageStartupTask { task_id } => {
+            format!("MSIX startup task {task_id}")
+        }
     }
 }
 
@@ -1034,6 +1043,9 @@ fn scheme_target(target: &SchemeTarget) -> String {
             path.to_string_lossy().into_owned()
         }
         SchemeTarget::RegistryClass(key) => key.clone(),
+        SchemeTarget::PackageManifest { scheme } => {
+            format!("MSIX manifest protocol {scheme}://")
+        }
     }
 }
 

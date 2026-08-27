@@ -12,7 +12,7 @@ use std::{
 
 use scrozz_core::{
     Error, Result,
-    identity::{AUTOSTART_LABEL, PRODUCT_NAME},
+    identity::{AUTOSTART_LABEL, PRODUCT_NAME, WINDOWS_STARTUP_TASK_ID},
 };
 
 use crate::{
@@ -35,6 +35,11 @@ pub enum AutostartTarget {
         key: String,
         /// Value name.
         name: String,
+    },
+    /// The default-off startup task declared by the installed MSIX manifest.
+    PackageStartupTask {
+        /// Manifest `TaskId`.
+        task_id: String,
     },
 }
 
@@ -65,6 +70,25 @@ impl AutostartPlan {
         executable: &Path,
         home: &Path,
         config_home: &Path,
+    ) -> Result<Self> {
+        Self::for_platform_with_windows_package(platform, executable, home, config_home, false)
+    }
+
+    /// Computes a plan while explicitly selecting Windows package ownership.
+    ///
+    /// Tests and packaging checks use this entry point to inspect both Windows
+    /// distributions from any host. Callers should pass `true` only after the
+    /// runtime package identity probe reports MSIX.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::for_platform`].
+    pub fn for_platform_with_windows_package(
+        platform: SystemPlatform,
+        executable: &Path,
+        home: &Path,
+        config_home: &Path,
+        windows_package: bool,
     ) -> Result<Self> {
         let executable = path_text(executable)?;
         match platform {
@@ -127,6 +151,19 @@ impl AutostartPlan {
                 })
             }
             SystemPlatform::Windows => {
+                if windows_package {
+                    return Ok(Self {
+                        platform,
+                        target: AutostartTarget::PackageStartupTask {
+                            task_id: WINDOWS_STARTUP_TASK_ID.to_owned(),
+                        },
+                        contents: None,
+                        launch_command: vec![executable, "gui".to_owned()],
+                        enable: Vec::new(),
+                        disable: Vec::new(),
+                        inspect: None,
+                    });
+                }
                 if executable.contains('"') {
                     return Err(Error::InvalidRequest(
                         "the Windows executable path cannot contain a quote".to_owned(),
@@ -221,6 +258,9 @@ impl AutostartPlan {
                 }
                 Ok(())
             }
+            (AutostartTarget::PackageStartupTask { task_id }, None) => {
+                crate::package::set_startup_task_enabled(task_id, true)
+            }
             _ => Err(Error::InvalidRequest(
                 "autostart plan target and contents disagree".to_owned(),
             )),
@@ -244,6 +284,9 @@ impl AutostartPlan {
                     command.apply("disable launch at login")?;
                 }
                 Ok(())
+            }
+            AutostartTarget::PackageStartupTask { task_id } => {
+                crate::package::set_startup_task_enabled(task_id, false)
             }
         }
     }
@@ -270,6 +313,9 @@ impl AutostartPlan {
                     Error::InvalidRequest("registry plan has no inspect command".to_owned())
                 })?;
                 registry_value_status(inspect, "inspect launch-at-login registry value")
+            }
+            (AutostartTarget::PackageStartupTask { task_id }, None) => {
+                crate::package::startup_task_status(task_id)
             }
             _ => Err(Error::InvalidRequest(
                 "autostart plan target and contents disagree".to_owned(),
@@ -467,6 +513,30 @@ mod tests {
             key == "SCROZZ_REGISTRY_EXPECTED"
                 && value == r#""C:\Program Files\Scrozz\scrozz.exe" gui"#
         }));
+    }
+
+    #[test]
+    fn packaged_windows_plan_uses_the_manifest_startup_task() {
+        let plan = AutostartPlan::for_platform_with_windows_package(
+            SystemPlatform::Windows,
+            Path::new(r"C:\Program Files\WindowsApps\Scrozz\scrozz.exe"),
+            Path::new(r"C:\Users\alice"),
+            Path::new(r"C:\Users\alice\AppData\Roaming"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.target(),
+            &AutostartTarget::PackageStartupTask {
+                task_id: WINDOWS_STARTUP_TASK_ID.to_owned()
+            }
+        );
+        assert!(plan.enable_commands().is_empty());
+        assert!(plan.disable_commands().is_empty());
+        assert_eq!(
+            plan.launch_command(),
+            [r"C:\Program Files\WindowsApps\Scrozz\scrozz.exe", "gui"]
+        );
     }
 
     #[test]
