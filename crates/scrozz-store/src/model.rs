@@ -148,6 +148,194 @@ impl ImageState {
     }
 }
 
+/// What kind of media a capture holds.
+///
+/// History's headline filter is All / Screenshots / Videos / GIFs, and the
+/// distinction cannot be derived from [`Provenance`]: a region capture and a
+/// region *recording* are both `Provenance::Region`. So it is recorded at
+/// insert time and carried in its own indexed column.
+///
+/// A scrolling capture is a screenshot. It is stitched rather than grabbed in
+/// one shot, but the user looking for "that long page" is looking under
+/// screenshots, and [`Provenance::Stitched`] already records how it was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    /// A still image.
+    #[default]
+    Screenshot,
+    /// A screen recording with a video codec.
+    Video,
+    /// An animated GIF.
+    Gif,
+}
+
+impl MediaKind {
+    /// Every kind, in the order the filter bar shows them.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Screenshot, Self::Video, Self::Gif]
+    }
+
+    /// The stable token stored in the index and printed by the CLI.
+    ///
+    /// Never rename one: it is a value in a user's database and in the output
+    /// of a script somebody has already written.
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::Video => "video",
+            Self::Gif => "gif",
+        }
+    }
+
+    /// The plural label the filter bar shows.
+    #[must_use]
+    pub const fn plural(self) -> &'static str {
+        match self {
+            Self::Screenshot => "Screenshots",
+            Self::Video => "Videos",
+            Self::Gif => "GIFs",
+        }
+    }
+
+    /// Reads a token back.
+    ///
+    /// Accepts the plural spellings too, because a person typing
+    /// `--kind screenshots` after reading the filter bar is not making a
+    /// mistake worth an error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] naming every valid token.
+    pub fn from_token(token: &str) -> Result<Self> {
+        match token.trim().to_lowercase().as_str() {
+            "screenshot" | "screenshots" | "image" | "images" => Ok(Self::Screenshot),
+            "video" | "videos" | "recording" | "recordings" => Ok(Self::Video),
+            "gif" | "gifs" => Ok(Self::Gif),
+            other => Err(Error::InvalidRequest(format!(
+                "unknown capture kind {other:?}; known kinds: screenshot, video, gif"
+            ))),
+        }
+    }
+
+    /// Whether this kind plays rather than sits still.
+    #[must_use]
+    pub const fn is_motion(self) -> bool {
+        matches!(self, Self::Video | Self::Gif)
+    }
+}
+
+/// How long source images are kept, independent of the size cap.
+///
+/// Decision D23 caps images by *size* and keeps documents forever. This is the
+/// second, optional axis: a user who wants a week of pixels and nothing older
+/// can say so. It evicts images exactly as the size cap does — the document
+/// survives, the capture stays in history, and a pinned capture is never
+/// touched — so turning it on can never cost an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionWindow {
+    /// Keep images until the size cap says otherwise. The default.
+    #[default]
+    Forever,
+    /// Keep one day of images.
+    OneDay,
+    /// Keep three days of images.
+    ThreeDays,
+    /// Keep one week of images.
+    OneWeek,
+    /// Keep one month of images, counted as 30 days.
+    OneMonth,
+}
+
+impl RetentionWindow {
+    /// Every window, longest-lived first, as the settings control lists them.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Forever,
+            Self::OneMonth,
+            Self::OneWeek,
+            Self::ThreeDays,
+            Self::OneDay,
+        ]
+    }
+
+    /// The stable token stored in settings and accepted by the CLI.
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Forever => "forever",
+            Self::OneDay => "1-day",
+            Self::ThreeDays => "3-days",
+            Self::OneWeek => "1-week",
+            Self::OneMonth => "1-month",
+        }
+    }
+
+    /// The label a settings control shows.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Forever => "Forever",
+            Self::OneDay => "1 day",
+            Self::ThreeDays => "3 days",
+            Self::OneWeek => "1 week",
+            Self::OneMonth => "1 month",
+        }
+    }
+
+    /// Reads a token back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] naming every valid token.
+    pub fn from_token(token: &str) -> Result<Self> {
+        let folded = token.trim().to_lowercase().replace([' ', '_'], "-");
+        match folded.as_str() {
+            "forever" | "never" | "off" | "unlimited" => Ok(Self::Forever),
+            "1-day" | "1d" | "day" | "24h" => Ok(Self::OneDay),
+            "3-days" | "3d" => Ok(Self::ThreeDays),
+            "1-week" | "1w" | "week" | "7-days" | "7d" => Ok(Self::OneWeek),
+            "1-month" | "1m" | "month" | "30-days" | "30d" => Ok(Self::OneMonth),
+            other => Err(Error::InvalidRequest(format!(
+                "unknown retention window {other:?}; known windows: {}",
+                Self::all()
+                    .iter()
+                    .map(|w| w.as_token())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// How long images live under this window, or `None` for forever.
+    #[must_use]
+    pub const fn max_age(self) -> Option<Duration> {
+        const DAY: u64 = 60 * 60 * 24;
+        match self {
+            Self::Forever => None,
+            Self::OneDay => Some(Duration::from_secs(DAY)),
+            Self::ThreeDays => Some(Duration::from_secs(3 * DAY)),
+            Self::OneWeek => Some(Duration::from_secs(7 * DAY)),
+            Self::OneMonth => Some(Duration::from_secs(30 * DAY)),
+        }
+    }
+
+    /// The instant before which images are stale, given `now`.
+    ///
+    /// Saturating rather than wrapping: a clock set to 1970 must produce "keep
+    /// everything", not "evict everything".
+    #[must_use]
+    pub fn cutoff(self, now: Timestamp) -> Option<Timestamp> {
+        let age = self.max_age()?;
+        let millis = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+        Some(Timestamp(now.0.saturating_sub(millis)))
+    }
+}
+
 /// One capture in history, without its pixels.
 ///
 /// Deliberately not serialisable: this is a read model assembled from the
@@ -159,6 +347,8 @@ pub struct CaptureRecord {
     pub id: CaptureId,
     /// When the capture was taken.
     pub created_at: Timestamp,
+    /// Still, video or GIF.
+    pub media_kind: MediaKind,
     /// Exempt from eviction. Decision D23: pinned captures are never evicted.
     pub pinned: bool,
     /// Application and window metadata captured with the pixels.
