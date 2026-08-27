@@ -3,8 +3,8 @@
 `tools/package.sh` emits both Windows distributions from the same release
 binary:
 
-- a deterministic portable ZIP, which uses a locally installed Tesseract for
-  OCR;
+- a deterministic portable ZIP, which carries its own Tesseract executable,
+  dependent DLLs and English trained data for OCR;
 - an MSIX package, which has the package identity required by
   `Windows.Media.Ocr` and owns its startup task through `AppxManifest.xml`.
 
@@ -55,20 +55,24 @@ Each artifact has an adjacent `.artifact.json` file. Its `package_kind` and
 `ocr_backend` fields make the distribution contract explicit: portable means
 `tesseract`, while MSIX means `windows-media-ocr`.
 
-The portable ZIP does not bundle Tesseract or language models. By default it
-finds `tesseract.exe` through `PATH`. For a self-contained local test or managed
-installation, set `SCROZZ_TESSERACT_DIR` to an absolute directory with this
-layout:
+The portable build requires `SCROZZ_TESSERACT_DIR` to be an absolute directory
+with this shape:
 
 ```text
-Tesseract-OCR/
-├── tesseract.exe
-└── tessdata/
-    └── <language>.traineddata
+tesseract.exe
+*.dll
+tessdata/
+  eng.traineddata
 ```
 
-Scrozz passes the `tessdata` directory explicitly. A malformed override is a
-typed configuration error; it never silently falls back to another executable.
+The complete directory is copied to `tesseract/` beside `scrozz.exe`. Packaging
+fails if the executable or English model is absent, if the source overlaps the
+output directory, or if the payload contains reparse points. Scrozz never uses
+an ambient `tesseract.exe` from `PATH`.
+
+At runtime, the portable executable uses that sibling `tesseract/` directory by
+default. `SCROZZ_TESSERACT_DIR` remains an absolute override for source builds
+and managed installations; an invalid override fails without falling back.
 
 On a Windows SDK host, `powershell -NoProfile -File tools/test-windows-packaging.ps1`
 runs MakeAppx against normalized inputs and checks both archive layouts,

@@ -10,6 +10,7 @@ $Root = Join-Path ([IO.Path]::GetTempPath()) (
 )
 $Output = Join-Path $Root "artifacts"
 $Binary = Join-Path $Root "scrozz.exe"
+$Tesseract = Join-Path $Root "tesseract-payload"
 $EnvironmentNames = @(
     "SCROZZ_WINDOWS_VERIFY_DETERMINISM",
     "SCROZZ_MSIX_VERIFY_DETERMINISM",
@@ -17,6 +18,7 @@ $EnvironmentNames = @(
     "SCROZZ_MSIX_PUBLISHER",
     "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME",
     "SCROZZ_MSIX_VERSION",
+    "SCROZZ_TESSERACT_DIR",
     "SCROZZ_MSIX_SIGN_PFX",
     "SCROZZ_MSIX_SIGN_PFX_PASSWORD",
     "SCROZZ_MSIX_SIGN_CERT_SHA1"
@@ -115,6 +117,44 @@ try {
     # execute the payload. A minimal MZ marker keeps this test independent of a
     # release build while exercising the exact production packaging path.
     [IO.File]::WriteAllBytes($Binary, [byte[]] @(0x4d, 0x5a))
+    [Environment]::SetEnvironmentVariable(
+        "SCROZZ_TESSERACT_DIR",
+        (Join-Path $Root "missing-tesseract")
+    )
+    $RejectedMissingPayload = $false
+    try {
+        & (Join-Path $RepoRoot "tools\package-windows.ps1") `
+            -OutputDirectory $Output `
+            -Binary $Binary `
+            -Version "1.2.3" `
+            -Stamp "rejection-test" `
+            -Architecture "x86_64"
+    } catch {
+        if ($_.Exception.Message -notmatch "SCROZZ_TESSERACT_DIR") {
+            throw
+        }
+        $RejectedMissingPayload = $true
+    }
+    if (-not $RejectedMissingPayload) {
+        throw "Windows packaging accepted a missing Tesseract payload"
+    }
+
+    New-Item -ItemType Directory -Path (Join-Path $Tesseract "tessdata") -Force |
+        Out-Null
+    [IO.File]::WriteAllBytes(
+        (Join-Path $Tesseract "tesseract.exe"),
+        [byte[]] @(0x4d, 0x5a)
+    )
+    [IO.File]::WriteAllBytes(
+        (Join-Path $Tesseract "libtesseract-5.dll"),
+        [byte[]] @(0x4d, 0x5a)
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $Tesseract "tessdata\eng.traineddata"),
+        "fixture",
+        [Text.Encoding]::ASCII
+    )
+    [Environment]::SetEnvironmentVariable("SCROZZ_TESSERACT_DIR", $Tesseract)
 
     & (Join-Path $RepoRoot "tools\package-windows.ps1") `
         -OutputDirectory $Output `
@@ -140,6 +180,13 @@ try {
         $PortableEntries `
         "scrozz-1.2.3-artifact-test-windows-x86_64/scrozz.exe" `
         "portable ZIP"
+    foreach ($Entry in @(
+        "scrozz-1.2.3-artifact-test-windows-x86_64/tesseract/tesseract.exe",
+        "scrozz-1.2.3-artifact-test-windows-x86_64/tesseract/libtesseract-5.dll",
+        "scrozz-1.2.3-artifact-test-windows-x86_64/tesseract/tessdata/eng.traineddata"
+    )) {
+        Assert-ArchiveEntry $PortableEntries $Entry "portable ZIP OCR payload"
+    }
     if ($PortableEntries -contains "AppxManifest.xml") {
         throw "Portable ZIP unexpectedly contains package identity"
     }
@@ -157,6 +204,9 @@ try {
     }
     if ($MsixEntries -contains "AppxSignature.p7x") {
         throw "Unsigned package test unexpectedly produced a package signature"
+    }
+    if ($MsixEntries -contains "tesseract/tesseract.exe") {
+        throw "MSIX unexpectedly contains the portable Tesseract payload"
     }
 
     $Manifest = Read-ArchiveText $Msix "AppxManifest.xml"
