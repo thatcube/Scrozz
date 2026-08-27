@@ -106,6 +106,10 @@ fn encoder_plan_caps_height_preserves_aspect_and_rounds_even() {
         output_dimensions(101, 99, 1.0, RecordingResolution::ScalePercent(1)),
         (2, 2)
     );
+    assert_eq!(
+        output_dimensions(1, 1, 1.0, RecordingResolution::Native),
+        (0, 0)
+    );
 }
 
 #[test]
@@ -150,6 +154,25 @@ fn quality_and_frame_rate_change_the_encoder_plan() {
     assert!(high.bitrate > low.bitrate * 3);
     assert_eq!(sixty.bitrate, thirty.bitrate * 2);
     assert_eq!(sixty.gop, 120);
+    let high_4k60 = build(
+        3840,
+        2160,
+        1.0,
+        60,
+        Quality::High,
+        RecordingResolution::Native,
+    )
+    .unwrap();
+    assert_eq!(
+        u64::from(high_4k60.bitrate),
+        Quality::High.target_bitrate(3840, 2160, 60)
+    );
+    let minimum = build(2, 2, 1.0, 1, Quality::Low, RecordingResolution::Native).unwrap();
+    assert_eq!(u64::from(minimum.bitrate), 64_000);
+    assert_eq!(
+        u64::from(minimum.bitrate),
+        Quality::Low.target_bitrate(2, 2, 1)
+    );
     assert_eq!(
         build(
             1920,
@@ -171,6 +194,20 @@ fn quality_and_frame_rate_change_the_encoder_plan() {
             RecordingResolution::LogicalPoints
         ),
         Err(PlanError::InvalidScale(0.0))
+    );
+    assert_eq!(
+        build(
+            1,
+            1,
+            1.0,
+            30,
+            Quality::Balanced,
+            RecordingResolution::Native
+        ),
+        Err(PlanError::ResolutionTooSmall {
+            width: 0,
+            height: 0,
+        })
     );
 }
 
@@ -304,6 +341,7 @@ fn fragmented_output_is_verified_and_incomplete_tail_is_trimmed() {
 
     assert!(inspection.playable());
     assert_eq!(inspection.complete_fragments, 1);
+    assert_eq!(inspection.nonempty_fragments, 1);
     assert_eq!(inspection.truncate_to, complete_bytes);
     assert_eq!(classify(None, complete_bytes, 10, None), Outcome::Complete);
     assert!(matches!(
@@ -317,6 +355,37 @@ fn fragmented_output_is_verified_and_incomplete_tail_is_trimmed() {
     ));
     assert!(matches!(
         classify(Some("device removed"), 0, 0, None),
+        Outcome::Unusable(_)
+    ));
+}
+
+#[test]
+fn empty_mdat_does_not_count_as_playable_media() {
+    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(payload.len() + 8);
+        bytes.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    let mut bytes = mp4_box(b"ftyp", b"isom");
+    bytes.extend(mp4_box(b"moov", b"init"));
+    bytes.extend(mp4_box(b"moof", b"fragment"));
+    bytes.extend_from_slice(&8u32.to_be_bytes());
+    bytes.extend_from_slice(b"mdat");
+    let inspection = inspect(&mut std::io::Cursor::new(bytes)).unwrap();
+
+    assert_eq!(inspection.complete_fragments, 1);
+    assert_eq!(inspection.nonempty_fragments, 0);
+    assert!(!inspection.playable());
+    assert!(matches!(
+        classify(
+            Some("device removed"),
+            inspection.file_bytes,
+            1,
+            Some(inspection)
+        ),
         Outcome::Unusable(_)
     ));
 }

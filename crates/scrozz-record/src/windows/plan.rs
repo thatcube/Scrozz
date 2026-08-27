@@ -30,6 +30,10 @@ pub enum PlanError {
     InvalidFrameRate(u32),
     /// The source scale is not usable for logical-point sizing.
     InvalidScale(f64),
+    /// The shared resolution policy resolved below the minimum encodable size.
+    ResolutionTooSmall { width: u32, height: u32 },
+    /// The shared bitrate does not fit the native API contract.
+    UnsupportedBitrate(u64),
 }
 
 /// Builds a deterministic encoder plan.
@@ -52,14 +56,14 @@ pub fn build(
     }
 
     let (output_width, output_height) = output_dimensions(width, height, backing_scale, resolution);
-    let bits_per_pixel = match quality {
-        Quality::Low => 0.04,
-        Quality::Balanced => 0.09,
-        Quality::High => 0.18,
-    };
-    let raw_bitrate =
-        f64::from(output_width) * f64::from(output_height) * f64::from(fps) * bits_per_pixel;
-    let bitrate = raw_bitrate.clamp(128_000.0, 80_000_000.0).round() as u32;
+    if output_width < 2 || output_height < 2 {
+        return Err(PlanError::ResolutionTooSmall {
+            width: output_width,
+            height: output_height,
+        });
+    }
+    let bitrate = quality.target_bitrate(output_width, output_height, fps);
+    let bitrate = u32::try_from(bitrate).map_err(|_| PlanError::UnsupportedBitrate(bitrate))?;
 
     Ok(EncoderPlan {
         source_width: width,
@@ -72,7 +76,7 @@ pub fn build(
     })
 }
 
-/// Applies the shared resolution policy and guarantees GPU-safe nonzero even dimensions.
+/// Applies the shared resolution policy without altering its result.
 #[must_use]
 pub fn output_dimensions(
     width: u32,
@@ -80,11 +84,5 @@ pub fn output_dimensions(
     backing_scale: f64,
     resolution: RecordingResolution,
 ) -> (u32, u32) {
-    let (scaled_width, scaled_height) = resolution.apply(width, height, backing_scale);
-    (nonzero_even(scaled_width), nonzero_even(scaled_height))
-}
-
-const fn nonzero_even(value: u32) -> u32 {
-    let even = value & !1;
-    if even < 2 { 2 } else { even }
+    resolution.apply(width, height, backing_scale)
 }

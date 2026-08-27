@@ -657,9 +657,8 @@ impl Worker {
         retained_bytes: u64,
         video_frames: u64,
         audio_channels: u16,
-        partial_reason: Option<String>,
+        mut partial_reason: Option<String>,
     ) -> Result<Recording> {
-        promote_output(&self.output)?;
         let metadata = RecordingMetadata {
             size: Some(PhysicalSize::new(
                 f64::from(self.encoder_plan.output_width),
@@ -676,9 +675,22 @@ impl Worker {
             quality: Some(self.quality),
             resolution: Some(self.resolution),
         };
-        let mut recording =
-            Recording::native(&self.output.final_path, duration_secs, super::ENGINE_NAME)?
-                .with_native_details(self.target.clone(), metadata)?;
+        let path = match promote_output(&self.output) {
+            Ok(()) => self.output.final_path.clone(),
+            Err(error) => {
+                append_error(
+                    &mut partial_reason,
+                    format!(
+                        "could not atomically move the finished recording into place at {}: {error}; retained the owned temporary output at {}",
+                        self.output.final_path.display(),
+                        self.output.temporary_path.display()
+                    ),
+                );
+                self.output.temporary_path.clone()
+            }
+        };
+        let mut recording = Recording::native(path, duration_secs, super::ENGINE_NAME)?
+            .with_native_details(self.target.clone(), metadata)?;
         if let Some(reason) = partial_reason {
             recording = recording.into_partial(reason)?;
         }
@@ -763,7 +775,7 @@ fn output_paths(explicit: Option<&Path>) -> Result<OutputPaths> {
 }
 
 fn reserve_default_output() -> Result<PathBuf> {
-    let directory = std::env::current_dir()?;
+    let directory = std::env::temp_dir();
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -864,5 +876,14 @@ fn plan_error(error: plan::PlanError) -> Error {
         plan::PlanError::InvalidScale(scale) => Error::Platform(format!(
             "capture target reported an invalid DPI scale factor {scale}"
         )),
+        plan::PlanError::ResolutionTooSmall { width, height } => Error::InvalidRequest(format!(
+            "recording resolution resolved to {width}x{height}; the Windows encoder requires at least 2 by 2 pixels"
+        )),
+        plan::PlanError::UnsupportedBitrate(bitrate) => Error::Unsupported {
+            what: "recording quality".into(),
+            why: format!(
+                "the shared target bitrate {bitrate} bps does not fit the Windows encoder API limits"
+            ),
+        },
     }
 }
