@@ -34,7 +34,9 @@
 //! between monitors of different scale; nothing anchors across that gap, since
 //! overlays are positioned per-display from [`scrozz_core::Display::work_area`].
 
-use scrozz_core::{LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize, Point, ScaleFactor, Size};
+use scrozz_core::{
+    LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize, Point, ScaleFactor, Size,
+};
 
 /// The DPI Windows calls 100%.
 pub const USER_DEFAULT_SCREEN_DPI: u32 = 96;

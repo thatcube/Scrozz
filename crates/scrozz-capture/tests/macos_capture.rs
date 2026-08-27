@@ -280,7 +280,10 @@ fn the_frame_reports_a_pixel_format_the_encoder_can_act_on() {
     assert!(
         matches!(
             capture.frame.format,
-            PixelFormat::Rgba8 | PixelFormat::RgbaPremultiplied8 | PixelFormat::Bgra8
+            PixelFormat::Rgba8
+                | PixelFormat::RgbaPremultiplied8
+                | PixelFormat::Bgra8
+                | PixelFormat::BgraPremultiplied8
         ),
         "unexpected format {:?}",
         capture.frame.format

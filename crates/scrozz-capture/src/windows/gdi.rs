@@ -44,7 +44,17 @@ use windows::Win32::{
     },
 };
 
-use super::{ffi, geom::DeviceRect, pixels};
+use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+
+use super::{geom::DeviceRect, pixels};
+
+/// `PW_RENDERFULLCONTENT`.
+///
+/// win32metadata only describes `PW_CLIENTONLY`, so the generated bindings have
+/// no constant for this one and it is spelled out here against the real
+/// `PRINT_WINDOW_FLAGS` newtype. That keeps it type-safe at the call site; the
+/// value is fixed by the Win32 ABI and documented in `MSDN: PrintWindow`.
+const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0x0000_0002);
 
 /// An owned screen DC, released on drop.
 ///
@@ -108,12 +118,22 @@ impl MemoryDib {
         };
 
         let mut bits = core::ptr::null_mut();
-        let bitmap =
-            unsafe { CreateDIBSection(Some(dc), &raw const info, DIB_RGB_COLORS, &mut bits, None, 0) };
+        let bitmap = unsafe {
+            CreateDIBSection(
+                Some(dc),
+                &raw const info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+        };
         let bitmap = match bitmap {
             Ok(b) if !b.is_invalid() && !bits.is_null() => b,
             _ => {
-                unsafe { let _ = DeleteDC(dc); };
+                unsafe {
+                    let _ = DeleteDC(dc);
+                };
                 return Err(Error::Platform("CreateDIBSection failed".into()));
             }
         };
@@ -229,7 +249,7 @@ pub fn capture_window(hwnd: HWND, bounds: DeviceRect, scale: ScaleFactor) -> Res
     // which is the only way this captures hardware-accelerated child content.
     // Windows 8.1+; on older builds the flag is ignored and the call degrades
     // to a plain `WM_PRINT`, which is still better than nothing.
-    let ok = unsafe { ffi::PrintWindow(hwnd, dib.dc, ffi::PW_RENDERFULLCONTENT) };
+    let ok = unsafe { PrintWindow(hwnd, dib.dc, PW_RENDERFULLCONTENT) };
     if !ok.as_bool() {
         return Err(Error::TargetGone(
             "PrintWindow failed; the window has probably closed".into(),
@@ -247,7 +267,8 @@ pub fn capture_window(hwnd: HWND, bounds: DeviceRect, scale: ScaleFactor) -> Res
         return Err(Error::Unsupported {
             what: "capturing this window without Windows.Graphics.Capture".into(),
             why: "it has no GDI-readable surface (WS_EX_NOREDIRECTIONBITMAP); \
-                  Windows 10 1903 or newer is required to capture it".into(),
+                  Windows 10 1903 or newer is required to capture it"
+                .into(),
         });
     }
 

@@ -4,7 +4,7 @@
 //! 100% external monitor is the common case, not an edge case — so there is no
 //! such thing as an app-wide scale factor here. Every [`scrozz_core::Display`]
 //! carries the scale of *its own* monitor, read from
-//! [`GetDpiForMonitor`](super::ffi::GetDpiForMonitor).
+//! [`GetDpiForMonitor`].
 //!
 //! Getting there requires the process to be **per-monitor DPI aware v2**.
 //! Under the default (unaware) mode Windows lies to the process: it reports
@@ -17,11 +17,12 @@ use std::sync::Once;
 
 use scrozz_core::ScaleFactor;
 use windows::Win32::Graphics::Gdi::HMONITOR;
-
-use super::{
-    ffi,
-    geom::{USER_DEFAULT_SCREEN_DPI, scale_from_dpi},
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
 };
+
+use super::geom::{USER_DEFAULT_SCREEN_DPI, scale_from_dpi};
 
 static DPI_AWARE: Once = Once::new();
 
@@ -36,8 +37,8 @@ static DPI_AWARE: Once = Once::new();
 /// is just subject to the OS's virtualisation.
 pub fn ensure_process_dpi_aware() {
     DPI_AWARE.call_once(|| {
-        let context = ffi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 as *mut core::ffi::c_void;
-        let _ = unsafe { ffi::SetProcessDpiAwarenessContext(context) };
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     });
 }
 
@@ -52,8 +53,8 @@ pub fn dpi_for_monitor(monitor: HMONITOR) -> (u32, u32) {
     ensure_process_dpi_aware();
     let mut x = 0u32;
     let mut y = 0u32;
-    let hr = unsafe { ffi::GetDpiForMonitor(monitor, ffi::MDT_EFFECTIVE_DPI, &mut x, &mut y) };
-    if hr.is_err() || x == 0 || y == 0 {
+    let ok = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) };
+    if ok.is_err() || x == 0 || y == 0 {
         return (USER_DEFAULT_SCREEN_DPI, USER_DEFAULT_SCREEN_DPI);
     }
     (x, y)
