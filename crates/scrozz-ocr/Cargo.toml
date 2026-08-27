@@ -20,7 +20,17 @@ objc2-vision.workspace = true
 objc2-core-graphics.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, features = ["Media_Ocr", "Graphics_Imaging", "Foundation"] }
+windows = { workspace = true, features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Foundation",
+    # CopyFromBuffer, so the pixel upload need not hand-write an
+    # IMemoryBufferByteAccess vtable.
+    "Storage_Streams",
+    # TryCreateFromLanguage; without it, requested languages are only advisory.
+    "Globalization",
+] }
+windows-core.workspace = true
 
 [lints]
 workspace = true

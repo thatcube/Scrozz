@@ -84,6 +84,9 @@ dispatch2 = "0.3"
 
 # --- Windows ---
 windows = "0.62"
+# Direct dependency so `#[windows::core::interface]` can generate COM vtables:
+# reached only via `windows::core`, the macro emits unresolvable paths.
+windows-core = "0.62"
 
 # --- Linux ---
 x11rb = "0.14"
