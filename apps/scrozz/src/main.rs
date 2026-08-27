@@ -43,6 +43,7 @@ mod cli;
 mod commands;
 mod exit;
 mod fault;
+mod gui;
 mod hotkey_config;
 mod ipc;
 mod json;
@@ -138,6 +139,14 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
             })?;
             return Ok(Outcome::Relayed(code));
         }
+    }
+
+    // The GUI is not a command that runs and returns; it is the process
+    // becoming an application. It is handled here rather than in `commands` so
+    // the command layer stays a pure request-to-report function — which is what
+    // makes it usable from the IPC listener the GUI itself runs.
+    if matches!(command, Command::Gui) {
+        return gui::run(cli).map(Outcome::Local);
     }
 
     commands::dispatch(command).map(Outcome::Local)

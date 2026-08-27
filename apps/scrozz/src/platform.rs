@@ -85,19 +85,19 @@ pub fn start_recording(
     Ok(scrozz_record::start(request)?)
 }
 
-/// The capture history.
+/// The capture history, at its default location.
+///
+/// Not guarded by [`UNSTABLE_ENV`]: the store is a SQLite database and a
+/// directory of files, with no platform backend behind it that could be
+/// half-finished. Opening it on a machine with no capture support still
+/// works, which is what `scrozz history` on a headless box needs.
 ///
 /// # Errors
 ///
-/// Always [`CliError::NotImplemented`]: `scrozz-store` exports the [`Store`]
-/// trait but no constructor, so there is nothing to open.
-///
-/// [`Store`]: scrozz_store::Store
-pub fn store() -> CliResult<Box<dyn scrozz_store::Store>> {
-    Err(CliError::not_implemented(
-        "opening the capture history",
-        "scrozz-store (the Store trait has no exported constructor)",
-    ))
+/// Returns [`CliError`] if the database could not be opened or migrated — a
+/// missing directory, a schema from a newer Scrozz, a disk that is full.
+pub fn store() -> CliResult<scrozz_store::SqliteStore> {
+    Ok(scrozz_store::SqliteStore::open_default()?)
 }
 
 /// The text recogniser.
@@ -122,19 +122,17 @@ pub const fn ocr_available() -> bool {
 
 /// Decodes an image file into a frame.
 ///
+/// Goes through `scrozz-export` rather than an image crate of its own, so the
+/// binary has exactly one decode path. A second one would drift: colour space
+/// and premultiplication are decided at decode time, and two answers to that
+/// question is how a screenshot comes back with grey fringing.
+///
 /// # Errors
 ///
-/// Always [`CliError::NotImplemented`]. Decoding is the gap: `scrozz-export`
-/// encodes and can sniff a format from a magic number, but nothing in the
-/// dependency graph turns PNG bytes back into pixels. Recorded as a gap rather
-/// than solved here, because adding an image decoder to the CLI would put a
-/// second, divergent decode path in the tree.
+/// Returns [`CliError`] if the file is unreadable or is not an image format
+/// this build understands.
 pub fn decode_image_file(path: &std::path::Path) -> CliResult<scrozz_core::Frame> {
-    let _ = path;
-    Err(CliError::not_implemented(
-        "reading an image file",
-        "scrozz-export (no decoder is exposed; only encoding and format sniffing)",
-    ))
+    Ok(scrozz_export::decode_file(path)?)
 }
 
 /// Puts the process into macOS's accessory activation policy.
@@ -146,31 +144,36 @@ pub fn decode_image_file(path: &std::path::Path) -> CliResult<scrozz_core::Frame
 /// `NSApplication.setActivationPolicy(.accessory)` — or `LSUIElement` in the
 /// bundle's `Info.plist`, which is the same decision made statically.
 ///
-/// # Why it is not done here
+/// # When
 ///
-/// It cannot be. Setting the policy means calling into AppKit, and reaching
-/// AppKit means an `objc2-app-kit` dependency. This crate deliberately does not
-/// have one: the CLI must be buildable and runnable on a headless machine, and
-/// linking AppKit into the binary that a compositor keybinding invokes is
-/// exactly backwards.
+/// Before anything creates a window or a menu-bar item, and before the first
+/// `NSApplication` activation. A Dock icon that appears for two hundred
+/// milliseconds during start-up and then vanishes is still a Dock icon the
+/// user saw, and it is still a bounce in their peripheral vision.
 ///
-/// The right home is `scrozz-shell`, which already owns the platform boundary
-/// and already links AppKit for the overlay window. It needs one addition, an
-/// activation-policy call, which does not exist yet. Until then the GUI path is
-/// stubbed anyway, so nothing is lost — but the requirement is recorded here so
-/// it cannot be forgotten when the GUI lands.
+/// The AppKit call itself lives in `scrozz-shell`, which owns the platform
+/// boundary and already links AppKit. This crate stays free of `objc2`: the
+/// CLI must build and run on a headless machine, and linking AppKit into the
+/// binary a compositor keybinding invokes is exactly backwards.
 ///
 /// # Errors
 ///
-/// Never fails today. It is fallible because the eventual implementation is.
+/// Never. AppKit can refuse — inside a `.app` whose `Info.plist` disagrees, or
+/// in a test binary with no real `NSApplication` — and the refusal is logged
+/// with the remedy it carries. It is not returned, because the consequence of
+/// a refusal is a Dock icon, and a Dock icon is a worse look, not a broken
+/// app. Failing to be invisible must never be the reason a capture does not
+/// happen.
 #[allow(clippy::unnecessary_wraps)]
 pub fn become_accessory_app() -> CliResult<()> {
     #[cfg(target_os = "macos")]
-    {
-        tracing::debug!(
-            "D27 wants this process in the accessory activation policy (no Dock icon); \
-             scrozz-shell does not expose that call yet"
-        );
+    match scrozz_shell::tray::use_accessory_activation_policy() {
+        Ok(()) => {
+            tracing::debug!("this process is now a macOS accessory app (D27: no Dock icon)");
+        }
+        Err(err) => {
+            tracing::warn!("{err}");
+        }
     }
     Ok(())
 }
@@ -185,10 +188,11 @@ pub fn readiness() -> Vec<(&'static str, bool)> {
     vec![
         ("capture", unstable_backends_enabled()),
         ("record", unstable_backends_enabled()),
-        ("enumerate", false),
-        ("store", false),
+        ("enumerate", unstable_backends_enabled()),
+        ("store", true),
         ("ocr", ocr_available()),
-        ("decode", false),
+        ("decode", true),
+        ("gui", crate::gui::available()),
     ]
 }
 
@@ -227,22 +231,30 @@ mod tests {
     }
 
     #[test]
-    fn the_store_is_unavailable_regardless_of_the_guard() {
-        // Unlike capture, this one is not merely unfinished: there is no
-        // constructor to call, so the override must not pretend otherwise.
+    fn the_store_opens_without_the_unstable_guard() {
+        // History is not a platform backend. Gating it would make `scrozz
+        // history` fail on a machine that can read its own database perfectly
+        // well, which is the wrong answer for a headless box or a CI runner.
         let _env = test_env::lock();
-        test_env::set(UNSTABLE_ENV, "1");
-        let err = err_of(store());
         test_env::clear(UNSTABLE_ENV);
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("scrozz-store"), "{err}");
+        if let Err(e) = store() {
+            assert_ne!(
+                e.exit(),
+                Exit::NotImplemented,
+                "the store is implemented; a failure must name a real cause"
+            );
+        }
     }
 
     #[test]
-    fn decoding_an_image_is_a_named_gap() {
-        let err = err_of(decode_image_file(std::path::Path::new("/x.png")));
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("decoder"), "{err}");
+    fn decoding_a_missing_file_fails_for_a_real_reason() {
+        // Not `NotImplemented` any more: `scrozz-export` decodes. What is left
+        // is an ordinary I/O failure, and calling that "unimplemented" would
+        // send someone looking for missing code instead of a missing file.
+        let err = err_of(decode_image_file(std::path::Path::new(
+            "/nonexistent/scrozz-not-here.png",
+        )));
+        assert_ne!(err.exit(), Exit::NotImplemented, "{err}");
     }
 
     #[test]
@@ -306,7 +318,9 @@ mod tests {
         let names: Vec<&str> = readiness().into_iter().map(|(n, _)| n).collect();
         assert_eq!(
             names,
-            ["capture", "record", "enumerate", "store", "ocr", "decode"]
+            [
+                "capture", "record", "enumerate", "store", "ocr", "decode", "gui"
+            ]
         );
     }
 }
