@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 
-use objc2_core_foundation::{CFArray, CFNumber, CFNumberType};
 use objc2_core_graphics::{CGWindowID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID};
 use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
 use scrozz_core::{Display, DisplayId, Error, LogicalRect, Result, SourceApp, Window, WindowId};
@@ -44,24 +43,13 @@ fn core_graphics_z_order() -> Result<Vec<CGWindowID>> {
     )
     .ok_or_else(|| Error::Platform("CoreGraphics could not enumerate window z-order".to_owned()))?;
 
-    // SAFETY: `CGWindowListCreate` documents every array member as a
-    // `CGWindowID` wrapped in a `CFNumber`.
-    let ids: &CFArray<CFNumber> = unsafe { list.cast_unchecked() };
-    Ok(ids
-        .iter()
-        .filter_map(|number| {
-            let mut raw = 0_i64;
-            // SAFETY: `raw` is a valid, correctly sized output pointer for the
-            // requested signed 64-bit conversion.
-            let converted = unsafe {
-                number.value(
-                    CFNumberType::SInt64Type,
-                    std::ptr::from_mut(&mut raw).cast(),
-                )
-            };
-            converted
-                .then_some(raw)
-                .and_then(|raw| CGWindowID::try_from(raw).ok())
+    Ok((0..list.count())
+        .filter_map(|index| {
+            // SAFETY: `CGWindowListCreate` stores each `CGWindowID` directly
+            // in an array pointer slot; the value is read without retaining or
+            // dereferencing it.
+            let slot = unsafe { list.value_at_index(index) };
+            CGWindowID::try_from(slot.addr()).ok()
         })
         .collect())
 }
