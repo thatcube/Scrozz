@@ -81,12 +81,21 @@ esac
 
 BIN="${SCROZZ_BIN:-}"
 if [[ -z "$BIN" ]]; then
-  BIN="target/release/scrozz"
-  [[ -x "$BIN" ]] || BIN="target/release/scrozz.exe"
+  if [[ "${CI:-}" != "true" &&
+        "${GITHUB_ACTIONS:-}" != "true" &&
+        "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
+        -z "${CARGO_TARGET_DIR:-}" ]]; then
+    echo "package: refusing an unowned target/release binary." >&2
+    echo "package: build and package one leased binary with: tools/dev.sh package" >&2
+    exit 1
+  fi
+  TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+  BIN="$TARGET_DIR/release/scrozz"
+  [[ -x "$BIN" ]] || BIN="$TARGET_DIR/release/scrozz.exe"
 fi
 if [[ ! -x "$BIN" ]]; then
   echo "package: no executable at '$BIN'." >&2
-  echo "package: build one first: cargo build --release --locked -p scrozz" >&2
+  echo "package: build and package one leased binary with: tools/dev.sh package" >&2
   exit 1
 fi
 
@@ -136,6 +145,7 @@ case "$OS" in
     # point it at the target directory the release binary already lives in and
     # the build is a no-op rebuild rather than a second full compile.
     if ! CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" \
+      SCROZZ_PREBUILT_BIN="$BIN" \
       SCROZZ_BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-1}" \
       tools/make-app-bundle.sh "$STAGE/Scrozz.app"; then
       echo "package: make-app-bundle.sh failed" >&2

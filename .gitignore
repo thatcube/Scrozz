@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/target/
+/.artifacts/
 
 # Backtrace/profiling output
 *.profraw

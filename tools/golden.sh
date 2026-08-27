@@ -17,7 +17,9 @@
 # ignore red.
 set -uo pipefail
 
-cd "$(dirname "$0")/.." || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)" || exit 1
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+cd "$SCRIPT_DIR/.." || exit 1
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -28,7 +30,7 @@ fi
 
 CRATE="scrozz-ui"
 CRATE_DIR="crates/scrozz-ui"
-ARTIFACT_DIR="target/golden-artifacts"
+ARTIFACT_DIR="${SCROZZ_ARTIFACT_DIR:-.artifacts}/golden"
 
 # Tell CI a thing worth reading on the run summary page, not just in the log.
 note() {
@@ -78,6 +80,13 @@ if [[ "$have_dep" == "0" || "$have_tests" == "0" ]]; then
   exit 0
 fi
 
+if [[ "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
+      "${CI:-}" != "true" &&
+      "${GITHUB_ACTIONS:-}" != "true" &&
+      -z "${CARGO_TARGET_DIR:-}" ]]; then
+  exec "$SCRIPT_DIR/cargo-pool.sh" "$SCRIPT_PATH" "$@"
+fi
+
 # --- Run --------------------------------------------------------------------
 #
 # The harness can use this to pick a per-platform baseline directory. Font
@@ -119,7 +128,7 @@ while IFS= read -r -d '' img; do
   cp "$img" "$dest"
   found=$((found + 1))
 done < <(
-  find ./crates ./target -type f \
+  find ./crates "${CARGO_TARGET_DIR:-target}" -type f \
     \( -name '*.png' -o -name '*.webp' \) \
     \( -path '*snapshots*' -o -name '*.new.*' -o -name '*.diff.*' -o -name '*.old.*' \) \
     -print0 2>/dev/null

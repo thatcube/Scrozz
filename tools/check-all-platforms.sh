@@ -8,7 +8,9 @@
 # CI. It proves nothing about runtime behaviour — see docs/platforms.md.
 set -uo pipefail
 
-cd "$(dirname "$0")/.." || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)" || exit 1
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+cd "$SCRIPT_DIR/.." || exit 1
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -25,6 +27,13 @@ Environment:
                           this script for the one case where that is needed.
 USAGE
   exit 0
+fi
+
+if [[ "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
+      "${CI:-}" != "true" &&
+      "${GITHUB_ACTIONS:-}" != "true" &&
+      -z "${CARGO_TARGET_DIR:-}" ]]; then
+  exec "$SCRIPT_DIR/cargo-pool.sh" "$SCRIPT_PATH" "$@"
 fi
 
 TARGETS=(
@@ -65,7 +74,7 @@ if [[ -n "${SCROZZ_XCHECK_EXCLUDE:-}" ]]; then
   EXCLUDES=(${SCROZZ_XCHECK_EXCLUDE})
 fi
 
-LOG_DIR="target/xcheck-logs"
+LOG_DIR="${SCROZZ_ARTIFACT_DIR:-.artifacts}/xcheck-logs"
 mkdir -p "$LOG_DIR"
 
 failed=0
@@ -84,9 +93,10 @@ for target in "${TARGETS[@]}"; do
 
   log="$LOG_DIR/$target.log"
 
-  # A separate target dir per platform stops artifacts thrashing each other.
-  if CARGO_TARGET_DIR="target/xcheck-$target" \
-       cargo "${args[@]}" 2>&1 | tee "$log" | tail -n 15; then
+  # Cargo already segregates explicit targets beneath
+  # $CARGO_TARGET_DIR/<triple>; another target root per triple only duplicates
+  # host-independent metadata and makes every worktree several GiB larger.
+  if cargo "${args[@]}" 2>&1 | tee "$log" | tail -n 15; then
     echo "  ok"
   else
     echo "  FAILED"

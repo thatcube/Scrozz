@@ -92,16 +92,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # The gate keeps four target directories (one per triple plus the
-          # host); a distinct key stops it fighting the matrix jobs for cache
-          # space and evicting them.
+          # The gate keeps one Cargo target root with a subdirectory per
+          # explicit triple; a distinct key stops it fighting the matrix jobs
+          # for cache space and evicting them.
           key: gate
-          # tools/check-all-platforms.sh writes to target/xcheck-*, which is
-          # outside the default cache path.
           cache-directories: |
-            target/xcheck-aarch64-apple-darwin
-            target/xcheck-x86_64-pc-windows-msvc
-            target/xcheck-x86_64-unknown-linux-gnu
+            target/aarch64-apple-darwin
+            target/x86_64-pc-windows-msvc
+            target/x86_64-unknown-linux-gnu
 
       # Formatting is byte-identical on every platform, so it runs exactly once
       # here rather than three times in the matrix.
@@ -265,8 +263,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: golden-${{ runner.os }}
-          path: target/golden-artifacts
+          path: .artifacts/golden
           if-no-files-found: ignore
+          include-hidden-files: true
           # Long enough to survive a weekend; short enough not to accumulate.
           retention-days: 14
 

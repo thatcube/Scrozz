@@ -8,9 +8,26 @@
 # reporting — the two are meant to be the same thing.
 set -uo pipefail
 
-cd "$(dirname "$0")/.." || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)" || exit 1
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+cd "$SCRIPT_DIR/.." || exit 1
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true
+
+# Local compilation is leased from a bounded pool so parallel worktrees do not
+# each retain a full copy of the dependency graph. CI remains job-local, and an
+# explicit CARGO_TARGET_DIR remains the caller's responsibility.
+case "${1:-help}" in
+  fmt | fmt-check | help | -h | --help | linux-deps | update) ;;
+  *)
+    if [[ "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
+          "${CI:-}" != "true" &&
+          "${GITHUB_ACTIONS:-}" != "true" &&
+          -z "${CARGO_TARGET_DIR:-}" ]]; then
+      exec "$SCRIPT_DIR/cargo-pool.sh" "$SCRIPT_PATH" "$@"
+    fi
+    ;;
+esac
 
 # Crates whose build scripts compile C, which cannot cross-compile without a
 # foreign toolchain. See tools/check-all-platforms.sh for the full explanation.
@@ -26,6 +43,10 @@ Scrozz developer commands
     tools/dev.sh lint         clippy, warnings denied (what CI enforces)
     tools/dev.sh test         run the test suite
     tools/dev.sh build        debug build of the app
+    tools/dev.sh run -- ...   run the CLI or GUI with Scrozz arguments
+    tools/dev.sh update ...   update Cargo.lock without creating artifacts
+    tools/dev.sh smoke        build and smoke-test one release binary
+    tools/dev.sh package      build and package one release binary
 
   Cross-platform (docs/platforms.md)
     tools/dev.sh platforms    type-check macOS + Windows + Linux from here
@@ -87,6 +108,28 @@ cmd_check() { cargo check --workspace --all-targets; }
 cmd_lint() { cargo clippy --workspace --all-targets -- -D warnings; }
 cmd_test() { cargo test --workspace; }
 cmd_build() { cargo build --workspace; }
+cmd_update() { cargo update "$@"; }
+cmd_run() {
+  [[ "${1:-}" == "--" ]] && shift
+  cargo run -p scrozz -- "$@"
+}
+
+release_binary() {
+  local target_dir="${CARGO_TARGET_DIR:-target}"
+  local binary="$target_dir/release/scrozz"
+  [[ -x "$binary" ]] || binary="$target_dir/release/scrozz.exe"
+  printf '%s\n' "$binary"
+}
+
+cmd_smoke() {
+  cargo build --release --locked -p scrozz || return
+  tools/smoke.sh "$(release_binary)"
+}
+
+cmd_package() {
+  cargo build --release --locked -p scrozz || return
+  SCROZZ_BIN="$(release_binary)" tools/package.sh "$@"
+}
 
 cmd_platforms() {
   SCROZZ_XCHECK_EXCLUDE="$XCHECK_EXCLUDE" tools/check-all-platforms.sh
@@ -122,6 +165,19 @@ case "${1:-help}" in
   lint | clippy) cmd_lint ;;
   test) cmd_test ;;
   build) cmd_build ;;
+  update)
+    shift
+    cmd_update "$@"
+    ;;
+  run)
+    shift
+    cmd_run "$@"
+    ;;
+  smoke) cmd_smoke ;;
+  package)
+    shift
+    cmd_package "$@"
+    ;;
   platforms | check-all) cmd_platforms ;;
   golden) cmd_golden ;;
   golden-update) cmd_golden_update ;;

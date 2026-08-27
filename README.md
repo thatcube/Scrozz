@@ -127,13 +127,13 @@ it is a stable contract ([D11](docs/decisions.md)). It is also how Scrozz gets
 hotkeys on compositors that refuse to provide them.
 
 ```bash
-cargo run -p scrozz -- list displays
-cargo run -p scrozz -- list windows
-cargo run -p scrozz -- capture --display primary -o shot.png
-cargo run -p scrozz -- capture --region 0,0,1200,800 --json
-cargo run -p scrozz -- ocr shot.png
-cargo run -p scrozz -- settings get
-cargo run -p scrozz -- --help
+tools/dev.sh run -- list displays
+tools/dev.sh run -- list windows
+tools/dev.sh run -- capture --display primary -o shot.png
+tools/dev.sh run -- capture --region 0,0,1200,800 --json
+tools/dev.sh run -- ocr shot.png
+tools/dev.sh run -- settings get
+tools/dev.sh run -- --help
 ```
 
 Commands that are not built yet say so and exit with a distinct status rather
@@ -141,9 +141,9 @@ than pretending — `history`, for instance, currently reports that it is not
 implemented. Exit codes are part of the contract, so scripts can tell "no such
 window" apart from "not implemented" apart from "permission denied".
 
-Capture from a bare `cargo run` will be refused on macOS until you have built and
-approved the app bundle above, for the permission reason described there. That
-refusal is deliberate and tells you exactly which setting to change.
+Capture from the development binary will be refused on macOS until you have
+built and approved the app bundle above, for the permission reason described
+there. That refusal is deliberate and tells you exactly which setting to change.
 
 ## Contributing & development
 
@@ -156,8 +156,23 @@ tools/dev.sh lint       # clippy, warnings denied
 tools/dev.sh test       # the test suite
 tools/dev.sh platforms  # type-check macOS + Windows + Linux, from any of them
 tools/dev.sh golden     # headless golden-image tests
+tools/dev.sh update     # intentionally update Cargo.lock without build output
+tools/dev.sh smoke      # build + smoke-test one release binary under one lease
+tools/dev.sh package    # build + package one release binary under one lease
 tools/dev.sh ci         # everything, in CI's order — the answer before pushing
 ```
+
+Local build commands run through a two-slot Cargo pool. The lease keeps parallel
+worktrees from writing the same target directory at once, while the fixed slot
+count prevents every branch from retaining another full dependency graph. When
+a slot changes worktrees, the wrapper removes only workspace-package artifacts
+under the lease so stable Cargo cannot reuse a same-hash local artifact from
+another checkout; registry dependencies remain warm. Set
+`SCROZZ_CARGO_POOL_ROOT` to move the pool to another **local** filesystem, or
+`SCROZZ_CARGO_POOL_SLOTS` to change the concurrency bound. Do not put the pool
+on SMB/NFS, and do not point concurrent raw `cargo` commands at one shared
+`CARGO_TARGET_DIR`; use `tools/dev.sh` or `tools/cargo-pool.sh` so the lease
+covers the entire command.
 
 `tools/dev.sh platforms` is the one worth knowing about: it type-checks the
 Windows and Linux code against the genuine API surface without a Windows or Linux

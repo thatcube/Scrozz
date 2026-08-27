@@ -18,8 +18,12 @@ platform-specific code** — including the real platform bindings: the `windows`
 crate, `x11rb`, and `ashpd` with its zbus stack.
 
 ```bash
-tools/check-all-platforms.sh
+tools/dev.sh platforms
 ```
+
+The developer wrapper leases one of a fixed number of Cargo target roots. Cargo
+already isolates explicit triples inside that root, so this check does not create
+another target directory per platform or per worktree.
 
 This is the layer that changes the character of the work. Windows and Linux code
 is compiled against the genuine API surface, so a misremembered method name, a
@@ -98,7 +102,7 @@ behaviour the first three layers structurally cannot reach.
    `~/.cargo/registry/src/` before writing the call. These crates are generated,
    they move fast, and your memory of them is probably older than the pinned
    version.
-2. **Cross-check before committing.** `tools/check-all-platforms.sh` is fast, and
+2. **Cross-check before committing.** `tools/dev.sh platforms` is fast, and
    a Windows compile error found here costs a minute instead of a CI round trip.
 3. **Keep `cfg(target_os)` out of the crates above the platform layer.** Only
    `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and `scrozz-shell` may contain

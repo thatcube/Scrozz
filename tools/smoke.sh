@@ -61,13 +61,22 @@ fi
 
 BIN="${1:-${SCROZZ_BIN:-}}"
 if [[ -z "$BIN" ]]; then
-  BIN="target/release/scrozz"
-  [[ -x "$BIN" ]] || BIN="target/release/scrozz.exe"
+  if [[ "${CI:-}" != "true" &&
+        "${GITHUB_ACTIONS:-}" != "true" &&
+        "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
+        -z "${CARGO_TARGET_DIR:-}" ]]; then
+    echo "smoke: refusing an unowned target/release binary." >&2
+    echo "smoke: build and test one leased binary with: tools/dev.sh smoke" >&2
+    exit 1
+  fi
+  TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+  BIN="$TARGET_DIR/release/scrozz"
+  [[ -x "$BIN" ]] || BIN="$TARGET_DIR/release/scrozz.exe"
 fi
 
 if [[ ! -x "$BIN" ]]; then
   echo "smoke: no executable at '$BIN'." >&2
-  echo "smoke: build one first: cargo build --release --locked -p scrozz" >&2
+  echo "smoke: build and test one leased binary with: tools/dev.sh smoke" >&2
   exit 1
 fi
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"

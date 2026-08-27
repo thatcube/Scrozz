@@ -116,6 +116,18 @@ todo = "allow"
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
+
+[profile.test]
+opt-level = 1
+debug = "line-tables-only"
+incremental = false
+
+[profile.test.package."*"]
+opt-level = 3
+debug = false

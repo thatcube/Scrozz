@@ -17,9 +17,19 @@
 # step at the end of this script.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+cd "$SCRIPT_DIR/.."
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true
+
+if [[ -z "${SCROZZ_PREBUILT_BIN:-}" &&
+      "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
+      "${CI:-}" != "true" &&
+      "${GITHUB_ACTIONS:-}" != "true" &&
+      -z "${CARGO_TARGET_DIR:-}" ]]; then
+  exec "$SCRIPT_DIR/cargo-pool.sh" "$SCRIPT_PATH" "$@"
+fi
 
 # Install where Finder's Applications sidebar actually points. Using
 # `$HOME/Applications` made the app valid but effectively invisible to someone
@@ -67,7 +77,7 @@ if [[ -e "$APP" && ! -d "$APP" ]]; then
   exit 1
 fi
 
-TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/scrozz-rel}"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-$(date +%s)}"
 
 # --- where the executable comes from ---------------------------------------
