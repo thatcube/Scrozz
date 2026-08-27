@@ -137,7 +137,10 @@ pub struct WindowPicker {
     /// Scrozz's own windows, which must never be selectable.
     excluded: Vec<WindowId>,
     focused: Option<WindowId>,
+    /// Last reported pointer position, retained as an anchor while keys own focus.
     pointer: Option<LogicalPoint>,
+    /// Keyboard focus must survive frames where the overlay reports no pointer.
+    keyboard_focus: bool,
 }
 
 impl WindowPicker {
@@ -150,6 +153,7 @@ impl WindowPicker {
             excluded: Vec::new(),
             focused: None,
             pointer: None,
+            keyboard_focus: false,
         }
     }
 
@@ -167,6 +171,8 @@ impl WindowPicker {
             .is_some_and(|id| self.excluded.contains(id))
         {
             self.focused = None;
+            self.pointer = None;
+            self.keyboard_focus = false;
         }
         self
     }
@@ -207,14 +213,22 @@ impl WindowPicker {
             return false;
         }
         self.pointer = Some(position);
+        self.keyboard_focus = false;
         let hit = self.window_at(position).map(|window| window.id.clone());
         let changed = hit != self.focused;
         self.focused = hit;
         changed
     }
 
-    /// Removes the pointer, e.g. when it leaves every display.
+    /// Removes pointer-owned focus when the pointer leaves every display.
+    ///
+    /// A keyboard-owned highlight remains selected. Its last pointer position is
+    /// retained so a passive leave/re-enter sequence cannot masquerade as mouse
+    /// movement and reset the Tab cycle.
     pub fn clear_pointer(&mut self) -> bool {
+        if self.keyboard_focus {
+            return false;
+        }
         self.pointer = None;
         let changed = self.focused.is_some();
         self.focused = None;
@@ -282,6 +296,7 @@ impl WindowPicker {
         let order: Vec<WindowId> = self.candidates().map(|window| window.id.clone()).collect();
         if order.is_empty() {
             self.focused = None;
+            self.keyboard_focus = true;
             return None;
         }
 
@@ -304,21 +319,22 @@ impl WindowPicker {
         };
 
         self.focused = order.get(next as usize).cloned();
+        self.keyboard_focus = true;
         self.focused.as_ref()
     }
 
     /// Replaces the window snapshot, keeping focus where it still makes sense.
     ///
-    /// Focus follows the pointer when there is one, because the window under the
-    /// pointer is what the user believes is selected and a stale id would let
-    /// them click on a highlight that has moved. With no pointer — keyboard
-    /// operation — focus is kept if the window survived and dropped if it did
-    /// not, rather than jumping to an arbitrary neighbour the user was not
-    /// looking at.
+    /// Pointer-owned focus follows the pointer because a stale id would let the
+    /// user click on a highlight that moved. Keyboard-owned focus is kept if the
+    /// window survived and dropped if it did not, rather than being reset by a
+    /// stationary pointer during the live commit check.
     pub fn refresh(&mut self, windows: Vec<Window>) {
         self.windows = windows;
 
-        if let Some(pointer) = self.pointer {
+        if !self.keyboard_focus
+            && let Some(pointer) = self.pointer
+        {
             // Force a fresh hit-test even though the physical pointer did not
             // move: the windows underneath it may have.
             self.pointer = None;
@@ -795,6 +811,46 @@ mod tests {
             picker.focused_id(),
             Some(&pointer_window),
             "real pointer movement takes focus back"
+        );
+    }
+
+    #[test]
+    fn keyboard_focus_survives_when_the_pointer_leaves_on_the_next_frame() {
+        let mut picker = fixtures::overlapping().into_picker();
+        picker.point_at(at(300.0, 300.0));
+        let pointer_window = picker.focused_id().cloned().expect("pointer hit");
+        picker.focus_next();
+        let keyboard_window = picker.focused_id().cloned().expect("keyboard focus");
+        assert_ne!(keyboard_window, pointer_window);
+
+        assert!(
+            !picker.clear_pointer(),
+            "pointer absence must not clear keyboard focus"
+        );
+        assert_eq!(picker.focused_id(), Some(&keyboard_window));
+        assert!(
+            !picker.point_at(at(300.0, 300.0)),
+            "passive pointer re-entry at the same position is not movement"
+        );
+        assert_eq!(picker.focused_id(), Some(&keyboard_window));
+    }
+
+    #[test]
+    fn refreshing_for_keyboard_commit_does_not_restore_pointer_focus() {
+        let fixture = fixtures::overlapping();
+        let mut picker = fixture.clone().into_picker();
+        picker.point_at(at(300.0, 300.0));
+        let pointer_window = picker.focused_id().cloned().expect("pointer hit");
+        picker.focus_next();
+        let keyboard_window = picker.focused_id().cloned().expect("keyboard focus");
+        assert_ne!(keyboard_window, pointer_window);
+
+        picker.refresh(fixture.windows);
+
+        assert_eq!(
+            picker.focused_id(),
+            Some(&keyboard_window),
+            "live commit enumeration must preserve keyboard focus"
         );
     }
 
