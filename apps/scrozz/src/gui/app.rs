@@ -193,6 +193,7 @@ pub struct App {
     notes: Vec<String>,
     active_window_capture: Option<crate::gui::card::CardId>,
     window_picker: Option<WindowPickerSession>,
+    pending_window_commit: Option<PendingWindowCommit>,
 }
 
 struct WindowPickerSession {
@@ -200,11 +201,26 @@ struct WindowPickerSession {
     picker: scrozz_ui::picker::WindowPicker,
     theme: scrozz_ui::Theme,
     notice: Option<String>,
-    committing: bool,
+    terminal_input: scrozz_ui::picker::TerminalInputGate,
     #[cfg(target_os = "macos")]
     native_overlay: scrozz_shell::MacSelectionOverlayLease,
     #[cfg(target_os = "linux")]
     native_focus: scrozz_shell::X11FocusLease,
+}
+
+struct PendingWindowCommit {
+    card: crate::gui::card::CardId,
+    window: scrozz_core::WindowId,
+}
+
+impl WindowPickerSession {
+    fn close(&mut self, root: &egui::Context) {
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.native_focus.restore() {
+            tracing::warn!("X11 picker focus restoration reported: {error}");
+        }
+        scrozz_ui::picker::close_viewports(root, self.picker.displays());
+    }
 }
 
 impl App {
@@ -287,6 +303,7 @@ impl App {
             notes,
             active_window_capture: None,
             window_picker: None,
+            pending_window_commit: None,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -451,7 +468,8 @@ impl App {
                             session.picker =
                                 scrozz_ui::picker::WindowPicker::new(windows, displays);
                             session.notice = notice;
-                            session.committing = false;
+                            session.terminal_input =
+                                scrozz_ui::picker::TerminalInputGate::default();
                             continue;
                         }
                         #[cfg(target_os = "linux")]
@@ -482,7 +500,7 @@ impl App {
                             picker: scrozz_ui::picker::WindowPicker::new(windows, displays),
                             theme: scrozz_ui::Theme::dark(),
                             notice,
-                            committing: false,
+                            terminal_input: scrozz_ui::picker::TerminalInputGate::default(),
                             #[cfg(target_os = "macos")]
                             native_overlay,
                             #[cfg(target_os = "linux")]
@@ -596,6 +614,18 @@ impl App {
     /// Wayland never reaches this method with a picker: its trusted portal owns
     /// selection and the worker returns the completed capture directly.
     pub fn paint_window_picker(&mut self, root: &egui::Context) {
+        if let Some(pending) = self.pending_window_commit.take() {
+            if !self.pipeline.post(Job::CommitWindow {
+                card: pending.card,
+                window: pending.window,
+            }) {
+                self.note("the capture worker has gone");
+                self.pipeline.cancel_window(pending.card);
+                self.active_window_capture = None;
+            }
+            return;
+        }
+
         #[cfg(target_os = "linux")]
         let focus_error =
             self.window_picker
@@ -624,18 +654,20 @@ impl App {
         };
 
         #[cfg(target_os = "windows")]
-        let (intent, close_requested) = scrozz_ui::picker::interact_display_viewports(
-            root,
-            &mut session.picker,
-            &session.theme,
-            session.notice.as_deref(),
-        );
+        let (intent, close_requested, terminal_input) =
+            scrozz_ui::picker::interact_display_viewports(
+                root,
+                &mut session.picker,
+                &session.theme,
+                session.notice.as_deref(),
+            );
 
         #[cfg(not(target_os = "windows"))]
-        let (intent, close_requested) = {
+        let (intent, close_requested, terminal_input) = {
             let bounds = session.picker.desktop_bounds();
             let mut intent = scrozz_ui::picker::paint::Intent::None;
             let mut close_requested = false;
+            let mut terminal_input = scrozz_ui::picker::TerminalInputState::default();
             #[cfg(target_os = "macos")]
             let picker_was_visible = session.native_overlay.is_attached();
             #[cfg(target_os = "macos")]
@@ -648,6 +680,7 @@ impl App {
                 native_viewport,
                 |ctx, _class| {
                     close_requested = ctx.input(|input| input.viewport().close_requested());
+                    terminal_input = scrozz_ui::picker::TerminalInputState::read(ctx);
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                         .show(ctx, |ui| {
@@ -672,36 +705,47 @@ impl App {
                     return;
                 }
             }
-            (intent, close_requested)
+            (intent, close_requested, terminal_input)
         };
 
-        if close_requested || intent == scrozz_ui::picker::paint::Intent::Cancel {
-            self.cancel_window_picker(root);
-            return;
+        let terminal = session.terminal_input.update(
+            intent,
+            close_requested,
+            session.picker.focused_id(),
+            terminal_input,
+        );
+        if session.terminal_input.is_waiting() {
+            root.request_repaint_after(Duration::from_millis(16));
         }
-        if intent != scrozz_ui::picker::paint::Intent::Commit || session.committing {
+        let Some(terminal) = terminal else {
             return;
-        }
+        };
 
-        let Some(window) = session.picker.focused_id().cloned() else {
+        let scrozz_ui::picker::TerminalAction::Commit(window) = terminal else {
             self.cancel_window_picker(root);
             return;
         };
-        session.committing = true;
-        session.notice = Some("Checking that window…".to_owned());
-        if !self.pipeline.post(Job::CommitWindow {
+        self.commit_window_picker(root, window);
+    }
+
+    fn commit_window_picker(&mut self, root: &egui::Context, window: scrozz_core::WindowId) {
+        let Some(mut session) = self.window_picker.take() else {
+            return;
+        };
+        session.close(root);
+        self.pending_window_commit = Some(PendingWindowCommit {
             card: session.card,
             window,
-        }) {
-            self.note("the capture worker has gone");
-            self.cancel_window_picker(root);
-        }
+        });
+        drop(session);
+        root.request_repaint();
     }
 
     fn cancel_window_picker(&mut self, root: &egui::Context) {
-        if let Some(session) = self.window_picker.take() {
+        if let Some(mut session) = self.window_picker.take() {
+            session.close(root);
             self.pipeline.cancel_window(session.card);
-            scrozz_ui::picker::close_viewports(root, session.picker.displays());
+            drop(session);
         }
         self.active_window_capture = None;
         self.note("window capture cancelled");
@@ -771,6 +815,7 @@ impl App {
             self.pipeline.cancel_window(card);
         }
         self.window_picker = None;
+        self.pending_window_commit = None;
         self.pipeline.stop();
     }
 

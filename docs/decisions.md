@@ -329,6 +329,13 @@ and text-size settings, and WCAG AA contrast. The **annotation canvas is
 exempt** from screen-reader semantics — it gets keyboard operation and a
 structured layer list instead, the same compromise Figma makes.
 
+Terminal keyboard and pointer actions keep ownership of a transient picker
+until every held key, modifier, and pointer button has been released. Only then
+may the picker restore prior focus and close. Closing on key-down would deliver
+the matching key-up to the previously focused application, making an otherwise
+keyboard-accessible flow interfere with whatever the user was doing before it
+opened.
+
 **Why.** Accessibility and custom-drawn UI are **orthogonal**, not opposed —
 this was initially framed wrongly. Assistive technology reads a *semantic tree*
 the app publishes, never the pixels. **AccessKit** exists precisely for

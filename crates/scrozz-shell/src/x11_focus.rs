@@ -15,14 +15,16 @@ const MAX_DISCOVERY_ATTEMPTS: u16 = 120;
 ///
 /// Window managers intentionally ignore override-redirect windows, so activation
 /// requests cannot focus a selection overlay. This lease uses `SetInputFocus`
-/// against the exact XID, keeps that focus while the picker is live, and restores
-/// the window that was focused before selection began.
+/// against the exact XID, keeps the restoration state while the picker is live,
+/// and restores the window that was focused before selection began unless
+/// another client has taken focus in the meantime.
 pub struct X11FocusLease {
     connection: RustConnection,
     previous_focus: FocusSnapshot,
     target: Option<Window>,
     discovery: Option<Discovery>,
     discovery_attempts: u16,
+    focus_acquired: bool,
     restored: bool,
 }
 
@@ -58,6 +60,7 @@ impl X11FocusLease {
             target: None,
             discovery: None,
             discovery_attempts: 0,
+            focus_acquired: false,
             restored: false,
         })
     }
@@ -87,8 +90,8 @@ impl X11FocusLease {
     /// Creates a lease for a known picker XID.
     ///
     /// The window may still be unmapped. Call [`Self::maintain`] from the event
-    /// loop until it returns `true`, then continue calling it while selection is
-    /// active so another client cannot accidentally retain the picker's input.
+    /// loop until it returns `true`; continuing to call it afterward is harmless
+    /// and detects attempts to reuse a restored lease.
     ///
     /// # Errors
     ///
@@ -136,13 +139,17 @@ impl X11FocusLease {
                 pid_atom,
             }),
             discovery_attempts: 0,
+            focus_acquired: false,
             restored: false,
         })
     }
 
-    /// Acquires or reasserts focus for the picker XID.
+    /// Acquires focus for the picker XID once it becomes viewable.
     ///
-    /// Returns `false` while the native window is not mapped yet.
+    /// Returns `false` while the native window is not mapped yet and `true`
+    /// after acquisition. Once acquired, this deliberately does not steal focus
+    /// back if the user or window manager moves it to a third-party window;
+    /// [`Self::restore`] will detect that handoff and leave it untouched.
     ///
     /// # Errors
     ///
@@ -153,6 +160,9 @@ impl X11FocusLease {
             return Err(Error::Platform(
                 "cannot reacquire a restored X11 focus lease".to_owned(),
             ));
+        }
+        if self.focus_acquired {
+            return Ok(true);
         }
 
         let target = match self.target {
@@ -196,7 +206,8 @@ impl X11FocusLease {
         if input_focus(&self.connection)?.window != target {
             set_input_focus(&self.connection, target, InputFocus::PARENT)?;
         }
-        Ok(input_focus(&self.connection)?.window == target)
+        self.focus_acquired = input_focus(&self.connection)?.window == target;
+        Ok(self.focus_acquired)
     }
 
     /// Restores the focus that existed before the picker opened.
@@ -206,7 +217,9 @@ impl X11FocusLease {
     ///
     /// # Errors
     ///
-    /// Returns a platform error when X11 rejects the restoration request.
+    /// Returns a platform error when X11 rejects the restoration request, or
+    /// [`Error::TargetGone`] after successfully falling back to pointer-root
+    /// focus when the prior window disappeared.
     pub fn restore(&mut self) -> Result<()> {
         if self.restored {
             return Ok(());
@@ -221,16 +234,23 @@ impl X11FocusLease {
             return Ok(());
         }
 
-        let destination = if self.previous_focus.window <= POINTER_ROOT
-            || is_viewable(&self.connection, self.previous_focus.window)
-        {
-            self.previous_focus.window
-        } else {
+        let previous_vanished = self.previous_focus.window > POINTER_ROOT
+            && !is_viewable(&self.connection, self.previous_focus.window);
+        let destination = if previous_vanished {
             POINTER_ROOT
+        } else {
+            self.previous_focus.window
         };
         set_input_focus(&self.connection, destination, self.previous_focus.revert_to)?;
         self.restored = true;
-        Ok(())
+        if previous_vanished {
+            Err(Error::TargetGone(format!(
+                "X11 window {:#x} that held focus before selection disappeared; focus now follows the pointer",
+                self.previous_focus.window
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// The XID attached to this lease, once a deferred child has been discovered.
@@ -272,7 +292,7 @@ impl X11FocusLease {
 impl Drop for X11FocusLease {
     fn drop(&mut self) {
         if let Err(error) = self.restore() {
-            tracing::warn!("could not restore X11 focus after selection: {error}");
+            tracing::warn!("X11 picker focus restoration reported: {error}");
         }
     }
 }

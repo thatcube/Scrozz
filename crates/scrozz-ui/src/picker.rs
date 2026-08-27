@@ -145,6 +145,97 @@ pub enum Outcome {
     Vanished(WindowId),
 }
 
+/// A terminal picker action whose triggering input has not necessarily been released yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalAction {
+    /// Cancel selection.
+    Cancel,
+    /// Commit the window that was focused when the action began.
+    Commit(WindowId),
+}
+
+/// Whether any input that could outlive a terminal picker action remains held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalInputState {
+    keys_down: bool,
+    modifiers_down: bool,
+    pointer_down: bool,
+}
+
+impl TerminalInputState {
+    /// Samples held input from the picker viewport that received the action.
+    #[must_use]
+    pub fn read(ctx: &egui::Context) -> Self {
+        ctx.input(|input| Self {
+            keys_down: !input.keys_down.is_empty(),
+            modifiers_down: input.modifiers.any(),
+            pointer_down: input.pointer.any_down(),
+        })
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.keys_down |= other.keys_down;
+        self.modifiers_down |= other.modifiers_down;
+        self.pointer_down |= other.pointer_down;
+    }
+
+    const fn all_released(self) -> bool {
+        !self.keys_down && !self.modifiers_down && !self.pointer_down
+    }
+}
+
+/// Holds the first terminal action until its complete input chord is released.
+///
+/// A picker that restores focus or closes on the key-down frame sends the
+/// matching key-up event to the previously focused application. Keeping this
+/// gate alive until every held key, modifier, and pointer button is up prevents
+/// that input from leaking across the focus handoff.
+#[derive(Debug, Default)]
+pub struct TerminalInputGate {
+    pending: Option<TerminalAction>,
+}
+
+impl TerminalInputGate {
+    /// Records the first terminal action and returns it once all input is up.
+    ///
+    /// The focused id is copied on the triggering frame so pointer movement
+    /// during key release cannot silently change what Return will capture.
+    #[must_use]
+    pub fn update(
+        &mut self,
+        intent: paint::Intent,
+        close_requested: bool,
+        focused: Option<&WindowId>,
+        input: TerminalInputState,
+    ) -> Option<TerminalAction> {
+        if self.pending.is_none() {
+            self.pending = if close_requested || intent == paint::Intent::Cancel {
+                Some(TerminalAction::Cancel)
+            } else if intent == paint::Intent::Commit {
+                Some(
+                    focused
+                        .cloned()
+                        .map_or(TerminalAction::Cancel, TerminalAction::Commit),
+                )
+            } else {
+                None
+            };
+        }
+
+        if input.all_released() {
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    /// Whether a terminal action is waiting for its input to be released.
+    #[must_use]
+    pub const fn is_waiting(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 /// A live window-selection session.
 ///
 /// Constructed from a snapshot of the window list, driven by pointer and
@@ -587,10 +678,11 @@ pub fn interact_display_viewports(
     picker: &mut WindowPicker,
     theme: &crate::Theme,
     notice: Option<&str>,
-) -> (paint::Intent, bool) {
+) -> (paint::Intent, bool, TerminalInputState) {
     let displays = picker.displays.clone();
     let mut combined = paint::Intent::None;
     let mut close_requested = false;
+    let mut terminal_input = TerminalInputState::default();
 
     for (index, display) in displays.iter().enumerate() {
         let mut intent = paint::Intent::None;
@@ -599,6 +691,7 @@ pub fn interact_display_viewports(
             display_viewport(index),
             |ctx, _class| {
                 close_requested |= ctx.input(|input| input.viewport().close_requested());
+                terminal_input.merge(TerminalInputState::read(ctx));
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                     .show(ctx, |ui| {
@@ -620,13 +713,18 @@ pub fn interact_display_viewports(
         };
     }
 
-    (combined, close_requested)
+    (combined, close_requested, terminal_input)
 }
 
 /// Closes every picker viewport that may be alive.
 pub fn close_viewports(ctx: &egui::Context, displays: &[Display]) {
+    ctx.send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Visible(false));
     ctx.send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Close);
     for display in displays {
+        ctx.send_viewport_cmd_to(
+            display_viewport_id(display),
+            egui::ViewportCommand::Visible(false),
+        );
         ctx.send_viewport_cmd_to(display_viewport_id(display), egui::ViewportCommand::Close);
     }
 }
@@ -758,6 +856,7 @@ pub fn pick_window_with_native_hook(
                 result: sink,
                 theme,
                 notice: None,
+                terminal_input: TerminalInputGate::default(),
                 #[cfg(target_os = "linux")]
                 native_focus,
             }))
@@ -780,6 +879,7 @@ struct PickerApp {
     result: Arc<Mutex<Option<scrozz_core::Result<Outcome>>>>,
     theme: crate::theme::Theme,
     notice: Option<String>,
+    terminal_input: TerminalInputGate,
     #[cfg(target_os = "linux")]
     native_focus: scrozz_shell::X11FocusLease,
 }
@@ -799,13 +899,14 @@ impl PickerApp {
     fn finish(&mut self, ctx: &egui::Context, outcome: scrozz_core::Result<Outcome>) {
         #[cfg(target_os = "linux")]
         if let Err(error) = self.native_focus.restore() {
-            tracing::warn!("could not restore X11 focus before closing the picker: {error}");
+            tracing::warn!("X11 picker focus restoration reported: {error}");
         }
         store_terminal_result(self.result.as_ref(), outcome);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    fn commit(&mut self, ctx: &egui::Context) {
+    fn commit(&mut self, ctx: &egui::Context, id: WindowId) {
         let live = match (self.refresh)() {
             Ok(mut windows) => {
                 windows.retain(|window| !is_scrozz_window(window));
@@ -817,16 +918,14 @@ impl PickerApp {
             }
         };
 
-        match self.picker.commit(&live) {
-            Outcome::Selected(id) => self.finish(ctx, Ok(Outcome::Selected(id))),
-            Outcome::Cancelled => self.finish(ctx, Ok(Outcome::Cancelled)),
-            Outcome::Vanished(id) => {
-                self.picker.refresh(live);
-                self.notice = Some(format!(
-                    "That window closed. Choose another window. ({})",
-                    id.0
-                ));
-            }
+        if live.iter().any(|window| window.id == id) {
+            self.finish(ctx, Ok(Outcome::Selected(id)));
+        } else {
+            self.picker.refresh(live);
+            self.notice = Some(format!(
+                "That window closed. Choose another window. ({})",
+                id.0
+            ));
         }
     }
 }
@@ -850,11 +949,11 @@ impl eframe::App for PickerApp {
         let root_close_requested = ctx.input(|input| input.viewport().close_requested());
 
         #[cfg(target_os = "windows")]
-        let (intent, child_close_requested) =
+        let (intent, child_close_requested, terminal_input) =
             interact_display_viewports(&ctx, &mut self.picker, &self.theme, self.notice.as_deref());
 
         #[cfg(not(target_os = "windows"))]
-        let (intent, child_close_requested) = {
+        let (intent, child_close_requested, terminal_input) = {
             let bounds = self.picker.desktop_bounds();
             (
                 paint::interact(
@@ -865,18 +964,26 @@ impl eframe::App for PickerApp {
                     self.notice.as_deref(),
                 ),
                 false,
+                TerminalInputState::read(&ctx),
             )
         };
 
-        if root_close_requested || child_close_requested {
-            self.finish(&ctx, Ok(Outcome::Cancelled));
-            return;
+        let terminal = self.terminal_input.update(
+            intent,
+            root_close_requested || child_close_requested,
+            self.picker.focused_id(),
+            terminal_input,
+        );
+        if self.terminal_input.is_waiting() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+        let Some(terminal) = terminal else {
+            return;
+        };
 
-        match intent {
-            paint::Intent::None => {}
-            paint::Intent::Cancel => self.finish(&ctx, Ok(Outcome::Cancelled)),
-            paint::Intent::Commit => self.commit(&ctx),
+        match terminal {
+            TerminalAction::Cancel => self.finish(&ctx, Ok(Outcome::Cancelled)),
+            TerminalAction::Commit(id) => self.commit(&ctx, id),
         }
     }
 
@@ -1182,6 +1289,184 @@ mod tests {
             .expect("terminal result")
             .expect("successful picker result");
         assert_eq!(outcome, Outcome::Selected(selected));
+    }
+
+    #[test]
+    fn terminal_actions_wait_for_every_key_modifier_and_pointer_button() {
+        let focused = WindowId("front".to_owned());
+        let held_states = [
+            TerminalInputState {
+                keys_down: true,
+                ..TerminalInputState::default()
+            },
+            TerminalInputState {
+                modifiers_down: true,
+                ..TerminalInputState::default()
+            },
+            TerminalInputState {
+                pointer_down: true,
+                ..TerminalInputState::default()
+            },
+        ];
+
+        for held in held_states {
+            let mut gate = TerminalInputGate::default();
+            assert_eq!(
+                gate.update(paint::Intent::Commit, false, Some(&focused), held),
+                None
+            );
+            assert!(gate.is_waiting());
+            assert_eq!(
+                gate.update(
+                    paint::Intent::None,
+                    false,
+                    None,
+                    TerminalInputState::default()
+                ),
+                Some(TerminalAction::Commit(focused.clone()))
+            );
+            assert!(!gate.is_waiting());
+        }
+    }
+
+    #[test]
+    fn terminal_input_sampling_tracks_escape_and_enter_through_release() {
+        for key in [egui::Key::Escape, egui::Key::Enter] {
+            let ctx = egui::Context::default();
+            let event = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![event(true)],
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            output.textures_delta.clear();
+            assert!(
+                TerminalInputState::read(&ctx).keys_down,
+                "{key:?} must remain held after its key-down frame"
+            );
+
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![event(false)],
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            output.textures_delta.clear();
+            assert!(
+                TerminalInputState::read(&ctx).all_released(),
+                "{key:?} key-up must unlock terminal finalization"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_input_sampling_tracks_modifiers_and_pointer_buttons() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                events: vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                    egui::Event::PointerButton {
+                        pos: egui::pos2(10.0, 10.0),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::SHIFT,
+                    },
+                ],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        let held = TerminalInputState::read(&ctx);
+        assert!(held.modifiers_down);
+        assert!(held.pointer_down);
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                events: vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                    egui::Event::PointerButton {
+                        pos: egui::pos2(10.0, 10.0),
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        assert!(TerminalInputState::read(&ctx).all_released());
+    }
+
+    #[test]
+    fn escape_waits_for_release_before_cancelling() {
+        let mut gate = TerminalInputGate::default();
+        assert_eq!(
+            gate.update(
+                paint::Intent::Cancel,
+                false,
+                None,
+                TerminalInputState {
+                    keys_down: true,
+                    ..TerminalInputState::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            gate.update(
+                paint::Intent::None,
+                false,
+                None,
+                TerminalInputState::default()
+            ),
+            Some(TerminalAction::Cancel)
+        );
+    }
+
+    #[test]
+    fn a_pending_commit_keeps_the_window_focused_on_the_key_down_frame() {
+        let mut gate = TerminalInputGate::default();
+        let first = WindowId("front".to_owned());
+        let later = WindowId("back".to_owned());
+
+        assert_eq!(
+            gate.update(
+                paint::Intent::Commit,
+                false,
+                Some(&first),
+                TerminalInputState {
+                    keys_down: true,
+                    ..TerminalInputState::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            gate.update(
+                paint::Intent::Commit,
+                false,
+                Some(&later),
+                TerminalInputState::default()
+            ),
+            Some(TerminalAction::Commit(first))
+        );
     }
 
     #[test]
