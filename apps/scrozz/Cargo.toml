@@ -23,6 +23,12 @@ scrozz-store.workspace = true
 scrozz-export.workspace = true
 scrozz-shell.workspace = true
 scrozz-ui.workspace = true
+# The app opens the overlay window, so it names eframe directly. scrozz-ui
+# builds the whole overlay but deliberately does not depend on scrozz-shell, so
+# the app is the only crate that can see both and connect them.
+eframe.workspace = true
+egui.workspace = true
+raw-window-handle.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
