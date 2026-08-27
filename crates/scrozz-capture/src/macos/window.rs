@@ -1,12 +1,16 @@
 //! Enumerating windows.
 //!
-//! ScreenCaptureKit is the source rather than `CGWindowListCopyWindowInfo`,
-//! for one decisive reason: capturing a window needs the `SCWindow` object
-//! itself, so enumerating through anything else would mean looking the window
-//! up a second time and racing with the user closing it in between.
+//! ScreenCaptureKit remains the source of window identity and metadata because
+//! capture needs the same `SCWindow` object. Its array is not ordered by visual
+//! stacking, though, so window IDs are joined to CoreGraphics' authoritative
+//! front-to-back list before the picker sees them.
 
+use std::collections::HashMap;
+
+use objc2_core_foundation::{CFArray, CFNumber, CFNumberType};
+use objc2_core_graphics::{CGWindowID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID};
 use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
-use scrozz_core::{Display, DisplayId, LogicalRect, Result, SourceApp, Window, WindowId};
+use scrozz_core::{Display, DisplayId, Error, LogicalRect, Result, SourceApp, Window, WindowId};
 
 /// Windows the user could plausibly pick, in front-to-back order.
 ///
@@ -19,7 +23,7 @@ pub(crate) fn windows(content: &SCShareableContent, displays: &[Display]) -> Res
     // SAFETY: reading properties of the shareable content snapshot.
     let list = unsafe { content.windows() };
 
-    Ok(list
+    let mut windows: Vec<_> = list
         .iter()
         .filter(|window| {
             // SAFETY: `windowLayer` is a plain property read.
@@ -27,7 +31,58 @@ pub(crate) fn windows(content: &SCShareableContent, displays: &[Display]) -> Res
             layer == 0
         })
         .map(|window| to_window(&window, displays))
+        .collect();
+
+    order_front_to_back(&mut windows, &core_graphics_z_order()?);
+    Ok(windows)
+}
+
+fn core_graphics_z_order() -> Result<Vec<CGWindowID>> {
+    let list = CGWindowListCreate(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        kCGNullWindowID,
+    )
+    .ok_or_else(|| Error::Platform("CoreGraphics could not enumerate window z-order".to_owned()))?;
+
+    // SAFETY: `CGWindowListCreate` documents every array member as a
+    // `CGWindowID` wrapped in a `CFNumber`.
+    let ids: &CFArray<CFNumber> = unsafe { list.cast_unchecked() };
+    Ok(ids
+        .iter()
+        .filter_map(|number| {
+            let mut raw = 0_i64;
+            // SAFETY: `raw` is a valid, correctly sized output pointer for the
+            // requested signed 64-bit conversion.
+            let converted = unsafe {
+                number.value(
+                    CFNumberType::SInt64Type,
+                    std::ptr::from_mut(&mut raw).cast(),
+                )
+            };
+            converted
+                .then_some(raw)
+                .and_then(|raw| CGWindowID::try_from(raw).ok())
+        })
         .collect())
+}
+
+fn order_front_to_back(windows: &mut [Window], front_to_back: &[CGWindowID]) {
+    let ranks: HashMap<_, _> = front_to_back
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(rank, id)| (id, rank))
+        .collect();
+
+    windows.sort_by_key(|window| {
+        window
+            .id
+            .0
+            .parse::<CGWindowID>()
+            .ok()
+            .and_then(|id| ranks.get(&id).copied())
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// Finds a specific window in a content snapshot.
@@ -180,6 +235,49 @@ mod tests {
 
     fn window_at(x: f64, width: f64) -> LogicalRect {
         LogicalRect::new(LogicalPoint::new(x, 100.0), LogicalSize::new(width, 200.0))
+    }
+
+    fn overlapping_window(id: CGWindowID) -> Window {
+        Window {
+            id: WindowId(id.to_string()),
+            title: Some(format!("window-{id}")),
+            application: Some("Test".to_owned()),
+            application_id: Some("com.thatcube.test".to_owned()),
+            bounds: window_at(100.0, 500.0),
+            display: DisplayId("main".to_owned()),
+            is_visible: true,
+        }
+    }
+
+    #[test]
+    fn core_graphics_order_puts_the_visible_front_window_first_for_hit_testing() {
+        // This is the ordering contradiction captured by the native macOS lab:
+        // SCK put Outlook first while CoreGraphics showed the target above it.
+        let outlook = 48_110;
+        let target = 48_457;
+        let finder = 48_188;
+        let unmatched = 99_999;
+        let mut windows = vec![
+            overlapping_window(outlook),
+            overlapping_window(finder),
+            overlapping_window(target),
+            overlapping_window(unmatched),
+        ];
+
+        order_front_to_back(&mut windows, &[target, outlook, finder]);
+
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["48457", "48110", "48188", "99999"]
+        );
+        assert_eq!(
+            windows.first().map(|window| &window.id),
+            Some(&WindowId(target.to_string())),
+            "the picker uses the first overlapping candidate as the visible hit"
+        );
     }
 
     #[test]
