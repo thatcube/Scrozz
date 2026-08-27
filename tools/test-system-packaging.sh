@@ -74,4 +74,82 @@ grep -q 'developer-id-release)' tools/make-app-bundle.sh ||
 grep -q '"signed_manifest": false' tools/package.sh ||
   fail "package metadata does not keep signing explicitly gated"
 
+MANIFEST="packaging/windows/AppxManifest.xml.in"
+WINDOWS_PACKAGE="tools/package-windows.ps1"
+WINDOWS_PACKAGE_TEST="tools/test-windows-packaging.ps1"
+[[ -f "$MANIFEST" ]] || fail "Windows AppxManifest template is absent"
+[[ -f "$WINDOWS_PACKAGE" ]] || fail "Windows package script is absent"
+[[ -f "$WINDOWS_PACKAGE_TEST" ]] || fail "Windows artifact test is absent"
+if command -v xmllint >/dev/null 2>&1; then
+  xmllint --noout "$MANIFEST" ||
+    fail "Windows AppxManifest template is not well-formed XML"
+fi
+grep -q 'uap10:RuntimeBehavior="packagedClassicApp"' "$MANIFEST" ||
+  fail "MSIX app does not declare packaged classic runtime behavior"
+grep -q 'uap10:TrustLevel="mediumIL"' "$MANIFEST" ||
+  fail "MSIX app does not declare medium integrity"
+grep -q 'Id="Scrozz"' "$MANIFEST" ||
+  fail "MSIX application id drifted"
+grep -q '<rescap:Capability Name="runFullTrust"' "$MANIFEST" ||
+  fail "MSIX app does not declare full-trust capability"
+grep -q 'Category="windows.protocol"' "$MANIFEST" ||
+  fail "MSIX protocol registration is absent"
+grep -q '<uap:Protocol Name="scrozz"' "$MANIFEST" ||
+  fail "MSIX protocol name drifted"
+grep -q 'uap10:Parameters="url handle"' "$MANIFEST" ||
+  fail "MSIX protocol activation does not route through the allow-listed URL command"
+grep -q 'Category="windows.startupTask"' "$MANIFEST" ||
+  fail "MSIX startup task is absent"
+grep -q 'TaskId="ScrozzStartup"' "$MANIFEST" ||
+  fail "MSIX startup task id drifted"
+grep -q 'Enabled="false"' "$MANIFEST" ||
+  fail "MSIX startup task is not opt-in"
+grep -q 'uap10:Parameters="gui"' "$MANIFEST" ||
+  fail "MSIX startup task does not launch the GUI command"
+grep -q 'Category="windows.appExecutionAlias"' "$MANIFEST" ||
+  fail "MSIX CLI execution alias is absent"
+grep -q '<uap5:ExecutionAlias Alias="scrozz.exe"' "$MANIFEST" ||
+  fail "MSIX CLI execution alias drifted"
+if grep -Eq 'internetClient|broadFileSystemAccess' "$MANIFEST"; then
+  fail "MSIX manifest requests an unnecessary broad capability"
+fi
+grep -q 'pack /o /h SHA256 /f' "$WINDOWS_PACKAGE" ||
+  fail "MSIX package does not pin SHA-256 and a deterministic mapping"
+grep -q '1980, 1, 1' "$WINDOWS_PACKAGE" ||
+  fail "Windows package inputs do not receive a reproducible timestamp"
+grep -q 'SCROZZ_MSIX_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
+  fail "Windows package has no byte-for-byte determinism check"
+grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
+  fail "Windows package has no all-artifact determinism check"
+grep -q 'determinism-check.zip' "$WINDOWS_PACKAGE" ||
+  fail "portable ZIP is excluded from reproducibility verification"
+grep -q 'SCROZZ_MSIX_SIGN_PFX' "$WINDOWS_PACKAGE" ||
+  fail "Windows package has no external PFX signing hook"
+grep -q 'SCROZZ_MSIX_SIGN_CERT_SHA1' "$WINDOWS_PACKAGE" ||
+  fail "Windows package has no certificate-store signing hook"
+grep -Fq "signed_manifest = \$false" "$WINDOWS_PACKAGE" ||
+  fail "Windows metadata does not keep update signing human-gated"
+if ! grep -Fq -- '-PackageKind "portable"' "$WINDOWS_PACKAGE" ||
+  ! grep -Fq -- '-OcrBackend "tesseract"' "$WINDOWS_PACKAGE"; then
+  fail "portable metadata does not declare the Tesseract backend"
+fi
+if ! grep -Fq -- '-PackageKind "msix"' "$WINDOWS_PACKAGE" ||
+  ! grep -Fq -- '-OcrBackend "windows-media-ocr"' "$WINDOWS_PACKAGE"; then
+  fail "MSIX metadata does not declare the Windows.Media.Ocr backend"
+fi
+grep -Fq "Test-ArtifactMetadata \$Portable \"portable\" \"tesseract\" \"\"" \
+  "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not verify the portable OCR contract"
+grep -Fq "Test-ArtifactMetadata \$Msix \"msix\" \"windows-media-ocr\"" \
+  "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not verify the MSIX OCR contract"
+grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not exercise reproducible packaging"
+grep -q 'package-windows.ps1' tools/package.sh ||
+  fail "the cross-platform package hook does not delegate Windows packaging"
+for asset in Square44x44Logo.png Square150x150Logo.png StoreLogo.png; do
+  [[ -f "packaging/windows/Assets/$asset" ]] ||
+    fail "MSIX asset is absent: $asset"
+done
+
 echo "system packaging checks passed"

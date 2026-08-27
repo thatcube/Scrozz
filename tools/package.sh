@@ -22,8 +22,22 @@ Environment:
   SCROZZ_BUILD_NUMBER  macOS CFBundleVersion
   SCROZZ_SIGNING_MODE  macOS bundle mode (default: ad-hoc-dev)
   SCROZZ_SIGN_IDENTITY Developer ID Application identity for release mode
+  SCROZZ_MSIX_IDENTITY_NAME
+                        Partner Center package identity (Windows)
+  SCROZZ_MSIX_PUBLISHER
+                        Certificate/Store publisher DN (Windows)
+  SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME
+                        Store-facing publisher name (Windows)
+  SCROZZ_MSIX_VERSION   four-part package version override (Windows)
+  SCROZZ_MSIX_SIGN_PFX  optional external package-signing certificate
+  SCROZZ_MSIX_SIGN_PFX_PASSWORD
+                        optional PFX password
+  SCROZZ_MSIX_SIGN_CERT_SHA1
+                        optional certificate-store thumbprint
+  SCROZZ_WINDOWS_VERIFY_DETERMINISM
+                        rebuild and compare both Windows artifacts
 
-The output includes <archive>.sha256 and <archive>.artifact.json. The JSON is
+Each output includes <artifact>.sha256 and <artifact>.artifact.json. The JSON is
 unsigned artifact metadata, not an update manifest and not installation
 authority.
 USAGE
@@ -132,23 +146,26 @@ case "$OS" in
     ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_ROOT" "$ARCHIVE"
     ;;
   windows)
-    PACKAGE_ROOT="$STAGE/$NAME"
-    mkdir -p "$PACKAGE_ROOT"
-    cp "$BIN" "$PACKAGE_ROOT/scrozz.exe"
-    copy_documents "$PACKAGE_ROOT"
-    ARCHIVE="$DIST/$NAME.zip"
-    rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.artifact.json"
-    if command -v 7z >/dev/null 2>&1; then
-      (cd "$STAGE" && 7z a -bso0 -bsp0 "$ARCHIVE" "$NAME")
+    if command -v powershell.exe >/dev/null 2>&1; then
+      POWERSHELL="powershell.exe"
     elif command -v powershell >/dev/null 2>&1; then
-      SCROZZ_PACKAGE_ROOT="$PACKAGE_ROOT" \
-        SCROZZ_PACKAGE_ARCHIVE="$ARCHIVE" \
-        powershell -NoProfile -Command \
-        'Compress-Archive -LiteralPath $env:SCROZZ_PACKAGE_ROOT -DestinationPath $env:SCROZZ_PACKAGE_ARCHIVE -Force'
+      POWERSHELL="powershell"
     else
-      echo "package: no Windows zip tool is available" >&2
+      echo "package: PowerShell is required for deterministic ZIP and MSIX output" >&2
       exit 1
     fi
+    "$POWERSHELL" \
+      -NoLogo \
+      -NoProfile \
+      -NonInteractive \
+      -ExecutionPolicy Bypass \
+      -File tools/package-windows.ps1 \
+      -OutputDirectory "$DIST" \
+      -Binary "$BIN" \
+      -Version "$VERSION" \
+      -Stamp "$STAMP" \
+      -Architecture "$ARCH"
+    exit
     ;;
   linux)
     APPDIR="$STAGE/Scrozz.AppDir"
