@@ -6,7 +6,9 @@ use std::{
 };
 
 use scrozz_core::Error as CoreError;
-use scrozz_shell::{SystemPlatform, autostart::AutostartPlan, url_scheme::SchemeRegistration};
+use scrozz_shell::{
+    PackageKind, SystemPlatform, autostart::AutostartPlan, url_scheme::SchemeRegistration,
+};
 
 use crate::{
     fault::{CliError, CliResult},
@@ -23,6 +25,7 @@ const BUNDLE_ENV: &str = "SCROZZ_APP_BUNDLE";
 #[derive(Debug, Clone)]
 pub struct SystemContext {
     pub platform: SystemPlatform,
+    pub package_kind: PackageKind,
     pub executable: PathBuf,
     pub home: PathBuf,
     pub config_home: PathBuf,
@@ -39,6 +42,7 @@ impl SystemContext {
     /// Returns a platform or storage error when a required host path is absent.
     pub fn current() -> CliResult<Self> {
         let platform = SystemPlatform::current()?;
+        let package_kind = scrozz_shell::package_kind()?;
         let executable = optional_path(EXECUTABLE_ENV)
             .map_or_else(env::current_exe, Ok)
             .map_err(CoreError::Io)?;
@@ -61,6 +65,7 @@ impl SystemContext {
             .join("update-state.json");
         Ok(Self {
             platform,
+            package_kind,
             executable,
             home,
             config_home,
@@ -72,21 +77,23 @@ impl SystemContext {
 
     /// Creates the launch-at-login plan for this context.
     pub fn autostart(&self) -> CliResult<AutostartPlan> {
-        Ok(AutostartPlan::for_platform(
+        Ok(AutostartPlan::for_platform_with_windows_package(
             self.platform,
             &self.executable,
             &self.home,
             &self.config_home,
+            self.package_kind.is_msix(),
         )?)
     }
 
     /// Creates the URL-scheme registration plan for this context.
     pub fn url_scheme(&self) -> CliResult<SchemeRegistration> {
-        Ok(SchemeRegistration::for_platform(
+        Ok(SchemeRegistration::for_platform_with_windows_package(
             self.platform,
             &self.executable,
             &self.bundle,
             &self.data_home,
+            self.package_kind.is_msix(),
         )?)
     }
 }

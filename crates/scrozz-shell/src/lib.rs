@@ -16,6 +16,7 @@ pub mod hotkey;
 pub mod macos;
 pub mod notify;
 pub mod overlay;
+pub mod package;
 pub mod permissions;
 pub mod tray;
 pub mod url_scheme;
@@ -34,6 +35,7 @@ pub use overlay::{
     AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
+pub use package::{PackageKind, package_kind};
 pub use permissions::SystemPermissions;
 pub use tray::{Tray, TrayAction, TrayEntry};
 
