@@ -67,7 +67,7 @@ use objc2::{ClassType, sel};
 use objc2_app_kit::{
     NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
     NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
-    NSWindowStyleMask,
+    NSWindowSharingType, NSWindowStyleMask,
 };
 use objc2_core_graphics::CGShieldingWindowLevel;
 use objc2_foundation::NSRect;
@@ -464,6 +464,11 @@ impl MacOverlay {
     /// Returns [`Error::Platform`] if called off the main thread.
     pub fn apply(&mut self, behavior: &OverlayBehavior) -> Result<OverlayReport> {
         let _mtm = main_thread("configuring an overlay window")?;
+
+        // This hook runs while eframe is creating the window, before it can draw
+        // a capture card or recording HUD. Keep that private content out of all
+        // system capture APIs even if panel conversion degrades below.
+        self.window.setSharingType(NSWindowSharingType::None);
 
         // SAFETY: we are on the main thread (checked above) and hold a strong
         // reference to a live window.

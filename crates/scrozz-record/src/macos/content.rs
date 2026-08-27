@@ -6,10 +6,14 @@ use std::time::Duration;
 use block2::RcBlock;
 use objc2::AnyThread;
 use objc2::rc::Retained;
+use objc2::runtime::NSObjectProtocol;
+use objc2::sel;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID};
 use objc2_foundation::{NSArray, NSError};
-use objc2_screen_capture_kit::{SCContentFilter, SCDisplay, SCShareableContent, SCWindow};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCDisplay, SCRunningApplication, SCShareableContent, SCWindow,
+};
 use scrozz_core::{CaptureTarget, Error, LogicalPoint, LogicalRect, LogicalSize, Result};
 
 use super::{error, permission};
@@ -78,13 +82,14 @@ unsafe impl Send for ContentDelivery {}
 
 pub(crate) fn resolve(target: &CaptureTarget) -> Result<CaptureContent> {
     let content = shareable_content()?;
+    let excluded_applications = current_process_applications(&content);
     match target {
         CaptureTarget::Display(id) => {
             let display_id = id.0.parse::<u32>().map_err(|_| {
                 Error::InvalidRequest(format!("{:?} is not a macOS display id", id.0))
             })?;
             let display = find_display(&content, display_id)?;
-            whole_display(&display)
+            whole_display(&display, &excluded_applications)
         }
         CaptureTarget::Window(id) => {
             let window_id = id.0.parse::<u32>().map_err(|_| {
@@ -93,18 +98,22 @@ pub(crate) fn resolve(target: &CaptureTarget) -> Result<CaptureContent> {
             let window = find_window(&content, window_id)?;
             window_content(&content, &window)
         }
-        CaptureTarget::Region(rect) => region_content(&content, *rect),
-        CaptureTarget::AllDisplays => all_displays(&content),
+        CaptureTarget::Region(rect) => region_content(&content, *rect, &excluded_applications),
+        CaptureTarget::AllDisplays => all_displays(&content, &excluded_applications),
     }
 }
 
-fn whole_display(display: &SCDisplay) -> Result<CaptureContent> {
-    // SAFETY: this is ScreenCaptureKit's designated whole-display filter
-    // initializer and the exclusion list remains alive for the call.
+fn whole_display(
+    display: &SCDisplay,
+    excluded_applications: &NSArray<SCRunningApplication>,
+) -> Result<CaptureContent> {
+    // SAFETY: this is ScreenCaptureKit's designated display filter initializer;
+    // both exclusion lists remain alive for the call.
     let filter = unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(
+        SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
             SCContentFilter::alloc(),
             display,
+            excluded_applications,
             &NSArray::new(),
         )
     };
@@ -166,13 +175,14 @@ fn window_content(content: &SCShareableContent, window: &SCWindow) -> Result<Cap
 fn region_content(
     content: &SCShareableContent,
     rect: scrozz_core::LogicalRect,
+    excluded_applications: &NSArray<SCRunningApplication>,
 ) -> Result<CaptureContent> {
     let displays = display_snapshots(content);
     if let Some(display) = displays
         .iter()
         .find(|display| contains_rect(display.frame, rect))
     {
-        return region_on_one_display(display, rect);
+        return region_on_one_display(display, rect, excluded_applications);
     }
     let mut participating: Vec<_> = displays
         .into_iter()
@@ -204,7 +214,7 @@ fn region_content(
                 CGSize::new(visible.size.width, visible.size.height),
             );
             Ok(CaptureSource {
-                filter: display_filter(&display.display),
+                filter: display_filter(&display.display, excluded_applications),
                 source_rect: Some(source_rect),
                 label: format!("display {}", display.id),
                 terminal_inactivity: false,
@@ -223,7 +233,11 @@ fn region_content(
     })
 }
 
-fn region_on_one_display(display: &DisplaySnapshot, rect: LogicalRect) -> Result<CaptureContent> {
+fn region_on_one_display(
+    display: &DisplaySnapshot,
+    rect: LogicalRect,
+    excluded_applications: &NSArray<SCRunningApplication>,
+) -> Result<CaptureContent> {
     // SAFETY: immutable geometry read.
     let display_frame = display.frame;
     let source_rect = CGRect::new(
@@ -235,7 +249,7 @@ fn region_on_one_display(display: &DisplaySnapshot, rect: LogicalRect) -> Result
     );
     // SAFETY: a whole-display filter is required for region streams; sourceRect
     // performs the crop in the display's local point coordinate space.
-    let filter = display_filter(&display.display);
+    let filter = display_filter(&display.display, excluded_applications);
     let scale = filter_scale(&filter, display.scale);
     let (native_width, native_height) =
         dimensions(rect.size.width * scale, rect.size.height * scale)?;
@@ -255,7 +269,10 @@ fn region_on_one_display(display: &DisplaySnapshot, rect: LogicalRect) -> Result
     })
 }
 
-fn all_displays(content: &SCShareableContent) -> Result<CaptureContent> {
+fn all_displays(
+    content: &SCShareableContent,
+    excluded_applications: &NSArray<SCRunningApplication>,
+) -> Result<CaptureContent> {
     let mut displays = display_snapshots(content);
     match displays.len() {
         0 => {
@@ -264,7 +281,7 @@ fn all_displays(content: &SCShareableContent) -> Result<CaptureContent> {
                 why: "no shareable displays are attached".to_owned(),
             });
         }
-        1 => return whole_display(&displays[0].display),
+        1 => return whole_display(&displays[0].display, excluded_applications),
         _ => {}
     }
 
@@ -283,7 +300,7 @@ fn all_displays(content: &SCShareableContent) -> Result<CaptureContent> {
     let sources = displays
         .into_iter()
         .map(|display| CaptureSource {
-            filter: display_filter(&display.display),
+            filter: display_filter(&display.display, excluded_applications),
             source_rect: None,
             label: format!("display {}", display.id),
             terminal_inactivity: false,
@@ -332,12 +349,18 @@ fn sort_primary_first<T>(values: &mut [T], id: impl Fn(&T) -> u32) {
     });
 }
 
-fn display_filter(display: &SCDisplay) -> Retained<SCContentFilter> {
-    // SAFETY: designated initializer with a live display and empty exclusion list.
+fn display_filter(
+    display: &SCDisplay,
+    excluded_applications: &NSArray<SCRunningApplication>,
+) -> Retained<SCContentFilter> {
+    // SAFETY: designated initializer with a live display and retained exclusion
+    // lists. Excluding this process prevents Scrozz's HUD and private cards from
+    // entering display- or region-recording frames.
     unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(
+        SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
             SCContentFilter::alloc(),
             display,
+            excluded_applications,
             &NSArray::new(),
         )
     }
@@ -349,21 +372,44 @@ fn filter_geometry(
     fallback_size: CGSize,
 ) -> Result<(u32, u32, f64)> {
     let scale = filter_scale(filter, fallback_scale);
-    // SAFETY: immutable geometry read from a configured content filter.
-    let content = unsafe { filter.contentRect() };
-    let (width, height) = dimensions(content.size.width * scale, content.size.height * scale)
+    let content_size = if filter.respondsToSelector(sel!(contentRect)) {
+        // SAFETY: selector availability was checked on this exact filter.
+        unsafe { filter.contentRect().size }
+    } else {
+        fallback_size
+    };
+    let (width, height) = dimensions(content_size.width * scale, content_size.height * scale)
         .or_else(|_| dimensions(fallback_size.width * scale, fallback_size.height * scale))?;
     Ok((width, height, scale))
 }
 
 fn filter_scale(filter: &SCContentFilter, fallback: f64) -> f64 {
-    // SAFETY: immutable scale read from a configured content filter.
+    if !filter.respondsToSelector(sel!(pointPixelScale)) {
+        return fallback;
+    }
+    // SAFETY: selector availability was checked on this exact filter.
     let scale = unsafe { filter.pointPixelScale() as f64 };
     if scale.is_finite() && (0.5..=16.0).contains(&scale) {
         scale
     } else {
         fallback
     }
+}
+
+fn current_process_applications(
+    content: &SCShareableContent,
+) -> Retained<NSArray<SCRunningApplication>> {
+    // SAFETY: immutable process identifiers from one retained shareable-content
+    // snapshot.
+    let applications = unsafe { content.applications() }
+        .iter()
+        .filter(|application| is_current_process(unsafe { application.processID() }))
+        .collect::<Vec<_>>();
+    NSArray::from_retained_slice(&applications)
+}
+
+fn is_current_process(process_id: i32) -> bool {
+    u32::try_from(process_id).is_ok_and(|process_id| process_id == std::process::id())
 }
 
 fn display_scale(display: &SCDisplay) -> f64 {
@@ -595,6 +641,13 @@ fn shareable_content() -> Result<Retained<SCShareableContent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_exclusion_matches_only_this_nonnegative_pid() {
+        let current = i32::try_from(std::process::id()).expect("macOS process ids fit i32");
+        assert!(is_current_process(current));
+        assert!(!is_current_process(-1));
+    }
 
     #[test]
     fn mixed_scale_tiles_keep_one_global_geometry_without_upscaling() {
