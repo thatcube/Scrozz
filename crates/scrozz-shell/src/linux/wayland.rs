@@ -982,6 +982,9 @@ impl LayerShellSession {
     }
 
     fn finish_dispatch(&mut self) {
+        if let Some(serial) = self.state.transport.take_pending_configure_serial() {
+            self.layer_surface.ack_configure(serial);
+        }
         for released in self.state.released_buffers.drain(..) {
             if let Some(buffer) = self.buffers.iter_mut().find(|buffer| buffer.id == released) {
                 buffer.busy = false;
@@ -1601,7 +1604,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for SessionState {
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for SessionState {
     fn event(
         state: &mut Self,
-        surface: &ZwlrLayerSurfaceV1,
+        _: &ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
         _: &(),
         _: &Connection,
@@ -1613,8 +1616,9 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for SessionState {
                 width,
                 height,
             } => {
-                surface.ack_configure(serial);
-                state.transport.configure(SurfaceSize::new(width, height));
+                state
+                    .transport
+                    .configure(serial, SurfaceSize::new(width, height));
                 state.extent_changed = true;
             }
             zwlr_layer_surface_v1::Event::Closed => {

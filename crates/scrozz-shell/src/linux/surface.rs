@@ -475,6 +475,7 @@ impl RemapState {
 pub(crate) struct TransportState {
     requested: SurfaceSize,
     granted: Option<SurfaceSize>,
+    pending_configure_serial: Option<u32>,
     integer_scale: u32,
     fractional_enabled: bool,
     fractional_scale_120: Option<u32>,
@@ -488,6 +489,7 @@ impl TransportState {
         Self {
             requested,
             granted: None,
+            pending_configure_serial: None,
             integer_scale: 1,
             fractional_enabled,
             fractional_scale_120: None,
@@ -506,14 +508,19 @@ impl TransportState {
         self.granted = None;
     }
 
-    pub(crate) fn configure(&mut self, granted: SurfaceSize) {
+    pub(crate) fn configure(&mut self, serial: u32, granted: SurfaceSize) {
         if self.is_closed() {
             return;
         }
+        self.pending_configure_serial = Some(serial);
         self.granted = Some(granted);
         self.events.push(LayerSurfaceEvent::Configured {
             logical_size: self.logical_size(),
         });
+    }
+
+    pub(crate) fn take_pending_configure_serial(&mut self) -> Option<u32> {
+        self.pending_configure_serial.take()
     }
 
     pub(crate) fn granted(&self) -> Option<SurfaceSize> {
@@ -737,7 +744,7 @@ mod tests {
     fn configure_resolves_zero_grants_against_requested_size() {
         let mut state = TransportState::new(SurfaceSize::new(232, 150), false);
         assert_eq!(state.logical_size(), None);
-        state.configure(SurfaceSize::new(0, 0));
+        state.configure(1, SurfaceSize::new(0, 0));
         assert_eq!(state.logical_size(), Some(SurfaceSize::new(232, 150)));
         assert_eq!(
             state.take_events(),
@@ -748,9 +755,20 @@ mod tests {
     }
 
     #[test]
+    fn configure_batch_acknowledges_only_the_latest_serial() {
+        let mut state = TransportState::new(SurfaceSize::new(264, 720), false);
+        state.configure(4, SurfaceSize::new(264, 720));
+        state.configure(5, SurfaceSize::new(1280, 720));
+
+        assert_eq!(state.granted(), Some(SurfaceSize::new(1280, 720)));
+        assert_eq!(state.take_pending_configure_serial(), Some(5));
+        assert_eq!(state.take_pending_configure_serial(), None);
+    }
+
+    #[test]
     fn fractional_preference_supersedes_integer_scale_and_resizes_buffer() {
         let mut state = TransportState::new(SurfaceSize::new(101, 51), true);
-        state.configure(SurfaceSize::new(101, 51));
+        state.configure(1, SurfaceSize::new(101, 51));
         state.take_events();
 
         state.set_integer_scale(2);
@@ -772,7 +790,7 @@ mod tests {
     #[test]
     fn a_frame_becomes_stale_when_scale_changes_during_rendering() {
         let mut state = TransportState::new(SurfaceSize::new(100, 50), true);
-        state.configure(SurfaceSize::new(100, 50));
+        state.configure(1, SurfaceSize::new(100, 50));
         let before = state.frame_signature();
         let submitted = state.buffer_size().unwrap();
 
@@ -798,7 +816,7 @@ mod tests {
         state.set_mapped(false);
         state.close(SurfaceCloseReason::Compositor);
         state.close(SurfaceCloseReason::Compositor);
-        state.configure(SurfaceSize::new(20, 20));
+        state.configure(1, SurfaceSize::new(20, 20));
         state.set_integer_scale(2);
         assert_eq!(
             state.take_events(),
