@@ -22,6 +22,9 @@
 //! - [`Error::PermissionDenied`] and [`Error::Unsupported`] make D15's
 //!   permission-on-first-use and D8's documented platform gaps ordinary,
 //!   handled outcomes rather than crashes.
+//! - [`scroll::ScrollSynthesis`] makes D8's "query capabilities, never assume"
+//!   rule unavoidable for scrolling capture: a caller cannot reach the scroll
+//!   API without first having been told whether this desktop can scroll at all.
 
 #![forbid(unsafe_code)]
 
@@ -29,10 +32,15 @@ pub mod capture;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod scroll;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
 pub use error::{Error, Result};
+pub use scroll::{
+    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
+    ScrollSynthesis,
+};
 pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
