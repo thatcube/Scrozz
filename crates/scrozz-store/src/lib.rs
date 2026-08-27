@@ -11,8 +11,52 @@
 //! The alternative, a blunt "delete everything older than a week" slider,
 //! discards the edit history along with the pixels, which is the one part worth
 //! keeping.
+//!
+//! # How it is stored
+//!
+//! ```text
+//! <data dir>/Scrozz/
+//!   index.sqlite          the query index — a cache, rebuildable at any time
+//!   documents/<id>.json   the durable record: metadata + every edit
+//!   images/ab/cd/<hash>   source pixels, content-addressed, evictable
+//! ```
+//!
+//! The index is deliberately *not* the source of truth. Every capture writes a
+//! self-contained JSON record before its index row exists, so a database lost to
+//! corruption, a bad upgrade, or a full disk costs a rebuild rather than a
+//! user's history. Source images live on the filesystem rather than in SQLite
+//! because eviction should be an `unlink`, and because a 10 GB database is a
+//! liability every time it is backed up, vacuumed, or checked.
+//!
+//! # Concurrency
+//!
+//! The GUI and the CLI are expected to run at the same time (decision D11), so
+//! the index runs in WAL mode with a busy timeout and every write takes an
+//! immediate transaction. Readers never block writers and writers never block
+//! readers.
 
 #![forbid(unsafe_code)]
+
+pub mod db;
+pub mod hash;
+pub mod id;
+pub mod layout;
+pub mod model;
+pub mod record;
+pub mod schema;
+pub mod sqlite_store;
+
+#[doc(hidden)]
+pub mod test_support;
+
+pub use layout::StoreLayout;
+pub use model::{
+    CaptureRecord, FrameHeader, ImageState, Page, RetentionReport, SearchQuery, Timestamp,
+};
+pub use record::StoredRecord;
+pub use sqlite_store::{
+    DocumentState, EvictedDocument, History, NewCapture, RecoveryReport, SqliteStore,
+};
 
 use scrozz_core::Result;
 use serde::{Deserialize, Serialize};
