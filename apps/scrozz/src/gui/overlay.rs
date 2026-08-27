@@ -168,6 +168,11 @@ impl CardSurface for OverlayCards {
                         out.push(CardEvent::Save(ours));
                     }
                 }
+                OverlayEvent::UploadRequested { id } => {
+                    if let Some(ours) = self.mapped.get(&id.0).copied() {
+                        out.push(CardEvent::Upload(ours));
+                    }
+                }
                 OverlayEvent::AnnotateRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         out.push(CardEvent::Open(ours));
@@ -188,8 +193,7 @@ impl CardSurface for OverlayCards {
                 // Nothing downstream acts on these yet, and inventing a
                 // translation for them would be worse than leaving the gap
                 // visible.
-                OverlayEvent::UploadRequested { .. }
-                | OverlayEvent::PinRequested { .. }
+                OverlayEvent::PinRequested { .. }
                 | OverlayEvent::DockExpanded
                 | OverlayEvent::Emptied => {}
                 _ => {}

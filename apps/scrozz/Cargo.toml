@@ -12,6 +12,10 @@ repository.workspace = true
 name = "scrozz"
 path = "src/main.rs"
 
+[features]
+default = []
+cloud = ["dep:scrozz-cloud", "scrozz-cloud/network"]
+
 [dependencies]
 scrozz-core.workspace = true
 scrozz-capture.workspace = true
@@ -21,6 +25,7 @@ scrozz-stitch.workspace = true
 scrozz-ocr.workspace = true
 scrozz-store.workspace = true
 scrozz-export.workspace = true
+scrozz-cloud = { workspace = true, optional = true }
 scrozz-shell.workspace = true
 scrozz-ui.workspace = true
 # The app opens the overlay window, so it names eframe directly. scrozz-ui

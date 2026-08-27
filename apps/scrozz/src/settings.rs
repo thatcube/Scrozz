@@ -44,6 +44,11 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// A key combination, validated by the same parser the hotkey commands use.
     Accelerator,
+    /// Free text. Empty is permitted where it means "not configured".
+    Text {
+        /// Whether an empty value is meaningful.
+        allow_empty: bool,
+    },
 }
 
 impl Kind {
@@ -56,6 +61,7 @@ impl Kind {
             Self::Path => "path",
             Self::Choice(_) => "choice",
             Self::Accelerator => "accelerator",
+            Self::Text { .. } => "text",
         }
     }
 }
@@ -154,6 +160,13 @@ impl Setting {
                 }
             }
             Kind::Accelerator => Accelerator::parse(value).map(|_| ()),
+            Kind::Text { allow_empty } => {
+                if !allow_empty && value.trim().is_empty() {
+                    Err(CliError::usage(format!("{} cannot be empty", self.key)))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -227,6 +240,75 @@ pub const SETTINGS: &[Setting] = &[
         },
         default: "10737418240",
         description: "Disk budget for stored source images. Pinned captures are never evicted.",
+    },
+    Setting {
+        key: "cloud.provider",
+        kind: Kind::Choice(&["aws", "r2", "b2", "minio"]),
+        default: "aws",
+        description: "S3-compatible provider preset used for private sharing.",
+    },
+    Setting {
+        key: "cloud.bucket",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Bucket name. Empty leaves sharing unconfigured.",
+    },
+    Setting {
+        key: "cloud.region",
+        kind: Kind::Text { allow_empty: false },
+        default: "us-east-1",
+        description: "Signature region. R2 always signs with auto; B2 requires its bucket region.",
+    },
+    Setting {
+        key: "cloud.endpoint",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Optional S3 API endpoint override; required for MinIO.",
+    },
+    Setting {
+        key: "cloud.account-id",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Cloudflare account id used to form the default R2 endpoint.",
+    },
+    Setting {
+        key: "cloud.prefix",
+        kind: Kind::Text { allow_empty: true },
+        default: "captures",
+        description: "Object-key prefix for uploaded captures.",
+    },
+    Setting {
+        key: "cloud.public-base-url",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Custom public origin or path used only for non-expiring links.",
+    },
+    Setting {
+        key: "cloud.expiry-seconds",
+        kind: Kind::Int {
+            min: 0,
+            max: 604_800,
+        },
+        default: "86400",
+        description: "Presigned-link lifetime; zero means an already-public bucket or CDN.",
+    },
+    Setting {
+        key: "cloud.credential-command",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Optional program whose stdout supplies the secret access key.",
+    },
+    Setting {
+        key: "cloud.viewer-title",
+        kind: Kind::Text { allow_empty: false },
+        default: "Scrozz share",
+        description: "Heading and browser title for encrypted share viewers.",
+    },
+    Setting {
+        key: "cloud.viewer-accent",
+        kind: Kind::Text { allow_empty: false },
+        default: "#7c3aed",
+        description: "Six-digit CSS accent color for encrypted share viewers.",
     },
     Setting {
         key: "hotkey.capture-region",
@@ -376,6 +458,19 @@ mod tests {
                 .validate(setting.default)
                 .unwrap_or_else(|e| panic!("{} has an invalid default: {e}", setting.key));
         }
+    }
+
+    #[test]
+    fn credential_values_have_no_plaintext_setting() {
+        for forbidden in ["secret", "access-key", "session-token", "password"] {
+            assert!(
+                SETTINGS
+                    .iter()
+                    .all(|setting| !setting.key.contains(forbidden)),
+                "a credential-bearing setting contains {forbidden:?}"
+            );
+        }
+        assert!(lookup("cloud.credential-command").is_ok());
     }
 
     #[test]

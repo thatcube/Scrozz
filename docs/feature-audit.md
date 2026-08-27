@@ -291,13 +291,13 @@ correct shape.
 
 | ID | Feature | Tier | Notes |
 |---|---|---|---|
-| CLD-01 | Upload capture, get shareable link | T2 | BYO storage (S3/R2/B2/generic S3) |
-| CLD-02 | Self-destruct / expiry | T3 | Requires server logic or object lifecycle rules |
-| CLD-03 | Password-protected links | T3 | Requires a server or a viewer page |
-| CLD-04 | Tags / organization | T3 | |
-| CLD-05 | Custom domain & branding | T3 | Free with BYO bucket |
+| CLD-01 | Upload capture, get shareable link | T2 | Implemented behind optional `cloud`: BYO AWS S3/R2/B2/MinIO |
+| CLD-02 | Self-destruct / expiry | T3 | Provider-enforced presigned GET plus tagged lifecycle on AWS/MinIO or prefix lifecycle on R2/B2 |
+| CLD-03 | Password-protected links | T3 | Client-side AES-256-GCM and self-contained WebCrypto viewer; not a server gate |
+| CLD-04 | Tags / organization | T3 | S3 object tags on AWS/MinIO; rejected honestly on R2/B2, whose S3 APIs do not support them |
+| CLD-05 | Custom domain & branding | T3 | Public-base URL plus encrypted-viewer title/accent |
 | CLD-06 | Team management | — | **Explicit non-goal** |
-| CLD-07 | Cloud is optional, app fully functional without it | T0 | Hard requirement |
+| CLD-07 | Cloud is optional, app fully functional without it | T0 | Default build contains no network transport; `cloud` is non-default |
 
 ---
 

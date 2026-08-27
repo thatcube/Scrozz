@@ -76,6 +76,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Drag-out to another app | 🟡 | ⬜ | ⬜ | The hero interaction ([D12](docs/decisions.md)): promised-file drag exists on macOS; other backends are planned, not written |
 | Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
 | Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
+| Private sharing | 🟡 | 🟡 | 🟡 | Optional BYO S3/R2/B2/MinIO upload; automated signing, encryption and loopback transport tests pass, but no provider has been confirmed by hand |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
 | Screen recording | ⬜ | ⬜ | ⬜ | Contracts only. Hardware encoders only, for licence reasons |
@@ -136,6 +137,24 @@ cargo run -p scrozz -- settings get
 cargo run -p scrozz -- --help
 ```
 
+Private sharing is an optional build feature: it adds no account or Scrozz
+service, and uploads only to the S3-compatible endpoint you configure.
+
+```bash
+export SCROZZ_S3_BUCKET=my-captures
+export SCROZZ_S3_ACCESS_KEY_ID=...
+export SCROZZ_S3_SECRET_ACCESS_KEY=...
+cargo run -p scrozz --features cloud -- share shot.png
+```
+
+AWS S3, Cloudflare R2, Backblaze B2 and MinIO presets are built in. Expiring
+private links, client-side password encryption, provider-compatible object
+organization and lifecycle deletion, tags where supported, and custom domains
+are documented in
+**[`docs/private-sharing.md`](docs/private-sharing.md)**. Credential secrets are
+accepted only from environment variables, a credential command's stdout, or
+stdin — never as command-line values or plaintext settings.
+
 Commands that are not built yet say so and exit with a distinct status rather
 than pretending — `history`, for instance, currently reports that it is not
 implemented. Exit codes are part of the contract, so scripts can tell "no such
@@ -175,6 +194,7 @@ before implementation:
 |---|---|
 | [`docs/decisions.md`](docs/decisions.md) | Every architectural decision (D1–D31), with the reasoning and what it rules out |
 | [`docs/platforms.md`](docs/platforms.md) | The cross-platform strategy, the four verification layers, and what Windows and Linux still need |
+| [`docs/private-sharing.md`](docs/private-sharing.md) | BYO object-storage setup, credential boundaries, expiry and encrypted viewer behavior |
 | [`docs/feature-audit.md`](docs/feature-audit.md) | The authoritative feature inventory, per-platform feasibility, and the backlog |
 | [`docs/research/`](docs/research) | The research the decisions were made from |
 | [`AI_DISCLOSURE.md`](AI_DISCLOSURE.md) | How Scrozz is built, and what it does not do |
@@ -188,16 +208,18 @@ decision is wrong, say so and change it there first — that is what it is for.
 A screenshot tool sees your screen, including things you never meant to share.
 That earns a direct answer rather than a marketing adjective, so:
 
-**Scrozz contains no AI.** No language model, no inference, nothing generated. It
-does not upload your captures anywhere, has no telemetry, no analytics, no
-account, no sign-in, and no server to talk to. There is nothing to monetise
-because nothing leaves your machine. Text recognition runs on device, using the
-recogniser already built into your operating system.
+**Scrozz contains no AI.** No language model, no inference, nothing generated.
+It has no telemetry, analytics, account, sign-in, or Scrozz server. Text
+recognition runs on device, using the recogniser already built into your
+operating system. A capture leaves the machine only when you explicitly use the
+optional sharing feature, and then it goes only to the S3-compatible storage you
+configured.
 
-You can check that rather than believe it: **there is no HTTP client anywhere in
-the dependency tree** — search `Cargo.lock` for `reqwest`, `hyper`, `ureq` or
-`curl` and you will come up empty. An application that cannot make a web request
-cannot phone home.
+You can check that rather than believe it: the default build compiles no HTTP
+client. Building with `--features cloud` adds optional `ureq` networking for
+authenticated object-storage PUTs; redirects are disabled. `Cargo.lock` lists
+`ureq` because lockfiles include optional dependencies, so verify the compiled
+boundary with `cargo tree -p scrozz --no-default-features`.
 
 **Coding agents did assist with implementation.** Brandon Moore conceived Scrozz,
 researched it, designed the product and its visual identity, made every

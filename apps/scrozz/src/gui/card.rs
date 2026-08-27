@@ -294,6 +294,8 @@ pub enum CardEvent {
     Copy(CardId),
     /// Write it to the configured folder.
     Save(CardId),
+    /// Upload it to configured private storage and copy the link.
+    Upload(CardId),
     /// Swiped left: throw it away.
     Dismiss(CardId),
     /// Dragged right or up: a drag onto another application has begun.
@@ -311,6 +313,7 @@ impl CardEvent {
         match self {
             Self::Copy(id)
             | Self::Save(id)
+            | Self::Upload(id)
             | Self::Dismiss(id)
             | Self::Drag(id)
             | Self::Collapse(id)
@@ -554,6 +557,7 @@ mod tests {
         for event in [
             CardEvent::Copy(id),
             CardEvent::Save(id),
+            CardEvent::Upload(id),
             CardEvent::Dismiss(id),
             CardEvent::Drag(id),
             CardEvent::Collapse(id),

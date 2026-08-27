@@ -25,6 +25,7 @@ scrozz-stitch = { path = "crates/scrozz-stitch" }
 scrozz-ocr = { path = "crates/scrozz-ocr" }
 scrozz-store = { path = "crates/scrozz-store" }
 scrozz-export = { path = "crates/scrozz-export" }
+scrozz-cloud = { path = "crates/scrozz-cloud" }
 scrozz-shell = { path = "crates/scrozz-shell" }
 scrozz-ui = { path = "crates/scrozz-ui" }
 
@@ -68,6 +69,9 @@ arboard = "3.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 global-hotkey = "0.8"
 tray-icon = "0.24"
+aes-gcm = "0.11"
+getrandom = "0.3"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 # --- macOS ---
 objc2 = "0.6"

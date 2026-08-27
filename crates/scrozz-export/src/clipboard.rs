@@ -361,6 +361,19 @@ impl SystemClipboard {
         }
         Ok(report)
     }
+
+    /// Writes plain text, used for a share URL after an upload succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] if the system clipboard is unavailable.
+    pub fn write_text(&self, text: &str) -> Result<()> {
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| Error::Platform(format!("could not write clipboard text: {e}")))
+    }
 }
 
 impl Clipboard for SystemClipboard {

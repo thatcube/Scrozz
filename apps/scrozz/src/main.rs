@@ -40,6 +40,7 @@
 //!   workspace is `todo!()` today; none of it reaches the user as exit 101.
 
 mod cli;
+mod cloud;
 mod commands;
 mod exit;
 mod fault;

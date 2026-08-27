@@ -4,8 +4,9 @@ Two different questions get confused with each other whenever AI comes up in an
 open-source project, so this document answers them separately and plainly.
 
 1. **Was AI used to build it?** Yes, for implementation, under direction.
-2. **Does the app use AI?** No. Scrozz ships no generative AI, sends nothing
-   anywhere, and has no account.
+2. **Does the app use AI?** No. Scrozz ships no generative AI and has no
+   account, telemetry or Scrozz service. Its optional sharing feature sends a
+   capture only to object storage the user configured and explicitly chose.
 
 The short version, which is the one worth remembering:
 
@@ -60,26 +61,33 @@ These are properties of the shipped application, not promises about intent.
 - **No generative AI at runtime.** Scrozz contains no language model, no
   diffusion model, and no inference of any kind. Nothing you capture is
   interpreted, described, summarised, or generated.
-- **Your captures are never uploaded to an AI service.** There is no such
-  integration, and none is planned.
+- **Your captures are never uploaded to an AI service or a Scrozz service.**
+  There is no such integration, and none is planned. If the optional `cloud`
+  feature is built and the user presses Upload or runs `scrozz share`, that
+  chosen capture goes to the S3-compatible endpoint they configured.
 - **No telemetry, analytics, crash reporting, or usage tracking.**
 - **No account, no sign-in, no server.** There is no Scrozz backend to talk to.
-- **Your data is not monetised.** There is nothing to monetise, because none of
-  it leaves your machine.
+- **Your data is not monetised.** Scrozz receives none of it. A capture leaves
+  the machine only when the user explicitly shares it to storage they control.
 - **Text recognition is local.** Optical character recognition uses the
   recogniser already built into your operating system — Vision on macOS,
   `Windows.Media.Ocr` on Windows — running on device. Linux ships no comparable
   system engine, and per [D8](docs/decisions.md) Scrozz reports that honestly
-  rather than quietly returning an empty result. Nothing is sent off the machine
-  in any case.
+  rather than quietly returning an empty result. OCR sends nothing off the
+  machine in any case.
 
 ### How you can verify that
 
 You do not have to take any of it on trust:
 
-- **There is no HTTP client in the dependency tree.** Search `Cargo.lock` for
-  `reqwest`, `hyper`, `ureq`, or `curl` and you will find none. An application
-  that cannot make a web request cannot phone home.
+- **The default build contains no HTTP client.** `scrozz-cloud` has no default
+  network feature. Building the app with `--features cloud` adds `ureq`; its
+  only application path is an authenticated PUT to the endpoint the user
+  selected or the provider endpoint derived from their configuration, and
+  redirects are disabled. Nothing is contacted until the user explicitly
+  shares a capture. `Cargo.lock` lists `ureq` because lockfiles include optional
+  dependencies even when they are not compiled. Verify the actual default graph with
+  `cargo tree -p scrozz --no-default-features`.
 - **The source is GPL-3.0** (see [`LICENSE`](LICENSE)), so every line is
   readable, and any derivative must publish its own source too.
 - **The dependency set is audited in CI.** `cargo-deny` checks licences and
@@ -97,7 +105,8 @@ marketing adjective.
 
 So: an AI helped write this code, under direction, with the checks to prove it
 works. The app itself is an ordinary native program that reads your screen when
-you ask it to and writes a file. That is the whole story.
+you ask it to and writes a file — or, only when you ask it to share, sends that
+file to your configured object storage. That is the whole story.
 
 ---
 

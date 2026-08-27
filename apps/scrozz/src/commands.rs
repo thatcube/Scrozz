@@ -26,7 +26,8 @@ use scrozz_ocr::Ocr as _;
 use crate::{
     cli::{
         CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand, HotkeyCommand,
-        InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
+        InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, ShareArgs, Sink,
+        TargetSpec,
     },
     fault::{CliError, CliResult},
     hotkey_config, ipc,
@@ -49,10 +50,57 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
         Command::Ocr(args) => ocr(args),
+        Command::Share(args) => share(args),
         Command::Settings(args) => settings_command(&args.command),
         Command::Hotkey(args) => hotkey(&args.command),
         Command::Gui => gui(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// share
+// ---------------------------------------------------------------------------
+
+fn share(args: &ShareArgs) -> CliResult<Report> {
+    let shared = crate::cloud::share_file(args)?;
+    let expiry = match shared.expires_seconds {
+        Some(seconds) => Json::obj([
+            ("mode", Json::str("provider-enforced")),
+            ("seconds", Json::Int(i64::from(seconds))),
+        ]),
+        None => Json::obj([("mode", Json::str("public")), ("seconds", Json::Null)]),
+    };
+    let data = Json::obj([
+        ("url", Json::str(shared.url.as_str())),
+        ("key", Json::str(shared.key.as_str())),
+        ("provider", Json::str(shared.provider)),
+        ("encrypted", Json::Bool(shared.encrypted)),
+        ("expiry", expiry),
+        (
+            "lifecycle_rule",
+            Json::opt(shared.lifecycle_rule.as_deref(), Json::str),
+        ),
+    ]);
+    let encryption = if shared.encrypted {
+        " The uploaded object contains only client-side AES-256-GCM ciphertext."
+    } else {
+        ""
+    };
+    let expiry = match (shared.expires_seconds, &shared.lifecycle_rule) {
+        (Some(seconds), Some(rule)) => format!(
+            "\n\nThe provider enforces this link for {seconds} seconds. To delete the \
+             object too, merge these rule fragment(s) into the bucket's existing lifecycle \
+             configuration (do not replace its other rules):\n{rule}"
+        ),
+        (None, _) => "\n\nThis is a public/custom-domain URL; the bucket or CDN must already \
+                      allow public GET requests."
+            .to_owned(),
+        _ => String::new(),
+    };
+    Ok(Report::new(
+        data,
+        format!("{}{}{}", shared.url, encryption, expiry),
+    ))
 }
 
 // ---------------------------------------------------------------------------

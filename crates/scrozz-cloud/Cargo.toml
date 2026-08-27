@@ -1,0 +1,23 @@
+[package]
+name = "scrozz-cloud"
+description = "Private, bring-your-own S3-compatible capture sharing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+network = ["dep:ureq"]
+
+[dependencies]
+scrozz-core.workspace = true
+scrozz-export.workspace = true
+aes-gcm.workspace = true
+getrandom.workspace = true
+ureq = { workspace = true, optional = true }
+
+[lints]
+workspace = true

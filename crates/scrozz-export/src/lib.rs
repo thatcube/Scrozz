@@ -14,7 +14,7 @@ pub use clipboard::{
     ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,
 };
 pub use decode::{decode, decode_file};
-pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader, UnimplementedS3Uploader};
+pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader};
 pub use encode::{EncodeOptions, FrameEncoder, PngEffort};
 pub use icc::profile_for;
 pub use naming::{FilenameRules, NamePolicy, NameTemplate, NamingContext, Timestamp};

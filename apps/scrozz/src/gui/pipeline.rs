@@ -58,6 +58,8 @@ pub enum Job {
     Copy(CardId),
     /// Write a card's capture to the configured folder.
     Save(CardId),
+    /// Upload a card's capture and copy the returned link.
+    Upload(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Finish, so the thread can be joined.
@@ -75,6 +77,13 @@ pub enum Outcome {
         card: CardId,
         /// Why it will not arrive.
         error: CliError,
+    },
+    /// A slower card action was accepted by its dedicated worker.
+    Started {
+        /// Which card.
+        card: CardId,
+        /// What began.
+        detail: String,
     },
     /// A card action completed, with a phrase for the log.
     Done {
@@ -95,8 +104,11 @@ pub enum Outcome {
 /// A handle to the capture thread.
 pub struct Pipeline {
     jobs: Sender<Job>,
+    uploads: Sender<UploadJob>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
+    upload_worker: Option<JoinHandle<()>>,
+    upload_cancellation: crate::cloud::ShareCancellation,
     next_card: u64,
 }
 
@@ -111,21 +123,43 @@ impl Pipeline {
     /// is worth more than a capture refused because history was unavailable.
     pub fn start() -> CliResult<Self> {
         let (jobs, job_rx) = channel();
+        let (uploads, upload_rx) = channel();
         let (outcome_tx, outcomes) = channel();
-
-        let worker = std::thread::Builder::new()
-            .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx).run(&job_rx))
+        let upload_cancellation = crate::cloud::ShareCancellation::default();
+        let upload_cancel = upload_cancellation.clone();
+        let upload_outcomes = outcome_tx.clone();
+        let upload_worker = std::thread::Builder::new()
+            .name("scrozz-upload".to_owned())
+            .spawn(move || UploadWorker::new(upload_outcomes, upload_cancel).run(&upload_rx))
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
-                    "could not start the capture worker: {err}"
+                    "could not start the upload worker: {err}"
                 )))
             })?;
 
+        let capture_uploads = uploads.clone();
+        let worker = match std::thread::Builder::new()
+            .name("scrozz-capture".to_owned())
+            .spawn(move || Worker::new(outcome_tx, capture_uploads).run(&job_rx))
+        {
+            Ok(worker) => worker,
+            Err(err) => {
+                upload_cancellation.cancel();
+                let _ = uploads.send(UploadJob::Stop);
+                let _ = upload_worker.join();
+                return Err(CliError::Core(CoreError::Platform(format!(
+                    "could not start the capture worker: {err}"
+                ))));
+            }
+        };
+
         Ok(Self {
             jobs,
+            uploads,
             outcomes,
             worker: Some(worker),
+            upload_worker: Some(upload_worker),
+            upload_cancellation,
             next_card: 1,
         })
     }
@@ -152,8 +186,13 @@ impl Pipeline {
     /// Called from `Drop`, but exposed so a host can shut down deterministically
     /// rather than at an unspecified point during teardown.
     pub fn stop(&mut self) {
+        self.upload_cancellation.cancel();
         let _ = self.jobs.send(Job::Stop);
         if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let _ = self.uploads.send(UploadJob::Stop);
+        if let Some(worker) = self.upload_worker.take() {
             let _ = worker.join();
         }
     }
@@ -172,12 +211,13 @@ struct Cached {
 
 struct Worker {
     outcomes: Sender<Outcome>,
+    uploads: Sender<UploadJob>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>) -> Self {
+    fn new(outcomes: Sender<Outcome>, uploads: Sender<UploadJob>) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -196,6 +236,7 @@ impl Worker {
 
         Self {
             outcomes,
+            uploads,
             store,
             cache: HashMap::new(),
         }
@@ -207,8 +248,10 @@ impl Worker {
                 Job::Capture { kind, card } => self.capture(kind, card),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
+                Job::Upload(card) => self.upload(card),
                 Job::Release(card) => {
                     self.cache.remove(&card);
+                    let _ = self.uploads.send(UploadJob::Release(card));
                 }
                 Job::Stop => break,
             }
@@ -313,6 +356,28 @@ impl Worker {
         self.answer(card, result);
     }
 
+    fn upload(&mut self, card: CardId) {
+        let result = self.cached(card, "upload").and_then(|cached| {
+            self.uploads
+                .send(UploadJob::Share {
+                    card,
+                    bytes: cached.bytes.clone(),
+                })
+                .map_err(|_| {
+                    CliError::Core(CoreError::Platform("the upload worker has gone".to_owned()))
+                })
+        });
+        match result {
+            Ok(()) => {
+                let _ = self.outcomes.send(Outcome::Started {
+                    card,
+                    detail: "upload queued".to_owned(),
+                });
+            }
+            Err(error) => self.answer(card, Err(error)),
+        }
+    }
+
     fn cached(&self, card: CardId, verb: &str) -> CliResult<&Cached> {
         self.cache
             .get(&card)
@@ -325,6 +390,104 @@ impl Worker {
             Err(error) => Outcome::Refused { card, error },
         };
         let _ = self.outcomes.send(message);
+    }
+}
+
+enum UploadJob {
+    Share { card: CardId, bytes: Vec<u8> },
+    Release(CardId),
+    Stop,
+}
+
+struct UploadWorker {
+    outcomes: Sender<Outcome>,
+    cancellation: crate::cloud::ShareCancellation,
+    links: HashMap<CardId, CachedShare>,
+}
+
+struct CachedShare {
+    shared: crate::cloud::Shared,
+    expires_at: Option<SystemTime>,
+}
+
+impl CachedShare {
+    fn new(shared: crate::cloud::Shared) -> Self {
+        let expires_at = shared.expires_at;
+        Self { shared, expires_at }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| SystemTime::now() >= expires_at)
+    }
+}
+
+impl UploadWorker {
+    fn new(outcomes: Sender<Outcome>, cancellation: crate::cloud::ShareCancellation) -> Self {
+        Self {
+            outcomes,
+            cancellation,
+            links: HashMap::new(),
+        }
+    }
+
+    fn run(mut self, jobs: &Receiver<UploadJob>) {
+        while let Ok(job) = jobs.recv() {
+            match job {
+                UploadJob::Share { card, bytes } => {
+                    if self.cancellation.is_cancelled() {
+                        break;
+                    }
+                    self.upload(card, &bytes);
+                }
+                UploadJob::Release(card) => {
+                    self.links.remove(&card);
+                }
+                UploadJob::Stop => break,
+            }
+        }
+        tracing::debug!("upload worker stopped");
+    }
+
+    fn upload(&mut self, card: CardId, bytes: &[u8]) {
+        if self.links.get(&card).is_some_and(CachedShare::is_expired) {
+            self.links.remove(&card);
+        }
+        if !self.links.contains_key(&card) {
+            match crate::cloud::share_card(bytes, card.0, &self.cancellation) {
+                Ok(shared) => {
+                    self.links.insert(card, CachedShare::new(shared));
+                }
+                Err(error) => {
+                    let _ = self.outcomes.send(Outcome::Refused { card, error });
+                    return;
+                }
+            }
+        }
+        let Some(shared) = self.links.get(&card) else {
+            let _ = self.outcomes.send(Outcome::Refused {
+                card,
+                error: CliError::Core(CoreError::Platform(
+                    "the upload completed without a retained share link".to_owned(),
+                )),
+            });
+            return;
+        };
+        let outcome = match SystemClipboard::new().write_text(&shared.shared.url) {
+            Ok(()) => Outcome::Done {
+                card,
+                detail: "uploaded and copied the private share link".to_owned(),
+            },
+            Err(error) => Outcome::Refused {
+                card,
+                error: CliError::Core(CoreError::Platform(format!(
+                    "the upload succeeded, but its link could not be copied: {error}. \
+                     Press Upload again to retry the clipboard; Scrozz reuses the object while \
+                     its signed URL remains valid"
+                ))),
+            },
+        };
+        let _ = self.outcomes.send(outcome);
     }
 }
 
@@ -345,6 +508,29 @@ mod tests {
     fn polling_an_idle_pipeline_does_not_block() {
         let pipeline = Pipeline::start().expect("the worker should start");
         assert!(pipeline.poll().is_none());
+    }
+
+    #[test]
+    fn cached_share_expiry_is_enforced_before_clipboard_retry() {
+        let expiring = CachedShare {
+            shared: crate::cloud::Shared {
+                url: "https://example.test/private".to_owned(),
+                key: "capture.png".to_owned(),
+                provider: "aws",
+                expires_seconds: Some(1),
+                expires_at: Some(std::time::UNIX_EPOCH),
+                lifecycle_rule: None,
+                encrypted: false,
+            },
+            expires_at: Some(std::time::UNIX_EPOCH),
+        };
+        assert!(expiring.is_expired());
+
+        let public = CachedShare {
+            expires_at: None,
+            ..expiring
+        };
+        assert!(!public.is_expired());
     }
 
     #[test]
@@ -379,6 +565,49 @@ mod tests {
             Some(Outcome::Refused { card, .. }) => assert_eq!(card, CardId(7)),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn uploading_a_card_that_was_never_captured_is_refused_too() {
+        let pipeline = Pipeline::start().expect("the worker should start");
+        assert!(pipeline.post(Job::Upload(CardId(8))));
+
+        match wait_for(&pipeline) {
+            Some(Outcome::Refused { card, .. }) => assert_eq!(card, CardId(8)),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_is_forwarded_without_running_network_work_on_the_capture_worker() {
+        let (outcome_tx, outcome_rx) = channel();
+        let (upload_tx, upload_rx) = channel();
+        let mut worker = Worker {
+            outcomes: outcome_tx,
+            uploads: upload_tx,
+            store: None,
+            cache: HashMap::from([(
+                CardId(9),
+                Cached {
+                    bytes: b"encoded-capture".to_vec(),
+                },
+            )]),
+        };
+
+        worker.upload(CardId(9));
+
+        let UploadJob::Share { card, bytes } = upload_rx.try_recv().unwrap() else {
+            panic!("capture worker did not forward the upload")
+        };
+        assert_eq!(card, CardId(9));
+        assert_eq!(bytes, b"encoded-capture");
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Ok(Outcome::Started {
+                card: CardId(9),
+                ..
+            })
+        ));
     }
 
     #[test]

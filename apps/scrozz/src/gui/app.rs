@@ -395,6 +395,9 @@ impl App {
                 Outcome::Failed { card, error } => {
                     self.note(format!("{card} failed: {error}"));
                 }
+                Outcome::Started { card, detail } => {
+                    self.note(format!("{card} {detail}"));
+                }
                 Outcome::Done { card, detail } => {
                     self.note(format!("{card} {detail}"));
                 }
@@ -418,6 +421,9 @@ impl App {
                 }
                 CardEvent::Save(id) => {
                     self.pipeline.post(Job::Save(id));
+                }
+                CardEvent::Upload(id) => {
+                    self.pipeline.post(Job::Upload(id));
                 }
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
@@ -674,6 +680,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the copy never reached the worker: {:?}", app.notes());
+    }
+
+    #[test]
+    fn uploading_a_card_reaches_the_worker_and_comes_back() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Upload(CardId(43)));
+        app.tick();
+
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if app.notes().iter().any(|n| n.contains("card:43 refused")) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the upload never reached the worker: {:?}", app.notes());
     }
 
     #[test]
