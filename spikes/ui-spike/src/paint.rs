@@ -165,9 +165,13 @@ pub fn icon_button(
 /// Round-rect icon button with an explicit id, a reveal factor (for chrome that
 /// fades in) and a draw-only offset (so a "rise" never moves the hit target).
 ///
-/// The hover wash **fades** (`FAST`) and the press **sinks** (`INSTANT`, a
-/// couple of points of scale). Two `motion::anim` calls; egui schedules the
-/// repaints for both and stops asking once they settle.
+/// **Controls do not animate.** Hover and press flip instantly. This is a
+/// deliberate reversal of an earlier pass that eased them: an instant state
+/// change reads as *responsive*, while even a 140ms hover fade reads as the
+/// control lagging behind the pointer. Motion is reserved for objects that
+/// move through space (the cards); controls just answer. The `reveal`/`offset`
+/// arguments are still animated, but they belong to the **card's** hover-reveal
+/// choreography, not to the button.
 #[allow(clippy::too_many_arguments)]
 pub fn icon_button_id(
     ui: &mut Ui,
@@ -182,15 +186,13 @@ pub fn icon_button_id(
     offset: Vec2,
 ) -> Response {
     let resp = interact_id(ui, rect, id);
-    let ctx = ui.ctx().clone();
     let live = reveal > 0.85 && !shot_mode();
     let hovered = (resp.hovered() && live) || st.force_hover;
     let pressed = resp.is_pointer_button_down_on() && live;
 
-    let h = motion::anim(&ctx, id.with("hov"), hovered, motion::FAST, motion::ease_out_cubic);
-    let d = motion::anim(&ctx, id.with("prs"), pressed, motion::INSTANT, motion::ease_out_cubic);
-    // Press reads as the control physically sinking, not as a colour swap.
-    let rect = rect.translate(offset).shrink(1.6 * d);
+    let h = if hovered { 1.0 } else { 0.0 };
+    let d = if pressed { 1.0 } else { 0.0 };
+    let rect = rect.translate(offset);
     let painter = ui.painter();
 
     if st.selected {
@@ -201,23 +203,20 @@ pub fn icon_button_id(
             cr(theme::R_BTN),
             motion::fade(pal.accent_hi.linear_multiply(0.10), reveal),
         );
-    } else {
-        // Hover wash and press wash are separate layers, so a press during a
-        // half-complete hover doesn't snap the background.
-        if h * reveal > 0.001 {
-            painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.hover, h * reveal));
-        }
-        if d * reveal > 0.001 {
-            painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.active, d * reveal));
-        }
+    } else if d > 0.5 {
+        painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.active, reveal));
+    } else if h > 0.5 {
+        painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.hover, reveal));
     }
 
     let tint = if st.selected {
         pal.on_accent
+    } else if h > 0.5 {
+        pal.text
     } else {
-        lerp_col(pal.text_muted, pal.text, h)
+        pal.text_muted
     };
-    icons.draw(painter, name, rect.center(), icon_px * (1.0 - 0.04 * d), motion::fade(tint, reveal));
+    icons.draw(painter, name, rect.center(), icon_px, motion::fade(tint, reveal));
     resp
 }
 
@@ -237,14 +236,14 @@ pub fn pill_button(
     offset: Vec2,
 ) -> Response {
     let resp = interact_id(ui, rect, id);
-    let ctx = ui.ctx().clone();
     let live = reveal > 0.85 && !shot_mode();
     let hovered = resp.hovered() && live;
     let pressed = resp.is_pointer_button_down_on() && live;
 
-    let h = motion::anim(&ctx, id.with("hov"), hovered, motion::FAST, motion::ease_out_cubic);
-    let d = motion::anim(&ctx, id.with("prs"), pressed, motion::INSTANT, motion::ease_out_cubic);
-    let rect = rect.translate(offset).shrink(1.8 * d);
+    // Instant, like every other control — see `icon_button_id`.
+    let h = if hovered { 1.0 } else { 0.0 };
+    let d = if pressed { 1.0 } else { 0.0 };
+    let rect = rect.translate(offset);
     let r = rect.height() / 2.0;
     let painter = ui.painter();
 
@@ -378,11 +377,10 @@ pub fn menu_row(
     st: BtnState,
 ) -> Response {
     let resp = interact(ui, rect, label);
-    let ctx = ui.ctx().clone();
     let hovered = (resp.hovered() && !shot_mode()) || st.force_hover;
-    // Menu highlights are the fastest thing in the app: any perceptible ramp
-    // here reads as lag while the pointer sweeps down a list.
-    let h = motion::anim(&ctx, resp.id.with("hov"), hovered, motion::INSTANT, motion::ease_out_cubic);
+    // Instant. A menu highlight that ramps reads as lag while the pointer
+    // sweeps a list — this is the clearest case for controls not animating.
+    let h = if hovered { 1.0 } else { 0.0 };
     let painter = ui.painter();
 
     if h > 0.001 {

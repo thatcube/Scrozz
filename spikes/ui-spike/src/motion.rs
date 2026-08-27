@@ -275,6 +275,126 @@ pub const C_DRAG: f32 = 48.0;
 pub const K_SOFT: f32 = 190.0;
 pub const C_SOFT: f32 = 22.0;
 
+// ---------------------------------------------------------------------------
+// Live-tunable gesture physics.
+//
+// These are the numbers that actually decide how the card gestures *feel*, so
+// they are runtime globals rather than consts — the `M` overlay writes them
+// while the app runs. Durations and easing barely matter for spatial motion;
+// stiffness, damping, friction and the dismiss threshold are everything.
+// ---------------------------------------------------------------------------
+
+macro_rules! f32_global {
+    ($store:ident, $get:ident, $set:ident, $default:expr, $lo:expr, $hi:expr) => {
+        static $store: AtomicU32 = AtomicU32::new(0);
+        pub fn $get() -> f32 {
+            let raw = $store.load(Ordering::Relaxed);
+            if raw == 0 {
+                $default
+            } else {
+                f32::from_bits(raw)
+            }
+        }
+        pub fn $set(v: f32) {
+            $store.store(v.clamp($lo, $hi).to_bits(), Ordering::Relaxed);
+        }
+    };
+}
+
+// Settle spring for a card arriving at, or springing back to, its home slot.
+f32_global!(SETTLE_K, settle_k, set_settle_k, 210.0, 20.0, 900.0);
+f32_global!(SETTLE_C, settle_c, set_settle_c, 22.0, 2.0, 90.0);
+// Depth spring for the cards *underneath* reflowing. Softer on purpose.
+f32_global!(DECK_K, deck_k, set_deck_k, 150.0, 20.0, 900.0);
+f32_global!(DECK_C, deck_c, set_deck_c, 19.0, 2.0, 90.0);
+// Air drag on a flung card, per second. Higher = stops sooner.
+f32_global!(FLING_DRAG, fling_drag, set_fling_drag, 1.1, 0.0, 8.0);
+// Release speed (px/s) toward the anchored edge that counts as a throw.
+f32_global!(DISMISS_VEL, dismiss_vel, set_dismiss_vel, 420.0, 40.0, 2000.0);
+// Displacement (px) toward the anchored edge that dismisses on release even
+// without speed.
+f32_global!(DISMISS_DIST, dismiss_dist, set_dismiss_dist, 110.0, 10.0, 400.0);
+// Per-card delay (s) applied down the deck so the stack cascades rather than
+// moving as one rigid body.
+f32_global!(SETTLE_STAGGER, settle_stagger, set_settle_stagger, 0.045, 0.0, 0.30);
+
+/// Restore every gesture-physics tunable to its designed default.
+pub fn reset_tunables() {
+    for s in [
+        &SETTLE_K,
+        &SETTLE_C,
+        &DECK_K,
+        &DECK_C,
+        &FLING_DRAG,
+        &DISMISS_VEL,
+        &DISMISS_DIST,
+        &SETTLE_STAGGER,
+    ] {
+        s.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer velocity tracking.
+// ---------------------------------------------------------------------------
+
+/// Rolling window of recent pointer positions, used to carry a *real* throw
+/// velocity into a fling.
+///
+/// egui exposes `input.pointer.velocity()`, but it is smoothed over a fixed
+/// window that is tuned for scrolling, and it keeps reporting motion for a
+/// while after the pointer stops — which turns "drag slowly, then stop, then
+/// release" into an unwanted throw. Sampling the drag deltas ourselves and
+/// differencing over the last ~80ms makes a dead stop actually read as zero,
+/// which is the difference between a dismissal that feels intentional and one
+/// that feels twitchy.
+#[derive(Clone, Debug, Default)]
+pub struct VelocityTracker {
+    samples: Vec<(f32, Vec2)>,
+    t: f32,
+}
+
+/// How far back to difference when estimating throw speed.
+const VEL_WINDOW: f32 = 0.080;
+
+impl VelocityTracker {
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.t = 0.0;
+    }
+
+    /// Feed one frame of drag. `pos` is the cumulative drag offset.
+    pub fn push(&mut self, dt: f32, pos: Vec2) {
+        self.t += dt;
+        self.samples.push((self.t, pos));
+        let cutoff = self.t - VEL_WINDOW * 2.0;
+        self.samples.retain(|(t, _)| *t >= cutoff);
+    }
+
+    /// Average velocity (px/s) over the trailing window. Zero if the pointer
+    /// has been still, which is the behaviour that matters.
+    pub fn velocity(&self) -> Vec2 {
+        let Some(&(t_end, p_end)) = self.samples.last() else {
+            return Vec2::ZERO;
+        };
+        let target = t_end - VEL_WINDOW;
+        // Oldest sample still inside the window, so a long still-hold differences
+        // against a recent identical position and yields zero.
+        let base = self
+            .samples
+            .iter()
+            .find(|(t, _)| *t >= target)
+            .copied()
+            .unwrap_or((t_end, p_end));
+        let dt = t_end - base.0;
+        if dt < 1e-4 {
+            Vec2::ZERO
+        } else {
+            (p_end - base.1) / dt
+        }
+    }
+}
+
 /// Clamp a frame delta so a stalled frame (debugger, window drag) can't launch
 /// a spring into orbit.
 pub fn dt_of(ctx: &Context) -> f32 {

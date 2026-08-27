@@ -484,3 +484,99 @@ fn curve_override_changes_the_shape() {
         "curve override had no effect: linear={plain}, ease_out_cubic={overridden}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Velocity tracking — the detail a fling lives or dies on.
+// ---------------------------------------------------------------------------
+
+/// A throw must carry the speed of the *last few milliseconds* of the drag, and
+/// a drag that stops dead before release must carry nothing.
+///
+/// This is exactly why the spike does not use egui's `pointer.velocity()`:
+/// that value is smoothed for kinetic scrolling and keeps reporting motion
+/// after the pointer has stopped, which turns "drag slowly, pause, let go" into
+/// a phantom throw. Differencing over a short trailing window makes a dead stop
+/// read as a dead stop.
+#[test]
+fn velocity_tracker_reads_a_throw_and_ignores_a_dead_stop() {
+    let dt = 1.0 / 120.0;
+
+    // A fast sweep left: 12px per frame at 120Hz ≈ 1440 px/s.
+    let mut fast = motion::VelocityTracker::default();
+    let mut p = egui::Vec2::ZERO;
+    for _ in 0..40 {
+        p.x -= 12.0;
+        fast.push(dt, p);
+    }
+    let v = fast.velocity();
+    assert!(
+        v.x < -900.0,
+        "a hard leftward flick should read as a large negative velocity, got {:.0}",
+        v.x
+    );
+    assert!(v.y.abs() < 60.0, "a horizontal flick should not read vertical");
+
+    // Same gesture, then the finger stops and rests before release. The stored
+    // window has to age out the fast part.
+    let mut stalled = motion::VelocityTracker::default();
+    let mut p = egui::Vec2::ZERO;
+    for _ in 0..40 {
+        p.x -= 12.0;
+        stalled.push(dt, p);
+    }
+    for _ in 0..40 {
+        stalled.push(dt, p); // held perfectly still
+    }
+    let v = stalled.velocity();
+    assert!(
+        v.x.abs() < 50.0,
+        "a drag that stopped before release must not throw, but read {:.0} px/s",
+        v.x
+    );
+
+    // And a fresh tracker reports nothing rather than garbage.
+    let idle = motion::VelocityTracker::default();
+    assert_eq!(idle.velocity(), egui::Vec2::ZERO);
+}
+
+/// The gesture thresholds and spring constants are live-tunable globals, and
+/// `reset_tunables` must genuinely put them all back — otherwise a session with
+/// the tuner open silently poisons every later animation.
+#[test]
+fn physics_tunables_round_trip_and_reset() {
+    let _g = Globals::lock();
+
+    let defaults = (
+        motion::settle_k(),
+        motion::deck_c(),
+        motion::fling_drag(),
+        motion::dismiss_vel(),
+        motion::dismiss_dist(),
+    );
+
+    motion::set_settle_k(640.0);
+    motion::set_deck_c(51.0);
+    motion::set_fling_drag(4.25);
+    motion::set_dismiss_vel(1234.0);
+    motion::set_dismiss_dist(321.0);
+
+    assert_eq!(motion::settle_k(), 640.0);
+    assert_eq!(motion::deck_c(), 51.0);
+    assert_eq!(motion::fling_drag(), 4.25);
+    assert_eq!(motion::dismiss_vel(), 1234.0);
+    assert_eq!(motion::dismiss_dist(), 321.0);
+
+    motion::reset_tunables();
+
+    assert_eq!(
+        (
+            motion::settle_k(),
+            motion::deck_c(),
+            motion::fling_drag(),
+            motion::dismiss_vel(),
+            motion::dismiss_dist(),
+        ),
+        defaults,
+        "reset_tunables must restore every physics global"
+    );
+}

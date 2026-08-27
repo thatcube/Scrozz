@@ -108,6 +108,7 @@ impl SpikeApp {
         let mut spawn = false;
         let mut dismiss = false;
         let mut replay = false;
+        let mut flip_anchor = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Num1) {
                 self.live_surface = Surface::Quick;
@@ -145,6 +146,7 @@ impl SpikeApp {
             spawn = i.key_pressed(egui::Key::N);
             dismiss = i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete);
             replay = i.key_pressed(egui::Key::R);
+            flip_anchor = i.key_pressed(egui::Key::A);
             if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -160,6 +162,12 @@ impl SpikeApp {
             self.stack.dismiss_top();
         }
         if replay {
+            self.stack.replay();
+        }
+        // Cards enter from and exit toward whichever edge the overlay is docked
+        // to, so flipping the anchor flips the whole gesture language.
+        if flip_anchor {
+            self.stack.anchor = self.stack.anchor.flipped();
             self.stack.replay();
         }
         // Re-install style when theme flips (selection colors etc.).
@@ -245,7 +253,8 @@ impl eframe::App for SpikeApp {
         if self.cfg.interactive() {
             hint_bar(ui, &pal, screen);
             if self.tuner_open {
-                let act = crate::tuner::show(&ctx, &mut self.tuner_open, &pal);
+                let anchor = self.stack.anchor.label();
+                let act = crate::tuner::show(&ctx, &mut self.tuner_open, &pal, anchor);
                 if act.replay {
                     self.stack.replay();
                 }
@@ -256,6 +265,10 @@ impl eframe::App for SpikeApp {
                 }
                 if act.dismiss {
                     self.stack.dismiss_top();
+                }
+                if act.flip_anchor {
+                    self.stack.anchor = self.stack.anchor.flipped();
+                    self.stack.replay();
                 }
             }
         }
@@ -280,7 +293,7 @@ impl eframe::App for SpikeApp {
 
 /// Small live legend so the interactive window explains its own hotkeys.
 fn hint_bar(ui: &mut egui::Ui, pal: &Palette, screen: Rect) {
-    let text = "1 Quick  2 Menu  3 Annotate  4 Onboard   V state   N new capture  ⌫ dismiss  R replay   M motion tuner   L light/dark  G glass  Q quit     ·  hover a card, drag it, flick to throw";
+    let text = "N new capture (slides in)  ·  drag the card toward the edge, flick to throw  ·  ⌫ dismiss  ·  R replay  ·  A anchor  ·  M tuner   |   1-4 surface  V state  L theme  G glass  Q quit";
     let font = theme::ts_caption();
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, pal.text_muted);
     let size = galley.size() + egui::vec2(20.0, 12.0);

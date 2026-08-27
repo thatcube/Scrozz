@@ -29,10 +29,43 @@ const BY: f32 = 13.0; // deck vertical peek
 /// How long the "Copied" / "Dismissed" confirmation stays up, in seconds.
 const TOAST_LIFE: f32 = 1.25;
 
-/// Release speed (px/s) above which a drag becomes a throw.
-const FLING_SPEED: f32 = 520.0;
-/// Displacement (px) above which a slow drag still dismisses on release.
-const FLING_DIST: f32 = 96.0;
+/// Which screen edge the overlay is docked to.
+///
+/// CleanShot's setting is literally "Position on screen: Left". Cards **enter
+/// from, and exit toward, the anchored edge** — so the whole gesture language
+/// is one signed axis rather than a hardcoded direction. Left is the default
+/// and the case that has to be excellent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Anchor {
+    #[default]
+    Left,
+    Right,
+}
+
+impl Anchor {
+    /// +1 if "away" means increasing x, −1 if it means decreasing x.
+    pub fn sign(self) -> f32 {
+        match self {
+            Anchor::Left => -1.0,
+            Anchor::Right => 1.0,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Anchor::Left => "left",
+            Anchor::Right => "right",
+        }
+    }
+    pub fn flipped(self) -> Self {
+        match self {
+            Anchor::Left => Anchor::Right,
+            Anchor::Right => Anchor::Left,
+        }
+    }
+}
+
+/// How far off-screen a card starts, and how far it must travel to be gone.
+const OFFSCREEN: f32 = CARD_W + 90.0;
 
 pub struct Card {
     pub id: u64,
@@ -42,14 +75,18 @@ pub struct Card {
     /// Animated position in the deck. Target is the card's index, so inserting
     /// or removing a card makes every other card spring to its new slot.
     depth: Spring1,
-    /// Offset from the card's home position. Chases `drag_target` while held,
-    /// then coasts ballistically once flung.
+    /// Offset from the card's home position. **Snapped 1:1 to the pointer while
+    /// held**, springs home on a cancelled drag, coasts ballistically once flung.
     drag: Spring2,
     drag_target: Vec2,
+    /// Counts down before this card's depth spring starts moving, so the deck
+    /// cascades instead of shifting as one rigid body.
+    settle_delay: f32,
     angle: f32,
     spin: f32,
     alpha: f32,
-    /// 0→1 entry ramp, used for the fade and the unwinding entry tilt.
+    /// 0→1 entry ramp. Only used for the entry tilt now that entry is a real
+    /// slide rather than a fade.
     entry: f32,
 }
 
@@ -63,6 +100,7 @@ impl Card {
             depth: Spring1::at(index),
             drag: Spring2::at(Vec2::ZERO),
             drag_target: Vec2::ZERO,
+            settle_delay: 0.0,
             angle: 0.0,
             spin: 0.0,
             alpha: 1.0,
@@ -70,12 +108,23 @@ impl Card {
         }
     }
 
-    /// Seed the "just captured" state: in front of the deck, high and to the
-    /// left, falling in. The depth spring then pulls it back to slot 0.
-    fn seed_entry(&mut self) {
-        self.depth = Spring1 { pos: -1.7, vel: 0.0 };
-        self.drag = Spring2 { pos: vec2(-22.0, -96.0), vel: vec2(40.0, 210.0) };
+    /// Seed the "just captured" state: fully off-screen past the anchored edge,
+    /// already moving inward. The settle spring carries it home from there.
+    ///
+    /// This is a **slide**, not a fade — the card is opaque the whole way in.
+    /// A capture that fades in looks like a notification; one that slides in
+    /// from the edge it lives on looks like an object arriving.
+    fn seed_entry(&mut self, anchor: Anchor) {
+        let s = anchor.sign();
+        self.depth = Spring1::at(0.0);
+        self.drag = Spring2 {
+            pos: vec2(s * OFFSCREEN, 0.0),
+            // A little inward launch speed so it reads as thrown in rather than
+            // merely pulled by a spring.
+            vel: vec2(-s * 420.0, 0.0),
+        };
         self.drag_target = Vec2::ZERO;
+        self.settle_delay = 0.0;
         self.entry = 0.0;
         self.alpha = 1.0;
         self.angle = 0.0;
@@ -104,6 +153,12 @@ pub struct Stack {
     /// Bumped by Replay so every keyed animation restarts from scratch.
     pub epoch: u64,
     toast: Option<(String, f32)>,
+    /// Which edge cards arrive from and leave toward.
+    pub anchor: Anchor,
+    /// Real pointer velocity over the last few frames, carried into the fling.
+    vel: motion::VelocityTracker,
+    /// True while the pointer is holding the front card.
+    dragging: bool,
 }
 
 fn label(clock: u32) -> (String, &'static str) {
@@ -128,6 +183,9 @@ impl Stack {
             clock: 0,
             epoch: 0,
             toast: None,
+            anchor: Anchor::default(),
+            vel: motion::VelocityTracker::default(),
+            dragging: false,
         };
         for i in 0..4 {
             let (name, dims) = label(s.clock);
@@ -139,47 +197,69 @@ impl Stack {
         s
     }
 
-    /// `N` — a new capture lands on top and the deck settles back.
+    /// `N` — a new capture slides in from the anchored edge and the deck settles
+    /// back to make room, cascading rather than shifting as a block.
     pub fn spawn(&mut self) {
         let (name, dims) = label(self.clock);
         self.clock += 1;
         let id = self.next_id;
         self.next_id += 1;
         let mut c = Card::new(id, (id as usize + 1) % 4, name, dims, 0.0);
-        c.seed_entry();
+        c.seed_entry(self.anchor);
         self.deck.insert(0, c);
+        self.stagger_deck();
         // Keeping the deck shallow means the springs behind stay legible.
         self.deck.truncate(6);
         self.toast = Some(("Captured".into(), 0.0));
     }
 
-    /// `Backspace` — throw the top card without a gesture, so the dismiss
-    /// animation is reachable from the keyboard.
+    /// Give each card below the front a slightly later start, so the reflow
+    /// ripples down the deck. Cheap, and it is the whole difference between a
+    /// stack that feels like objects and one that feels like a rigid diagram.
+    fn stagger_deck(&mut self) {
+        let step = motion::settle_stagger();
+        for (i, c) in self.deck.iter_mut().enumerate() {
+            if i > 0 {
+                c.settle_delay = step * i as f32;
+            }
+        }
+    }
+
+    /// `Backspace` — throw the top card toward the anchored edge without a
+    /// gesture, so the dismiss motion is reachable from the keyboard.
     pub fn dismiss_top(&mut self) {
         if self.deck.is_empty() {
             return;
         }
+        let s = self.anchor.sign();
         let mut c = self.deck.remove(0);
-        c.drag.vel = vec2(760.0, -180.0);
-        c.spin = 1.5;
+        c.drag.vel = vec2(s * 1150.0, -60.0);
+        c.spin = s * 1.1;
         self.flying.push(c);
+        self.stagger_deck();
     }
 
-    /// `R` / tuner Replay — re-run the entry animation for the whole deck so the
+    /// `R` / tuner Replay — re-run the entry slide for the whole deck so the
     /// maintainer can watch the same motion repeatedly without restarting.
     pub fn replay(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.flying.clear();
+        self.dragging = false;
+        self.vel.clear();
+        let s = self.anchor.sign();
+        let step = motion::settle_stagger();
         for (i, c) in self.deck.iter_mut().enumerate() {
-            c.depth = Spring1 { pos: -1.7 - i as f32 * 0.35, vel: 0.0 };
+            c.depth = Spring1::at(i as f32);
             c.drag = Spring2 {
-                pos: vec2(-22.0 - i as f32 * 6.0, -96.0 - i as f32 * 10.0),
-                vel: vec2(40.0, 210.0),
+                pos: vec2(s * (OFFSCREEN + i as f32 * 40.0), 0.0),
+                vel: vec2(-s * 420.0, 0.0),
             };
             c.drag_target = Vec2::ZERO;
+            c.settle_delay = step * i as f32;
             c.entry = 0.0;
             c.alpha = 1.0;
             c.angle = 0.0;
+            c.spin = 0.0;
         }
     }
 
@@ -257,22 +337,57 @@ impl Stack {
         );
 
         // ---- physics -------------------------------------------------------
+        let front_held = self.dragging;
         for (i, c) in self.deck.iter_mut().enumerate() {
-            active |= c.depth.step(i as f32, dt, motion::K_SOFT, motion::C_SOFT);
-            let target = c.drag_target;
-            active |= c.drag.step(target, dt, motion::K_DRAG, motion::C_DRAG);
+            // Stagger: a card waits its turn before starting to settle.
+            if c.settle_delay > 0.0 {
+                c.settle_delay = (c.settle_delay - dt).max(0.0);
+                if !motion::reduced() {
+                    active = true;
+                }
+            } else {
+                active |= c.depth.step(i as f32, dt, motion::deck_k(), motion::deck_c());
+            }
+
+            if i == 0 && front_held {
+                // **1:1 with the pointer.** No spring, no lag: a card being
+                // dragged must sit exactly under the finger or the gesture
+                // feels like it is fighting you. Inertia belongs to the
+                // *release*, not the hold.
+                c.drag.pos = c.drag_target;
+                c.drag.vel = Vec2::ZERO;
+            } else {
+                active |= c.drag.step(
+                    c.drag_target,
+                    dt,
+                    motion::settle_k(),
+                    motion::settle_c(),
+                );
+            }
             active |= c.advance_entry(dt);
+
             // Tilt tracks lateral offset *and* velocity, so the card leans into
-            // a throw before it has travelled far. Entry adds a tilt that
-            // unwinds as the card lands.
-            c.angle = (c.drag.pos.x * 0.0016 + c.drag.vel.x * 0.00010).clamp(-0.26, 0.26)
-                - 0.09 * (1.0 - c.entry);
+            // a throw before it has travelled far. Entry adds a slight tilt
+            // that unwinds as the card lands.
+            let lean = if i == 0 && front_held {
+                c.drag_target.x * 0.0016
+            } else {
+                c.drag.pos.x * 0.0016 + c.drag.vel.x * 0.00008
+            };
+            c.angle = lean.clamp(-0.26, 0.26) + 0.07 * (1.0 - c.entry) * self.anchor.sign();
         }
         for c in self.flying.iter_mut() {
-            c.drag.coast(dt, 1.5, vec2(0.0, 1500.0));
+            // Light gravity: a dismissed card should exit *sideways past the
+            // edge it belongs to*, not arc into the floor.
+            c.drag.coast(dt, motion::fling_drag(), vec2(0.0, 260.0));
             c.angle += c.spin * dt;
-            let fade = if motion::reduced() { 1.0 } else { dt * 1.7 };
-            c.alpha = (c.alpha - fade).max(0.0);
+            // Fade over distance travelled, not over wall-clock time, so a fast
+            // flick stays solid until it is genuinely gone and a weak one
+            // dissolves near the edge.
+            let travelled = (c.drag.pos.x * self.anchor.sign()).max(0.0);
+            let by_dist = 1.0 - (travelled / OFFSCREEN).clamp(0.0, 1.0);
+            let fade_floor = if motion::reduced() { 0.0 } else { c.alpha - dt * 0.8 };
+            c.alpha = by_dist.min(c.alpha).min(fade_floor.max(0.0)).max(0.0);
             active = true;
         }
         self.flying.retain(|c| c.alpha > 0.01);
@@ -420,7 +535,7 @@ impl Stack {
                     );
                     if resp.clicked() {
                         if *name == "x" {
-                            fling = Some(vec2(700.0, -200.0));
+                            fling = Some(vec2(self.anchor.sign() * 1100.0, -60.0));
                         } else {
                             clicked = Some(toast);
                         }
@@ -453,21 +568,42 @@ impl Stack {
             // ---- drag / fling ----------------------------------------------
             if resp.drag_started() {
                 card.drag_target = card.drag.pos;
+                self.dragging = true;
+                self.vel.clear();
+                self.vel.push(0.0, card.drag_target);
             }
             if resp.dragged() {
                 card.drag_target += resp.drag_delta();
+                self.vel.push(dt, card.drag_target);
                 active = true;
             }
             if resp.drag_stopped() {
-                let v = ctx.input(|i| i.pointer.velocity());
-                if v.length() > FLING_SPEED || card.drag_target.length() > FLING_DIST {
-                    // Give a slow-but-far drag enough push to clear the frame.
-                    let raw = if v.length() > 60.0 { v } else { card.drag_target };
-                    let dir = if raw.length() > 1.0 { raw.normalized() } else { vec2(1.0, 0.0) };
-                    fling = Some(if v.length() > FLING_SPEED { v } else { dir * 720.0 });
+                self.dragging = false;
+                let s = self.anchor.sign();
+                // Our own tracker, not egui's smoothed one — see VelocityTracker.
+                let v = self.vel.velocity();
+                // Only motion *toward the anchored edge* counts, in either test.
+                // Dragging a card the other way is a drag-out, not a dismissal.
+                let toward = v.x * s;
+                let travelled = card.drag_target.x * s;
+
+                if toward > motion::dismiss_vel() || travelled > motion::dismiss_dist() {
+                    // Carry the real throw velocity, so a hard flick travels
+                    // further and faster than a shove. A slow drag that merely
+                    // passed the distance threshold gets a fixed launch so it
+                    // still clears the frame instead of stalling mid-air.
+                    fling = Some(if toward > motion::dismiss_vel() {
+                        vec2(v.x, v.y * 0.35)
+                    } else {
+                        vec2(s * 900.0, v.y * 0.25)
+                    });
                 } else {
+                    // Under threshold: spring home. This is the branch that
+                    // makes the threshold *feel* like a threshold.
                     card.drag_target = Vec2::ZERO;
+                    active = true;
                 }
+                self.vel.clear();
             }
             if over {
                 ctx.set_cursor_icon(if held {
@@ -479,10 +615,14 @@ impl Stack {
         }
 
         if let Some(v) = fling {
+            let s = self.anchor.sign();
             let mut c = self.deck.remove(0);
             c.drag.vel = v;
-            c.spin = (v.x * 0.0022).clamp(-2.6, 2.6);
+            // Spin the way it is thrown.
+            c.spin = (v.x * 0.0016).clamp(-2.2, 2.2) + s * 0.35;
             self.flying.push(c);
+            self.stagger_deck();
+            self.dragging = false;
             active = true;
         }
         if let Some(t) = clicked {

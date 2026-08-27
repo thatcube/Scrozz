@@ -303,3 +303,126 @@ fn replay_restarts_the_animation_without_leaking() {
     }
     assert_eq!(sim.settle(120), 0, "stack stayed busy after five replays");
 }
+
+// ---------------------------------------------------------------------------
+// The corrected scope: cards enter from, and leave toward, the anchored edge.
+// ---------------------------------------------------------------------------
+
+/// The front card's horizontal offset from its home position this frame.
+/// `pose()` lays each card out as [depth, x, y, angle, alpha, entry], and the
+/// deck's front card is always first.
+fn front_x(f: &Frame) -> f32 {
+    f.pose.get(1).copied().unwrap_or(0.0)
+}
+
+/// The headline of the whole spike: a new capture must arrive as a *slide from
+/// off-screen past the anchored edge*, not a fade in place. So the first frame
+/// after a spawn has to put the card a long way out on the anchor side, and the
+/// settled frame has to put it home.
+#[test]
+fn entry_slides_in_from_the_anchored_edge() {
+    let _g = Globals::lock();
+    let mut sim = Sim::new();
+    sim.settle(400);
+
+    sim.harness.state_mut().spawn += 1;
+    let first = sim.step();
+
+    // Left anchor ⇒ the card starts far out to the *left* (negative x).
+    assert!(
+        front_x(&first) < -300.0,
+        "a new card should start off-screen left, but front_x was {:.1}",
+        front_x(&first)
+    );
+
+    // And it must actually travel — inward, over several frames — rather than
+    // teleporting. (kittest advances ~50ms per step, so a ~500ms spring settle
+    // is on the order of ten frames, not thirty.)
+    let mut travel = vec![first.clone()];
+    travel.extend(sim.run(90));
+    let inward: f32 = travel
+        .windows(2)
+        .map(|w| (front_x(&w[1]) - front_x(&w[0])).max(0.0))
+        .sum();
+    let frames = travel
+        .windows(2)
+        .filter(|w| front_x(&w[1]) - front_x(&w[0]) > 0.5)
+        .count();
+    assert!(
+        inward > 280.0 && frames >= 4,
+        "expected a long inward slide over several frames, got {inward:.0}px over {frames} frames"
+    );
+
+    // A spring settle, not an ease-out: the card must carry past its home
+    // position and come back. If this ever reads 0 the motion has quietly
+    // degraded into a plain tween.
+    let overshoot = travel.iter().map(|f| front_x(f)).fold(f32::MIN, f32::max);
+    assert!(
+        overshoot > 2.0,
+        "the entry should overshoot and settle back, peak was {overshoot:.1}px"
+    );
+
+    sim.settle(400);
+    let home = sim.step();
+    assert!(
+        front_x(&home).abs() < 2.0,
+        "the card should settle flush in the stack, but sits at {:.1}",
+        front_x(&home)
+    );
+}
+
+/// The anchor is a parameter, not a hardcoded left. Docking the overlay to the
+/// right edge must mirror the entire gesture language: in from the right, out
+/// to the right.
+#[test]
+fn flipping_the_anchor_mirrors_the_entry() {
+    let _g = Globals::lock();
+    let mut sim = Sim::new();
+    sim.settle(400);
+
+    sim.harness.state_mut().stack.anchor = stack::Anchor::Right;
+    sim.harness.state_mut().spawn += 1;
+    let first = sim.step();
+
+    assert!(
+        front_x(&first) > 300.0,
+        "with a right anchor the card should start off-screen right, got {:.1}",
+        front_x(&first)
+    );
+
+    sim.settle(400);
+    assert!(front_x(&sim.step()).abs() < 2.0, "should still settle home");
+}
+
+/// A dismissal must carry the card *toward the anchored edge* and off-screen —
+/// not just fade it out where it stands. This is the visible half of "swipe it
+/// off to the left".
+#[test]
+fn dismissal_travels_toward_the_anchored_edge() {
+    let _g = Globals::lock();
+    let mut sim = Sim::new();
+    sim.settle(400);
+
+    let before = sim.harness.state().last.len;
+    sim.harness.state_mut().dismiss += 1;
+    sim.step();
+
+    // Track how far left the flying card gets before it is reaped.
+    let mut furthest = 0.0_f32;
+    for f in sim.run(120) {
+        for c in f.pose.chunks(6) {
+            furthest = furthest.min(c[1]);
+        }
+    }
+    assert!(
+        furthest < -200.0,
+        "the dismissed card should fly off to the left; furthest x was {furthest:.1}"
+    );
+
+    sim.settle(400);
+    assert_eq!(
+        sim.step().len,
+        before - 1,
+        "the dismissed card should have left the deck"
+    );
+}
