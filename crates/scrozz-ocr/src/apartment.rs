@@ -14,25 +14,38 @@
 //! know which reader it is talking to. `CO_E_NOTINITIALIZED` is a message for a
 //! developer; everything else here is a message for the user.
 //!
-//! Kept free of the `windows` crate so the mapping is checked by tests on
-//! whatever machine happens to be building, which — for this project — is not
-//! Windows.
+//! The classification below stays free of the `windows` crate so it is checked
+//! by tests on whatever machine happens to be building. The small native guard
+//! at the bottom is Windows-only and makes the OCR library safe to call without
+//! relying on every embedder to remember an undocumented thread prerequisite.
 
 use scrozz_core::Error;
+
+#[cfg(target_os = "windows")]
+use scrozz_core::Result;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::WinRT::{
+    RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize,
+};
 
 /// `CO_E_NOTINITIALIZED` — the calling thread is in no COM apartment.
 pub const CO_E_NOTINITIALIZED: i32 = 0x8004_01F0_u32 as i32;
 
-/// `RPC_E_CHANGED_MODE` — the thread is in an apartment, of the other model.
+/// `RPC_E_CHANGED_MODE` — retry `RoInitialize` with the existing model.
 ///
-/// Not a failure: WinRT works in either model. It appears here only so that a
-/// reader of this module does not mistake it for one.
+/// The failed call neither initialises WinRT nor takes a reference.
 pub const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
 
 /// Whether an HRESULT means "this thread never entered a COM apartment".
 #[must_use]
 pub const fn is_uninitialised_apartment(hresult: i32) -> bool {
     hresult == CO_E_NOTINITIALIZED
+}
+
+/// Whether `RoInitialize` must be retried with the other apartment model.
+#[must_use]
+pub const fn needs_apartment_model_retry(hresult: i32) -> bool {
+    hresult == RPC_E_CHANGED_MODE
 }
 
 /// The error for a failed OCR engine construction.
@@ -63,20 +76,98 @@ pub fn engine_failure(hresult: i32, what: &str, detail: &str) -> Error {
     }
 }
 
+/// Membership of the calling thread in a COM apartment.
+///
+/// Windows OCR is WinRT, and apartments are per thread. The guard is kept for
+/// the complete recognition operation and is deliberately neither `Send` nor
+/// `Sync`, so the balancing `RoUninitialize` cannot run on a different thread.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct Apartment {
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Apartment {
+    /// Enters an MTA on the calling thread.
+    ///
+    /// `RPC_E_CHANGED_MODE` means a caller such as winit already selected an
+    /// STA. Retry with that model; only a successful retry makes WinRT usable
+    /// and earns the `RoUninitialize` performed by this guard.
+    pub fn enter_multithreaded() -> Result<Self> {
+        // SAFETY: `RoInitialize` affects only the calling thread and accepts this
+        // documented enum value.
+        match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+            Ok(()) => Ok(Self {
+                _not_send: std::marker::PhantomData,
+            }),
+            Err(err) if needs_apartment_model_retry(err.code().0) => {
+                // SAFETY: the MTA attempt established that this thread already
+                // has the other model. Retrying the documented STA value is the
+                // only way to initialise WinRT without changing that model.
+                unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }
+                    .map(|()| Self {
+                        _not_send: std::marker::PhantomData,
+                    })
+                    .map_err(|retry| {
+                        Error::Platform(format!(
+                            "entering the existing STA for Windows OCR failed \
+                             after RPC_E_CHANGED_MODE (0x{:08X}): {}; text \
+                             recognition cannot run on this thread",
+                            retry.code().0,
+                            retry
+                        ))
+                    })
+            }
+            Err(err) => Err(Error::Platform(format!(
+                "entering a COM apartment for Windows OCR failed \
+                 (0x{:08X}): {}; text recognition cannot run on this thread",
+                err.code().0,
+                err
+            ))),
+        }
+    }
+
+    /// Whether this guard owes the thread a matching `RoUninitialize`.
+    #[must_use]
+    pub const fn owns(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        // SAFETY: constructors return a guard only after a successful
+        // `RoInitialize` on this thread; the guard cannot be sent elsewhere.
+        unsafe { RoUninitialize() };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CO_E_NOTINITIALIZED, RPC_E_CHANGED_MODE, engine_failure, is_uninitialised_apartment,
+        needs_apartment_model_retry,
     };
     use scrozz_core::Error;
 
     #[test]
     fn only_co_e_notinitialized_means_no_apartment() {
         assert!(is_uninitialised_apartment(CO_E_NOTINITIALIZED));
-        // The thread *is* in an apartment, just not the one that was asked for.
+        // COM already selected a model, but this failed call did not initialise
+        // WinRT and needs a matching-model retry.
         assert!(!is_uninitialised_apartment(RPC_E_CHANGED_MODE));
         assert!(!is_uninitialised_apartment(0));
         assert!(!is_uninitialised_apartment(0x8007_000E_u32 as i32));
+    }
+
+    #[test]
+    fn only_rpc_e_changed_mode_requests_the_other_model() {
+        assert!(needs_apartment_model_retry(RPC_E_CHANGED_MODE));
+        assert!(!needs_apartment_model_retry(CO_E_NOTINITIALIZED));
+        assert!(!needs_apartment_model_retry(0));
+        assert!(!needs_apartment_model_retry(1));
     }
 
     #[test]

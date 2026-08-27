@@ -238,6 +238,11 @@ pub struct OverlayOptions {
     pub probe: Option<PointerProbe>,
     /// Optional native conversion; see [`PanelHook`].
     pub panel: Option<PanelHook>,
+    /// Whether the host has a real promised-file drag hand-off.
+    ///
+    /// Descriptor bytes or a backend that returns `Unsupported` do not qualify.
+    /// When false, a drag-out gesture springs back instead of retiring the card.
+    pub promised_file_drag: bool,
     /// Longest thumbnail edge in pixels.
     pub thumbnail_px: u32,
 }
@@ -250,6 +255,7 @@ impl Default for OverlayOptions {
             passthrough: Passthrough::default(),
             probe: None,
             panel: None,
+            promised_file_drag: false,
             thumbnail_px: THUMBNAIL_PX,
         }
     }
@@ -263,6 +269,7 @@ impl std::fmt::Debug for OverlayOptions {
             .field("passthrough", &self.passthrough)
             .field("probe", &self.probe.is_some())
             .field("panel", &self.panel.is_some())
+            .field("promised_file_drag", &self.promised_file_drag)
             .field("thumbnail_px", &self.thumbnail_px)
             .finish()
     }
@@ -732,6 +739,7 @@ pub struct OverlayApp {
     geometry: OverlayGeometry,
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
+    promised_file_drag: bool,
     thumbnail_px: u32,
     /// The value most recently sent to the window, so the command is sent on
     /// change rather than every frame.
@@ -781,6 +789,11 @@ impl OverlayApp {
                  to a click-through window"
             );
         }
+        if !options.promised_file_drag {
+            tracing::debug!(
+                "promised-file drag is unavailable; drag-out gestures will spring back"
+            );
+        }
 
         Self {
             stack: CaptureStack::for_work_area(options.geometry.local()),
@@ -791,6 +804,7 @@ impl OverlayApp {
             geometry: options.geometry,
             passthrough: options.passthrough,
             probe: options.probe,
+            promised_file_drag: options.promised_file_drag,
             thumbnail_px: options.thumbnail_px.max(1),
             passthrough_now: false,
             last_seen: 0.0,
@@ -1128,7 +1142,10 @@ impl eframe::App for OverlayApp {
             self.stack.drag_to(p, &m);
         }
         if drag_end {
-            if let Some(release) = self.stack.release_drag(&m) {
+            if let Some(release) = self
+                .stack
+                .release_drag_with_promised_file(&m, self.promised_file_drag)
+            {
                 let at = release.rect.center();
                 match release.intent {
                     Intent::Dismiss => self.emit(OverlayEvent::Dismissed {

@@ -26,16 +26,41 @@ impl WindowsBackend {
     ///
     /// # Errors
     ///
-    /// Never fails: a machine with no WGC support still gets the GDI path, and
-    /// reporting a hard error here would leave the user with no screenshot at
-    /// all on exactly the old or unusual machines that most need a fallback.
+    /// A machine with no WGC support still gets the GDI path. Failures that do
+    /// not establish genuine platform unavailability are returned instead of
+    /// being disguised as a successful, lower-fidelity capture.
     pub fn new() -> Result<Self> {
         dpi::ensure_process_dpi_aware();
 
-        let wgc = if wgc::is_supported() {
-            wgc::WgcDevice::new().ok()
-        } else {
-            None
+        let availability = wgc::wgc_availability();
+        let wgc = match availability {
+            wgc::WgcAvailability::Available => match wgc::WgcDevice::new() {
+                Ok(device) => Some(device),
+                Err(err @ Error::Unsupported { .. }) => {
+                    tracing::warn!(
+                        %err,
+                        "Windows.Graphics.Capture has no usable D3D11 device; \
+                         using the explicit GDI fallback"
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            },
+            wgc::WgcAvailability::Unsupported => {
+                tracing::warn!(
+                    "{}",
+                    super::availability::explanation(availability)
+                        .unwrap_or_else(|| "Windows.Graphics.Capture is unavailable".to_owned())
+                );
+                None
+            }
+            wgc::WgcAvailability::ApartmentMissing | wgc::WgcAvailability::Refused(_) => {
+                return Err(Error::Platform(
+                    super::availability::explanation(availability).unwrap_or_else(|| {
+                        "Windows.Graphics.Capture support could not be determined".to_owned()
+                    }),
+                ));
+            }
         };
 
         Ok(Self { wgc })
@@ -44,12 +69,9 @@ impl WindowsBackend {
     fn capture_display(&self, monitor: &MonitorRecord, request: &CaptureRequest) -> Result<Frame> {
         if let Some(device) = &self.wgc {
             let item = wgc::item_for_monitor(monitor.handle)?;
-            match wgc::capture_item(device, &item, request.cursor, monitor.scale) {
-                Ok(frame) => return Ok(frame),
-                Err(e @ Error::TargetGone(_)) => return Err(e),
-                Err(_) => {}
-            }
+            return wgc::capture_item(device, &item, request.cursor, monitor.scale);
         }
+        require_gdi_compatible(request)?;
         gdi::capture_rect(monitor.bounds, monitor.scale)
     }
 
@@ -65,12 +87,9 @@ impl WindowsBackend {
 
         if let Some(device) = &self.wgc {
             let item = wgc::item_for_window(record.handle)?;
-            match wgc::capture_item(device, &item, request.cursor, scale) {
-                Ok(frame) => return Ok(frame),
-                Err(e @ Error::TargetGone(_)) => return Err(e),
-                Err(_) => {}
-            }
+            return wgc::capture_item(device, &item, request.cursor, scale);
         }
+        require_gdi_compatible(request)?;
         gdi::capture_window(record.handle, record.bounds, scale)
     }
 
@@ -151,9 +170,19 @@ impl WindowsBackend {
         let origin = (canvas.origin.x, canvas.origin.y);
 
         for monitor in &monitors {
-            let Ok(frame) = self.capture_display(monitor, request) else {
-                // One unplugged monitor should not lose the other three.
-                continue;
+            let frame = match self.capture_display(monitor, request) {
+                Ok(frame) => frame,
+                // One unplugged monitor should not lose the other three, but the
+                // omission must be visible in diagnostics.
+                Err(Error::TargetGone(reason)) => {
+                    tracing::warn!(
+                        display = %monitor.device_name,
+                        %reason,
+                        "display disappeared while composing all displays"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
             };
             let placement =
                 geom::placement_in_composite(monitor.bounds, monitor.scale, origin, scale);
@@ -187,6 +216,23 @@ impl WindowsBackend {
             scale,
         })
     }
+}
+
+/// Rejects semantics the GDI fallback does not implement.
+///
+/// Returning a cursor-less image for `CursorMode::Visible` would be a successful
+/// lie. The WGC path can control the cursor; this GDI implementation cannot yet.
+fn require_gdi_compatible(request: &CaptureRequest) -> Result<()> {
+    if matches!(request.cursor, scrozz_core::CursorMode::Visible) {
+        return Err(Error::Unsupported {
+            what: "capturing the pointer with the GDI fallback".to_owned(),
+            why: "Windows.Graphics.Capture is unavailable and the GDI path does \
+                  not composite the cursor. Retry without --cursor or use \
+                  Windows 10 1903 or later"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl TargetEnumerator for WindowsBackend {

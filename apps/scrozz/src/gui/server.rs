@@ -29,10 +29,12 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_os = "windows"))]
+use crate::fault::CliError;
 use crate::{
     cli::{Cli, Command},
     commands,
-    fault::{CliError, CliResult},
+    fault::CliResult,
     ipc::{self, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };

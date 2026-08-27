@@ -26,10 +26,11 @@ use scrozz_core::{LogicalRect, Point, ScaleFactor, Size};
 use scrozz_shell::overlay::{OverlayBehavior, OverlayLevel};
 use scrozz_shell::win32::{
     ApartmentEntry, DeviceRect, HR_ACCESS_DENIED, HR_CO_E_NOTINITIALIZED, HR_E_HANDLE,
-    HR_E_OUTOFMEMORY, HR_INVALID_WINDOW_HANDLE, HR_RPC_E_CHANGED_MODE, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, ZOrder, classify_apartment_entry, classify_hresult,
-    device_from_logical, enforced_ex_style_spec, ex_style_spec, logical_from_device,
-    pointer_in_window, scale_from_dpi, work_area_logical, z_order,
+    HR_E_OUTOFMEMORY, HR_INVALID_WINDOW_HANDLE, HR_RPC_E_CHANGED_MODE, WS_EX_APPWINDOW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, ZOrder,
+    classify_apartment_entry, classify_hresult, device_from_logical, enforced_ex_style_spec,
+    ex_style_spec, hit_test_passes_through, logical_from_device, pointer_in_window, scale_from_dpi,
+    work_area_logical, z_order,
 };
 
 /// The ex-style word winit hands over for a transparent, always-on-top,
@@ -56,7 +57,11 @@ fn a_capture_card_never_takes_the_keyboard() {
 fn a_capture_card_stays_out_of_the_taskbar_and_the_alt_tab_list() {
     let spec = ex_style_spec(&OverlayBehavior::capture_card());
     let style = spec.apply(WINIT_BASELINE);
-    assert_ne!(style & WS_EX_TOOLWINDOW, 0, "tool windows are not alt-tabbed");
+    assert_ne!(
+        style & WS_EX_TOOLWINDOW,
+        0,
+        "tool windows are not alt-tabbed"
+    );
     assert_eq!(style & WS_EX_APPWINDOW, 0, "and must not be forced back in");
 }
 
@@ -107,15 +112,27 @@ fn the_enforced_subset_is_only_what_winit_would_destroy() {
     // egui asks for mouse passthrough every frame, eframe forwards it to
     // `set_cursor_hittest`, and winit answers by writing the *entire* ex-style
     // word from its own flags — erasing NOACTIVATE and TOOLWINDOW, which it
-    // does not model. Those two are what the hook must restore.
+    // does not model, and LAYERED whenever passthrough turns off. Those three
+    // are what the hook must restore.
     //
-    // Restoring more would be worse than restoring less: LAYERED and
-    // TRANSPARENT are exactly the bits winit is legitimately toggling, and
-    // fighting it over them would break passthrough entirely.
+    // TRANSPARENT remains winit's bit. LAYERED does not: the card needs alpha
+    // while it is clickable as much as while clicks pass through.
     let enforced = enforced_ex_style_spec(&OverlayBehavior::capture_card());
-    assert_eq!(enforced.required, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+    assert_eq!(
+        enforced.required,
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+    );
     assert_eq!(enforced.forbidden, WS_EX_APPWINDOW);
-    assert_eq!(enforced.required & (WS_EX_LAYERED | WS_EX_TRANSPARENT), 0);
+    assert_eq!(enforced.required & WS_EX_TRANSPARENT, 0);
+}
+
+#[test]
+fn winit_turning_passthrough_off_cannot_remove_layering() {
+    // Winit's clickable state contains neither TRANSPARENT nor LAYERED. The
+    // guard must restore LAYERED while leaving TRANSPARENT off.
+    let repaired = enforced_ex_style_spec(&OverlayBehavior::capture_card()).apply(WINIT_BASELINE);
+    assert_ne!(repaired & WS_EX_LAYERED, 0);
+    assert_eq!(repaired & WS_EX_TRANSPARENT, 0);
 }
 
 #[test]
@@ -146,7 +163,10 @@ fn the_selection_overlay_is_allowed_to_take_focus() {
     // behaviour rather than hard-coded.
     let behavior = OverlayBehavior::selection_overlay();
     assert!(behavior.accepts_key);
-    assert_eq!(ex_style_spec(&behavior).apply(WINIT_BASELINE) & WS_EX_NOACTIVATE, 0);
+    assert_eq!(
+        ex_style_spec(&behavior).apply(WINIT_BASELINE) & WS_EX_NOACTIVATE,
+        0
+    );
     assert_eq!(
         enforced_ex_style_spec(&behavior).required & WS_EX_NOACTIVATE,
         0,
@@ -173,6 +193,15 @@ fn passthrough_is_a_single_bit_that_toggles_cleanly() {
         WS_EX_TRANSPARENT,
         "and nothing else changes with it"
     );
+}
+
+#[test]
+fn native_hit_testing_uses_the_same_transparent_bit_as_the_style_spec() {
+    assert!(!hit_test_passes_through(0));
+    assert!(hit_test_passes_through(WS_EX_TRANSPARENT));
+    assert!(hit_test_passes_through(
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT
+    ));
 }
 
 #[test]
@@ -332,17 +361,16 @@ fn s_false_is_still_an_entry_and_still_owes_a_matching_exit() {
 }
 
 #[test]
-fn a_thread_already_in_the_other_model_is_usable_and_must_be_left_alone() {
+fn a_changed_mode_requires_a_matching_model_retry() {
     // winit calls `OleInitialize` on the event-loop thread, making it an STA.
-    // Asking for MTA there returns RPC_E_CHANGED_MODE. WinRT works fine in an
-    // STA, so this is not a failure \u2014 but uninitialising would tear down
-    // winit's drag-and-drop registration from underneath it.
+    // Asking for MTA there returns RPC_E_CHANGED_MODE. The failed call does not
+    // initialise WinRT; the native guard must retry with the existing STA model.
     let entry = classify_apartment_entry(HR_RPC_E_CHANGED_MODE);
-    assert_eq!(entry, ApartmentEntry::AlreadyOtherModel);
-    assert!(entry.is_usable(), "an STA is a perfectly good apartment");
+    assert_eq!(entry, ApartmentEntry::RetryOtherModel);
+    assert!(!entry.is_usable(), "the retry has not succeeded yet");
     assert!(
         !entry.owes_uninitialise(),
-        "leaving an apartment this call did not enter breaks the thread that did"
+        "a failed attempt took no reference"
     );
 }
 
@@ -355,21 +383,20 @@ fn a_genuine_refusal_is_neither_usable_nor_owed_an_exit() {
 }
 
 #[test]
-fn usability_and_ownership_are_different_questions() {
-    // Conflating them is the bug in both directions: treat "usable" as "owned"
-    // and the STA gets torn down; treat "owned" as "usable" and a failed entry
-    // is used anyway.
-    let usable_but_not_owned = classify_apartment_entry(HR_RPC_E_CHANGED_MODE);
-    assert!(usable_but_not_owned.is_usable() && !usable_but_not_owned.owes_uninitialise());
+fn only_a_successful_roinitialize_is_usable_and_owned() {
+    let retry = classify_apartment_entry(HR_RPC_E_CHANGED_MODE);
+    assert!(!retry.is_usable() && !retry.owes_uninitialise());
 
     for entry in [
         ApartmentEntry::Entered,
-        ApartmentEntry::AlreadyOtherModel,
+        ApartmentEntry::RetryOtherModel,
         ApartmentEntry::Failed(-1),
     ] {
-        if entry.owes_uninitialise() {
-            assert!(entry.is_usable(), "{entry:?}: owning implies usable");
-        }
+        assert_eq!(
+            entry.is_usable(),
+            entry.owes_uninitialise(),
+            "{entry:?}: successful initialization is exactly what takes a reference"
+        );
     }
 }
 
@@ -399,9 +426,8 @@ fn windows_has_two_z_bands_and_the_mapping_says_so() {
 // - That a window carrying these bits behaves as intended. Nothing here calls
 //   Windows; the adapter that does is held up by `cargo check`, `clippy` and
 //   `const` assertions against the real constants.
-// - That `WS_EX_LAYERED` without `SetLayeredWindowAttributes` renders. winit
-//   relies on exactly that for its own `set_cursor_hittest`, which is strong
-//   evidence and is not observation.
+// - That DWM preserves per-pixel transparency after the hidden layered window
+//   is initialised with `SetLayeredWindowAttributes(alpha=255)`.
 // - That the `WM_STYLECHANGING` subclass survives winit's own subclassing, or
 //   unhooks cleanly on `WM_NCDESTROY`.
 // - That `MA_NOACTIVATE` keeps focus where it was during a real click.

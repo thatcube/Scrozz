@@ -101,13 +101,14 @@ pub fn explanation(availability: WgcAvailability) -> Option<String> {
             "Windows.Graphics.Capture was probed from a thread with no COM \
              apartment, so it reports itself unavailable. This is a Scrozz bug, \
              not a limitation of this machine: the thread that builds the \
-             capture backend must enter an apartment first. Falling back to \
-             GDI, which loses cursor control and per-window capture"
+             capture backend must enter an apartment first. The GDI fallback is \
+             refused because it would hide that bug and lose cursor control and \
+             per-window capture"
                 .to_owned(),
         ),
         WgcAvailability::Refused(code) => Some(format!(
             "Windows.Graphics.Capture refused the support query (0x{code:08X}); \
-             using the GDI fallback"
+             refusing to hide that failure behind the GDI fallback"
         )),
     }
 }

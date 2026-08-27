@@ -11,7 +11,7 @@
 # This is intentionally a CLI/headless probe. It does not automate egui or
 # claim that the overlay behaves correctly; a person still has to verify focus,
 # hit-testing and placement. What it does exercise is the same native display,
-# capture, encoder, file and clipboard code the tray app's capture worker uses.
+# capture, encoder, file, clipboard and OCR code the tray app's worker uses.
 
 [CmdletBinding()]
 param(
@@ -93,7 +93,10 @@ function Invoke-ScrozzJson {
         [string] $Name,
 
         [Parameter(Mandatory)]
-        [string] $Scratch
+        [string] $Scratch,
+
+        [Parameter()]
+        [switch] $AllowUnsupported
     )
 
     $stderrPath = Join-Path $Scratch "$Name.stderr.log"
@@ -120,7 +123,14 @@ function Invoke-ScrozzJson {
         throw "Windows smoke test failed: '$Name' wrote invalid JSON: $stdout"
     }
 
-    if ($exitCode -ne 0 -or -not $document.ok) {
+    $unsupported = (
+        $AllowUnsupported -and
+        $exitCode -ne 0 -and
+        -not $document.ok -and
+        $null -ne $document.error -and
+        $document.error.kind -eq "unsupported"
+    )
+    if (($exitCode -ne 0 -or -not $document.ok) -and -not $unsupported) {
         $detail = if ($null -ne $document.error) {
             $document.error | ConvertTo-Json -Compress -Depth 8
         } else {
@@ -131,9 +141,10 @@ function Invoke-ScrozzJson {
 
     # This was the merge-review finding that prompted the apartment work. WGC
     # may legitimately be unsupported and fall back to GDI, but it must never
-    # do so because Scrozz forgot to initialise the calling thread.
+    # do so because Scrozz forgot to initialise the calling thread. Check both
+    # streams: JSON errors keep the same diagnostic without relying on logging.
     Assert-Smoke (
-        $stderr -notmatch "CO_E_NOTINITIALIZED|no COM apartment|thread with no COM apartment|has not entered a COM apartment"
+        ($stderr + $stdout) -notmatch "CO_E_NOTINITIALIZED|no COM apartment|thread with no COM apartment|has not entered a COM apartment"
     ) "'$Name' reached WinRT without a COM apartment"
 
     return [pscustomobject] @{
@@ -268,7 +279,7 @@ try {
     $env:SCROZZ_UNSTABLE_BACKENDS = "1"
     $env:RUST_LOG = "scrozz=info,warn"
 
-    Write-Host "[1/4] Enumerating native displays"
+    Write-Host "[1/5] Enumerating native displays"
     $listed = Invoke-ScrozzJson `
         -Executable $Binary `
         -Arguments @("list", "displays") `
@@ -288,7 +299,7 @@ try {
     Assert-Smoke ($primary.Count -eq 1) `
         "expected exactly one primary display, found $($primary.Count)"
 
-    Write-Host "[2/4] Capturing the primary display to file and clipboard"
+    Write-Host "[2/5] Capturing the primary display to file and clipboard"
     $pngPath = [System.IO.Path]::GetFullPath((Join-Path $scratch "capture.png"))
     $captured = Invoke-ScrozzJson `
         -Executable $Binary `
@@ -304,6 +315,16 @@ try {
 
     Assert-Smoke ($captured.Json.command -eq "capture") `
         "capture returned command '$($captured.Json.command)'"
+    $backend = $captured.Json.data.backend
+    Assert-Smoke (
+        $backend -eq "Windows.Graphics.Capture" -or
+        $backend -eq "GDI BitBlt"
+    ) "capture reported unknown backend '$backend'"
+    if ($backend -eq "GDI BitBlt") {
+        Assert-Smoke (
+            $captured.Stderr -match "GDI fallback"
+        ) "capture used GDI without explaining the WGC downgrade"
+    }
     Assert-Smoke (Test-Path -LiteralPath $pngPath -PathType Leaf) `
         "capture reported success but did not create '$pngPath'"
 
@@ -326,7 +347,7 @@ try {
     Assert-Smoke ($savedPngs.Count -eq 1) `
         "one capture request wrote $($savedPngs.Count) PNG files; Save must happen once"
 
-    Write-Host "[3/4] Parsing the PNG independently"
+    Write-Host "[3/5] Parsing the PNG independently"
     $png = Read-PngDimensions $pngPath
     Assert-Smoke ($png.Width -gt 0 -and $png.Height -gt 0) `
         "capture.png has zero dimensions"
@@ -335,17 +356,31 @@ try {
         $png.Height -eq [uint32] $captured.Json.data.height
     ) "PNG dimensions $($png.Width)x$($png.Height) disagree with capture JSON"
 
-    Write-Host "[4/4] Reading the image back from the native clipboard"
+    Write-Host "[4/5] Reading the image back from the native clipboard"
     $clipboard = Read-ClipboardImageDimensions -Scratch $scratch
     Assert-Smoke (
         $clipboard.Width -eq $png.Width -and
         $clipboard.Height -eq $png.Height
     ) "clipboard image $($clipboard.Width)x$($clipboard.Height) disagrees with the saved PNG"
 
-    Write-Host (
+    Write-Host "[5/5] Exercising Windows.Media.Ocr on the calling thread"
+    $recognised = Invoke-ScrozzJson `
+        -Executable $Binary `
+        -Arguments @("ocr", "--file", $pngPath) `
+        -Name "ocr" `
+        -Scratch $scratch `
+        -AllowUnsupported
+    Assert-Smoke ($recognised.Json.command -eq "ocr") `
+        "OCR returned command '$($recognised.Json.command)'"
+    if (-not $recognised.Json.ok) {
+        Assert-Smoke ($recognised.Json.error.kind -eq "unsupported") `
+            "OCR failed with unexpected kind '$($recognised.Json.error.kind)'"
+    }
+
+    Write-Host ((
         "PASS: {0} display(s); captured {1}x{2}, saved one PNG, and " +
-        "round-tripped the same image through the Windows clipboard."
-    ) -f $displays.Count, $png.Width, $png.Height
+        "round-tripped the same image through the Windows clipboard via {3}."
+    ) -f $displays.Count, $png.Width, $png.Height, $backend)
 } finally {
     if ($locationPushed) {
         Pop-Location

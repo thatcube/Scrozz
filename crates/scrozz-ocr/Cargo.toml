@@ -24,6 +24,7 @@ windows = { workspace = true, features = [
     "Media_Ocr",
     "Graphics_Imaging",
     "Foundation",
+    "Win32_System_WinRT",
     # CopyFromBuffer, so the pixel upload need not hand-write an
     # IMemoryBufferByteAccess vtable.
     "Storage_Streams",

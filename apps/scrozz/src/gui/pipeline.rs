@@ -25,7 +25,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::mpsc::{Receiver, Sender, channel, sync_channel},
     thread::JoinHandle,
     time::SystemTime,
 };
@@ -119,32 +119,21 @@ pub struct Pipeline {
 /// `let _apartment = …` rather than a bare call: `let _ = …` would drop it
 /// immediately and leave the thread exactly as uninitialised as before.
 #[cfg(target_os = "windows")]
-fn enter_apartment() -> Option<scrozz_shell::windows::apartment::Apartment> {
-    match scrozz_shell::windows::apartment::Apartment::enter_multithreaded() {
-        Ok(apartment) => {
-            tracing::debug!(
-                owned = apartment.owns(),
-                "capture worker entered a COM apartment"
-            );
-            Some(apartment)
-        }
-        Err(err) => {
-            // Not fatal: GDI capture needs no apartment, so the worker can
-            // still take screenshots. It is loud because the user is about to
-            // get a visibly worse product than their machine can deliver.
-            tracing::error!(
-                %err,
-                "the capture worker has no COM apartment, so Windows.Graphics.Capture \
-                 and text recognition are both unavailable; falling back to GDI"
-            );
-            None
-        }
-    }
+fn enter_apartment() -> CliResult<scrozz_shell::windows::apartment::Apartment> {
+    let apartment = scrozz_shell::windows::apartment::Apartment::enter_multithreaded()
+        .map_err(CliError::Core)?;
+    tracing::debug!(
+        owned = apartment.owns(),
+        "capture worker entered a COM apartment"
+    );
+    Ok(apartment)
 }
 
 /// No apartment concept on this platform; nothing to enter.
 #[cfg(not(target_os = "windows"))]
-const fn enter_apartment() {}
+fn enter_apartment() -> CliResult<()> {
+    Ok(())
+}
 
 impl Pipeline {
     /// Starts the worker.
@@ -158,18 +147,34 @@ impl Pipeline {
     pub fn start() -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
+        let (ready_tx, ready_rx) = sync_channel(1);
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || {
-                let _apartment = enter_apartment();
-                Worker::new(outcome_tx).run(&job_rx);
+            .spawn(move || match enter_apartment() {
+                Ok(_apartment) => {
+                    let _ = ready_tx.send(Ok(()));
+                    Worker::new(outcome_tx).run(&job_rx);
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                }
             })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
                 )))
             })?;
+
+        let ready = ready_rx.recv().map_err(|err| {
+            CliError::Core(CoreError::Platform(format!(
+                "the capture worker exited during platform initialisation: {err}"
+            )))
+        })?;
+        if let Err(err) = ready {
+            let _ = worker.join();
+            return Err(err);
+        }
 
         Ok(Self {
             jobs,
@@ -282,6 +287,7 @@ impl Worker {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
+        tracing::debug!(backend = backend.name(), "capture backend selected");
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.

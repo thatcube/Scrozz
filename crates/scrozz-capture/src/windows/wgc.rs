@@ -172,24 +172,6 @@ pub fn wgc_availability() -> WgcAvailability {
     availability::classify(GraphicsCaptureSession::IsSupported().map_err(|e| e.code().0))
 }
 
-/// Whether this machine can run the WGC path at all.
-///
-/// Logs the reason when the answer is no, because every `false` here costs the
-/// user cursor control, per-window capture and alpha, and a downgrade nobody
-/// can see is a downgrade nobody can fix.
-#[must_use]
-pub fn is_supported() -> bool {
-    let availability = wgc_availability();
-    if let Some(explanation) = availability::explanation(availability) {
-        if availability.is_our_fault() {
-            tracing::error!("{explanation}");
-        } else {
-            tracing::info!("{explanation}");
-        }
-    }
-    availability.is_available()
-}
-
 /// The interop factory that turns an `HWND` or `HMONITOR` into a capture item.
 fn interop() -> Result<IGraphicsCaptureItemInterop> {
     windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(|e| {

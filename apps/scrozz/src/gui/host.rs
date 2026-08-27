@@ -193,6 +193,10 @@ impl Host for Windowed {
             geometry,
             panel: panel_hook(),
             probe: pointer_probe(),
+            // Windows currently has tested FILEGROUPDESCRIPTORW construction,
+            // but no IDataObject/IStream/DoDragDrop hand-off. A card must spring
+            // back until the native drop reports acceptance.
+            promised_file_drag: false,
             ..Default::default()
         };
 

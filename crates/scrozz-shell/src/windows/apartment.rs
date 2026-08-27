@@ -25,12 +25,14 @@
 //! And the main thread is already spoken for: winit calls `OleInitialize` on
 //! the event-loop thread to register drag-and-drop, which puts it in a
 //! single-threaded apartment. Asking for an MTA there returns
-//! `RPC_E_CHANGED_MODE` — which is *not* a failure. The thread has a good
-//! apartment and WinRT works in it. What `RPC_E_CHANGED_MODE` means is only
-//! *this call did not enter anything, so it must not leave anything*.
+//! `RPC_E_CHANGED_MODE`. That call did **not** initialise WinRT. Scrozz retries
+//! with `RO_INIT_SINGLETHREADED`; only that successful call makes WinRT usable,
+//! increments the apartment reference count, and earns a matching
+//! `RoUninitialize`.
 //!
-//! Getting that backwards is how a program calls `RoUninitialize` on winit's
-//! STA and breaks drag-and-drop somewhere else entirely, hours later.
+//! Treating changed-mode as success reaches WinRT without initialising it.
+//! Calling `RoUninitialize` for the failed attempt instead breaks somebody
+//! else's apartment. The successful retry avoids both errors.
 //!
 //! # The rule, in one line
 //!
@@ -69,6 +71,13 @@ impl ApartmentModel {
             Self::Single => RO_INIT_SINGLETHREADED,
         }
     }
+
+    const fn other(self) -> Self {
+        match self {
+            Self::Multi => Self::Single,
+            Self::Single => Self::Multi,
+        }
+    }
 }
 
 /// A thread's membership of a COM/WinRT apartment, released on drop.
@@ -89,9 +98,9 @@ pub struct Apartment {
 impl Apartment {
     /// Enters `model` on the calling thread.
     ///
-    /// Succeeds both when this call entered the apartment and when the thread
-    /// was already in the other model, because both leave the thread able to
-    /// call WinRT — which is the question the caller is actually asking.
+    /// If the requested model conflicts with the thread's existing model, this
+    /// retries with the other model. Success always means a `RoInitialize` call
+    /// succeeded and this guard owns the matching reference.
     ///
     /// # Errors
     ///
@@ -101,20 +110,35 @@ impl Apartment {
     pub fn enter(model: ApartmentModel) -> Result<Self> {
         // SAFETY: `RoInitialize` takes only an enum by value and affects the
         // calling thread. It is safe to call repeatedly and from any thread.
-        let hr = match unsafe { RoInitialize(model.raw()) } {
-            Ok(()) => 0,
-            Err(err) => err.code().0,
-        };
-        let entry = classify_apartment_entry(hr);
+        let first = initialise(model);
+        let entry = classify_apartment_entry(first);
         match entry {
             ApartmentEntry::Failed(code) => Err(Error::Platform(format!(
                 "entering a COM apartment: Windows refused (0x{code:08X}); \
                  screen capture and text recognition both need one"
             ))),
-            _ => Ok(Self {
+            ApartmentEntry::Entered => Ok(Self {
                 entry,
                 _not_send: std::marker::PhantomData,
             }),
+            ApartmentEntry::RetryOtherModel => {
+                let retry_model = model.other();
+                let retry = initialise(retry_model);
+                match classify_apartment_entry(retry) {
+                    ApartmentEntry::Entered => Ok(Self {
+                        entry: ApartmentEntry::Entered,
+                        _not_send: std::marker::PhantomData,
+                    }),
+                    ApartmentEntry::RetryOtherModel | ApartmentEntry::Failed(_) => {
+                        Err(Error::Platform(format!(
+                            "entering a COM apartment: {model:?} returned \
+                             RPC_E_CHANGED_MODE and retrying {retry_model:?} \
+                             failed (0x{retry:08X}); WinRT is not initialised \
+                             on this thread"
+                        )))
+                    }
+                }
+            }
         }
     }
 
@@ -135,11 +159,20 @@ impl Apartment {
 
     /// Whether this guard owns the apartment it is holding.
     ///
-    /// `false` when the thread was already in the other model — winit's STA on
-    /// the event-loop thread being the case that matters.
+    /// Every returned guard owns one successful `RoInitialize`, including one
+    /// obtained by retrying with winit's existing STA model.
     #[must_use]
     pub const fn owns(&self) -> bool {
         self.entry.owes_uninitialise()
+    }
+}
+
+fn initialise(model: ApartmentModel) -> i32 {
+    // SAFETY: `RoInitialize` takes only a documented enum by value and affects
+    // the calling thread. It is safe to retry with the matching model.
+    match unsafe { RoInitialize(model.raw()) } {
+        Ok(()) => 0,
+        Err(err) => err.code().0,
     }
 }
 

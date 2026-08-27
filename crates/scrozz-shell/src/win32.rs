@@ -194,45 +194,48 @@ pub fn ex_style_spec(behavior: &OverlayBehavior) -> ExStyleSpec {
 /// the flag without moving the window in the Z-order, which is exactly the
 /// inconsistent state that makes topmost windows fall behind.
 ///
-/// What is left is the pair winit has no concept of, and therefore the pair
-/// that would otherwise be silently erased.
+/// `WS_EX_LAYERED` is *not* volatile. Winit happens to add it while
+/// passthrough is enabled, but removes it again when passthrough is disabled.
+/// The capture card needs it in both states for per-pixel alpha, so the native
+/// guard owns that bit just as it owns `NOACTIVATE` and `TOOLWINDOW`.
 #[must_use]
 pub fn enforced_ex_style_spec(behavior: &OverlayBehavior) -> ExStyleSpec {
     let full = ex_style_spec(behavior);
-    let volatile = WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_LAYERED;
+    let volatile = WS_EX_TRANSPARENT | WS_EX_TOPMOST;
     ExStyleSpec {
         required: full.required & !volatile,
         forbidden: full.forbidden & !volatile,
     }
 }
 
-/// Why `WS_EX_LAYERED` is set but `SetLayeredWindowAttributes` is never called.
+/// Why the layered window is initialised with a fully opaque global multiplier.
 ///
-/// The MSDN sentence everyone quotes — *"the window will not be displayed until
-/// `SetLayeredWindowAttributes` or `UpdateLayeredWindow` is called"* — predates
-/// DWM composition. Since Windows 8 a layered window under DWM is composited
-/// with per-pixel alpha straight from its normal painting, and winit relies on
-/// exactly that: its own `set_cursor_hittest(false)` sets
-/// `WS_EX_TRANSPARENT | WS_EX_LAYERED` and never calls
-/// `SetLayeredWindowAttributes`.
+/// A hidden window created with `WS_EX_LAYERED` is not guaranteed to become
+/// visible until `SetLayeredWindowAttributes` or `UpdateLayeredWindow` has
+/// initialised the layered path. The eframe hook runs before the window is
+/// shown, so relying on winit to toggle the style later leaves a real invisible
+/// startup path.
 ///
-/// Calling it would in fact be actively wrong here. winit implements
-/// `with_transparent(true)` via `DwmEnableBlurBehindWindow` with an empty blur
-/// region, which is what gives the overlay true per-pixel alpha.
-/// `SetLayeredWindowAttributes` with `LWA_ALPHA` replaces that with a *uniform*
-/// alpha over the whole window, flattening the rounded, shadowed capture cards
-/// D27 describes into a translucent rectangle.
+/// `LWA_ALPHA` with an alpha of 255 is an identity multiplier: it satisfies the
+/// layered-window initialisation contract without making the window uniformly
+/// translucent. DWM still composites the transparent client area winit created
+/// with `DwmEnableBlurBehindWindow`, so rounded corners and shadows retain their
+/// source alpha.
 ///
-/// This is the one decision in the Windows overlay that has not been checked on
-/// hardware. The reasoning is winit's own shipped behaviour rather than
-/// speculation, but if a real Windows run shows an invisible overlay, the first
-/// thing to try is `SetLayeredWindowAttributes(hwnd, COLORREF(0), 255,
-/// LWA_ALPHA)` — and the second is dropping `WS_EX_LAYERED` when the surface is
-/// not click-through, since DWM blur-behind does not require it.
+/// This interaction still needs a real Windows desktop run: cross-compilation
+/// proves the API contract and types, not the DWM pixels.
 pub const fn layered_note() -> &'static str {
-    "WS_EX_LAYERED set without SetLayeredWindowAttributes: DWM composites \
-     per-pixel alpha from winit's blur-behind region, and a uniform LWA_ALPHA \
-     would flatten it"
+    "WS_EX_LAYERED initialised with SetLayeredWindowAttributes(alpha=255); \
+     DWM keeps compositing winit's transparent client area"
+}
+
+/// Whether native hit-testing should pass through this window.
+///
+/// Kept as a pure predicate so the `WM_NCHITTEST` hook and the style writer
+/// cannot acquire subtly different meanings for `WS_EX_TRANSPARENT`.
+#[must_use]
+pub const fn hit_test_passes_through(ex_style: u32) -> bool {
+    ex_style & WS_EX_TRANSPARENT != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -369,10 +372,7 @@ pub fn logical_from_device(rect: DeviceRect, scale: ScaleFactor) -> LogicalRect 
     let s = scale.get();
     LogicalRect::new(
         LogicalPoint::new(f64::from(rect.left) / s, f64::from(rect.top) / s),
-        LogicalSize::new(
-            f64::from(rect.width()) / s,
-            f64::from(rect.height()) / s,
-        ),
+        LogicalSize::new(f64::from(rect.width()) / s, f64::from(rect.height()) / s),
     )
 }
 
@@ -473,7 +473,7 @@ pub const HR_E_OUTOFMEMORY: i32 = 0x8007_000E_u32 as i32;
 pub const HR_E_NOINTERFACE: i32 = 0x8000_4002_u32 as i32;
 /// `E_NOTIMPL`.
 pub const HR_E_NOTIMPL: i32 = 0x8000_4001_u32 as i32;
-/// `RPC_E_CHANGED_MODE` — COM already initialised in the other apartment model.
+/// `RPC_E_CHANGED_MODE` — retry `RoInitialize` with the thread's existing model.
 pub const HR_RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
 /// `DV_E_FORMATETC` — the data object was asked for a format it cannot supply.
 pub const HR_DV_E_FORMATETC: i32 = 0x8004_0064_u32 as i32;
@@ -531,13 +531,14 @@ pub fn classify_hresult(hr: i32, context: &str) -> Error {
                      standard-user app"
                 .into(),
         },
-        HR_INVALID_PARAMETER | HR_E_NOINTERFACE | HR_E_NOTIMPL => {
-            Error::InvalidRequest(format!("{context}: Windows rejected the request (0x{hr:08X})"))
-        }
+        HR_INVALID_PARAMETER | HR_E_NOINTERFACE | HR_E_NOTIMPL => Error::InvalidRequest(format!(
+            "{context}: Windows rejected the request (0x{hr:08X})"
+        )),
         HR_E_OUTOFMEMORY => Error::Platform(format!("{context}: out of memory")),
         HR_RPC_E_CHANGED_MODE => Error::Platform(format!(
             "{context}: COM is already initialised in a different apartment on \
-             this thread"
+             this thread; retry RoInitialize with the matching model before \
+             calling WinRT"
         )),
         HR_CO_E_NOTINITIALIZED => Error::Platform(format!(
             "{context}: this thread has not entered a COM apartment. Every \
@@ -550,21 +551,18 @@ pub fn classify_hresult(hr: i32, context: &str) -> Error {
                   medium this drag does not offer"
                 .into(),
         },
-        _ if hresult_is_ok(hr) => {
-            Error::Platform(format!("{context}: reported success (0x{hr:08X}) as a failure"))
-        }
+        _ if hresult_is_ok(hr) => Error::Platform(format!(
+            "{context}: reported success (0x{hr:08X}) as a failure"
+        )),
         _ => Error::Platform(format!("{context}: Windows error 0x{hr:08X}")),
     }
 }
 
 /// What happened when a thread tried to enter a COM/WinRT apartment.
 ///
-/// Exists to separate the two questions that `RoInitialize` answers at once and
-/// that callers routinely conflate: *is this thread usable for WinRT now*, and
-/// *whose job is it to tear the apartment down*. Answering the first correctly
-/// and the second wrongly gives either a premature `RoUninitialize` that breaks
-/// somebody else's COM, or a leaked apartment reference that keeps the thread
-/// alive-ish forever.
+/// `RPC_E_CHANGED_MODE` does not initialise WinRT. It says the requested model
+/// conflicts with one already assigned to the thread, so the caller must retry
+/// with the other model and may proceed only if that second call succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApartmentEntry {
     /// This call entered the apartment, and owes a matching uninitialise.
@@ -572,15 +570,13 @@ pub enum ApartmentEntry {
     /// Covers `S_FALSE` as well as `S_OK`: "already initialised with the same
     /// model" still increments the reference count, so it still owes one.
     Entered,
-    /// The thread was already in the *other* apartment model.
+    /// Retry with the other apartment model.
     ///
-    /// `RPC_E_CHANGED_MODE`. Emphatically **not** an error: the thread has a
-    /// perfectly good apartment and WinRT works in it. It is only a statement
-    /// about ownership — this call did not enter anything, so it must not
-    /// leave anything. winit puts the event-loop thread into an STA with
-    /// `OleInitialize` before Scrozz ever sees it, so this is the *expected*
-    /// answer on the main thread rather than a rare one.
-    AlreadyOtherModel,
+    /// The failed call owns no reference and does not make WinRT usable. winit
+    /// reaches this path after `OleInitialize` establishes its STA; retrying
+    /// `RoInitialize(RO_INIT_SINGLETHREADED)` then performs the required WinRT
+    /// initialisation and takes the reference Scrozz later balances.
+    RetryOtherModel,
     /// The apartment could not be entered at all.
     Failed(i32),
 }
@@ -589,7 +585,7 @@ impl ApartmentEntry {
     /// Whether WinRT calls may be made on this thread afterwards.
     #[must_use]
     pub const fn is_usable(&self) -> bool {
-        matches!(self, Self::Entered | Self::AlreadyOtherModel)
+        matches!(self, Self::Entered)
     }
 
     /// Whether this call owes a matching uninitialise.
@@ -603,7 +599,7 @@ impl ApartmentEntry {
 #[must_use]
 pub const fn classify_apartment_entry(hr: i32) -> ApartmentEntry {
     if hr == HR_RPC_E_CHANGED_MODE {
-        ApartmentEntry::AlreadyOtherModel
+        ApartmentEntry::RetryOtherModel
     } else if hresult_is_ok(hr) {
         ApartmentEntry::Entered
     } else {
@@ -724,11 +720,15 @@ mod tests {
     #[test]
     fn the_enforced_subset_leaves_winits_own_bits_to_winit() {
         let spec = enforced_ex_style_spec(&card());
-        let volatile = WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_LAYERED;
+        let volatile = WS_EX_TRANSPARENT | WS_EX_TOPMOST;
         assert_eq!(spec.required & volatile, 0);
         assert_eq!(spec.forbidden & volatile, 0);
-        // But it still carries the two bits winit does not model.
-        assert_eq!(spec.required, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        // LAYERED is restored too: winit models it only as a side effect of
+        // passthrough, then removes it when the card becomes clickable.
+        assert_eq!(
+            spec.required,
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+        );
         assert_eq!(spec.forbidden, WS_EX_APPWINDOW);
     }
 
@@ -944,16 +944,19 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_mode_is_usable_but_not_ours() {
+    fn a_changed_mode_requires_a_successful_retry() {
         // winit calls OleInitialize on the event-loop thread, so asking for an
-        // MTA there returns this. The thread is fine; we just did not enter it
-        // and must not leave it.
+        // MTA there returns this. COM has a model, but RoInitialize failed and
+        // WinRT may not be used until a matching STA retry succeeds.
         let entry = classify_apartment_entry(HR_RPC_E_CHANGED_MODE);
-        assert_eq!(entry, ApartmentEntry::AlreadyOtherModel);
-        assert!(entry.is_usable(), "an STA is a perfectly good WinRT apartment");
+        assert_eq!(entry, ApartmentEntry::RetryOtherModel);
+        assert!(
+            !entry.is_usable(),
+            "the failed call did not initialise WinRT"
+        );
         assert!(
             !entry.owes_uninitialise(),
-            "uninitialising an apartment we did not enter breaks whoever did"
+            "a failed call took no reference"
         );
     }
 

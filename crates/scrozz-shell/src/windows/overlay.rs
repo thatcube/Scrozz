@@ -18,7 +18,7 @@
 //!
 //! `WM_STYLECHANGING` is the documented place to *veto* a style change: it
 //! arrives before the write, carries a mutable `STYLESTRUCT`, and a subclass
-//! may edit `styleNew`. Re-adding the two bits there makes the guarantee hold
+//! may edit `styleNew`. Re-adding the required bits there makes the guarantee hold
 //! against winit, against eframe, and against anything else that touches the
 //! window.
 //!
@@ -39,7 +39,9 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 
 use scrozz_core::{Error, LogicalRect, Result, ScaleFactor};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
@@ -50,9 +52,10 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GWL_EXSTYLE, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, MA_NOACTIVATE, SHOW_WINDOW_CMD,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, STYLESTRUCT, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_STYLECHANGING, WNDPROC,
+    GetWindowThreadProcessId, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, LWA_ALPHA,
+    MA_NOACTIVATE, SHOW_WINDOW_CMD, STYLESTRUCT, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WINDOW_LONG_PTR_INDEX, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_STYLECHANGING, WNDPROC,
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT,
 };
@@ -61,7 +64,8 @@ use crate::OverlayWindow;
 use crate::overlay::{OverlayBehavior, OverlayLevel, OverlayReport};
 use crate::win32::{
     DeviceRect, ExStyleSpec, ZOrder, classify_hresult, device_from_logical, enforced_ex_style_spec,
-    ex_style_spec, pointer_in_window, scale_from_dpi, work_area_logical, z_order,
+    ex_style_spec, hit_test_passes_through, pointer_in_window, scale_from_dpi, work_area_logical,
+    z_order,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,13 +135,39 @@ fn ensure_process_dpi_aware() {
     ONCE.call_once(|| {
         // SAFETY: no arguments to get wrong; the call is idempotent and its
         // failure modes are all benign.
-        let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     });
 }
 
 /// Turns a `windows` error into a typed Scrozz error.
 fn map_err(err: windows::core::Error, context: &str) -> Error {
     classify_hresult(err.code().0, context)
+}
+
+/// Writes one window-long slot without losing a real Win32 failure behind the
+/// API's ambiguous zero return value.
+fn set_window_long_ptr(
+    hwnd: HWND,
+    index: WINDOW_LONG_PTR_INDEX,
+    value: isize,
+    context: &str,
+) -> Result<isize> {
+    // `SetWindowLongPtrW` returns the previous value, so zero can mean either
+    // success or failure. Clearing last-error first is the documented way to
+    // tell the two apart.
+    let (previous, error) = unsafe {
+        SetLastError(WIN32_ERROR(0));
+        let previous = SetWindowLongPtrW(hwnd, index, value);
+        (previous, GetLastError())
+    };
+    if previous == 0 && error.0 != 0 {
+        return Err(Error::Platform(format!(
+            "{context}: SetWindowLongPtrW failed with Win32 error {}",
+            error.0
+        )));
+    }
+    Ok(previous)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +234,7 @@ unsafe extern "system" fn guard_proc(
 
     match msg {
         // The window's extended style is about to change. Anything that is not
-        // ours passes through untouched; our two bits are put back.
+        // ours passes through untouched; our required bits are put back.
         WM_STYLECHANGING if wparam.0 as i32 == GWL_EXSTYLE.0 => {
             let styles = lparam.0 as *mut STYLESTRUCT;
             if !styles.is_null() {
@@ -218,6 +248,17 @@ unsafe extern "system" fn guard_proc(
         // Refuse activation outright, independently of the style bit.
         WM_MOUSEACTIVATE if refuse_activation => {
             return LRESULT(MA_NOACTIVATE as isize);
+        }
+        // `WS_EX_TRANSPARENT` is what winit toggles for cursor hit-testing.
+        // Returning HTTRANSPARENT as well makes the native hit-test answer
+        // explicit instead of relying on style side effects alone.
+        WM_NCHITTEST => {
+            // SAFETY: reading a documented slot on the live window that invoked
+            // this procedure.
+            let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+            if hit_test_passes_through(style) {
+                return LRESULT(HTTRANSPARENT as isize);
+            }
         }
         // Last message a window ever receives: unhook and forget it.
         WM_NCDESTROY => {
@@ -257,7 +298,12 @@ unsafe fn isize_to_wndproc(value: isize) -> WNDPROC {
         // SAFETY: the caller guarantees `value` is a window-procedure address,
         // and `WNDPROC` is `Option<fn(..)>`, whose non-null representation is
         // the function pointer itself.
-        Some(unsafe { std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(value) })
+        Some(unsafe {
+            std::mem::transmute::<
+                isize,
+                unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+            >(value)
+        })
     }
 }
 
@@ -343,17 +389,26 @@ impl WindowsOverlay {
         let enforced = enforced_ex_style_spec(behavior);
         let refuse_activation = !behavior.accepts_key;
 
-        self.install_guard(enforced, refuse_activation);
+        self.install_guard(enforced, refuse_activation)?;
 
         // SAFETY: live window on the owning thread; `GWL_EXSTYLE` is a read of
         // a documented slot.
         let current = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } as u32;
         let wanted = spec.apply(current);
         if wanted != current {
-            // SAFETY: as above, writing the slot the window already has.
-            unsafe {
-                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, wanted as isize);
-            }
+            set_window_long_ptr(
+                self.hwnd,
+                GWL_EXSTYLE,
+                wanted as isize,
+                "configuring the overlay's extended styles",
+            )?;
+        }
+
+        if spec.required & WS_EX_LAYERED.0 != 0 {
+            // SAFETY: the style was just applied to this live top-level window.
+            // Alpha 255 is an identity global multiplier; see `layered_note`.
+            unsafe { SetLayeredWindowAttributes(self.hwnd, COLORREF(0), 255, LWA_ALPHA) }
+                .map_err(|e| map_err(e, "initialising the layered overlay window"))?;
         }
 
         // The Z-order band has to be *moved*, not merely flagged: setting
@@ -364,12 +419,19 @@ impl WindowsOverlay {
 
         // SAFETY: reading back the slot just written.
         let after = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } as u32;
+        if !spec.satisfied_by(after) {
+            return Err(Error::Platform(format!(
+                "the overlay's extended styles did not stick: got 0x{after:08X}, \
+                 require 0x{:08X}, forbid 0x{:08X}",
+                spec.required, spec.forbidden
+            )));
+        }
         self.non_activating = !refuse_activation || after & WS_EX_NOACTIVATE.0 != 0;
 
         let detail = if self.non_activating {
             format!(
-                "HWND {:p}: ex-style 0x{after:08X}{}, style guard installed on \
-                 WM_STYLECHANGING{}",
+                "HWND {:p}: ex-style 0x{after:08X}{}, layered path initialised, \
+                 style guard installed on WM_STYLECHANGING and WM_NCHITTEST{}",
                 self.hwnd.0,
                 if refuse_activation {
                     " with WS_EX_NOACTIVATE"
@@ -550,7 +612,7 @@ impl WindowsOverlay {
     }
 
     /// Installs the style guard, replacing any guard already on this window.
-    fn install_guard(&mut self, spec: ExStyleSpec, refuse_activation: bool) {
+    fn install_guard(&mut self, spec: ExStyleSpec, refuse_activation: bool) -> Result<()> {
         let key = self.hwnd.0 as isize;
 
         // Already guarded: update the specification in place. Re-subclassing
@@ -567,19 +629,23 @@ impl WindowsOverlay {
         });
         if updated {
             self.guarded = true;
-            return;
+            return Ok(());
         }
 
-        // SAFETY: live window on the owning thread; the value installed is a
-        // real `extern "system"` window procedure with the right signature.
-        let previous = unsafe {
-            let raw = SetWindowLongPtrW(
-                self.hwnd,
-                GWLP_WNDPROC,
-                wndproc_to_isize(Some(guard_proc)),
-            );
-            isize_to_wndproc(raw)
-        };
+        let raw = set_window_long_ptr(
+            self.hwnd,
+            GWLP_WNDPROC,
+            wndproc_to_isize(Some(guard_proc)),
+            "installing the overlay window procedure",
+        )?;
+        // SAFETY: `raw` is the previous procedure returned from this live
+        // window's `GWLP_WNDPROC` slot.
+        let previous = unsafe { isize_to_wndproc(raw) };
+        if previous.is_none() {
+            return Err(Error::Platform(
+                "installing the overlay window procedure returned no previous procedure".to_owned(),
+            ));
+        }
 
         GUARDS.with(|g| {
             g.borrow_mut().push(Guard {
@@ -590,6 +656,7 @@ impl WindowsOverlay {
             });
         });
         self.guarded = true;
+        Ok(())
     }
 }
 
@@ -624,10 +691,20 @@ impl OverlayWindow for WindowsOverlay {
             current & !WS_EX_TRANSPARENT.0
         };
         if wanted != current {
-            // SAFETY: as above.
-            unsafe {
-                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, wanted as isize);
-            }
+            set_window_long_ptr(
+                self.hwnd,
+                GWL_EXSTYLE,
+                wanted as isize,
+                "changing overlay hit-testing",
+            )?;
+        }
+        // SAFETY: live window on its owning thread; documented slot.
+        let after = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } as u32;
+        if hit_test_passes_through(after) != passthrough || after & WS_EX_LAYERED.0 == 0 {
+            return Err(Error::Platform(format!(
+                "overlay hit-testing did not stick: passthrough={passthrough}, \
+                 ex-style=0x{after:08X}"
+            )));
         }
         Ok(())
     }
@@ -667,7 +744,12 @@ impl OverlayDiagnostics {
     /// must be: never activating, never in the taskbar, always on top.
     #[must_use]
     pub const fn is_well_formed_overlay(&self) -> bool {
-        self.no_activate && self.tool_window && !self.app_window && self.topmost
+        self.no_activate
+            && self.tool_window
+            && !self.app_window
+            && self.layered
+            && self.topmost
+            && self.guarded
     }
 }
 
@@ -737,12 +819,10 @@ pub fn work_area_under_pointer() -> Result<LogicalRect> {
     ensure_process_dpi_aware();
     let mut point = POINT::default();
     // SAFETY: live out-parameter.
-    unsafe { GetCursorPos(&raw mut point) }
-        .map_err(|e| map_err(e, "locating the pointer"))?;
+    unsafe { GetCursorPos(&raw mut point) }.map_err(|e| map_err(e, "locating the pointer"))?;
     // SAFETY: `MonitorFromPoint` with DEFAULTTONEAREST always yields a monitor.
-    let monitor = unsafe {
-        windows::Win32::Graphics::Gdi::MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
-    };
+    let monitor =
+        unsafe { windows::Win32::Graphics::Gdi::MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
     monitor_work_area(monitor)
 }
 

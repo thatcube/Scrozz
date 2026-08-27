@@ -1076,10 +1076,31 @@ impl CaptureStack {
     ///
     /// Returns `None` if nothing was held.
     pub fn release_drag(&mut self, m: &Motion) -> Option<DragRelease> {
+        self.release_drag_with_promised_file(m, true)
+    }
+
+    /// Lets go, but refuses to retire a drag-out card unless the host can hand
+    /// a promised file to the operating system.
+    ///
+    /// A gesture is not a successful drag. When `promised_file` is false, a
+    /// right/up release becomes [`Intent::SpringBack`] and the card remains in
+    /// the pile. This prevents a platform with only descriptor/layout scaffolding
+    /// from reporting structural success and discarding the only visible handle
+    /// to the capture.
+    pub fn release_drag_with_promised_file(
+        &mut self,
+        m: &Motion,
+        promised_file: bool,
+    ) -> Option<DragRelease> {
         let drag = self.drag.take()?;
         let travel = drag.latest - drag.origin;
         let velocity = drag.velocity.velocity(m);
-        let (intent, direction) = classify(travel, velocity, &self.gestures);
+        let (classified, direction) = classify(travel, velocity, &self.gestures);
+        let (intent, direction) = if classified == Intent::DragOut && !promised_file {
+            (Intent::SpringBack, None)
+        } else {
+            (classified, direction)
+        };
         let slot = self.slot_of(drag.id)?;
         let rect = self.rect_of_resident(slot, m);
 

@@ -182,6 +182,68 @@ case, not an edge case.
 
 ---
 
+## Windows first-slice findings (native run still required)
+
+The Windows slice now has a real `HWND` adapter rather than a set of intended
+flags. It applies `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED`, removes
+`WS_EX_APPWINDOW`, and moves the window with `SetWindowPos(...,
+SWP_NOACTIVATE)`. This must be a continuing invariant, not a creation-time
+write: winit rewrites the complete `GWL_EXSTYLE` value when egui changes mouse
+passthrough. A `WM_STYLECHANGING` guard therefore restores the three required
+bits while leaving `WS_EX_TRANSPARENT` under winit's control. While that
+transparent bit is set, the same hook returns `HTTRANSPARENT` from
+`WM_NCHITTEST`; empty overlay regions pass through and card regions remain
+interactive.
+
+Layering has a separate startup requirement. The panel hook runs while eframe's
+window is hidden, and Windows does not guarantee that a hidden layered window
+will become visible until `SetLayeredWindowAttributes` or
+`UpdateLayeredWindow` initialises it. Scrozz uses
+`SetLayeredWindowAttributes(alpha=255)`: the global alpha is an identity
+multiplier, while DWM continues compositing the transparent client area winit
+created. The Windows target check proves the API surface and constants. Only a
+native desktop run can prove that the DWM pixels, focus and Z-order behave as
+intended.
+
+COM/WinRT membership is per thread, not per process. The direct CLI and the
+forwarded-command handler both enter through `commands::dispatch`, which holds
+an apartment around backend construction, capture, clipboard delivery and OCR.
+The GUI capture worker establishes its own MTA before it reports ready and holds
+that guard for the worker's full lifetime. The Windows OCR backend additionally
+guards every recognition call, so library callers cannot accidentally reach
+`Windows.Media.Ocr` from an uninitialised thread. `RPC_E_CHANGED_MODE` is a retry
+signal rather than success: when winit has already selected an STA, Scrozz
+retries `RoInitialize(RO_INIT_SINGLETHREADED)` and balances only that successful
+WinRT entry, leaving winit's own apartment reference intact.
+
+The capture backend no longer reads `CO_E_NOTINITIALIZED` or an arbitrary WGC
+probe failure as permission to use GDI. GDI is selected only for a genuine
+unsupported result or the explicit no-D3D-device case, that downgrade is logged,
+and the CLI reports the backend in JSON. A runtime WGC failure is returned
+instead of being hidden behind a lower-fidelity frame. GDI also refuses a
+visible-cursor request until it can actually composite the cursor.
+
+Finally, the process entry point claims the main/event-loop thread before any
+UI object is built. Tray, global-hotkey and window setup can compare against
+that identity; the native overlay separately checks that every mutating call is
+on the thread that owns its `HWND`. Capture and OCR work belong on initialized
+workers, while winit, the tray and window procedures remain on the owner thread
+with its message pump.
+
+Promised-file drag is still explicitly unsupported on Windows. The tested
+`FILEGROUPDESCRIPTORW` layout is preparation, not delivery: until an
+`IDataObject` exposes indexed `CFSTR_FILECONTENTS` through an `IStream` and
+`DoDragDrop` reports an accepted drop, a drag-out gesture springs the card back
+and retains the capture.
+
+`tools/windows-smoke.ps1` exercises native display enumeration, capture,
+encoding, save-once behavior, clipboard round-trip and Windows OCR while
+rejecting apartment failures and unexplained GDI downgrades. It deliberately
+does not claim to automate focus, Alt-Tab visibility, DWM alpha, Z-order or
+cross-application hit-testing.
+
+---
+
 ## Known asymmetry, stated honestly
 
 macOS is where interactive verification happens today, so macOS code will be

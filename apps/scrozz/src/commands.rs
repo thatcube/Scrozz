@@ -73,14 +73,13 @@ fn dispatch_in_apartment(command: &Command) -> CliResult<Report> {
 /// the other calling thread: a direct `scrozz capture` or `scrozz ocr`, plus a
 /// command forwarded into the GUI event loop. In the first case this call owns
 /// an MTA and balances it when the command returns. In the second, winit has
-/// already put the thread in an STA, so `Apartment` records
-/// `RPC_E_CHANGED_MODE` as usable but not owned and deliberately does not call
-/// `RoUninitialize`.
+/// already put the thread in an STA, so `Apartment` retries
+/// `RoInitialize(RO_INIT_SINGLETHREADED)` and balances that successful WinRT
+/// entry without disturbing winit's own reference.
 #[cfg(target_os = "windows")]
 fn with_platform_apartment<T>(body: impl FnOnce() -> CliResult<T>) -> CliResult<T> {
-    let apartment =
-        scrozz_shell::windows::apartment::Apartment::enter_multithreaded()
-            .map_err(CliError::Core)?;
+    let apartment = scrozz_shell::windows::apartment::Apartment::enter_multithreaded()
+        .map_err(CliError::Core)?;
     tracing::debug!(
         owned = apartment.owns(),
         "command thread has a COM apartment"
@@ -141,6 +140,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     }
 
+    let backend_name = backend.name().to_owned();
     let capture = backend.capture(&request)?;
     let frame = &capture.frame;
 
@@ -190,6 +190,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         ("height", Json::Int(i64::from(frame.height()))),
         ("scale", Json::Float(frame.scale.get())),
         ("bytes", Json::Int(bytes.len() as i64)),
+        ("backend", Json::str(backend_name)),
         ("provenance", Json::str(format!("{:?}", capture.provenance))),
         (
             "written",

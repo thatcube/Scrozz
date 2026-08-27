@@ -13,10 +13,10 @@ pub mod drag;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod main_thread;
 pub mod overlay;
 pub mod permissions;
 pub mod tray;
-pub mod main_thread;
 pub mod win32;
 pub mod win32_drag;
 #[cfg(target_os = "windows")]

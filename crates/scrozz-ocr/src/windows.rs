@@ -66,6 +66,12 @@ const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 /// the machine has no OCR language pack installed, [`Error::Platform`] for any
 /// other WinRT failure.
 pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    let apartment = apartment::Apartment::enter_multithreaded()?;
+    tracing::debug!(
+        owned = apartment.owns(),
+        "Windows OCR caller has a COM apartment"
+    );
+
     // Ask the engine for its ceiling first: the answer feeds the upscale
     // decision, so an image is never enlarged past what the engine will accept
     // and an already-oversized capture is shrunk rather than rejected.
@@ -191,9 +197,8 @@ fn engine_for(languages: &[String]) -> Result<OcrEngine> {
         // HRESULT. Usually — but not when the thread never entered a COM
         // apartment, in which case that remedy is advice to install a language
         // pack the user already has, for a fault that is entirely ours.
-        return OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| {
-            apartment::engine_failure(e.code().0, "text recognition", &e.message())
-        });
+        return OcrEngine::TryCreateFromUserProfileLanguages()
+            .map_err(|e| apartment::engine_failure(e.code().0, "text recognition", &e.message()));
     }
 
     for tag in languages {

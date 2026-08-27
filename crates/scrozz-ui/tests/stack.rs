@@ -751,6 +751,32 @@ fn a_swipe_right_or_up_begins_a_drag_out() {
 }
 
 #[test]
+fn an_unavailable_promised_file_drag_springs_back_without_retiring_the_card() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+
+    let origin = pos2(120.0, 900.0);
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    let release = s
+        .release_drag_with_promised_file(&at(SETTLED + 80), false)
+        .unwrap();
+
+    assert_eq!(release.intent, Intent::SpringBack);
+    assert_eq!(release.direction, None);
+    assert_eq!(
+        s.slot_of(id),
+        Some(0),
+        "unsupported drag must keep the card"
+    );
+    assert!(
+        s.departing().is_empty(),
+        "descriptor scaffolding is not a successful OS drop"
+    );
+}
+
+#[test]
 fn a_swipe_down_collapses_without_dismissing() {
     let mut s = stack();
     let a = s.push(&at(0));

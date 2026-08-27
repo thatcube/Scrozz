@@ -255,8 +255,8 @@ mod tests {
     use super::{
         DescriptorError, FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTES_OFFSET, FILE_DESCRIPTOR_SIZE, FILE_NAME_OFFSET,
-        FILE_SIZE_OFFSET, MAX_PATH, PromisedFileDescriptor, decode_file_name, encode_file_name,
-        encode_file_group_descriptor,
+        FILE_SIZE_OFFSET, MAX_PATH, PromisedFileDescriptor, decode_file_name,
+        encode_file_group_descriptor, encode_file_name,
     };
 
     /// The count field that precedes the single descriptor.
@@ -315,11 +315,7 @@ mod tests {
         let bytes = encode_file_group_descriptor(&file).expect("encodes");
         let at = HEADER + FILE_SIZE_OFFSET;
         assert_eq!(&bytes[at..at + 4], &0x0000_00ABu32.to_le_bytes(), "high");
-        assert_eq!(
-            &bytes[at + 4..at + 8],
-            &0x1234_5678u32.to_le_bytes(),
-            "low"
-        );
+        assert_eq!(&bytes[at + 4..at + 8], &0x1234_5678u32.to_le_bytes(), "low");
     }
 
     #[test]

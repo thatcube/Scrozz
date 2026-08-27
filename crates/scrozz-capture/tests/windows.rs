@@ -40,9 +40,9 @@ mod sut {
 }
 
 use scrozz_core::{LogicalRect, Point, ScaleFactor, Size};
+use sut::availability::{self, WgcAvailability};
 use sut::filter::{self, Rejection, WindowFacts};
 use sut::geom::{self, DeviceRect};
-use sut::availability::{self, WgcAvailability};
 use sut::pixels::{self, PlaneRef};
 
 // ---------------------------------------------------------------------------
