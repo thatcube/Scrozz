@@ -1,44 +1,24 @@
-# Scrozz release build.
-#
-# Triggered by a version tag. Builds release binaries for macOS, Windows and
-# Linux, checksums them, and opens a **draft** GitHub release.
-#
-# It never publishes. Decision D5 is explicit that agents implement and validate
-# but the maintainer gates shipping, so the last step is always a human pressing
-# "Publish release" after looking at what is in it.
-#
-# ---------------------------------------------------------------------------
-# Signing is scaffolded, not wired up
-# ---------------------------------------------------------------------------
-# Every signing step below is gated on a secret being present and is skipped
-# with a notice when it is not. No credential is invented, committed, or
-# implied to exist. The repository secrets Brandon must create himself, if and
-# when he wants signed builds, are listed in each step's comment and summarised
-# in the `checksums-and-draft` job's final output.
-#
-# Until then this workflow produces working *unsigned* binaries, which macOS
-# Gatekeeper and Windows SmartScreen will both complain about. That is the
-# correct state for a project that has not yet decided to pay for certificates.
+# Signed native release artifacts. The release-signing environment is expected
+# to require a human reviewer and owns every production signing credential.
 name: Release
 
 on:
   push:
     tags:
-      # v1.2.3, v1.2.3-beta.1, and so on.
-      - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to build (e.g. v0.1.0)"
-        required: true
-        type: string
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   RUST_VERSION: "1.98.0"
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
 
@@ -47,340 +27,494 @@ defaults:
     shell: bash
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build one release artefact per platform.
-  # ---------------------------------------------------------------------------
-  build:
-    name: Build — ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    # Signing secrets are surfaced as job-level environment variables because
-    # the `secrets` context is NOT available in a step's `if:` condition, while
-    # `env` is. This indirection is what lets each signing step skip cleanly
-    # when the corresponding secret has never been created. An unset secret
-    # interpolates to the empty string; nothing here assumes one exists.
-    env:
-      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-      WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-    strategy:
-      # Publish nothing rather than a partial set: if Windows fails we still
-      # want to see whether macOS and Linux succeeded, so the draft can be
-      # assembled once the cause is fixed.
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            name: macOS (universal)
-            slug: macos-universal
-            archive: tar.gz
-          - os: ubuntu-latest
-            name: Linux (x86_64)
-            slug: linux-x86_64
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-          - os: windows-latest
-            name: Windows (x86_64)
-            slug: windows-x86_64
-            target: x86_64-pc-windows-msvc
-            archive: zip
-          # An arm64 Linux runner (`ubuntu-24.04-arm`) is available to public
-          # repositories. Adding a `linux-aarch64` entry here is all it takes,
-          # once somebody can actually test the result — see docs/platforms.md
-          # on the difference between "it builds" and "it works".
-
+  prepare:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      bundle_version: ${{ steps.release.outputs.bundle_version }}
+      stamp: ${{ steps.release.outputs.stamp }}
+      tag_preview: ${{ steps.release.outputs.tag_preview }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Match tag to the workspace version
+        id: release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error title=Invalid release tag::$GITHUB_REF_NAME is not a supported semantic version."
+            exit 1
+          fi
+
+          package_version="$(
+            sed -n 's/^version = "\(.*\)"/\1/p' apps/scrozz/Cargo.toml | head -1
+          )"
+          if [[ "$version" != "$package_version" ]]; then
+            echo "::error title=Version mismatch::Tag $version does not match scrozz $package_version."
+            exit 1
+          fi
+
+          tag_preview=false
+          [[ "$version" == *-* ]] && tag_preview=true
+          {
+            echo "version=$version"
+            echo "bundle_version=${version%%-*}"
+            echo "stamp=${GITHUB_SHA:0:12}"
+            echo "tag_preview=$tag_preview"
+          } >>"$GITHUB_OUTPUT"
+
+  macos:
+    name: macOS signed and notarized app
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 60
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install Rust ${{ env.RUST_VERSION }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          # macOS builds both architectures and lipos them together; the others
-          # build for the host only.
-          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+
+      - name: Import Developer ID and notarization credentials
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          for name in CERTIFICATE_BASE64 CERTIFICATE_PASSWORD SIGN_IDENTITY \
+            NOTARY_KEY_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error title=Missing release credential::$name is not configured in release-signing."
+              exit 1
+            fi
+          done
+
+          certificate="$RUNNER_TEMP/scrozz-developer-id.p12"
+          notary_key="$RUNNER_TEMP/scrozz-notary-key.p8"
+          keychain="$RUNNER_TEMP/scrozz-release.keychain-db"
+          keychain_password="$(uuidgen)"
+          printf '%s' "$CERTIFICATE_BASE64" | openssl base64 -d -A >"$certificate"
+          printf '%s' "$NOTARY_KEY_BASE64" | openssl base64 -d -A >"$notary_key"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          {
+            echo "SCROZZ_SIGN_IDENTITY=$SIGN_IDENTITY"
+            echo "SCROZZ_NOTARY_KEY=$notary_key"
+            echo "SCROZZ_NOTARY_KEY_ID=$NOTARY_KEY_ID"
+            echo "SCROZZ_NOTARY_ISSUER_ID=$NOTARY_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+
+      - name: Build release executable
+        run: cargo build --locked --release -p scrozz
+
+      - name: Smoke release executable
+        run: tools/smoke.sh
+
+      - name: Sign app bundle
+        env:
+          SCROZZ_APP_VERSION: ${{ needs.prepare.outputs.bundle_version }}
+          SCROZZ_BUILD_NUMBER: ${{ github.run_number }}
+          SCROZZ_PREBUILT_BIN: target/release/scrozz
+          SCROZZ_SIGNING_MODE: developer-id-release
+        run: tools/make-app-bundle.sh "$RUNNER_TEMP/Scrozz.app"
+
+      - name: Notarize and staple app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/Scrozz.app" \
+            "$RUNNER_TEMP/Scrozz-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/Scrozz-notary.zip" \
+            --key "$SCROZZ_NOTARY_KEY" \
+            --key-id "$SCROZZ_NOTARY_KEY_ID" \
+            --issuer "$SCROZZ_NOTARY_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$RUNNER_TEMP/Scrozz.app"
+          xcrun stapler validate "$RUNNER_TEMP/Scrozz.app"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Scrozz.app"
+          spctl --assess --type execute --verbose=2 "$RUNNER_TEMP/Scrozz.app"
+
+      - name: Package signed app without re-signing
+        env:
+          SCROZZ_APP_VERSION: ${{ needs.prepare.outputs.version }}
+          SCROZZ_STAMP: ${{ needs.prepare.outputs.stamp }}
+          SCROZZ_PREBUILT_APP: ${{ runner.temp }}/Scrozz.app
+        run: tools/package.sh dist
+
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/*.artifact.json
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows signed portable and MSIX
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: Build release executable
+        run: cargo build --locked --release -p scrozz
+
+      - name: Prepare pinned portable OCR payload
+        shell: pwsh
+        env:
+          TESSERACT_ARCHIVE_URL: ${{ secrets.WINDOWS_TESSERACT_ARCHIVE_URL }}
+          TESSERACT_ARCHIVE_SHA256: ${{ secrets.WINDOWS_TESSERACT_ARCHIVE_SHA256 }}
+        run: |
+          if ([String]::IsNullOrWhiteSpace($env:TESSERACT_ARCHIVE_URL) -or
+              -not $env:TESSERACT_ARCHIVE_URL.StartsWith("https://", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "WINDOWS_TESSERACT_ARCHIVE_URL must be configured as an HTTPS URL"
+          }
+          if ($env:TESSERACT_ARCHIVE_SHA256 -notmatch "^[0-9A-Fa-f]{64}$") {
+            throw "WINDOWS_TESSERACT_ARCHIVE_SHA256 must be configured"
+          }
+
+          $ArchivePath = Join-Path $env:RUNNER_TEMP "scrozz-tesseract.zip"
+          $ExtractRoot = Join-Path $env:RUNNER_TEMP "scrozz-tesseract"
+          & curl.exe `
+            --fail `
+            --silent `
+            --show-error `
+            --location `
+            --proto "=https" `
+            --proto-redir "=https" `
+            --max-redirs 5 `
+            --connect-timeout 15 `
+            --max-time 300 `
+            --max-filesize 536870912 `
+            --output $ArchivePath `
+            --url $env:TESSERACT_ARCHIVE_URL
+          if ($LASTEXITCODE -ne 0) {
+            throw "Portable OCR payload download failed with status $LASTEXITCODE"
+          }
+          $ActualHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash
+          if ($ActualHash -ne $env:TESSERACT_ARCHIVE_SHA256) {
+            throw "Portable OCR payload SHA-256 mismatch"
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $Archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+          try {
+            if ($Archive.Entries.Count -gt 4096) {
+              throw "Portable OCR payload contains too many archive entries"
+            }
+            [UInt64] $ExpandedBytes = 0
+            $Prefix = [IO.Path]::GetFullPath($ExtractRoot).TrimEnd("\") + "\"
+            foreach ($Entry in $Archive.Entries) {
+              if ($Entry.FullName.Contains("`r") -or $Entry.FullName.Contains("`n")) {
+                throw "Portable OCR payload contains an unsafe entry name"
+              }
+              $Target = [IO.Path]::GetFullPath((Join-Path $ExtractRoot $Entry.FullName))
+              if (-not $Target.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Portable OCR payload entry escapes the extraction root"
+              }
+              $ExpandedBytes += [UInt64] $Entry.Length
+              if ($ExpandedBytes -gt 536870912) {
+                throw "Portable OCR payload expands beyond 512 MiB"
+              }
+            }
+          } finally {
+            $Archive.Dispose()
+          }
+
+          Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractRoot
+          $ReparsePoints = @(Get-ChildItem -LiteralPath $ExtractRoot -Recurse -Force |
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
+          if ($ReparsePoints.Count -ne 0) {
+            throw "Portable OCR payload contains reparse points"
+          }
+          $Candidates = @(Get-ChildItem -LiteralPath $ExtractRoot -Filter "tesseract.exe" -File -Recurse |
+            Where-Object {
+              Test-Path -LiteralPath (Join-Path $_.Directory.FullName "tessdata\eng.traineddata") -PathType Leaf
+            })
+          if ($Candidates.Count -ne 1) {
+            throw "Portable OCR payload must contain exactly one Tesseract runtime with eng.traineddata"
+          }
+          "SCROZZ_TESSERACT_DIR=$($Candidates[0].Directory.FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Sign release executable
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+          PACKAGE_PUBLISHER: ${{ secrets.WINDOWS_MSIX_PUBLISHER }}
+          PUBLISHER_DISPLAY_NAME: ${{ secrets.WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          foreach ($Name in @(
+            "SIGN_PFX_BASE64",
+            "SIGN_PFX_PASSWORD",
+            "PACKAGE_PUBLISHER",
+            "PUBLISHER_DISPLAY_NAME"
+          )) {
+            if ([String]::IsNullOrWhiteSpace((Get-Item "Env:$Name").Value)) {
+              throw "$Name is not configured in the release-signing environment"
+            }
+          }
+
+          $Pfx = Join-Path $env:RUNNER_TEMP "scrozz-release.pfx"
+          [IO.File]::WriteAllBytes($Pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $SignTool = Get-ChildItem `
+            -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter "signtool.exe" `
+            -Recurse |
+            Where-Object { $_.FullName -match "\\x64\\signtool\.exe$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ([String]::IsNullOrWhiteSpace($SignTool)) {
+            throw "SignTool was not found in the Windows SDK"
+          }
+
+          & $SignTool sign `
+            /fd SHA256 `
+            /f $Pfx `
+            /p $env:SIGN_PFX_PASSWORD `
+            /tr "http://timestamp.digicert.com" `
+            /td SHA256 `
+            "target\release\scrozz.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "SignTool failed with status $LASTEXITCODE"
+          }
+          & $SignTool verify /pa "target\release\scrozz.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "SignTool verification failed with status $LASTEXITCODE"
+          }
+
+          @(
+            "SCROZZ_SIGNTOOL=$SignTool",
+            "SCROZZ_MSIX_SIGN_PFX=$Pfx",
+            "SCROZZ_MSIX_IDENTITY_NAME=com.thatcube.Scrozz",
+            "SCROZZ_MSIX_PUBLISHER=$env:PACKAGE_PUBLISHER",
+            "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME=$env:PUBLISHER_DISPLAY_NAME",
+            "SCROZZ_WINDOWS_BINARY_SIGNED=1"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Smoke signed release executable
+        run: tools/smoke.sh
+
+      - name: Package signed Windows artifacts
+        env:
+          SCROZZ_APP_VERSION: ${{ needs.prepare.outputs.version }}
+          SCROZZ_STAMP: ${{ needs.prepare.outputs.stamp }}
+          SCROZZ_MSIX_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+          SCROZZ_WINDOWS_VERIFY_DETERMINISM: "1"
+        run: tools/package.sh dist
+
+      - name: Verify signed MSIX
+        shell: pwsh
+        run: |
+          $Msix = Get-ChildItem -LiteralPath dist -Filter *.msix -File |
+            Select-Object -First 1 -ExpandProperty FullName
+          & $env:SCROZZ_SIGNTOOL verify /pa $Msix
+          if ($LASTEXITCODE -ne 0) {
+            throw "SignTool rejected the packaged MSIX"
+          }
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/*.zip
+            dist/*.msix
+            dist/*.sha256
+            dist/*.artifact.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux AppDir archive
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install Linux system packages
-        if: runner.os == 'Linux'
         run: tools/ci-linux-deps.sh
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.slug }}
+          key: release-linux
 
-      - name: Determine version
-        id: version
+      - name: Build release executable
+        run: cargo build --locked --release -p scrozz
+
+      - name: Smoke release executable
+        run: tools/smoke.sh
+
+      - name: Package AppDir
+        env:
+          SCROZZ_APP_VERSION: ${{ needs.prepare.outputs.version }}
+          SCROZZ_STAMP: ${{ needs.prepare.outputs.stamp }}
+        run: tools/package.sh dist
+
+      - name: Verify Linux package determinism
+        env:
+          SCROZZ_APP_VERSION: ${{ needs.prepare.outputs.version }}
+          SCROZZ_STAMP: ${{ needs.prepare.outputs.stamp }}
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
-          # Strip a leading 'v' so the filename reads scrozz-0.1.0-... rather
-          # than scrozz-v0.1.0-...
-          VERSION="${REF#v}"
-          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
-          echo "Building version $VERSION from $REF"
+          tools/package.sh dist-repeat
+          cmp dist/*.tar.gz dist-repeat/*.tar.gz
+          cmp dist/*.tar.gz.sha256 dist-repeat/*.tar.gz.sha256
+          cmp dist/*.tar.gz.artifact.json dist-repeat/*.tar.gz.artifact.json
 
-      # --- Compile ------------------------------------------------------------
-      - name: Build (macOS universal)
-        if: matrix.os == 'macos-latest'
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.artifact.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    needs: [prepare, macos, windows, linux]
+    runs-on: ubuntu-latest
+    environment: release-publish
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify artifacts and determine release kind
+        id: release_kind
         run: |
-          # Two builds and a lipo, rather than one build, because a universal
-          # binary is the only kind that runs natively on both Apple Silicon
-          # and the Intel Macs still in use.
-          cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
-          cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
-          mkdir -p dist
-          lipo -create -output dist/scrozz \
-            target/aarch64-apple-darwin/release/scrozz \
-            target/x86_64-apple-darwin/release/scrozz
-          lipo -info dist/scrozz
-
-      - name: Build (single target)
-        if: matrix.os != 'macos-latest'
-        run: |
-          cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
-          mkdir -p dist
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp "target/${{ matrix.target }}/release/scrozz.exe" dist/
-          else
-            cp "target/${{ matrix.target }}/release/scrozz" dist/
-          fi
-
-      # --- macOS signing and notarisation (skipped unless secrets exist) ------
-      #
-      # Requires, all as repository secrets:
-      #   MACOS_CERTIFICATE_P12       base64 of a Developer ID Application .p12
-      #   MACOS_CERTIFICATE_PASSWORD  its export password
-      #   MACOS_SIGN_IDENTITY         e.g. "Developer ID Application: Name (TEAMID)"
-      #   MACOS_NOTARY_KEY            base64 of an App Store Connect .p8 API key
-      #   MACOS_NOTARY_KEY_ID         that key's ID
-      #   MACOS_NOTARY_ISSUER_ID      the issuer UUID
-      - name: Sign and notarise (macOS)
-        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 != ''
-        run: |
-          set -euo pipefail
-
-          # A throwaway keychain, so the certificate never touches the login
-          # keychain and dies with the runner.
-          KEYCHAIN="$RUNNER_TEMP/scrozz-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 900 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-
-          echo "$MACOS_CERTIFICATE_P12" | base64 --decode >"$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" \
-            -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-          # --options runtime is the hardened runtime; notarisation rejects
-          # anything without it. --timestamp is likewise mandatory.
-          codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGN_IDENTITY" dist/scrozz
-          codesign --verify --strict --verbose=2 dist/scrozz
-
-          # Notarisation needs a container; a zip of the binary is enough for a
-          # bare executable. When Scrozz grows a .app bundle this should submit
-          # the bundle (or a .dmg) instead.
-          echo "$MACOS_NOTARY_KEY" | base64 --decode >"$RUNNER_TEMP/notary.p8"
-          ditto -c -k --keepParent dist/scrozz "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --key "$RUNNER_TEMP/notary.p8" \
-            --key-id "$MACOS_NOTARY_KEY_ID" \
-            --issuer "$MACOS_NOTARY_ISSUER_ID" \
-            --wait
-          rm -f "$RUNNER_TEMP/notary.p8"
-
-          # `stapler staple` only works on bundles and disk images, not bare
-          # executables, so it is intentionally not called here. Gatekeeper
-          # verifies a bare signed binary online instead.
-
-      - name: Note unsigned macOS build
-        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 == ''
-        run: |
-          echo "::notice title=macOS binary is unsigned::No MACOS_CERTIFICATE_P12 secret is set, so signing and notarisation were skipped. Gatekeeper will block this binary on other people's machines until a Developer ID certificate is configured."
-
-      # --- Windows signing (skipped unless secrets exist) ---------------------
-      #
-      # Requires, as repository secrets:
-      #   WINDOWS_CERTIFICATE_PFX       base64 of a code-signing .pfx
-      #   WINDOWS_CERTIFICATE_PASSWORD  its password
-      #
-      # A cheaper, keyless alternative worth considering before buying an EV
-      # certificate is Azure Trusted Signing, which swaps these two secrets for
-      # an Azure identity and a different action.
-      - name: Sign (Windows)
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE_PFX != ''
-        run: |
-          set -euo pipefail
-          echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$RUNNER_TEMP/cert.pfx"
-
-          # signtool lives in the Windows SDK, whose directory is versioned.
-          # Find the newest rather than hard-coding a version that a runner
-          # image update will silently remove.
-          SIGNTOOL="$(find '/c/Program Files (x86)/Windows Kits/10/bin' \
-            -name 'signtool.exe' -path '*x64*' 2>/dev/null | sort | tail -n 1)"
-          if [[ -z "$SIGNTOOL" ]]; then
-            echo "::error title=signtool not found::The Windows SDK layout on this runner image changed. Look under '/c/Program Files (x86)/Windows Kits/10/bin' (the Git-bash spelling of C:\\Program Files...) and update the find in this step."
+          shopt -s nullglob
+          archives=(
+            release-assets/*.zip
+            release-assets/*.msix
+            release-assets/*.tar.gz
+          )
+          metadata=(release-assets/*.artifact.json)
+          if [[ "${#archives[@]}" -ne 4 || "${#metadata[@]}" -ne 4 ]]; then
+            echo "::error title=Incomplete native release::Expected four archives and four metadata documents."
             exit 1
           fi
 
-          "$SIGNTOOL" sign \
-            /f "$RUNNER_TEMP/cert.pfx" \
-            /p "$WINDOWS_CERTIFICATE_PASSWORD" \
-            /fd SHA256 \
-            /tr http://timestamp.digicert.com \
-            /td SHA256 \
-            dist/scrozz.exe
-          "$SIGNTOOL" verify /pa dist/scrozz.exe
-          rm -f "$RUNNER_TEMP/cert.pfx"
+          (
+            cd release-assets
+            for sidecar in *.sha256; do
+              sha256sum --check "$sidecar"
+            done
+          )
 
-      - name: Note unsigned Windows build
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE_PFX == ''
-        run: |
-          echo "::notice title=Windows binary is unsigned::No WINDOWS_CERTIFICATE_PFX secret is set, so signing was skipped. SmartScreen will warn on download until a code-signing certificate is configured."
+          jq -s -e '
+            (map(select(.artifact_kind == "macos-app-zip"))) as $mac |
+            (map(select(.artifact_kind == "windows-msix"))) as $msix |
+            (map(select(.artifact_kind == "windows-portable-zip"))) as $portable |
+            (map(select(.artifact_kind == "linux-appdir-tar-gz"))) as $linux |
+            ($mac | length) == 1 and
+            ($msix | length) == 1 and
+            ($portable | length) == 1 and
+            ($linux | length) == 1 and
+            $mac[0].payload_signed == true and
+            $mac[0].notarized == true and
+            $msix[0].signed == true and
+            $msix[0].payload_signed == true and
+            $portable[0].payload_signed == true
+          ' release-assets/*.artifact.json >/dev/null
 
-      # --- Package ------------------------------------------------------------
-      - name: Package
-        id: package
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          NAME="scrozz-${VERSION}-${{ matrix.slug }}"
+          (
+            cd release-assets
+            : >SHA256SUMS
+            for archive in *.zip *.msix *.tar.gz; do
+              sha256sum "$archive" >>SHA256SUMS
+            done
+          )
 
-          # GPL-3.0 obliges us to ship the licence with the binary (D2), and
-          # the trademark terms travel with it.
-          cp LICENSE TRADEMARK.md README.md dist/
-
-          cd dist
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            7z a "../${NAME}.zip" ./* >/dev/null
-            ASSET="${NAME}.zip"
-          else
-            tar -czf "../${NAME}.tar.gz" ./*
-            ASSET="${NAME}.tar.gz"
+          artifact_preview=false
+          if jq -s -e 'any(.[]; .preview == true)' \
+            release-assets/*.artifact.json >/dev/null; then
+            artifact_preview=true
           fi
-          cd ..
-
-          # Checksum per artefact now; the release job concatenates them into a
-          # single SHA256SUMS file people can actually verify against.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$ASSET" >"${ASSET}.sha256"
-          else
-            shasum -a 256 "$ASSET" >"${ASSET}.sha256"
+          preview="${{ needs.prepare.outputs.tag_preview }}"
+          if [[ "$artifact_preview" == "true" ]]; then
+            preview=true
           fi
-          cat "${ASSET}.sha256"
-          echo "asset=$ASSET" >>"$GITHUB_OUTPUT"
+          echo "preview=$preview" >>"$GITHUB_OUTPUT"
+          echo "artifact_preview=$artifact_preview" >>"$GITHUB_OUTPUT"
 
-      - name: Upload artefact
-        uses: actions/upload-artifact@v4
+          if [[ "$artifact_preview" == "true" ]]; then
+            cat >release-notes.md <<'NOTICE'
+          > [!WARNING]
+          > **Preview build:** at least one native capture backend remains gated.
+          > Preview artifacts are labelled in their filenames and include
+          > `PREVIEW.txt`; they are not complete production releases.
+          NOTICE
+          elif [[ "${{ needs.prepare.outputs.tag_preview }}" == "true" ]]; then
+            cat >release-notes.md <<'NOTICE'
+          Signed native prerelease artifacts for macOS, Windows, and Linux.
+          NOTICE
+          else
+            cat >release-notes.md <<'NOTICE'
+          Signed native artifacts for macOS, Windows, and Linux.
+          NOTICE
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
-          name: release-${{ matrix.slug }}
-          path: |
-            ${{ steps.package.outputs.asset }}
-            ${{ steps.package.outputs.asset }}.sha256
-          if-no-files-found: error
-          retention-days: 7
-
-  # ---------------------------------------------------------------------------
-  # Assemble the checksums and open a DRAFT release.
-  # ---------------------------------------------------------------------------
-  checksums-and-draft:
-    name: Draft release
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      # The one job that needs write access, and only for creating the release.
-      contents: write
-    # Job level, not step level — see the note on the `build` job.
-    env:
-      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Build SHA256SUMS
-        run: |
-          set -euo pipefail
-          cd artifacts
-          # One file, sorted, in the format `sha256sum -c` expects.
-          cat ./*.sha256 | sort -k2 >SHA256SUMS
-          rm -f ./*.sha256
-          {
-            echo "### Artefacts"
-            echo '```'
-            cat SHA256SUMS
-            echo '```'
-          } >>"$GITHUB_STEP_SUMMARY"
-
-      # Optional detached signature over the checksum file — the customary way
-      # to make a Linux release verifiable without any platform certificate.
-      # Requires secrets GPG_PRIVATE_KEY (ASCII-armoured) and GPG_PASSPHRASE.
-      - name: Sign SHA256SUMS
-        if: env.GPG_PRIVATE_KEY != ''
-        run: |
-          set -euo pipefail
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          cd artifacts
-          gpg --batch --yes --pinentry-mode loopback \
-            --passphrase "$GPG_PASSPHRASE" \
-            --detach-sign --armor SHA256SUMS
-
-      - name: Create draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          # --draft is the point of this whole job. Decision D5: agents build
-          # and validate, the maintainer decides what ships. Nothing here is
-          # ever visible to the public until a human presses Publish.
-          #
-          # --verify-tag refuses to invent a tag that does not exist, which
-          # turns a typo in workflow_dispatch into an error rather than a
-          # release built from the wrong commit.
-          gh release create "$TAG" \
-            --draft \
-            --verify-tag \
-            --title "Scrozz $TAG" \
-            --generate-notes \
-            artifacts/*
-
-          echo "::notice title=Draft release created::Review it, then publish by hand. Nothing has been made public."
-
-      - name: Summarise what is and is not signed
-        run: |
-          {
-            echo "### Signing status"
-            echo
-            echo "| Platform | Signed | Secret that enables it |"
-            echo "|---|---|---|"
-            echo "| macOS | ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'yes' || 'no' }} | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
-            echo "| Windows | ${{ secrets.WINDOWS_CERTIFICATE_PFX != '' && 'yes' || 'no' }} | \`WINDOWS_CERTIFICATE_PFX\` (+ password) |"
-            echo "| Checksums (GPG) | ${{ secrets.GPG_PRIVATE_KEY != '' && 'yes' || 'no' }} | \`GPG_PRIVATE_KEY\` (+ passphrase) |"
-            echo
-            echo "Unsigned binaries work, but Gatekeeper and SmartScreen will"
-            echo "warn users. Configure the secrets above in"
-            echo "**Settings → Secrets and variables → Actions** when signing"
-            echo "certificates exist. None are required for a draft release."
-            echo
-            echo "This release is a **draft**. Publishing it is a human decision (D5)."
-          } >>"$GITHUB_STEP_SUMMARY"
+          name: Scrozz ${{ needs.prepare.outputs.version }}${{ steps.release_kind.outputs.preview == 'true' && ' (Preview)' || '' }}
+          prerelease: ${{ steps.release_kind.outputs.preview == 'true' }}
+          draft: false
+          generate_release_notes: true
+          body_path: release-notes.md
+          files: |
+            release-assets/*.zip
+            release-assets/*.msix
+            release-assets/*.tar.gz
+            release-assets/*.sha256
+            release-assets/*.artifact.json
+            release-assets/SHA256SUMS

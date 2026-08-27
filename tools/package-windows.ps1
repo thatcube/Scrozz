@@ -204,6 +204,64 @@ function New-DeterministicZip {
     }
 }
 
+function Copy-PortableTesseract {
+    param([string] $DestinationRoot)
+
+    $Configured = [Environment]::GetEnvironmentVariable("SCROZZ_TESSERACT_DIR")
+    if ([String]::IsNullOrWhiteSpace($Configured) -or
+        -not [IO.Path]::IsPathRooted($Configured) -or
+        $Configured.Contains("`r") -or
+        $Configured.Contains("`n")) {
+        throw "SCROZZ_TESSERACT_DIR must name an absolute portable Tesseract directory"
+    }
+    $SourceRoot = [IO.Path]::GetFullPath($Configured)
+    if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
+        throw "SCROZZ_TESSERACT_DIR does not name a directory: $SourceRoot"
+    }
+    $SourceItem = Get-Item -LiteralPath $SourceRoot -Force
+    if (($SourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "SCROZZ_TESSERACT_DIR must not be a reparse point: $SourceRoot"
+    }
+
+    $Program = Join-Path $SourceRoot "tesseract.exe"
+    $TessdataSource = Join-Path $SourceRoot "tessdata"
+    $EnglishModel = Join-Path $TessdataSource "eng.traineddata"
+    if (-not (Test-Path -LiteralPath $TessdataSource -PathType Container) -or
+        (((Get-Item -LiteralPath $TessdataSource -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "The portable Tesseract tessdata directory is missing or unsafe: $TessdataSource"
+    }
+    foreach ($Required in @($Program, $EnglishModel)) {
+        if (-not (Test-Path -LiteralPath $Required -PathType Leaf)) {
+            throw "The portable Tesseract payload is incomplete: $Required"
+        }
+        $Item = Get-Item -LiteralPath $Required -Force
+        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The portable Tesseract payload must not contain reparse points: $Required"
+        }
+    }
+
+    $Destination = Join-Path $DestinationRoot "tesseract"
+    $Tessdata = Join-Path $Destination "tessdata"
+    New-Item -ItemType Directory -Path $Tessdata -Force | Out-Null
+    Copy-Item -LiteralPath $Program -Destination (Join-Path $Destination "tesseract.exe")
+    Copy-Item -LiteralPath $EnglishModel -Destination (Join-Path $Tessdata "eng.traineddata")
+
+    $Supplemental = @(
+        Get-ChildItem -LiteralPath $SourceRoot -File -Force |
+            Where-Object {
+                $_.Extension -eq ".dll" -or
+                $_.Name -match "^(LICENSE|COPYING|NOTICE|README)(\..*)?$"
+            } |
+            Sort-Object Name
+    )
+    foreach ($File in $Supplemental) {
+        if (($File.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The portable Tesseract payload must not contain reparse points: $($File.FullName)"
+        }
+        Copy-Item -LiteralPath $File.FullName -Destination (Join-Path $Destination $File.Name)
+    }
+}
+
 function New-MappingFile {
     param([string] $PackageRoot, [string] $Destination)
     $Lines = [Collections.Generic.List[string]]::new()
@@ -259,11 +317,17 @@ function Write-ArtifactMetadata {
         [string] $PackageKind,
         [string] $OcrBackend,
         [bool] $Signed,
+        [bool] $PayloadSigned,
         [string] $IdentityName
     )
     $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
     $Length = (Get-Item -LiteralPath $Artifact).Length
     $FileName = [IO.Path]::GetFileName($Artifact)
+    $ArtifactKind = if ($PackageKind -eq "msix") {
+        "windows-msix"
+    } else {
+        "windows-portable-zip"
+    }
     [IO.File]::WriteAllText(
         "$Artifact.sha256",
         "$Hash  $FileName`n",
@@ -276,7 +340,11 @@ function Write-ArtifactMetadata {
         file = $FileName
         sha256 = $Hash
         size = $Length
+        artifact_kind = $ArtifactKind
         package_kind = $PackageKind
+        preview = $Preview
+        payload_signed = $PayloadSigned
+        notarized = $false
         ocr_backend = $OcrBackend
         package_identity = $IdentityName
         signed = $Signed
@@ -299,6 +367,24 @@ $PublisherDisplayName = Get-EnvironmentOrDefault `
     "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME" "Scrozz Development"
 $MsixVersion = Convert-ToMsixVersion $Version
 $MsixArchitecture = if ($Architecture -eq "x86_64") { "x64" } else { "arm64" }
+$Preview = [Environment]::GetEnvironmentVariable("SCROZZ_PREVIEW") -eq "1"
+$PreviewNotice = [Environment]::GetEnvironmentVariable("SCROZZ_PREVIEW_NOTICE")
+$PayloadSigned = (
+    [Environment]::GetEnvironmentVariable("SCROZZ_WINDOWS_BINARY_SIGNED") -eq "1"
+)
+if ($Preview -and (
+    [String]::IsNullOrWhiteSpace($PreviewNotice) -or
+    -not (Test-Path -LiteralPath $PreviewNotice -PathType Leaf)
+)) {
+    throw "Preview packaging requires SCROZZ_PREVIEW_NOTICE to name a file"
+}
+if ($PayloadSigned) {
+    $PayloadSignTool = Resolve-WindowsSdkTool "signtool" "SCROZZ_SIGNTOOL"
+    & $PayloadSignTool verify /pa $Binary
+    if ($LASTEXITCODE -ne 0) {
+        throw "SCROZZ_WINDOWS_BINARY_SIGNED is set but SignTool rejected $Binary"
+    }
+}
 
 if ($PackageIdentityName -notmatch "^[0-9A-Za-z.-]{3,50}$") {
     throw "SCROZZ_MSIX_IDENTITY_NAME is not a valid package identity name"
@@ -307,6 +393,9 @@ Assert-SingleLine $PackagePublisher "MSIX Publisher" 8192
 Assert-SingleLine $PublisherDisplayName "MSIX PublisherDisplayName" 256
 
 $Name = "scrozz-$Version-$Stamp-windows-$Architecture"
+if ($Preview) {
+    $Name = "$Name-preview"
+}
 $Portable = Join-Path $OutputDirectory "$Name.zip"
 $Msix = Join-Path $OutputDirectory "$Name.msix"
 $Scratch = Join-Path $OutputDirectory (
@@ -328,6 +417,11 @@ try {
     Copy-Item -LiteralPath $Binary -Destination (Join-Path $MsixRoot "scrozz.exe")
     Copy-DistributionDocuments $PortableRoot
     Copy-DistributionDocuments $MsixRoot
+    Copy-PortableTesseract $PortableRoot
+    if ($Preview) {
+        Copy-Item -LiteralPath $PreviewNotice -Destination (Join-Path $PortableRoot "PREVIEW.txt")
+        Copy-Item -LiteralPath $PreviewNotice -Destination (Join-Path $MsixRoot "PREVIEW.txt")
+    }
 
     foreach ($Asset in @(
         "Square44x44Logo.png",
@@ -465,6 +559,7 @@ try {
         -PackageKind "portable" `
         -OcrBackend "tesseract" `
         -Signed $false `
+        -PayloadSigned $PayloadSigned `
         -IdentityName ""
     Write-ArtifactMetadata `
         -Artifact $Msix `
@@ -472,6 +567,7 @@ try {
         -PackageKind "msix" `
         -OcrBackend "windows-media-ocr" `
         -Signed $Signed `
+        -PayloadSigned $PayloadSigned `
         -IdentityName $PackageIdentityName
 } finally {
     if (Test-Path -LiteralPath $Scratch) {

@@ -3,8 +3,8 @@
 `tools/package.sh` emits both Windows distributions from the same release
 binary:
 
-- a deterministic portable ZIP, which uses a locally installed Tesseract for
-  OCR and keeps per-user registry registration;
+- a deterministic portable ZIP, which carries an artifact-local Tesseract
+  runtime for OCR and keeps per-user registry registration;
 - an MSIX package, which has the package identity required by
   `Windows.Media.Ocr` and owns its protocol and startup task through
   `AppxManifest.xml`.
@@ -46,6 +46,22 @@ The certificate subject must match `SCROZZ_MSIX_PUBLISHER`. `SCROZZ_SIGNTOOL`,
 `SCROZZ_MAKEAPPX`, and `SCROZZ_MSIX_TIMESTAMP_URL` can override SDK tool and
 timestamp locations. No certificate, password, Store identity, or private key
 belongs in the repository.
+
+## Portable OCR payload
+
+`SCROZZ_TESSERACT_DIR` must name an absolute directory containing
+`tesseract.exe`, its adjacent dependent DLLs, and
+`tessdata/eng.traineddata`. Packaging copies that payload into
+`tesseract/` beside `scrozz.exe`; the portable runtime never searches `PATH`.
+The MSIX does not contain this payload because package identity selects
+`Windows.Media.Ocr`.
+
+The release workflow obtains that directory from the human-approved
+`release-signing` environment. `WINDOWS_TESSERACT_ARCHIVE_URL` and
+`WINDOWS_TESSERACT_ARCHIVE_SHA256` must identify a ZIP and its pinned digest.
+The workflow rejects non-HTTPS downloads, hash mismatches, path traversal,
+reparse points, oversized expansion, and ambiguous Tesseract roots before
+packaging.
 
 Set `SCROZZ_WINDOWS_VERIFY_DETERMINISM=1` to package the normalized staging
 trees twice and require byte-identical portable ZIP and unsigned MSIX output

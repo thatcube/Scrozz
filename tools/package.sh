@@ -17,6 +17,7 @@ Packages the already-built release executable for the current host.
 
 Environment:
   SCROZZ_BIN           executable to package
+  SCROZZ_PREBUILT_APP  signed/stapled Scrozz.app to preserve when packaging
   SCROZZ_STAMP         archive-name suffix (default: short commit)
   SCROZZ_APP_VERSION   packaged version (default: workspace version)
   SCROZZ_BUILD_NUMBER  macOS CFBundleVersion
@@ -34,6 +35,7 @@ Environment:
                         optional PFX password
   SCROZZ_MSIX_SIGN_CERT_SHA1
                         optional certificate-store thumbprint
+  SCROZZ_TESSERACT_DIR  absolute Tesseract payload directory for portable Windows
   SCROZZ_WINDOWS_VERIFY_DETERMINISM
                         rebuild and compare both Windows artifacts
 
@@ -117,6 +119,11 @@ if [[ ! -f "$BIN" ]]; then
   exit 1
 fi
 
+PREVIEW="$(tools/preview-check.sh probe "$BIN")"
+if [[ "$PREVIEW" == "1" ]]; then
+  NAME="$NAME-preview"
+fi
+
 STAGE="$(mktemp -d "$DIST/.scrozz-package.XXXXXX")"
 cleanup() {
   rm -rf "$STAGE"
@@ -130,20 +137,67 @@ copy_documents() {
   done
 }
 
+write_preview_notice() {
+  local destination="$1"
+  if [[ "$PREVIEW" == "1" ]]; then
+    SCROZZ_VERSION="$VERSION" \
+      SCROZZ_STAMP="$STAMP" \
+      SCROZZ_PLATFORM="$PLATFORM" \
+      tools/preview-check.sh notice "$destination"
+  fi
+}
+
 case "$OS" in
   macos)
+    ARTIFACT_KIND="macos-app-zip"
+    PACKAGE_KIND="app-bundle"
+    PAYLOAD_SIGNED=false
+    NOTARIZED=false
     PACKAGE_ROOT="$STAGE/$NAME"
     mkdir -p "$PACKAGE_ROOT"
-    SCROZZ_PREBUILT_BIN="$BIN" \
-      SCROZZ_APP_VERSION="$VERSION" \
-      SCROZZ_BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-1}" \
-      SCROZZ_SIGNING_MODE="${SCROZZ_SIGNING_MODE:-ad-hoc-dev}" \
-      SCROZZ_SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}" \
-      tools/make-app-bundle.sh "$PACKAGE_ROOT/Scrozz.app"
+    PREBUILT_APP="${SCROZZ_PREBUILT_APP:-}"
+    if [[ -n "$PREBUILT_APP" ]]; then
+      if [[ ! -d "$PREBUILT_APP" || -L "$PREBUILT_APP" ]] ||
+        [[ "$(basename "$PREBUILT_APP")" != "Scrozz.app" ]]; then
+        echo "package: SCROZZ_PREBUILT_APP must name a real Scrozz.app directory" >&2
+        exit 1
+      fi
+      PREBUILT_ID="$(
+        /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+          "$PREBUILT_APP/Contents/Info.plist" 2>/dev/null || true
+      )"
+      if [[ "$PREBUILT_ID" != "com.thatcube.Scrozz" ]] ||
+        [[ ! -x "$PREBUILT_APP/Contents/MacOS/Scrozz" ]]; then
+        echo "package: SCROZZ_PREBUILT_APP has an unexpected identity or executable" >&2
+        exit 1
+      fi
+      codesign --verify --strict --verbose=2 "$PREBUILT_APP"
+      ditto "$PREBUILT_APP" "$PACKAGE_ROOT/Scrozz.app"
+    else
+      SCROZZ_PREBUILT_BIN="$BIN" \
+        SCROZZ_APP_VERSION="$VERSION" \
+        SCROZZ_BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-1}" \
+        SCROZZ_SIGNING_MODE="${SCROZZ_SIGNING_MODE:-ad-hoc-dev}" \
+        SCROZZ_SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}" \
+        tools/make-app-bundle.sh "$PACKAGE_ROOT/Scrozz.app"
+    fi
+    SIGNATURE_DETAILS="$(codesign -dv --verbose=4 "$PACKAGE_ROOT/Scrozz.app" 2>&1)"
+    if [[ "$SIGNATURE_DETAILS" != *"Signature=adhoc"* ]]; then
+        PAYLOAD_SIGNED=true
+    fi
+    if xcrun stapler validate "$PACKAGE_ROOT/Scrozz.app" >/dev/null 2>&1; then
+        NOTARIZED=true
+    fi
     copy_documents "$PACKAGE_ROOT"
+    write_preview_notice "$PACKAGE_ROOT"
     ARCHIVE="$DIST/$NAME.zip"
     rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.artifact.json"
     ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_ROOT" "$ARCHIVE"
+
+    VERIFY_ROOT="$STAGE/verify"
+    mkdir -p "$VERIFY_ROOT"
+    ditto -x -k "$ARCHIVE" "$VERIFY_ROOT"
+    codesign --verify --strict --verbose=2 "$VERIFY_ROOT/$NAME/Scrozz.app"
     ;;
   windows)
     if command -v powershell.exe >/dev/null 2>&1; then
@@ -154,7 +208,14 @@ case "$OS" in
       echo "package: PowerShell is required for deterministic ZIP and MSIX output" >&2
       exit 1
     fi
-    "$POWERSHELL" \
+    PREVIEW_NOTICE=""
+    if [[ "$PREVIEW" == "1" ]]; then
+      write_preview_notice "$STAGE"
+      PREVIEW_NOTICE="$STAGE/PREVIEW.txt"
+    fi
+    SCROZZ_PREVIEW="$PREVIEW" \
+      SCROZZ_PREVIEW_NOTICE="$PREVIEW_NOTICE" \
+      "$POWERSHELL" \
       -NoLogo \
       -NoProfile \
       -NonInteractive \
@@ -168,6 +229,10 @@ case "$OS" in
     exit
     ;;
   linux)
+    ARTIFACT_KIND="linux-appdir-tar-gz"
+    PACKAGE_KIND="appdir"
+    PAYLOAD_SIGNED=false
+    NOTARIZED=false
     APPDIR="$STAGE/Scrozz.AppDir"
     mkdir -p \
       "$APPDIR/usr/bin" \
@@ -192,16 +257,28 @@ Categories=Graphics;Utility;
 Terminal=false
 DESKTOP
     cp "$APPDIR/scrozz.desktop" "$APPDIR/usr/share/applications/scrozz.desktop"
+    write_preview_notice "$APPDIR"
     cat >"$APPDIR/AppRun" <<'APPRUN'
 #!/bin/sh
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 export PATH="$HERE/usr/bin:$PATH"
 exec "$HERE/usr/bin/scrozz" "$@"
 APPRUN
+    find "$APPDIR" -type d -exec chmod 755 {} +
+    find "$APPDIR" -type f -exec chmod 644 {} +
     chmod +x "$APPDIR/AppRun"
+    chmod +x "$APPDIR/usr/bin/scrozz"
     ARCHIVE="$DIST/$NAME.tar.gz"
     rm -f "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.artifact.json"
-    tar -czf "$ARCHIVE" -C "$STAGE" Scrozz.AppDir
+    TZ=UTC tar \
+      --sort=name \
+      --mtime="1980-01-01 00:00:00Z" \
+      --owner=0 \
+      --group=0 \
+      --numeric-owner \
+      -czf "$ARCHIVE" \
+      -C "$STAGE" \
+      Scrozz.AppDir
     ;;
 esac
 
@@ -224,9 +301,18 @@ cat >"$ARCHIVE.artifact.json" <<JSON
   "file": "$FILE_NAME",
   "sha256": "$SHA256",
   "size": $SIZE,
+  "artifact_kind": "$ARTIFACT_KIND",
+  "package_kind": "$PACKAGE_KIND",
+  "preview": $([[ "$PREVIEW" == "1" ]] && printf true || printf false),
+  "payload_signed": $PAYLOAD_SIGNED,
+  "notarized": $NOTARIZED,
   "signed_manifest": false
 }
 JSON
+
+if [[ "$PREVIEW" == "1" ]]; then
+  write_preview_notice "$DIST"
+fi
 
 echo "built: $ARCHIVE"
 echo "sha256: $SHA256"
