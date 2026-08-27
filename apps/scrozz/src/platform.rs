@@ -103,9 +103,9 @@ pub fn store() -> CliResult<scrozz_store::SqliteStore> {
 /// The text recogniser.
 ///
 /// Unlike the others this one is genuinely constructible today, so it is not
-/// guarded. What is missing is upstream: turning a *file* into a
-/// [`scrozz_core::Frame`] needs an image decoder, which lives behind
-/// `scrozz-store`/`scrozz-export` rather than here.
+/// guarded, and its input is no longer a gap either: [`decode_image_file`]
+/// turns a path into a [`scrozz_core::Frame`]. What remains is the call that
+/// joins them, which lives in `commands::ocr`.
 #[must_use]
 pub fn ocr_engine() -> scrozz_ocr::SystemOcr {
     scrozz_ocr::SystemOcr::new()
@@ -126,6 +126,22 @@ pub const fn ocr_available() -> bool {
 /// binary has exactly one decode path. A second one would drift: colour space
 /// and premultiplication are decided at decode time, and two answers to that
 /// question is how a screenshot comes back with grey fringing.
+///
+/// Two properties of the returned frame are deliberate, and callers that
+/// paper over them will be wrong in the harmful direction:
+///
+/// - [`ColorSpace::Unknown`], not `Srgb`. The bytes may carry an ICC profile
+///   the decoder does not interpret, and calling a Display P3 screenshot sRGB
+///   is exactly what makes wide-gamut captures come back wrong. Encoders read
+///   `Unknown` as "embed nothing", never as "embed sRGB".
+/// - [`ScaleFactor::IDENTITY`]. A file records no display. A caller that
+///   genuinely knows better — the store reopening its own capture — should
+///   override it rather than let the decoder invent one. For OCR the 1× claim
+///   errs safely: the recogniser upscales small images, so it may upscale a
+///   little more than it needed to instead of skipping it on a 2× shot.
+///
+/// [`ColorSpace::Unknown`]: scrozz_core::ColorSpace::Unknown
+/// [`ScaleFactor::IDENTITY`]: scrozz_core::ScaleFactor::IDENTITY
 ///
 /// # Errors
 ///
@@ -255,6 +271,67 @@ mod tests {
             "/nonexistent/scrozz-not-here.png",
         )));
         assert_ne!(err.exit(), Exit::NotImplemented, "{err}");
+    }
+
+    #[test]
+    fn a_real_png_decodes_and_keeps_the_decoder_honest() {
+        // The round trip the OCR path depends on, through the encoder that
+        // wrote the file. Doing it end to end is the point: a hand-written
+        // fixture could agree with a decoder that both encoder and decoder had
+        // got wrong.
+        use scrozz_core::{ColorSpace, ScaleFactor};
+        use scrozz_export::{FrameEncoder, ImageFormat, RgbaImage};
+
+        let image = RgbaImage {
+            width: 3,
+            height: 2,
+            // Straight alpha, deliberately not opaque: premultiplication
+            // damage shows up in the partly transparent pixel and nowhere else.
+            data: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, //
+                255, 255, 0, 128, 0, 0, 0, 255, 255, 255, 255, 0,
+            ],
+        };
+        let bytes = FrameEncoder::new()
+            .encode_rgba(&image, ColorSpace::Srgb, ImageFormat::Png)
+            .expect("encoding a 3x2 png");
+
+        let dir = std::env::temp_dir().join(format!("scrozz-decode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("probe.png");
+        std::fs::write(&path, &bytes).expect("writing the probe");
+
+        let frame = decode_image_file(&path).expect("decoding what we just wrote");
+
+        assert_eq!(frame.size.width as u32, image.width);
+        assert_eq!(frame.size.height as u32, image.height);
+        assert_eq!(
+            frame.stride,
+            image.width as usize * 4,
+            "the decoder promises tightly packed rows, so no stride reconciliation is needed"
+        );
+        assert_eq!(
+            frame.data[..image.data.len()],
+            image.data[..],
+            "straight alpha, unchanged: the 128-alpha pixel is where premultiplication would show"
+        );
+
+        // Both of these are deliberate, and both are the safe direction.
+        // Claiming sRGB for what might be Display P3 is what makes wide-gamut
+        // captures look wrong; claiming 1x for a 2x file only makes the OCR
+        // upscaler do slightly more work than it had to.
+        assert_eq!(
+            frame.color_space,
+            ColorSpace::Unknown,
+            "the decoder must not claim a colour space it did not interpret"
+        );
+        assert_eq!(
+            frame.scale,
+            ScaleFactor::IDENTITY,
+            "a file records no display; a caller that knows better overrides"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
