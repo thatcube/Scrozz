@@ -229,9 +229,9 @@ pub const SETTINGS: &[Setting] = &[
         description: "Disk budget for stored source images. Pinned captures are never evicted.",
     },
     Setting {
-        key: "history.max-image-age",
-        kind: Kind::Choice(&["forever", "1-month", "1-week", "3-days", "1-day"]),
-        default: "forever",
+        key: "history.max-age-days",
+        kind: Kind::Choice(&["0", "1", "3", "7", "30"]),
+        default: "0",
         description: "Maximum age of unpinned source images. Capture documents and edits are kept.",
     },
     Setting {
@@ -417,26 +417,22 @@ mod tests {
         // D23 fixes the default at 10 GB in `scrozz-store`. Two numbers that
         // must agree should be checked, not hoped about.
         let setting = lookup("history.max-image-bytes").unwrap();
+        let age = lookup("history.max-age-days").unwrap();
         assert_eq!(
-            setting.default.parse::<u64>().unwrap(),
-            scrozz_store::RetentionPolicy::default().max_image_bytes
-        );
-
-        let age = lookup("history.max-image-age").unwrap();
-        assert_eq!(
-            scrozz_store::RetentionWindow::from_token(age.default).unwrap(),
-            scrozz_store::RetentionPolicy::default().max_image_age
+            scrozz_store::RetentionPolicy::from_limits(
+                setting.default.parse().unwrap(),
+                age.default.parse().unwrap(),
+            )
+            .unwrap(),
+            scrozz_store::RetentionPolicy::default()
         );
         let Kind::Choice(options) = age.kind else {
-            panic!("history.max-image-age should be a choice")
+            panic!("history.max-age-days should be a choice")
         };
-        assert_eq!(
-            options,
-            scrozz_store::RetentionWindow::all()
-                .iter()
-                .map(|window| window.as_token())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(options, &["0", "1", "3", "7", "30"]);
+        for option in options {
+            scrozz_store::RetentionWindow::from_days(option.parse().unwrap()).unwrap();
+        }
     }
 
     #[test]
