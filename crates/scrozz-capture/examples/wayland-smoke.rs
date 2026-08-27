@@ -211,61 +211,6 @@ fn run(fresh_process_restore: bool) -> Result<(), Outcome> {
         return Ok(());
     }
 
-    fn select_display<'a>(
-        backend: &(dyn CaptureBackend + 'static),
-        displays: &'a [Display],
-    ) -> Result<&'a Display, Outcome> {
-        if let Ok(requested) = env::var("SCROZZ_WAYLAND_DISPLAY_ID") {
-            return displays
-                .iter()
-                .find(|display| display.id.0 == requested)
-                .ok_or_else(|| {
-                    Outcome::Failed(format!(
-                        "SCROZZ_WAYLAND_DISPLAY_ID names {requested:?}, but the compositor reported: {}",
-                        displays
-                            .iter()
-                            .map(|display| display.id.0.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                });
-        }
-        if displays.len() == 1 {
-            return displays.first().ok_or_else(|| {
-                Outcome::Failed("the sole Wayland output disappeared during selection".into())
-            });
-        }
-        let active = backend.active_display().map_err(classify)?;
-        displays
-            .iter()
-            .find(|display| display.id == active.id)
-            .ok_or_else(|| {
-                Outcome::Failed(
-                    "the active Wayland output disappeared between discovery and selection".into(),
-                )
-            })
-    }
-
-    fn print_selected_restore_key() -> Result<(), Outcome> {
-        let backend = scrozz_capture::backend().map_err(classify)?;
-        if !backend.name().starts_with("xdg-desktop-portal") {
-            return Err(Outcome::Failed(format!(
-                "the selected backend is {}, not the Wayland portal",
-                backend.name()
-            )));
-        }
-        let displays = backend.displays().map_err(classify)?;
-        let display = select_display(backend.as_ref(), &displays)?;
-        let mut key = String::with_capacity("display:".len() + display.id.0.len() * 2);
-        key.push_str("display:");
-        for byte in display.id.0.bytes() {
-            use std::fmt::Write;
-            write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        println!("{key}");
-        Ok(())
-    }
-
     let capture = match backend.capture(&request) {
         Ok(capture) => capture,
         Err(Error::Cancelled) => {
@@ -321,6 +266,61 @@ fn run(fresh_process_restore: bool) -> Result<(), Outcome> {
     drop(source);
     eprintln!("wayland-smoke: reusable session dropped; teardown trace should now be complete");
 
+    Ok(())
+}
+
+fn select_display<'a>(
+    backend: &(dyn CaptureBackend + 'static),
+    displays: &'a [Display],
+) -> Result<&'a Display, Outcome> {
+    if let Ok(requested) = env::var("SCROZZ_WAYLAND_DISPLAY_ID") {
+        return displays
+            .iter()
+            .find(|display| display.id.0 == requested)
+            .ok_or_else(|| {
+                Outcome::Failed(format!(
+                    "SCROZZ_WAYLAND_DISPLAY_ID names {requested:?}, but the compositor reported: {}",
+                    displays
+                        .iter()
+                        .map(|display| display.id.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            });
+    }
+    if displays.len() == 1 {
+        return displays.first().ok_or_else(|| {
+            Outcome::Failed("the sole Wayland output disappeared during selection".into())
+        });
+    }
+    let active = backend.active_display().map_err(classify)?;
+    displays
+        .iter()
+        .find(|display| display.id == active.id)
+        .ok_or_else(|| {
+            Outcome::Failed(
+                "the active Wayland output disappeared between discovery and selection".into(),
+            )
+        })
+}
+
+fn print_selected_restore_key() -> Result<(), Outcome> {
+    let backend = scrozz_capture::backend().map_err(classify)?;
+    if !backend.name().starts_with("xdg-desktop-portal") {
+        return Err(Outcome::Failed(format!(
+            "the selected backend is {}, not the Wayland portal",
+            backend.name()
+        )));
+    }
+    let displays = backend.displays().map_err(classify)?;
+    let display = select_display(backend.as_ref(), &displays)?;
+    let mut key = String::with_capacity("display:".len() + display.id.0.len() * 2);
+    key.push_str("display:");
+    for byte in display.id.0.bytes() {
+        use std::fmt::Write;
+        write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    println!("{key}");
     Ok(())
 }
 
