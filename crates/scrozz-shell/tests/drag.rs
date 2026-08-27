@@ -18,7 +18,7 @@ use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_shell::drag::{
     DragFormat, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, FALLBACK_STEM,
     MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source, card_rect_in_view, check_origin,
-    sanitise_stem,
+    point_in_view, sanitise_stem,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -441,6 +441,18 @@ fn a_card_at_the_top_of_an_unflipped_view_sits_at_the_top() {
     let card = rect(0.0, 0.0, 100.0, 60.0);
     let placed = card_rect_in_view(card, VIEW_HEIGHT, false);
     assert_eq!(placed.y, VIEW_HEIGHT - 60.0);
+}
+
+#[test]
+fn a_flipped_view_keeps_the_pointer_in_top_left_coordinates() {
+    let point = LogicalPoint::new(40.0, 120.0);
+    assert_eq!(point_in_view(point, VIEW_HEIGHT, true), point);
+}
+
+#[test]
+fn an_unflipped_view_flips_the_pointer_with_the_card() {
+    let point = point_in_view(LogicalPoint::new(40.0, 120.0), VIEW_HEIGHT, false);
+    assert_eq!(point, LogicalPoint::new(40.0, VIEW_HEIGHT - 120.0));
 }
 
 // ---------------------------------------------------------------------------

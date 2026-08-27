@@ -438,7 +438,7 @@ impl DragPayload {
     ///
     /// The bytes must be PNG regardless of what the promised file is: PNG is
     /// the one still-image encoding every platform's clipboard understands, and
-    /// on macOS `NSImage` re-derives TIFF from it for the apps that want that
+    /// the macOS backend derives TIFF from it for apps that request that flavour
     /// instead.
     #[must_use]
     pub fn with_image(mut self, png: ByteSource) -> Self {
@@ -536,7 +536,7 @@ impl NativeSurface {
 /// All coordinates are **window-local logical points with a top-left origin** —
 /// Scrozz's convention everywhere, and the space `scrozz-ui` already works in.
 /// The flip into AppKit's bottom-left space happens inside the macOS backend,
-/// via [`card_rect_in_view`].
+/// via [`card_rect_in_view`] and [`point_in_view`].
 #[derive(Debug, Clone, Copy)]
 pub struct DragOrigin {
     surface: NativeSurface,
@@ -602,6 +602,16 @@ pub fn card_rect_in_view(card: LogicalRect, view_height: f64, flipped: bool) -> 
         )
     } else {
         logical_to_appkit(card, view_height)
+    }
+}
+
+/// Places a top-left-origin point in a native view's own coordinate system.
+#[must_use]
+pub fn point_in_view(point: LogicalPoint, view_height: f64, flipped: bool) -> LogicalPoint {
+    if flipped {
+        point
+    } else {
+        LogicalPoint::new(point.x, view_height - point.y)
     }
 }
 

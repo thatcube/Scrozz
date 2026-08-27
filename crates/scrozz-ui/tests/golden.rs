@@ -110,6 +110,14 @@ fn renderer() -> SoftwareRenderer {
     SoftwareRenderer::production()
 }
 
+#[test]
+fn only_the_annotation_editor_remains_a_placeholder() {
+    assert_eq!(
+        SceneRegistry::production().placeholder_scenarios(),
+        vec![Scenario::EditorAnnotating]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 1. Determinism
 // ---------------------------------------------------------------------------

@@ -27,13 +27,63 @@
 //! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
 //! `detail` string rather than being a bool.
 
-use std::ffi::c_void;
+use std::{
+    ffi::c_void,
+    sync::{Arc, Mutex},
+};
 
 use raw_window_handle::HasWindowHandle;
 #[cfg(target_os = "macos")]
 use raw_window_handle::RawWindowHandle;
-use scrozz_shell::{NativeOverlay, OverlayBehavior};
+use scrozz_core::Error;
+use scrozz_shell::{NativeOverlay, NativeSurface, OverlayBehavior};
 use scrozz_ui::PanelReport;
+
+/// The live native view shared by panel setup and drag-out.
+///
+/// The pointer is stored as an address so this synchronization container stays
+/// `Send + Sync`; reconstruction remains inside this app's audited unsafe
+/// boundary and only happens on the main thread.
+#[derive(Clone, Debug, Default)]
+pub struct NativeSurfaceSlot {
+    address: Arc<Mutex<Option<usize>>>,
+}
+
+impl NativeSurfaceSlot {
+    fn remember(&self, view: *mut c_void) {
+        if !view.is_null()
+            && let Ok(mut address) = self.address.lock()
+        {
+            *address = Some(view as usize);
+        }
+    }
+
+    /// Returns the live view captured during window creation.
+    #[must_use]
+    pub fn get(&self) -> Option<NativeSurface> {
+        let address = self.address.lock().ok()?.as_ref().copied()?;
+        // SAFETY: `remember` accepts only the NSView from eframe's live window
+        // handle. The slot is owned by that same Windowed host and no drag can
+        // outlive its event loop.
+        Some(unsafe { NativeSurface::from_raw(address as *mut c_void) })
+    }
+
+    /// Changes panel visibility without taking keyboard focus.
+    #[cfg(target_os = "macos")]
+    pub fn set_visible_without_activation(&self, visible: bool) -> scrozz_core::Result<()> {
+        let address = self
+            .address
+            .lock()
+            .ok()
+            .and_then(|address| *address)
+            .ok_or_else(|| Error::TargetGone("the overlay NSView is unavailable".to_owned()))?;
+        // SAFETY: the slot contains only the live NSView captured from eframe,
+        // and this hook runs from the overlay's main-thread update.
+        let overlay = unsafe { NativeOverlay::from_ns_view(address as *mut c_void)? };
+        overlay.set_visible_without_activation(visible);
+        Ok(())
+    }
+}
 
 /// Converts the window hosting `ns_view` into a non-activating overlay panel.
 ///
@@ -96,7 +146,26 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
 /// pins the arm this reaches for.
 #[must_use]
 pub fn hook() -> scrozz_ui::PanelHook {
-    Box::new(|cc: &eframe::CreationContext<'_>| {
+    hook_with_surface(NativeSurfaceSlot::default())
+}
+
+/// The panel hook while retaining the view for native drag-out.
+#[must_use]
+pub fn hook_with_surface(surface: NativeSurfaceSlot) -> scrozz_ui::PanelHook {
+    hook_configured(surface, true)
+}
+
+/// Retains the native view without converting its window into a panel.
+///
+/// This keeps native drag-out available when panel conversion is disabled for
+/// diagnostics.
+#[must_use]
+pub fn hook_without_conversion(surface: NativeSurfaceSlot) -> scrozz_ui::PanelHook {
+    hook_configured(surface, false)
+}
+
+fn hook_configured(surface: NativeSurfaceSlot, convert: bool) -> scrozz_ui::PanelHook {
+    Box::new(move |cc: &eframe::CreationContext<'_>| {
         let handle = match cc.window_handle() {
             Ok(handle) => handle,
             Err(err) => {
@@ -116,7 +185,15 @@ pub fn hook() -> scrozz_ui::PanelHook {
         // SAFETY: `handle` borrows the window for this scope, so the view is
         // alive; `OverlayApp::new` runs on the main thread.
         #[cfg(target_os = "macos")]
-        return unsafe { convert_ns_view(appkit.ns_view.as_ptr()) };
+        {
+            let view = appkit.ns_view.as_ptr();
+            surface.remember(view);
+            if convert {
+                unsafe { convert_ns_view(view) }
+            } else {
+                PanelReport::unsupported("the panel conversion is disabled")
+            }
+        }
 
         #[cfg(not(target_os = "macos"))]
         {

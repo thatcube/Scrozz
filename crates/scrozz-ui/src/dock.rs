@@ -27,7 +27,12 @@
 //! `pub mod stack;`. `lib.rs` must **not** also declare `pub mod dock;` — that
 //! would compile this file twice into two unrelated type identities.
 
-use crate::motion::{Activity, Duration, Ease, Motion, Timeline};
+use crate::{
+    icons::Icon,
+    motion::{Activity, Duration, Ease, Motion, Timeline, fade},
+    paint::{self, Surface},
+    theme::{Radius, corner},
+};
 use egui::{Rect, Vec2, pos2, vec2};
 
 /// Dock height as a fraction of card height.
@@ -277,4 +282,43 @@ pub fn rect_for_slot0(slot0: Rect) -> Rect {
         pos2(slot0.left(), slot0.bottom() - h),
         vec2(slot0.width(), h),
     )
+}
+
+/// Paints the production dock and returns its hit rectangle and click state.
+///
+/// Shared by the live overlay and deterministic harness so store assets cannot
+/// drift into a second rendering of the same surface.
+pub fn draw(
+    ui: &mut egui::Ui,
+    surface: &Surface<'_>,
+    dock: &Dock,
+    m: &Motion,
+) -> (Option<Rect>, bool) {
+    if !dock.is_visible(m) {
+        return (None, false);
+    }
+    let rect = dock.rect();
+    let alpha = dock.alpha(m);
+    if alpha <= 0.004 || rect.width() <= 0.0 {
+        return (None, false);
+    }
+    let palette = surface.palette();
+    let painter = ui.painter();
+    paint::soft_shadow(painter, rect, Radius::BAR, palette, 0.6 * alpha);
+    painter.rect_filled(
+        rect,
+        corner(Radius::BAR),
+        fade(palette.card_fill_raised, alpha),
+    );
+    surface.icons.draw_faded(
+        painter,
+        Icon::ChevronRight,
+        dock.chevron_rect().center(),
+        crate::icons::SIZE,
+        palette.text_muted,
+        alpha,
+    );
+
+    let response = ui.interact(rect, egui::Id::new("scrozz.dock"), egui::Sense::click());
+    (Some(rect), response.clicked())
 }

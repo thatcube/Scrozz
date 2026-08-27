@@ -23,11 +23,15 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
-    SystemPermissions, Tray, TrayAction,
+    Accelerator, Capability, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession,
+    DragSource, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions, SystemPermissions,
+    Tray, TrayAction, native_drag_source,
 };
 
 use crate::{
@@ -55,6 +59,9 @@ pub const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("Cmd+Shift+9", Action::Capture(CaptureKind::Window)),
 ];
 
+const OVERLAY_ESCAPE_ACCELERATOR: &str = "Escape";
+const OVERLAY_ESCAPE_ACTION: &str = "overlay-dismiss-all";
+
 /// Overrides the whole binding table, as `accelerator=action-id` pairs.
 ///
 /// e.g. `SCROZZ_GUI_HOTKEYS="Ctrl+Alt+P=capture.fullscreen"`. Empty disables
@@ -77,6 +84,51 @@ pub const DEADLINE_ENV: &str = "SCROZZ_GUI_TIMEOUT_MS";
 /// The end-to-end path without touching the keyboard.
 pub const AUTOCAPTURE_ENV: &str = "SCROZZ_GUI_CAPTURE_ON_START";
 
+/// Card-size multiplier (`0.5..=2.0`).
+pub const CARD_SCALE_ENV: &str = "SCROZZ_GUI_CARD_SCALE";
+
+/// Stack inset from the selected display's work-area edges, in points.
+pub const STACK_MARGIN_ENV: &str = "SCROZZ_GUI_STACK_MARGIN";
+
+/// Inactivity interval in milliseconds. `0` disables auto-close.
+pub const AUTO_CLOSE_ENV: &str = "SCROZZ_GUI_AUTO_CLOSE_MS";
+
+/// Which display supplies the overlay work area: `active` or `primary`.
+pub const DISPLAY_ENV: &str = "SCROZZ_GUI_DISPLAY";
+
+/// How the capture stack is sized and placed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayConfig {
+    /// Multiplier for card size and spacing.
+    pub card_scale: f32,
+    /// Inset from the work-area edges.
+    pub stack_margin: f32,
+    /// Inactivity interval; `None` keeps unpinned cards open.
+    pub auto_close: Option<Duration>,
+    /// Display selection policy.
+    pub display: OverlayDisplay,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            card_scale: 1.0,
+            stack_margin: 16.0,
+            auto_close: Some(Duration::from_secs(8)),
+            display: OverlayDisplay::Active,
+        }
+    }
+}
+
+/// Which display hosts the transient capture stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayDisplay {
+    /// Follow the display containing the pointer.
+    Active,
+    /// Stay on the menu-bar/primary display.
+    Primary,
+}
+
 /// How the GUI was asked to run.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -90,6 +142,8 @@ pub struct Config {
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
     pub capture_on_start: Option<CaptureKind>,
+    /// Capture-stack size, position, timeout, and display behavior.
+    pub overlay: OverlayConfig,
 }
 
 impl Default for Config {
@@ -103,6 +157,7 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
+            overlay: OverlayConfig::default(),
         }
     }
 }
@@ -137,6 +192,30 @@ impl Config {
                 _ => Some(CaptureKind::Fullscreen),
             };
         }
+        if let Ok(raw) = std::env::var(CARD_SCALE_ENV)
+            && let Ok(scale) = raw.parse::<f32>()
+            && scale.is_finite()
+        {
+            config.overlay.card_scale = scale.clamp(0.5, 2.0);
+        }
+        if let Ok(raw) = std::env::var(STACK_MARGIN_ENV)
+            && let Ok(margin) = raw.parse::<f32>()
+            && margin.is_finite()
+        {
+            config.overlay.stack_margin = margin.clamp(0.0, 256.0);
+        }
+        if let Ok(raw) = std::env::var(AUTO_CLOSE_ENV)
+            && let Ok(ms) = raw.parse::<u64>()
+        {
+            config.overlay.auto_close = (ms > 0).then(|| Duration::from_millis(ms));
+        }
+        if let Ok(raw) = std::env::var(DISPLAY_ENV) {
+            config.overlay.display = if raw.eq_ignore_ascii_case("primary") {
+                OverlayDisplay::Primary
+            } else {
+                OverlayDisplay::Active
+            };
+        }
 
         config
     }
@@ -153,6 +232,7 @@ impl Config {
             ipc: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
+            overlay: OverlayConfig::default(),
         }
     }
 }
@@ -190,6 +270,16 @@ pub struct App {
     started: Instant,
     captures: u64,
     notes: Vec<String>,
+    drags: Vec<InFlightDrag>,
+    deferred_action_dismissals: HashSet<crate::gui::card::CardId>,
+    escape_registered: bool,
+    escape_retry_at: Option<Instant>,
+    overlay_hidden: bool,
+}
+
+struct InFlightDrag {
+    card: crate::gui::card::CardId,
+    session: DragSession,
 }
 
 impl App {
@@ -270,6 +360,11 @@ impl App {
             started: Instant::now(),
             captures: 0,
             notes,
+            drags: Vec::new(),
+            deferred_action_dismissals: HashSet::new(),
+            escape_registered: false,
+            escape_retry_at: None,
+            overlay_hidden: false,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -299,6 +394,8 @@ impl App {
         }
         self.drain_pipeline();
         self.drain_cards();
+        self.drain_drags();
+        self.reconcile_escape_binding();
 
         Tick::Continue
     }
@@ -338,6 +435,10 @@ impl App {
         }
 
         for id in pending {
+            if id == OVERLAY_ESCAPE_ACTION {
+                self.surface.dismiss_all();
+                continue;
+            }
             if let Some(action) = Action::from_id(&id) {
                 self.perform(action);
             } else {
@@ -382,25 +483,50 @@ impl App {
 
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
-            match outcome {
-                Outcome::Ready(card) => {
-                    self.captures += 1;
-                    let summary = card.summary();
-                    if let Err(err) = self.surface.present(*card) {
-                        self.note(format!("a card could not be shown: {err}"));
+            self.handle_pipeline_outcome(outcome);
+        }
+    }
+
+    fn handle_pipeline_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Ready(card) => {
+                self.captures += 1;
+                let summary = card.summary();
+                if let Err(err) = self.surface.present(*card) {
+                    self.note(format!("a card could not be shown: {err}"));
+                } else {
+                    self.ensure_escape_binding();
+                    self.note(summary);
+                }
+            }
+            Outcome::Failed { card, error } => {
+                self.note(format!("{card} failed: {error}"));
+            }
+            Outcome::Done {
+                card,
+                detail,
+                dismiss,
+            } => {
+                if dismiss {
+                    if self.drags.iter().any(|drag| drag.card == card) {
+                        self.deferred_action_dismissals.insert(card);
                     } else {
-                        self.note(summary);
+                        self.surface.dismiss_after_action(card);
+                        self.pipeline.post(Job::Release(card));
                     }
                 }
-                Outcome::Failed { card, error } => {
-                    self.note(format!("{card} failed: {error}"));
-                }
-                Outcome::Done { card, detail } => {
-                    self.note(format!("{card} {detail}"));
-                }
-                Outcome::Refused { card, error } => {
-                    self.note(format!("{card} refused: {error}"));
-                }
+                self.note(format!("{card} {detail}"));
+            }
+            Outcome::PinUpdated {
+                card,
+                pinned,
+                detail,
+            } => {
+                self.surface.set_pinned(card, pinned);
+                self.note(format!("{card} {detail}"));
+            }
+            Outcome::Refused { card, error } => {
+                self.note(format!("{card} refused: {error}"));
             }
         }
     }
@@ -426,13 +552,198 @@ impl App {
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
                 }
-                // Not yet routed. The drag payload is `scrozz-shell`'s
-                // `DragSource`, and collapsing into the dock is the capture
-                // stack's own animation — both belong to the surface that
-                // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
-                    self.note(format!("{id}: {event:?} is not routed yet"));
+                CardEvent::DragStarted(_) => {
+                    // The native session begins when directional intent commits.
+                    // This earlier event exists for diagnostics and deliberately
+                    // performs no work.
                 }
+                CardEvent::DragOut { id, rect, pointer } => {
+                    self.begin_native_drag(id, rect, pointer);
+                }
+                CardEvent::Collapse(_) | CardEvent::DockCollapsed => {
+                    self.note("capture stack collapsed");
+                }
+                CardEvent::DockExpanded => {
+                    self.note("capture stack expanded");
+                }
+                CardEvent::Emptied => {
+                    self.release_escape_binding();
+                    self.note("capture stack emptied");
+                }
+                CardEvent::Restored(id) => {
+                    self.ensure_escape_binding();
+                    self.note(format!("{id} restored"));
+                }
+                CardEvent::VisibilityChanged { hidden } => {
+                    self.overlay_hidden = hidden;
+                    self.reconcile_escape_binding();
+                }
+                CardEvent::Open(id) => {
+                    self.note(format!("{id}: annotation editor is not built yet"));
+                }
+                CardEvent::Upload(id) => {
+                    self.pipeline.post(Job::Upload(id));
+                }
+                CardEvent::Pin { id, pinned } => {
+                    self.pipeline.post(Job::Pin { card: id, pinned });
+                }
+            }
+        }
+    }
+
+    fn begin_native_drag(
+        &mut self,
+        card: crate::gui::card::CardId,
+        rect: scrozz_core::LogicalRect,
+        pointer: scrozz_core::LogicalPoint,
+    ) {
+        let Some(surface) = self.surface.native_surface() else {
+            self.surface.finish_drag(card, false);
+            self.note(format!(
+                "{card} could not start drag-out because the overlay has no native surface"
+            ));
+            return;
+        };
+        let source = match native_drag_source() {
+            Ok(source) => source,
+            Err(error) => {
+                self.surface.finish_drag(card, false);
+                self.note(format!("{card} could not start drag-out: {error}"));
+                return;
+            }
+        };
+        let byte_source = match self.pipeline.lease_bytes(card) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.surface.finish_drag(card, false);
+                self.note(format!("{card} could not load drag-out bytes: {error}"));
+                return;
+            }
+        };
+        let preview = match byte_source().and_then(|png| DragPreview::from_png(png, rect.size)) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.surface.finish_drag(card, false);
+                self.note(format!("{card} could not build its drag preview: {error}"));
+                return;
+            }
+        };
+        let payload = DragPayload::png_capture(&format!("Scrozz capture {}", card.0), byte_source)
+            .with_preview(preview);
+        if !self.release_escape_binding() {
+            self.surface.finish_drag(card, false);
+            self.note(format!(
+                "{card} could not start drag-out while the Escape binding remained active"
+            ));
+            return;
+        }
+        match source.begin(payload, DragOrigin::new(surface, rect, pointer)) {
+            Ok(session) => self.drags.push(InFlightDrag { card, session }),
+            Err(error) => {
+                self.surface.finish_drag(card, false);
+                self.ensure_escape_binding();
+                self.note(format!("{card} could not start drag-out: {error}"));
+            }
+        }
+    }
+
+    fn drain_drags(&mut self) {
+        let mut finished = Vec::new();
+        for (index, drag) in self.drags.iter().enumerate() {
+            if let Some(outcome) = drag.session.outcome() {
+                finished.push((index, drag.card, outcome));
+            }
+        }
+        for (index, card, outcome) in finished.into_iter().rev() {
+            self.drags.remove(index);
+            let accepted = outcome.is_accepted();
+            let dismiss_after_drag = self.deferred_action_dismissals.remove(&card);
+            self.surface.finish_drag(card, accepted);
+            if accepted {
+                self.pipeline.post(Job::Release(card));
+                self.note(format!("{card} drag-out accepted"));
+            } else {
+                if dismiss_after_drag {
+                    // FinishDrag restores first; dismissal is queued after it so
+                    // a successful Copy/Save still retires the restored card.
+                    self.surface.dismiss_after_action(card);
+                    self.pipeline.post(Job::Release(card));
+                }
+                let detail = match outcome {
+                    DragOutcome::Rejected => "drop target rejected it".to_owned(),
+                    DragOutcome::Cancelled => "drag-out cancelled".to_owned(),
+                    DragOutcome::Failed(error) => format!("drag-out failed: {error}"),
+                    DragOutcome::Accepted(_) => unreachable!("accepted was handled above"),
+                    _ => "drag-out ended without acceptance".to_owned(),
+                };
+                self.note(format!("{card} {detail}"));
+            }
+            self.ensure_escape_binding();
+        }
+    }
+
+    /// Drains interactions emitted while the overlay was drawing this frame.
+    ///
+    /// The window host calls this before returning from the native mouse event,
+    /// which lets AppKit begin a drag with the real initiating event still live.
+    pub(super) fn drain_overlay_events(&mut self) {
+        self.drain_cards();
+        self.drain_drags();
+        self.reconcile_escape_binding();
+    }
+
+    fn reconcile_escape_binding(&mut self) {
+        if self.overlay_hidden || self.surface.is_empty() || !self.drags.is_empty() {
+            let _ = self.release_escape_binding();
+        } else {
+            self.ensure_escape_binding();
+        }
+    }
+
+    fn ensure_escape_binding(&mut self) {
+        if self.escape_registered
+            || self.surface.is_empty()
+            || !self.drags.is_empty()
+            || self.overlay_hidden
+            || self
+                .escape_retry_at
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+        let hotkey = Hotkey {
+            accelerator: OVERLAY_ESCAPE_ACCELERATOR.to_owned(),
+        };
+        match self.hotkeys.register(&hotkey, OVERLAY_ESCAPE_ACTION) {
+            Ok(()) => {
+                self.escape_registered = true;
+                self.escape_retry_at = None;
+            }
+            Err(error) => {
+                self.escape_retry_at = Some(Instant::now() + Duration::from_secs(5));
+                self.note(format!(
+                    "Escape could not dismiss the capture stack: {error}"
+                ));
+            }
+        }
+    }
+
+    fn release_escape_binding(&mut self) -> bool {
+        self.escape_retry_at = None;
+        if !self.escape_registered {
+            return true;
+        }
+        let hotkey = Hotkey {
+            accelerator: OVERLAY_ESCAPE_ACCELERATOR.to_owned(),
+        };
+        match self.hotkeys.unregister(&hotkey) {
+            Ok(()) => {
+                self.escape_registered = false;
+                true
+            }
+            Err(error) => {
+                self.note(format!("Escape binding could not be released: {error}"));
+                false
             }
         }
     }
@@ -450,6 +761,16 @@ impl App {
                 // and has no session to toggle yet. Saying so beats a menu item
                 // that does nothing.
                 self.note("recording is not wired up yet");
+                Tick::Continue
+            }
+            Action::RestoreRecent => {
+                self.surface.restore_recent();
+                self.note("restore-last requested");
+                Tick::Continue
+            }
+            Action::ToggleOverlay => {
+                self.surface.toggle_hidden();
+                self.note("capture stack visibility toggled");
                 Tick::Continue
             }
             Action::OpenHistory => {
@@ -661,7 +982,11 @@ mod tests {
     #[test]
     fn copying_a_card_reaches_the_worker_and_comes_back() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Copy(CardId(42)));
+        let card = CardId(42);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        surface.inject(CardEvent::Copy(card));
         app.tick();
 
         // The worker has no bytes for a card it never captured, so the answer
@@ -669,6 +994,7 @@ mod tests {
         for _ in 0..200 {
             app.drain_pipeline();
             if app.notes().iter().any(|n| n.contains("card:42 refused")) {
+                assert_eq!(app.showing(), 1, "a failed copy must remain retryable");
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -677,15 +1003,159 @@ mod tests {
     }
 
     #[test]
-    fn an_unrouted_card_gesture_is_recorded_not_swallowed() {
+    fn only_successful_retiring_actions_dismiss_the_card() {
+        let (mut app, _) = app();
+        let card = CardId(43);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+
+        app.handle_pipeline_outcome(Outcome::Refused {
+            card,
+            error: CliError::usage("clipboard unavailable"),
+        });
+        assert_eq!(app.showing(), 1);
+
+        app.handle_pipeline_outcome(Outcome::Done {
+            card,
+            detail: "copied".to_owned(),
+            dismiss: true,
+        });
+        assert_eq!(app.showing(), 0);
+    }
+
+    #[test]
+    fn successful_action_waits_for_an_active_drag_to_restore_before_dismissal() {
+        let (mut app, _) = app();
+        let card = CardId(44);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        let session = DragSession::new();
+        app.drags.push(InFlightDrag {
+            card,
+            session: session.clone(),
+        });
+
+        app.handle_pipeline_outcome(Outcome::Done {
+            card,
+            detail: "copied".to_owned(),
+            dismiss: true,
+        });
+        assert_eq!(app.showing(), 1);
+        assert!(app.deferred_action_dismissals.contains(&card));
+
+        session.finish(DragOutcome::Cancelled);
+        app.drain_drags();
+
+        assert_eq!(app.showing(), 0);
+        assert!(!app.deferred_action_dismissals.contains(&card));
+    }
+
+    #[test]
+    fn pin_state_reaches_the_surface_only_after_persistence_acknowledges_it() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Drag(CardId(5)));
+        let card = CardId(45);
+
+        app.handle_pipeline_outcome(Outcome::Refused {
+            card,
+            error: CliError::usage("capture history is unavailable"),
+        });
+        assert!(surface.pin_updates().is_empty());
+
+        app.handle_pipeline_outcome(Outcome::PinUpdated {
+            card,
+            pinned: true,
+            detail: "pinned in capture history".to_owned(),
+        });
+        assert_eq!(surface.pin_updates(), vec![(card, true)]);
+    }
+
+    #[test]
+    fn stack_events_are_recorded_not_swallowed() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::DockCollapsed);
+        surface.inject(CardEvent::DockExpanded);
+        surface.inject(CardEvent::Emptied);
         app.tick();
-        assert!(
-            app.notes().iter().any(|n| n.contains("not routed yet")),
-            "{:?}",
-            app.notes()
-        );
+        let notes = app.notes().join("\n");
+        assert!(notes.contains("stack collapsed"), "{notes}");
+        assert!(notes.contains("stack expanded"), "{notes}");
+        assert!(notes.contains("stack emptied"), "{notes}");
+    }
+
+    #[test]
+    fn escape_is_bound_only_while_the_stack_has_cards() {
+        let (mut app, surface) = app();
+        let card = CardId(9);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+
+        app.ensure_escape_binding();
+        let escape = Accelerator::parse(OVERLAY_ESCAPE_ACCELERATOR).expect("Escape parses");
+        assert!(app.escape_registered);
+        assert_eq!(app.hotkeys.action_for(&escape), Some(OVERLAY_ESCAPE_ACTION));
+
+        surface.inject(CardEvent::Dismiss(card));
+        surface.inject(CardEvent::Emptied);
+        app.drain_cards();
+
+        assert!(!app.escape_registered);
+        assert_eq!(app.hotkeys.action_for(&escape), None);
+    }
+
+    #[test]
+    fn an_escape_registration_retry_resets_after_the_stack_empties() {
+        let (mut app, surface) = app();
+        app.escape_retry_at = Some(Instant::now() + Duration::from_secs(5));
+
+        surface.inject(CardEvent::Emptied);
+        app.drain_cards();
+
+        assert!(app.escape_retry_at.is_none());
+    }
+
+    #[test]
+    fn restoring_after_emptying_the_stack_reinstates_escape() {
+        let (mut app, surface) = app();
+        let card = CardId(11);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        app.ensure_escape_binding();
+
+        surface.inject(CardEvent::Dismiss(card));
+        surface.inject(CardEvent::Emptied);
+        app.drain_cards();
+        assert!(!app.escape_registered);
+
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        surface.inject(CardEvent::Restored(card));
+        app.drain_cards();
+
+        assert!(app.escape_registered);
+    }
+
+    #[test]
+    fn hiding_the_stack_releases_escape_until_it_is_visible_again() {
+        let (mut app, surface) = app();
+        let card = CardId(12);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        app.ensure_escape_binding();
+        assert!(app.escape_registered);
+
+        surface.inject(CardEvent::VisibilityChanged { hidden: true });
+        app.drain_cards();
+        assert!(!app.escape_registered);
+
+        surface.inject(CardEvent::VisibilityChanged { hidden: false });
+        app.drain_cards();
+        assert!(app.escape_registered);
     }
 
     #[test]

@@ -10,12 +10,13 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scrozz_ui::{
     OverlayHandle,
-    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
+    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions, VisibilityHook},
+    stack::CardMetrics,
 };
 
 use scrozz_core::Error as CoreError;
@@ -23,9 +24,10 @@ use scrozz_core::Error as CoreError;
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, Tick},
+        app::{App, Config, OverlayConfig, OverlayDisplay, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
+        panel::NativeSurfaceSlot,
     },
     report::Report,
 };
@@ -121,13 +123,13 @@ impl Host for Headless {
 /// headless. Silently running without a window when a window was asked for is
 /// the failure mode this whole module exists to avoid: the app appears to work
 /// and nothing ever appears on screen.
-pub fn for_platform(_config: &Config, emit: Emit) -> CliResult<Box<dyn Host>> {
+pub fn for_platform(config: &Config, emit: Emit) -> CliResult<Box<dyn Host>> {
     if headless_requested() {
         return Ok(Box::new(Headless));
     }
 
     if HAS_WINDOW {
-        return Ok(Box::new(Windowed::new(emit)));
+        return Ok(Box::new(Windowed::configured(emit, config.overlay)));
     }
 
     Err(CliError::NotImplemented {
@@ -165,15 +167,25 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
 pub struct Windowed {
     handle: OverlayHandle,
     emit: Emit,
+    config: OverlayConfig,
+    native_surface: NativeSurfaceSlot,
 }
 
 impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
+        Self::configured(emit, OverlayConfig::default())
+    }
+
+    /// A window host with explicit stack controls.
+    #[must_use]
+    pub fn configured(emit: Emit, config: OverlayConfig) -> Self {
         Self {
             handle: OverlayHandle::new(),
             emit,
+            config,
+            native_surface: NativeSurfaceSlot::default(),
         }
     }
 }
@@ -186,13 +198,22 @@ impl Default for Windowed {
 
 impl Host for Windowed {
     fn run(self: Box<Self>, app: App) -> CliResult<Report> {
-        let geometry = work_area();
+        let geometry = work_area(self.config.display);
         tracing::info!(?geometry, "opening the overlay");
 
+        let mut metrics = CardMetrics::default().scaled(self.config.card_scale);
+        metrics.margin = self.config.stack_margin;
+        let geometry_state = Arc::new(Mutex::new(geometry));
         let options = OverlayOptions {
             geometry,
-            panel: panel_hook(),
-            probe: pointer_probe(),
+            panel: panel_hook(self.native_surface.clone()),
+            visibility: visibility_hook(self.native_surface.clone()),
+            probe: pointer_probe(Arc::clone(&geometry_state)),
+            card_metrics: metrics,
+            auto_close_secs: self
+                .config
+                .auto_close
+                .map(|duration| duration.as_secs_f64()),
             ..Default::default()
         };
 
@@ -203,6 +224,7 @@ impl Host for Windowed {
         let sink = Arc::clone(&outcome);
         let handle = self.handle.clone();
         let reporting = self.handle.clone();
+        let display = self.config.display;
         let emit = self.emit;
 
         eframe::run_native(
@@ -218,6 +240,10 @@ impl Host for Windowed {
                     emit: Some(emit),
                     announced: false,
                     stopped: false,
+                    display,
+                    geometry,
+                    geometry_state,
+                    last_display_probe: Instant::now(),
                 }))
             }),
         )
@@ -250,7 +276,10 @@ impl Host for Windowed {
     fn surface(&self) -> Box<dyn CardSurface> {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
-        Box::new(OverlayCards::new(self.handle.clone()))
+        Box::new(OverlayCards::with_native_surface(
+            self.handle.clone(),
+            self.native_surface.clone(),
+        ))
     }
 }
 
@@ -263,6 +292,10 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
+    display: OverlayDisplay,
+    geometry: OverlayGeometry,
+    geometry_state: Arc<Mutex<OverlayGeometry>>,
+    last_display_probe: Instant,
 }
 
 impl Driver {
@@ -344,25 +377,42 @@ impl eframe::App for Driver {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
 
-        if !self.stopped && self.app.tick() == Tick::Stop {
-            self.stopped = true;
-            let report = self.app.report();
-            if let Ok(mut slot) = self.sink.lock() {
-                *slot = Some(report.clone());
-            }
-            // Before the window closes, so the menu-bar item never outlives
-            // what the user can see.
-            self.app.shut_down();
-
-            if self.converted() {
-                if let Some(emit) = self.emit.take() {
-                    emit(&report);
+        if self.last_display_probe.elapsed() >= Duration::from_millis(250) {
+            self.last_display_probe = Instant::now();
+            let geometry = work_area(self.display);
+            if geometry != self.geometry {
+                self.geometry = geometry;
+                if let Ok(mut current) = self.geometry_state.lock() {
+                    *current = geometry;
                 }
-                tracing::debug!("leaving without dismantling the converted panel");
-                std::process::exit(0);
+                self.handle.set_geometry(geometry);
             }
+        }
 
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if !self.stopped {
+            if self.app.tick() == Tick::Stop {
+                self.stopped = true;
+                let report = self.app.report();
+                if let Ok(mut slot) = self.sink.lock() {
+                    *slot = Some(report.clone());
+                }
+                // Before the window closes, so the menu-bar item never outlives
+                // what the user can see.
+                self.app.shut_down();
+
+                if self.converted() {
+                    if let Some(emit) = self.emit.take() {
+                        emit(&report);
+                    }
+                    tracing::debug!("leaving without dismantling the converted panel");
+                    std::process::exit(0);
+                }
+
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.overlay.service_hidden(ctx);
+                self.app.drain_overlay_events();
+            }
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while
@@ -373,6 +423,7 @@ impl eframe::App for Driver {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.overlay.ui(ui, frame);
+        self.app.drain_overlay_events();
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -391,16 +442,16 @@ impl eframe::App for Driver {
 pub const PANEL_ENV: &str = "SCROZZ_GUI_PANEL";
 
 /// The native panel conversion, unless it was switched off.
-fn panel_hook() -> Option<scrozz_ui::PanelHook> {
+fn panel_hook(native_surface: NativeSurfaceSlot) -> Option<scrozz_ui::PanelHook> {
     let enabled =
         std::env::var(PANEL_ENV).map_or(true, |raw| !matches!(raw.as_str(), "0" | "false" | "no"));
     if !enabled {
         tracing::warn!(
             "the panel conversion is disabled; capture cards will pull focus when clicked"
         );
-        return None;
+        return Some(crate::gui::panel::hook_without_conversion(native_surface));
     }
-    Some(crate::gui::panel::hook())
+    Some(crate::gui::panel::hook_with_surface(native_surface))
 }
 
 /// Where the overlay window goes.
@@ -408,10 +459,14 @@ fn panel_hook() -> Option<scrozz_ui::PanelHook> {
 /// The work area, not the display bounds: anchoring a card to the bottom-left
 /// of the *bounds* puts it behind the Dock. Falls back to a sensible default
 /// rather than failing, because a card in a slightly wrong place beats no card.
-fn work_area() -> OverlayGeometry {
+fn work_area(display: OverlayDisplay) -> OverlayGeometry {
     #[cfg(target_os = "macos")]
     {
-        match scrozz_shell::macos::display::active_display() {
+        let selected = match display {
+            OverlayDisplay::Active => scrozz_shell::macos::display::active_display(),
+            OverlayDisplay::Primary => scrozz_shell::macos::display::primary_display(),
+        };
+        match selected {
             Ok(display) => {
                 let area = display.work_area;
                 return OverlayGeometry::new(egui::Rect::from_min_size(
@@ -430,24 +485,45 @@ fn work_area() -> OverlayGeometry {
 
 /// An exact pointer source for the click-through logic, if one is available.
 ///
-/// Returns `None` today. See [`PROBE_GAP`] — the degradation is bounded and
-/// documented, and a probe that guessed would be worse than none.
-fn pointer_probe() -> Option<scrozz_ui::PointerProbe> {
-    tracing::debug!("{PROBE_GAP}");
-    None
+/// macOS exposes the global pointer in the same flipped coordinate system as the
+/// display work areas, so converting to overlay-local coordinates is exact.
+fn pointer_probe(geometry: Arc<Mutex<OverlayGeometry>>) -> Option<scrozz_ui::PointerProbe> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Arc::new(move || {
+            let point = scrozz_shell::macos::display::pointer_location().ok()?;
+            let geometry = *geometry.lock().ok()?;
+            Some(egui::pos2(
+                point.x as f32 - geometry.work_area.left(),
+                point.y as f32 - geometry.work_area.top(),
+            ))
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = geometry;
+        None
+    }
 }
 
-/// Why there is no pointer probe.
-pub const PROBE_GAP: &str = "no crate exposes the pointer as a point. \
-     scrozz-shell reads NSEvent::mouseLocation inside \
-     macos::display::active_display and returns the Display containing it, \
-     never the location, so the one correct implementation of the AppKit \
-     coordinate flip is not reachable from here. Exposing \
-     `pub fn pointer_location() -> Result<LogicalPoint>` next to \
-     active_display would be a three-line extraction and is the right fix; \
-     calling NSEvent::mouseLocation again from this crate would duplicate \
-     that flip and eventually disagree with it. Without a probe the overlay \
-     re-samples click-through every 350ms, which is imprecise but bounded";
+/// Focus-preserving native visibility control where the platform provides it.
+fn visibility_hook(surface: NativeSurfaceSlot) -> Option<VisibilityHook> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Arc::new(move |visible| {
+            if let Err(error) = surface.set_visible_without_activation(visible) {
+                tracing::warn!(%error, visible, "could not change overlay visibility");
+            }
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = surface;
+        None
+    }
+}
 
 /// Whether the environment asked for a run without a window.
 #[must_use]
@@ -522,8 +598,11 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_gap_names_the_fix_rather_than_apologising() {
-        assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
-        assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    fn macos_has_an_exact_pointer_probe() {
+        let geometry = Arc::new(Mutex::new(OverlayGeometry::default()));
+        #[cfg(target_os = "macos")]
+        assert!(pointer_probe(geometry).is_some());
+        #[cfg(not(target_os = "macos"))]
+        assert!(pointer_probe(geometry).is_none());
     }
 }

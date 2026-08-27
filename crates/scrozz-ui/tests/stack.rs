@@ -348,6 +348,60 @@ fn overflow_and_manual_dismissal_use_the_same_exit() {
     assert_rect_eq(a.rect, b.rect, "one shared departure animation (D21)");
 }
 
+#[test]
+fn overflow_skips_a_protected_oldest_card() {
+    let mut s = stack();
+    let ids: Vec<_> = (0..s.capacity()).map(|_| s.push(&at(0))).collect();
+    s.advance(&at(SETTLED));
+
+    let pushed = s.push_with_protection(&at(SETTLED), |id| id == ids[0]);
+
+    assert!(pushed.resident);
+    assert_eq!(pushed.retired, vec![ids[1]]);
+    assert_eq!(
+        s.slot_of(ids[0]),
+        Some(0),
+        "the protected oldest stayed put"
+    );
+    assert_eq!(s.slot_of(ids[1]), None);
+    assert_eq!(s.slot_of(pushed.id), Some(s.capacity() - 1));
+}
+
+#[test]
+fn overflow_refuses_a_new_resident_when_every_card_is_protected() {
+    let mut s = stack();
+    let ids: Vec<_> = (0..s.capacity()).map(|_| s.push(&at(0))).collect();
+
+    let pushed = s.push_with_protection(&at(SETTLED), |id| ids.contains(&id));
+
+    assert!(!pushed.resident);
+    assert!(pushed.retired.is_empty());
+    assert_eq!(s.len(), s.capacity());
+    assert_eq!(s.slot_of(pushed.id), None);
+}
+
+#[test]
+fn a_push_after_protected_overcapacity_reports_every_retirement() {
+    let mut s = stack();
+    let ids: Vec<_> = (0..s.capacity()).map(|_| s.push(&at(0))).collect();
+    s.resize_with_protection(work_area(300.0), &at(SETTLED), |id| {
+        id == ids[0] || id == ids[1]
+    });
+    assert_eq!(s.capacity(), 1);
+    assert_eq!(
+        s.len(),
+        2,
+        "protected residents may temporarily exceed capacity"
+    );
+
+    let pushed = s.push_with_protection(&at(SETTLED * 2), |_| false);
+
+    assert!(pushed.resident);
+    assert_eq!(pushed.retired, vec![ids[0], ids[1]]);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s.slot_of(pushed.id), Some(0));
+}
+
 // ---------------------------------------------------------------------------
 // Dismissal
 // ---------------------------------------------------------------------------
@@ -601,6 +655,40 @@ fn shrinking_the_display_retires_from_the_bottom() {
     s.check_no_card_moved_up().unwrap();
 }
 
+#[test]
+fn shrinking_the_display_retires_only_unprotected_cards() {
+    let mut s = stack();
+    let ids: Vec<_> = (0..6).map(|_| s.push(&at(0))).collect();
+    s.advance(&at(SETTLED));
+
+    let retired = s.resize_with_protection(work_area(580.0), &at(SETTLED), |id| id == ids[0]);
+
+    assert_eq!(retired, ids[1..4]);
+    assert_eq!(s.slot_of(ids[0]), Some(0));
+    assert_eq!(s.slot_of(ids[4]), Some(1));
+    assert_eq!(s.slot_of(ids[5]), Some(2));
+    s.check_no_card_moved_up().unwrap();
+}
+
+#[test]
+fn unprotecting_a_card_reconciles_temporary_overcapacity() {
+    let mut s = stack();
+    let ids: Vec<_> = (0..6).map(|_| s.push(&at(0))).collect();
+    s.advance(&at(SETTLED));
+    s.resize_with_protection(work_area(300.0), &at(SETTLED), |id| {
+        id == ids[0] || id == ids[1]
+    });
+    assert_eq!(s.capacity(), 1);
+    assert_eq!(s.len(), 2, "both protected cards remain resident");
+
+    let retired = s.enforce_capacity_with_protection(&at(SETTLED * 2), |id| id == ids[0]);
+
+    assert_eq!(retired, vec![ids[1]]);
+    assert_eq!(s.len(), 1);
+    assert_eq!(s.slot_of(ids[0]), Some(0));
+    assert_eq!(s.slot_of(ids[1]), None);
+}
+
 // ---------------------------------------------------------------------------
 // Gestures — direction is intent (D21)
 // ---------------------------------------------------------------------------
@@ -742,12 +830,60 @@ fn a_swipe_right_or_up_begins_a_drag_out() {
         let origin = pos2(120.0, 900.0);
         s.begin_drag(id, origin, &at(SETTLED));
         s.drag_to(origin + delta, &at(SETTLED + 60));
+        assert_eq!(
+            s.active_drag_intent(&at(SETTLED + 60)),
+            Some(Intent::DragOut),
+            "{dir:?}"
+        );
         let release = s.release_drag(&at(SETTLED + 80)).unwrap();
 
         assert_eq!(release.intent, Intent::DragOut, "{dir:?}");
         assert_eq!(release.direction, Some(dir));
         assert!(s.is_empty(), "the capture leaves the pile with the drag");
     }
+}
+
+#[test]
+fn an_accepted_drag_out_stays_retained_until_it_is_finalised() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let origin = pos2(120.0, 900.0);
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    let release = s.release_drag(&at(SETTLED + 80)).unwrap();
+    assert_eq!(release.intent, Intent::DragOut);
+
+    s.advance(&at(SETTLED * 3));
+    assert_eq!(
+        s.departing().len(),
+        1,
+        "the native session still owns the outcome"
+    );
+    assert!(s.finalize_drag_out(id));
+    assert!(s.departing().is_empty());
+    assert!(!s.finalize_drag_out(id), "finalisation is one-shot");
+}
+
+#[test]
+fn a_rejected_drag_out_restores_the_same_card_as_newest() {
+    let mut s = stack();
+    let dragged = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let origin = pos2(120.0, 900.0);
+    s.begin_drag(dragged, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    s.release_drag(&at(SETTLED + 80)).unwrap();
+    let arrived_during_drag = s.push(&at(SETTLED + 100));
+
+    let restored = s.restore_drag_out(dragged, &at(SETTLED + 120), |_| false);
+
+    assert!(restored.restored);
+    assert!(restored.retired.is_empty());
+    assert_eq!(s.slot_of(arrived_during_drag), Some(0));
+    assert_eq!(s.slot_of(dragged), Some(1));
+    assert!(s.departing().is_empty());
+    s.check_no_card_moved_up().unwrap();
 }
 
 #[test]
@@ -936,6 +1072,69 @@ fn chrome_hides_while_a_card_is_held() {
 
     s.begin_drag(id, pos2(120.0, 900.0), &at(SETTLED + 300));
     assert_eq!(s.frame_of(id, &at(SETTLED + 300)).unwrap().reveal, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Motion-clock auto-close
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_close_waits_on_the_motion_clock_and_retires_once() {
+    let mut s = stack();
+    s.set_auto_close(Some(1.0), &at(0));
+    let id = s.push(&at(0));
+
+    assert_eq!(s.activity(&at(0)).wake_after(), Some(1.0));
+    assert!(s.advance_with_protection(&at(999), |_| false).is_empty());
+    assert_eq!(s.advance_with_protection(&at(1_000), |_| false), vec![id]);
+    assert!(s.is_empty());
+    assert!(s.advance_with_protection(&at(2_000), |_| false).is_empty());
+}
+
+#[test]
+fn a_protected_expired_deadline_does_not_spin_the_repaint_clock() {
+    let mut s = stack();
+    s.set_auto_close(Some(1.0), &at(0));
+    let id = s.push(&at(0));
+
+    assert!(
+        s.advance_with_protection(&at(2_000), |candidate| candidate == id)
+            .is_empty()
+    );
+    assert_eq!(
+        s.activity_with_protection(&at(2_000), |candidate| candidate == id)
+            .wake_after(),
+        None
+    );
+}
+
+#[test]
+fn hover_pauses_auto_close_and_leaving_hover_restarts_the_interval() {
+    let mut s = stack();
+    s.set_auto_close(Some(1.0), &at(0));
+    let id = s.push(&at(0));
+    s.set_hover(Some(id), &at(500));
+
+    assert!(s.advance_with_protection(&at(5_000), |_| false).is_empty());
+    s.set_hover(None, &at(5_000));
+    assert!(s.advance_with_protection(&at(5_999), |_| false).is_empty());
+    assert_eq!(s.advance_with_protection(&at(6_000), |_| false), vec![id]);
+}
+
+#[test]
+fn external_pin_state_pauses_auto_close_without_entering_the_stack_model() {
+    let mut s = stack();
+    s.set_auto_close(Some(1.0), &at(0));
+    let id = s.push(&at(0));
+    s.set_auto_close_paused(id, true, &at(500));
+
+    assert!(
+        s.advance_with_protection(&at(10_000), |candidate| candidate == id)
+            .is_empty()
+    );
+    s.set_auto_close_paused(id, false, &at(10_000));
+    assert!(s.advance_with_protection(&at(10_999), |_| false).is_empty());
+    assert_eq!(s.advance_with_protection(&at(11_000), |_| false), vec![id]);
 }
 
 // ---------------------------------------------------------------------------

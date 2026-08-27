@@ -440,6 +440,18 @@ impl MacOverlay {
         &self.window
     }
 
+    /// Shows or hides the overlay without making it the key window.
+    ///
+    /// winit's ordinary `set_visible(true)` calls `makeKeyAndOrderFront`, which
+    /// would divert keyboard input even though this is a non-activating panel.
+    pub fn set_visible_without_activation(&self, visible: bool) {
+        if visible {
+            self.window.orderFrontRegardless();
+        } else {
+            self.window.orderOut(None);
+        }
+    }
+
     /// Whether the window is now a non-activating panel.
     ///
     /// `false` means clicking the overlay will pull focus to Scrozz.

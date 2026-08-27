@@ -20,16 +20,22 @@
 //! we pushed and have not yet been told the identifier for, matched up as the
 //! announcements arrive.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
+use scrozz_core::{
+    ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, PixelFormat,
+    Provenance, ScaleFactor,
+};
+use scrozz_shell::NativeSurface;
 use scrozz_ui::{
-    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
+    CaptureRequest, OverlayEvent, OverlayHandle,
+    overlay_app::{RECENTLY_CLOSED_LIMIT, THUMBNAIL_PX},
 };
 
 use crate::gui::{
     action::CaptureKind,
     card::{Card, CardEvent, CardId, CardSurface},
+    panel::NativeSurfaceSlot,
 };
 
 /// A [`CardSurface`] backed by a running `scrozz-ui` overlay.
@@ -40,7 +46,7 @@ use crate::gui::{
 pub struct OverlayCards {
     handle: OverlayHandle,
     /// Pushed, awaiting the overlay's identifier. Front is oldest.
-    pending: VecDeque<CardId>,
+    pending: VecDeque<(CardId, bool)>,
     /// Overlay identifier to ours, for cards currently in the pile.
     mapped: HashMap<u64, CardId>,
     /// Ours to the overlay's, so a dismissal we initiate can be addressed.
@@ -50,6 +56,12 @@ pub struct OverlayCards {
     /// `drain_events` empties the overlay's outbox in one go, so a batch of
     /// five has to be held somewhere; without this, four would be dropped.
     queued: VecDeque<CardEvent>,
+    /// Application and prior overlay identities for the matching restoration ring.
+    recent: VecDeque<(CardId, u64)>,
+    /// Cards whose pixels can be rehydrated after cache release.
+    restorable: HashSet<CardId>,
+    /// The live native view retained by the panel hook.
+    native_surface: NativeSurfaceSlot,
 }
 
 impl OverlayCards {
@@ -62,6 +74,18 @@ impl OverlayCards {
             mapped: HashMap::new(),
             reverse: HashMap::new(),
             queued: VecDeque::new(),
+            recent: VecDeque::with_capacity(RECENTLY_CLOSED_LIMIT),
+            restorable: HashSet::new(),
+            native_surface: NativeSurfaceSlot::default(),
+        }
+    }
+
+    /// Wraps a handle and the native view slot owned by the same window host.
+    #[must_use]
+    pub fn with_native_surface(handle: OverlayHandle, native_surface: NativeSurfaceSlot) -> Self {
+        Self {
+            native_surface,
+            ..Self::new(handle)
         }
     }
 
@@ -76,6 +100,112 @@ impl OverlayCards {
             self.mapped.remove(&theirs);
         }
     }
+
+    fn remember_closed(&mut self, ours: CardId, theirs: u64) {
+        self.recent.push_back((ours, theirs));
+        if self.recent.len() > RECENTLY_CLOSED_LIMIT
+            && let Some((evicted, _)) = self.recent.pop_front()
+        {
+            self.restorable.remove(&evicted);
+        }
+    }
+
+    fn translate(&mut self, event: OverlayEvent, out: &mut Vec<CardEvent>) {
+        match event {
+            OverlayEvent::Pushed { id } => {
+                // In push order, which is the contract that makes this
+                // matching sound.
+                if let Some((ours, restorable)) = self.pending.pop_front() {
+                    self.mapped.insert(id.0, ours);
+                    self.reverse.insert(ours, id.0);
+                    if restorable {
+                        self.restorable.insert(ours);
+                    }
+                } else {
+                    tracing::warn!(
+                        overlay_card = id.0,
+                        "the overlay announced a card this app did not push"
+                    );
+                }
+            }
+            OverlayEvent::Dismissed { id, reason } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    let _ = reason;
+                    out.push(CardEvent::Dismiss(ours));
+                    if self.restorable.contains(&ours) {
+                        self.remember_closed(ours, id.0);
+                    } else {
+                        self.restorable.remove(&ours);
+                    }
+                    self.forget(ours);
+                }
+            }
+            OverlayEvent::CopyRequested { id } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::Copy(ours));
+                }
+            }
+            OverlayEvent::SaveRequested { id } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::Save(ours));
+                }
+            }
+            OverlayEvent::AnnotateRequested { id } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::Open(ours));
+                }
+            }
+            OverlayEvent::UploadRequested { id } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::Upload(ours));
+                }
+            }
+            OverlayEvent::PinRequested { id, pinned } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::Pin { id: ours, pinned });
+                }
+            }
+            OverlayEvent::DragStarted { id, .. } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::DragStarted(ours));
+                }
+            }
+            OverlayEvent::DragOut { id, at, rect } => {
+                if let Some(ours) = self.mapped.get(&id.0).copied() {
+                    out.push(CardEvent::DragOut {
+                        id: ours,
+                        rect: logical_rect(rect),
+                        pointer: LogicalPoint::new(f64::from(at.x), f64::from(at.y)),
+                    });
+                }
+            }
+            OverlayEvent::DockCollapsed => {
+                out.push(CardEvent::DockCollapsed);
+            }
+            OverlayEvent::DockExpanded => {
+                out.push(CardEvent::DockExpanded);
+            }
+            OverlayEvent::Emptied => {
+                out.push(CardEvent::Emptied);
+            }
+            OverlayEvent::Restored { id } => {
+                if let Some((ours, _)) = self.recent.pop_back() {
+                    self.mapped.insert(id.0, ours);
+                    self.reverse.insert(ours, id.0);
+                    out.push(CardEvent::Restored(ours));
+                } else {
+                    tracing::warn!(
+                        overlay_card = id.0,
+                        "the overlay restored a card with no matching application history"
+                    );
+                }
+            }
+            OverlayEvent::VisibilityChanged { hidden } => {
+                out.push(CardEvent::VisibilityChanged { hidden });
+            }
+            _ => {}
+        }
+    }
 }
 
 impl CardSurface for OverlayCards {
@@ -88,6 +218,7 @@ impl CardSurface for OverlayCards {
         // roughly 300 points wide. Shipping the full frame across so egui can
         // throw away 99% of it would cost a copy of every capture, held for as
         // long as the card is on screen.
+        let restorable = card.capture_id.is_some();
         let request = match card.thumbnail.as_ref().and_then(Thumb::frame) {
             Some(frame) => CaptureRequest::from_frame(
                 name.clone(),
@@ -102,9 +233,10 @@ impl CardSurface for OverlayCards {
             // capture that happened should be visible even if thumbnailing
             // failed, because the file on disk is fine.
             None => CaptureRequest::new(name, provenance, card.source_px()),
-        };
+        }
+        .with_restorable(restorable);
 
-        self.pending.push_back(card.id);
+        self.pending.push_back((card.id, restorable));
         self.handle.push(request);
         Ok(())
     }
@@ -113,7 +245,30 @@ impl CardSurface for OverlayCards {
         if let Some(theirs) = self.reverse.get(&id).copied() {
             self.handle.dismiss(scrozz_ui::stack::CardId(theirs));
         }
-        self.forget(id);
+    }
+
+    fn dismiss_after_action(&mut self, id: CardId) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .dismiss_after_action(scrozz_ui::stack::CardId(theirs));
+        }
+    }
+
+    fn set_pinned(&mut self, id: CardId, pinned: bool) {
+        let theirs = self.reverse.get(&id).copied().or_else(|| {
+            self.recent
+                .iter()
+                .rev()
+                .find_map(|(ours, theirs)| (*ours == id).then_some(*theirs))
+        });
+        if let Some(theirs) = theirs {
+            self.handle
+                .set_pinned(scrozz_ui::stack::CardId(theirs), pinned);
+        }
+    }
+
+    fn dismiss_all(&mut self) {
+        self.handle.dismiss_all();
     }
 
     fn poll(&mut self) -> Option<CardEvent> {
@@ -131,69 +286,7 @@ impl CardSurface for OverlayCards {
         let mut out = Vec::new();
 
         for event in batch {
-            match event {
-                OverlayEvent::Pushed { id } => {
-                    // In push order, which is the contract that makes this
-                    // matching sound.
-                    if let Some(ours) = self.pending.pop_front() {
-                        self.mapped.insert(id.0, ours);
-                        self.reverse.insert(ours, id.0);
-                    } else {
-                        tracing::warn!(
-                            overlay_card = id.0,
-                            "the overlay announced a card this app did not push"
-                        );
-                    }
-                }
-                OverlayEvent::Dismissed { id, reason } => {
-                    if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        // A drag that left the pile has already delivered the
-                        // file to wherever it was dropped. Treating it as a
-                        // plain dismissal would be right, but saying which it
-                        // was lets the pipeline release the bytes either way.
-                        out.push(match reason {
-                            DismissReason::DragOut => CardEvent::Drag(ours),
-                            _ => CardEvent::Dismiss(ours),
-                        });
-                        self.forget(ours);
-                    }
-                }
-                OverlayEvent::CopyRequested { id } => {
-                    if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Copy(ours));
-                    }
-                }
-                OverlayEvent::SaveRequested { id } => {
-                    if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Save(ours));
-                    }
-                }
-                OverlayEvent::AnnotateRequested { id } => {
-                    if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Open(ours));
-                    }
-                }
-                OverlayEvent::DragStarted { id, .. } | OverlayEvent::DragOut { id, .. } => {
-                    if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Drag(ours));
-                    }
-                }
-                OverlayEvent::DockCollapsed => {
-                    // Collapsing is about the pile, not a card. The oldest one
-                    // stands in for it so the event is not lost entirely.
-                    if let Some(ours) = self.mapped.values().copied().min() {
-                        out.push(CardEvent::Collapse(ours));
-                    }
-                }
-                // Nothing downstream acts on these yet, and inventing a
-                // translation for them would be worse than leaving the gap
-                // visible.
-                OverlayEvent::UploadRequested { .. }
-                | OverlayEvent::PinRequested { .. }
-                | OverlayEvent::DockExpanded
-                | OverlayEvent::Emptied => {}
-                _ => {}
-            }
+            self.translate(event, &mut out);
         }
 
         // `drain_events` took everything, so what is not returned now must be
@@ -210,6 +303,29 @@ impl CardSurface for OverlayCards {
         self.mapped.len() + self.pending.len()
     }
 
+    fn restore_recent(&mut self) {
+        self.handle.restore_recent();
+    }
+
+    fn upload_latest(&mut self) {
+        self.handle.upload_latest();
+    }
+
+    fn toggle_hidden(&mut self) {
+        self.handle.toggle_hidden();
+    }
+
+    fn native_surface(&self) -> Option<NativeSurface> {
+        self.native_surface.get()
+    }
+
+    fn finish_drag(&mut self, id: CardId, accepted: bool) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .finish_drag(scrozz_ui::stack::CardId(theirs), accepted);
+        }
+    }
+
     fn describe(&self) -> String {
         if self.handle.is_attached() {
             let panel = self
@@ -221,6 +337,13 @@ impl CardSurface for OverlayCards {
             "scrozz-ui overlay (no window yet)".to_owned()
         }
     }
+}
+
+fn logical_rect(rect: egui::Rect) -> LogicalRect {
+    LogicalRect::new(
+        LogicalPoint::new(f64::from(rect.min.x), f64::from(rect.min.y)),
+        LogicalSize::new(f64::from(rect.width()), f64::from(rect.height())),
+    )
 }
 
 /// The chrome a capture kind should get.
@@ -286,8 +409,8 @@ mod tests {
 
         // Simulate the overlay announcing them, which is what a real frame does.
         assert_eq!(surface.pending.len(), 2);
-        assert_eq!(surface.pending[0], CardId(7));
-        assert_eq!(surface.pending[1], CardId(8));
+        assert_eq!(surface.pending[0], (CardId(7), false));
+        assert_eq!(surface.pending[1], (CardId(8), false));
     }
 
     #[test]
@@ -320,5 +443,118 @@ mod tests {
         let mut surface = OverlayCards::new(OverlayHandle::new());
         surface.dismiss(CardId(99));
         assert_eq!(surface.len(), 0);
+    }
+
+    #[test]
+    fn every_overlay_action_translates_once_and_in_order() {
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let ours = CardId(41);
+        let theirs = scrozz_ui::stack::CardId(7);
+        surface.pending.push_back((ours, true));
+        let mut events = Vec::new();
+        surface.translate(OverlayEvent::Pushed { id: theirs }, &mut events);
+
+        let at = egui::pos2(12.0, 34.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(1.0, 2.0), egui::vec2(3.0, 4.0));
+        for event in [
+            OverlayEvent::CopyRequested { id: theirs },
+            OverlayEvent::SaveRequested { id: theirs },
+            OverlayEvent::AnnotateRequested { id: theirs },
+            OverlayEvent::UploadRequested { id: theirs },
+            OverlayEvent::PinRequested {
+                id: theirs,
+                pinned: true,
+            },
+            OverlayEvent::DragStarted { id: theirs, at },
+            OverlayEvent::DragOut {
+                id: theirs,
+                at,
+                rect,
+            },
+            OverlayEvent::DockCollapsed,
+            OverlayEvent::DockExpanded,
+            OverlayEvent::Emptied,
+            OverlayEvent::VisibilityChanged { hidden: true },
+        ] {
+            surface.translate(event, &mut events);
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                CardEvent::Copy(ours),
+                CardEvent::Save(ours),
+                CardEvent::Open(ours),
+                CardEvent::Upload(ours),
+                CardEvent::Pin {
+                    id: ours,
+                    pinned: true,
+                },
+                CardEvent::DragStarted(ours),
+                CardEvent::DragOut {
+                    id: ours,
+                    rect: LogicalRect::new(LogicalPoint::new(1.0, 2.0), LogicalSize::new(3.0, 4.0),),
+                    pointer: LogicalPoint::new(12.0, 34.0),
+                },
+                CardEvent::DockCollapsed,
+                CardEvent::DockExpanded,
+                CardEvent::Emptied,
+                CardEvent::VisibilityChanged { hidden: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_action_stays_ahead_of_the_dismiss_that_releases_its_bytes() {
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let ours = CardId(5);
+        let theirs = scrozz_ui::stack::CardId(9);
+        surface.pending.push_back((ours, true));
+        let mut events = Vec::new();
+        surface.translate(OverlayEvent::Pushed { id: theirs }, &mut events);
+        surface.translate(OverlayEvent::CopyRequested { id: theirs }, &mut events);
+        surface.translate(
+            OverlayEvent::Dismissed {
+                id: theirs,
+                reason: scrozz_ui::DismissReason::Acted,
+            },
+            &mut events,
+        );
+
+        assert_eq!(
+            events,
+            vec![CardEvent::Copy(ours), CardEvent::Dismiss(ours)]
+        );
+        assert!(!surface.reverse.contains_key(&ours));
+        assert_eq!(surface.recent.back(), Some(&(ours, theirs.0)));
+    }
+
+    #[test]
+    fn restoration_reuses_the_application_identity_with_a_new_overlay_identity() {
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let ours = CardId(5);
+        let first = scrozz_ui::stack::CardId(9);
+        let restored = scrozz_ui::stack::CardId(10);
+        surface.pending.push_back((ours, true));
+        let mut events = Vec::new();
+        surface.translate(OverlayEvent::Pushed { id: first }, &mut events);
+        surface.translate(
+            OverlayEvent::Dismissed {
+                id: first,
+                reason: scrozz_ui::DismissReason::Closed,
+            },
+            &mut events,
+        );
+        events.clear();
+
+        surface.translate(OverlayEvent::Restored { id: restored }, &mut events);
+        surface.translate(OverlayEvent::CopyRequested { id: restored }, &mut events);
+
+        assert_eq!(
+            events,
+            vec![CardEvent::Restored(ours), CardEvent::Copy(ours)]
+        );
+        assert_eq!(surface.reverse.get(&ours), Some(&restored.0));
+        assert!(surface.recent.is_empty());
     }
 }
