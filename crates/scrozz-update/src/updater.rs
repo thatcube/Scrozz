@@ -8,9 +8,9 @@ use semver::Version;
 
 use crate::{
     ArtifactMetadata, CandidateMetadata, CurlFetcher, Error, FetchRequest, Fetcher, HttpsUrl,
-    InstallPlan, ManifestVerification, Phase, PinnedKeyRing, Result, StagedArtifact, UpdateState,
-    VerifiedArtifact, VerifiedDownload, VerifiedManifest, fsutil, state::StateFile,
-    verify_artifact_file, verify_manifest,
+    InstallPlan, ManifestVerification, Phase, PinnedKeyRing, ResolvedChannel, Result,
+    StagedArtifact, UpdateChannel, UpdateState, VerifiedArtifact, VerifiedDownload,
+    VerifiedManifest, fsutil, state::StateFile, verify_artifact_file, verify_manifest,
 };
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -27,9 +27,17 @@ pub struct VerifiedUpdate {
 }
 
 impl VerifiedUpdate {
-    fn from_manifest(manifest: &VerifiedManifest, artifact: VerifiedArtifact) -> Self {
+    fn from_manifest(
+        manifest: &VerifiedManifest,
+        artifact: VerifiedArtifact,
+        channel: Option<UpdateChannel>,
+    ) -> Self {
         Self {
-            candidate: CandidateMetadata::new(manifest.version().clone(), manifest.generated()),
+            candidate: CandidateMetadata::new(
+                manifest.version().clone(),
+                manifest.generated(),
+                channel,
+            ),
             artifact,
         }
     }
@@ -57,6 +65,14 @@ impl VerifiedUpdate {
     #[must_use]
     pub fn artifact(&self) -> &VerifiedArtifact {
         &self.artifact
+    }
+
+    /// Returns the endpoint-catalog channel that produced this update.
+    ///
+    /// `None` identifies checks made through [`Updater::check`] with raw URLs.
+    #[must_use]
+    pub const fn channel(&self) -> Option<UpdateChannel> {
+        self.candidate.channel()
     }
 }
 
@@ -93,6 +109,109 @@ pub struct Updater<F = CurlFetcher> {
     keys: PinnedKeyRing,
     state_file: StateFile,
     state: UpdateState,
+}
+
+/// Signed update checker with no download, staging, recovery, installation, or
+/// rollback authority.
+///
+/// Unlike [`Updater::open`], opening this type never reconciles durable install
+/// state. It therefore cannot turn an automatic check into an installation
+/// after a prior process interruption.
+pub struct UpdateChecker<F = CurlFetcher> {
+    updater: Updater<F>,
+}
+
+impl UpdateChecker<CurlFetcher> {
+    /// Opens check-only state with the default bounded curl transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when state cannot be read or is in a phase that needs
+    /// explicit full-updater recovery.
+    pub fn open(state_path: impl Into<PathBuf>, keys: PinnedKeyRing) -> Result<Self> {
+        Self::with_fetcher(state_path, keys, CurlFetcher::new())
+    }
+
+    /// Opens with the intentionally empty production key ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when state cannot be read or is in a phase that needs
+    /// explicit full-updater recovery.
+    pub fn open_with_production_keys(state_path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open(state_path, PinnedKeyRing::production())
+    }
+}
+
+impl<F: Fetcher> UpdateChecker<F> {
+    /// Opens check-only state with a caller-provided transport.
+    ///
+    /// Only idle state, a pending checked update, and a failed check without
+    /// candidate or install metadata are accepted. No recovery runs here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PassiveCheckUnavailable`] for any lifecycle that could
+    /// carry download or installation authority.
+    pub fn with_fetcher(
+        state_path: impl Into<PathBuf>,
+        keys: PinnedKeyRing,
+        fetcher: F,
+    ) -> Result<Self> {
+        let (state_file, state) = StateFile::open(state_path)?;
+        if !check_only_state_is_safe(&state) {
+            return Err(Error::PassiveCheckUnavailable(state.phase()));
+        }
+        Ok(Self {
+            updater: Updater {
+                fetcher,
+                keys,
+                state_file,
+                state,
+            },
+        })
+    }
+
+    /// Returns the current durable state snapshot.
+    #[must_use]
+    pub fn state(&self) -> &UpdateState {
+        self.updater.state()
+    }
+
+    /// Checks one resolved channel without acquiring installation authority.
+    ///
+    /// A previously verified pending candidate is returned without networking.
+    /// A transport or verification failure may be retried on the same checker;
+    /// its failed check state is safely reset before the next attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fetch, verification, state, or persistence error. It never
+    /// downloads an artifact and never recovers or installs prior staged state.
+    pub fn check(
+        &mut self,
+        channel: &ResolvedChannel,
+        installed_version: &Version,
+    ) -> Result<CheckOutcome> {
+        if let Some(update) = self.updater.available_update() {
+            if update.channel() == Some(channel.channel()) && update.version() > installed_version {
+                return Ok(CheckOutcome::UpdateAvailable(update));
+            }
+            self.updater.reset_to_idle()?;
+        }
+        if self.updater.state.phase == Phase::Failed {
+            if !check_failure_is_safe(&self.updater.state) {
+                return Err(Error::PassiveCheckUnavailable(self.updater.state.phase()));
+            }
+            self.updater.reset_to_idle()?;
+        }
+        self.updater.check_inner(
+            channel.endpoints().manifest().as_str(),
+            channel.endpoints().signature().as_str(),
+            installed_version,
+            Some(channel.channel()),
+        )
+    }
 }
 
 impl Updater<CurlFetcher> {
@@ -281,6 +400,16 @@ impl<F: Fetcher> Updater<F> {
         signature_url: impl Into<String>,
         installed_version: &Version,
     ) -> Result<CheckOutcome> {
+        self.check_inner(manifest_url, signature_url, installed_version, None)
+    }
+
+    fn check_inner(
+        &mut self,
+        manifest_url: impl Into<String>,
+        signature_url: impl Into<String>,
+        installed_version: &Version,
+        channel: Option<UpdateChannel>,
+    ) -> Result<CheckOutcome> {
         self.require_transition(Phase::Checking)?;
         if self.keys.is_empty() {
             return Err(Error::NoPinnedKeys);
@@ -341,12 +470,16 @@ impl<F: Fetcher> Updater<F> {
             Err(error) => return self.record_failure(error),
         };
 
+        let highest_accepted_generation = channel
+            .map_or(self.state.highest_accepted_generation, |channel| {
+                self.state.highest_accepted_generation_for(channel)
+            });
         let verification = match verify_manifest(
             &manifest_bytes,
             &signature_bytes,
             &self.keys,
             installed_version,
-            self.state.highest_accepted_generation,
+            highest_accepted_generation,
         ) {
             Ok(verification) => verification,
             Err(error) => return self.record_failure(error),
@@ -357,7 +490,7 @@ impl<F: Fetcher> Updater<F> {
                 let mut idle = self.state.clone();
                 idle.phase = Phase::Idle;
                 clear_active_lifecycle(&mut idle);
-                idle.highest_accepted_generation = idle.highest_accepted_generation.max(generated);
+                accept_generation(&mut idle, channel, generated);
                 self.commit(idle)?;
                 Ok(CheckOutcome::Current { version, generated })
             }
@@ -365,12 +498,13 @@ impl<F: Fetcher> Updater<F> {
                 let platform = scrozz_core::identity::platform_key();
                 let artifact = manifest.artifact_for(&platform);
                 let mut next = self.state.clone();
-                next.highest_accepted_generation = manifest.generated();
+                accept_generation(&mut next, channel, manifest.generated());
                 next.transient_paths.clear();
                 next.failure = None;
                 match artifact {
                     Some(artifact) => {
-                        let update = VerifiedUpdate::from_manifest(&manifest, artifact.clone());
+                        let update =
+                            VerifiedUpdate::from_manifest(&manifest, artifact.clone(), channel);
                         next.phase = Phase::UpdateAvailable;
                         next.candidate = Some(update.candidate.clone());
                         next.artifact = Some(artifact.metadata().clone());
@@ -1133,6 +1267,49 @@ fn clear_active_lifecycle(state: &mut UpdateState) {
     state.failure = None;
 }
 
+fn accept_generation(state: &mut UpdateState, channel: Option<UpdateChannel>, generated: u64) {
+    match channel {
+        Some(channel) => {
+            state.channel_generations.insert(
+                channel,
+                state
+                    .highest_accepted_generation_for(channel)
+                    .max(generated),
+            );
+        }
+        None => {
+            state.highest_accepted_generation = state.highest_accepted_generation.max(generated);
+        }
+    }
+}
+
+fn check_only_state_is_safe(state: &UpdateState) -> bool {
+    match state.phase {
+        Phase::Idle => true,
+        Phase::UpdateAvailable => {
+            state.candidate.is_some()
+                && state.artifact.is_some()
+                && state.downloaded_path.is_none()
+                && state.staged_path.is_none()
+                && state.install_plan.is_none()
+                && state.transient_paths.is_empty()
+                && !state.rollback_requested
+        }
+        Phase::Failed => check_failure_is_safe(state),
+        _ => false,
+    }
+}
+
+fn check_failure_is_safe(state: &UpdateState) -> bool {
+    state.candidate.is_none()
+        && state.artifact.is_none()
+        && state.downloaded_path.is_none()
+        && state.staged_path.is_none()
+        && state.install_plan.is_none()
+        && state.transient_paths.is_empty()
+        && !state.rollback_requested
+}
+
 fn cleanup_files<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Option<Error> {
     let mut first_error = None;
     for path in paths {
@@ -1259,6 +1436,161 @@ mod tests {
         assert_eq!(fs::read(&live).unwrap(), b"installed version");
         assert_eq!(fs::read(download.path()).unwrap(), CANDIDATE_BYTES);
         assert_eq!(updater.state().phase(), Phase::Downloaded);
+    }
+
+    #[test]
+    fn check_only_open_never_recovers_an_awaiting_installation() {
+        let (scratch, keys, mut updater, staged) = staged_updater("passive-no-recovery");
+        let live = scratch.path().join("scrozz");
+        let previous = scratch.path().join("scrozz.previous");
+        let failed = scratch.path().join("scrozz.failed");
+        fs::write(&live, b"installed version").unwrap();
+        updater
+            .begin_install(
+                &staged,
+                InstallPlan::new(&live, &previous, &failed).unwrap(),
+            )
+            .unwrap();
+        drop(updater);
+
+        let checker = UpdateChecker::with_fetcher(
+            scratch.path().join("state.json"),
+            keys,
+            FakeFetcher::default(),
+        );
+
+        assert!(matches!(
+            checker,
+            Err(Error::PassiveCheckUnavailable(Phase::AwaitingRestart))
+        ));
+        assert_eq!(fs::read(&live).unwrap(), b"installed version");
+        assert!(staged.path().is_file());
+        assert!(!previous.exists());
+        assert!(!failed.exists());
+    }
+
+    #[test]
+    fn check_only_checker_retries_a_failed_manifest_fetch() {
+        let scratch = ScratchDir::new("passive-retry");
+        let key = signing_key(32);
+        let keys = ring(&[("fixture", &key)]);
+        let channel = crate::EndpointCatalog::new(
+            Some(crate::UpdateEndpoints::new(MANIFEST_URL, SIGNATURE_URL).unwrap()),
+            None,
+        )
+        .resolve(UpdateChannel::Stable)
+        .unwrap();
+        let mut checker = UpdateChecker::with_fetcher(
+            scratch.path().join("state.json"),
+            keys,
+            FakeFetcher::from_responses([(
+                MANIFEST_URL,
+                FakeResponse::PartialFailure(b"partial".to_vec()),
+            )]),
+        )
+        .unwrap();
+
+        assert!(checker.check(&channel, &Version::new(1, 0, 0)).is_err());
+        assert_eq!(checker.state().phase(), Phase::Failed);
+        assert!(check_failure_is_safe(checker.state()));
+
+        let manifest = serde_json::to_vec_pretty(&manifest_value(
+            "2.0.0",
+            32,
+            &scrozz_core::identity::platform_key(),
+            CANDIDATE_BYTES,
+        ))
+        .unwrap();
+        let signature = signed_envelope(&manifest, "fixture", &key);
+        checker.updater.fetcher = FakeFetcher::from_responses([
+            (MANIFEST_URL, FakeResponse::Bytes(manifest)),
+            (SIGNATURE_URL, FakeResponse::Bytes(signature)),
+        ]);
+
+        assert!(matches!(
+            checker.check(&channel, &Version::new(1, 0, 0)).unwrap(),
+            CheckOutcome::UpdateAvailable(_)
+        ));
+    }
+
+    #[test]
+    fn check_only_generations_and_candidates_are_scoped_by_channel() {
+        const PREVIEW_MANIFEST: &str = "https://updates.example.test/preview.json";
+        const PREVIEW_SIGNATURE: &str = "https://updates.example.test/preview.sig";
+        const STABLE_MANIFEST: &str = "https://updates.example.test/stable.json";
+        const STABLE_SIGNATURE: &str = "https://updates.example.test/stable.sig";
+
+        let scratch = ScratchDir::new("passive-channel-switch");
+        let key = signing_key(33);
+        let keys = ring(&[("fixture", &key)]);
+        let catalog = crate::EndpointCatalog::new(
+            Some(crate::UpdateEndpoints::new(STABLE_MANIFEST, STABLE_SIGNATURE).unwrap()),
+            Some(crate::UpdateEndpoints::new(PREVIEW_MANIFEST, PREVIEW_SIGNATURE).unwrap()),
+        );
+        let preview_manifest = serde_json::to_vec(&manifest_value(
+            "3.0.0",
+            100,
+            &scrozz_core::identity::platform_key(),
+            CANDIDATE_BYTES,
+        ))
+        .unwrap();
+        let preview_signature = signed_envelope(&preview_manifest, "fixture", &key);
+        let mut checker = UpdateChecker::with_fetcher(
+            scratch.path().join("state.json"),
+            keys,
+            FakeFetcher::from_responses([
+                (PREVIEW_MANIFEST, FakeResponse::Bytes(preview_manifest)),
+                (PREVIEW_SIGNATURE, FakeResponse::Bytes(preview_signature)),
+            ]),
+        )
+        .unwrap();
+
+        let preview = catalog.resolve(UpdateChannel::Preview).unwrap();
+        let CheckOutcome::UpdateAvailable(update) =
+            checker.check(&preview, &Version::new(1, 0, 0)).unwrap()
+        else {
+            panic!("preview update expected");
+        };
+        assert_eq!(update.channel(), Some(UpdateChannel::Preview));
+        assert_eq!(
+            checker
+                .state()
+                .highest_accepted_generation_for(UpdateChannel::Preview),
+            100
+        );
+
+        let stable_manifest = serde_json::to_vec(&manifest_value(
+            "2.0.0",
+            1,
+            &scrozz_core::identity::platform_key(),
+            CANDIDATE_BYTES,
+        ))
+        .unwrap();
+        let stable_signature = signed_envelope(&stable_manifest, "fixture", &key);
+        checker.updater.fetcher = FakeFetcher::from_responses([
+            (STABLE_MANIFEST, FakeResponse::Bytes(stable_manifest)),
+            (STABLE_SIGNATURE, FakeResponse::Bytes(stable_signature)),
+        ]);
+
+        let stable = catalog.resolve(UpdateChannel::Stable).unwrap();
+        let CheckOutcome::UpdateAvailable(update) =
+            checker.check(&stable, &Version::new(1, 0, 0)).unwrap()
+        else {
+            panic!("stable update expected");
+        };
+        assert_eq!(update.channel(), Some(UpdateChannel::Stable));
+        assert_eq!(
+            checker
+                .state()
+                .highest_accepted_generation_for(UpdateChannel::Stable),
+            1
+        );
+        assert_eq!(
+            checker
+                .state()
+                .highest_accepted_generation_for(UpdateChannel::Preview),
+            100
+        );
     }
 
     #[test]

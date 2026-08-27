@@ -3,10 +3,17 @@ use std::{
     fs::File,
     io::{self, Read as _, Seek as _, SeekFrom},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    thread,
 };
 
 use crate::{Error, HttpsUrl, Result};
+
+const CONNECT_TIMEOUT_SECONDS: u64 = 10;
+const MIN_TRANSFER_TIMEOUT_SECONDS: u64 = 120;
+const MAX_TRANSFER_TIMEOUT_SECONDS: u64 = 60 * 60;
+const MIN_EXPECTED_BYTES_PER_SECOND: u64 = 64 * 1024;
+const MAX_CAPTURED_STDERR_BYTES: usize = 64 * 1024;
 
 /// One HTTPS fetch with a fixed user-agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +21,7 @@ pub struct FetchRequest {
     url: HttpsUrl,
     user_agent: String,
     max_bytes: u64,
+    transfer_timeout_seconds: u64,
 }
 
 impl FetchRequest {
@@ -39,6 +47,7 @@ impl FetchRequest {
             url,
             user_agent,
             max_bytes,
+            transfer_timeout_seconds: transfer_timeout_seconds(max_bytes),
         })
     }
 
@@ -68,6 +77,12 @@ impl FetchRequest {
     #[must_use]
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// Returns the size-aware whole-transfer timeout passed to curl.
+    #[must_use]
+    pub const fn transfer_timeout_seconds(&self) -> u64 {
+        self.transfer_timeout_seconds
     }
 }
 
@@ -139,6 +154,10 @@ impl CurlFetcher {
             OsString::from("=https"),
             OsString::from("--max-redirs"),
             OsString::from("5"),
+            OsString::from("--connect-timeout"),
+            OsString::from(CONNECT_TIMEOUT_SECONDS.to_string()),
+            OsString::from("--max-time"),
+            OsString::from(request.transfer_timeout_seconds().to_string()),
             OsString::from("--max-filesize"),
             OsString::from(request.max_bytes().to_string()),
             OsString::from("--user-agent"),
@@ -164,30 +183,94 @@ impl Fetcher for CurlFetcher {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| Error::io("run fetch command", &self.program, error))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::FetchFailed {
-            status: None,
-            stderr: "fetch command did not expose stdout".into(),
+        let stdout = child.stdout.take().ok_or_else(|| {
+            terminate_child(&mut child);
+            Error::FetchFailed {
+                status: None,
+                stderr: "fetch command did not expose stdout".into(),
+            }
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            terminate_child(&mut child);
+            Error::FetchFailed {
+                status: None,
+                stderr: "fetch command did not expose stderr".into(),
+            }
+        })?;
+        let stderr_worker = thread::spawn(move || capture_stderr(stderr));
         let mut limited = stdout.take(request.max_bytes().saturating_add(1));
         let copied = io::copy(&mut limited, destination);
         drop(limited);
-        let output = child
-            .wait_with_output()
-            .map_err(|error| Error::io("wait for fetch command", &self.program, error))?;
-        let copied = copied.map_err(Error::FetchOutput)?;
+        let copied = match copied {
+            Ok(copied) => copied,
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = join_stderr(stderr_worker);
+                return Err(Error::FetchOutput(error));
+            }
+        };
 
         if copied > request.max_bytes() {
+            terminate_child(&mut child);
+            let _ = join_stderr(stderr_worker);
             return Err(Error::FetchResponseTooLarge {
                 max_bytes: request.max_bytes(),
             });
         }
-        if !output.status.success() {
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = join_stderr(stderr_worker);
+                return Err(Error::io("wait for fetch command", &self.program, error));
+            }
+        };
+        let stderr = join_stderr(stderr_worker)?;
+        if !status.success() {
             return Err(Error::FetchFailed {
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                status: status.code(),
+                stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
             });
         }
         Ok(())
+    }
+}
+
+fn capture_stderr(mut stderr: impl io::Read) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stderr.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        let remaining = MAX_CAPTURED_STDERR_BYTES.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+fn join_stderr(worker: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    worker
+        .join()
+        .map_err(|_| Error::FetchOutput(io::Error::other("fetch stderr worker panicked")))?
+        .map_err(Error::FetchOutput)
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+const fn transfer_timeout_seconds(max_bytes: u64) -> u64 {
+    let scaled = max_bytes.saturating_add(MIN_EXPECTED_BYTES_PER_SECOND - 1)
+        / MIN_EXPECTED_BYTES_PER_SECOND
+        + 30;
+    if scaled < MIN_TRANSFER_TIMEOUT_SECONDS {
+        MIN_TRANSFER_TIMEOUT_SECONDS
+    } else if scaled > MAX_TRANSFER_TIMEOUT_SECONDS {
+        MAX_TRANSFER_TIMEOUT_SECONDS
+    } else {
+        scaled
     }
 }
 
@@ -222,6 +305,10 @@ mod tests {
                 "=https",
                 "--max-redirs",
                 "5",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "120",
                 "--max-filesize",
                 "1048576",
                 "--user-agent",
@@ -244,5 +331,18 @@ mod tests {
         assert!(FetchRequest::new(url.clone(), "Scrozz\n--output bad", 1).is_err());
         assert!(FetchRequest::new(url.clone(), "", 1).is_err());
         assert!(FetchRequest::new(url, "Scrozz/1", 0).is_err());
+    }
+
+    #[test]
+    fn artifact_timeout_scales_with_the_signed_size_and_remains_bounded() {
+        let url = HttpsUrl::parse("https://updates.example.test/file").unwrap();
+        let medium = FetchRequest::new(url.clone(), "Scrozz/1", 64 * 1024 * 1024).unwrap();
+        let huge = FetchRequest::new(url, "Scrozz/1", u64::MAX).unwrap();
+
+        assert!(medium.transfer_timeout_seconds() > MIN_TRANSFER_TIMEOUT_SECONDS);
+        assert_eq!(
+            huge.transfer_timeout_seconds(),
+            MAX_TRANSFER_TIMEOUT_SECONDS
+        );
     }
 }

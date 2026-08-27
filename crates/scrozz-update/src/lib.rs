@@ -52,6 +52,7 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+mod channel;
 mod error;
 mod fetch;
 mod fsutil;
@@ -63,6 +64,9 @@ mod updater;
 mod test_support;
 
 pub use artifact::{StagedArtifact, VerifiedDownload, verify_artifact_bytes, verify_artifact_file};
+pub use channel::{
+    ChannelEndpointStatus, EndpointCatalog, ResolvedChannel, UpdateChannel, UpdateEndpoints,
+};
 pub use error::{Error, Result};
 pub use fetch::{CurlFetcher, FetchRequest, Fetcher};
 pub use manifest::{
@@ -70,4 +74,4 @@ pub use manifest::{
     VerifiedArtifact, VerifiedManifest, verify_manifest,
 };
 pub use state::{CandidateMetadata, InstallPlan, Phase, UpdateState};
-pub use updater::{CheckOutcome, Updater, VerifiedUpdate};
+pub use updater::{CheckOutcome, UpdateChecker, Updater, VerifiedUpdate};

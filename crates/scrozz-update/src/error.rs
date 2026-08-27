@@ -3,7 +3,7 @@ use std::{io, path::PathBuf};
 use semver::Version;
 use thiserror::Error;
 
-use crate::Phase;
+use crate::{Phase, UpdateChannel};
 
 /// Errors produced while checking, downloading, staging, or swapping an update.
 #[derive(Debug, Error)]
@@ -33,6 +33,14 @@ pub enum Error {
     /// An update URL was not an acceptable HTTPS URL.
     #[error("invalid HTTPS URL: {0}")]
     InvalidUrl(String),
+
+    /// A settings or command-line value was not a supported update channel.
+    #[error("invalid update channel `{0}`")]
+    InvalidUpdateChannel(String),
+
+    /// A release channel has no deliberately configured production endpoints.
+    #[error("update channel `{0}` is disabled because no trusted endpoint is configured")]
+    UpdateChannelUnavailable(UpdateChannel),
 
     /// A key identifier was empty or contained unsafe characters.
     #[error("invalid signing key id `{0}`")]
@@ -148,6 +156,10 @@ pub enum Error {
         /// The requested phase.
         to: Phase,
     },
+
+    /// Check-only authority cannot safely operate on an installation lifecycle.
+    #[error("passive update checking is unavailable while the updater is in phase {0:?}")]
+    PassiveCheckUnavailable(Phase),
 
     /// A path that must be a regular file was a directory.
     #[error("directory updates are not supported: `{0}`")]

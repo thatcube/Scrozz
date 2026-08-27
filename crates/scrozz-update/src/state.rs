@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactMetadata, Error, Result,
+    ArtifactMetadata, Error, Result, UpdateChannel,
     fsutil::{absolute, atomic_write, ensure_distinct_siblings, ensure_regular_file, parent},
 };
 
@@ -82,11 +82,17 @@ impl Phase {
 pub struct CandidateMetadata {
     pub(crate) version: Version,
     pub(crate) generated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) channel: Option<UpdateChannel>,
 }
 
 impl CandidateMetadata {
-    pub(crate) fn new(version: Version, generated: u64) -> Self {
-        Self { version, generated }
+    pub(crate) fn new(version: Version, generated: u64, channel: Option<UpdateChannel>) -> Self {
+        Self {
+            version,
+            generated,
+            channel,
+        }
     }
 
     /// Returns the candidate semantic version.
@@ -99,6 +105,14 @@ impl CandidateMetadata {
     #[must_use]
     pub const fn generated(&self) -> u64 {
         self.generated
+    }
+
+    /// Returns the endpoint-catalog channel that produced this candidate.
+    ///
+    /// `None` identifies a candidate checked through the raw URL API.
+    #[must_use]
+    pub const fn channel(&self) -> Option<UpdateChannel> {
+        self.channel
     }
 }
 
@@ -174,6 +188,8 @@ pub struct UpdateState {
     pub(crate) schema: u32,
     pub(crate) phase: Phase,
     pub(crate) highest_accepted_generation: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) channel_generations: BTreeMap<UpdateChannel, u64>,
     pub(crate) candidate: Option<CandidateMetadata>,
     pub(crate) artifact: Option<ArtifactMetadata>,
     pub(crate) downloaded_path: Option<PathBuf>,
@@ -190,6 +206,7 @@ impl Default for UpdateState {
             schema: STATE_SCHEMA,
             phase: Phase::Idle,
             highest_accepted_generation: 0,
+            channel_generations: BTreeMap::new(),
             candidate: None,
             artifact: None,
             downloaded_path: None,
@@ -213,6 +230,12 @@ impl UpdateState {
     #[must_use]
     pub const fn highest_accepted_generation(&self) -> u64 {
         self.highest_accepted_generation
+    }
+
+    /// Returns the highest signed generation accepted for one release channel.
+    #[must_use]
+    pub fn highest_accepted_generation_for(&self, channel: UpdateChannel) -> u64 {
+        self.channel_generations.get(&channel).copied().unwrap_or(0)
     }
 
     /// Returns the accepted candidate, if one is active or retained on failure.
@@ -266,6 +289,15 @@ impl UpdateState {
                 "too many temporary paths are recorded".into(),
             ));
         }
+        if self
+            .channel_generations
+            .values()
+            .any(|generation| *generation == 0)
+        {
+            return Err(Error::InvalidState(
+                "accepted channel generations must be greater than zero".into(),
+            ));
+        }
         let mut unique = BTreeSet::new();
         if self.transient_paths.iter().any(|path| !unique.insert(path)) {
             return Err(Error::InvalidState(
@@ -299,7 +331,12 @@ impl UpdateState {
                     "candidate generation must be greater than zero".into(),
                 ));
             }
-            if candidate.generated > self.highest_accepted_generation {
+            let watermark = candidate
+                .channel
+                .map_or(self.highest_accepted_generation, |channel| {
+                    self.highest_accepted_generation_for(channel)
+                });
+            if candidate.generated > watermark {
                 return Err(Error::InvalidState(
                     "candidate generation exceeds the accepted watermark".into(),
                 ));
