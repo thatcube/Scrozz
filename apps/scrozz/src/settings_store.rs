@@ -29,7 +29,7 @@ use crate::{
 pub const CONFIG_DIR_ENV: &str = "SCROZZ_CONFIG_DIR";
 
 /// The settings document format this build writes.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 const FILE_NAME: &str = "settings.json";
 
@@ -66,6 +66,15 @@ impl SettingsStore {
     /// or an existing document cannot be read, migrated or validated.
     pub fn load() -> CliResult<Self> {
         Self::open(settings_path()?)
+    }
+
+    /// Compatibility spelling used by the system-integration layer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`].
+    pub fn open_default() -> CliResult<Self> {
+        Self::load()
     }
 
     /// Loads an explicit path.
@@ -132,6 +141,19 @@ impl SettingsStore {
         let setting = settings::lookup(key)?;
         let (value, source) = self.resolve(setting);
         Ok((setting, value, source))
+    }
+
+    /// Reads a boolean setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or non-boolean key.
+    pub fn boolean(&self, key: &str) -> CliResult<bool> {
+        let (setting, value, _) = self.get(key)?;
+        if setting.kind != settings::Kind::Bool {
+            return Err(CliError::usage(format!("{key} is not a boolean setting")));
+        }
+        Ok(value == "true")
     }
 
     /// The stable provenance token for one key.
@@ -215,7 +237,7 @@ impl SettingsStore {
         Ok(())
     }
 
-    /// Every resolved setting in the stable CLI JSON order.
+    /// Every resolved setting in stable CLI JSON order.
     #[must_use]
     pub fn all_json(&self) -> Json {
         Json::arr(settings::SETTINGS.iter().map(|setting| {
@@ -293,10 +315,18 @@ fn migrate(document: &mut Document) -> CliResult<bool> {
     let original = document.version;
     while document.version < CURRENT_VERSION {
         match document.version {
-            // Version 2 added more schema entries but did not rename any stored
-            // key. Bumping still matters: later migrations now have a stable
-            // point from which to transform values.
             1 => document.version = 2,
+            2 => {
+                if let Some(value) = document.values.remove("system.url-scheme") {
+                    document
+                        .values
+                        .entry("system.url-scheme-enabled".to_owned())
+                        .or_insert(value);
+                }
+                document.values.remove("update.check-automatically");
+                document.values.remove("update.channel");
+                document.version = 3;
+            }
             version => {
                 return Err(storage(format!(
                     "no migration exists for settings document version {version}"
@@ -510,19 +540,22 @@ mod tests {
     }
 
     #[test]
-    fn version_one_is_migrated_forward_and_rewritten() {
+    fn old_documents_are_migrated_and_rewritten() {
         let scratch = Scratch::new("migration");
         fs::write(
             scratch.settings(),
-            br#"{"version":1,"values":{"capture.format":"jpeg"}}"#,
+            br#"{"version":1,"values":{"capture.format":"jpeg","system.url-scheme":"true","update.channel":"preview"}}"#,
         )
         .unwrap();
 
         let store = SettingsStore::open(scratch.settings()).unwrap();
         assert_eq!(store.get("capture.format").unwrap().1, "jpeg");
+        assert!(store.boolean("system.url-scheme-enabled").unwrap());
         let document: Document =
             serde_json::from_slice(&fs::read(scratch.settings()).unwrap()).unwrap();
         assert_eq!(document.version, CURRENT_VERSION);
+        assert!(!document.values.contains_key("system.url-scheme"));
+        assert!(!document.values.contains_key("update.channel"));
     }
 
     #[test]
@@ -531,11 +564,11 @@ mod tests {
             ("future", r#"{"version":99,"values":{}}"#),
             (
                 "invalid",
-                r#"{"version":2,"values":{"capture.quality":"101"}}"#,
+                r#"{"version":3,"values":{"capture.quality":"101"}}"#,
             ),
             (
                 "unknown",
-                r#"{"version":2,"values":{"capture.typo":"png"}}"#,
+                r#"{"version":3,"values":{"capture.typo":"png"}}"#,
             ),
         ] {
             let scratch = Scratch::new(name);

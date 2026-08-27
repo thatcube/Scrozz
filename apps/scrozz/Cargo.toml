@@ -23,6 +23,7 @@ scrozz-store.workspace = true
 scrozz-export.workspace = true
 scrozz-shell.workspace = true
 scrozz-ui.workspace = true
+scrozz-update.workspace = true
 # The app opens the overlay window, so it names eframe directly. scrozz-ui
 # builds the whole overlay but deliberately does not depend on scrozz-shell, so
 # the app is the only crate that can see both and connect them.
@@ -36,6 +37,7 @@ anyhow.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }

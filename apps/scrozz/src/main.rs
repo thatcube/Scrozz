@@ -55,8 +55,10 @@ mod settings;
 mod settings_hotkeys;
 mod settings_runtime;
 mod settings_store;
+mod system_integration;
 #[cfg(test)]
 mod test_env;
+mod url;
 
 use std::{io::Write, process::ExitCode};
 

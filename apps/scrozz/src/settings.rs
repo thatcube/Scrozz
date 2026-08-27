@@ -596,12 +596,12 @@ pub const SETTINGS: &[Setting] = &[
         "Start Scrozz when the desktop session begins.",
     ),
     Setting::new(
-        "system.url-scheme",
+        "system.url-scheme-enabled",
         System,
         "Open scrozz links",
         Kind::Bool,
         "false",
-        "Register Scrozz to open scrozz links.",
+        "Allow registered scrozz links to trigger fixed, allow-listed actions.",
     ),
     Setting::new(
         "system.xwayland",
@@ -618,22 +618,6 @@ pub const SETTINGS: &[Setting] = &[
         Kind::Bool,
         "true",
         "Keep Scrozz available from the menu bar or system tray.",
-    ),
-    Setting::new(
-        "update.check-automatically",
-        Updates,
-        "Check automatically",
-        Kind::Bool,
-        "true",
-        "Check for available updates in the background.",
-    ),
-    Setting::new(
-        "update.channel",
-        Updates,
-        "Update channel",
-        Kind::Choice(&["stable", "preview"]),
-        "stable",
-        "Choose stable releases or preview builds.",
     ),
     Setting::new(
         "onboarding.completed",

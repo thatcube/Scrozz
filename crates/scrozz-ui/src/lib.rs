@@ -109,8 +109,8 @@ pub mod motion;
 pub mod onboarding_view;
 pub mod overlay_app;
 pub mod paint;
-pub mod settings_view;
 pub mod picker;
+pub mod settings_view;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
@@ -126,6 +126,6 @@ pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
 };
-pub use settings_view::{SettingsAction, SettingsResponse};
 pub use picker::{Highlight as WindowHighlight, Outcome as WindowPickerOutcome, WindowPicker};
+pub use settings_view::{SettingsAction, SettingsResponse};
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

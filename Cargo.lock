@@ -3357,6 +3357,8 @@ dependencies = [
  "scrozz-stitch",
  "scrozz-store",
  "scrozz-ui",
+ "scrozz-update",
+ "semver",
  "serde",
  "serde_json",
  "tracing",

@@ -105,6 +105,18 @@ pub enum Command {
     /// Hotkey helpers.
     Hotkey(HotkeyArgs),
 
+    /// Configure launch at login.
+    Autostart(AutostartArgs),
+
+    /// Register and handle fixed scrozz:// actions.
+    Url(UrlArgs),
+
+    /// Check, prepare, explicitly install, or roll back signed updates.
+    Update(UpdateArgs),
+
+    /// Inspect system integration or show a native notification.
+    System(SystemArgs),
+
     /// Launch the menu-bar app.
     Gui,
 }
@@ -141,6 +153,33 @@ impl Command {
             },
             Self::Hotkey(args) => match args.command {
                 HotkeyCommand::GenerateConfig { .. } => "hotkey.generate-config".into(),
+            },
+            Self::Autostart(args) => match args.command {
+                AutostartCommand::Status => "autostart.status".into(),
+                AutostartCommand::Enable => "autostart.enable".into(),
+                AutostartCommand::Disable => "autostart.disable".into(),
+            },
+            Self::Url(args) => match args.command {
+                UrlCommand::Status => "url.status".into(),
+                UrlCommand::Register => "url.register".into(),
+                UrlCommand::Unregister => "url.unregister".into(),
+                UrlCommand::Enable => "url.enable".into(),
+                UrlCommand::Disable => "url.disable".into(),
+                UrlCommand::Handle { .. } => "url.handle".into(),
+            },
+            Self::Update(args) => match args.command {
+                UpdateCommand::Status => "update.status".into(),
+                UpdateCommand::Check { .. } => "update.check".into(),
+                UpdateCommand::Download { .. } => "update.download".into(),
+                UpdateCommand::Stage { .. } => "update.stage".into(),
+                UpdateCommand::Install { .. } => "update.install".into(),
+                UpdateCommand::Recover => "update.recover".into(),
+                UpdateCommand::Rollback => "update.rollback".into(),
+                UpdateCommand::Reset => "update.reset".into(),
+            },
+            Self::System(args) => match args.command {
+                SystemCommand::Status => "system.status".into(),
+                SystemCommand::Notify { .. } => "system.notify".into(),
             },
             Self::Gui => "gui".into(),
         }
@@ -913,6 +952,147 @@ pub enum HotkeyAction {
     RecordStart,
     /// Stop the recording in progress.
     RecordStop,
+}
+
+// ---------------------------------------------------------------------------
+// system integration
+// ---------------------------------------------------------------------------
+
+/// Arguments to `scrozz autostart`.
+#[derive(Debug, Clone, Args)]
+pub struct AutostartArgs {
+    /// The launch-at-login operation.
+    #[command(subcommand)]
+    pub command: AutostartCommand,
+}
+
+/// Launch-at-login operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum AutostartCommand {
+    /// Report whether the installed entry matches this executable.
+    Status,
+    /// Start Scrozz when this user logs in.
+    Enable,
+    /// Remove Scrozz from this user's login.
+    Disable,
+}
+
+/// Arguments to `scrozz url`.
+#[derive(Debug, Clone, Args)]
+pub struct UrlArgs {
+    /// The URL-scheme operation.
+    #[command(subcommand)]
+    pub command: UrlCommand,
+}
+
+/// URL-scheme operations.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum UrlCommand {
+    /// Report OS registration and the independent master toggle.
+    Status,
+    /// Register Scrozz as a handler without enabling automation.
+    Register,
+    /// Remove the handler and turn the master toggle off.
+    Unregister,
+    /// Allow registered, fixed URL actions.
+    Enable,
+    /// Refuse every incoming URL action.
+    Disable,
+    /// Handle one URL delivered by the operating system.
+    #[command(hide = true)]
+    Handle {
+        /// The exact scrozz:// URL.
+        url: String,
+    },
+}
+
+impl UrlArgs {
+    /// Whether this operation changes shared settings state.
+    #[must_use]
+    pub const fn writes_settings(&self) -> bool {
+        matches!(
+            self.command,
+            UrlCommand::Enable | UrlCommand::Disable | UrlCommand::Unregister
+        )
+    }
+}
+
+/// Arguments to `scrozz update`.
+#[derive(Debug, Clone, Args)]
+pub struct UpdateArgs {
+    /// The signed-update operation.
+    #[command(subcommand)]
+    pub command: UpdateCommand,
+}
+
+/// Signed-update operations.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum UpdateCommand {
+    /// Show the durable updater state.
+    Status,
+    /// Fetch and verify a signed manifest without downloading an artifact.
+    Check {
+        /// HTTPS JSON manifest URL.
+        #[arg(long)]
+        manifest_url: String,
+        /// HTTPS detached-signature envelope URL.
+        #[arg(long)]
+        signature_url: String,
+    },
+    /// Download and verify the accepted platform artifact.
+    Download {
+        /// New file path. It must not already exist.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Copy a verified download into a sibling staging file.
+    Stage {
+        /// New staging path. It must not already exist.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Explicitly swap a staged regular file into place.
+    Install {
+        /// Current installed file.
+        #[arg(long)]
+        installed: PathBuf,
+        /// Sibling path that retains the previous installed file.
+        #[arg(long)]
+        previous: PathBuf,
+        /// Sibling path that preserves a candidate removed by rollback.
+        #[arg(long)]
+        failed_candidate: PathBuf,
+    },
+    /// Reconcile an explicitly started install after a recoverable failure.
+    Recover,
+    /// Restore the retained previous installation.
+    Rollback,
+    /// Abandon pre-install or terminal state while preserving the anti-replay watermark.
+    Reset,
+}
+
+/// Arguments to `scrozz system`.
+#[derive(Debug, Clone, Args)]
+pub struct SystemArgs {
+    /// The system-integration operation.
+    #[command(subcommand)]
+    pub command: SystemCommand,
+}
+
+/// System-integration operations.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SystemCommand {
+    /// Report identity, registration, consent, and updater state.
+    Status,
+    /// Show one native desktop notification.
+    Notify {
+        /// Notification title.
+        #[arg(long)]
+        title: String,
+        /// Notification body.
+        #[arg(long)]
+        body: String,
+    },
 }
 
 impl HotkeyAction {
@@ -1866,6 +2046,69 @@ mod tests {
             (
                 vec!["scrozz", "hotkey", "generate-config"],
                 "hotkey.generate-config",
+            ),
+            (vec!["scrozz", "autostart", "status"], "autostart.status"),
+            (vec!["scrozz", "autostart", "enable"], "autostart.enable"),
+            (vec!["scrozz", "autostart", "disable"], "autostart.disable"),
+            (vec!["scrozz", "url", "status"], "url.status"),
+            (vec!["scrozz", "url", "register"], "url.register"),
+            (vec!["scrozz", "url", "unregister"], "url.unregister"),
+            (vec!["scrozz", "url", "enable"], "url.enable"),
+            (vec!["scrozz", "url", "disable"], "url.disable"),
+            (
+                vec!["scrozz", "url", "handle", "scrozz://capture/region"],
+                "url.handle",
+            ),
+            (vec!["scrozz", "update", "status"], "update.status"),
+            (
+                vec![
+                    "scrozz",
+                    "update",
+                    "check",
+                    "--manifest-url",
+                    "https://updates.example/manifest.json",
+                    "--signature-url",
+                    "https://updates.example/manifest.sig",
+                ],
+                "update.check",
+            ),
+            (
+                vec!["scrozz", "update", "download", "--output", "candidate"],
+                "update.download",
+            ),
+            (
+                vec!["scrozz", "update", "stage", "--output", "staged"],
+                "update.stage",
+            ),
+            (
+                vec![
+                    "scrozz",
+                    "update",
+                    "install",
+                    "--installed",
+                    "scrozz",
+                    "--previous",
+                    "scrozz.previous",
+                    "--failed-candidate",
+                    "scrozz.failed",
+                ],
+                "update.install",
+            ),
+            (vec!["scrozz", "update", "recover"], "update.recover"),
+            (vec!["scrozz", "update", "rollback"], "update.rollback"),
+            (vec!["scrozz", "update", "reset"], "update.reset"),
+            (vec!["scrozz", "system", "status"], "system.status"),
+            (
+                vec![
+                    "scrozz",
+                    "system",
+                    "notify",
+                    "--title",
+                    "Ready",
+                    "--body",
+                    "Update downloaded",
+                ],
+                "system.notify",
             ),
             (vec!["scrozz", "gui"], "gui"),
         ];
