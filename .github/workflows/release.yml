@@ -143,7 +143,12 @@ jobs:
       - name: Build (single target)
         if: matrix.os != 'macos-latest'
         run: |
-          cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
+          FEATURES=()
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            FEATURES=(--features linux-recording)
+          fi
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            --bin scrozz "${FEATURES[@]}"
           mkdir -p dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "target/${{ matrix.target }}/release/scrozz.exe" dist/

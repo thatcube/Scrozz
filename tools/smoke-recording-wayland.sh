@@ -50,7 +50,7 @@ trap cleanup EXIT INT TERM
 
 export XDG_SESSION_TYPE=wayland
 echo "recording-wayland-smoke: compositor=${XDG_CURRENT_DESKTOP:-unknown}; approve the portal picker"
-echo "recording-wayland-smoke: mixed-scale layouts are checked for geometry, not fractional-coordinate conversion"
+echo "recording-wayland-smoke: portal geometry is converted to buffer pixels; incompatible mixed scales are rejected"
 
 if ! SCROZZ_SMOKE_CODEC="${SCROZZ_SMOKE_CODEC:-auto}" \
   SCROZZ_SMOKE_FPS=10 \
