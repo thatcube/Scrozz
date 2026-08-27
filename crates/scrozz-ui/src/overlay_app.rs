@@ -620,7 +620,6 @@ pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
         .with_transparent(true)
         .with_has_shadow(false)
         .with_taskbar(false)
-        .with_content_protected(true)
         .with_resizable(false)
         .with_drag_and_drop(true)
         .with_always_on_top()
@@ -1457,7 +1456,6 @@ mod tests {
         assert_eq!(v.transparent, Some(true));
         assert_eq!(v.has_shadow, Some(false));
         assert_eq!(v.taskbar, Some(false));
-        assert_eq!(v.content_protected, Some(true));
         assert_eq!(v.resizable, Some(false));
         assert_eq!(v.active, Some(false));
         assert_eq!(v.window_level, Some(egui::WindowLevel::AlwaysOnTop));

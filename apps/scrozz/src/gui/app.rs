@@ -726,44 +726,6 @@ impl App {
             editor.document.tick(delta);
         }
 
-        fn start_pending_recording(&mut self) {
-            let ready = self
-                .pending_recording_start
-                .as_ref()
-                .is_some_and(|pending| pending.armed_tick < self.tick_sequence);
-            if !ready {
-                return;
-            }
-            let pending = self
-                .pending_recording_start
-                .take()
-                .expect("readiness came from the pending start");
-            let result = match pending.start {
-                PendingRecordingStart::Settings {
-                    target,
-                    destination,
-                } => self
-                    .recording
-                    .as_mut()
-                    .expect("a pending settings start requires a recording machine")
-                    .begin_with_destination(target, destination),
-                PendingRecordingStart::Request(request) => self
-                    .recording
-                    .as_mut()
-                    .expect("a pending configured start requires a recording machine")
-                    .begin_request(request),
-            };
-            if let Err(error) = result {
-                let error = CliError::Core(error);
-                self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
-                self.present_recording_error(error);
-            } else {
-                self.recording_preflight = None;
-                self.note("recording countdown started");
-            }
-            self.drain_recording_events();
-            self.refresh_recording_tray();
-        }
         let result = self.recording.as_mut().map(|machine| machine.tick(delta));
         if let Some(Err(error)) = result {
             self.note(format!("recording tick failed: {error}"));
@@ -775,6 +737,45 @@ impl App {
         if stopped_without_terminal_event && self.recording_finalisation.is_none() {
             self.begin_recording_finalisation(None);
             return;
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn start_pending_recording(&mut self) {
+        let ready = self
+            .pending_recording_start
+            .as_ref()
+            .is_some_and(|pending| pending.armed_tick < self.tick_sequence);
+        if !ready {
+            return;
+        }
+        let pending = self
+            .pending_recording_start
+            .take()
+            .expect("readiness came from the pending start");
+        let result = match pending.start {
+            PendingRecordingStart::Settings {
+                target,
+                destination,
+            } => self
+                .recording
+                .as_mut()
+                .expect("a pending settings start requires a recording machine")
+                .begin_with_destination(target, destination),
+            PendingRecordingStart::Request(request) => self
+                .recording
+                .as_mut()
+                .expect("a pending configured start requires a recording machine")
+                .begin_request(request),
+        };
+        if let Err(error) = result {
+            let error = CliError::Core(error);
+            self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
+            self.present_recording_error(error);
+        } else {
+            self.recording_preflight = None;
+            self.note("recording countdown started");
         }
         self.drain_recording_events();
         self.refresh_recording_tray();

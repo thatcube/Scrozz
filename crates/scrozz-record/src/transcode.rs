@@ -952,8 +952,8 @@ fn cleanup_abandoned_transcodes(parent: &Path) -> Result<()> {
                     return Err(Error::Io(error));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(Error::Io(error)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
         }
     }
     Ok(())

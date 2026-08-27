@@ -1345,11 +1345,14 @@ mod tests {
 
         let mut machine = RecordingMachine::with_engine(Box::new(engine), settings).unwrap();
         machine.begin(target()).unwrap();
-        let error = machine
-            .tick(Duration::from_secs(1))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("failed to start"), "{error}");
+        let error = machine.tick(Duration::from_secs(1)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidRequest(ref message) if message.contains("one scripted session")
+            ),
+            "{error}"
+        );
         assert_eq!(machine.phase(), RecordingPhase::Failed);
         assert!(
             machine
