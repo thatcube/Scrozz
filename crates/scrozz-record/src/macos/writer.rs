@@ -181,6 +181,10 @@ impl Writer {
         self.paused = false;
     }
 
+    pub(crate) fn video_ready(&self) -> bool {
+        !self.paused && unsafe { self.video.isReadyForMoreMediaData() }
+    }
+
     pub(crate) fn append_video(&mut self, sample: &CMSampleBuffer) -> Result<()> {
         if self.paused {
             return Ok(());
@@ -276,7 +280,11 @@ impl Writer {
         }
     }
 
-    pub(crate) fn finish(&mut self, interrupted: Option<String>) -> Result<WriterSummary> {
+    pub(crate) fn finish(
+        &mut self,
+        interrupted: Option<String>,
+        session_duration: Duration,
+    ) -> Result<WriterSummary> {
         if self.finished {
             return Err(Error::InvalidRequest(
                 "recording writer was already finalised".to_owned(),
@@ -287,6 +295,20 @@ impl Writer {
         let mut partial = interrupted;
         if let Err(failure) = self.flush_audio() {
             append_reason(&mut partial, &failure.to_string());
+        }
+
+        // SAFETY: writer status is a documented thread-safe property read.
+        let writer_is_active = unsafe { self.asset.status() == AVAssetWriterStatus::Writing };
+        if let Some(origin_ns) = self.session_origin_ns.filter(|_| writer_is_active) {
+            let elapsed_ns = i64::try_from(session_duration.as_nanos()).unwrap_or(i64::MAX);
+            self.media_end_ns = self.media_end_ns.max(elapsed_ns);
+            let end_ns = origin_ns.saturating_add(self.media_end_ns).max(origin_ns);
+            // SAFETY: the writer session started at the numeric source origin,
+            // and no more samples can arrive after capture shutdown.
+            unsafe {
+                self.asset
+                    .endSessionAtSourceTime(CMTime::new(end_ns, NANOSECONDS_PER_SECOND as i32));
+            }
         }
 
         // SAFETY: capture has stopped, so no further appends can race these calls.
@@ -353,10 +375,10 @@ impl Writer {
                 Ok(false) => {
                     return Err(discard_unplayable(
                         &self.path,
-                        Error::Storage(
-                            "recording failed before a playable MP4 fragment was written"
-                                .to_owned(),
-                        ),
+                        Error::Storage(format!(
+                            "recording failed before a playable MP4 fragment was written: {}",
+                            partial.as_deref().unwrap_or("unknown interruption")
+                        )),
                     ));
                 }
                 Err(failure) => {

@@ -1,6 +1,6 @@
 //! macOS recording error classification.
 
-use objc2_foundation::NSError;
+use objc2_foundation::{NSError, NSUnderlyingErrorKey};
 use objc2_screen_capture_kit::SCStreamErrorCode;
 use scrozz_core::Error;
 
@@ -41,8 +41,33 @@ pub(crate) fn from_sck(error: &NSError, context: &str) -> Error {
 }
 
 pub(crate) fn describe(error: &NSError, context: &str) -> String {
+    format!("{context}: {}", describe_error(error, true))
+}
+
+fn describe_error(error: &NSError, include_underlying: bool) -> String {
     let message = error.localizedDescription().to_string();
-    format!("{context}: {message} (code {})", error.code())
+    let mut detail = format!("{message} ({} code {})", error.domain(), error.code());
+    if let Some(reason) = error.localizedFailureReason() {
+        let reason = reason.to_string();
+        if !reason.is_empty() && reason != message {
+            detail.push_str(&format!(": {reason}"));
+        }
+    }
+    if include_underlying {
+        // SAFETY: immutable weak-linked Foundation user-info key.
+        let key = unsafe { NSUnderlyingErrorKey };
+        if let Some(underlying) = error
+            .userInfo()
+            .objectForKey(key)
+            .and_then(|value| value.downcast::<NSError>().ok())
+        {
+            detail.push_str(&format!(
+                "; underlying {}",
+                describe_error(&underlying, false)
+            ));
+        }
+    }
+    detail
 }
 
 #[cfg(test)]

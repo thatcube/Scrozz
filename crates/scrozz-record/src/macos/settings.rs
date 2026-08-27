@@ -5,7 +5,8 @@ use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264, AVVideoCodecTypeHEVC,
     AVVideoCompressionPropertiesKey, AVVideoEncoderSpecificationKey,
-    AVVideoExpectedSourceFrameRateKey, AVVideoHeightKey, AVVideoWidthKey,
+    AVVideoExpectedSourceFrameRateKey, AVVideoHeightKey, AVVideoMaxKeyFrameIntervalDurationKey,
+    AVVideoWidthKey,
 };
 use objc2_foundation::{NSMutableDictionary, NSNumber, NSString};
 use scrozz_core::{Error, Result};
@@ -15,6 +16,7 @@ use crate::VideoCodec;
 use super::plan::RecordingPlan;
 
 pub(crate) type SettingsDictionary = NSMutableDictionary<NSString, AnyObject>;
+const MAX_KEYFRAME_INTERVAL_SECONDS: f64 = 2.0;
 
 pub(crate) fn video(
     plan: &RecordingPlan,
@@ -26,6 +28,7 @@ pub(crate) fn video(
 
     let bitrate = NSNumber::numberWithUnsignedLongLong(plan.bitrate);
     let frame_rate = NSNumber::numberWithUnsignedInt(fps);
+    let keyframe_interval = NSNumber::numberWithDouble(MAX_KEYFRAME_INTERVAL_SECONDS);
     let width = NSNumber::numberWithUnsignedInt(plan.size.width.round() as u32);
     let height = NSNumber::numberWithUnsignedInt(plan.size.height.round() as u32);
     let require_hardware = NSNumber::numberWithBool(true);
@@ -39,6 +42,13 @@ pub(crate) fn video(
         required(
             AVVideoExpectedSourceFrameRateKey,
             "AVVideoExpectedSourceFrameRateKey",
+        )
+    }?;
+    // SAFETY: see above.
+    let keyframe_interval_key = unsafe {
+        required(
+            AVVideoMaxKeyFrameIntervalDurationKey,
+            "AVVideoMaxKeyFrameIntervalDurationKey",
         )
     }?;
     // SAFETY: see above.
@@ -64,6 +74,7 @@ pub(crate) fn video(
 
     compression.insert(average_bitrate_key, any(&*bitrate));
     compression.insert(source_rate_key, any(&*frame_rate));
+    compression.insert(keyframe_interval_key, any(&*keyframe_interval));
     encoder.insert(&*hardware_key, any(&*require_hardware));
 
     let codec = match plan.codec {
@@ -123,10 +134,11 @@ mod tests {
     use crate::RecordingRequest;
 
     #[test]
-    fn muxer_settings_require_hardware_and_use_five_second_fragments() {
+    fn muxer_settings_require_hardware_and_frequent_fragment_keyframes() {
         let request = RecordingRequest::new(CaptureTarget::AllDisplays);
         let plan = RecordingPlan::new(&request, 1_920, 1_080, 1.0, false);
         assert_eq!(plan.fragment_interval_seconds, 5);
+        assert!(MAX_KEYFRAME_INTERVAL_SECONDS < plan.fragment_interval_seconds as f64);
 
         let settings = video(&plan, request.fps).unwrap();
         // SAFETY: immutable weak-linked AVFoundation constant.
