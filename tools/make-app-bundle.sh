@@ -11,7 +11,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source "$HOME/.cargo/env" 2>/dev/null || true
 
-APP="${1:-$HOME/Applications/Scrozz.app}"
+# Install where Finder's Applications sidebar actually points. Using
+# `$HOME/Applications` made the app valid but effectively invisible to someone
+# looking in the normal /Applications folder, and future rebuilds then updated
+# the wrong copy.
+APP="${1:-/Applications/Scrozz.app}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/scrozz-rel}"
 
 echo "==> building release binary"
