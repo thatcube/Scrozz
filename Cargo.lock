@@ -3939,6 +3939,7 @@ dependencies = [
  "scrozz-annotate",
  "scrozz-core",
  "scrozz-record",
+ "scrozz-store",
  "thiserror 2.0.20",
  "tracing",
 ]

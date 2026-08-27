@@ -46,9 +46,10 @@ use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
 };
+use scrozz_store::{History as _, Page, Store as _};
 use scrozz_ui::{
-    RecordingHudAction, RecordingHudSnapshot, RecordingPresentation, RecordingSurfaceAction,
-    VideoEditorAction, VideoEditorSnapshot,
+    HistoryWindowAction, HistoryWindowSnapshot, RecordingHudAction, RecordingHudSnapshot,
+    RecordingPresentation, RecordingSurfaceAction, VideoEditorAction, VideoEditorSnapshot,
 };
 
 use crate::{
@@ -62,6 +63,7 @@ use crate::{
         server::{Request, Server},
     },
     json::Json,
+    platform,
     report::Report,
 };
 
@@ -256,8 +258,11 @@ pub struct App {
     recording_preflight: Option<RecordingHudSnapshot>,
     pending_recording_start: Option<ArmedRecordingStart>,
     recording_editor: Option<ActiveVideoEditor>,
+    history_window: Option<HistoryWindowSnapshot>,
     tick_sequence: u64,
 }
+
+const HISTORY_PAGE_SIZE: u32 = 100;
 
 impl App {
     /// Builds the application, connecting everything that will connect.
@@ -364,6 +369,7 @@ impl App {
             recording_preflight: None,
             pending_recording_start: None,
             recording_editor: None,
+            history_window: None,
             tick_sequence: 0,
         };
 
@@ -576,7 +582,7 @@ impl App {
                 Tick::Continue
             }
             Action::OpenHistory => {
-                self.note("the history window is not built yet");
+                self.open_history();
                 Tick::Continue
             }
             Action::OpenSettings => {
@@ -1105,6 +1111,143 @@ impl App {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);
+    }
+
+    fn open_history(&mut self) {
+        if self.history_window.is_none() {
+            self.history_window = Some(HistoryWindowSnapshot::default());
+        }
+        self.refresh_history();
+    }
+
+    fn refresh_history(&mut self) {
+        let requested_offset = self
+            .history_window
+            .as_ref()
+            .map_or(0, |window| window.offset);
+        let loaded = platform::store().and_then(|store| {
+            let total = store.count().map_err(CliError::Core)?;
+            let last_page_offset = if total == 0 {
+                0
+            } else {
+                let offset = ((total - 1) / u64::from(HISTORY_PAGE_SIZE))
+                    .saturating_mul(u64::from(HISTORY_PAGE_SIZE));
+                u32::try_from(offset).unwrap_or(u32::MAX - (u32::MAX % HISTORY_PAGE_SIZE))
+            };
+            let offset = requested_offset.min(last_page_offset);
+            let records = store
+                .page(Page::new(HISTORY_PAGE_SIZE, offset))
+                .map_err(CliError::Core)?;
+            Ok(HistoryWindowSnapshot {
+                records,
+                total,
+                offset,
+                confirm_delete: None,
+                error: None,
+            })
+        });
+        match loaded {
+            Ok(snapshot) => self.history_window = Some(snapshot),
+            Err(error) => {
+                let message = error.to_string();
+                self.history_window
+                    .get_or_insert_with(HistoryWindowSnapshot::default)
+                    .error = Some(message.clone());
+                self.note(format!("could not load capture history: {message}"));
+            }
+        }
+    }
+
+    /// Current ordinary history-window state for the native host.
+    #[must_use]
+    pub fn history_window(&self) -> Option<HistoryWindowSnapshot> {
+        self.history_window.clone()
+    }
+
+    /// Applies one semantic action from the ordinary history viewport.
+    pub fn handle_history_window_action(&mut self, action: HistoryWindowAction) {
+        match action {
+            HistoryWindowAction::Close => self.history_window = None,
+            HistoryWindowAction::Refresh => self.refresh_history(),
+            HistoryWindowAction::PreviousPage => {
+                if let Some(window) = &mut self.history_window {
+                    window.offset = window.offset.saturating_sub(HISTORY_PAGE_SIZE);
+                }
+                self.refresh_history();
+            }
+            HistoryWindowAction::NextPage => {
+                if let Some(window) = &mut self.history_window {
+                    let next = window.offset.saturating_add(HISTORY_PAGE_SIZE);
+                    if u64::from(next) < window.total {
+                        window.offset = next;
+                    }
+                }
+                self.refresh_history();
+            }
+            HistoryWindowAction::SetPinned { id, pinned } => {
+                match platform::store()
+                    .and_then(|mut store| store.set_pinned(&id, pinned).map_err(CliError::Core))
+                {
+                    Ok(()) => self.refresh_history(),
+                    Err(error) => self.record_history_error("change pinned state", error),
+                }
+            }
+            HistoryWindowAction::RequestDelete(id) => {
+                if let Some(window) = &mut self.history_window {
+                    window.confirm_delete = Some(id);
+                }
+            }
+            HistoryWindowAction::CancelDelete => {
+                if let Some(window) = &mut self.history_window {
+                    window.confirm_delete = None;
+                }
+            }
+            HistoryWindowAction::Delete(id) => {
+                let confirmed = self
+                    .history_window
+                    .as_ref()
+                    .is_some_and(|window| window.confirm_delete.as_ref() == Some(&id));
+                if !confirmed {
+                    self.record_history_error(
+                        "delete history item",
+                        CliError::Core(CoreError::InvalidRequest(
+                            "history deletion was not confirmed".to_owned(),
+                        )),
+                    );
+                    return;
+                }
+                match platform::store()
+                    .and_then(|mut store| store.delete(&id).map_err(CliError::Core))
+                {
+                    Ok(true) => self.refresh_history(),
+                    Ok(false) => self.record_history_error(
+                        "delete history item",
+                        CliError::Core(CoreError::InvalidRequest(format!(
+                            "history contains no capture {}",
+                            id.0
+                        ))),
+                    ),
+                    Err(error) => self.record_history_error("delete history item", error),
+                }
+            }
+            HistoryWindowAction::Reveal(id) => {
+                let path = self
+                    .history_window
+                    .as_ref()
+                    .and_then(|window| window.records.iter().find(|record| record.id == id))
+                    .and_then(|record| record.video.as_ref())
+                    .map(|video| video.path.clone());
+                self.reveal_recording_path(path);
+            }
+        }
+    }
+
+    fn record_history_error(&mut self, action: &str, error: CliError) {
+        let message = format!("could not {action}: {error}");
+        self.history_window
+            .get_or_insert_with(HistoryWindowSnapshot::default)
+            .error = Some(message.clone());
+        self.note(message);
     }
 
     fn present_recording_error(&mut self, error: CliError) {
@@ -1677,18 +1820,42 @@ mod tests {
     fn unavailable_and_unwired_actions_say_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
         app.recording = None;
-        for action in [Action::OpenHistory, Action::OpenSettings] {
-            assert_eq!(app.perform(action), Tick::Continue);
-        }
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
         app.recording = None;
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
-        assert!(notes.contains("history window"), "{notes}");
         assert!(notes.contains("settings window"), "{notes}");
         assert!(
-            notes.contains("screen recording is unavailable")
+            notes.contains("no native engine advertised video capture")
                 || notes.contains("recording countdown started"),
             "{notes}"
+        );
+    }
+
+    #[test]
+    fn history_deletion_requires_an_explicit_confirmation() {
+        let (mut app, _) = app();
+        let id = scrozz_store::CaptureId("history-fixture".to_owned());
+        app.history_window = Some(HistoryWindowSnapshot::default());
+
+        app.handle_history_window_action(HistoryWindowAction::Delete(id.clone()));
+        assert!(
+            app.history_window()
+                .and_then(|window| window.error)
+                .is_some_and(|error| error.contains("was not confirmed"))
+        );
+
+        app.handle_history_window_action(HistoryWindowAction::RequestDelete(id.clone()));
+        assert_eq!(
+            app.history_window()
+                .and_then(|window| window.confirm_delete),
+            Some(id)
+        );
+        app.handle_history_window_action(HistoryWindowAction::CancelDelete);
+        assert!(
+            app.history_window()
+                .and_then(|window| window.confirm_delete)
+                .is_none()
         );
     }
 
@@ -1720,6 +1887,12 @@ mod tests {
         app.recording_destination = destination;
 
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
+        assert_eq!(
+            app.recording.as_ref().map(RecordingMachine::phase),
+            Some(RecordingPhase::Idle)
+        );
+        assert!(app.pending_recording_start.is_some());
+        assert_eq!(app.tick(), Tick::Continue);
         assert_eq!(
             app.recording.as_ref().map(RecordingMachine::phase),
             Some(RecordingPhase::Recording)

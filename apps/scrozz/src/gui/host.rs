@@ -14,8 +14,9 @@ use std::{
 };
 
 use scrozz_ui::{
-    OverlayHandle,
+    HistoryWindowAction, OverlayHandle, Theme, history_viewport_builder, history_viewport_id,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
+    show_history_window,
 };
 
 use scrozz_core::Error as CoreError;
@@ -218,6 +219,7 @@ impl Host for Windowed {
                     emit: Some(emit),
                     announced: false,
                     stopped: false,
+                    history_actions: Arc::new(Mutex::new(Vec::new())),
                 }))
             }),
         )
@@ -263,6 +265,7 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
+    history_actions: Arc<Mutex<Vec<HistoryWindowAction>>>,
 }
 
 impl Driver {
@@ -295,6 +298,38 @@ impl Driver {
         self.handle
             .panel_report()
             .is_some_and(|report| report.non_activating)
+    }
+
+    fn show_history(&self, ctx: &egui::Context) {
+        let Some(snapshot) = self.app.history_window() else {
+            return;
+        };
+        let actions = Arc::clone(&self.history_actions);
+        let viewport = history_viewport_id();
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(viewport, history_viewport_builder(), move |ui, _class| {
+            let theme = if ui.visuals().dark_mode {
+                Theme::dark()
+            } else {
+                Theme::light()
+            };
+            let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+            let mut emitted = show_history_window(ui, &snapshot, &theme);
+            if close_requested {
+                emitted.push(HistoryWindowAction::Close);
+            }
+            if emitted
+                .iter()
+                .any(|action| matches!(action, HistoryWindowAction::Close))
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(emitted);
+            ui.ctx().request_repaint_after(IDLE);
+        });
     }
 }
 
@@ -344,6 +379,15 @@ impl eframe::App for Driver {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
 
+        let mut pending_history_actions = self
+            .history_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history_actions = std::mem::take(&mut *pending_history_actions);
+        drop(pending_history_actions);
+        for action in history_actions {
+            self.app.handle_history_window_action(action);
+        }
         for action in self.handle.drain_recording_actions() {
             self.app.handle_recording_surface_action(action);
         }
@@ -370,6 +414,7 @@ impl eframe::App for Driver {
         }
         if !self.stopped {
             self.handle.set_recording(self.app.recording_presentation());
+            self.show_history(ctx);
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while

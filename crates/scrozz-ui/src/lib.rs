@@ -83,6 +83,7 @@
 pub mod card;
 pub mod countdown;
 pub mod harness;
+pub mod history_window;
 pub mod icons;
 pub mod motion;
 pub mod overlay_app;
@@ -97,6 +98,10 @@ pub mod video_editor;
 
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use countdown::{Countdown, CountdownResponse};
+pub use history_window::{
+    HistoryWindowAction, HistoryWindowSnapshot, show as show_history_window,
+    viewport_builder as history_viewport_builder, viewport_id as history_viewport_id,
+};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,

@@ -651,6 +651,7 @@ fn menu_ids_are_unique_and_round_trip() {
 #[test]
 fn enabled_menu_items_are_never_clickable_no_ops() {
     assert!(TrayAction::CaptureFullscreen.is_available());
+    assert!(TrayAction::OpenHistory.is_available());
     assert!(TrayAction::Quit.is_available());
     assert!(!TrayAction::ToggleRecording.is_available_with(false));
     assert!(TrayAction::ToggleRecording.is_available_with(true));
@@ -658,7 +659,6 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
     for unfinished in [
         TrayAction::CaptureRegion,
         TrayAction::CaptureWindow,
-        TrayAction::OpenHistory,
         TrayAction::OpenSettings,
     ] {
         assert!(

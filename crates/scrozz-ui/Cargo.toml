@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 scrozz-core.workspace = true
 scrozz-record.workspace = true
+scrozz-store.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-annotate.workspace = true
