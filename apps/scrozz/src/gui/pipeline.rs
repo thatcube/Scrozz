@@ -31,7 +31,7 @@ use std::{
 
 use scrozz_annotate::Document;
 use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
-use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
+use scrozz_export::{Encoder, NamingContext, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
@@ -40,6 +40,7 @@ use crate::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
     },
+    output::CaptureOutput,
     platform,
 };
 
@@ -168,6 +169,8 @@ impl Drop for Pipeline {
 /// What the worker remembers about a card it produced.
 struct Cached {
     bytes: Vec<u8>,
+    output: CaptureOutput,
+    naming: NamingContext,
 }
 
 struct Worker {
@@ -248,19 +251,42 @@ impl Worker {
                 ));
             }
         };
+        let output = CaptureOutput::load()?;
 
         let request = CaptureRequest {
             target,
-            cursor: CursorMode::Hidden,
-            include_window_shadow: !kind.needs_selection(),
+            cursor: if output.include_cursor() {
+                CursorMode::Visible
+            } else {
+                CursorMode::Hidden
+            },
+            include_window_shadow: output.include_window_shadow() && !kind.needs_selection(),
         };
 
         let capture = backend.capture(&request)?;
-        let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
+        let bytes = output
+            .encoder(None)
+            .encode(&capture.frame, output.format())?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
+        if output.copy_to_clipboard()
+            && let Err(error) = SystemClipboard::new().write_image_reporting(&capture.frame)
+        {
+            tracing::warn!("capture succeeded but automatic clipboard copy failed: {error}");
+        }
 
-        self.cache.insert(card, Cached { bytes });
+        self.cache.insert(
+            card,
+            Cached {
+                bytes,
+                output,
+                naming: NamingContext {
+                    width: capture.frame.width(),
+                    height: capture.frame.height(),
+                    ..NamingContext::now()
+                },
+            },
+        );
 
         Ok(Card {
             id: card,
@@ -307,7 +333,7 @@ impl Worker {
 
     fn save(&mut self, card: CardId) {
         let result = self.cached(card, "save").and_then(|cached| {
-            let path = crate::output::export_default(&cached.bytes)?;
+            let path = cached.output.export(&cached.bytes, &cached.naming)?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer(card, result);

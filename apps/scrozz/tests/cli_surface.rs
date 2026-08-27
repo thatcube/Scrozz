@@ -28,11 +28,21 @@
 
 use std::{
     ffi::OsStr,
+    path::{Path, PathBuf},
     process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Runs the binary and returns everything the shell would have seen.
 fn scrozz<I, S>(args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    scrozz_at(&isolated_config_dir("read"), args)
+}
+
+fn scrozz_at<I, S>(config_dir: &Path, args: I) -> Output
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -44,8 +54,18 @@ where
         .env_remove("RUST_LOG")
         .env_remove("SCROZZ_SIMULATE_ERROR")
         .env_remove("SCROZZ_UNSTABLE_BACKENDS")
+        .env("SCROZZ_CONFIG_DIR", config_dir)
         .output()
         .expect("the binary should run")
+}
+
+fn isolated_config_dir(name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "scrozz-cli-surface-{name}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 /// Runs the binary with one simulated failure injected.
@@ -58,6 +78,7 @@ where
         .args(args)
         .env_remove("RUST_LOG")
         .env_remove("SCROZZ_UNSTABLE_BACKENDS")
+        .env("SCROZZ_CONFIG_DIR", isolated_config_dir("failure"))
         .env("SCROZZ_SIMULATE_ERROR", kind)
         .output()
         .expect("the binary should run")
@@ -117,6 +138,8 @@ fn every_subcommand_has_working_help() {
         vec!["settings", "--help"],
         vec!["settings", "get", "--help"],
         vec!["settings", "set", "--help"],
+        vec!["settings", "reset", "--help"],
+        vec!["settings", "path", "--help"],
         vec!["hotkey", "--help"],
         vec!["hotkey", "generate-config", "--help"],
         vec!["gui", "--help"],
@@ -336,6 +359,7 @@ fn logs_never_reach_stdout_however_loud_the_verbosity() {
     let out = Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(["-vvv", "--json", "settings", "get"])
         .env_remove("SCROZZ_SIMULATE_ERROR")
+        .env("SCROZZ_CONFIG_DIR", isolated_config_dir("logs"))
         .env("RUST_LOG", "trace")
         .output()
         .expect("the binary should run");
@@ -447,6 +471,49 @@ fn the_command_slug_identifies_the_subcommand_precisely() {
             "{args:?} reported the wrong command: {text}"
         );
     }
+}
+
+#[test]
+fn settings_set_get_reset_and_path_persist_across_processes() {
+    let directory = isolated_config_dir("round-trip");
+
+    let set = scrozz_at(
+        &directory,
+        [
+            "--json",
+            "--no-ipc",
+            "settings",
+            "set",
+            "capture.format",
+            "webp",
+        ],
+    );
+    assert_eq!(code(&set), 0, "{}", stderr(&set));
+    assert!(stdout(&set).contains(r#""source":"user""#));
+
+    let get = scrozz_at(&directory, ["--json", "settings", "get", "capture.format"]);
+    assert_eq!(code(&get), 0, "{}", stderr(&get));
+    assert!(stdout(&get).contains(r#""value":"webp""#));
+
+    let plan = scrozz_at(&directory, ["--json", "--no-ipc", "capture", "--dry-run"]);
+    assert_eq!(code(&plan), 0, "{}", stderr(&plan));
+    assert!(stdout(&plan).contains(r#""format":"webp""#));
+
+    let path = scrozz_at(&directory, ["settings", "path"]);
+    assert_eq!(
+        stdout(&path).trim(),
+        directory.join("settings.json").display().to_string()
+    );
+
+    let reset = scrozz_at(
+        &directory,
+        ["--json", "--no-ipc", "settings", "reset", "capture.format"],
+    );
+    assert_eq!(code(&reset), 0, "{}", stderr(&reset));
+    assert!(stdout(&reset).contains(r#""source":"default""#));
+    assert!(stdout(&reset).contains(r#""value":"png""#));
+
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[test]

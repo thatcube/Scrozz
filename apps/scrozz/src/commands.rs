@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
-use scrozz_export::{Clipboard, Encoder, FrameEncoder};
+use scrozz_export::{Clipboard, Encoder, ImageFormat, NamingContext};
 use scrozz_ocr::Ocr as _;
 
 use crate::{
@@ -31,9 +31,11 @@ use crate::{
     fault::{CliError, CliResult},
     hotkey_config, ipc,
     json::Json,
+    output::CaptureOutput,
     platform,
     report::Report,
-    settings,
+    settings_runtime,
+    settings_store::{self, SettingsStore},
 };
 
 /// Runs a command locally.
@@ -60,17 +62,36 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 // ---------------------------------------------------------------------------
 
 fn capture(args: &CaptureArgs) -> CliResult<Report> {
+    let output = CaptureOutput::load()?;
+    capture_with_output(args, &output)
+}
+
+fn capture_with_output(args: &CaptureArgs, output: &CaptureOutput) -> CliResult<Report> {
     args.validate()?;
     let target = args.target.resolve()?;
-    let sinks = args.sinks();
+    let mut sinks = args.sinks();
+    if output.copy_to_clipboard() && !sinks.contains(&Sink::Clipboard) {
+        sinks.push(Sink::Clipboard);
+    }
+    let format = args
+        .format
+        .map_or_else(|| output.format(), |format| format.to_export());
+    let quality = args.quality.unwrap_or(output.quality());
+    let cursor = args.cursor || output.include_cursor();
+    let window_shadow = !args.no_window_shadow && output.include_window_shadow();
 
     let plan = Json::obj([
         ("target", target_json(&target)),
         ("interactive", Json::Bool(args.target.is_interactive())),
-        ("cursor", Json::Bool(args.cursor)),
-        ("window_shadow", Json::Bool(!args.no_window_shadow)),
-        ("format", Json::str(args.format().slug())),
-        ("quality", Json::opt(args.quality, |q| Json::Int(q.into()))),
+        ("cursor", Json::Bool(cursor)),
+        ("window_shadow", Json::Bool(window_shadow)),
+        ("format", Json::str(format_slug(format))),
+        (
+            "quality",
+            Json::opt((format != ImageFormat::Png).then_some(quality), |quality| {
+                Json::Int(quality.into())
+            }),
+        ),
         ("delay_secs", Json::opt(args.delay, Json::Float)),
         ("sinks", Json::arr(sinks.iter().map(sink_json))),
     ]);
@@ -88,12 +109,12 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     let backend = platform::capture_backend()?;
     let request = CaptureRequest {
         target: capture_target(&target)?,
-        cursor: if args.cursor {
+        cursor: if cursor {
             CursorMode::Visible
         } else {
             CursorMode::Hidden
         },
-        include_window_shadow: !args.no_window_shadow,
+        include_window_shadow: window_shadow,
     };
 
     if let Some(secs) = args.delay {
@@ -103,8 +124,9 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     let capture = backend.capture(&request)?;
     let frame = &capture.frame;
 
-    let bytes = FrameEncoder::new()
-        .encode(frame, args.format().to_export())
+    let bytes = output
+        .encoder(args.quality)
+        .encode(frame, format)
         .map_err(CliError::Core)?;
 
     let mut written = Vec::new();
@@ -125,7 +147,14 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
             // D18: any folder the user picks, which is what lets a Dropbox or
             // iCloud directory provide sync for free with no service on our side.
             Sink::DefaultFolder => {
-                let path = crate::output::export_default(&bytes)?;
+                let path = output.export(
+                    &bytes,
+                    &NamingContext {
+                        width: frame.width(),
+                        height: frame.height(),
+                        ..NamingContext::now()
+                    },
+                )?;
                 written.push(path.display().to_string());
             }
         }
@@ -160,6 +189,14 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     let mut report = Report::new(data, human);
     report.raw = raw;
     Ok(report)
+}
+
+const fn format_slug(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::WebP => "webp",
+    }
 }
 
 /// Turns a resolved [`TargetSpec`] into the core request type.
@@ -477,26 +514,64 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
     match command {
-        SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json())]),
-            settings::all_human(),
-        )),
+        SettingsCommand::Get { key: None } => {
+            let store = SettingsStore::load()?;
+            Ok(Report::new(
+                Json::obj([("settings", store.all_json())]),
+                store.all_human(),
+            ))
+        }
 
         SettingsCommand::Get { key: Some(key) } => {
-            let setting = settings::lookup(key)?;
-            Ok(Report::new(setting.to_json(), setting.default.to_string()))
+            let store = SettingsStore::load()?;
+            let (setting, value, source) = store.get(key)?;
+            Ok(Report::new(
+                setting.to_json(value, source),
+                value.to_owned(),
+            ))
         }
 
         SettingsCommand::Set { key, value } => {
-            // Validate first and completely. A rejected value must be rejected
-            // for the right reason: "that is not a format" is useful, "settings
-            // are not implemented" is not, and the user needs to hear the first
-            // one even while the second is true.
-            let setting = settings::lookup(key)?;
-            setting.validate(value)?;
-            Err(CliError::not_implemented(
-                format!("saving {key}"),
-                "scrozz-store (settings persistence)",
+            let mut store = SettingsStore::load()?;
+            settings_runtime::set(&mut store, key, value)?;
+            let (setting, resolved, source) = store.get(key)?;
+            Ok(Report::new(
+                setting.to_json(resolved, source),
+                format!("{key} = {resolved}"),
+            ))
+        }
+
+        SettingsCommand::Reset { key: Some(key) } => {
+            let mut store = SettingsStore::load()?;
+            settings_runtime::reset(&mut store, key)?;
+            let (setting, value, source) = store.get(key)?;
+            Ok(Report::new(
+                setting.to_json(value, source),
+                format!("{key} = {value}"),
+            ))
+        }
+
+        SettingsCommand::Reset { key: None } => {
+            let mut store = SettingsStore::load()?;
+            let count = settings_runtime::reset_all(&mut store)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("reset", Json::Int(i64::try_from(count).unwrap_or(i64::MAX))),
+                    (
+                        "path",
+                        Json::str(store.path().to_string_lossy().into_owned()),
+                    ),
+                ]),
+                format!("Reset {count} setting override(s)."),
+            ))
+        }
+
+        SettingsCommand::Path => {
+            let path = settings_store::settings_path()?;
+            let text = path.to_string_lossy().into_owned();
+            Ok(Report::new(
+                Json::obj([("path", Json::str(text.as_str()))]),
+                text,
             ))
         }
     }
@@ -682,6 +757,8 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use clap::Parser;
 
     use super::*;
@@ -690,11 +767,41 @@ mod tests {
     fn run(argv: &[&str]) -> CliResult<Report> {
         let cli = Cli::try_parse_from(argv).expect("should parse");
         cli.validate()?;
-        dispatch(&cli.command.clone().expect("should have a command"))
+        let command = cli.command.clone().expect("should have a command");
+        match &command {
+            Command::Capture(args) => capture_with_output(args, &default_capture_output()),
+            _ => dispatch(&command),
+        }
+    }
+
+    fn default_capture_output() -> CaptureOutput {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "scrozz-command-capture-defaults-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = SettingsStore::open(path).unwrap();
+        CaptureOutput::from_store(&store).unwrap()
     }
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    fn with_settings<T>(name: &str, body: impl FnOnce() -> T) -> T {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let _env = crate::test_env::lock();
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-command-settings-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::test_env::set(settings_store::CONFIG_DIR_ENV, directory.to_str().unwrap());
+        let result = body();
+        let _ = std::fs::remove_dir_all(directory);
+        result
     }
 
     // -- dry-run capture ---------------------------------------------------
@@ -775,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_quality_is_null_rather_than_missing() {
+    fn an_unset_quality_is_null_for_the_default_lossless_format() {
         let rendered = json_of(&["scrozz", "capture", "--dry-run"]);
         assert!(rendered.contains(r#""quality":null"#), "{rendered}");
         assert!(rendered.contains(r#""delay_secs":null"#), "{rendered}");
@@ -892,7 +999,7 @@ mod tests {
 
     #[test]
     fn listing_settings_works_today() {
-        let rendered = json_of(&["scrozz", "settings", "get"]);
+        let rendered = with_settings("listing", || json_of(&["scrozz", "settings", "get"]));
         assert!(rendered.contains(r#""key":"capture.format""#), "{rendered}");
         assert!(
             rendered.contains(r#""key":"hotkey.record-stop""#),
@@ -902,7 +1009,9 @@ mod tests {
 
     #[test]
     fn reading_one_setting_returns_just_that_one() {
-        let report = run(&["scrozz", "settings", "get", "capture.quality"]).unwrap();
+        let report = with_settings("read-one", || {
+            run(&["scrozz", "settings", "get", "capture.quality"]).unwrap()
+        });
         assert_eq!(report.human, "90");
         assert!(
             report
@@ -914,25 +1023,55 @@ mod tests {
 
     #[test]
     fn an_unknown_setting_is_a_usage_error_with_a_suggestion() {
-        let err = run(&["scrozz", "settings", "get", "capture.forrmat"]).unwrap_err();
+        let err = with_settings("unknown", || {
+            run(&["scrozz", "settings", "get", "capture.forrmat"]).unwrap_err()
+        });
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("capture.format"), "{err}");
     }
 
     #[test]
     fn a_bad_value_is_rejected_for_being_bad_not_for_being_unimplemented() {
-        // The distinction that matters: the user must learn about their mistake
-        // even though persistence is missing.
-        let err = run(&["scrozz", "settings", "set", "capture.format", "gif"]).unwrap_err();
+        let err = with_settings("bad-value", || {
+            run(&["scrozz", "settings", "set", "capture.format", "gif"]).unwrap_err()
+        });
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("png"), "{err}");
     }
 
     #[test]
-    fn a_good_value_reports_the_missing_persistence() {
-        let err = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap_err();
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("capture.format"), "{err}");
+    fn set_get_reset_and_path_share_one_persistent_document() {
+        with_settings("round-trip", || {
+            let set = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap();
+            assert!(set.data.to_compact_string().contains(r#""source":"user""#));
+
+            let get = run(&["scrozz", "settings", "get", "capture.format"]).unwrap();
+            assert_eq!(get.human, "webp");
+
+            let path = run(&["scrozz", "settings", "path"]).unwrap();
+            assert!(path.human.ends_with("settings.json"), "{}", path.human);
+
+            let reset = run(&["scrozz", "settings", "reset", "capture.format"]).unwrap();
+            assert_eq!(reset.human, "capture.format = png");
+            assert!(
+                reset
+                    .data
+                    .to_compact_string()
+                    .contains(r#""source":"default""#)
+            );
+        });
+    }
+
+    #[test]
+    fn settings_path_still_works_when_the_document_needs_repair() {
+        with_settings("corrupt-path", || {
+            let path = settings_store::settings_path().unwrap();
+            std::fs::write(&path, b"not json").unwrap();
+            let report = run(&["scrozz", "settings", "path"]).unwrap();
+            assert_eq!(report.human, path.to_string_lossy());
+            let error = run(&["scrozz", "settings", "get"]).unwrap_err();
+            assert_eq!(error.exit(), Exit::Storage);
+        });
     }
 
     // -- hotkey ------------------------------------------------------------

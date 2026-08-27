@@ -3211,8 +3211,11 @@ dependencies = [
  "scrozz-stitch",
  "scrozz-store",
  "scrozz-ui",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]
@@ -3304,6 +3307,7 @@ name = "scrozz-shell"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "dirs",
  "global-hotkey",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",

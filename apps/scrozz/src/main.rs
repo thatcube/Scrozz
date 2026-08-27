@@ -47,10 +47,14 @@ mod gui;
 mod hotkey_config;
 mod ipc;
 mod json;
+mod onboarding;
 mod output;
 mod platform;
 mod report;
 mod settings;
+mod settings_hotkeys;
+mod settings_runtime;
+mod settings_store;
 #[cfg(test)]
 mod test_env;
 

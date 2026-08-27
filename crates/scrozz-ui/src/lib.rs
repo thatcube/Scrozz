@@ -24,9 +24,30 @@
 //! | Assets | [`icons`] | SVG → texture, rasterised once per context |
 //! | Platform | [`vibrancy`] | OS window materials, where they exist |
 //! | Drawing | [`paint`] | Primitives and controls built from all of the above |
-//! | Surfaces | [`card`], [`stack`] | The product's actual screens |
+//! | Surfaces | [`card`], [`stack`], [`form`], [`settings_view`], [`onboarding_view`] | The product's actual screens |
 //! | Window | [`overlay_app`] | The floating window the stack lives in |
 //! | Verification | [`harness`] | Headless rendering of any surface |
+//!
+//! # Settings and onboarding
+//!
+//! [`form`] is a UI-only, owned view model: rows with stable ids, described
+//! kinds (toggle, text, dropdown, slider, path, shortcut, section header, and
+//! a validated filename template), and current values. The app maps its own
+//! settings schema onto and off of it; this crate never persists anything.
+//! [`settings_view::render`] draws that form — sectioned, scrollable, with a
+//! footer carrying dirty/error state and Save/Reset/Re-run-onboarding — and
+//! returns the [`settings_view::SettingsAction`]s the app should apply. The
+//! live shortcut recorder, with its own conflict/validation state
+//! ([`form::ShortcutStatus`]), is the surface's signature control.
+//!
+//! [`onboarding_view`] is the first-run wizard for exactly the four D26
+//! topics: the drag-out gesture, the capture hotkey, where captures go, and —
+//! on Linux under a wlroots compositor — the keybinding line the user has to
+//! add themselves. [`onboarding_view::OnboardingState::apply`] is a small,
+//! independently testable state machine with explicit
+//! [`onboarding_view::OnboardingAction::Back`]/`Next`/`Skip`/`Finish`
+//! transitions; it is never a permissions wall — every path out is
+//! re-runnable.
 //!
 //! # Driving the overlay
 //!
@@ -81,19 +102,28 @@
 #![forbid(unsafe_code)]
 
 pub mod card;
+pub mod form;
 pub mod harness;
 pub mod icons;
 pub mod motion;
+pub mod onboarding_view;
 pub mod overlay_app;
 pub mod paint;
+pub mod settings_view;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
 
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
+pub use form::{
+    ApplyOutcome, Row, RowChange, RowId, RowKind, SettingsForm, ShortcutChord, ShortcutStatus,
+    Validation,
+};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
+pub use onboarding_view::{OnboardingAction, OnboardingOutcome, OnboardingState, OnboardingTopic};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
 };
+pub use settings_view::{SettingsAction, SettingsResponse};
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

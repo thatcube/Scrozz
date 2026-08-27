@@ -11,10 +11,12 @@
 
 pub mod drag;
 pub mod hotkey;
+pub mod login;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod overlay;
 pub mod permissions;
+pub mod picker;
 pub mod tray;
 
 pub use drag::{
@@ -26,12 +28,16 @@ pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,
 };
+pub use login::SystemLaunchAtLogin;
 pub use overlay::{
     AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
 pub use permissions::SystemPermissions;
+pub use picker::{NativeFolderPicker, StubFolderPicker, native_folder_picker};
 pub use tray::{Tray, TrayAction, TrayEntry};
+
+use std::path::PathBuf;
 
 use scrozz_core::{LogicalRect, Result};
 
@@ -138,4 +144,100 @@ pub trait Permissions {
     ///
     /// Returns an error if the request could not be presented.
     fn request(&self, capability: Capability) -> Result<()>;
+}
+
+/// Registers Scrozz to launch automatically when the user logs in.
+///
+/// Feature SYS-03 in the settings/onboarding plan: a single toggle in
+/// preferences, backed by a completely different mechanism per platform — a
+/// `launchd` agent under `~/Library/LaunchAgents` on macOS, the `Run` key
+/// under `HKEY_CURRENT_USER` on Windows, and a freedesktop autostart entry
+/// under `~/.config/autostart` on Linux. Nothing above [`login`] needs to know
+/// which; see [`login::SystemLaunchAtLogin`] for the concrete implementation.
+pub trait LaunchAtLogin {
+    /// Whether Scrozz is currently registered to launch at login.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform's registration store exists but could
+    /// not be read.
+    fn is_enabled(&self) -> Result<bool>;
+
+    /// Registers Scrozz to launch at the next login.
+    ///
+    /// Idempotent, and overwrites rather than refuses an existing
+    /// registration: a settings toggle calls this on every switch-on without
+    /// first checking [`LaunchAtLogin::is_enabled`], and the executable's path
+    /// may have changed since it was first registered (an app bundle moved, or
+    /// an updater replaced it under a new path).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registration could not be written.
+    fn enable(&self) -> Result<()>;
+
+    /// Removes the launch-at-login registration.
+    ///
+    /// Idempotent: disabling a registration that does not exist is success,
+    /// not an error, for the same reason [`LaunchAtLogin::enable`] is
+    /// unconditional — a settings toggle switches off without checking first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registration exists but could not be removed.
+    fn disable(&self) -> Result<()>;
+}
+
+/// A request to choose a single folder from the filesystem.
+///
+/// Backs feature SYS-04 (configurable save location) and decision D18's
+/// arbitrary save/import folder: the export path accepts any mounted path, and
+/// this is how the user names one.
+#[derive(Debug, Clone, Default)]
+pub struct FolderPickerRequest {
+    /// The dialog's window or task title, where the platform shows one.
+    pub title: Option<String>,
+    /// A short instruction shown above the file browser, where the platform
+    /// supports one. `kdialog` shows this as its caption; `zenity` and
+    /// `NSOpenPanel` ignore it.
+    pub prompt: Option<String>,
+    /// The folder to open the dialog on. Platforms fall back to their own
+    /// default (usually the last-used folder) when this is `None` or no
+    /// longer exists.
+    pub starting_directory: Option<PathBuf>,
+}
+
+/// Presents a native "choose a folder" dialog.
+///
+/// A trait, rather than a single native type, precisely so the app coordinator
+/// can substitute [`picker::StubFolderPicker`] in tests instead of a real one.
+/// `scrozz-ui` emits a browse intent and never depends on this crate: opening `NSOpenPanel`, an
+/// `IFileOpenDialog`, or a `zenity` subprocess from a test suite would hang
+/// waiting for a human, or fail outright in CI with no display server.
+///
+/// # Threading
+///
+/// On macOS this must be called from the main thread, the same constraint as
+/// every other AppKit-backed type in this crate.
+///
+/// # Cancellation
+///
+/// A user closing the dialog without choosing anything is
+/// [`scrozz_core::Error::Cancelled`], never
+/// [`scrozz_core::Error::Unsupported`] or a generic platform error — callers
+/// must not treat "the user changed their mind" the same as "this doesn't
+/// work here", and must not silently swallow either outcome.
+pub trait FolderPicker {
+    /// Presents the dialog and returns the chosen folder.
+    ///
+    /// # Errors
+    ///
+    /// - [`scrozz_core::Error::Cancelled`] if the user dismissed the dialog
+    ///   without choosing a folder.
+    /// - [`scrozz_core::Error::Unsupported`] if no picker mechanism is
+    ///   available at all, for example when neither `zenity` nor `kdialog` is
+    ///   installed on a Linux session with no other portal wired up.
+    /// - [`scrozz_core::Error::Platform`] for any other failure to present the
+    ///   dialog or read its result.
+    fn pick_folder(&self, request: &FolderPickerRequest) -> Result<PathBuf>;
 }

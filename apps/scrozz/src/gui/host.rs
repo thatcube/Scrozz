@@ -26,6 +26,7 @@ use crate::{
         app::{App, Config, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
+        settings_window::SettingsWindow,
     },
     report::Report,
 };
@@ -210,9 +211,11 @@ impl Host for Windowed {
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
+                let settings = SettingsWindow::new(&cc.egui_ctx, app.settings_revision())?;
                 Ok(Box::new(Driver {
                     app,
                     overlay,
+                    settings,
                     sink,
                     handle: reporting,
                     emit: Some(emit),
@@ -258,6 +261,7 @@ impl Host for Windowed {
 struct Driver {
     app: App,
     overlay: OverlayApp,
+    settings: SettingsWindow,
     sink: Arc<Mutex<Option<Report>>>,
     handle: OverlayHandle,
     emit: Option<Emit>,
@@ -363,6 +367,9 @@ impl eframe::App for Driver {
             }
 
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if !self.stopped {
+            self.settings.update(ctx, &mut self.app);
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while

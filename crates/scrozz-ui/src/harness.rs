@@ -259,6 +259,16 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// The settings surface: sections of rows, scrollable, with the live
+    /// shortcut recorder as its signature control. [`KeyInstant`] selects
+    /// among three sample states — default, edited, and a shortcut conflict —
+    /// rather than an animation, since D19 gives this controls-only surface
+    /// nothing to animate. See [`crate::settings_view`].
+    SettingsForm,
+    /// The onboarding wizard: exactly four D26 topics, skippable and
+    /// re-runnable from any of them. [`KeyInstant`] selects which of the four
+    /// topics is showing. See [`crate::onboarding_view`].
+    Onboarding,
 }
 
 impl Scenario {
@@ -275,6 +285,8 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::SettingsForm,
+            Self::Onboarding,
         ]
     }
 
@@ -294,6 +306,8 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::SettingsForm => "settings",
+            Self::Onboarding => "onboarding",
         }
     }
 
@@ -614,6 +628,60 @@ mod instants {
             expectation: "card follows the pointer 1:1 with tilt proportional to travel",
         },
     ];
+
+    // Neither of the two lists below is an animation. D19 gives a
+    // controls-only surface nothing to animate, so there is no "settled"
+    // frame to converge on; `at_ms` here is reused purely as the stable
+    // integer index `SettingsScene`/`OnboardingScene` switch on to choose
+    // which fixed sample state to draw. See those scenes' own doc comments.
+
+    pub(super) const SETTINGS: &[KeyInstant] = &[
+        KeyInstant {
+            name: "default",
+            at_ms: 0,
+            expectation: "the settings form as first opened: every row shows its saved \
+                          value and the footer reads \"Everything is saved\"",
+        },
+        KeyInstant {
+            name: "edited",
+            at_ms: 1,
+            expectation: "several rows differ from their saved values; the footer shows \
+                          the dirty state and Save/Reset are both active",
+        },
+        KeyInstant {
+            name: "conflict",
+            at_ms: 2,
+            expectation: "a shortcut row shows a conflict in the one alert hue the \
+                          surface uses, and the footer's Save button is disabled",
+        },
+    ];
+
+    pub(super) const ONBOARDING: &[KeyInstant] = &[
+        KeyInstant {
+            name: "drag-out",
+            at_ms: 0,
+            expectation: "topic 1 of 4: dragging a card right or up sends it to another \
+                          app; Back is disabled, since this is the first topic",
+        },
+        KeyInstant {
+            name: "capture-hotkey",
+            at_ms: 1,
+            expectation: "topic 2 of 4: the keyboard shortcut that takes a capture",
+        },
+        KeyInstant {
+            name: "where-captures-go",
+            at_ms: 2,
+            expectation: "topic 3 of 4: captures pile up in the corner and can be tucked \
+                          into the dock without being deleted",
+        },
+        KeyInstant {
+            name: "compositor-keybinding",
+            at_ms: 3,
+            expectation: "topic 4 of 4: on Linux/wlroots the user binds the capture \
+                          hotkey in their own compositor config; the primary button \
+                          reads \"Finish\", not \"Next\"",
+        },
+    ];
 }
 
 impl Fixture {
@@ -747,9 +815,34 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::SettingsForm => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Settings",
+                    "The settings surface: dense sections for capture, recording, output and shortcuts, with the live shortcut recorder as the signature control.",
+                    instants::SETTINGS,
+                    None,
+                ),
+                Scenario::Onboarding => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Four things, once",
+                    "The onboarding wizard: exactly four D26 topics — the drag-out gesture, the capture hotkey, where captures go, and (on Linux/wlroots) the compositor keybinding line. Skippable and re-runnable; never a permissions wall.",
+                    instants::ONBOARDING,
+                    None,
+                ),
             };
 
-        let size_pt = if annotating { (900.0, 620.0) } else { size_pt };
+        let size_pt = match scenario {
+            Scenario::SettingsForm => (640.0, 640.0),
+            Scenario::Onboarding => (560.0, 620.0),
+            _ if annotating => (900.0, 620.0),
+            _ => size_pt,
+        };
 
         Self {
             scenario,
@@ -1870,7 +1963,7 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
@@ -1878,6 +1971,14 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        me.register(
+            Scenario::SettingsForm,
+            Box::new(crate::settings_view::SettingsScene::new()),
+        );
+        me.register(
+            Scenario::Onboarding,
+            Box::new(crate::onboarding_view::OnboardingScene::new()),
+        );
         me
     }
 

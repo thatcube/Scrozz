@@ -136,6 +136,8 @@ impl Command {
             Self::Settings(args) => match args.command {
                 SettingsCommand::Get { .. } => "settings.get".into(),
                 SettingsCommand::Set { .. } => "settings.set".into(),
+                SettingsCommand::Reset { .. } => "settings.reset".into(),
+                SettingsCommand::Path => "settings.path".into(),
             },
             Self::Hotkey(args) => match args.command {
                 HotkeyCommand::GenerateConfig { .. } => "hotkey.generate-config".into(),
@@ -819,6 +821,15 @@ pub enum SettingsCommand {
         /// The new value.
         value: String,
     },
+
+    /// Restore one setting, or every setting, to its default.
+    Reset {
+        /// The setting key. Omit it to reset every override.
+        key: Option<String>,
+    },
+
+    /// Print the settings file path.
+    Path,
 }
 
 impl SettingsArgs {
@@ -829,7 +840,10 @@ impl SettingsArgs {
     /// until one of them is restarted.
     #[must_use]
     pub const fn is_write(&self) -> bool {
-        matches!(self.command, SettingsCommand::Set { .. })
+        matches!(
+            self.command,
+            SettingsCommand::Set { .. } | SettingsCommand::Reset { .. }
+        )
     }
 }
 
@@ -1697,6 +1711,33 @@ mod tests {
         };
         assert_eq!(key, "capture.format");
         assert_eq!(value, "webp");
+    }
+
+    #[test]
+    fn settings_reset_accepts_one_key_or_every_key() {
+        let Some(Command::Settings(args)) =
+            parse(&["scrozz", "settings", "reset", "capture.format"]).command
+        else {
+            panic!("expected settings")
+        };
+        assert!(matches!(
+            args.command,
+            SettingsCommand::Reset { key: Some(ref key) } if key == "capture.format"
+        ));
+
+        let Some(Command::Settings(args)) = parse(&["scrozz", "settings", "reset"]).command else {
+            panic!("expected settings")
+        };
+        assert!(matches!(args.command, SettingsCommand::Reset { key: None }));
+    }
+
+    #[test]
+    fn settings_path_is_a_read_only_command() {
+        let Some(Command::Settings(args)) = parse(&["scrozz", "settings", "path"]).command else {
+            panic!("expected settings")
+        };
+        assert!(matches!(args.command, SettingsCommand::Path));
+        assert!(!args.is_write());
     }
 
     // -- hotkey -----------------------------------------------------------

@@ -451,20 +451,19 @@ mod tests {
 
     #[test]
     fn writing_a_setting_forwards_but_reading_one_does_not() {
-        assert_eq!(
-            policy(&command_of(&[
-                "scrozz",
-                "settings",
-                "set",
-                "capture.format",
-                "png"
-            ])),
-            Forwarding::Prefer
-        );
-        assert_eq!(
-            policy(&command_of(&["scrozz", "settings", "get"])),
-            Forwarding::Never
-        );
+        for args in [
+            vec!["scrozz", "settings", "set", "capture.format", "png"],
+            vec!["scrozz", "settings", "reset", "capture.format"],
+            vec!["scrozz", "settings", "reset"],
+        ] {
+            assert_eq!(policy(&command_of(&args)), Forwarding::Prefer, "{args:?}");
+        }
+        for args in [
+            vec!["scrozz", "settings", "get"],
+            vec!["scrozz", "settings", "path"],
+        ] {
+            assert_eq!(policy(&command_of(&args)), Forwarding::Never, "{args:?}");
+        }
     }
 
     #[test]

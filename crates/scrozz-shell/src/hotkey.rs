@@ -139,6 +139,36 @@ impl Accelerator {
             .find(|reserved| Self::parse(reserved.accelerator).is_ok_and(|it| it == *self))
     }
 
+    /// Whether the physical Control modifier is present.
+    #[must_use]
+    pub const fn has_control(self) -> bool {
+        self.mods.contains(Modifiers::CONTROL)
+    }
+
+    /// Whether the physical Alt/Option modifier is present.
+    #[must_use]
+    pub const fn has_alt(self) -> bool {
+        self.mods.contains(Modifiers::ALT)
+    }
+
+    /// Whether the Shift modifier is present.
+    #[must_use]
+    pub const fn has_shift(self) -> bool {
+        self.mods.contains(Modifiers::SHIFT)
+    }
+
+    /// Whether the physical Command/Super modifier is present.
+    #[must_use]
+    pub const fn has_super(self) -> bool {
+        self.mods.contains(Modifiers::SUPER)
+    }
+
+    /// The canonical display spelling of the non-modifier key.
+    #[must_use]
+    pub fn key_name(self) -> String {
+        display_for(self.code)
+    }
+
     fn to_hotkey(self) -> HotKey {
         HotKey::new(Some(self.mods), self.code)
     }
@@ -907,6 +937,17 @@ impl GlobalHotkeys {
     #[must_use]
     pub fn detached() -> Self {
         Self::with_backend(Backend::Detached, Session::detect())
+    }
+
+    /// A detached manager for pure conflict validation.
+    ///
+    /// Unlike [`Self::detached`], this deliberately has no detected display
+    /// session. Registering entries seeds only the in-memory conflict table, so
+    /// validation remains available on Wayland even though real registration is
+    /// unsupported there.
+    #[must_use]
+    pub fn detached_for_conflict_checks() -> Self {
+        Self::with_backend(Backend::Detached, Session::from_env(None, None, None, None))
     }
 
     /// A detached manager reporting a session it is not actually running in.

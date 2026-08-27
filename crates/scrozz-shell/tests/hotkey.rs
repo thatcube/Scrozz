@@ -267,6 +267,24 @@ fn a_detached_manager_never_touches_the_operating_system() {
 }
 
 #[test]
+fn conflict_checks_do_not_depend_on_the_detected_display_server() {
+    let mut manager = GlobalHotkeys::detached_for_conflict_checks();
+    assert_eq!(manager.session().server, DisplayServer::Headless);
+
+    manager
+        .register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("pure bookkeeping should accept a binding");
+    assert_eq!(
+        manager
+            .check(&hotkey("Cmd+Shift+F13"))
+            .expect("valid accelerator"),
+        Some(Conflict::AlreadyBound {
+            action: "capture.region".to_owned()
+        })
+    );
+}
+
+#[test]
 fn distinct_combinations_bind_to_distinct_actions() {
     let mut manager = GlobalHotkeys::detached();
     manager
@@ -651,6 +669,7 @@ fn menu_ids_are_unique_and_round_trip() {
 #[test]
 fn enabled_menu_items_are_never_clickable_no_ops() {
     assert!(TrayAction::CaptureFullscreen.is_available());
+    assert!(TrayAction::OpenSettings.is_available());
     assert!(TrayAction::Quit.is_available());
 
     for unfinished in [
@@ -658,7 +677,6 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
         TrayAction::CaptureWindow,
         TrayAction::ToggleRecording,
         TrayAction::OpenHistory,
-        TrayAction::OpenSettings,
     ] {
         assert!(
             !unfinished.is_available(),

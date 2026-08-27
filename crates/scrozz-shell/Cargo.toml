@@ -14,6 +14,7 @@ thiserror.workspace = true
 tracing.workspace = true
 global-hotkey.workspace = true
 tray-icon.workspace = true
+dirs.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
@@ -26,6 +27,13 @@ windows = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # login.rs: the HKCU ...\CurrentVersion\Run launch-at-login registration.
+    "Win32_System_Registry",
+    # picker.rs: IFileOpenDialog (FOS_PICKFOLDERS) for the folder picker.
+    "Win32_UI_Shell",
+    # picker.rs: CoCreateInstance/CoInitializeEx for the folder picker's COM
+    # dialog, and (per drag.rs's TODO) the eventual DoDragDrop backend.
+    "Win32_System_Com",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

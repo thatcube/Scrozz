@@ -31,7 +31,7 @@ use scrozz_shell::{
 };
 
 use crate::{
-    cli::Cli,
+    cli::{Cli, Command, SettingsCommand},
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
@@ -41,6 +41,7 @@ use crate::{
     },
     json::Json,
     report::Report,
+    settings_store::SettingsStore,
 };
 
 /// What a hotkey is bound to unless the environment says otherwise.
@@ -53,6 +54,25 @@ pub const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("Cmd+Shift+7", Action::Capture(CaptureKind::Fullscreen)),
     ("Cmd+Shift+8", Action::Capture(CaptureKind::Region)),
     ("Cmd+Shift+9", Action::Capture(CaptureKind::Window)),
+];
+
+/// Settings keys that currently have a live GUI action.
+///
+/// Recording and all-display shortcuts remain in the schema, but are not
+/// registered until those actions can complete end to end.
+pub const SETTING_BINDINGS: &[(&str, Action)] = &[
+    (
+        "hotkey.capture-region",
+        Action::Capture(CaptureKind::Region),
+    ),
+    (
+        "hotkey.capture-window",
+        Action::Capture(CaptureKind::Window),
+    ),
+    (
+        "hotkey.capture-display",
+        Action::Capture(CaptureKind::Fullscreen),
+    ),
 ];
 
 /// Overrides the whole binding table, as `accelerator=action-id` pairs.
@@ -114,9 +134,9 @@ impl Config {
     /// belongs to the command-line surface — so the knobs are environment
     /// variables. That is also the right shape for them: they are for driving
     /// the app from a script, not for a person to type.
-    #[must_use]
-    pub fn from_cli(_cli: &Cli) -> Self {
-        let mut config = Self::default();
+    pub fn from_cli(_cli: &Cli) -> CliResult<Self> {
+        let store = SettingsStore::load()?;
+        let mut config = Self::from_settings(&store)?;
 
         if let Ok(raw) = std::env::var(HOTKEYS_ENV) {
             config.bindings = parse_bindings(&raw);
@@ -138,7 +158,22 @@ impl Config {
             };
         }
 
-        config
+        Ok(config)
+    }
+
+    fn from_settings(store: &SettingsStore) -> CliResult<Self> {
+        Ok(Self {
+            bindings: SETTING_BINDINGS
+                .iter()
+                .map(|(key, action)| {
+                    store
+                        .get(key)
+                        .map(|(_, value, _)| (value.to_owned(), *action))
+                })
+                .collect::<CliResult<_>>()?,
+            tray: store.get("system.tray-icon")?.1 == "true",
+            ..Self::default()
+        })
     }
 
     /// A configuration that touches nothing outside this process.
@@ -190,6 +225,8 @@ pub struct App {
     started: Instant,
     captures: u64,
     notes: Vec<String>,
+    settings_requested: bool,
+    settings_revision: u64,
 }
 
 impl App {
@@ -270,6 +307,8 @@ impl App {
             started: Instant::now(),
             captures: 0,
             notes,
+            settings_requested: false,
+            settings_revision: 0,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -363,12 +402,25 @@ impl App {
             // command layer is synchronous. A capture is tens of milliseconds;
             // a recording returns as soon as it has started.
             if let Some(command) = request.serve() {
+                let settings_changed = matches!(
+                    &command,
+                    Command::Settings(args)
+                        if matches!(
+                            args.command,
+                            SettingsCommand::Set { .. } | SettingsCommand::Reset { .. }
+                        )
+                );
                 self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
                     // again". There is nothing to show yet, so it is a no-op
                     // that has at least been answered rather than ignored.
                     self.note("a second launch was answered by this instance");
+                }
+                if settings_changed && let Err(error) = self.reload_settings() {
+                    self.note(format!(
+                        "settings changed but could not be reloaded: {error}"
+                    ));
                 }
             }
         }
@@ -457,7 +509,8 @@ impl App {
                 Tick::Continue
             }
             Action::OpenSettings => {
-                self.note("the settings window is not built yet");
+                self.settings_requested = true;
+                self.note("settings requested");
                 Tick::Continue
             }
             Action::Quit => {
@@ -497,6 +550,64 @@ impl App {
     #[must_use]
     pub fn showing(&self) -> usize {
         self.surface.len()
+    }
+
+    /// Takes a coalesced request to open or focus the settings viewport.
+    pub fn take_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_requested)
+    }
+
+    /// Monotonically changes after a settings write handled by this process.
+    #[must_use]
+    pub const fn settings_revision(&self) -> u64 {
+        self.settings_revision
+    }
+
+    /// Reloads settings that affect live tray and hotkey integration.
+    ///
+    /// Environment overrides remain authoritative for the lifetime of this
+    /// process. Registration failures are reported in the app notes, matching
+    /// startup behavior, rather than turning a usable capture app into a crash.
+    pub fn reload_settings(&mut self) -> CliResult<()> {
+        let store = SettingsStore::load()?;
+        let desired = Config::from_settings(&store)?;
+
+        if std::env::var_os(HOTKEYS_ENV).is_none() && desired.bindings != self.config.bindings {
+            self.hotkeys.unregister_all();
+            for (accelerator, action) in &desired.bindings {
+                let hotkey = Hotkey {
+                    accelerator: accelerator.clone(),
+                };
+                match self.hotkeys.register(&hotkey, action.id()) {
+                    Ok(()) => self.notes.push(format!("{accelerator} → {}", action.id())),
+                    Err(error) => self
+                        .notes
+                        .push(format!("{accelerator} not rebound: {error}")),
+                }
+            }
+            self.config.bindings = desired.bindings;
+        }
+
+        if std::env::var_os(TRAY_ENV).is_none() && desired.tray != self.config.tray {
+            if desired.tray {
+                match Tray::with_tooltip("Scrozz") {
+                    Ok(tray) => {
+                        self.notes.push("menu-bar item shown".to_owned());
+                        self.tray = Some(tray);
+                    }
+                    Err(error) => self
+                        .notes
+                        .push(format!("menu-bar item could not be shown: {error}")),
+                }
+            } else if let Some(tray) = self.tray.take() {
+                tray.close();
+                self.notes.push("menu-bar item hidden".to_owned());
+            }
+            self.config.tray = desired.tray;
+        }
+
+        self.settings_revision = self.settings_revision.saturating_add(1);
+        Ok(())
     }
 
     /// What happened, for the report the CLI prints when the app exits.
@@ -591,6 +702,11 @@ pub fn menu_actions() -> Vec<Action> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
 
@@ -601,12 +717,37 @@ mod tests {
         (app, handle)
     }
 
+    fn settings_store(name: &str) -> (std::path::PathBuf, SettingsStore) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-gui-config-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let store = SettingsStore::open(directory.join("settings.json")).unwrap();
+        (directory, store)
+    }
+
     #[test]
     fn a_sealed_app_touches_nothing() {
         let (app, _) = app();
         assert!(app.tray.is_none(), "no menu-bar item");
         assert!(app.server.is_none(), "no socket");
         assert_eq!(app.config.bindings.len(), 0, "no keyboard registration");
+    }
+
+    #[test]
+    fn persisted_shortcuts_and_tray_visibility_drive_gui_configuration() {
+        let (directory, mut store) = settings_store("persisted");
+        store.set("hotkey.capture-region", "Ctrl+Alt+P").unwrap();
+        store.set("system.tray-icon", "false").unwrap();
+
+        let config = Config::from_settings(&store).unwrap();
+        assert!(!config.tray);
+        assert_eq!(config.bindings[0].0, "Ctrl+Alt+P");
+        assert_eq!(config.bindings[0].1, Action::Capture(CaptureKind::Region));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -630,17 +771,21 @@ mod tests {
     #[test]
     fn an_unwired_action_says_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
-        for action in [
-            Action::ToggleRecording,
-            Action::OpenHistory,
-            Action::OpenSettings,
-        ] {
+        for action in [Action::ToggleRecording, Action::OpenHistory] {
             assert_eq!(app.perform(action), Tick::Continue);
         }
         let notes = app.notes().join("\n");
         assert!(notes.contains("recording is not wired up yet"), "{notes}");
         assert!(notes.contains("history window"), "{notes}");
-        assert!(notes.contains("settings window"), "{notes}");
+    }
+
+    #[test]
+    fn opening_settings_requests_the_real_viewport() {
+        let (mut app, _) = app();
+        assert!(!app.take_settings_request());
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
+        assert!(app.take_settings_request());
+        assert!(!app.take_settings_request(), "requests coalesce");
     }
 
     #[test]

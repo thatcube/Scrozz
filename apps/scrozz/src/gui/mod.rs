@@ -68,6 +68,7 @@ pub mod overlay;
 pub mod panel;
 pub mod pipeline;
 pub mod server;
+pub mod settings_window;
 
 // Re-exported so the rest of the binary — and anything that later lifts this
 // module into a library — names these from one place. A binary crate has no
@@ -101,7 +102,7 @@ use crate::{cli::Cli, fault::CliResult, report::Report};
 pub fn run(cli: &Cli) -> CliResult<Report> {
     crate::platform::become_accessory_app()?;
 
-    let config = Config::from_cli(cli);
+    let config = Config::from_cli(cli)?;
 
     // Handed to the host because a windowed run cannot always return to `main`
     // to have its report printed — see `host::Driver::logic`.

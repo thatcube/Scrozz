@@ -11,10 +11,8 @@
 # every baseline, every freshly rendered image and every diff into one directory
 # that CI uploads as an artifact, and prints where they went.
 #
-# It also has to survive the harness not existing yet. `scrozz-ui::harness` is
-# a `todo!()` at the time of writing, so the honest behaviour is to skip loudly
-# rather than to fail — a job that is red for "not built yet" trains people to
-# ignore red.
+# It also has to survive the harness not existing yet, so the honest behaviour
+# is to skip loudly rather than train people to ignore a permanently red job.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -41,23 +39,20 @@ note() {
 # --- Is there anything to run? ---------------------------------------------
 #
 # Two independent signals, because either one alone gives a false answer:
-#   * a test file with no `egui_kittest` in the lock cannot compile;
-#   * `egui_kittest` in the lock with no test file renders nothing.
-have_dep=0
+#   * the public harness module supplies the deterministic software renderer;
+#   * the golden integration test drives the committed corpus.
+have_harness=0
 have_tests=0
 
-if [[ -f Cargo.lock ]] && grep -q '^name = "egui_kittest"$' Cargo.lock; then
-  have_dep=1
+if [[ -f "$CRATE_DIR/src/lib.rs" ]] && grep -q '^pub mod harness;' "$CRATE_DIR/src/lib.rs"; then
+  have_harness=1
 fi
 
-for f in "$CRATE_DIR"/tests/*.rs; do
-  if [[ -f "$f" ]]; then
-    have_tests=1
-    break
-  fi
-done
+if [[ -f "$CRATE_DIR/tests/golden.rs" ]]; then
+  have_tests=1
+fi
 
-if [[ "$have_dep" == "0" || "$have_tests" == "0" ]]; then
+if [[ "$have_harness" == "0" || "$have_tests" == "0" ]]; then
   note "### Golden images: skipped"
   note ""
   note "The headless screenshot harness (decision D25) is not wired up yet, so"
@@ -66,12 +61,12 @@ if [[ "$have_dep" == "0" || "$have_tests" == "0" ]]; then
   note ""
   note "| Precondition | Found |"
   note "|---|---|"
-  note "| \`egui_kittest\` in \`Cargo.lock\` | $([[ $have_dep == 1 ]] && echo yes || echo '**no**') |"
+  note "| public \`scrozz_ui::harness\` module | $([[ $have_harness == 1 ]] && echo yes || echo '**no**') |"
   note "| a test file in \`$CRATE_DIR/tests/\` | $([[ $have_tests == 1 ]] && echo yes || echo '**no**') |"
   note ""
-  note "This job starts enforcing itself the moment both are true — add"
-  note "\`egui_kittest\` as a dev-dependency of \`$CRATE\` and put the tests in"
-  note "\`$CRATE_DIR/tests/\`. Baselines belong in \`$CRATE_DIR/tests/snapshots/\`."
+  note "This job starts enforcing itself the moment both are present: the"
+  note "deterministic harness module and \`$CRATE_DIR/tests/golden.rs\`."
+  note "Baselines belong in \`$CRATE_DIR/snapshots/golden/\`."
   if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
     echo "::notice title=Golden images skipped::The D25 screenshot harness is not implemented yet; no baselines to diff."
   fi
