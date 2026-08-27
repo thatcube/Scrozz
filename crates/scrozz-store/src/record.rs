@@ -27,7 +27,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     CaptureId,
-    model::{CaptureRecord, FrameHeader, ImageState, ProvenanceRepr, TargetRepr, Timestamp},
+    model::{
+        CaptureRecord, FrameHeader, ImageState, MediaKind, ProvenanceRepr, TargetRepr, Timestamp,
+    },
 };
 
 /// Current sidecar format. Bumped only when old files stop being readable,
@@ -47,6 +49,9 @@ pub struct StoredRecord {
     /// When it entered history, which may differ for an import.
     #[serde(default)]
     pub stored_at: i64,
+    /// Still, video or GIF. Old sidecars were all screenshots.
+    #[serde(default)]
+    pub media_kind: MediaKind,
     /// Exempt from eviction.
     #[serde(default)]
     pub pinned: bool,
@@ -101,6 +106,7 @@ impl StoredRecord {
         id: &CaptureId,
         created_at: Timestamp,
         stored_at: Timestamp,
+        media_kind: MediaKind,
         pinned: bool,
         source_app: SourceApp,
         window_shadow: Option<bool>,
@@ -117,6 +123,7 @@ impl StoredRecord {
             id: id.0.clone(),
             created_at: created_at.0,
             stored_at: stored_at.0,
+            media_kind,
             pinned,
             source_app,
             window_shadow,
@@ -199,6 +206,7 @@ impl StoredRecord {
         CaptureRecord {
             id: CaptureId(self.id.clone()),
             created_at: Timestamp(self.created_at),
+            media_kind: self.media_kind,
             pinned: self.pinned,
             source_app: self.source_app.clone(),
             window_shadow: self.window_shadow,
@@ -270,6 +278,8 @@ struct StoredRecordWire {
     #[serde(default)]
     stored_at: i64,
     #[serde(default)]
+    media_kind: MediaKind,
+    #[serde(default)]
     pinned: bool,
     #[serde(default)]
     source_app: Option<SourceApp>,
@@ -312,6 +322,7 @@ impl<'de> Deserialize<'de> for StoredRecord {
             id: wire.id,
             created_at: wire.created_at,
             stored_at: wire.stored_at,
+            media_kind: wire.media_kind,
             pinned: wire.pinned,
             source_app,
             window_shadow: wire.window_shadow,
@@ -378,6 +389,7 @@ mod tests {
             &CaptureId("01ABC".into()),
             Timestamp(1_700_000_000_000),
             Timestamp(1_700_000_000_001),
+            MediaKind::Screenshot,
             false,
             SourceApp {
                 name: Some("Safari".into()),
@@ -506,6 +518,7 @@ mod tests {
             .expect("decode");
         assert_eq!(record.annotation_count(), 0);
         assert_eq!(record.image_state(), ImageState::Absent);
+        assert_eq!(record.media_kind, MediaKind::Screenshot);
         assert!(!record.pinned);
         assert_eq!(record.source_app, SourceApp::default());
         assert_eq!(record.window_shadow, None);

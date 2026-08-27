@@ -3,7 +3,7 @@
 use scrozz_annotate::{Annotation, Style};
 use scrozz_core::{LogicalPoint, SourceApp};
 use scrozz_store::{
-    DocumentState, History as _, ImageState, NewCapture, Page, SearchQuery, SqliteStore,
+    DocumentState, History as _, ImageState, MediaKind, NewCapture, Page, SearchQuery, SqliteStore,
     Store as _, Timestamp,
     test_support::{ScratchDir, richly_annotated_document, sample_document, scratch_dir},
 };
@@ -254,6 +254,104 @@ fn search_finds_captures_by_app_title_text_and_date() {
         .search(&SearchQuery::all().text("no such capture"))
         .expect("search");
     assert!(nothing.is_empty());
+}
+
+#[test]
+fn media_kind_round_trips_filters_and_defaults_to_screenshot() {
+    let (dir, mut store) = store("media-kind");
+    let screenshot = sample_document(8, 8, 1, 0);
+    let video = sample_document(8, 8, 2, 0);
+    let gif = sample_document(8, 8, 3, 0);
+
+    let screenshot_id = store
+        .insert(NewCapture::new(&screenshot).taken_at(Timestamp(1)))
+        .expect("screenshot");
+    let video_id = store
+        .insert(
+            NewCapture::of_kind(&video, MediaKind::Video)
+                .taken_at(Timestamp(2))
+                .from_app("Recorder"),
+        )
+        .expect("video");
+    let gif_id = store
+        .insert(
+            NewCapture::of_kind(&gif, MediaKind::Gif)
+                .taken_at(Timestamp(3))
+                .from_app("Recorder"),
+        )
+        .expect("gif");
+
+    assert_eq!(
+        store
+            .record(&screenshot_id)
+            .expect("read")
+            .expect("present")
+            .media_kind,
+        MediaKind::Screenshot
+    );
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().kind(MediaKind::Video))
+            .expect("videos")
+            .iter()
+            .map(|record| &record.id)
+            .collect::<Vec<_>>(),
+        vec![&video_id]
+    );
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().kind(MediaKind::Gif))
+            .expect("gifs")
+            .iter()
+            .map(|record| &record.id)
+            .collect::<Vec<_>>(),
+        vec![&gif_id]
+    );
+
+    drop(store);
+    let store = SqliteStore::open(dir.path()).expect("reopen");
+    assert_eq!(
+        store
+            .record(&video_id)
+            .expect("read")
+            .expect("present")
+            .media_kind,
+        MediaKind::Video
+    );
+}
+
+#[test]
+fn count_matching_ignores_pagination_and_apps_are_distinct_and_sorted() {
+    let (_dir, mut store) = store("count-and-apps");
+    for (index, app) in ["Terminal", "Safari", "terminal", "Mail"]
+        .into_iter()
+        .enumerate()
+    {
+        let document = sample_document(8, 8, index as u8, 0);
+        store
+            .insert(
+                NewCapture::new(&document)
+                    .from_app(app)
+                    .with_ocr("needle")
+                    .taken_at(Timestamp(index as i64)),
+            )
+            .expect("insert");
+    }
+    let no_app = sample_document(8, 8, 9, 0);
+    store.insert(NewCapture::new(&no_app)).expect("insert");
+
+    let query = SearchQuery::all().text("needle").paged(Page::new(1, 2));
+    assert_eq!(store.search(&query).expect("page").len(), 1);
+    assert_eq!(
+        store.count_matching(&query).expect("matching count"),
+        4,
+        "the total must not shrink to the requested page"
+    );
+    assert_eq!(
+        store.apps().expect("apps"),
+        vec!["Mail", "Safari", "Terminal"],
+        "case-only duplicates and missing app names do not become filter choices"
+    );
 }
 
 #[test]

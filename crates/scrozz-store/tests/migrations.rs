@@ -67,11 +67,19 @@ fn an_old_database_climbs_forward_with_every_row_intact() {
     )
     .expect("insert old row");
 
-    assert_eq!(migrate(&mut conn, MIGRATIONS).expect("upgrade"), 2);
-    let row: (i64, String, String, i64, Option<String>, Option<i64>) = conn
+    assert_eq!(migrate(&mut conn, MIGRATIONS).expect("upgrade"), 3);
+    let row: (
+        i64,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<i64>,
+        String,
+    ) = conn
         .query_row(
             "SELECT pinned, app_name, window_title, annotation_count,
-                    app_identifier, window_shadow
+                    app_identifier, window_shadow, media_kind
              FROM captures WHERE id = 'old'",
             [],
             |row| {
@@ -82,11 +90,23 @@ fn an_old_database_climbs_forward_with_every_row_intact() {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .expect("old row survives");
-    assert_eq!(row, (1, "Xcode".into(), "window 0".into(), 1, None, None));
+    assert_eq!(
+        row,
+        (
+            1,
+            "Xcode".into(),
+            "window 0".into(),
+            1,
+            None,
+            None,
+            "screenshot".into(),
+        )
+    );
 }
 
 #[test]

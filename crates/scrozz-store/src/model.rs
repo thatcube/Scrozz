@@ -423,6 +423,8 @@ pub struct SearchQuery {
     pub created_after: Option<Timestamp>,
     /// Only captures taken at or before this instant.
     pub created_before: Option<Timestamp>,
+    /// Restricts results to one media kind.
+    pub media_kind: Option<MediaKind>,
     /// Only pinned captures.
     pub pinned_only: bool,
     /// Exclude captures whose pixels have been evicted.
@@ -489,6 +491,13 @@ impl SearchQuery {
     pub const fn between(mut self, after: Option<Timestamp>, before: Option<Timestamp>) -> Self {
         self.created_after = after;
         self.created_before = before;
+        self
+    }
+
+    /// Restricts results to one media kind.
+    #[must_use]
+    pub const fn kind(mut self, kind: MediaKind) -> Self {
+        self.media_kind = Some(kind);
         self
     }
 

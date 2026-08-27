@@ -32,9 +32,10 @@ pub struct Migration {
 
 /// The schema, in order.
 ///
-/// Creation statements use `IF NOT EXISTS`; later rungs are applied exactly once
-/// according to `user_version`, with each rung and its version update committed
-/// in the same transaction.
+/// Creation statements are `IF NOT EXISTS`, while each rung runs atomically with
+/// its `user_version` update. SQLite does not support `IF NOT EXISTS` for
+/// `ALTER TABLE ADD COLUMN`, so the transaction is what prevents a column and
+/// its recorded version from drifting apart.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -103,6 +104,18 @@ pub const MIGRATIONS: &[Migration] = &[
             ALTER TABLE captures ADD COLUMN window_shadow INTEGER
                 CHECK (window_shadow IS NULL OR window_shadow IN (0, 1));
         ",
+    },
+    Migration {
+        version: 3,
+        name: "index capture media kind",
+        sql: r"
+        ALTER TABLE captures
+            ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'screenshot'
+            CHECK (media_kind IN ('screenshot', 'video', 'gif'));
+
+        CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+            ON captures (media_kind, created_at DESC, id DESC);
+    ",
     },
 ];
 
@@ -354,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn the_real_v1_schema_upgrades_to_v2_without_losing_rows() {
+    fn the_real_v1_schema_upgrades_without_losing_rows() {
         let mut conn = memory();
         migrate(&mut conn, &MIGRATIONS[..1]).expect("create v1");
         conn.execute(
@@ -366,15 +379,29 @@ mod tests {
         )
         .expect("insert v1 row");
 
-        assert_eq!(migrate(&mut conn, MIGRATIONS).expect("upgrade"), 2);
-        let row: (String, Option<String>, Option<i64>) = conn
+        assert_eq!(migrate(&mut conn, MIGRATIONS).expect("upgrade"), 3);
+        let row: (String, Option<String>, Option<i64>, String) = conn
             .query_row(
-                "SELECT app_name, app_identifier, window_shadow FROM captures WHERE id = 'old'",
+                "SELECT app_name, app_identifier, window_shadow, media_kind
+                 FROM captures WHERE id = 'old'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("read upgraded row");
-        assert_eq!(row, ("Safari".to_owned(), None, None));
+        assert_eq!(
+            row,
+            ("Safari".to_owned(), None, None, "screenshot".to_owned())
+        );
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'captures_by_kind_recency'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index lookup");
+        assert_eq!(indexed, 1);
     }
 
     #[test]
