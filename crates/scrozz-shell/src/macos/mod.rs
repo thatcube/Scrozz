@@ -14,6 +14,7 @@
 //! than reporting it.
 
 pub mod display;
+pub mod drag;
 pub mod overlay;
 pub mod permissions;
 

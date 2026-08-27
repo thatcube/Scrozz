@@ -9,6 +9,7 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod drag;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -16,6 +17,11 @@ pub mod overlay;
 pub mod permissions;
 pub mod tray;
 
+pub use drag::{
+    byte_source, native_drag_source, ByteSource, DragCapability, DragFormat, DragOperation,
+    DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
+    NativeSurface, PromisedFile,
+};
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,
