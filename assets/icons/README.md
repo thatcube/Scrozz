@@ -63,10 +63,17 @@ is added by macOS; changing pixels inside the `.icns` cannot remove it.
 `CFBundleIconName` selects it on macOS 26, while `CFBundleIconFile` keeps
 `Scrozz.icns` as the fallback for Sequoia and earlier.
 
-The layered icon has real light and dark appearances. Light mode uses a pale
-lavender plate with a dark-violet mark; dark mode keeps the near-black plate and
-the original purple mark. The foreground halo peaks at 16.5% opacity—exactly 25%
-below the first version—so it reads as ambient light rather than a visible disc.
+The layered icon deliberately keeps the **dark plate in every appearance**.
+An attempted pale-lavender light appearance looked like a large gray backing
+tile in Finder list view and System Settings—the same visual defect the Tahoe
+asset was meant to remove. System mode may change the surrounding UI; Scrozz's
+identity stays dark.
+
+The original purple mark is scaled to 120% inside the system-shaped plate so it
+does not read as a small icon nested inside another icon. Neutral shadow and
+specular treatments are disabled to prevent a gray rim. The foreground halo
+peaks at 16.5% opacity—exactly 25% below the first version—so it reads as ambient
+light rather than a visible disc.
 
 ### Menu-bar mark
 
