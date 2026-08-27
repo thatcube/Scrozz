@@ -1,39 +1,10 @@
-<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-<g clip-path="url(#clip0_931_1870)">
-<g clip-path="url(#clip1_931_1870)">
-<path d="M15 24H21V23H23V25H21V26H15V25H13V23H15V24ZM17 14H16V15H15V16H14V17H17V19H12V16H13V15H14V14H15V13H12V11H17V14ZM24 14H23V15H22V17H24V19H19V16H20V15H21V14H22V13H19V11H24V14Z" fill="white"/>
-</g>
-<g clip-path="url(#clip2_931_1870)">
-<path d="M33 2V1L31 1V0H22V3L29 3V4H31V5H32V7L33 7V14H36V5L35 5V3H34V2L33 2Z" fill="white"/>
-</g>
-<g clip-path="url(#clip3_931_1870)">
-<path d="M2 3H1L1 5H0V14H3L3 7H4V5H5V4H7L7 3H14V0H5L5 1H3V2H2L2 3Z" fill="white"/>
-</g>
-<g clip-path="url(#clip4_931_1870)">
-<path d="M3 34L3 35L5 35L5 36L14 36L14 33L7 33L7 32L5 32L5 31L4 31L4 29L3 29L3 22L-6.11959e-07 22L-2.18557e-07 31L1 31L1 33L2 33L2 34L3 34Z" fill="white"/>
-</g>
-<g clip-path="url(#clip5_931_1870)">
-<path d="M34 33L35 33L35 31L36 31L36 22L33 22L33 29L32 29L32 31L31 31L31 32L29 32L29 33L22 33L22 36L31 36L31 35L33 35L33 34L34 34L34 33Z" fill="white"/>
-</g>
-</g>
-<defs>
-<clipPath id="clip0_931_1870">
-<rect width="36" height="36" fill="white"/>
-</clipPath>
-<clipPath id="clip1_931_1870">
-<rect width="12" height="15" fill="white" transform="translate(12 11)"/>
-</clipPath>
-<clipPath id="clip2_931_1870">
-<rect width="14" height="14" fill="white" transform="translate(36) rotate(90)"/>
-</clipPath>
-<clipPath id="clip3_931_1870">
-<rect width="14" height="14" fill="white"/>
-</clipPath>
-<clipPath id="clip4_931_1870">
-<rect width="14" height="14" fill="white" transform="matrix(0 -1 1 0 0 36)"/>
-</clipPath>
-<clipPath id="clip5_931_1870">
-<rect width="14" height="14" fill="white" transform="translate(36 36) rotate(180)"/>
-</clipPath>
-</defs>
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" fill="none">
+  <g fill="#fff" clip-path="url(#a)">
+    <path d="M3 29h1v2h1v1h2v1h7v3H5v-1H3v-1H2v-1H1v-2H0v-9h3zm33-7v9h-1v2h-1v1h-1v1h-2v1h-9v-3h7v-1h2v-1h1v-2h1v-7zm-21 2h6v-1h2v2h-2v1h-6v-1h-2v-2h2zm2-10h-1v1h-1v1h-1v1h3v2h-5v-3h1v-1h1v-1h1v-1h-3v-2h5zm7 0h-1v1h-1v2h2v2h-5v-3h1v-1h1v-1h1v-1h-3v-2h5zM14 3H7v1H5v1H4v2H3v7H0V5h1V3h1V2h1V1h2V0h9zm17-2h2v1h1v1h1v2h1v9h-3V7h-1V5h-1V4h-2V3h-7V0h9z"/>
+  </g>
+  <defs>
+    <clipPath id="a">
+      <path fill="#fff" d="M0 0h36v36H0z"/>
+    </clipPath>
+  </defs>
 </svg>
