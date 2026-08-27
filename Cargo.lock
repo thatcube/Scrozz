@@ -3833,6 +3833,7 @@ name = "scrozz-export"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "gif",
  "image",
  "scrozz-core",
  "thiserror 2.0.20",
@@ -3862,6 +3863,7 @@ dependencies = [
  "block2 0.6.2",
  "dispatch2",
  "ffmpeg-sys-next",
+ "image",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-av-foundation",

@@ -7,6 +7,7 @@ use scrozz_export::AnimationFormat;
 
 use crate::{
     Recording,
+    media::NativeMediaSource,
     settings::{Quality, ResolutionCap},
 };
 
@@ -68,6 +69,26 @@ pub struct VideoDocument {
 }
 
 impl VideoDocument {
+    /// Inspects native media on disk and opens it with source-derived metadata.
+    ///
+    /// Unlike [`VideoDocument::open`], this constructor does not trust summary
+    /// metadata carried beside the recording. It opens the encoded file through
+    /// the platform media stack and uses the actual stream dimensions, frame
+    /// rate, audio channels, and duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for synthetic/unplayable recording reports, missing or
+    /// empty files, unsupported platform media backends, or undecodable media.
+    pub fn open_native(recording: Recording) -> Result<Self> {
+        let source = NativeMediaSource::open(recording.clone())?;
+        Self::from_validated_recording_with_duration(
+            recording,
+            source.metadata(),
+            source.inspection().duration,
+        )
+    }
+
     /// Opens real native recording output for editing.
     ///
     /// Partial native recordings are accepted because editing is a recovery path
@@ -96,13 +117,21 @@ impl VideoDocument {
     }
 
     fn from_validated_recording(recording: Recording, metadata: SourceMetadata) -> Result<Self> {
-        metadata.validate()?;
         let duration = Duration::try_from_secs_f64(recording.duration_secs).map_err(|_| {
             Error::InvalidRequest(format!(
                 "recording duration {} cannot be represented for playback",
                 recording.duration_secs
             ))
         })?;
+        Self::from_validated_recording_with_duration(recording, metadata, duration)
+    }
+
+    fn from_validated_recording_with_duration(
+        recording: Recording,
+        metadata: SourceMetadata,
+        duration: Duration,
+    ) -> Result<Self> {
+        metadata.validate()?;
         if duration.is_zero() {
             return Err(Error::InvalidRequest(
                 "a zero-duration recording cannot be opened for editing".to_owned(),

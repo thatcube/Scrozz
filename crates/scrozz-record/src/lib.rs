@@ -33,6 +33,7 @@ mod linux;
 pub mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod media;
 mod muxer;
 pub mod overlay;
 mod pacing;

@@ -33,17 +33,20 @@ rav1e = { version = "0.8.1", default-features = false, features = ["threading"],
 block2.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL"] }
-objc2-av-foundation = { workspace = true, features = ["AVAssetWriter", "AVAssetWriterInput", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media"] }
+objc2-av-foundation = { workspace = true, features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVVideoComposition", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media", "objc2-core-video"] }
 objc2-core-audio-types = "0.3.2"
 objc2-core-foundation.workspace = true
 objc2-core-graphics.workspace = true
-objc2-core-media = { workspace = true, features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "objc2-core-audio-types", "objc2-core-video"] }
+objc2-core-media = { workspace = true, features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "CMTimeRange", "objc2-core-audio-types", "objc2-core-video"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-screen-capture-kit = { workspace = true, features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 dispatch2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-app-kit.workspace = true
+
+[dev-dependencies]
+image.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd.workspace = true

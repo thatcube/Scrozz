@@ -13,7 +13,7 @@ pub mod pixels;
 
 pub use animation::{
     AnimationFormat, AnimationRepeat, GIF_MAX_FRAME_DELAY, GIF_MIN_FRAME_DELAY,
-    GifAnimationEncoder, TimedRgbaFrame,
+    GifAnimationEncoder, GifAnimationStream, GifInspection, TimedRgbaFrame, inspect_gif_file,
 };
 pub use clipboard::{
     ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,

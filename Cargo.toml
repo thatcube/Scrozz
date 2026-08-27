@@ -58,6 +58,7 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "webp",
 ] }
+gif = "0.14"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
