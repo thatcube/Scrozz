@@ -731,6 +731,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn the_screenshot_shortcuts_are_recognised_as_taken() {
         // The negative of the test above: if this stops holding, the one above
         // has stopped proving anything.
