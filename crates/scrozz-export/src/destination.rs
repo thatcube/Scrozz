@@ -395,16 +395,40 @@ fn normalise_prefix(prefix: &str) -> String {
 /// genuinely a link that works for other people.
 fn path_url(path: &Path) -> Option<String> {
     let text = path.to_str()?;
-    let mut url = String::from("file://");
-    for byte in text.bytes() {
+    Some(path_text_url(text, cfg!(target_os = "windows")))
+}
+
+/// Converts platform path text to an RFC 8089-style file URL.
+///
+/// Kept separate from [`Path`] so Windows drive and UNC vectors are testable on
+/// every host. A Windows `Path` cannot represent Windows semantics when the
+/// tests themselves are running on Unix.
+fn path_text_url(text: &str, windows: bool) -> String {
+    let normalized;
+    let (prefix, path) = if windows {
+        normalized = text.replace('\\', "/");
+        if normalized.starts_with("//") {
+            // UNC: //server/share/file -> file://server/share/file.
+            ("file:", normalized.as_str())
+        } else {
+            // Drive path: D:/folder/file -> file:///D:/folder/file.
+            ("file:///", normalized.trim_start_matches('/'))
+        }
+    } else {
+        // Absolute Unix paths already begin with '/', producing file:///path.
+        ("file://", text)
+    };
+
+    let mut url = String::from(prefix);
+    for byte in path.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
                 url.push(byte as char);
             }
             _ => url.push_str(&format!("%{byte:02X}")),
         }
     }
-    Some(url)
+    url
 }
 
 /// Recovers a frame from encoded bytes.
@@ -427,4 +451,41 @@ fn decode_to_frame(bytes: &[u8]) -> Result<Frame> {
         color_space: ColorSpace::Unknown,
         scale: ScaleFactor::IDENTITY,
     })
+}
+
+#[cfg(test)]
+mod path_url_tests {
+    use super::path_text_url;
+
+    #[test]
+    fn windows_drive_path_uses_three_slashes_and_keeps_the_drive_colon() {
+        assert_eq!(
+            path_text_url(r"D:\a\Scrozz\folder url\shot.png", true),
+            "file:///D:/a/Scrozz/folder%20url/shot.png"
+        );
+    }
+
+    #[test]
+    fn windows_unc_path_uses_the_server_as_authority() {
+        assert_eq!(
+            path_text_url(r"\\server\captures\shot 1.png", true),
+            "file://server/captures/shot%201.png"
+        );
+    }
+
+    #[test]
+    fn unix_absolute_path_remains_a_three_slash_file_url() {
+        assert_eq!(
+            path_text_url("/tmp/folder url/shot.png", false),
+            "file:///tmp/folder%20url/shot.png"
+        );
+    }
+
+    #[test]
+    fn non_ascii_path_bytes_are_utf8_percent_encoded() {
+        assert_eq!(
+            path_text_url("/tmp/café.png", false),
+            "file:///tmp/caf%C3%A9.png"
+        );
+    }
 }
