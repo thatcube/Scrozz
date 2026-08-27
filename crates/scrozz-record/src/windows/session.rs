@@ -1,6 +1,7 @@
 //! Recording worker, lifecycle commands, and orderly finalisation.
 
 use std::{
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -12,11 +13,13 @@ use std::{
 };
 
 use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
-use windows::Graphics::Capture::GraphicsCaptureSession;
+use windows::{
+    Graphics::Capture::GraphicsCaptureSession, Win32::Storage::FileSystem::MoveFileW, core::PCWSTR,
+};
 
 use crate::{
     Recording, RecordingMetadata, RecordingRequest, RecordingResolution, RecordingSession,
-    SessionEvent, VideoCodec,
+    RecordingState, SessionEvent, VideoCodec,
 };
 
 use super::{
@@ -28,6 +31,7 @@ use super::{
     plan::{self, EncoderPlan},
     salvage::{self, Outcome},
     target,
+    terminal::{NativeRecording, SessionState, SharedSessionState, TerminalCache},
     timing::{FramePacer, HNS_PER_SECOND, Timeline, audio_drain_limit, audio_frames_to_hns},
     video::{Capture, FramePacket, Signal},
 };
@@ -41,33 +45,39 @@ static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Starts a worker and waits until every native subsystem is live.
 pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
-    let request = request.clone();
+    let mut request = request.clone();
+    if let Some(destination) = request.destination.as_mut() {
+        *destination = absolute_path(destination)?;
+    }
     let elapsed_hns = Arc::new(AtomicU64::new(0));
     let (commands_tx, commands_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let (completion_tx, completion_rx) = mpsc::sync_channel(1);
     let (events_tx, events_rx) = mpsc::channel();
+    let state = Arc::new(SharedSessionState::new());
     let thread = thread::Builder::new()
         .name("scrozz-recording".into())
         .spawn({
             let elapsed_hns = Arc::clone(&elapsed_hns);
-            let terminal_events = events_tx.clone();
-            move || match Worker::initialize(
-                request,
-                commands_rx,
-                Arc::clone(&elapsed_hns),
-                events_tx,
-            ) {
-                Ok(worker) => {
-                    if ready_tx.send(Ok(())).is_ok() {
-                        let result = worker.run();
-                        let terminal = TerminalOutcome::from_result(&result);
-                        let _ = completion_tx.send(result);
-                        let _ = terminal_events.send(WorkerEvent::Terminal(Box::new(terminal)));
+            let worker_state = Arc::clone(&state);
+            move || {
+                let _ended = EndStateGuard(Arc::clone(&worker_state));
+                match Worker::initialize(
+                    request,
+                    commands_rx,
+                    Arc::clone(&elapsed_hns),
+                    Arc::clone(&worker_state),
+                    events_tx.clone(),
+                ) {
+                    Ok(worker) => {
+                        if ready_tx.send(Ok(())).is_ok() {
+                            let result = worker.run();
+                            worker_state.set(SessionState::Ended);
+                            let _ = events_tx.send(WorkerEvent::Terminal(Box::new(result)));
+                        }
                     }
-                }
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
                 }
             }
         })?;
@@ -76,11 +86,10 @@ pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
         Ok(Ok(())) => Ok(Box::new(WindowsSession {
             commands: commands_tx,
             events: events_rx,
-            completion: completion_rx,
             thread: Some(thread),
-            state: SessionState::Running,
+            state,
             elapsed_hns,
-            terminal: None,
+            terminal: TerminalCache::default(),
         })),
         Ok(Err(error)) => {
             let _ = thread.join();
@@ -98,88 +107,66 @@ pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
 struct WindowsSession {
     commands: mpsc::Sender<Command>,
     events: Receiver<WorkerEvent>,
-    completion: Receiver<Result<Recording>>,
     thread: Option<JoinHandle<()>>,
-    state: SessionState,
+    state: Arc<SharedSessionState>,
     elapsed_hns: Arc<AtomicU64>,
-    terminal: Option<TerminalOutcome>,
+    terminal: TerminalCache,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionState {
-    Running,
-    Paused,
-    Ended,
+struct EndStateGuard(Arc<SharedSessionState>);
+
+impl Drop for EndStateGuard {
+    fn drop(&mut self) {
+        self.0.set(SessionState::Ended);
+    }
 }
 
 #[derive(Debug)]
 enum WorkerEvent {
     FirstFrame,
-    Terminal(Box<TerminalOutcome>),
-}
-
-#[derive(Debug, Clone)]
-enum TerminalOutcome {
-    Finished(Box<Recording>),
-    Failed(Arc<Error>),
-}
-
-impl TerminalOutcome {
-    fn from_result(result: &Result<Recording>) -> Self {
-        match result {
-            Ok(recording) => Self::Finished(Box::new(recording.clone())),
-            Err(error) => Self::Failed(Arc::new(clone_error(error))),
-        }
-    }
-
-    fn as_session_event(&self) -> SessionEvent {
-        match self {
-            Self::Finished(recording) => SessionEvent::Finished((**recording).clone()),
-            Self::Failed(error) => SessionEvent::Failed(Arc::clone(error)),
-        }
-    }
-
-    fn into_result(self) -> Result<Recording> {
-        match self {
-            Self::Finished(recording) => Ok(*recording),
-            Self::Failed(error) => Err(clone_error(&error)),
-        }
-    }
+    Terminal(Box<Result<NativeRecording>>),
 }
 
 impl RecordingSession for WindowsSession {
+    fn state(&self) -> RecordingState {
+        self.state.recording_state()
+    }
+
     fn pause(&mut self) -> Result<()> {
-        if self.state != SessionState::Running {
+        if self.state.get() != SessionState::Running {
             return Err(Error::InvalidRequest(
                 "recording is already paused or has ended".into(),
             ));
         }
         self.command_with_ack(Command::Pause)?;
-        self.state = SessionState::Paused;
         Ok(())
     }
 
     fn resume(&mut self) -> Result<()> {
-        if self.state != SessionState::Paused {
+        if self.state.get() != SessionState::Paused {
             return Err(Error::InvalidRequest(
                 "recording is not paused or has ended".into(),
             ));
         }
         self.command_with_ack(Command::Resume)?;
-        self.state = SessionState::Running;
         Ok(())
     }
 
     fn poll(&mut self) -> Option<SessionEvent> {
+        if self.terminal.is_some() {
+            return self.terminal.emit();
+        }
         match self.events.try_recv() {
             Ok(WorkerEvent::FirstFrame) => Some(SessionEvent::FirstFrame),
-            Ok(WorkerEvent::Terminal(terminal)) => {
-                self.state = SessionState::Ended;
-                let event = terminal.as_session_event();
-                self.terminal = Some(*terminal);
-                Some(event)
+            Ok(WorkerEvent::Terminal(result)) => {
+                self.terminal.cache(*result);
+                self.terminal.emit()
             }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.cache_disconnected_terminal();
+                self.terminal.emit()
+            }
+            Err(TryRecvError::Empty) => None,
         }
     }
 
@@ -188,19 +175,16 @@ impl RecordingSession for WindowsSession {
     }
 
     fn stop(mut self: Box<Self>) -> Result<Recording> {
-        if self.state != SessionState::Ended {
-            self.state = SessionState::Ended;
+        if !self.terminal.is_some() {
             let _ = self.commands.send(Command::Stop);
+            self.receive_terminal();
         }
-        let result = match self.terminal.take() {
-            Some(terminal) => terminal.into_result(),
-            None => self
-                .completion
-                .recv()
-                .map_err(|_| Error::Platform("recording worker ended without a result".into()))?,
-        };
-        self.join()?;
-        result
+        if let Err(error) = self.join() {
+            tracing::error!(%error, "Windows recording worker did not join after finalisation");
+        }
+        self.terminal
+            .take_result()
+            .expect("terminal outcome was received")
     }
 }
 
@@ -223,6 +207,45 @@ impl WindowsSession {
         }
         Ok(())
     }
+
+    fn cache_disconnected_terminal(&mut self) {
+        let join_detail = self
+            .join()
+            .err()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        self.terminal.cache_error(Error::Platform(format!(
+            "recording worker exited without a terminal result{join_detail}"
+        )));
+    }
+
+    fn receive_terminal(&mut self) {
+        while !self.terminal.is_some() {
+            match self.events.recv() {
+                Ok(WorkerEvent::FirstFrame) => {}
+                Ok(WorkerEvent::Terminal(result)) => self.terminal.cache(*result),
+                Err(_) => self.cache_disconnected_terminal(),
+            }
+        }
+    }
+
+    fn report_abandoned_terminal(&self) {
+        let Some(outcome) = self.terminal.outcome() else {
+            return;
+        };
+        if let Some(recording) = outcome.recording() {
+            tracing::warn!(
+                path = %recording.path().display(),
+                partial = recording.is_partial(),
+                "recording owner dropped the session without collecting its retained output"
+            );
+        } else if let Some(error) = outcome.error() {
+            tracing::error!(
+                %error,
+                "recording owner dropped the session after native finalisation failed"
+            );
+        }
+    }
 }
 
 impl Drop for WindowsSession {
@@ -230,11 +253,14 @@ impl Drop for WindowsSession {
         if self.thread.is_none() {
             return;
         }
-        if self.state != SessionState::Ended {
+        if !self.terminal.is_some() {
             let _ = self.commands.send(Command::Stop);
+            self.receive_terminal();
         }
-        let _ = self.completion.recv();
-        let _ = self.join();
+        self.report_abandoned_terminal();
+        if let Err(error) = self.join() {
+            tracing::error!(%error, "Windows recording worker did not join during drop");
+        }
     }
 }
 
@@ -248,6 +274,7 @@ struct Worker {
     commands: Receiver<Command>,
     events: Sender<WorkerEvent>,
     elapsed_hns: Arc<AtomicU64>,
+    state: Arc<SharedSessionState>,
     paused: Arc<AtomicBool>,
     capture: Option<Capture>,
     frames: Receiver<FramePacket>,
@@ -263,7 +290,6 @@ struct Worker {
     audio_requested: bool,
     timeline: Timeline,
     pacer: FramePacer,
-    frame_duration_hns: i64,
     media_end_hns: i64,
     latest_video_hns: i64,
     started: bool,
@@ -279,18 +305,20 @@ impl Worker {
         request: RecordingRequest,
         commands: Receiver<Command>,
         elapsed_hns: Arc<AtomicU64>,
+        state: Arc<SharedSessionState>,
         events: Sender<WorkerEvent>,
     ) -> Result<Self> {
         let output = output_paths(request.destination.as_deref())?;
-        Self::initialize_at(request, commands, elapsed_hns, events, output)
+        Self::initialize_at(request, commands, elapsed_hns, state, events, output)
     }
 
     fn initialize_at(
         request: RecordingRequest,
         commands: Receiver<Command>,
         elapsed_hns: Arc<AtomicU64>,
+        state: Arc<SharedSessionState>,
         events: Sender<WorkerEvent>,
-        output: OutputPaths,
+        mut output: OutputPaths,
     ) -> Result<Self> {
         resolve_video_codec(request.video_codec)?;
         let apartment = Apartment::enter()?;
@@ -320,6 +348,7 @@ impl Worker {
         let device = Device::new()?;
         let wants_audio = request.system_audio || request.microphone;
         let encoder = Encoder::new(&output.temporary_path, &device, encoder_plan, wants_audio)?;
+        output.mark_owned();
         let audio = match wants_audio
             .then(|| AudioCapture::start(request.system_audio, request.microphone))
             .transpose()
@@ -327,7 +356,7 @@ impl Worker {
             Ok(audio) => audio,
             Err(error) => {
                 encoder.discard();
-                return Err(discard_output(&output.temporary_path, error));
+                return Err(output.discard(error));
             }
         };
 
@@ -347,13 +376,14 @@ impl Worker {
             Err(error) => {
                 drop(audio);
                 encoder.discard();
-                return Err(discard_output(&output.temporary_path, error));
+                return Err(output.discard(error));
             }
         };
         Ok(Self {
             commands,
             events,
             elapsed_hns,
+            state,
             paused,
             capture: Some(capture),
             frames,
@@ -376,7 +406,6 @@ impl Worker {
             audio_requested: wants_audio,
             timeline: Timeline::default(),
             pacer: FramePacer::new(encoder_plan.fps),
-            frame_duration_hns: HNS_PER_SECOND / i64::from(encoder_plan.fps),
             media_end_hns: 0,
             latest_video_hns: 0,
             started: false,
@@ -388,7 +417,7 @@ impl Worker {
         })
     }
 
-    fn run(mut self) -> Result<Recording> {
+    fn run(mut self) -> Result<NativeRecording> {
         let cause = loop {
             if let Some(cause) = self.process_commands() {
                 break cause;
@@ -445,6 +474,7 @@ impl Worker {
             .map_err(|error| Error::Platform(format!("could not timestamp pause: {error}")))?;
         self.paused.store(true, Ordering::Release);
         self.timeline.pause(now);
+        self.state.set(SessionState::Paused);
         self.publish_elapsed();
         Ok(())
     }
@@ -458,6 +488,7 @@ impl Worker {
         self.min_raw_hns = now;
         self.timeline.resume(now);
         self.paused.store(false, Ordering::Release);
+        self.state.set(SessionState::Running);
         self.publish_elapsed();
         Ok(())
     }
@@ -486,21 +517,21 @@ impl Worker {
             return Ok(());
         };
         self.latest_video_hns = self.latest_video_hns.max(stream_hns);
-        if !self.pacer.accept(stream_hns) {
+        let Some(schedule) = self.pacer.schedule(stream_hns) else {
             self.publish_elapsed();
             return Ok(());
-        }
+        };
         self.encoder
             .as_mut()
             .expect("encoder lives until finalisation")
-            .write_video(frame, stream_hns)?;
+            .write_video(frame, schedule.timestamp_hns, schedule.duration_hns)?;
         if !self.first_frame_emitted {
             self.first_frame_emitted = true;
             let _ = self.events.send(WorkerEvent::FirstFrame);
         }
         self.media_end_hns = self
             .media_end_hns
-            .max(stream_hns.saturating_add(self.frame_duration_hns));
+            .max(schedule.timestamp_hns.saturating_add(schedule.duration_hns));
         self.publish_elapsed();
         Ok(())
     }
@@ -537,9 +568,18 @@ impl Worker {
         }
 
         if let Some(mixer) = self.mixer.as_mut() {
+            let qpc_watermark_hns = if include_partial {
+                self.latest_video_hns
+            } else {
+                let now = qpc_now_hns().map_err(|error| {
+                    Error::Platform(format!("could not timestamp audio watermark: {error}"))
+                })?;
+                self.timeline.project(now).unwrap_or(self.latest_video_hns)
+            };
             let through_hns = audio_drain_limit(
                 self.media_end_hns,
                 self.latest_video_hns,
+                qpc_watermark_hns,
                 AUDIO_SETTLE_HNS,
                 include_partial,
             );
@@ -554,7 +594,7 @@ impl Worker {
         Ok(())
     }
 
-    fn finish(mut self, cause: EndCause) -> Result<Recording> {
+    fn finish(mut self, cause: EndCause) -> Result<NativeRecording> {
         if let Some(capture) = self.capture.take() {
             capture.close();
         }
@@ -633,10 +673,9 @@ impl Worker {
                 audio_channels,
                 None,
             ),
-            Outcome::Complete => Err(discard_output(
-                &self.output.temporary_path,
-                Error::Codec("recording ended before any media reached the output file".into()),
-            )),
+            Outcome::Complete => Err(self.output.discard(Error::Codec(
+                "recording ended before any media reached the output file".into(),
+            ))),
             Outcome::Salvaged(reason) => self.finish_recording(
                 duration_secs,
                 retained_bytes,
@@ -644,10 +683,7 @@ impl Worker {
                 audio_channels,
                 Some(reason),
             ),
-            Outcome::Unusable(reason) => Err(discard_output(
-                &self.output.temporary_path,
-                Error::Codec(reason),
-            )),
+            Outcome::Unusable(reason) => Err(self.output.discard(Error::Codec(reason))),
         }
     }
 
@@ -658,7 +694,7 @@ impl Worker {
         video_frames: u64,
         audio_channels: u16,
         mut partial_reason: Option<String>,
-    ) -> Result<Recording> {
+    ) -> Result<NativeRecording> {
         let metadata = RecordingMetadata {
             size: Some(PhysicalSize::new(
                 f64::from(self.encoder_plan.output_width),
@@ -675,7 +711,7 @@ impl Worker {
             quality: Some(self.quality),
             resolution: Some(self.resolution),
         };
-        let path = match promote_output(&self.output) {
+        let path = match promote_output(&mut self.output) {
             Ok(()) => self.output.final_path.clone(),
             Err(error) => {
                 append_error(
@@ -694,6 +730,8 @@ impl Worker {
         if let Some(reason) = partial_reason {
             recording = recording.into_partial(reason)?;
         }
+        let recording = NativeRecording::new(recording, super::ENGINE_NAME)?;
+        self.output.mark_reported();
         Ok(recording)
     }
 
@@ -716,6 +754,65 @@ enum EndCause {
 struct OutputPaths {
     final_path: PathBuf,
     temporary_path: PathBuf,
+    owns_output: bool,
+    promoted: bool,
+    reported: bool,
+}
+
+impl OutputPaths {
+    fn owned_path(&self) -> &Path {
+        if self.promoted {
+            &self.final_path
+        } else {
+            &self.temporary_path
+        }
+    }
+
+    fn mark_reported(&mut self) {
+        self.reported = true;
+    }
+
+    fn mark_owned(&mut self) {
+        self.owns_output = true;
+    }
+
+    fn discard(&mut self, error: Error) -> Error {
+        if !self.owns_output {
+            self.reported = true;
+            return error;
+        }
+        let path = self.owned_path().to_owned();
+        let cleanup = std::fs::remove_file(&path);
+        self.reported = true;
+        match cleanup {
+            Ok(()) => error,
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+            Err(cleanup) => Error::Platform(format!(
+                "{error}; could not remove incomplete output {}: {cleanup}",
+                path.display()
+            )),
+        }
+    }
+}
+
+impl Drop for OutputPaths {
+    fn drop(&mut self) {
+        if self.reported || !self.owns_output {
+            return;
+        }
+        let path = self.owned_path().to_owned();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    %error,
+                    "could not remove abandoned Windows recording output"
+                );
+            }
+        }
+    }
 }
 
 fn append_error(current: &mut Option<String>, next: String) {
@@ -725,38 +822,6 @@ fn append_error(current: &mut Option<String>, next: String) {
             current.push_str(&next);
         }
         None => *current = Some(next),
-    }
-}
-
-fn clone_error(error: &Error) -> Error {
-    match error {
-        Error::PermissionDenied { capability, remedy } => Error::PermissionDenied {
-            capability: capability.clone(),
-            remedy: remedy.clone(),
-        },
-        Error::Unsupported { what, why } => Error::Unsupported {
-            what: what.clone(),
-            why: why.clone(),
-        },
-        Error::TargetGone(message) => Error::TargetGone(message.clone()),
-        Error::InvalidRequest(message) => Error::InvalidRequest(message.clone()),
-        Error::Codec(message) => Error::Codec(message.clone()),
-        Error::Storage(message) => Error::Storage(message.clone()),
-        Error::Cancelled => Error::Cancelled,
-        Error::Io(io) => Error::Io(std::io::Error::new(io.kind(), io.to_string())),
-        Error::Platform(message) => Error::Platform(message.clone()),
-        _ => Error::Platform(error.to_string()),
-    }
-}
-
-fn discard_output(path: &Path, error: Error) -> Error {
-    match std::fs::remove_file(path) {
-        Ok(()) => error,
-        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
-        Err(cleanup) => Error::Platform(format!(
-            "{error}; could not remove incomplete output {}: {cleanup}",
-            path.display()
-        )),
     }
 }
 
@@ -771,6 +836,9 @@ fn output_paths(explicit: Option<&Path>) -> Result<OutputPaths> {
     Ok(OutputPaths {
         final_path,
         temporary_path,
+        owns_output: false,
+        promoted: false,
+        reported: false,
     })
 }
 
@@ -841,14 +909,39 @@ fn validate_output(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn promote_output(paths: &OutputPaths) -> Result<()> {
-    std::fs::rename(&paths.temporary_path, &paths.final_path).map_err(|error| {
-        Error::Storage(format!(
-            "could not move recording into place from {} to {}: {error}",
-            paths.temporary_path.display(),
-            paths.final_path.display()
-        ))
-    })
+fn promote_output(paths: &mut OutputPaths) -> Result<()> {
+    if !paths.owns_output {
+        return Err(Error::Storage(
+            "cannot promote a recording output that this worker does not own".into(),
+        ));
+    }
+    let temporary: Vec<u16> = paths
+        .temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let final_path: Vec<u16> = paths
+        .final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe { MoveFileW(PCWSTR(temporary.as_ptr()), PCWSTR(final_path.as_ptr())) }.map_err(
+        |error| {
+            Error::Storage(format!(
+                "could not atomically move recording without replacement from {} to {}: {error}",
+                paths.temporary_path.display(),
+                paths.final_path.display()
+            ))
+        },
+    )?;
+    paths.promoted = true;
+    Ok(())
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).map_err(Error::Io)
 }
 
 fn resolve_video_codec(codec: VideoCodec) -> Result<VideoCodec> {

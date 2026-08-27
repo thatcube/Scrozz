@@ -165,7 +165,9 @@ impl AudioCapture {
 
 impl Drop for AudioCapture {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if let Err(error) = self.stop() {
+            tracing::error!(%error, "could not stop abandoned WASAPI capture");
+        }
     }
 }
 
@@ -358,7 +360,13 @@ impl EndpointCapture {
 
 impl Drop for EndpointCapture {
     fn drop(&mut self) {
-        let _ = unsafe { self.client.Stop() };
+        if let Err(error) = unsafe { self.client.Stop() } {
+            tracing::warn!(
+                source = ?self.source,
+                %error,
+                "could not stop WASAPI endpoint during drop"
+            );
+        }
     }
 }
 
@@ -579,7 +587,9 @@ impl Event {
 
 impl Drop for Event {
     fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
+        if let Err(error) = unsafe { CloseHandle(self.0) } {
+            tracing::error!(%error, "could not close WASAPI event handle");
+        }
     }
 }
 

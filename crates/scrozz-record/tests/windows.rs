@@ -1,11 +1,15 @@
 //! Cross-host tests for Windows recording policy.
 
 pub use scrozz_record::{
-    EngineCapabilities, Quality, RecordingRequest, RecordingResolution, VideoCodec,
+    EngineCapabilities, Quality, Recording, RecordingCompletion, RecordingMetadata,
+    RecordingProvenance, RecordingRequest, RecordingResolution, RecordingState, Salvageability,
+    SessionEvent, VideoCodec,
 };
 
-use scrozz_core::{CaptureTarget, DisplayId};
+use scrozz_core::{CaptureTarget, DisplayId, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize};
 
+#[path = "../src/windows/geometry.rs"]
+mod geometry;
 #[path = "../src/windows/plan.rs"]
 mod plan;
 #[path = "../src/windows/timing.rs"]
@@ -16,10 +20,14 @@ mod mix;
 
 #[path = "../src/windows/salvage.rs"]
 mod salvage;
+#[path = "../src/windows/terminal.rs"]
+mod terminal;
 
+use geometry::{MonitorGeometry, RegionCrop, RegionError, resolve_region};
 use mix::{Mixer, Packet, Source, downmix_stereo, f32_to_i16, resample_linear};
 use plan::{PlanError, build, output_dimensions};
 use salvage::{Outcome, classify, inspect};
+use terminal::{NativeRecording, SessionState, SharedSessionState, TerminalCache};
 use timing::{
     Backpressure, FramePacer, HNS_PER_SECOND, Timeline, audio_drain_limit, backpressure, qpc_to_hns,
 };
@@ -239,30 +247,300 @@ fn independent_stream_timestamps_do_not_clamp_each_other() {
 }
 
 #[test]
+fn qpc_projection_does_not_claim_unwritten_media_duration() {
+    let mut timeline = Timeline::default();
+    timeline.start(10 * HNS_PER_SECOND);
+    assert_eq!(timeline.map(11 * HNS_PER_SECOND), Some(HNS_PER_SECOND));
+    assert_eq!(
+        timeline.project(20 * HNS_PER_SECOND),
+        Some(10 * HNS_PER_SECOND)
+    );
+    assert_eq!(timeline.duration_hns(), HNS_PER_SECOND);
+}
+
+#[test]
 fn frame_pacing_and_queue_backpressure_drop_newest_work() {
     let mut pacer = FramePacer::new(30);
-    assert!(pacer.accept(0));
-    assert!(!pacer.accept(100_000));
-    assert!(pacer.accept(HNS_PER_SECOND / 30));
+    assert!(pacer.schedule(0).is_some());
+    assert!(pacer.schedule(100_000).is_none());
+    assert!(pacer.schedule(HNS_PER_SECOND / 30).is_some());
     assert_eq!(backpressure(2, 3), Backpressure::Enqueue);
     assert_eq!(backpressure(3, 3), Backpressure::DropNewest);
     assert_eq!(backpressure(0, 0), Backpressure::DropNewest);
 }
 
 #[test]
-fn audio_watermark_waits_for_wasapi_but_finalisation_fills_the_tail() {
+fn frame_pacing_is_phase_locked_from_sixty_hz_to_twenty_four_fps() {
+    let mut pacer = FramePacer::new(24);
+    let schedules: Vec<_> = (0..60)
+        .filter_map(|input| {
+            let timestamp = i64::from(input) * HNS_PER_SECOND / 60;
+            pacer.schedule(timestamp)
+        })
+        .collect();
+
+    assert_eq!(schedules.len(), 24);
+    assert_eq!(schedules.first().unwrap().timestamp_hns, 0);
+    assert_eq!(
+        schedules.last().unwrap().timestamp_hns,
+        23 * HNS_PER_SECOND / 24
+    );
+    for (index, schedule) in schedules.iter().enumerate() {
+        assert_eq!(schedule.timestamp_hns, index as i64 * HNS_PER_SECOND / 24);
+        assert_eq!(
+            schedule.timestamp_hns + schedule.duration_hns,
+            (index as i64 + 1) * HNS_PER_SECOND / 24
+        );
+    }
+}
+
+#[test]
+fn audio_watermark_uses_qpc_when_video_stalls_and_finalisation_fills_the_tail() {
     let frame_end = 2 * HNS_PER_SECOND;
     let latest_video = frame_end - HNS_PER_SECOND / 30;
+    let qpc_watermark = frame_end + HNS_PER_SECOND;
     let settle = HNS_PER_SECOND / 10;
 
     assert_eq!(
-        audio_drain_limit(frame_end, latest_video, settle, false),
-        latest_video - settle
-    );
-    assert_eq!(
-        audio_drain_limit(frame_end, latest_video, settle, true),
+        audio_drain_limit(frame_end, latest_video, qpc_watermark, settle, false),
         frame_end
     );
+    assert_eq!(
+        audio_drain_limit(frame_end, latest_video, qpc_watermark, settle, true),
+        frame_end
+    );
+}
+
+#[test]
+fn qpc_watermark_keeps_audio_mixer_retention_bounded_during_video_stall() {
+    let sample_rate = 1_000;
+    let packet_frames = 10;
+    let settle_hns = HNS_PER_SECOND / 10;
+    let mut mixer = Mixer::new(sample_rate, packet_frames, true, false);
+
+    for packet in 0..1_000 {
+        let start_frame = packet * packet_frames;
+        let stream_hns = i64::from(start_frame) * HNS_PER_SECOND / i64::from(sample_rate);
+        mixer.ingest(
+            Source::System,
+            Packet {
+                stream_hns,
+                sample_rate,
+                channels: 1,
+                channel_mask: 0x0004,
+                samples: vec![0.25; packet_frames as usize],
+            },
+        );
+        let media_end_hns =
+            i64::from(start_frame + packet_frames) * HNS_PER_SECOND / i64::from(sample_rate);
+        let through = audio_drain_limit(media_end_hns, 0, media_end_hns, settle_hns, false);
+        drop(mixer.drain_through(through, false));
+        assert!(
+            mixer.buffered_frames() <= u64::from(sample_rate / 10 + packet_frames),
+            "retained {} source frames",
+            mixer.buffered_frames()
+        );
+    }
+}
+
+#[test]
+fn mixed_dpi_region_resolution_keeps_monitor_identity_and_relative_crop() {
+    let monitors = [
+        MonitorGeometry {
+            id: r"\\.\DISPLAY1",
+            left: 0,
+            top: 0,
+            right: 1_920,
+            bottom: 1_080,
+            scale: 1.0,
+        },
+        MonitorGeometry {
+            id: r"\\.\DISPLAY2",
+            left: 1_920,
+            top: 0,
+            right: 4_480,
+            bottom: 1_440,
+            scale: 2.0,
+        },
+    ];
+    let region = LogicalRect::new(
+        LogicalPoint::new(2_000.25, 100.25),
+        LogicalSize::new(10.5, 20.5),
+    );
+
+    assert_eq!(
+        resolve_region(region, &monitors).unwrap(),
+        RegionCrop {
+            monitor_index: 1,
+            left: 2_080,
+            top: 200,
+            width: 22,
+            height: 42,
+        }
+    );
+}
+
+#[test]
+fn mixed_dpi_coordinate_overlap_and_cross_display_regions_are_rejected() {
+    let monitors = [
+        MonitorGeometry {
+            id: r"\\.\DISPLAY1",
+            left: 0,
+            top: 0,
+            right: 1_920,
+            bottom: 1_080,
+            scale: 1.0,
+        },
+        MonitorGeometry {
+            id: r"\\.\DISPLAY2",
+            left: 1_920,
+            top: 0,
+            right: 4_480,
+            bottom: 1_440,
+            scale: 2.0,
+        },
+    ];
+    let ambiguous = LogicalRect::new(
+        LogicalPoint::new(1_000.0, 100.0),
+        LogicalSize::new(100.0, 100.0),
+    );
+    assert!(matches!(
+        resolve_region(ambiguous, &monitors),
+        Err(RegionError::AmbiguousDisplays(displays)) if displays.len() == 2
+    ));
+
+    let crossing = LogicalRect::new(
+        LogicalPoint::new(900.0, 100.0),
+        LogicalSize::new(100.0, 100.0),
+    );
+    assert!(matches!(
+        resolve_region(crossing, &monitors),
+        Err(RegionError::AmbiguousDisplays(_))
+    ));
+}
+
+#[test]
+fn mixed_dpi_monitor_edges_snap_without_clipping_or_false_overflow() {
+    let scale = 1.5;
+    let left = 1_920;
+    let right = 4_480;
+    let top = 0;
+    let bottom = 1_440;
+    let monitor = MonitorGeometry {
+        id: r"\\.\DISPLAY2",
+        left,
+        top,
+        right,
+        bottom,
+        scale,
+    };
+    let region = LogicalRect::new(
+        LogicalPoint::new(f64::from(left) / scale, f64::from(top) / scale),
+        LogicalSize::new(
+            f64::from(right - left) / scale,
+            f64::from(bottom - top) / scale,
+        ),
+    );
+
+    assert_eq!(
+        resolve_region(region, &[monitor]).unwrap(),
+        RegionCrop {
+            monitor_index: 0,
+            left: 0,
+            top: 0,
+            width: 2_560,
+            height: 1_440,
+        }
+    );
+}
+
+#[test]
+fn mixed_dpi_integral_interior_edges_do_not_expand() {
+    let scale = 1.5;
+    let monitor = MonitorGeometry {
+        id: r"\\.\DISPLAY2",
+        left: -1_920,
+        top: 0,
+        right: 0,
+        bottom: 1_080,
+        scale,
+    };
+    let region = LogicalRect::new(
+        LogicalPoint::new(-1_918.0 / scale, 2.0 / scale),
+        LogicalSize::new(10.0 / scale, 10.0 / scale),
+    );
+
+    assert_eq!(
+        resolve_region(region, &[monitor]).unwrap(),
+        RegionCrop {
+            monitor_index: 0,
+            left: 2,
+            top: 2,
+            width: 10,
+            height: 10,
+        }
+    );
+}
+
+fn native_recording(path: &str) -> Recording {
+    Recording::native(path, 1.25, "Windows test")
+        .unwrap()
+        .with_native_details(
+            CaptureTarget::Display(DisplayId(r"\\.\DISPLAY1".into())),
+            RecordingMetadata {
+                size: Some(PhysicalSize::new(1_920.0, 1_080.0)),
+                video_codec: Some(VideoCodec::H264),
+                ..RecordingMetadata::default()
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn native_terminal_boundary_rejects_synthetic_and_incomplete_provenance() {
+    let synthetic = Recording::synthetic("fixture.mp4", 1.0, "fixture").unwrap();
+    assert!(NativeRecording::new(synthetic, "Windows test").is_err());
+    let missing_target = Recording::native("capture.mp4", 1.0, "Windows test").unwrap();
+    assert!(NativeRecording::new(missing_target, "Windows test").is_err());
+    let wrong_engine = Recording::native("capture.mp4", 1.0, "other")
+        .unwrap()
+        .with_native_details(
+            CaptureTarget::Display(DisplayId(r"\\.\DISPLAY1".into())),
+            RecordingMetadata::default(),
+        )
+        .unwrap();
+    assert!(NativeRecording::new(wrong_engine, "Windows test").is_err());
+}
+
+#[test]
+fn terminal_cache_freezes_partial_semantics_and_emits_once() {
+    let expected = native_recording("partial.mp4")
+        .into_partial("device removed after a complete fragment")
+        .unwrap();
+    let mut cache = TerminalCache::default();
+    cache.cache(Ok(
+        NativeRecording::new(expected.clone(), "Windows test").unwrap()
+    ));
+    cache.cache_error(scrozz_core::Error::Platform(
+        "late contradictory failure".into(),
+    ));
+
+    let SessionEvent::Finished(polled) = cache.emit().unwrap() else {
+        panic!("expected finished partial event");
+    };
+    assert_eq!(polled, expected);
+    assert!(cache.emit().is_none());
+    assert_eq!(cache.take_result().unwrap().unwrap(), expected);
+}
+
+#[test]
+fn shared_session_state_reports_pause_and_asynchronous_end() {
+    let state = SharedSessionState::new();
+    assert_eq!(state.recording_state(), RecordingState::Recording);
+    state.set(SessionState::Paused);
+    assert_eq!(state.recording_state(), RecordingState::Paused);
+    state.set(SessionState::Ended);
+    assert_eq!(state.recording_state(), RecordingState::Stopped);
 }
 
 #[test]

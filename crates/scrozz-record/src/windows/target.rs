@@ -2,7 +2,7 @@
 
 use core::ffi::c_void;
 
-use scrozz_core::{CaptureTarget, Error, LogicalRect, Result};
+use scrozz_core::{CaptureTarget, Error, Result};
 use windows::{
     Graphics::{Capture::GraphicsCaptureItem, SizeInt32},
     Win32::{
@@ -18,7 +18,10 @@ use windows::{
     },
 };
 
-use super::device::Crop;
+use super::{
+    device::Crop,
+    geometry::{MonitorGeometry, RegionCrop, RegionError, resolve_region},
+};
 
 /// Everything needed to create a WGC frame pool.
 pub struct Source {
@@ -99,26 +102,19 @@ pub fn resolve(target: &CaptureTarget) -> Result<Source> {
         }
         CaptureTarget::Region(region) => {
             let monitors = monitors()?;
-            let containing: Vec<&Monitor> = monitors
+            let geometry: Vec<MonitorGeometry<'_>> = monitors
                 .iter()
-                .filter(|monitor| contains(logical_bounds(monitor), *region))
+                .map(|monitor| MonitorGeometry {
+                    id: &monitor.name,
+                    left: monitor.bounds.left,
+                    top: monitor.bounds.top,
+                    right: monitor.bounds.right,
+                    bottom: monitor.bounds.bottom,
+                    scale: monitor.scale,
+                })
                 .collect();
-            let monitor = if let [monitor] = containing.as_slice() {
-                *monitor
-            } else {
-                let overlaps = monitors
-                    .iter()
-                    .filter(|monitor| overlap_area(*region, monitor) > 0.0)
-                    .count();
-                return Err(if overlaps == 0 {
-                    Error::TargetGone("recording area overlaps no display".into())
-                } else {
-                    Error::InvalidRequest(
-                        "Windows recording areas must stay within a single display".into(),
-                    )
-                });
-            };
-            source_for_monitor(monitor, Some(*region))
+            let resolved = resolve_region(*region, &geometry).map_err(region_error)?;
+            source_for_monitor(&monitors[resolved.monitor_index], Some(resolved))
         }
         CaptureTarget::AllDisplays => Err(Error::Unsupported {
             what: "all-displays recording on Windows".into(),
@@ -129,21 +125,76 @@ pub fn resolve(target: &CaptureTarget) -> Result<Source> {
     }
 }
 
-fn source_for_monitor(monitor: &Monitor, region: Option<LogicalRect>) -> Result<Source> {
+fn source_for_monitor(monitor: &Monitor, region: Option<RegionCrop>) -> Result<Source> {
     let item = item_for_monitor(monitor.handle)?;
     let size = item
         .Size()
         .map_err(|_| Error::TargetGone("display disconnected before recording began".into()))?;
     let (pool_width, pool_height) = checked_size(size)?;
-    let crop = region.map_or(
-        Crop {
+    let current = monitor_record(monitor.handle).ok_or_else(|| {
+        Error::TargetGone(format!(
+            "display {} disconnected while recording started",
+            monitor.name
+        ))
+    })?;
+    if !same_monitor(monitor, &current) {
+        return Err(Error::TargetGone(format!(
+            "display {} changed identity or geometry while recording started",
+            monitor.name
+        )));
+    }
+    let expected_width = current
+        .bounds
+        .right
+        .checked_sub(current.bounds.left)
+        .and_then(|width| u32::try_from(width).ok())
+        .unwrap_or(0);
+    let expected_height = current
+        .bounds
+        .bottom
+        .checked_sub(current.bounds.top)
+        .and_then(|height| u32::try_from(height).ok())
+        .unwrap_or(0);
+    if pool_width != expected_width || pool_height != expected_height {
+        return Err(Error::TargetGone(format!(
+            "display {} changed geometry while its capture item was created",
+            monitor.name
+        )));
+    }
+    let crop = match region {
+        None => Crop {
             left: 0,
             top: 0,
             width: pool_width,
             height: pool_height,
         },
-        |region| crop_for_region(region, monitor, pool_width, pool_height),
-    );
+        Some(region) => {
+            let right = region.left.checked_add(region.width);
+            let bottom = region.top.checked_add(region.height);
+            let (Some(right), Some(bottom)) = (right, bottom) else {
+                return Err(Error::TargetGone(format!(
+                    "display {} returned an overflowing recording crop",
+                    monitor.name
+                )));
+            };
+            if region.left >= pool_width
+                || region.top >= pool_height
+                || right > pool_width
+                || bottom > pool_height
+            {
+                return Err(Error::TargetGone(format!(
+                    "display {} changed before its recording crop could be applied",
+                    monitor.name
+                )));
+            }
+            Crop {
+                left: region.left,
+                top: region.top,
+                width: region.width,
+                height: region.height,
+            }
+        }
+    };
     if crop.width == 0 || crop.height == 0 {
         return Err(Error::InvalidRequest(
             "the recording area has no pixels".into(),
@@ -249,71 +300,31 @@ fn monitor_record(handle: HMONITOR) -> Option<Monitor> {
     })
 }
 
-fn logical_bounds(monitor: &Monitor) -> LogicalRect {
-    LogicalRect {
-        origin: scrozz_core::Point::new(
-            f64::from(monitor.bounds.left) / monitor.scale,
-            f64::from(monitor.bounds.top) / monitor.scale,
-        ),
-        size: scrozz_core::Size::new(
-            f64::from(monitor.bounds.right - monitor.bounds.left) / monitor.scale,
-            f64::from(monitor.bounds.bottom - monitor.bounds.top) / monitor.scale,
-        ),
+fn same_monitor(a: &Monitor, b: &Monitor) -> bool {
+    a.name == b.name
+        && a.bounds.left == b.bounds.left
+        && a.bounds.top == b.bounds.top
+        && a.bounds.right == b.bounds.right
+        && a.bounds.bottom == b.bounds.bottom
+        && a.scale == b.scale
+}
+
+fn region_error(error: RegionError) -> Error {
+    match error {
+        RegionError::InvalidGeometry => {
+            Error::InvalidRequest("the Windows recording area has invalid geometry".into())
+        }
+        RegionError::NoDisplay => {
+            Error::TargetGone("the recording area overlaps no connected display".into())
+        }
+        RegionError::AmbiguousDisplays(displays) => Error::InvalidRequest(format!(
+            "the Windows recording area cannot be assigned to one display under mixed DPI \
+             ({})",
+            displays.join(", ")
+        )),
+        RegionError::CrossesDisplay(display) => Error::InvalidRequest(format!(
+            "the Windows recording area crosses the edge of {display}; recording regions must \
+             stay within one display"
+        )),
     }
-}
-
-fn overlap_area(region: LogicalRect, monitor: &Monitor) -> f64 {
-    intersection(region, logical_bounds(monitor))
-        .map_or(0.0, |rect| rect.size.width * rect.size.height)
-}
-
-fn contains(outer: LogicalRect, inner: LogicalRect) -> bool {
-    inner.origin.x >= outer.origin.x
-        && inner.origin.y >= outer.origin.y
-        && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width
-        && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height
-}
-
-fn crop_for_region(
-    region: LogicalRect,
-    monitor: &Monitor,
-    pool_width: u32,
-    pool_height: u32,
-) -> Crop {
-    let bounds = logical_bounds(monitor);
-    let clipped = intersection(region, bounds).unwrap_or(LogicalRect {
-        origin: bounds.origin,
-        size: scrozz_core::Size::new(0.0, 0.0),
-    });
-    let left = ((clipped.origin.x - bounds.origin.x) * monitor.scale)
-        .round()
-        .max(0.0) as u32;
-    let top = ((clipped.origin.y - bounds.origin.y) * monitor.scale)
-        .round()
-        .max(0.0) as u32;
-    let right = (((clipped.origin.x + clipped.size.width - bounds.origin.x) * monitor.scale)
-        .round()
-        .max(0.0) as u32)
-        .min(pool_width);
-    let bottom = (((clipped.origin.y + clipped.size.height - bounds.origin.y) * monitor.scale)
-        .round()
-        .max(0.0) as u32)
-        .min(pool_height);
-    Crop {
-        left: left.min(right),
-        top: top.min(bottom),
-        width: right.saturating_sub(left),
-        height: bottom.saturating_sub(top),
-    }
-}
-
-fn intersection(a: LogicalRect, b: LogicalRect) -> Option<LogicalRect> {
-    let left = a.origin.x.max(b.origin.x);
-    let top = a.origin.y.max(b.origin.y);
-    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
-    let bottom = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
-    (right > left && bottom > top).then(|| LogicalRect {
-        origin: scrozz_core::Point::new(left, top),
-        size: scrozz_core::Size::new(right - left, bottom - top),
-    })
 }

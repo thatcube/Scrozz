@@ -53,16 +53,24 @@ impl Timeline {
 
     /// Maps a timestamp, or returns `None` while paused or before video starts.
     pub fn map(&mut self, raw_hns: i64) -> Option<i64> {
+        let mapped = self.project(raw_hns)?;
+        self.last_mapped = self.last_mapped.max(mapped);
+        Some(mapped)
+    }
+
+    /// Projects a timestamp without claiming that media was emitted through it.
+    #[must_use]
+    pub fn project(&self, raw_hns: i64) -> Option<i64> {
         if self.pause_started.is_some() {
             return None;
         }
         let origin = self.origin?;
-        let mapped = raw_hns
-            .saturating_sub(origin)
-            .saturating_sub(self.paused_total)
-            .max(0);
-        self.last_mapped = self.last_mapped.max(mapped);
-        Some(mapped)
+        Some(
+            raw_hns
+                .saturating_sub(origin)
+                .saturating_sub(self.paused_total)
+                .max(0),
+        )
     }
 
     /// The latest emitted stream time.
@@ -78,11 +86,20 @@ impl Timeline {
     }
 }
 
+/// One frame assigned to an exact rational output slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledFrame {
+    /// Phase-locked sample timestamp.
+    pub timestamp_hns: i64,
+    /// Exact duration to the next rational slot boundary.
+    pub duration_hns: i64,
+}
+
 /// Drops compositor frames that exceed the requested recording rate.
 #[derive(Debug, Clone)]
 pub struct FramePacer {
-    interval_hns: i64,
-    next_hns: i64,
+    fps: u32,
+    last_slot: Option<u64>,
 }
 
 impl FramePacer {
@@ -90,19 +107,39 @@ impl FramePacer {
     #[must_use]
     pub fn new(fps: u32) -> Self {
         Self {
-            interval_hns: HNS_PER_SECOND / i64::from(fps.max(1)),
-            next_hns: 0,
+            fps: fps.max(1),
+            last_slot: None,
         }
     }
 
-    /// Whether this frame should enter the bounded encoder queue.
-    pub fn accept(&mut self, stream_hns: i64) -> bool {
-        if stream_hns < self.next_hns {
-            return false;
+    /// Assigns the first input in each output slot to that slot's exact phase.
+    pub fn schedule(&mut self, stream_hns: i64) -> Option<ScheduledFrame> {
+        if stream_hns < 0 {
+            return None;
         }
-        self.next_hns = stream_hns.saturating_add(self.interval_hns);
-        true
+        // WGC/QPC conversion truncates to one 100 ns tick. Give that single
+        // tick back so a nominal 30 Hz source does not miss every exact 30 fps
+        // slot by the conversion remainder.
+        let phase = i128::from(stream_hns.saturating_add(1)) * i128::from(self.fps);
+        let slot = u64::try_from(phase / i128::from(HNS_PER_SECOND)).ok()?;
+        if self.last_slot.is_some_and(|last| slot <= last) {
+            return None;
+        }
+        self.last_slot = Some(slot);
+
+        let timestamp_hns = slot_hns(slot, self.fps);
+        let end_hns = slot_hns(slot.saturating_add(1), self.fps);
+        Some(ScheduledFrame {
+            timestamp_hns,
+            duration_hns: end_hns.saturating_sub(timestamp_hns).max(1),
+        })
     }
+}
+
+fn slot_hns(slot: u64, fps: u32) -> i64 {
+    ((i128::from(slot) * i128::from(HNS_PER_SECOND)) / i128::from(fps))
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 /// Bounded queues drop the newest frame rather than invalidating older timing.
@@ -130,18 +167,18 @@ pub const fn backpressure(len: usize, capacity: usize) -> Backpressure {
 pub fn audio_drain_limit(
     media_end_hns: i64,
     latest_video_hns: i64,
+    qpc_watermark_hns: i64,
     settle_hns: i64,
     finalising: bool,
 ) -> i64 {
     if finalising {
         media_end_hns.max(0)
     } else {
-        let settled_video = latest_video_hns.saturating_sub(settle_hns).max(0);
-        if media_end_hns < settled_video {
-            media_end_hns.max(0)
-        } else {
-            settled_video
-        }
+        let settled_capture = latest_video_hns
+            .max(qpc_watermark_hns)
+            .saturating_sub(settle_hns)
+            .max(0);
+        media_end_hns.min(settled_capture).max(0)
     }
 }
 

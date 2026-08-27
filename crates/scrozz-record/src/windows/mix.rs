@@ -105,6 +105,13 @@ impl Track {
         }
         segment.samples[(frame - segment.start) as usize]
     }
+
+    fn buffered_frames(&self, cursor: u64) -> u64 {
+        self.segments.iter().fold(0, |total, segment| {
+            let end = segment.start.saturating_add(segment.samples.len() as u64);
+            total.saturating_add(end.saturating_sub(segment.start.max(cursor)))
+        })
+    }
 }
 
 /// Aligns two independently clocked WASAPI streams and fills absent time with
@@ -179,6 +186,15 @@ impl Mixer {
             });
         }
         chunks
+    }
+
+    /// Number of source frames still retained across both input tracks.
+    #[must_use]
+    pub fn buffered_frames(&self) -> u64 {
+        self.tracks
+            .iter()
+            .map(|track| track.buffered_frames(self.cursor))
+            .fold(0, u64::saturating_add)
     }
 }
 

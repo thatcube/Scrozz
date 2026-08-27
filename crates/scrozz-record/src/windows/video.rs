@@ -127,6 +127,14 @@ impl Capture {
                         let _ = callback_signals.send(Signal::TargetClosed);
                         return Ok(());
                     }
+                    if !resize_with_content && *known != content {
+                        let _ = callback_signals.send(Signal::Failed(format!(
+                            "display geometry changed during fixed-region recording \
+                             ({}x{} became {}x{})",
+                            known.Width, known.Height, content.Width, content.Height
+                        )));
+                        return Ok(());
+                    }
 
                     if !paused.load(Ordering::Acquire) {
                         let timestamp = frame.SystemRelativeTime()?.Duration;
