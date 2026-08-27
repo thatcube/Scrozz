@@ -194,9 +194,9 @@ jobs:
   # unchanged on runners nobody owns. So the UI is not merely *compiled* on
   # Windows and Linux — it is rendered, and the pixels are diffed.
   #
-  # Font metrics, DPI rounding and text antialiasing genuinely differ between
-  # the three platforms, so this is the only mechanism that answers "does the
-  # UI look right on Windows" without a Windows machine.
+  # The harness embeds its fonts and rasterises egui meshes in software, so the
+  # same committed pixels are expected on every runner. The matrix proves that
+  # determinism instead of trusting a single development machine.
   #
   # When it fails it uploads the baseline, the new render and the diff, because
   # a red X reading "images differ" tells a human nothing they can act on.
@@ -206,10 +206,9 @@ jobs:
     needs: gate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    # Baselines have to be recorded on some platform, and macOS is where the UI
-    # is authored. Until per-platform baselines exist, a Windows or Linux pixel
-    # diff is expected and is reported as a warning with artefacts attached
-    # rather than as a blocking failure.
+    # macOS is where the UI is authored. Windows and Linux remain advisory while
+    # cross-platform determinism is established in CI; their failures still
+    # carry complete visual artefacts.
     #
     # D25 is explicit that a permanently-red golden suite gets disabled within a
     # week and the whole apparatus becomes worthless. This is how it stays
@@ -239,10 +238,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      # Includes mesa-vulkan-drivers (lavapipe) and libgl1-mesa-dri (llvmpipe).
-      # A CI runner has no GPU, and egui_kittest renders through wgpu, so
-      # without a software adapter every test fails with "no suitable adapter"
-      # — which looks like a code bug and is not one.
+      # The package still links Linux windowing and graphics dependencies even
+      # though the golden renderer itself is headless software.
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: tools/ci-linux-deps.sh
@@ -251,11 +248,8 @@ jobs:
         with:
           key: golden-${{ matrix.os }}
 
-      # tools/golden.sh exits 0 with an explanation when the harness does not
-      # exist yet. During Phase 0 that is the expected outcome: the harness in
-      # crates/scrozz-ui is still a todo!(). The job starts enforcing itself
-      # automatically once egui_kittest is a dev-dependency and there are tests
-      # in crates/scrozz-ui/tests/ — no edit to this file required.
+      # The script fails if the corpus test disappears, then runs every UI test
+      # and compares the committed software-rendered baselines byte-for-byte.
       - name: Render and diff golden images
         run: tools/golden.sh
 

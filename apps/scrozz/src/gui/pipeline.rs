@@ -29,7 +29,7 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_annotate::Document;
+use scrozz_annotate::{Document, DocumentData};
 use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
@@ -60,6 +60,15 @@ pub enum Job {
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Load a card's durable editable document.
+    LoadEditor(CardId),
+    /// Persist an editor snapshot through the existing history document.
+    SaveEdits {
+        /// Which visible card owns the document.
+        card: CardId,
+        /// The complete editable snapshot; source pixels remain in history.
+        data: DocumentData,
+    },
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -89,6 +98,13 @@ pub enum Outcome {
         card: CardId,
         /// Why.
         error: CliError,
+    },
+    /// A complete document is ready for an annotation viewport.
+    EditorLoaded {
+        /// Which card requested it.
+        card: CardId,
+        /// Source pixels and the latest non-destructive edits.
+        document: Box<Document>,
     },
 }
 
@@ -167,7 +183,8 @@ impl Drop for Pipeline {
 
 /// What the worker remembers about a card it produced.
 struct Cached {
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
+    capture_id: Option<CaptureId>,
 }
 
 struct Worker {
@@ -208,8 +225,18 @@ impl Worker {
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
                 Job::Release(card) => {
-                    self.cache.remove(&card);
+                    let forget = if let Some(cached) = self.cache.get_mut(&card) {
+                        cached.bytes = None;
+                        cached.capture_id.is_none()
+                    } else {
+                        false
+                    };
+                    if forget {
+                        self.cache.remove(&card);
+                    }
                 }
+                Job::LoadEditor(card) => self.load_editor(card),
+                Job::SaveEdits { card, data } => self.save_edits(card, &data),
                 Job::Stop => break,
             }
         }
@@ -260,7 +287,13 @@ impl Worker {
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
 
-        self.cache.insert(card, Cached { bytes });
+        self.cache.insert(
+            card,
+            Cached {
+                bytes: Some(bytes),
+                capture_id: capture_id.clone(),
+            },
+        );
 
         Ok(Card {
             id: card,
@@ -296,8 +329,8 @@ impl Worker {
         // is also what will make "copy" work for a card whose capture arrived
         // over IPC, where the worker never held a `Frame` at all.
         let result = self
-            .cached(card, "copy")
-            .and_then(|cached| Ok(scrozz_export::decode(&cached.bytes)?))
+            .cached_bytes(card, "copy")
+            .and_then(|bytes| Ok(scrozz_export::decode(bytes)?))
             .and_then(|frame| {
                 SystemClipboard::new().write_image_reporting(&frame)?;
                 Ok("copied to the clipboard".to_owned())
@@ -306,11 +339,63 @@ impl Worker {
     }
 
     fn save(&mut self, card: CardId) {
-        let result = self.cached(card, "save").and_then(|cached| {
-            let path = crate::output::export_default(&cached.bytes)?;
+        let result = self.cached_bytes(card, "save").and_then(|bytes| {
+            let path = crate::output::export_default(bytes)?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer(card, result);
+    }
+
+    fn load_editor(&mut self, card: CardId) {
+        let result = self
+            .capture_id(card, "annotate")
+            .and_then(|capture_id| {
+                let store = self.store.as_mut().ok_or_else(|| {
+                    CliError::usage(
+                        "history is unavailable, so this capture has no editable document",
+                    )
+                })?;
+                store
+                    .document(&capture_id)?
+                    .ok_or_else(|| CliError::usage(format!("{card} is no longer in history")))
+            })
+            .and_then(|state| {
+                state.complete().ok_or_else(|| {
+                    CliError::usage(format!(
+                        "{card}'s source image was evicted; its annotations remain in history but cannot be edited without the pixels"
+                    ))
+                })
+            });
+
+        match result {
+            Ok(document) => {
+                let _ = self.outcomes.send(Outcome::EditorLoaded {
+                    card,
+                    document: Box::new(document),
+                });
+            }
+            Err(error) => self.answer_error(card, error),
+        }
+    }
+
+    fn save_edits(&mut self, card: CardId, data: &DocumentData) {
+        let result = self.capture_id(card, "save edits").and_then(|capture_id| {
+            let store = self.store.as_mut().ok_or_else(|| {
+                CliError::usage("history is unavailable, so edits cannot be persisted")
+            })?;
+            store.save_edits(&capture_id, data)?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.answer_error(card, error);
+        }
+    }
+
+    fn capture_id(&self, card: CardId, verb: &str) -> CliResult<CaptureId> {
+        self.cached(card, verb)?
+            .capture_id
+            .clone()
+            .ok_or_else(|| CliError::usage(format!("{card} is not available in history to {verb}")))
     }
 
     fn cached(&self, card: CardId, verb: &str) -> CliResult<&Cached> {
@@ -319,12 +404,23 @@ impl Worker {
             .ok_or_else(|| CliError::usage(format!("{card} has no capture to {verb}")))
     }
 
+    fn cached_bytes(&self, card: CardId, verb: &str) -> CliResult<&[u8]> {
+        self.cached(card, verb)?
+            .bytes
+            .as_deref()
+            .ok_or_else(|| CliError::usage(format!("{card} is no longer available to {verb}")))
+    }
+
     fn answer(&self, card: CardId, result: CliResult<String>) {
         let message = match result {
             Ok(detail) => Outcome::Done { card, detail },
             Err(error) => Outcome::Refused { card, error },
         };
         let _ = self.outcomes.send(message);
+    }
+
+    fn answer_error(&self, card: CardId, error: CliError) {
+        let _ = self.outcomes.send(Outcome::Refused { card, error });
     }
 }
 
@@ -379,6 +475,76 @@ mod tests {
             Some(Outcome::Refused { card, .. }) => assert_eq!(card, CardId(7)),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn annotating_a_card_that_was_never_captured_is_refused_too() {
+        let pipeline = Pipeline::start().expect("the worker should start");
+        assert!(pipeline.post(Job::LoadEditor(CardId(8))));
+
+        match wait_for(&pipeline) {
+            Some(Outcome::Refused { card, error }) => {
+                assert_eq!(card, CardId(8));
+                assert!(error.to_string().contains("annotate"), "{error}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn editor_load_and_save_use_the_workers_existing_store() {
+        use scrozz_store::test_support::{sample_document, scratch_dir};
+
+        let scratch = scratch_dir("pipeline-editor");
+        let (outcome_tx, outcome_rx) = channel();
+        let mut store = SqliteStore::open_ephemeral(scratch.path()).expect("store");
+        let original = sample_document(16, 12, 4, 1);
+        let capture_id = store
+            .insert(NewCapture::new(&original))
+            .expect("capture inserted");
+        let card = CardId(23);
+        let mut worker = Worker {
+            outcomes: outcome_tx,
+            store: Some(store),
+            cache: HashMap::from([(
+                card,
+                Cached {
+                    bytes: None,
+                    capture_id: Some(capture_id.clone()),
+                },
+            )]),
+        };
+
+        worker.load_editor(card);
+        let loaded = match outcome_rx.recv().expect("load outcome") {
+            Outcome::EditorLoaded {
+                card: loaded_card,
+                document,
+            } => {
+                assert_eq!(loaded_card, card);
+                *document
+            }
+            other => panic!("expected an editor document, got {other:?}"),
+        };
+        assert_eq!(loaded.data(), original.data());
+
+        let mut changed = loaded.data();
+        changed.canvas.auto_expand = true;
+        worker.save_edits(card, &changed);
+        let reloaded = worker
+            .store
+            .as_mut()
+            .expect("store retained")
+            .document(&capture_id)
+            .expect("read")
+            .expect("record")
+            .complete()
+            .expect("source retained");
+        assert_eq!(reloaded.data(), changed);
+        assert!(
+            outcome_rx.try_recv().is_err(),
+            "autosave success should not flood the app with status messages"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     annotation::{Annotation, AnnotationId, AnnotationObject},
+    geom,
     style::{Color, Style},
 };
 
@@ -58,7 +59,147 @@ impl Beautification {
             background,
         }
     }
+}
 
+/// A non-destructive quarter-turn applied to the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasRotation {
+    /// Source orientation.
+    #[default]
+    None,
+    /// Ninety degrees clockwise.
+    Clockwise90,
+    /// One hundred and eighty degrees.
+    HalfTurn,
+    /// Ninety degrees counter-clockwise.
+    CounterClockwise90,
+}
+
+impl CanvasRotation {
+    /// The next clockwise quarter-turn.
+    #[must_use]
+    pub const fn clockwise(self) -> Self {
+        match self {
+            Self::None => Self::Clockwise90,
+            Self::Clockwise90 => Self::HalfTurn,
+            Self::HalfTurn => Self::CounterClockwise90,
+            Self::CounterClockwise90 => Self::None,
+        }
+    }
+
+    /// The next counter-clockwise quarter-turn.
+    #[must_use]
+    pub const fn counter_clockwise(self) -> Self {
+        match self {
+            Self::None => Self::CounterClockwise90,
+            Self::CounterClockwise90 => Self::HalfTurn,
+            Self::HalfTurn => Self::Clockwise90,
+            Self::Clockwise90 => Self::None,
+        }
+    }
+
+    const fn swaps_axes(self) -> bool {
+        matches!(self, Self::Clockwise90 | Self::CounterClockwise90)
+    }
+}
+
+/// Non-destructive image framing owned by document format v2.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Canvas {
+    /// The visible source region. `None` means the untouched source bounds.
+    #[serde(default)]
+    pub crop: Option<LogicalRect>,
+    /// A quarter-turn applied after flips.
+    #[serde(default)]
+    pub rotation: CanvasRotation,
+    /// Mirror around the vertical axis.
+    #[serde(default)]
+    pub flip_horizontal: bool,
+    /// Mirror around the horizontal axis.
+    #[serde(default)]
+    pub flip_vertical: bool,
+    /// Grow the output to retain annotations drawn beyond the crop.
+    #[serde(default)]
+    pub auto_expand: bool,
+}
+
+/// Resolved canvas bounds and reversible coordinate mapping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CanvasGeometry {
+    source_bounds: LogicalRect,
+    source_crop: LogicalRect,
+    output_size: LogicalSize,
+    rotation: CanvasRotation,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+}
+
+impl CanvasGeometry {
+    /// Source-space bounds represented by the output, including auto-expansion.
+    #[must_use]
+    pub const fn source_bounds(self) -> LogicalRect {
+        self.source_bounds
+    }
+
+    /// Source pixels that remain visible after cropping.
+    #[must_use]
+    pub const fn source_crop(self) -> LogicalRect {
+        self.source_crop
+    }
+
+    /// Output size after flips and rotation.
+    #[must_use]
+    pub const fn output_size(self) -> LogicalSize {
+        self.output_size
+    }
+
+    /// Maps an editable source-space point into the transformed canvas.
+    #[must_use]
+    pub fn source_to_canvas(self, source: LogicalPoint) -> LogicalPoint {
+        let width = self.source_bounds.size.width;
+        let height = self.source_bounds.size.height;
+        let mut x = source.x - self.source_bounds.origin.x;
+        let mut y = source.y - self.source_bounds.origin.y;
+        if self.flip_horizontal {
+            x = width - x;
+        }
+        if self.flip_vertical {
+            y = height - y;
+        }
+        match self.rotation {
+            CanvasRotation::None => LogicalPoint::new(x, y),
+            CanvasRotation::Clockwise90 => LogicalPoint::new(height - y, x),
+            CanvasRotation::HalfTurn => LogicalPoint::new(width - x, height - y),
+            CanvasRotation::CounterClockwise90 => LogicalPoint::new(y, width - x),
+        }
+    }
+
+    /// Maps a transformed canvas point back into editable source space.
+    #[must_use]
+    pub fn canvas_to_source(self, canvas: LogicalPoint) -> LogicalPoint {
+        let width = self.source_bounds.size.width;
+        let height = self.source_bounds.size.height;
+        let (mut x, mut y) = match self.rotation {
+            CanvasRotation::None => (canvas.x, canvas.y),
+            CanvasRotation::Clockwise90 => (canvas.y, height - canvas.x),
+            CanvasRotation::HalfTurn => (width - canvas.x, height - canvas.y),
+            CanvasRotation::CounterClockwise90 => (width - canvas.y, canvas.x),
+        };
+        if self.flip_horizontal {
+            x = width - x;
+        }
+        if self.flip_vertical {
+            y = height - y;
+        }
+        LogicalPoint::new(
+            x + self.source_bounds.origin.x,
+            y + self.source_bounds.origin.y,
+        )
+    }
+}
+
+impl Beautification {
     /// The radius a shape nested inside another must use to look concentric.
     ///
     /// D9's corollary: `inner_radius = outer_radius − padding`. Nesting two
@@ -94,6 +235,9 @@ pub struct DocumentData {
     pub annotations: Vec<AnnotationObject>,
     /// Framing, if permitted.
     pub beautification: Option<Beautification>,
+    /// Non-destructive crop, rotation, flips, and auto-expansion.
+    #[serde(default)]
+    pub canvas: Canvas,
     /// The next identifier to hand out.
     ///
     /// Persisted so a reopened document cannot reissue an id that an undo stack
@@ -103,7 +247,7 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 }
 
 impl Default for DocumentData {
@@ -112,6 +256,7 @@ impl Default for DocumentData {
             version: Self::VERSION,
             annotations: Vec::new(),
             beautification: None,
+            canvas: Canvas::default(),
             next_id: 1,
         }
     }
@@ -133,6 +278,7 @@ pub struct Document {
     pub source: Capture,
     objects: Vec<AnnotationObject>,
     beautification: Option<Beautification>,
+    canvas: Canvas,
     next_id: u64,
 }
 
@@ -144,6 +290,7 @@ impl Document {
             source,
             objects: Vec::new(),
             beautification: None,
+            canvas: Canvas::default(),
             next_id: 1,
         }
     }
@@ -157,6 +304,25 @@ impl Document {
     /// a document that was hand-edited or that changed provenance must not be
     /// silently accepted and then quietly rendered wrong.
     pub fn from_data(source: Capture, data: DocumentData) -> Result<Self> {
+        let data = Self::prepare_data(&source, data)?;
+        let highest = data
+            .annotations
+            .iter()
+            .map(|o| o.id.0)
+            .max()
+            .map_or(0, |id| id + 1);
+        let mut document = Self {
+            source,
+            objects: data.annotations,
+            beautification: data.beautification,
+            canvas: data.canvas,
+            next_id: data.next_id.max(highest).max(1),
+        };
+        document.renumber_counters();
+        Ok(document)
+    }
+
+    fn prepare_data(source: &Capture, mut data: DocumentData) -> Result<DocumentData> {
         if data.version > DocumentData::VERSION {
             return Err(Error::InvalidRequest(format!(
                 "document format version {} is newer than supported version {}",
@@ -169,20 +335,9 @@ impl Document {
                 "beautification is not permitted for window captures (decision D9)".to_owned(),
             ));
         }
-        let highest = data
-            .annotations
-            .iter()
-            .map(|o| o.id.0)
-            .max()
-            .map_or(0, |id| id + 1);
-        let mut document = Self {
-            source,
-            objects: data.annotations,
-            beautification: data.beautification,
-            next_id: data.next_id.max(highest).max(1),
-        };
-        document.renumber_counters();
-        Ok(document)
+        validate_canvas(data.canvas)?;
+        data.version = DocumentData::VERSION;
+        Ok(data)
     }
 
     /// The editable part of this document, ready to persist.
@@ -192,8 +347,30 @@ impl Document {
             version: DocumentData::VERSION,
             annotations: self.objects.clone(),
             beautification: self.beautification.clone(),
+            canvas: self.canvas,
             next_id: self.next_id,
         }
+    }
+
+    /// Restores an editable snapshot while retaining the immutable source pixels.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::from_data`].
+    pub fn restore(&mut self, data: DocumentData) -> Result<()> {
+        let data = Self::prepare_data(&self.source, data)?;
+        let highest = data
+            .annotations
+            .iter()
+            .map(|o| o.id.0)
+            .max()
+            .map_or(0, |id| id + 1);
+        self.objects = data.annotations;
+        self.beautification = data.beautification;
+        self.canvas = data.canvas;
+        self.next_id = data.next_id.max(highest).max(1);
+        self.renumber_counters();
+        Ok(())
     }
 
     /// Every annotation, bottom-most first.
@@ -232,6 +409,80 @@ impl Document {
         LogicalRect::new(LogicalPoint::new(0.0, 0.0), self.logical_size())
     }
 
+    /// The current non-destructive canvas transform.
+    #[must_use]
+    pub const fn canvas(&self) -> &Canvas {
+        &self.canvas
+    }
+
+    /// Replaces crop, rotation, flip, and auto-expand settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for an empty or non-finite crop.
+    pub fn set_canvas(&mut self, canvas: Canvas) -> Result<()> {
+        validate_canvas(canvas)?;
+        self.canvas = canvas;
+        Ok(())
+    }
+
+    /// Resolves crop and auto-expansion into a reversible coordinate mapping.
+    #[must_use]
+    pub fn canvas_geometry(&self) -> CanvasGeometry {
+        self.resolve_canvas_geometry(self.canvas)
+    }
+
+    /// Resolves a temporary canvas without changing the persisted document.
+    ///
+    /// This is useful for editing surfaces that need to show more of the source
+    /// than the final cropped export while preserving the same rotation, flips,
+    /// and annotation expansion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for an empty or non-finite crop.
+    pub fn canvas_geometry_for(&self, canvas: Canvas) -> Result<CanvasGeometry> {
+        validate_canvas(canvas)?;
+        Ok(self.resolve_canvas_geometry(canvas))
+    }
+
+    fn resolve_canvas_geometry(&self, canvas: Canvas) -> CanvasGeometry {
+        let source = self.logical_bounds();
+        let source_crop = canvas
+            .crop
+            .and_then(|crop| geom::intersection(&crop, &source))
+            .unwrap_or(source);
+        let mut source_bounds = source_crop;
+        if canvas.auto_expand {
+            for object in &self.objects {
+                let visual = object.visual_bounds();
+                if rect_is_finite(&visual) && !visual.is_empty() {
+                    source_bounds = geom::union(&source_bounds, &visual);
+                }
+            }
+        }
+
+        let output_size = if canvas.rotation.swaps_axes() {
+            LogicalSize::new(source_bounds.size.height, source_bounds.size.width)
+        } else {
+            source_bounds.size
+        };
+        CanvasGeometry {
+            source_bounds,
+            source_crop,
+            output_size,
+            rotation: canvas.rotation,
+            flip_horizontal: canvas.flip_horizontal,
+            flip_vertical: canvas.flip_vertical,
+        }
+    }
+
+    /// Output size after crop, expansion, and quarter-turn rotation.
+    #[must_use]
+    pub fn canvas_size(&self) -> LogicalSize {
+        self.canvas_geometry().output_size()
+    }
+
     /// Adds an annotation on top of everything else.
     ///
     /// Counter markers are numbered by the document, so the `index` on a
@@ -249,6 +500,7 @@ impl Document {
     pub fn add_default(&mut self, annotation: Annotation) -> AnnotationId {
         let style = match &annotation {
             Annotation::Highlight(_) => Style::highlighter(),
+            Annotation::Spotlight(_) => Style::spotlight(),
             Annotation::Redact { .. } => Style::redaction(),
             _ => Style::stroked(),
         };
@@ -461,6 +713,108 @@ impl Document {
                 *n = number as u32 + 1;
             }
         }
+    }
+}
+
+fn rect_is_finite(rect: &LogicalRect) -> bool {
+    rect.origin.x.is_finite()
+        && rect.origin.y.is_finite()
+        && rect.size.width.is_finite()
+        && rect.size.height.is_finite()
+}
+
+fn validate_canvas(canvas: Canvas) -> Result<()> {
+    if let Some(crop) = canvas.crop
+        && (!rect_is_finite(&crop) || crop.is_empty())
+    {
+        return Err(Error::InvalidRequest(
+            "canvas crop must be finite and have positive width and height".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Bounded undo/redo history made only of editable document snapshots.
+///
+/// Source pixels never enter this stack: D14 keeps the capture immutable and
+/// snapshots only the compact [`DocumentData`] that can actually change.
+#[derive(Debug, Clone)]
+pub struct UndoHistory {
+    undo: Vec<DocumentData>,
+    redo: Vec<DocumentData>,
+    limit: usize,
+}
+
+impl UndoHistory {
+    /// A history seeded with the document's current state.
+    #[must_use]
+    pub fn new(document: &Document) -> Self {
+        Self {
+            undo: vec![document.data()],
+            redo: Vec::new(),
+            limit: 128,
+        }
+    }
+
+    /// Records the current state after an edit.
+    ///
+    /// Equal adjacent states are deduplicated, and any edit after undoing starts
+    /// a new branch by clearing redo.
+    pub fn checkpoint(&mut self, document: &Document) {
+        let snapshot = document.data();
+        if self.undo.last() == Some(&snapshot) {
+            return;
+        }
+        self.undo.push(snapshot);
+        self.redo.clear();
+        if self.undo.len() > self.limit {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Whether an older snapshot exists.
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        self.undo.len() > 1
+    }
+
+    /// Whether an undone snapshot can be restored.
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Restores the previous editable state.
+    ///
+    /// # Errors
+    ///
+    /// Propagates snapshot validation errors from [`Document::restore`].
+    pub fn undo(&mut self, document: &mut Document) -> Result<bool> {
+        if !self.can_undo() {
+            return Ok(false);
+        }
+        if let Some(current) = self.undo.pop() {
+            self.redo.push(current);
+        }
+        let Some(previous) = self.undo.last().cloned() else {
+            return Ok(false);
+        };
+        document.restore(previous)?;
+        Ok(true)
+    }
+
+    /// Restores the next editable state.
+    ///
+    /// # Errors
+    ///
+    /// Propagates snapshot validation errors from [`Document::restore`].
+    pub fn redo(&mut self, document: &mut Document) -> Result<bool> {
+        let Some(next) = self.redo.pop() else {
+            return Ok(false);
+        };
+        document.restore(next.clone())?;
+        self.undo.push(next);
+        Ok(true)
     }
 }
 

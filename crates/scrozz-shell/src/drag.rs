@@ -871,6 +871,30 @@ pub fn native_drag_source() -> Result<NativeDragSource> {
     NativeDragSource::new()
 }
 
+/// The native surface receiving the current pointer event.
+///
+/// This is the route used by deferred egui viewports, whose callback receives a
+/// `Ui` but no `eframe::Frame` or raw window handle.
+///
+/// # Errors
+///
+/// Returns [`Error::TargetGone`] when the event has no live window, or
+/// [`Error::Unsupported`] where the platform backend cannot discover it.
+pub fn current_native_drag_surface() -> Result<NativeSurface> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::drag::current_native_surface()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Unsupported {
+            what: "dragging from a deferred viewport".to_owned(),
+            why: "this platform cannot recover a native surface from the current pointer event"
+                .to_owned(),
+        })
+    }
+}
+
 /// The two backends that are designed but not built.
 ///
 /// This module is not a placeholder that returns `todo!()`. Per D8 an

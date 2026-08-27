@@ -6,7 +6,8 @@ use common::{
     capture_with, document, flat, near, pixel, pixels, rect, region_capture, window_capture,
 };
 use scrozz_annotate::{
-    Annotation, Background, Beautification, Color, Document, Renderer, SkiaRenderer, Style,
+    Annotation, Background, Beautification, Canvas, CanvasRotation, Color, Document, Renderer,
+    SkiaRenderer, Style,
 };
 use scrozz_core::{Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
 
@@ -99,6 +100,95 @@ fn rendering_at_2x_doubles_the_canvas() {
     assert_eq!(two.width(), one.width() * 2);
     assert_eq!(two.height(), one.height() * 2);
     assert_eq!(two.scale.get(), 2.0);
+}
+
+#[test]
+fn crop_rotate_and_flip_transform_pixels_without_touching_the_source() {
+    let source = common::frame_with(4, 2, 1.0, |x, _| match x {
+        0 => [255, 0, 0, 255],
+        1 => [0, 255, 0, 255],
+        2 => [0, 0, 255, 255],
+        _ => [255, 255, 0, 255],
+    });
+    let mut doc = Document::new(capture_with(source, Provenance::Region));
+    let original = doc.source.frame.data.clone();
+    doc.set_canvas(Canvas {
+        crop: Some(rect(1.0, 0.0, 2.0, 2.0)),
+        rotation: CanvasRotation::Clockwise90,
+        flip_horizontal: true,
+        flip_vertical: false,
+        auto_expand: false,
+    })
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (2, 2));
+    assert_eq!(doc.source.frame.data, original);
+    let colors = pixels(&out);
+    assert!(colors.iter().all(|p| p[3] == 255));
+    assert!(colors.iter().any(|p| near(*p, [0, 255, 0, 255], 1)));
+    assert!(colors.iter().any(|p| near(*p, [0, 0, 255, 255], 1)));
+    assert!(
+        colors
+            .iter()
+            .all(|p| !near(*p, [255, 0, 0, 255], 1) && !near(*p, [255, 255, 0, 255], 1))
+    );
+}
+
+#[test]
+fn temporary_canvas_render_reveals_the_source_without_changing_the_crop() {
+    let mut doc = Document::new(capture_with(
+        flat(80, 50, [17, 99, 200, 255]),
+        Provenance::Region,
+    ));
+    doc.set_canvas(Canvas {
+        crop: Some(rect(10.0, 8.0, 40.0, 24.0)),
+        ..Canvas::default()
+    })
+    .unwrap();
+    let persisted = doc.data();
+
+    let renderer = SkiaRenderer::new();
+    let cropped = renderer.render(&doc).unwrap();
+    let workspace = renderer
+        .render_canvas(
+            &doc,
+            Canvas {
+                crop: None,
+                ..*doc.canvas()
+            },
+        )
+        .unwrap();
+
+    assert_eq!((cropped.width(), cropped.height()), (40, 24));
+    assert_eq!((workspace.width(), workspace.height()), (80, 50));
+    assert_eq!(doc.data(), persisted);
+}
+
+#[test]
+fn auto_expand_keeps_objects_drawn_beyond_the_source() {
+    let mut doc = Document::new(capture_with(
+        flat(40, 30, [255, 255, 255, 255]),
+        Provenance::Region,
+    ));
+    doc.add(
+        Annotation::Rectangle(rect(45.0, 5.0, 20.0, 15.0)),
+        Style::stroked()
+            .with_stroke(Color::BLACK)
+            .with_stroke_width(3.0),
+    );
+    doc.set_canvas(Canvas {
+        auto_expand: true,
+        ..Canvas::default()
+    })
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert!(out.width() > 60);
+    assert!(
+        (40..out.width()).any(|x| (0..out.height()).any(|y| pixel(&out, x, y)[0] < 64)),
+        "the outside annotation should remain visible"
+    );
 }
 
 #[test]

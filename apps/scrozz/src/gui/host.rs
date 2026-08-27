@@ -9,12 +9,20 @@
 //! calls [`App::tick`] — everything that blocks is already on a worker.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use scrozz_annotate::{Document, Renderer, SkiaRenderer};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat};
+use scrozz_shell::{
+    DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, byte_source,
+    current_native_drag_surface, native_drag_source,
+};
 use scrozz_ui::{
-    OverlayHandle,
+    AnnotationEditor, EditorDragRequest, EditorEvent, OverlayHandle, Theme,
+    icons::IconStore,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
 };
 
@@ -24,7 +32,7 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         app::{App, Config, Tick},
-        card::{CardSurface, Recording},
+        card::{CardId, CardSurface, Recording},
         overlay::OverlayCards,
     },
     report::Report,
@@ -210,6 +218,7 @@ impl Host for Windowed {
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
+                let editor_icons = Arc::new(IconStore::new(&cc.egui_ctx));
                 Ok(Box::new(Driver {
                     app,
                     overlay,
@@ -218,6 +227,8 @@ impl Host for Windowed {
                     emit: Some(emit),
                     announced: false,
                     stopped: false,
+                    editors: HashMap::new(),
+                    editor_icons,
                 }))
             }),
         )
@@ -263,6 +274,38 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
+    editors: HashMap<CardId, Arc<Mutex<EditorSession>>>,
+    editor_icons: Arc<IconStore>,
+}
+
+struct EditorSession {
+    editor: AnnotationEditor,
+    pending: Vec<EditorEvent>,
+    drag: Option<DragSession>,
+}
+
+impl EditorSession {
+    fn new(document: Document) -> Self {
+        Self {
+            editor: AnnotationEditor::new(document),
+            pending: Vec::new(),
+            drag: None,
+        }
+    }
+
+    fn poll_drag(&mut self) {
+        let Some(outcome) = self.drag.as_ref().and_then(DragSession::outcome) else {
+            return;
+        };
+        let notice = match outcome {
+            DragOutcome::Accepted(_) => "Dropped a copy.".to_owned(),
+            DragOutcome::Rejected | DragOutcome::Cancelled => "Drag cancelled.".to_owned(),
+            DragOutcome::Failed(reason) => format!("Drag failed: {reason}"),
+            _ => "The drag ended.".to_owned(),
+        };
+        self.editor.set_notice(notice);
+        self.drag = None;
+    }
 }
 
 impl Driver {
@@ -296,6 +339,139 @@ impl Driver {
             .panel_report()
             .is_some_and(|report| report.non_activating)
     }
+
+    fn collect_editor_requests(&mut self) {
+        for request in self.app.drain_editor_requests() {
+            self.editors
+                .entry(request.card)
+                .or_insert_with(|| Arc::new(Mutex::new(EditorSession::new(request.document))));
+        }
+    }
+
+    fn drain_editor_events(&mut self) {
+        let mut pending = Vec::new();
+        for (&card, editor) in &self.editors {
+            match editor.lock() {
+                Ok(mut session) => pending.extend(
+                    std::mem::take(&mut session.pending)
+                        .into_iter()
+                        .map(|event| (card, event)),
+                ),
+                Err(_) => tracing::error!(%card, "annotation editor state was poisoned"),
+            }
+        }
+
+        let mut closing = Vec::new();
+        for (card, event) in pending {
+            match event {
+                EditorEvent::Changed(data) | EditorEvent::Save(data) => {
+                    self.app.persist_editor(card, data);
+                }
+                EditorEvent::DragRequested(request) => {
+                    self.app.persist_editor(card, request.data);
+                }
+                EditorEvent::CloseRequested => closing.push(card),
+            }
+        }
+        for card in closing {
+            self.editors.remove(&card);
+        }
+    }
+
+    fn show_editors(&self, ctx: &egui::Context) {
+        for (&card, editor) in &self.editors {
+            show_editor_viewport(
+                ctx,
+                card,
+                Arc::clone(editor),
+                Arc::clone(&self.editor_icons),
+            );
+        }
+    }
+}
+
+fn editor_viewport_id(card: CardId) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("annotation-editor", card.0))
+}
+
+fn show_editor_viewport(
+    ctx: &egui::Context,
+    card: CardId,
+    editor: Arc<Mutex<EditorSession>>,
+    icons: Arc<IconStore>,
+) {
+    ctx.show_viewport_deferred(
+        editor_viewport_id(card),
+        egui::ViewportBuilder::default()
+            .with_title("Scrozz — Annotate")
+            .with_inner_size([960.0, 680.0])
+            .with_min_inner_size([900.0, 520.0]),
+        move |ui, _class| {
+            let theme = if ui.visuals().dark_mode {
+                Theme::dark()
+            } else {
+                Theme::light()
+            };
+            let drag = match editor.lock() {
+                Ok(mut session) => {
+                    session.poll_drag();
+                    session.editor.show(ui, &icons, &theme);
+                    let events = session.editor.drain_events();
+                    let drag = events.iter().find_map(|event| match event {
+                        EditorEvent::DragRequested(request) => {
+                            Some((session.editor.document().clone(), request.clone()))
+                        }
+                        _ => None,
+                    });
+                    session.pending.extend(events);
+                    if session.drag.as_ref().is_some_and(DragSession::is_active) {
+                        ui.ctx().request_repaint_after(IDLE);
+                    }
+                    drag
+                }
+                Err(_) => {
+                    ui.label("This editor could not recover its document state.");
+                    None
+                }
+            };
+
+            if let Some((document, request)) = drag {
+                match begin_editor_drag(&document, &request) {
+                    Ok(drag) => {
+                        if let Ok(mut session) = editor.lock() {
+                            session.editor.set_notice("Drop to copy the edited image.");
+                            session.drag = Some(drag);
+                        }
+                        ui.ctx().request_repaint_after(IDLE);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%card, %error, "could not begin annotation drag");
+                        if let Ok(mut session) = editor.lock() {
+                            session.editor.set_notice(format!("Drag failed: {error}"));
+                        }
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn begin_editor_drag(
+    document: &Document,
+    request: &EditorDragRequest,
+) -> scrozz_core::Result<DragSession> {
+    let frame = SkiaRenderer::new().render(document)?;
+    let png = FrameEncoder::new().encode(&frame, ImageFormat::Png)?;
+    let promised = Arc::new(png.clone());
+    let bytes = byte_source(move || Ok(promised.as_ref().clone()));
+    let preview = DragPreview::from_png(png, request.preview.size)?;
+    let payload = DragPayload::png_capture("Scrozz annotation", bytes).with_preview(preview);
+    let origin = DragOrigin::new(
+        current_native_drag_surface()?,
+        request.preview,
+        request.pointer,
+    );
+    native_drag_source()?.begin(payload, origin)
 }
 
 impl eframe::App for Driver {
@@ -343,6 +519,8 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        self.collect_editor_requests();
+        self.drain_editor_events();
 
         if !self.stopped && self.app.tick() == Tick::Stop {
             self.stopped = true;
@@ -373,6 +551,7 @@ impl eframe::App for Driver {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.overlay.ui(ui, frame);
+        self.show_editors(ui.ctx());
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -458,6 +637,7 @@ pub fn headless_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrozz_store::test_support::sample_document;
 
     #[test]
     fn a_headless_run_ends_by_itself() {
@@ -525,5 +705,30 @@ mod tests {
     fn the_probe_gap_names_the_fix_rather_than_apologising() {
         assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
         assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    }
+
+    #[test]
+    fn annotation_editors_register_as_deferred_native_viewports() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        scrozz_ui::theme::install_fonts(&ctx);
+        let icons = Arc::new(IconStore::new(&ctx));
+        let card = CardId(17);
+        let session = Arc::new(Mutex::new(EditorSession::new(sample_document(
+            16, 12, 3, 1,
+        ))));
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_editor_viewport(ui.ctx(), card, Arc::clone(&session), Arc::clone(&icons));
+        });
+
+        let viewport = output
+            .viewport_output
+            .get(&editor_viewport_id(card))
+            .expect("the editor viewport should be registered");
+        assert!(viewport.class == egui::ViewportClass::Deferred);
+        assert_eq!(viewport.builder.min_inner_size, Some([900.0, 520.0].into()));
+        assert_ne!(editor_viewport_id(card), editor_viewport_id(CardId(18)));
+        output.textures_delta.clear();
     }
 }

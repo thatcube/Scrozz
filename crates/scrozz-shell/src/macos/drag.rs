@@ -73,7 +73,7 @@ use scrozz_core::{Error, Result};
 
 use crate::drag::{
     ByteSource, DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragSession,
-    DragSource, card_rect_in_view, check_origin,
+    DragSource, NativeSurface, card_rect_in_view, check_origin,
 };
 use crate::overlay::AppKitRect;
 
@@ -404,6 +404,27 @@ fn retire(finished: &ScrozzDragSourceObject) {
 // ---------------------------------------------------------------------------
 // The public backend
 // ---------------------------------------------------------------------------
+
+/// Finds the `NSView` receiving the current mouse event.
+///
+/// The returned pointer is consumed immediately by [`MacDragSource::begin`],
+/// which retains it for the lifetime of the native drag.
+pub(crate) fn current_native_surface() -> Result<NativeSurface> {
+    let mtm = crate::macos::main_thread("find the current drag surface")?;
+    let event = NSApplication::sharedApplication(mtm)
+        .currentEvent()
+        .ok_or_else(|| Error::TargetGone("the drag gesture has no current AppKit event".into()))?;
+    let window = event
+        .window(mtm)
+        .ok_or_else(|| Error::TargetGone("the drag gesture has no AppKit window".into()))?;
+    let view = window
+        .contentView()
+        .ok_or_else(|| Error::TargetGone("the drag window has no content view".into()))?;
+    let raw = (&*view as *const NSView).cast_mut().cast::<c_void>();
+    // SAFETY: `view` is retained by its live window, and `MacDragSource::begin`
+    // takes its own retain before this local reference can be released.
+    Ok(unsafe { NativeSurface::from_raw(raw) })
+}
 
 /// macOS implementation of [`DragSource`].
 ///

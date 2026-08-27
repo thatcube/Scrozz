@@ -542,7 +542,57 @@ pub fn pill_button_with_state(
     state: ControlState,
     reveal: Reveal,
 ) -> Response {
-    let response = ui.interact(rect, id, sense_for(state));
+    pill_control_with_state(
+        ui,
+        surface,
+        rect,
+        id,
+        icon,
+        label,
+        accent,
+        state,
+        reveal,
+        sense_for(state),
+    )
+}
+
+/// A pill-shaped drag source with the same visual treatment as a button.
+#[allow(clippy::too_many_arguments)]
+pub fn pill_drag_source_with_state(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: Id,
+    icon: Icon,
+    label: &str,
+    accent: bool,
+    state: ControlState,
+    reveal: Reveal,
+) -> Response {
+    let sense = if state.enabled {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    pill_control_with_state(
+        ui, surface, rect, id, icon, label, accent, state, reveal, sense,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pill_control_with_state(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: Id,
+    icon: Icon,
+    label: &str,
+    accent: bool,
+    state: ControlState,
+    reveal: Reveal,
+    sense: Sense,
+) -> Response {
+    let response = ui.interact(rect, id, sense);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, state.enabled, label));
 
     let p = pointer_state(surface, &response, state, reveal);

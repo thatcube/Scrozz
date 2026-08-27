@@ -24,6 +24,13 @@ pub enum Annotation {
         /// Head.
         to: LogicalPoint,
     },
+    /// A straight line with no arrowhead.
+    Line {
+        /// First endpoint.
+        from: LogicalPoint,
+        /// Second endpoint.
+        to: LogicalPoint,
+    },
     /// A rectangle outline.
     Rectangle(LogicalRect),
     /// An ellipse inscribed in a rectangle.
@@ -49,6 +56,8 @@ pub enum Annotation {
     },
     /// A translucent highlight.
     Highlight(LogicalRect),
+    /// A bright region surrounded by a dimmed canvas.
+    Spotlight(LogicalRect),
     /// An obscured region.
     ///
     /// Must be applied destructively on export. Exporting a blur as a
@@ -85,6 +94,8 @@ pub enum RedactStyle {
 pub enum AnnotationKind {
     /// [`Annotation::Arrow`].
     Arrow,
+    /// [`Annotation::Line`].
+    Line,
     /// [`Annotation::Rectangle`].
     Rectangle,
     /// [`Annotation::Ellipse`].
@@ -97,6 +108,8 @@ pub enum AnnotationKind {
     Counter,
     /// [`Annotation::Highlight`].
     Highlight,
+    /// [`Annotation::Spotlight`].
+    Spotlight,
     /// [`Annotation::Redact`].
     Redact,
 }
@@ -107,12 +120,14 @@ impl Annotation {
     pub const fn kind(&self) -> AnnotationKind {
         match self {
             Self::Arrow { .. } => AnnotationKind::Arrow,
+            Self::Line { .. } => AnnotationKind::Line,
             Self::Rectangle(_) => AnnotationKind::Rectangle,
             Self::Ellipse(_) => AnnotationKind::Ellipse,
             Self::Freehand(_) => AnnotationKind::Freehand,
             Self::Text { .. } => AnnotationKind::Text,
             Self::Counter { .. } => AnnotationKind::Counter,
             Self::Highlight(_) => AnnotationKind::Highlight,
+            Self::Spotlight(_) => AnnotationKind::Spotlight,
             Self::Redact { .. } => AnnotationKind::Redact,
         }
     }
@@ -133,10 +148,13 @@ impl Annotation {
     #[must_use]
     pub fn bounds(&self) -> LogicalRect {
         match self {
-            Self::Arrow { from, to } => LogicalRect::from_corners(*from, *to),
+            Self::Arrow { from, to } | Self::Line { from, to } => {
+                LogicalRect::from_corners(*from, *to)
+            }
             Self::Rectangle(r)
             | Self::Ellipse(r)
             | Self::Highlight(r)
+            | Self::Spotlight(r)
             | Self::Redact { area: r, .. } => *r,
             Self::Freehand(points) => geom::bounding_box(points),
             Self::Text { at, .. } | Self::Counter { at, .. } => {
@@ -152,13 +170,14 @@ impl Annotation {
             p.y += dy;
         };
         match self {
-            Self::Arrow { from, to } => {
+            Self::Arrow { from, to } | Self::Line { from, to } => {
                 shift(from);
                 shift(to);
             }
             Self::Rectangle(r)
             | Self::Ellipse(r)
             | Self::Highlight(r)
+            | Self::Spotlight(r)
             | Self::Redact { area: r, .. } => {
                 shift(&mut r.origin);
             }
@@ -176,13 +195,14 @@ impl Annotation {
     pub fn set_bounds(&mut self, to: LogicalRect) {
         let from = self.bounds();
         match self {
-            Self::Arrow { from: a, to: b } => {
+            Self::Arrow { from: a, to: b } | Self::Line { from: a, to: b } => {
                 *a = geom::remap(*a, &from, &to);
                 *b = geom::remap(*b, &from, &to);
             }
             Self::Rectangle(r)
             | Self::Ellipse(r)
             | Self::Highlight(r)
+            | Self::Spotlight(r)
             | Self::Redact { area: r, .. } => {
                 *r = to;
             }
@@ -255,7 +275,11 @@ impl AnnotationObject {
         match &self.annotation {
             Annotation::Text { at, content } => LogicalRect::new(
                 *at,
-                font::measure(content, self.style.effective_font_size()),
+                font::measure_with_preset(
+                    content,
+                    self.style.effective_font_size(),
+                    self.style.text_preset,
+                ),
             ),
             Annotation::Counter { at, .. } => {
                 let r = self.counter_radius();
@@ -269,14 +293,29 @@ impl AnnotationObject {
     #[must_use]
     pub fn visual_bounds(&self) -> LogicalRect {
         let half_stroke = self.style.effective_stroke_width() / 2.0;
-        match &self.annotation {
-            Annotation::Text { .. } | Annotation::Counter { .. } => self.bounds(),
+        let bounds = match &self.annotation {
+            Annotation::Text { .. } => {
+                let bounds = self.bounds();
+                if self.style.text_preset.is_boxed() {
+                    geom::inflate(&bounds, self.style.effective_font_size() * 0.28)
+                } else {
+                    bounds
+                }
+            }
+            Annotation::Counter { .. } => self.bounds(),
             Annotation::Arrow { .. } => {
                 // The head is wider than the shaft, so grow by its half-width.
                 geom::inflate(&self.annotation.bounds(), self.arrow_head_half_width())
             }
-            Annotation::Highlight(_) | Annotation::Redact { .. } => self.annotation.bounds(),
+            Annotation::Highlight(_) | Annotation::Spotlight(_) | Annotation::Redact { .. } => {
+                self.annotation.bounds()
+            }
             _ => geom::inflate(&self.annotation.bounds(), half_stroke),
+        };
+        if self.style.shadow {
+            geom::inflate(&bounds, 6.0)
+        } else {
+            bounds
         }
     }
 
@@ -313,7 +352,19 @@ impl AnnotationObject {
         }
         let slack = self.style.effective_stroke_width() / 2.0 + Self::HIT_TOLERANCE;
         match &self.annotation {
-            Annotation::Arrow { from, to } => geom::distance_to_segment(point, *from, *to) <= slack,
+            Annotation::Arrow { from, to } => {
+                if self.style.arrow_style == crate::style::ArrowStyle::Curved {
+                    geom::distance_to_quadratic(
+                        point,
+                        *from,
+                        geom::curved_arrow_control(*from, *to),
+                        *to,
+                    ) <= slack
+                } else {
+                    geom::distance_to_segment(point, *from, *to) <= slack
+                }
+            }
+            Annotation::Line { from, to } => geom::distance_to_segment(point, *from, *to) <= slack,
             Annotation::Rectangle(r) => {
                 if self.style.fill.is_some_and(|f| !f.is_invisible()) {
                     geom::contains(&geom::inflate(r, slack), point)
@@ -337,7 +388,9 @@ impl AnnotationObject {
                         .first()
                         .is_some_and(|p| geom::distance(point, *p) <= slack)
             }
-            Annotation::Highlight(r) | Annotation::Redact { area: r, .. } => {
+            Annotation::Highlight(r)
+            | Annotation::Spotlight(r)
+            | Annotation::Redact { area: r, .. } => {
                 geom::contains(&geom::inflate(r, Self::HIT_TOLERANCE), point)
             }
             Annotation::Text { .. } => {

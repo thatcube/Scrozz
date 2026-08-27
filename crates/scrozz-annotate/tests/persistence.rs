@@ -7,7 +7,8 @@ mod common;
 
 use common::{document, every_annotation, rect, region_capture, window_capture};
 use scrozz_annotate::{
-    Annotation, Background, Beautification, Color, Document, DocumentData, RedactStyle, Style,
+    Annotation, ArrowStyle, Background, Beautification, Canvas, CanvasRotation, Color, Document,
+    DocumentData, RedactStyle, Style, TextPreset,
 };
 use scrozz_core::LogicalPoint;
 
@@ -160,6 +161,51 @@ fn an_empty_document_round_trips() {
     assert!(back.annotations.is_empty());
     assert!(back.beautification.is_none());
     assert_eq!(back.version, DocumentData::VERSION);
+}
+
+#[test]
+fn a_v1_document_migrates_with_canvas_and_style_defaults() {
+    let mut doc = document(100, 80);
+    doc.add_default(Annotation::Rectangle(rect(5.0, 6.0, 30.0, 20.0)));
+    let mut value = serde_json::to_value(doc.data()).unwrap();
+    value["version"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("canvas");
+    let style = value["annotations"][0]["style"].as_object_mut().unwrap();
+    style.remove("arrow_style");
+    style.remove("redact_strength");
+    style.remove("shadow");
+    style.remove("text_preset");
+
+    let legacy: DocumentData = serde_json::from_value(value).unwrap();
+    let restored = Document::from_data(region_capture(100, 80), legacy).unwrap();
+    let migrated = restored.data();
+    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.canvas, Canvas::default());
+    assert_eq!(
+        migrated.annotations[0].style.arrow_style,
+        ArrowStyle::Straight
+    );
+    assert_eq!(
+        migrated.annotations[0].style.text_preset,
+        TextPreset::Standard
+    );
+}
+
+#[test]
+fn canvas_v2_round_trips_every_transform() {
+    let mut doc = document(100, 80);
+    doc.set_canvas(Canvas {
+        crop: Some(rect(7.5, 8.25, 70.0, 50.0)),
+        rotation: CanvasRotation::CounterClockwise90,
+        flip_horizontal: true,
+        flip_vertical: true,
+        auto_expand: true,
+    })
+    .unwrap();
+
+    let json = serde_json::to_string(&doc.data()).unwrap();
+    let data: DocumentData = serde_json::from_str(&json).unwrap();
+    assert_eq!(data.canvas, *doc.canvas());
 }
 
 #[test]

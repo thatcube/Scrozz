@@ -11,10 +11,8 @@
 # every baseline, every freshly rendered image and every diff into one directory
 # that CI uploads as an artifact, and prints where they went.
 #
-# It also has to survive the harness not existing yet. `scrozz-ui::harness` is
-# a `todo!()` at the time of writing, so the honest behaviour is to skip loudly
-# rather than to fail — a job that is red for "not built yet" trains people to
-# ignore red.
+# The harness is part of the product contract now. If its corpus disappears,
+# this script fails rather than reporting a green run that compared no pixels.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -39,60 +37,29 @@ note() {
 }
 
 # --- Is there anything to run? ---------------------------------------------
-#
-# Two independent signals, because either one alone gives a false answer:
-#   * a test file with no `egui_kittest` in the lock cannot compile;
-#   * `egui_kittest` in the lock with no test file renders nothing.
-have_dep=0
-have_tests=0
-
-if [[ -f Cargo.lock ]] && grep -q '^name = "egui_kittest"$' Cargo.lock; then
-  have_dep=1
-fi
-
-for f in "$CRATE_DIR"/tests/*.rs; do
-  if [[ -f "$f" ]]; then
-    have_tests=1
-    break
-  fi
-done
-
-if [[ "$have_dep" == "0" || "$have_tests" == "0" ]]; then
-  note "### Golden images: skipped"
+GOLDEN_TEST="$CRATE_DIR/tests/golden.rs"
+if [[ ! -f "$GOLDEN_TEST" ]] ||
+  ! grep -q 'fn golden_corpus_matches_baselines' "$GOLDEN_TEST"; then
+  note "### Golden images: FAILED"
   note ""
-  note "The headless screenshot harness (decision D25) is not wired up yet, so"
-  note "there is nothing to diff. This is expected during Phase 0 and is **not**"
-  note "a failure."
-  note ""
-  note "| Precondition | Found |"
-  note "|---|---|"
-  note "| \`egui_kittest\` in \`Cargo.lock\` | $([[ $have_dep == 1 ]] && echo yes || echo '**no**') |"
-  note "| a test file in \`$CRATE_DIR/tests/\` | $([[ $have_tests == 1 ]] && echo yes || echo '**no**') |"
-  note ""
-  note "This job starts enforcing itself the moment both are true — add"
-  note "\`egui_kittest\` as a dev-dependency of \`$CRATE\` and put the tests in"
-  note "\`$CRATE_DIR/tests/\`. Baselines belong in \`$CRATE_DIR/tests/snapshots/\`."
+  note "The required corpus test \`golden_corpus_matches_baselines\` is missing"
+  note "from \`$GOLDEN_TEST\`. Restore it before accepting UI changes."
   if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-    echo "::notice title=Golden images skipped::The D25 screenshot harness is not implemented yet; no baselines to diff."
+    echo "::error title=Golden corpus missing::The D25 screenshot harness has no corpus test to run."
   fi
-  exit 0
+  exit 1
 fi
 
 # --- Run --------------------------------------------------------------------
-#
-# The harness can use this to pick a per-platform baseline directory. Font
-# rasterisation, hinting and DPI rounding genuinely differ between macOS,
-# Windows and Linux, so one committed baseline cannot be correct on all three
-# — and pretending otherwise produces the permanently-red suite D25 warns about.
-export SCROZZ_GOLDEN_PLATFORM="${RUNNER_OS:-$(uname -s)}"
+GOLDEN_PLATFORM="${RUNNER_OS:-$(uname -s)}"
 
 if [[ "$UPDATE" == "1" ]]; then
-  # The env var egui_kittest itself reads.
+  # The repository's GoldenStore reads this.
   export UPDATE_SNAPSHOTS=1
-  echo "golden: re-recording baselines for $SCROZZ_GOLDEN_PLATFORM"
+  echo "golden: re-recording baselines on $GOLDEN_PLATFORM"
 fi
 
-echo "golden: running $CRATE tests (platform=$SCROZZ_GOLDEN_PLATFORM)"
+echo "golden: running $CRATE tests (platform=$GOLDEN_PLATFORM)"
 cargo test --package "$CRATE" --tests -- --nocapture
 status=$?
 
@@ -103,7 +70,7 @@ if [[ "$UPDATE" == "1" ]]; then
 fi
 
 if [[ "$status" == "0" ]]; then
-  echo "golden: all baselines match on $SCROZZ_GOLDEN_PLATFORM"
+  echo "golden: all baselines match on $GOLDEN_PLATFORM"
   exit 0
 fi
 
@@ -121,22 +88,23 @@ while IFS= read -r -d '' img; do
 done < <(
   find ./crates ./target -type f \
     \( -name '*.png' -o -name '*.webp' \) \
-    \( -path '*snapshots*' -o -name '*.new.*' -o -name '*.diff.*' -o -name '*.old.*' \) \
+    \( -path '*snapshots*' -o -name '*.actual.*' -o -name '*.compare.*' -o -name '*.diff.*' \) \
     -print0 2>/dev/null
 )
 
-note "### Golden images: FAILED on ${SCROZZ_GOLDEN_PLATFORM}"
+note "### Golden images: FAILED on ${GOLDEN_PLATFORM}"
 note ""
 if [[ "$found" == "0" ]]; then
   note "The tests failed but produced no images, so this is probably a *compile*"
   note "or panic failure rather than a pixel diff. Read the job log above."
 else
-  note "Collected **$found** image(s). Download the \`golden-${SCROZZ_GOLDEN_PLATFORM}\`"
+  note "Collected **$found** image(s). Download the \`golden-${GOLDEN_PLATFORM}\`"
   note "artifact from this run's summary page and compare them:"
   note ""
   note "- \`<name>.png\` — the committed baseline (what we expected)"
-  note "- \`<name>.new.png\` — what this run actually rendered"
+  note "- \`<name>.actual.png\` — what this run actually rendered"
   note "- \`<name>.diff.png\` — the per-pixel difference"
+  note "- \`<name>.compare.png\` — expected, actual and diff side by side"
   note ""
   note "If the new rendering is **correct**, re-record and commit the baseline:"
   note ""

@@ -91,11 +91,148 @@ impl Color {
             Self::WHITE
         }
     }
+
+    /// The readable editor-palette name nearest this colour.
+    ///
+    /// Documents can contain arbitrary RGBA values, so the nearest named swatch
+    /// is more useful to assistive technology than a generic "custom colour".
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        if self.a == 0 {
+            return "Transparent";
+        }
+
+        const NAMED: &[(Color, &str)] = &[
+            (Color::WHITE, "White"),
+            (Color::rgb(200, 205, 214), "Silver"),
+            (Color::rgb(116, 124, 138), "Slate"),
+            (Color::rgb(25, 27, 33), "Black"),
+            (Color::rgb(255, 74, 85), "Red"),
+            (Color::rgb(255, 145, 52), "Orange"),
+            (Color::rgb(255, 211, 69), "Yellow"),
+            (Color::rgb(61, 207, 142), "Green"),
+            (Color::rgb(61, 139, 255), "Blue"),
+            (Color::rgb(121, 103, 255), "Indigo"),
+            (Color::rgb(185, 91, 255), "Purple"),
+            (Color::rgb(255, 88, 177), "Pink"),
+        ];
+
+        NAMED
+            .iter()
+            .min_by_key(|(candidate, _)| color_distance(self, *candidate))
+            .map_or("Custom", |(_, name)| *name)
+    }
+}
+
+fn color_distance(left: Color, right: Color) -> u32 {
+    let dr = i32::from(left.r) - i32::from(right.r);
+    let dg = i32::from(left.g) - i32::from(right.g);
+    let db = i32::from(left.b) - i32::from(right.b);
+    u32::try_from(dr * dr + dg * dg + db * db).unwrap_or(u32::MAX)
 }
 
 impl Default for Color {
     fn default() -> Self {
         Self::ACCENT
+    }
+}
+
+/// The geometry and endings used by an arrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrowStyle {
+    /// A straight shaft with one filled arrowhead.
+    #[default]
+    Straight,
+    /// A gently bowed shaft with one filled arrowhead.
+    Curved,
+    /// A straight shaft with filled arrowheads at both ends.
+    DoubleEnded,
+    /// A dashed shaft with one filled arrowhead.
+    Dashed,
+}
+
+impl ArrowStyle {
+    /// Every style, in the editor's stable menu order.
+    pub const ALL: [Self; 4] = [
+        Self::Straight,
+        Self::Curved,
+        Self::DoubleEnded,
+        Self::Dashed,
+    ];
+
+    /// The label shown in the editor.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Straight => "Straight",
+            Self::Curved => "Curved",
+            Self::DoubleEnded => "Double ended",
+            Self::Dashed => "Dashed",
+        }
+    }
+}
+
+/// One of the seven text treatments exposed by the annotation editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPreset {
+    /// Inter with no surrounding treatment.
+    #[default]
+    Standard,
+    /// A softer, heavier Inter treatment.
+    Rounded,
+    /// Fixed advances for code, dimensions, and data.
+    Monospaced,
+    /// Filled glyphs with a contrasting outline.
+    Outlined,
+    /// A compact square-cornered label.
+    Boxed,
+    /// A compact rounded label.
+    RoundedBoxed,
+    /// A boxed label using fixed advances.
+    MonospacedBoxed,
+}
+
+impl TextPreset {
+    /// Every preset, in the editor's stable menu order.
+    pub const ALL: [Self; 7] = [
+        Self::Standard,
+        Self::Rounded,
+        Self::Monospaced,
+        Self::Outlined,
+        Self::Boxed,
+        Self::RoundedBoxed,
+        Self::MonospacedBoxed,
+    ];
+
+    /// The label shown in the editor.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Rounded => "Rounded",
+            Self::Monospaced => "Monospaced",
+            Self::Outlined => "Outlined",
+            Self::Boxed => "Boxed",
+            Self::RoundedBoxed => "Rounded Boxed",
+            Self::MonospacedBoxed => "Monospaced Boxed",
+        }
+    }
+
+    /// Whether this preset uses one fixed horizontal advance per character.
+    #[must_use]
+    pub const fn is_monospaced(self) -> bool {
+        matches!(self, Self::Monospaced | Self::MonospacedBoxed)
+    }
+
+    /// Whether this preset paints text over a label background.
+    #[must_use]
+    pub const fn is_boxed(self) -> bool {
+        matches!(
+            self,
+            Self::Boxed | Self::RoundedBoxed | Self::MonospacedBoxed
+        )
     }
 }
 
@@ -117,6 +254,18 @@ pub struct Style {
     pub opacity: f32,
     /// Cap height for text and counter labels, in logical points.
     pub font_size: f64,
+    /// Geometry and endings for arrow annotations.
+    #[serde(default)]
+    pub arrow_style: ArrowStyle,
+    /// Strength of destructive blur or pixelation in `0.0..=1.0`.
+    #[serde(default = "default_redact_strength")]
+    pub redact_strength: f32,
+    /// Whether ordinary annotation objects cast a small drop shadow.
+    #[serde(default)]
+    pub shadow: bool,
+    /// The text treatment used by text annotations.
+    #[serde(default)]
+    pub text_preset: TextPreset,
 }
 
 impl Style {
@@ -135,6 +284,18 @@ impl Style {
         Self {
             stroke: Color::HIGHLIGHT,
             fill: Some(Color::HIGHLIGHT),
+            ..Self::default()
+        }
+    }
+
+    /// The default dimming layer used by a spotlight.
+    #[must_use]
+    pub fn spotlight() -> Self {
+        Self {
+            stroke: Color::BLACK,
+            fill: Some(Color::BLACK),
+            stroke_width: 0.0,
+            opacity: 0.62,
             ..Self::default()
         }
     }
@@ -214,6 +375,16 @@ impl Style {
             16.0
         }
     }
+
+    /// Redaction strength clamped to `0.0..=1.0`.
+    #[must_use]
+    pub fn effective_redact_strength(&self) -> f32 {
+        if self.redact_strength.is_finite() {
+            self.redact_strength.clamp(0.0, 1.0)
+        } else {
+            default_redact_strength()
+        }
+    }
 }
 
 impl Default for Style {
@@ -224,6 +395,44 @@ impl Default for Style {
             fill: None,
             opacity: 1.0,
             font_size: 18.0,
+            arrow_style: ArrowStyle::default(),
+            redact_strength: default_redact_strength(),
+            shadow: false,
+            text_preset: TextPreset::default(),
         }
+    }
+}
+
+const fn default_redact_strength() -> f32 {
+    0.65
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_style_json_receives_new_defaults() {
+        let style: Style = serde_json::from_str(
+            r#"{
+                "stroke":{"r":229,"g":36,"b":44,"a":255},
+                "stroke_width":4.0,
+                "fill":null,
+                "opacity":1.0,
+                "font_size":18.0
+            }"#,
+        )
+        .expect("legacy styles load");
+
+        assert_eq!(style.arrow_style, ArrowStyle::Straight);
+        assert_eq!(style.redact_strength, 0.65);
+        assert!(!style.shadow);
+        assert_eq!(style.text_preset, TextPreset::Standard);
+    }
+
+    #[test]
+    fn arbitrary_colors_get_a_stable_readable_name() {
+        assert_eq!(Color::rgba(248, 80, 90, 255).name(), "Red");
+        assert_eq!(Color::rgba(200, 100, 10, 0).name(), "Transparent");
     }
 }

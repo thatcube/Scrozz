@@ -259,6 +259,8 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// The non-destructive crop workspace over the same capture.
+    EditorCropping,
 }
 
 impl Scenario {
@@ -275,6 +277,7 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::EditorCropping,
         ]
     }
 
@@ -294,6 +297,7 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::EditorCropping => "editor-cropping",
         }
     }
 
@@ -744,6 +748,16 @@ impl Fixture {
                     true,
                     "Mark it up",
                     "The annotation toolbar open over a capture. Annotations stay editable forever with no user-facing project file (D14).",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorCropping => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Frame it without flattening",
+                    "Crop, rotate, flip, and auto-expand remain reversible because the source capture is never rewritten.",
                     instants::REST,
                     None,
                 ),
@@ -1870,14 +1884,20 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
         //   me.register(Scenario::DockCollapsed, Box::new(crate::dock::DockScene));
         //
-        // Until then every scenario renders a watermarked stand-in, and
-        // `Profile::Store` refuses to render those at all.
+        me.register(
+            Scenario::EditorAnnotating,
+            Box::new(crate::editor::EditorScene::composing()),
+        );
+        me.register(
+            Scenario::EditorCropping,
+            Box::new(crate::editor::EditorScene::cropping()),
+        );
         me
     }
 
@@ -3657,6 +3677,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::EditorCropping,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

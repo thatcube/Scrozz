@@ -1,530 +1,230 @@
-//! A built-in single-stroke vector font.
+//! Deterministic text shaping over an embedded Inter face.
 //!
-//! # Why this exists
-//!
-//! `tiny-skia` is a path rasteriser: it has no notion of glyphs, and this crate
-//! deliberately takes no font dependency. Text and numbered counters still have
-//! to render, so glyphs are defined here as polylines on a unit em box and
-//! stroked like any other annotation.
-//!
-//! That buys three things that matter more than typographic beauty at this
-//! stage: it is **resolution-independent** (the same document renders correctly
-//! at 1×, 2× or any export size), it is **deterministic** (no system font
-//! fallback, so golden-image tests are stable across machines), and it works in
-//! headless CI with no font configuration at all.
-//!
-//! It is explicitly a placeholder for a real shaping stack. Lowercase renders as
-//! small capitals, there is no kerning, and non-Latin scripts fall back to a
-//! "tofu" box. Replacing this module with a real font rasteriser changes nothing
-//! outside it: callers only ever ask for [`outline`] and [`measure`].
+//! Text never consults the operating system. The same Inter bytes are parsed by
+//! `ttf-parser`, shaped from cmap/advance data, and converted to filled
+//! `tiny-skia` outlines on every platform. That keeps annotation exports and
+//! golden images byte-stable while rendering real lowercase and Unicode glyphs.
 
 use scrozz_core::{LogicalPoint, LogicalSize};
+use tiny_skia::{Path, PathBuilder, Rect};
+use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
-/// Horizontal advance per character, as a fraction of the type size.
-pub const ADVANCE: f64 = 0.62;
+use crate::style::TextPreset;
 
-/// Baseline-to-baseline distance, as a fraction of the type size.
-pub const LINE_HEIGHT: f64 = 1.42;
+const INTER: &[u8] = include_bytes!("../../scrozz-ui/assets/fonts/Inter-Regular.ttf");
+const DEFAULT_LINE_HEIGHT: f64 = 1.22;
+const MONO_ADVANCE: f64 = 0.64;
 
-/// How much smaller a small-capital is than a full capital.
-const SMALL_CAPS: f32 = 0.76;
+#[derive(Debug, Clone, Copy)]
+struct Metrics {
+    scale: f64,
+    ascender: f64,
+    line_height: f64,
+    mono_advance: f64,
+}
 
-/// A glyph: a set of polylines on a unit box, x in 0–0.55, y in 0–1 downwards,
-/// where y = 0 is the cap line and y = 1 is the baseline.
-type Glyph = &'static [&'static [(f32, f32)]];
+impl Metrics {
+    fn new(face: &Face<'_>, font_size: f64) -> Self {
+        let units = f64::from(face.units_per_em()).max(1.0);
+        let scale = font_size.max(1.0) / units;
+        let natural_height = f64::from(face.height() + face.line_gap()) * scale;
+        Self {
+            scale,
+            ascender: f64::from(face.ascender()) * scale,
+            line_height: natural_height.max(font_size * DEFAULT_LINE_HEIGHT),
+            mono_advance: font_size * MONO_ADVANCE,
+        }
+    }
+}
 
-/// The size of a block of text, in logical points.
-///
-/// The box starts at the anchor's top-left and covers every line.
+fn face() -> Option<Face<'static>> {
+    Face::parse(INTER, 0).ok()
+}
+
+fn glyph(face: &Face<'_>, ch: char) -> GlyphId {
+    face.glyph_index(ch)
+        .or_else(|| face.glyph_index('\u{fffd}'))
+        .unwrap_or(GlyphId(0))
+}
+
+fn advance(face: &Face<'_>, glyph: GlyphId, metrics: Metrics, preset: TextPreset) -> f64 {
+    if preset.is_monospaced() {
+        metrics.mono_advance
+    } else {
+        f64::from(face.glyph_hor_advance(glyph).unwrap_or(face.units_per_em())) * metrics.scale
+    }
+}
+
+fn line_width(face: &Face<'_>, line: &str, metrics: Metrics, preset: TextPreset) -> f64 {
+    line.chars()
+        .map(|ch| {
+            if ch == '\t' {
+                metrics.mono_advance * 4.0
+            } else {
+                advance(face, glyph(face, ch), metrics, preset)
+            }
+        })
+        .sum()
+}
+
+/// The measured text box using the standard Inter preset.
 #[must_use]
 pub fn measure(text: &str, font_size: f64) -> LogicalSize {
-    let mut widest = 0usize;
-    let mut lines = 0usize;
+    measure_with_preset(text, font_size, TextPreset::Standard)
+}
+
+/// The measured text box for a specific text preset.
+#[must_use]
+pub fn measure_with_preset(text: &str, font_size: f64, preset: TextPreset) -> LogicalSize {
+    let Some(face) = face() else {
+        return fallback_measure(text, font_size, preset);
+    };
+    let metrics = Metrics::new(&face, font_size);
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let widest = lines
+        .iter()
+        .map(|line| line_width(&face, line, metrics, preset))
+        .fold(0.0_f64, f64::max);
+    let height = if lines.is_empty() {
+        font_size.max(1.0)
+    } else {
+        metrics.line_height * lines.len() as f64
+    };
+    LogicalSize::new(widest, height)
+}
+
+fn fallback_measure(text: &str, font_size: f64, preset: TextPreset) -> LogicalSize {
+    let advance = if preset.is_monospaced() {
+        MONO_ADVANCE
+    } else {
+        0.62
+    };
+    let mut widest = 0_usize;
+    let mut lines = 0_usize;
     for line in text.split('\n') {
         widest = widest.max(line.chars().count());
         lines += 1;
     }
-    if lines == 0 {
-        lines = 1;
-    }
     LogicalSize::new(
-        widest as f64 * ADVANCE * font_size,
-        (lines - 1) as f64 * LINE_HEIGHT * font_size + font_size,
+        widest as f64 * advance * font_size,
+        lines.max(1) as f64 * DEFAULT_LINE_HEIGHT * font_size,
     )
 }
 
-/// The polylines that draw `text`, in logical points relative to `at`.
-///
-/// `at` is the top-left of the first line's cap box. Every returned polyline is
-/// meant to be stroked, not filled.
+/// Filled Inter glyph outlines in logical document coordinates.
 #[must_use]
-pub fn outline(text: &str, at: LogicalPoint, font_size: f64) -> Vec<Vec<LogicalPoint>> {
-    let mut out = Vec::new();
+pub fn outline(text: &str, at: LogicalPoint, font_size: f64, preset: TextPreset) -> Option<Path> {
+    let face = face()?;
+    let metrics = Metrics::new(&face, font_size);
+    let mut path = PathBuilder::new();
+    let mut any = false;
+
     for (row, line) in text.split('\n').enumerate() {
-        let baseline_top = at.y + row as f64 * LINE_HEIGHT * font_size;
-        for (col, ch) in line.chars().enumerate() {
-            let origin_x = at.x + col as f64 * ADVANCE * font_size;
-            let (glyph, scale) = glyph_for(ch);
-            // Small capitals sit on the baseline, so shift them down by the
-            // height they give up. Doing it here keeps the glyph table itself
-            // free of case-specific offsets.
-            let drop = f64::from(1.0 - scale) * font_size;
-            for stroke in glyph {
-                if stroke.len() < 2 {
-                    continue;
-                }
-                let mut poly = Vec::with_capacity(stroke.len());
-                for (gx, gy) in *stroke {
-                    poly.push(LogicalPoint::new(
-                        f64::from(*gx) * f64::from(scale) * font_size + origin_x,
-                        f64::from(*gy) * f64::from(scale) * font_size + baseline_top + drop,
-                    ));
-                }
-                out.push(poly);
+        let baseline = at.y + metrics.ascender + row as f64 * metrics.line_height;
+        let mut cursor = at.x;
+        for ch in line.chars() {
+            if ch == '\t' {
+                cursor += metrics.mono_advance * 4.0;
+                continue;
             }
+            let glyph = glyph(&face, ch);
+            let mut sink = GlyphPath {
+                path: &mut path,
+                origin_x: cursor as f32,
+                baseline: baseline as f32,
+                scale: metrics.scale as f32,
+            };
+            if face.outline_glyph(glyph, &mut sink).is_some() {
+                any = true;
+            } else if !ch.is_whitespace() {
+                let width = advance(&face, glyph, metrics, preset) as f32;
+                let top = (baseline - metrics.ascender) as f32;
+                if let Some(rect) = Rect::from_xywh(
+                    cursor as f32,
+                    top,
+                    width.max(1.0),
+                    font_size.max(1.0) as f32,
+                ) {
+                    path.push_rect(rect);
+                    any = true;
+                }
+            }
+            cursor += advance(&face, glyph, metrics, preset);
         }
     }
-    out
+
+    any.then(|| path.finish()).flatten()
 }
 
-/// The glyph for `ch`, plus the scale it should be drawn at.
-fn glyph_for(ch: char) -> (Glyph, f32) {
-    if ch == ' ' || ch == '\t' {
-        return (&[], 1.0);
-    }
-    if ch.is_ascii_lowercase() {
-        let upper = ch.to_ascii_uppercase();
-        return (glyph_table(upper).unwrap_or(TOFU), SMALL_CAPS);
-    }
-    (glyph_table(ch).unwrap_or(TOFU), 1.0)
+struct GlyphPath<'a> {
+    path: &'a mut PathBuilder,
+    origin_x: f32,
+    baseline: f32,
+    scale: f32,
 }
 
-/// An unsupported character, drawn as a hollow box rather than dropped.
-///
-/// Silently omitting a character it cannot draw would let a redaction-adjacent
-/// mistake through: the user would believe they had labelled something.
-const TOFU: Glyph = &[&[
-    (0.08, 0.08),
-    (0.47, 0.08),
-    (0.47, 0.95),
-    (0.08, 0.95),
-    (0.08, 0.08),
-]];
+impl GlyphPath<'_> {
+    fn point(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            x.mul_add(self.scale, self.origin_x),
+            (-y).mul_add(self.scale, self.baseline),
+        )
+    }
+}
 
-#[allow(clippy::too_many_lines)]
-fn glyph_table(ch: char) -> Option<Glyph> {
-    Some(match ch {
-        '0' => &[&[
-            (0.275, 0.03),
-            (0.50, 0.22),
-            (0.53, 0.50),
-            (0.50, 0.78),
-            (0.275, 0.97),
-            (0.05, 0.78),
-            (0.02, 0.50),
-            (0.05, 0.22),
-            (0.275, 0.03),
-        ]],
-        '1' => &[
-            &[(0.10, 0.22), (0.28, 0.03), (0.28, 0.97)],
-            &[(0.08, 0.97), (0.48, 0.97)],
-        ],
-        '2' => &[&[
-            (0.04, 0.24),
-            (0.16, 0.05),
-            (0.40, 0.05),
-            (0.52, 0.24),
-            (0.47, 0.46),
-            (0.04, 0.97),
-            (0.53, 0.97),
-        ]],
-        '3' => &[
-            &[
-                (0.05, 0.10),
-                (0.22, 0.03),
-                (0.44, 0.06),
-                (0.52, 0.24),
-                (0.40, 0.45),
-                (0.22, 0.48),
-            ],
-            &[
-                (0.30, 0.47),
-                (0.48, 0.56),
-                (0.53, 0.76),
-                (0.42, 0.94),
-                (0.20, 0.97),
-                (0.03, 0.88),
-            ],
-        ],
-        '4' => &[
-            &[(0.42, 0.03), (0.03, 0.72), (0.53, 0.72)],
-            &[(0.42, 0.03), (0.42, 0.97)],
-        ],
-        '5' => &[&[
-            (0.48, 0.05),
-            (0.12, 0.05),
-            (0.08, 0.44),
-            (0.28, 0.38),
-            (0.50, 0.50),
-            (0.53, 0.74),
-            (0.36, 0.96),
-            (0.07, 0.90),
-        ]],
-        '6' => &[&[
-            (0.48, 0.08),
-            (0.26, 0.03),
-            (0.08, 0.30),
-            (0.04, 0.72),
-            (0.18, 0.95),
-            (0.40, 0.96),
-            (0.52, 0.75),
-            (0.42, 0.54),
-            (0.18, 0.52),
-            (0.05, 0.68),
-        ]],
-        '7' => &[&[(0.03, 0.05), (0.53, 0.05), (0.22, 0.97)]],
-        '8' => &[&[
-            (0.275, 0.03),
-            (0.48, 0.14),
-            (0.44, 0.40),
-            (0.275, 0.49),
-            (0.10, 0.58),
-            (0.06, 0.85),
-            (0.275, 0.97),
-            (0.48, 0.85),
-            (0.44, 0.58),
-            (0.275, 0.49),
-            (0.11, 0.40),
-            (0.07, 0.14),
-            (0.275, 0.03),
-        ]],
-        '9' => &[&[
-            (0.07, 0.92),
-            (0.29, 0.97),
-            (0.47, 0.70),
-            (0.51, 0.28),
-            (0.37, 0.05),
-            (0.15, 0.04),
-            (0.03, 0.25),
-            (0.13, 0.46),
-            (0.37, 0.48),
-            (0.50, 0.32),
-        ]],
-        'A' => &[
-            &[(0.02, 0.97), (0.275, 0.03), (0.53, 0.97)],
-            &[(0.10, 0.70), (0.45, 0.70)],
-        ],
-        'B' => &[
-            &[
-                (0.06, 0.97),
-                (0.06, 0.03),
-                (0.36, 0.03),
-                (0.50, 0.14),
-                (0.50, 0.36),
-                (0.36, 0.48),
-                (0.06, 0.48),
-            ],
-            &[
-                (0.36, 0.48),
-                (0.53, 0.60),
-                (0.53, 0.86),
-                (0.38, 0.97),
-                (0.06, 0.97),
-            ],
-        ],
-        'C' => &[&[
-            (0.52, 0.18),
-            (0.40, 0.04),
-            (0.20, 0.03),
-            (0.04, 0.25),
-            (0.04, 0.75),
-            (0.20, 0.97),
-            (0.40, 0.96),
-            (0.52, 0.82),
-        ]],
-        'D' => &[&[
-            (0.06, 0.97),
-            (0.06, 0.03),
-            (0.32, 0.03),
-            (0.51, 0.22),
-            (0.51, 0.78),
-            (0.32, 0.97),
-            (0.06, 0.97),
-        ]],
-        'E' => &[
-            &[(0.50, 0.03), (0.06, 0.03), (0.06, 0.97), (0.50, 0.97)],
-            &[(0.06, 0.49), (0.42, 0.49)],
-        ],
-        'F' => &[
-            &[(0.50, 0.03), (0.06, 0.03), (0.06, 0.97)],
-            &[(0.06, 0.47), (0.42, 0.47)],
-        ],
-        'G' => &[&[
-            (0.52, 0.18),
-            (0.40, 0.04),
-            (0.20, 0.03),
-            (0.04, 0.25),
-            (0.04, 0.75),
-            (0.20, 0.97),
-            (0.40, 0.96),
-            (0.52, 0.80),
-            (0.52, 0.55),
-            (0.32, 0.55),
-        ]],
-        'H' => &[
-            &[(0.06, 0.03), (0.06, 0.97)],
-            &[(0.50, 0.03), (0.50, 0.97)],
-            &[(0.06, 0.50), (0.50, 0.50)],
-        ],
-        'I' => &[
-            &[(0.28, 0.03), (0.28, 0.97)],
-            &[(0.10, 0.03), (0.46, 0.03)],
-            &[(0.10, 0.97), (0.46, 0.97)],
-        ],
-        'J' => &[&[
-            (0.44, 0.03),
-            (0.44, 0.76),
-            (0.32, 0.96),
-            (0.15, 0.96),
-            (0.04, 0.78),
-        ]],
-        'K' => &[
-            &[(0.06, 0.03), (0.06, 0.97)],
-            &[(0.50, 0.03), (0.06, 0.55)],
-            &[(0.20, 0.40), (0.53, 0.97)],
-        ],
-        'L' => &[&[(0.08, 0.03), (0.08, 0.97), (0.50, 0.97)]],
-        'M' => &[&[
-            (0.02, 0.97),
-            (0.02, 0.03),
-            (0.275, 0.55),
-            (0.53, 0.03),
-            (0.53, 0.97),
-        ]],
-        'N' => &[&[(0.06, 0.97), (0.06, 0.03), (0.50, 0.97), (0.50, 0.03)]],
-        'O' => &[&[
-            (0.275, 0.03),
-            (0.48, 0.20),
-            (0.53, 0.50),
-            (0.48, 0.80),
-            (0.275, 0.97),
-            (0.07, 0.80),
-            (0.02, 0.50),
-            (0.07, 0.20),
-            (0.275, 0.03),
-        ]],
-        'P' => &[&[
-            (0.06, 0.97),
-            (0.06, 0.03),
-            (0.38, 0.03),
-            (0.52, 0.15),
-            (0.52, 0.39),
-            (0.38, 0.52),
-            (0.06, 0.52),
-        ]],
-        'Q' => &[
-            &[
-                (0.275, 0.03),
-                (0.48, 0.20),
-                (0.53, 0.50),
-                (0.48, 0.80),
-                (0.275, 0.97),
-                (0.07, 0.80),
-                (0.02, 0.50),
-                (0.07, 0.20),
-                (0.275, 0.03),
-            ],
-            &[(0.33, 0.72), (0.54, 1.00)],
-        ],
-        'R' => &[
-            &[
-                (0.06, 0.97),
-                (0.06, 0.03),
-                (0.38, 0.03),
-                (0.52, 0.15),
-                (0.52, 0.39),
-                (0.38, 0.52),
-                (0.06, 0.52),
-            ],
-            &[(0.30, 0.52), (0.53, 0.97)],
-        ],
-        'S' => &[&[
-            (0.50, 0.16),
-            (0.36, 0.04),
-            (0.18, 0.03),
-            (0.05, 0.16),
-            (0.07, 0.36),
-            (0.25, 0.46),
-            (0.38, 0.55),
-            (0.50, 0.66),
-            (0.48, 0.86),
-            (0.34, 0.97),
-            (0.14, 0.96),
-            (0.03, 0.84),
-        ]],
-        'T' => &[
-            &[(0.02, 0.03), (0.53, 0.03)],
-            &[(0.275, 0.03), (0.275, 0.97)],
-        ],
-        'U' => &[&[
-            (0.06, 0.03),
-            (0.06, 0.72),
-            (0.18, 0.95),
-            (0.37, 0.95),
-            (0.50, 0.72),
-            (0.50, 0.03),
-        ]],
-        'V' => &[&[(0.02, 0.03), (0.275, 0.97), (0.53, 0.03)]],
-        'W' => &[&[
-            (0.00, 0.03),
-            (0.13, 0.97),
-            (0.275, 0.35),
-            (0.42, 0.97),
-            (0.55, 0.03),
-        ]],
-        'X' => &[&[(0.05, 0.03), (0.50, 0.97)], &[(0.50, 0.03), (0.05, 0.97)]],
-        'Y' => &[
-            &[(0.03, 0.03), (0.275, 0.50), (0.52, 0.03)],
-            &[(0.275, 0.50), (0.275, 0.97)],
-        ],
-        'Z' => &[&[(0.05, 0.03), (0.51, 0.03), (0.05, 0.97), (0.51, 0.97)]],
-        '.' => &[&[(0.26, 0.95), (0.29, 0.95)]],
-        ',' => &[&[(0.29, 0.90), (0.21, 1.08)]],
-        '!' => &[
-            &[(0.275, 0.03), (0.275, 0.70)],
-            &[(0.265, 0.95), (0.285, 0.95)],
-        ],
-        '?' => &[
-            &[
-                (0.05, 0.20),
-                (0.18, 0.04),
-                (0.38, 0.04),
-                (0.51, 0.20),
-                (0.48, 0.37),
-                (0.275, 0.52),
-                (0.275, 0.68),
-            ],
-            &[(0.265, 0.95), (0.285, 0.95)],
-        ],
-        ':' => &[
-            &[(0.265, 0.32), (0.285, 0.32)],
-            &[(0.265, 0.90), (0.285, 0.90)],
-        ],
-        ';' => &[
-            &[(0.265, 0.32), (0.285, 0.32)],
-            &[(0.29, 0.85), (0.21, 1.05)],
-        ],
-        '-' => &[&[(0.08, 0.53), (0.47, 0.53)]],
-        '_' => &[&[(0.02, 1.05), (0.53, 1.05)]],
-        '/' => &[&[(0.05, 0.99), (0.50, 0.01)]],
-        '\\' => &[&[(0.05, 0.01), (0.50, 0.99)]],
-        '|' => &[&[(0.275, 0.00), (0.275, 1.00)]],
-        '(' => &[&[(0.40, 0.01), (0.20, 0.26), (0.20, 0.74), (0.40, 0.99)]],
-        ')' => &[&[(0.15, 0.01), (0.35, 0.26), (0.35, 0.74), (0.15, 0.99)]],
-        '[' => &[&[(0.40, 0.01), (0.20, 0.01), (0.20, 0.99), (0.40, 0.99)]],
-        ']' => &[&[(0.15, 0.01), (0.35, 0.01), (0.35, 0.99), (0.15, 0.99)]],
-        '{' => &[&[
-            (0.42, 0.01),
-            (0.28, 0.10),
-            (0.28, 0.42),
-            (0.15, 0.50),
-            (0.28, 0.58),
-            (0.28, 0.90),
-            (0.42, 0.99),
-        ]],
-        '}' => &[&[
-            (0.13, 0.01),
-            (0.27, 0.10),
-            (0.27, 0.42),
-            (0.40, 0.50),
-            (0.27, 0.58),
-            (0.27, 0.90),
-            (0.13, 0.99),
-        ]],
-        '\'' => &[&[(0.275, 0.02), (0.275, 0.26)]],
-        '"' => &[&[(0.18, 0.02), (0.18, 0.26)], &[(0.37, 0.02), (0.37, 0.26)]],
-        '+' => &[
-            &[(0.275, 0.26), (0.275, 0.74)],
-            &[(0.04, 0.50), (0.51, 0.50)],
-        ],
-        '=' => &[&[(0.05, 0.38), (0.50, 0.38)], &[(0.05, 0.62), (0.50, 0.62)]],
-        '<' => &[&[(0.45, 0.16), (0.07, 0.50), (0.45, 0.84)]],
-        '>' => &[&[(0.10, 0.16), (0.48, 0.50), (0.10, 0.84)]],
-        '~' => &[&[(0.04, 0.56), (0.17, 0.42), (0.38, 0.60), (0.51, 0.46)]],
-        '*' => &[
-            &[(0.275, 0.04), (0.275, 0.44)],
-            &[(0.10, 0.13), (0.45, 0.36)],
-            &[(0.45, 0.13), (0.10, 0.36)],
-        ],
-        '#' => &[
-            &[(0.19, 0.04), (0.12, 0.96)],
-            &[(0.41, 0.04), (0.34, 0.96)],
-            &[(0.04, 0.34), (0.50, 0.34)],
-            &[(0.03, 0.67), (0.49, 0.67)],
-        ],
-        '%' => &[
-            &[(0.51, 0.03), (0.04, 0.97)],
-            &[
-                (0.05, 0.04),
-                (0.18, 0.04),
-                (0.18, 0.24),
-                (0.05, 0.24),
-                (0.05, 0.04),
-            ],
-            &[
-                (0.37, 0.74),
-                (0.50, 0.74),
-                (0.50, 0.94),
-                (0.37, 0.94),
-                (0.37, 0.74),
-            ],
-        ],
-        '&' => &[&[
-            (0.53, 0.97),
-            (0.16, 0.04),
-            (0.06, 0.16),
-            (0.09, 0.32),
-            (0.45, 0.66),
-            (0.45, 0.85),
-            (0.31, 0.97),
-            (0.14, 0.95),
-            (0.05, 0.79),
-            (0.11, 0.60),
-            (0.51, 0.36),
-        ]],
-        '@' => &[&[
-            (0.40, 0.62),
-            (0.28, 0.69),
-            (0.19, 0.60),
-            (0.24, 0.44),
-            (0.37, 0.41),
-            (0.40, 0.66),
-            (0.49, 0.65),
-            (0.52, 0.44),
-            (0.45, 0.14),
-            (0.20, 0.07),
-            (0.05, 0.30),
-            (0.05, 0.71),
-            (0.20, 0.96),
-            (0.46, 0.96),
-        ]],
-        '$' => &[
-            &[
-                (0.50, 0.20),
-                (0.36, 0.10),
-                (0.18, 0.09),
-                (0.05, 0.21),
-                (0.07, 0.39),
-                (0.25, 0.48),
-                (0.38, 0.56),
-                (0.50, 0.66),
-                (0.48, 0.83),
-                (0.34, 0.93),
-                (0.14, 0.92),
-                (0.03, 0.81),
-            ],
-            &[(0.275, 0.00), (0.275, 1.00)],
-        ],
-        _ => return None,
-    })
+impl OutlineBuilder for GlyphPath<'_> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let (x, y) = self.point(x, y);
+        self.path.move_to(x, y);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let (x, y) = self.point(x, y);
+        self.path.line_to(x, y);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let (x1, y1) = self.point(x1, y1);
+        let (x, y) = self.point(x, y);
+        self.path.quad_to(x1, y1, x, y);
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let (x1, y1) = self.point(x1, y1);
+        let (x2, y2) = self.point(x2, y2);
+        let (x, y) = self.point(x, y);
+        self.path.cubic_to(x1, y1, x2, y2, x, y);
+    }
+
+    fn close(&mut self) {
+        self.path.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_inter_has_real_lowercase_and_unicode_glyphs() {
+        let face = face().expect("embedded Inter parses");
+        assert!(face.glyph_index('a').is_some());
+        assert!(face.glyph_index('é').is_some());
+        assert!(
+            outline(
+                "Scrozz café",
+                LogicalPoint::new(0.0, 0.0),
+                24.0,
+                TextPreset::Standard,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn monospaced_preset_uses_fixed_advances() {
+        let narrow = measure_with_preset("iiii", 20.0, TextPreset::Monospaced);
+        let wide = measure_with_preset("WWWW", 20.0, TextPreset::Monospaced);
+        assert_eq!(narrow.width, wide.width);
+    }
 }

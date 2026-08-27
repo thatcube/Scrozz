@@ -23,8 +23,12 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
+use scrozz_annotate::{Document, DocumentData};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
@@ -179,6 +183,15 @@ pub enum Tick {
     Stop,
 }
 
+/// A worker-loaded document ready to become a deferred editor viewport.
+#[derive(Debug)]
+pub struct EditorRequest {
+    /// The card whose Annotate action opened the document.
+    pub card: crate::gui::card::CardId,
+    /// Source pixels and every persisted non-destructive edit.
+    pub document: Document,
+}
+
 /// The running application.
 pub struct App {
     config: Config,
@@ -190,6 +203,7 @@ pub struct App {
     started: Instant,
     captures: u64,
     notes: Vec<String>,
+    editor_requests: VecDeque<EditorRequest>,
 }
 
 impl App {
@@ -270,6 +284,7 @@ impl App {
             started: Instant::now(),
             captures: 0,
             notes,
+            editor_requests: VecDeque::new(),
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -401,6 +416,13 @@ impl App {
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
+                Outcome::EditorLoaded { card, document } => {
+                    self.editor_requests.push_back(EditorRequest {
+                        card,
+                        document: *document,
+                    });
+                    self.note(format!("{card} opened for annotation"));
+                }
             }
         }
     }
@@ -425,6 +447,11 @@ impl App {
                     // ask for them.
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
+                }
+                CardEvent::Annotate(id) => {
+                    if !self.pipeline.post(Job::LoadEditor(id)) {
+                        self.note("the capture worker has gone");
+                    }
                 }
                 // Not yet routed. The drag payload is `scrozz-shell`'s
                 // `DragSource`, and collapsing into the dock is the capture
@@ -491,6 +518,18 @@ impl App {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);
+    }
+
+    /// Takes all worker-loaded documents waiting for editor viewports.
+    pub fn drain_editor_requests(&mut self) -> Vec<EditorRequest> {
+        self.editor_requests.drain(..).collect()
+    }
+
+    /// Persists the latest editor state on the worker-owned store connection.
+    pub fn persist_editor(&mut self, card: crate::gui::card::CardId, data: DocumentData) {
+        if !self.pipeline.post(Job::SaveEdits { card, data }) {
+            self.note("the capture worker has gone; annotation edits were not saved");
+        }
     }
 
     /// How many cards are on screen.
@@ -674,6 +713,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the copy never reached the worker: {:?}", app.notes());
+    }
+
+    #[test]
+    fn annotate_reaches_the_document_worker_instead_of_opening_the_card() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Annotate(CardId(43)));
+        app.tick();
+
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if app
+                .notes()
+                .iter()
+                .any(|note| note.contains("card:43 refused") && note.contains("annotate"))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "the annotation request never reached the worker: {:?}",
+            app.notes()
+        );
     }
 
     #[test]

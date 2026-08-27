@@ -302,6 +302,8 @@ pub enum CardEvent {
     Collapse(CardId),
     /// Clicked: open it for editing.
     Open(CardId),
+    /// The annotate button was pressed: open the editable annotation document.
+    Annotate(CardId),
 }
 
 impl CardEvent {
@@ -314,7 +316,8 @@ impl CardEvent {
             | Self::Dismiss(id)
             | Self::Drag(id)
             | Self::Collapse(id)
-            | Self::Open(id) => *id,
+            | Self::Open(id)
+            | Self::Annotate(id) => *id,
         }
     }
 }
@@ -558,6 +561,7 @@ mod tests {
             CardEvent::Drag(id),
             CardEvent::Collapse(id),
             CardEvent::Open(id),
+            CardEvent::Annotate(id),
         ] {
             assert_eq!(event.card(), id);
         }

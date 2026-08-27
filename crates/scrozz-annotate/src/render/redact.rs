@@ -73,7 +73,13 @@ pub fn solid(pixmap: &mut Pixmap, region: IntRect, color: Color) {
 /// Blocks are aligned to the region, not to the image, so a redaction looks the
 /// same wherever it is dragged.
 pub fn pixelate(pixmap: &mut Pixmap, region: IntRect) {
-    let block = pixelate_block(region);
+    pixelate_with_strength(pixmap, region, 0.65);
+}
+
+/// Replaces a region with a mosaic adjusted by the persisted editor strength.
+pub fn pixelate_with_strength(pixmap: &mut Pixmap, region: IntRect, strength: f32) {
+    let block =
+        ((pixelate_block(region) as f32 * strength_factor(strength)).round() as u32).max(MIN_BLOCK);
     let width = pixmap.width() as usize;
     let (left, top) = (region.left(), region.top());
     let (right, bottom) = (region.right(), region.bottom());
@@ -132,7 +138,12 @@ pub fn pixelate(pixmap: &mut Pixmap, region: IntRect) {
 /// a real pixel, so a uniform image blurs to exactly itself — the canonical
 /// check that the edges are handled correctly.
 pub fn blur(pixmap: &mut Pixmap, region: IntRect) {
-    let sigma = blur_sigma(region);
+    blur_with_strength(pixmap, region, 0.65);
+}
+
+/// Blurs a region adjusted by the persisted editor strength.
+pub fn blur_with_strength(pixmap: &mut Pixmap, region: IntRect, strength: f32) {
+    let sigma = (blur_sigma(region) * strength_factor(strength)).clamp(MIN_SIGMA, 24.0);
     blur_with_sigma(pixmap, region, sigma);
 }
 
@@ -216,6 +227,17 @@ pub fn blur_sigma(region: IntRect) -> f32 {
 pub fn pixelate_block(region: IntRect) -> u32 {
     let shorter = region.width().min(region.height()) as f32;
     ((shorter * PIXELATE_FRACTION).round() as u32).max(MIN_BLOCK)
+}
+
+fn strength_factor(strength: f32) -> f32 {
+    let strength = if strength.is_finite() {
+        strength.clamp(0.0, 1.0)
+    } else {
+        0.65
+    };
+    // Preserve the v1 renderer's output at the v2 default (0.65), while still
+    // giving the editor meaningful room in both directions.
+    0.5 + strength * (10.0 / 13.0)
 }
 
 fn gaussian_kernel(sigma: f32, radius: i32) -> Vec<f32> {

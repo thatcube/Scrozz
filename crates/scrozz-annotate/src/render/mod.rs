@@ -5,13 +5,15 @@ pub mod raster;
 pub mod redact;
 pub mod shapes;
 
-use scrozz_core::{Error, Frame, Result, ScaleFactor};
-use tiny_skia::{BlendMode, Pixmap, Transform};
+use scrozz_core::{Error, Frame, LogicalRect, Result, ScaleFactor};
+use tiny_skia::{
+    BlendMode, FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect, StrokeDash, Transform,
+};
 
 use crate::{
     annotation::{Annotation, AnnotationObject, RedactStyle},
     document::Document,
-    style::Color,
+    style::{ArrowStyle, Color, TextPreset},
 };
 
 use shapes::Scaled;
@@ -51,6 +53,29 @@ impl SkiaRenderer {
     /// the output would be zero-sized or unallocatable, or if the document
     /// carries beautification for a window capture — see decision D9.
     pub fn render_at(&self, document: &Document, scale: ScaleFactor) -> Result<Frame> {
+        self.render_geometry_at(document, document.canvas_geometry(), scale)
+    }
+
+    /// Composites through a temporary canvas without changing the document.
+    ///
+    /// An editor can use this to reveal the full source while a crop remains
+    /// persisted for the final export.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render_at`], plus canvas validation
+    /// errors from [`Document::canvas_geometry_for`].
+    pub fn render_canvas(&self, document: &Document, canvas: crate::Canvas) -> Result<Frame> {
+        let geometry = document.canvas_geometry_for(canvas)?;
+        self.render_geometry_at(document, geometry, document.source.frame.scale)
+    }
+
+    fn render_geometry_at(
+        &self,
+        document: &Document,
+        geometry: crate::CanvasGeometry,
+        scale: ScaleFactor,
+    ) -> Result<Frame> {
         // D9, second gate. `Document::set_beautification` refuses this too, but
         // a document can also arrive from persistence or from a future editing
         // path, and shipping a re-shadowed window capture must be impossible
@@ -60,18 +85,23 @@ impl SkiaRenderer {
                 "beautification is not permitted for window captures (decision D9)".to_owned(),
             ));
         }
-
         let source = raster::to_pixmap(&document.source.frame)?;
-        let logical = document.logical_size();
-        let width = (logical.width * scale.get()).round().max(1.0) as u32;
-        let height = (logical.height * scale.get()).round().max(1.0) as u32;
+        let logical = geometry.output_size();
+        let width = (logical.width * scale.get()).ceil().max(1.0) as u32;
+        let height = (logical.height * scale.get()).ceil().max(1.0) as u32;
 
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
         })?;
-        draw_source(&mut canvas, &source);
+        let xf = Scaled::for_canvas(scale.get(), geometry);
+        draw_source(
+            &mut canvas,
+            &source,
+            document.source.frame.scale,
+            geometry.source_crop(),
+            xf,
+        )?;
 
-        let xf = Scaled::new(scale.get());
         for object in document.annotations() {
             draw_object(&mut canvas, object, xf);
         }
@@ -100,7 +130,7 @@ impl SkiaRenderer {
                 "export width must be greater than zero".to_owned(),
             ));
         }
-        let logical = document.logical_size();
+        let logical = document.canvas_size();
         if logical.width <= 0.0 {
             return Err(Error::InvalidRequest(
                 "cannot scale a source with no width".to_owned(),
@@ -117,17 +147,43 @@ impl Renderer for SkiaRenderer {
     }
 }
 
-/// Draws the source image scaled to fill the canvas.
-fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
-    let sx = f64::from(canvas.width()) / f64::from(source.width());
-    let sy = f64::from(canvas.height()) / f64::from(source.height());
-    let quality = if (sx - 1.0).abs() < 1e-9 && (sy - 1.0).abs() < 1e-9 {
+/// Draws source pixels through the reversible canvas transform and crop mask.
+fn draw_source(
+    canvas: &mut Pixmap,
+    source: &Pixmap,
+    source_scale: ScaleFactor,
+    crop: LogicalRect,
+    xf: Scaled,
+) -> Result<()> {
+    let logical_to_output = xf.transform();
+    let source_to_output = Transform::from_row(
+        logical_to_output.sx / source_scale.get() as f32,
+        logical_to_output.ky / source_scale.get() as f32,
+        logical_to_output.kx / source_scale.get() as f32,
+        logical_to_output.sy / source_scale.get() as f32,
+        logical_to_output.tx,
+        logical_to_output.ty,
+    );
+    let ratio = xf.factor() / source_scale.get();
+    let quality = if (ratio - 1.0).abs() < 1e-9 {
         // Exact 1:1 must be a byte-for-byte copy. Any filter here would soften
         // a native-resolution export, which is the common case.
         tiny_skia::FilterQuality::Nearest
     } else {
         tiny_skia::FilterQuality::Bilinear
     };
+    let mut mask = Mask::new(canvas.width(), canvas.height()).ok_or_else(|| {
+        Error::InvalidRequest(format!(
+            "crop mask {}x{} is not renderable",
+            canvas.width(),
+            canvas.height()
+        ))
+    })?;
+    let crop_path = shapes::rectangle(&crop, xf).ok_or_else(|| {
+        Error::InvalidRequest("canvas crop does not enclose any source pixels".to_owned())
+    })?;
+    mask.fill_path(&crop_path, FillRule::Winding, false, Transform::identity());
+
     canvas.draw_pixmap(
         0,
         0,
@@ -136,9 +192,10 @@ fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
             quality,
             ..tiny_skia::PixmapPaint::default()
         },
-        Transform::from_scale(sx as f32, sy as f32),
-        None,
+        source_to_output,
+        Some(&mask),
     );
+    Ok(())
 }
 
 /// Draws one annotation onto the canvas.
@@ -155,29 +212,58 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
 
     match &object.annotation {
         Annotation::Arrow { from, to } => {
-            let Some((shaft, head)) = shapes::arrow(object, *from, *to, xf) else {
+            let Some((shaft, heads)) = shapes::arrow(object, *from, *to, xf) else {
                 return;
             };
+            let mut shaft_style = shapes::stroke(width);
+            if object.style.arrow_style == ArrowStyle::Dashed {
+                shaft_style.dash = StrokeDash::new(vec![width * 2.2, width * 1.6], 0.0);
+            }
+            if object.style.shadow {
+                draw_path_shadow(canvas, &shaft, Some(&shaft_style), false, xf);
+                for head in &heads {
+                    draw_path_shadow(canvas, head, None, true, xf);
+                }
+            }
             let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
-            shapes::stroke_path(canvas, &shaft, &paint, width);
-            shapes::fill_path(canvas, &head, &paint);
+            shapes::stroke_path_with(canvas, &shaft, &paint, &shaft_style, Transform::identity());
+            for head in &heads {
+                shapes::fill_path(canvas, head, &paint);
+            }
+        }
+        Annotation::Line { from, to } => {
+            let Some(path) = shapes::line(*from, *to, xf) else {
+                return;
+            };
+            if object.style.shadow {
+                let stroke = shapes::stroke(width);
+                draw_path_shadow(canvas, &path, Some(&stroke), false, xf);
+            }
+            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            shapes::stroke_path(canvas, &path, &paint, width);
         }
         Annotation::Rectangle(rect) => {
             let Some(path) = shapes::rectangle(rect, xf) else {
                 return;
             };
+            draw_shape_shadow(canvas, &path, object, width, xf);
             fill_then_stroke(canvas, &path, object, opacity, width);
         }
         Annotation::Ellipse(rect) => {
             let Some(path) = shapes::ellipse(rect, xf) else {
                 return;
             };
+            draw_shape_shadow(canvas, &path, object, width, xf);
             fill_then_stroke(canvas, &path, object, opacity, width);
         }
         Annotation::Freehand(points) => {
             let Some(path) = shapes::freehand(points, xf) else {
                 return;
             };
+            if object.style.shadow {
+                let stroke = shapes::stroke(width);
+                draw_path_shadow(canvas, &path, Some(&stroke), false, xf);
+            }
             let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
             shapes::stroke_path(canvas, &path, &paint, width);
         }
@@ -185,18 +271,54 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             let Some(path) = shapes::text(content, *at, &object.style, xf) else {
                 return;
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
-            // Type weight is a fraction of cap height, not the shape stroke
-            // width: an 18pt label drawn with a 12pt shape stroke is a blob.
-            let weight = xf
-                .length(object.style.effective_font_size() * 0.12)
-                .max(1.0);
-            shapes::stroke_path(canvas, &path, &paint, weight);
+            let boxed = text_box(object, xf);
+            if object.style.shadow {
+                if let Some(boxed) = &boxed {
+                    draw_path_shadow(canvas, boxed, None, true, xf);
+                } else {
+                    draw_path_shadow(canvas, &path, None, true, xf);
+                }
+            }
+
+            let ink = if let Some(boxed) = boxed {
+                let background = object.style.fill.unwrap_or(object.style.stroke);
+                let paint = shapes::paint(background, opacity, BlendMode::SourceOver);
+                shapes::fill_path(canvas, &boxed, &paint);
+                background.contrasting()
+            } else {
+                object.style.stroke
+            };
+            let paint = shapes::paint(ink, opacity, BlendMode::SourceOver);
+            if object.style.text_preset == TextPreset::Outlined {
+                let outline = shapes::paint(
+                    object.style.stroke.contrasting(),
+                    opacity,
+                    BlendMode::SourceOver,
+                );
+                shapes::stroke_path(
+                    canvas,
+                    &path,
+                    &outline,
+                    xf.length(object.style.effective_font_size() * 0.16)
+                        .max(1.0),
+                );
+            } else if object.style.text_preset == TextPreset::Rounded {
+                shapes::stroke_path(
+                    canvas,
+                    &path,
+                    &paint,
+                    xf.length(object.style.effective_font_size() * 0.055),
+                );
+            }
+            shapes::fill_path(canvas, &path, &paint);
         }
         Annotation::Counter { at, index } => {
             let Some((disc, label)) = shapes::counter(object, *at, *index, xf) else {
                 return;
             };
+            if object.style.shadow {
+                draw_path_shadow(canvas, &disc, None, true, xf);
+            }
             let fill = object.style.fill.unwrap_or(object.style.stroke);
             let disc_paint = shapes::paint(fill, opacity, BlendMode::SourceOver);
             shapes::fill_path(canvas, &disc, &disc_paint);
@@ -204,8 +326,7 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
                 // Pick black or white against the disc so the numeral stays
                 // legible whatever colour the user chose.
                 let ink = shapes::paint(fill.contrasting(), opacity, BlendMode::SourceOver);
-                let weight = xf.length(object.counter_radius() * 0.2).max(1.0);
-                shapes::stroke_path(canvas, &label, &ink, weight);
+                shapes::fill_path(canvas, &label, &ink);
             }
         }
         Annotation::Highlight(rect) => {
@@ -219,19 +340,29 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             let paint = shapes::paint(color, opacity, BlendMode::Multiply);
             shapes::fill_path(canvas, &path, &paint);
         }
-        Annotation::Redact { area, style } => {
-            let Some(region) = redact::clip(
-                canvas,
-                xf.length(area.origin.x),
-                xf.length(area.origin.y),
-                xf.length(crate::geom::max_x(area)),
-                xf.length(crate::geom::max_y(area)),
-            ) else {
+        Annotation::Spotlight(area) => {
+            let Some(hole) = xf.rect(area) else {
                 return;
             };
+            let color = object.style.fill.unwrap_or(object.style.stroke);
+            let paint = shapes::paint(color, opacity, BlendMode::SourceOver);
+            draw_spotlight(canvas, hole, &paint);
+        }
+        Annotation::Redact { area, style } => {
+            let Some(rect) = xf.rect(area) else {
+                return;
+            };
+            let Some(region) =
+                redact::clip(canvas, rect.left(), rect.top(), rect.right(), rect.bottom())
+            else {
+                return;
+            };
+            let strength = object.style.effective_redact_strength();
             match style {
-                RedactStyle::Blur => redact::blur(canvas, region),
-                RedactStyle::Pixelate => redact::pixelate(canvas, region),
+                RedactStyle::Blur => redact::blur_with_strength(canvas, region, strength),
+                RedactStyle::Pixelate => {
+                    redact::pixelate_with_strength(canvas, region, strength);
+                }
                 RedactStyle::Solid => {
                     let color = object
                         .style
@@ -242,6 +373,77 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
                     redact::solid(canvas, region, color);
                 }
             }
+        }
+    }
+}
+
+fn draw_shape_shadow(
+    canvas: &mut Pixmap,
+    path: &Path,
+    object: &AnnotationObject,
+    width: f32,
+    xf: Scaled,
+) {
+    if !object.style.shadow {
+        return;
+    }
+    let fill = object.style.fill.is_some_and(|color| !color.is_invisible());
+    let stroke = (object.style.stroke_width > 0.0).then(|| shapes::stroke(width));
+    draw_path_shadow(canvas, path, stroke.as_ref(), fill, xf);
+}
+
+fn draw_path_shadow(
+    canvas: &mut Pixmap,
+    path: &Path,
+    stroke: Option<&tiny_skia::Stroke>,
+    fill: bool,
+    xf: Scaled,
+) {
+    let paint = shapes::paint(Color::BLACK, 0.28, BlendMode::SourceOver);
+    let transform = Transform::from_translate(xf.length(2.5), xf.length(3.5));
+    if fill {
+        shapes::fill_path_with(canvas, path, &paint, transform);
+    }
+    if let Some(stroke) = stroke {
+        shapes::stroke_path_with(canvas, path, &paint, stroke, transform);
+    }
+}
+
+fn text_box(object: &AnnotationObject, xf: Scaled) -> Option<Path> {
+    if !object.style.text_preset.is_boxed() {
+        return None;
+    }
+    let padding = object.style.effective_font_size() * 0.28;
+    let bounds = crate::geom::inflate(&object.bounds(), padding);
+    let rect = xf.rect(&bounds)?;
+    let radius = match object.style.text_preset {
+        TextPreset::RoundedBoxed => xf.length(object.style.effective_font_size() * 0.45),
+        TextPreset::Boxed | TextPreset::MonospacedBoxed => xf.length(3.0),
+        _ => 0.0,
+    };
+    shapes::rounded_rect(rect, radius)
+}
+
+fn draw_spotlight(canvas: &mut Pixmap, hole: Rect, paint: &Paint<'_>) {
+    let width = canvas.width() as f32;
+    let height = canvas.height() as f32;
+    let left = hole.left().clamp(0.0, width);
+    let top = hole.top().clamp(0.0, height);
+    let right = hole.right().clamp(0.0, width);
+    let bottom = hole.bottom().clamp(0.0, height);
+    for rect in [
+        Rect::from_ltrb(0.0, 0.0, width, top),
+        Rect::from_ltrb(0.0, bottom, width, height),
+        Rect::from_ltrb(0.0, top, left, bottom),
+        Rect::from_ltrb(right, top, width, bottom),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut path = PathBuilder::new();
+        path.push_rect(rect);
+        if let Some(path) = path.finish() {
+            shapes::fill_path(canvas, &path, paint);
         }
     }
 }

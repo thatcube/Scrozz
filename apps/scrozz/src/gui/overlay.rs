@@ -170,7 +170,7 @@ impl CardSurface for OverlayCards {
                 }
                 OverlayEvent::AnnotateRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Open(ours));
+                        out.push(CardEvent::Annotate(ours));
                     }
                 }
                 OverlayEvent::DragStarted { id, .. } | OverlayEvent::DragOut { id, .. } => {

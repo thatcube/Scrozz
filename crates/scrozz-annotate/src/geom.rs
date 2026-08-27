@@ -93,6 +93,59 @@ pub fn distance_to_segment(point: LogicalPoint, a: LogicalPoint, b: LogicalPoint
     )
 }
 
+/// The deterministic control point used by a curved arrow.
+#[must_use]
+pub fn curved_arrow_control(from: LogicalPoint, to: LogicalPoint) -> LogicalPoint {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let length = dx.hypot(dy);
+    if length <= f64::EPSILON {
+        return from;
+    }
+    let bow = (length * 0.22).clamp(12.0, 96.0);
+    LogicalPoint::new(
+        (from.x + to.x) / 2.0 - dy / length * bow,
+        (from.y + to.y) / 2.0 + dx / length * bow,
+    )
+}
+
+/// A point on a quadratic Bézier curve.
+#[must_use]
+pub fn quadratic_point(
+    from: LogicalPoint,
+    control: LogicalPoint,
+    to: LogicalPoint,
+    t: f64,
+) -> LogicalPoint {
+    let one_minus_t = 1.0 - t;
+    LogicalPoint::new(
+        one_minus_t.powi(2) * from.x + 2.0 * one_minus_t * t * control.x + t.powi(2) * to.x,
+        one_minus_t.powi(2) * from.y + 2.0 * one_minus_t * t * control.y + t.powi(2) * to.y,
+    )
+}
+
+/// Distance from `point` to a quadratic Bézier, sampled deterministically.
+///
+/// Thirty-two straight segments are well below a pixel apart for the editor's
+/// bounded curve and keep hit-testing independent of a raster backend.
+#[must_use]
+pub fn distance_to_quadratic(
+    point: LogicalPoint,
+    from: LogicalPoint,
+    control: LogicalPoint,
+    to: LogicalPoint,
+) -> f64 {
+    const SEGMENTS: u32 = 32;
+    let mut previous = from;
+    let mut best = f64::MAX;
+    for step in 1..=SEGMENTS {
+        let current = quadratic_point(from, control, to, f64::from(step) / f64::from(SEGMENTS));
+        best = best.min(distance_to_segment(point, previous, current));
+        previous = current;
+    }
+    best
+}
+
 /// Distance from `point` to the outline of `rect`.
 ///
 /// Zero on the outline, growing in both directions — an outlined rectangle is
@@ -136,6 +189,27 @@ pub fn bounding_box(points: &[LogicalPoint]) -> LogicalRect {
         bottom = bottom.max(p.y);
     }
     from_edges(left, top, right, bottom)
+}
+
+/// The smallest rectangle containing both inputs.
+#[must_use]
+pub fn union(left: &LogicalRect, right: &LogicalRect) -> LogicalRect {
+    from_edges(
+        left.origin.x.min(right.origin.x),
+        left.origin.y.min(right.origin.y),
+        max_x(left).max(max_x(right)),
+        max_y(left).max(max_y(right)),
+    )
+}
+
+/// The shared area of two rectangles.
+#[must_use]
+pub fn intersection(left: &LogicalRect, right: &LogicalRect) -> Option<LogicalRect> {
+    let x0 = left.origin.x.max(right.origin.x);
+    let y0 = left.origin.y.max(right.origin.y);
+    let x1 = max_x(left).min(max_x(right));
+    let y1 = max_y(left).min(max_y(right));
+    (x1 > x0 && y1 > y0).then(|| from_edges(x0, y0, x1, y1))
 }
 
 /// Maps `point` from `from` to the corresponding position within `to`.

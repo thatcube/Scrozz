@@ -112,6 +112,15 @@ pub fn every_annotation() -> Vec<(Annotation, Style)> {
                 .with_stroke_width(3.5),
         ),
         (
+            Annotation::Line {
+                from: LogicalPoint::new(12.0, 7.0),
+                to: LogicalPoint::new(91.0, 34.0),
+            },
+            Style::stroked()
+                .with_stroke(Color::rgb(61, 139, 255))
+                .with_stroke_width(2.0),
+        ),
+        (
             Annotation::Rectangle(rect(10.0, 12.0, 40.0, 22.0)),
             Style::stroked()
                 .with_stroke(Color::rgb(20, 160, 90))
@@ -147,6 +156,10 @@ pub fn every_annotation() -> Vec<(Annotation, Style)> {
         (
             Annotation::Highlight(rect(4.0, 40.0, 60.0, 12.0)),
             Style::highlighter(),
+        ),
+        (
+            Annotation::Spotlight(rect(18.0, 16.0, 55.0, 38.0)),
+            Style::spotlight(),
         ),
         (
             Annotation::Redact {

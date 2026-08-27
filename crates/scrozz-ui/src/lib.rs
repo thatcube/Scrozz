@@ -81,6 +81,7 @@
 #![forbid(unsafe_code)]
 
 pub mod card;
+pub mod editor;
 pub mod harness;
 pub mod icons;
 pub mod motion;
@@ -91,6 +92,7 @@ pub mod theme;
 pub mod vibrancy;
 
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
+pub use editor::{AnnotationEditor, EditorDragRequest, EditorEvent, EditorMode, EditorTool};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,

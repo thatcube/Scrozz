@@ -3,7 +3,10 @@
 mod common;
 
 use common::{document, every_annotation, rect};
-use scrozz_annotate::{Annotation, AnnotationKind, Color, Document, RedactStyle, Style};
+use scrozz_annotate::{
+    Annotation, AnnotationKind, Canvas, CanvasRotation, Color, Document, RedactStyle, Style,
+    UndoHistory,
+};
 use scrozz_core::LogicalPoint;
 
 #[test]
@@ -57,6 +60,80 @@ fn hit_test_picks_the_topmost_annotation() {
         vec![over, under],
         "hit_test_all must be ordered top-most first"
     );
+}
+
+#[test]
+fn line_and_spotlight_are_first_class_editable_objects() {
+    let mut doc = document(200, 120);
+    let line = doc.add(
+        Annotation::Line {
+            from: LogicalPoint::new(10.0, 10.0),
+            to: LogicalPoint::new(100.0, 60.0),
+        },
+        Style::stroked(),
+    );
+    let spotlight = doc.add_default(Annotation::Spotlight(rect(25.0, 20.0, 70.0, 40.0)));
+
+    assert_eq!(doc.get(line).unwrap().kind(), AnnotationKind::Line);
+    assert_eq!(
+        doc.get(spotlight).unwrap().kind(),
+        AnnotationKind::Spotlight
+    );
+    assert_eq!(doc.hit_test(LogicalPoint::new(30.0, 30.0)), Some(spotlight));
+}
+
+#[test]
+fn canvas_mapping_round_trips_every_quarter_turn_and_flip() {
+    let mut doc = document(200, 120);
+    let source = LogicalPoint::new(47.25, 68.5);
+    for rotation in [
+        CanvasRotation::None,
+        CanvasRotation::Clockwise90,
+        CanvasRotation::HalfTurn,
+        CanvasRotation::CounterClockwise90,
+    ] {
+        for flip_horizontal in [false, true] {
+            for flip_vertical in [false, true] {
+                doc.set_canvas(Canvas {
+                    crop: Some(rect(20.0, 15.0, 130.0, 80.0)),
+                    rotation,
+                    flip_horizontal,
+                    flip_vertical,
+                    auto_expand: false,
+                })
+                .unwrap();
+                let geometry = doc.canvas_geometry();
+                let back = geometry.canvas_to_source(geometry.source_to_canvas(source));
+                assert!((back.x - source.x).abs() < 1e-9);
+                assert!((back.y - source.y).abs() < 1e-9);
+            }
+        }
+    }
+}
+
+#[test]
+fn undo_and_redo_restore_only_editable_snapshots() {
+    let mut doc = document(120, 80);
+    let source = doc.source.frame.data.clone();
+    let mut history = UndoHistory::new(&doc);
+    let id = doc.add_default(Annotation::Rectangle(rect(10.0, 10.0, 30.0, 20.0)));
+    history.checkpoint(&doc);
+    doc.translate(id, 25.0, 0.0);
+    history.checkpoint(&doc);
+
+    assert!(history.undo(&mut doc).unwrap());
+    assert_eq!(doc.get(id).unwrap().bounds().origin.x, 10.0);
+    assert!(history.redo(&mut doc).unwrap());
+    assert_eq!(doc.get(id).unwrap().bounds().origin.x, 35.0);
+    assert_eq!(
+        doc.source.frame.data, source,
+        "source pixels never enter history"
+    );
+
+    assert!(history.undo(&mut doc).unwrap());
+    doc.remove(id);
+    history.checkpoint(&doc);
+    assert!(!history.can_redo(), "a divergent edit clears redo");
 }
 
 #[test]
@@ -412,7 +489,7 @@ fn every_variant_reports_a_kind_and_a_bounding_box() {
             object.kind()
         );
     }
-    assert_eq!(doc.len(), 10);
+    assert_eq!(doc.len(), 12);
 }
 
 #[test]
