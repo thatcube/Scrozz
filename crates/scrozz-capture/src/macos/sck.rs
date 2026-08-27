@@ -1,28 +1,31 @@
 //! Blocking wrappers around ScreenCaptureKit's asynchronous entry points.
 //!
 //! ScreenCaptureKit is completion-handler based throughout. A still capture is
-//! conceptually synchronous, so each function here dispatches the call, parks on
-//! a [`Slot`], and returns an owned object or a [`scrozz_core::Error`].
+//! conceptually synchronous, so each function here builds a [`block2::RcBlock`],
+//! hands it to the generated binding, parks on a [`Rendezvous`], and returns an
+//! owned object or a [`scrozz_core::Error`].
 //!
-//! The calls go through `msg_send!` rather than the generated bindings because
-//! those bindings mention `block2::DynBlock` in their signatures, and `block2`
-//! is not a dependency of this crate — see [`super::block`].
+//! Two hazards are inherent to bridging a completion handler to a blocking
+//! call, and both are handled in [`Rendezvous`] rather than at each call site:
+//! the handler runs on one of ScreenCaptureKit's own queues, so whatever it
+//! delivers crosses a thread boundary; and it delivers autoreleased objects,
+//! whose pool can drain before the parked thread wakes.
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use block2::{DynBlock, RcBlock};
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyClass, AnyObject};
-use objc2::{AnyThread, ClassType, msg_send, sel};
-use objc2_core_graphics::{
-    CGImage, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
-};
+use objc2::runtime::AnyClass;
+use objc2::{AnyThread, Message, sel};
+use objc2_core_foundation::CGRect;
+use objc2_core_graphics::{CGImage, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::NSError;
-use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCStreamConfiguration};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+};
 use scrozz_core::{Error, Result};
 
-use super::block::{CompletionBlock, Outcome, Slot};
 use super::error;
 
 /// Enumerating what is shareable is a local query; it should be near-instant.
@@ -40,16 +43,14 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 /// immediately, having granted nothing yet. The grant only takes effect for a
 /// *future* launch, which is why the remedy string says to relaunch.
 pub(crate) fn ensure_permission() -> Result<()> {
-    // SAFETY: both are plain C functions with no preconditions.
     if CGPreflightScreenCaptureAccess() {
         return Ok(());
     }
 
-    // SAFETY: as above. The return value is deliberately ignored — a `true`
-    // here does not mean this process can capture yet.
+    // The return value is deliberately ignored — a `true` here does not mean
+    // this process can capture yet.
     let _ = CGRequestScreenCaptureAccess();
 
-    // SAFETY: as above.
     if CGPreflightScreenCaptureAccess() {
         return Ok(());
     }
@@ -66,30 +67,15 @@ pub(crate) fn ensure_permission() -> Result<()> {
 pub(crate) fn shareable_content() -> Result<Retained<SCShareableContent>> {
     ensure_permission()?;
 
-    let slot = Slot::new();
-    let mut block = CompletionBlock::new(&slot);
-    let handler = block.as_arg();
-
-    // SAFETY: the selector is
-    // `+[SCShareableContent getShareableContentExcludingDesktopWindows:onScreenWindowsOnly:completionHandler:]`,
-    // whose arguments are `BOOL`, `BOOL` and a block. `handler` declares the
-    // block encoding, and the block outlives the call because it owns a strong
-    // reference to `slot` and is copied by ScreenCaptureKit.
-    unsafe {
-        let _: () = msg_send![
-            SCShareableContent::class(),
-            getShareableContentExcludingDesktopWindows: true,
-            onScreenWindowsOnly: false,
-            completionHandler: handler,
-        ];
-    }
-
-    let outcome = slot
-        .wait(ENUMERATE_TIMEOUT)
-        .ok_or_else(|| timed_out("listing shareable content"))?;
-
-    // SAFETY: on success `value` is a `+1` `SCShareableContent`.
-    unsafe { claim(outcome, "listing shareable content") }
+    blocking("listing shareable content", ENUMERATE_TIMEOUT, |handler| {
+        // SAFETY: the arguments match the selector's `BOOL, BOOL, block`.
+        unsafe {
+            SCShareableContent::
+                getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+                    true, false, handler,
+                );
+        }
+    })
 }
 
 /// Takes a single screenshot through the given filter.
@@ -117,29 +103,17 @@ pub(crate) fn capture_image(
         ));
     }
 
-    let slot = Slot::new();
-    let mut block = CompletionBlock::new(&slot);
-    let handler = block.as_arg();
-
-    // SAFETY: the selector's arguments are `SCContentFilter *`,
-    // `SCStreamConfiguration *` and a block, which is what is passed.
-    unsafe {
-        let _: () = msg_send![
-            manager,
-            captureImageWithFilter: filter,
-            configuration: config,
-            completionHandler: handler,
-        ];
-    }
-
-    let outcome = slot
-        .wait(CAPTURE_TIMEOUT)
-        .ok_or_else(|| timed_out("taking a screenshot"))?;
-
-    // SAFETY: on success `value` is a `+1` `CGImage`. ScreenCaptureKit vends it
-    // as a CoreFoundation object, which `Retained` manages identically to an
-    // Objective-C one — `CFRelease` and `objc_release` are the same call.
-    unsafe { claim(outcome, "taking a screenshot") }
+    blocking("taking a screenshot", CAPTURE_TIMEOUT, |handler| {
+        // SAFETY: the arguments match the selector's
+        // `SCContentFilter *, SCStreamConfiguration *, block`.
+        unsafe {
+            SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                filter,
+                config,
+                Some(handler),
+            );
+        }
+    })
 }
 
 /// Whether `+[SCScreenshotManager captureImageInRect:completionHandler:]` exists.
@@ -160,7 +134,7 @@ pub(crate) fn supports_capture_in_rect() -> bool {
 /// The rectangle is display-agnostic: ScreenCaptureKit resolves which displays
 /// it covers and returns one image. That is exactly what a region selection
 /// dragged across two monitors needs, and what a whole-desktop capture needs.
-pub(crate) fn capture_image_in_rect(rect: objc2_core_foundation::CGRect) -> Result<Retained<CGImage>> {
+pub(crate) fn capture_image_in_rect(rect: CGRect) -> Result<Retained<CGImage>> {
     ensure_permission()?;
 
     let manager = screenshot_manager()?;
@@ -174,25 +148,12 @@ pub(crate) fn capture_image_in_rect(rect: objc2_core_foundation::CGRect) -> Resu
         ));
     }
 
-    let slot = Slot::new();
-    let mut block = CompletionBlock::new(&slot);
-    let handler = block.as_arg();
-
-    // SAFETY: the selector takes a `CGRect` by value and a block.
-    unsafe {
-        let _: () = msg_send![
-            manager,
-            captureImageInRect: rect,
-            completionHandler: handler,
-        ];
-    }
-
-    let outcome = slot
-        .wait(CAPTURE_TIMEOUT)
-        .ok_or_else(|| timed_out("capturing a rectangle"))?;
-
-    // SAFETY: on success `value` is a `+1` `CGImage`.
-    unsafe { claim(outcome, "capturing a rectangle") }
+    blocking("capturing a rectangle", CAPTURE_TIMEOUT, |handler| {
+        // SAFETY: the arguments match the selector's `CGRect, block`.
+        unsafe {
+            SCScreenshotManager::captureImageInRect_completionHandler(rect, Some(handler));
+        }
+    })
 }
 
 /// Allocates an `SCContentFilter` for one of the `initWith…` families.
@@ -200,6 +161,10 @@ pub(crate) fn alloc_filter() -> Allocated<SCContentFilter> {
     SCContentFilter::alloc()
 }
 
+/// Looks the class up through the runtime rather than [`objc2::ClassType`].
+///
+/// `SCScreenshotManager::class()` panics when the class is absent, which is
+/// precisely the case this needs to report as [`Error::Unsupported`].
 fn screenshot_manager() -> Result<&'static AnyClass> {
     AnyClass::get(c"SCScreenshotManager").ok_or_else(|| {
         error::unsupported(
@@ -209,6 +174,37 @@ fn screenshot_manager() -> Result<&'static AnyClass> {
     })
 }
 
+/// Dispatches a completion-handler call and blocks until it answers.
+///
+/// `dispatch` is handed the block and must pass it to exactly one
+/// ScreenCaptureKit entry point. The block is an [`RcBlock`], so ScreenCaptureKit
+/// copying it onto its own queue is a reference-count bump rather than a
+/// lifetime question, and the closure — along with its strong reference to the
+/// rendezvous — lives exactly as long as the block does.
+fn blocking<T: Message + 'static>(
+    context: &'static str,
+    timeout: Duration,
+    dispatch: impl FnOnce(&DynBlock<dyn Fn(*mut T, *mut NSError)>),
+) -> Result<Retained<T>> {
+    let slot = Arc::new(Rendezvous::<T>::new());
+
+    let handler = {
+        let slot = Arc::clone(&slot);
+        RcBlock::new(move |value: *mut T, error: *mut NSError| {
+            // SAFETY: ScreenCaptureKit passes either null or a live, valid
+            // object of the type the selector declares.
+            let delivery = unsafe { Delivery::adopt(value, error) };
+            slot.fulfil(delivery);
+        })
+    };
+
+    dispatch(&handler);
+
+    slot.wait(timeout)
+        .ok_or_else(|| timed_out(context))?
+        .into_result(context)
+}
+
 fn timed_out(context: &str) -> Error {
     Error::Platform(format!(
         "{context}: ScreenCaptureKit did not answer in time; \
@@ -216,32 +212,145 @@ fn timed_out(context: &str) -> Error {
     ))
 }
 
-/// Converts a completion handler's outcome into an owned object or an error.
-///
-/// # Safety
-///
-/// `outcome.value`, when non-null, must be a `+1` reference to an object of
-/// type `T`, and `outcome.error`, when non-null, a `+1` `NSError`.
-unsafe fn claim<T: objc2::Message>(outcome: Outcome, context: &str) -> Result<Retained<T>> {
-    // Take ownership of the error first, so it is released either way.
-    let error = NonNull::new(outcome.error.cast::<NSError>())
-        // SAFETY: a `+1` `NSError`, per this function's contract.
-        .and_then(|error| unsafe { Retained::from_raw(error.as_ptr()) });
+/// What a completion handler hands back: a result, an error, or neither.
+struct Delivery<T: ?Sized> {
+    value: Option<Retained<T>>,
+    error: Option<Retained<NSError>>,
+}
 
-    match NonNull::new(outcome.value.cast::<T>()) {
-        // SAFETY: a `+1` `T`, per this function's contract.
-        Some(value) => unsafe { Retained::from_raw(value.as_ptr()) }
-            .ok_or_else(|| Error::Platform(format!("{context}: unexpected null result"))),
-        None => Err(error::from_optional_ns_error(error, context)),
+// SAFETY: a delivery crosses exactly one thread boundary, by move, under a
+// mutex, and the sending side never touches it again. The delivered types are
+// `SCShareableContent`, `CGImage` and `NSError`: immutable, non-thread-affine
+// value objects that Apple documents as usable from any thread. `objc2` cannot
+// mark them `Send` because it cannot know that in general; here it is known.
+unsafe impl<T: ?Sized> Send for Delivery<T> {}
+
+impl<T: Message> Delivery<T> {
+    /// Takes ownership of the autoreleased objects a handler was given.
+    ///
+    /// The retain is the point: these arrive `+0` in ScreenCaptureKit's own
+    /// autorelease pool, which can drain the moment the handler returns —
+    /// before the parked thread has looked at them.
+    ///
+    /// # Safety
+    ///
+    /// Each pointer must be null or a valid, live object of its type.
+    unsafe fn adopt(value: *mut T, error: *mut NSError) -> Self {
+        Self {
+            // SAFETY: upheld by the caller.
+            value: unsafe { Retained::retain(value) },
+            // SAFETY: upheld by the caller.
+            error: unsafe { Retained::retain(error) },
+        }
     }
 }
 
-/// Reinterprets an object pointer, for the few places where ScreenCaptureKit's
-/// static types and the runtime's disagree.
-#[expect(dead_code, reason = "kept alongside `claim` for symmetry of the bridge")]
-pub(crate) fn as_object<T>(value: &T) -> *mut AnyObject {
-    std::ptr::from_ref(value).cast::<AnyObject>().cast_mut()
+impl<T: ?Sized> Delivery<T> {
+    /// Prefers the result over the error, since a handler can deliver both.
+    fn into_result(self, context: &str) -> Result<Retained<T>> {
+        self.value
+            .ok_or_else(|| error::from_optional_ns_error(self.error, context))
+    }
 }
 
-/// Marker for the pointer width assumption baked into the block ABI shim.
-const _: () = assert!(size_of::<*mut c_void>() == 8);
+/// A one-shot handover between a completion handler and the thread waiting on it.
+///
+/// An unclaimed delivery — one that arrived after the wait timed out — is
+/// released when the last reference to the rendezvous drops. That matters: a
+/// late `CGImage` for a 6K display is tens of megabytes.
+struct Rendezvous<T: ?Sized> {
+    delivery: Mutex<Option<Delivery<T>>>,
+    ready: Condvar,
+}
+
+impl<T: ?Sized> Rendezvous<T> {
+    fn new() -> Self {
+        Self {
+            delivery: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn fulfil(&self, delivery: Delivery<T>) {
+        let mut slot = self.lock();
+        *slot = Some(delivery);
+        drop(slot);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<Delivery<T>> {
+        let (mut slot, _) = self
+            .ready
+            .wait_timeout_while(self.lock(), timeout, |slot| slot.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        slot.take()
+    }
+
+    /// A poisoned mutex here means a completion handler panicked. What it
+    /// guards is an `Option` either way, so recovering beats bringing down a
+    /// capture that may still succeed.
+    fn lock(&self) -> MutexGuard<'_, Option<Delivery<T>>> {
+        self.delivery.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use objc2::rc::Weak;
+    use objc2_foundation::NSObject;
+
+    use super::*;
+
+    #[test]
+    fn a_rendezvous_hands_the_delivery_to_the_waiter() {
+        let slot = Arc::new(Rendezvous::<NSObject>::new());
+        let writer = Arc::clone(&slot);
+
+        thread::spawn(move || {
+            writer.fulfil(Delivery {
+                value: Some(NSObject::new()),
+                error: None,
+            });
+        });
+
+        let delivery = slot
+            .wait(Duration::from_secs(5))
+            .expect("the writer fulfils well within the timeout");
+        assert!(delivery.value.is_some());
+    }
+
+    #[test]
+    fn a_rendezvous_nobody_fulfils_times_out_rather_than_hanging() {
+        let slot = Rendezvous::<NSObject>::new();
+        assert!(slot.wait(Duration::from_millis(50)).is_none());
+    }
+
+    #[test]
+    fn a_delivery_with_neither_value_nor_error_is_still_an_error() {
+        let delivery = Delivery::<NSObject> {
+            value: None,
+            error: None,
+        };
+        assert!(delivery.into_result("a test").is_err());
+    }
+
+    /// The hazard the old hand-rolled block had to handle by hand: a handler
+    /// answering after the waiter gave up must not leak the image it carries.
+    #[test]
+    fn a_late_delivery_is_released_with_the_rendezvous() {
+        let slot = Arc::new(Rendezvous::<NSObject>::new());
+        assert!(slot.wait(Duration::from_millis(10)).is_none());
+
+        let object = NSObject::new();
+        let weak = Weak::from_retained(&object);
+        slot.fulfil(Delivery {
+            value: Some(object),
+            error: None,
+        });
+
+        drop(slot);
+        assert!(weak.load().is_none(), "the late delivery was leaked");
+    }
+}
