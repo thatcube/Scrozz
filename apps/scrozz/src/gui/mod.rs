@@ -68,6 +68,8 @@ pub mod overlay;
 pub mod panel;
 pub mod pipeline;
 pub mod server;
+#[cfg(target_os = "windows")]
+mod windows_host;
 
 // Re-exported so the rest of the binary — and anything that later lifts this
 // module into a library — names these from one place. A binary crate has no

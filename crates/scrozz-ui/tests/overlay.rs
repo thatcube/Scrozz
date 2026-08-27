@@ -280,6 +280,51 @@ fn overlays_always_share_the_captures_rounding() {
     }
 }
 
+#[test]
+fn the_live_software_frame_keeps_pixels_premultiplied() {
+    let ctx = egui::Context::default();
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(8.0, 8.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            ctx.layer_painter(egui::LayerId::background()).rect_filled(
+                egui::Rect::from_min_size(egui::pos2(2.0, 2.0), egui::vec2(4.0, 4.0)),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(255, 64, 0, 128),
+            );
+        },
+    );
+
+    let mut renderer = scrozz_ui::harness::LiveSoftwareRenderer::default();
+    let frame = renderer
+        .render(
+            &ctx,
+            output.textures_delta,
+            output.shapes,
+            output.pixels_per_point,
+            8,
+            8,
+        )
+        .expect("a live software frame");
+    let (pixels, remainder) = frame.as_rgba().as_chunks::<4>();
+    assert!(remainder.is_empty());
+    assert!(
+        pixels
+            .iter()
+            .all(|pixel| pixel[..3].iter().all(|channel| *channel <= pixel[3])),
+        "a compositor-ready frame must never carry straight-alpha RGB"
+    );
+    assert!(
+        pixels.contains(&[128, 32, 0, 128]),
+        "the translucent orange should be multiplied once, not zero or twice"
+    );
+}
+
 /// A window capture's corner is *filled*, because Scrozz did not round it.
 #[test]
 fn a_window_card_keeps_its_square_corner() {
@@ -489,9 +534,6 @@ fn native_options_carry_the_viewport_and_never_persist_geometry() {
         "a restored window position would drop the overlay somewhere other \
          than the corner of the work area"
     );
-    #[cfg(target_os = "windows")]
-    assert_eq!(options.renderer, eframe::Renderer::Wgpu);
-    #[cfg(not(target_os = "windows"))]
     assert_eq!(options.renderer, eframe::Renderer::Glow);
 }
 

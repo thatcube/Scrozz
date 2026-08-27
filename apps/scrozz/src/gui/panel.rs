@@ -108,6 +108,35 @@ pub unsafe fn convert_hwnd(hwnd: *mut c_void) -> PanelReport {
     finish(unsafe { NativeOverlay::adopt(hwnd) })
 }
 
+/// Configures a Windows overlay whose pixels come from `UpdateLayeredWindow`.
+///
+/// This differs from [`convert_hwnd`] only in layered-window initialization:
+/// calling `SetLayeredWindowAttributes` first would make the later
+/// `UpdateLayeredWindow` fail by documented Win32 contract.
+///
+/// # Safety
+///
+/// As [`convert_hwnd`].
+#[cfg(target_os = "windows")]
+#[must_use]
+pub unsafe fn convert_hwnd_layered_bitmap(hwnd: *mut c_void) -> PanelReport {
+    if hwnd.is_null() {
+        return PanelReport::unsupported("the window handle carried a null HWND");
+    }
+    OVERLAY_HWND.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+
+    // SAFETY: forwarded from this function's own contract.
+    let mut overlay = match unsafe { NativeOverlay::adopt(hwnd) } {
+        Ok(overlay) => overlay,
+        Err(error) => return PanelReport::unsupported(error.to_string()),
+    };
+    match overlay.apply_layered_bitmap(&OverlayBehavior::capture_card()) {
+        Ok(report) if report.non_activating => PanelReport::converted(report.detail),
+        Ok(report) => PanelReport::unsupported(report.detail),
+        Err(error) => PanelReport::unsupported(error.to_string()),
+    }
+}
+
 /// The overlay window's `HWND`, as an integer, or `0` before it exists.
 ///
 /// An integer rather than an `HWND` because the one consumer — the pointer

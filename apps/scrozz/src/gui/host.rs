@@ -2,22 +2,25 @@
 //!
 //! [`crate::gui::App`] deliberately has no loop of its own — see its module
 //! documentation for why. A *host* is whatever supplies one: an `eframe` update
-//! callback on a real desktop, or [`Headless`] in a terminal and in tests.
+//! callback on macOS/Linux, a winit application handler with a Win32 layered
+//! presenter on Windows, or [`Headless`] in a terminal and in tests.
 //!
 //! Keeping this seam explicit is what stops a second event loop being invented
 //! somewhere else later. There is exactly one, it is on the main thread, and it
 //! calls [`App::tick`] — everything that blocks is already on a worker.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+#[cfg(not(target_os = "windows"))]
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+#[cfg(not(target_os = "windows"))]
+use scrozz_ui::overlay_app::OverlayApp;
 use scrozz_ui::{
     OverlayHandle,
-    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
+    overlay_app::{OverlayGeometry, OverlayOptions},
 };
 
+#[cfg(not(target_os = "windows"))]
 use scrozz_core::Error as CoreError;
 
 use crate::{
@@ -153,15 +156,16 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
      HAS_WINDOW to true. Until then, SCROZZ_GUI_HEADLESS=1 runs everything \
      except the card";
 
-/// Drives the app from `eframe`'s update callback, with the overlay on screen.
+/// Drives the app from the platform window loop, with the overlay on screen.
 ///
 /// # The one main thread
 ///
-/// `eframe` owns the main loop, so [`App::tick`] is called from inside
-/// [`eframe::App::update`]. That is the whole point of `tick` not being a loop:
-/// winit, the tray and the hotkey receiver are all serviced from the same
-/// thread, in the same callback, in a fixed order, and nothing blocking
-/// happens there — capture and encoding are already on a worker.
+/// eframe owns this loop on macOS/Linux; the Windows
+/// `ApplicationHandler`/layered presenter owns it there. In both cases
+/// [`App::tick`] runs inside winit's owner thread. That is the whole point of
+/// `tick` not being a loop: winit, the tray and the hotkey receiver are all
+/// serviced from the same thread, in a fixed order, while capture and encoding
+/// stay on workers.
 pub struct Windowed {
     handle: OverlayHandle,
     emit: Emit,
@@ -191,7 +195,10 @@ impl Host for Windowed {
 
         let options = OverlayOptions {
             geometry,
+            #[cfg(not(target_os = "windows"))]
             panel: panel_hook(),
+            #[cfg(target_os = "windows")]
+            panel: None,
             probe: pointer_probe(),
             // Windows currently has tested FILEGROUPDESCRIPTORW construction,
             // but no IDataObject/IStream/DoDragDrop hand-off. A card must spring
@@ -200,55 +207,70 @@ impl Host for Windowed {
             ..Default::default()
         };
 
-        // The app is moved into the window, so the report has to come back out
-        // some other way: `run_native` owns the loop and drops everything in
-        // it before returning.
-        let outcome: Arc<Mutex<Option<Report>>> = Arc::new(Mutex::new(None));
-        let sink = Arc::clone(&outcome);
-        let handle = self.handle.clone();
-        let reporting = self.handle.clone();
-        let emit = self.emit;
+        #[cfg(target_os = "windows")]
+        {
+            super::windows_host::run(app, self.handle.clone(), options)
+        }
 
-        eframe::run_native(
-            "Scrozz",
-            scrozz_ui::overlay_app::native_options(geometry),
-            Box::new(move |cc| {
-                let overlay = OverlayApp::new(cc, handle, options);
-                Ok(Box::new(Driver {
-                    app,
-                    overlay,
-                    sink,
-                    handle: reporting,
-                    emit: Some(emit),
-                    announced: false,
-                    stopped: false,
-                }))
-            }),
-        )
-        .map_err(|err| {
-            CliError::Core(CoreError::Platform(format!(
-                "the overlay window could not open: {err}"
-            )))
-        })?;
+        #[cfg(not(target_os = "windows"))]
+        {
+            // The app is moved into the window, so the report has to come back
+            // out some other way: `run_native` owns the loop and drops
+            // everything in it before returning.
+            let outcome: Arc<Mutex<Option<Report>>> = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&outcome);
+            let handle = self.handle.clone();
+            let reporting = self.handle.clone();
+            let emit = self.emit;
 
-        outcome.lock().map_or_else(
-            |_| {
-                Err(CliError::Core(CoreError::Platform(
-                    "the overlay panicked".to_owned(),
+            eframe::run_native(
+                "Scrozz",
+                scrozz_ui::overlay_app::native_options(geometry),
+                Box::new(move |cc| {
+                    let overlay = OverlayApp::new(cc, handle, options);
+                    Ok(Box::new(Driver {
+                        app,
+                        overlay,
+                        sink,
+                        handle: reporting,
+                        emit: Some(emit),
+                        announced: false,
+                        stopped: false,
+                    }))
+                }),
+            )
+            .map_err(|err| {
+                CliError::Core(CoreError::Platform(format!(
+                    "the overlay window could not open: {err}"
                 )))
-            },
-            |mut slot| {
-                slot.take().ok_or_else(|| {
-                    CliError::Core(CoreError::Platform(
-                        "the overlay closed before the app reported".to_owned(),
-                    ))
-                })
-            },
-        )
+            })?;
+
+            outcome.lock().map_or_else(
+                |_| {
+                    Err(CliError::Core(CoreError::Platform(
+                        "the overlay panicked".to_owned(),
+                    )))
+                },
+                |mut slot| {
+                    slot.take().ok_or_else(|| {
+                        CliError::Core(CoreError::Platform(
+                            "the overlay closed before the app reported".to_owned(),
+                        ))
+                    })
+                },
+            )
+        }
     }
 
     fn describe(&self) -> &'static str {
-        "eframe overlay"
+        #[cfg(target_os = "windows")]
+        {
+            "Win32 layered overlay"
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "eframe overlay"
+        }
     }
 
     fn surface(&self) -> Box<dyn CardSurface> {
@@ -259,6 +281,7 @@ impl Host for Windowed {
 }
 
 /// The `eframe::App` that services this app and draws the overlay.
+#[cfg(not(target_os = "windows"))]
 struct Driver {
     app: App,
     overlay: OverlayApp,
@@ -269,6 +292,7 @@ struct Driver {
     stopped: bool,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Driver {
     /// Says what the panel conversion did, the moment it is known.
     ///
@@ -302,6 +326,7 @@ impl Driver {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl eframe::App for Driver {
     /// The app's own work, before anything is drawn.
     ///
@@ -387,11 +412,11 @@ impl eframe::App for Driver {
     }
 }
 
-/// Set to `0` to leave the overlay window as `eframe` made it.
+/// Set to `0` to leave the macOS/Linux overlay window as `eframe` made it.
 ///
-/// The conversion is what stops a capture card stealing focus (D27), so this
-/// is not a preference — it is a way to isolate the conversion when something
-/// downstream of it misbehaves, and to keep running while it is being fixed.
+/// This diagnostic bypass is not available on Windows: its per-pixel presenter
+/// requires `WS_EX_LAYERED`, and falling back to an ordinary window would
+/// recreate the opaque-black failure while falsely reporting a usable overlay.
 pub const PANEL_ENV: &str = "SCROZZ_GUI_PANEL";
 
 /// The native panel conversion, unless it was switched off.
@@ -544,6 +569,9 @@ mod tests {
         }
         let host = for_platform(&Config::sealed(), Box::new(|_| {}))
             .expect("this build can open a window");
+        #[cfg(target_os = "windows")]
+        assert_eq!(host.describe(), "Win32 layered overlay");
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(host.describe(), "eframe overlay");
     }
 

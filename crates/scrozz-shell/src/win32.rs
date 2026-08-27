@@ -229,6 +229,40 @@ pub const fn layered_note() -> &'static str {
      DWM keeps compositing winit's transparent client area"
 }
 
+/// Reorders premultiplied RGBA pixels to premultiplied BGRA.
+///
+/// [`UpdateLayeredWindow`](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-updatelayeredwindow)
+/// requires this exact byte layout. Keeping the conversion free of Win32 types
+/// makes its alpha semantics testable on every host.
+pub(crate) fn copy_premultiplied_rgba_to_bgra(
+    rgba: &[u8],
+    bgra: &mut [u8],
+) -> std::result::Result<(), Error> {
+    if rgba.len() != bgra.len() || !rgba.len().is_multiple_of(4) {
+        return Err(Error::InvalidRequest(format!(
+            "RGBA/BGRA buffers must have the same whole-pixel length, got {} and {} bytes",
+            rgba.len(),
+            bgra.len()
+        )));
+    }
+
+    let (sources, source_remainder) = rgba.as_chunks::<4>();
+    let (destinations, destination_remainder) = bgra.as_chunks_mut::<4>();
+    debug_assert!(source_remainder.is_empty());
+    debug_assert!(destination_remainder.is_empty());
+    for (index, (source, destination)) in sources.iter().zip(destinations).enumerate() {
+        let alpha = source[3];
+        if source[..3].iter().any(|channel| *channel > alpha) {
+            return Err(Error::InvalidRequest(format!(
+                "RGBA pixel {index} is not premultiplied: channels {:?} exceed alpha {alpha}",
+                &source[..3]
+            )));
+        }
+        destination.copy_from_slice(&[source[2], source[1], source[0], alpha]);
+    }
+    Ok(())
+}
+
 /// Whether native hit-testing should pass through this window.
 ///
 /// Kept as a pure predicate so the `WM_NCHITTEST` hook and the style writer
@@ -783,6 +817,32 @@ mod tests {
         assert_eq!(repaired & WS_EX_TOPMOST, WS_EX_TOPMOST);
         assert_eq!(repaired & WS_EX_TRANSPARENT, WS_EX_TRANSPARENT);
         assert_eq!(repaired & WS_EX_LAYERED, WS_EX_LAYERED);
+    }
+
+    #[test]
+    fn layered_pixels_are_bgra_and_premultiplied() {
+        let rgba = [
+            128, 32, 0, 128, // premultiplied translucent orange
+            0, 0, 0, 0, // transparent RGB must not leak a fringe
+            7, 11, 13, 255, // opaque pixels only swap channels
+        ];
+        let mut bgra = [0; 12];
+        copy_premultiplied_rgba_to_bgra(&rgba, &mut bgra).expect("matching pixel buffers");
+        assert_eq!(
+            bgra,
+            [
+                0, 32, 128, 128, //
+                0, 0, 0, 0, //
+                13, 11, 7, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn layered_pixel_conversion_rejects_partial_or_mismatched_buffers() {
+        assert!(copy_premultiplied_rgba_to_bgra(&[1, 2, 3], &mut [0; 3]).is_err());
+        assert!(copy_premultiplied_rgba_to_bgra(&[1, 2, 3, 4], &mut [0; 8]).is_err());
+        assert!(copy_premultiplied_rgba_to_bgra(&[1, 0, 0, 0], &mut [0; 4]).is_err());
     }
 
     // -- z-order ---------------------------------------------------------

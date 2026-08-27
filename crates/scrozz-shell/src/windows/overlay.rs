@@ -35,15 +35,19 @@
 //! "it compiles and the maths is right" is not "it works", and this module says
 //! so rather than implying otherwise.
 
-use std::cell::RefCell;
 use std::ffi::c_void;
+use std::{cell::RefCell, mem::size_of};
 
 use scrozz_core::{Error, LogicalRect, Result, ScaleFactor};
 use windows::Win32::Foundation::{
-    COLORREF, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
+    COLORREF, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SetLastError, WIN32_ERROR,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW,
+    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    SelectObject,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
@@ -54,18 +58,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GWL_EXSTYLE, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, LWA_ALPHA,
     MA_NOACTIVATE, SHOW_WINDOW_CMD, STYLESTRUCT, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WINDOW_LONG_PTR_INDEX, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST, WM_STYLECHANGING, WNDPROC,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT,
+    SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA,
+    UpdateLayeredWindow, WINDOW_LONG_PTR_INDEX, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_STYLECHANGING, WNDPROC, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
 use crate::OverlayWindow;
 use crate::overlay::{OverlayBehavior, OverlayLevel, OverlayReport};
 use crate::win32::{
-    DeviceRect, ExStyleSpec, ZOrder, classify_hresult, device_from_logical, enforced_ex_style_spec,
-    ex_style_spec, hit_test_passes_through, pointer_in_window, scale_from_dpi, work_area_logical,
-    z_order,
+    DeviceRect, ExStyleSpec, ZOrder, classify_hresult, copy_premultiplied_rgba_to_bgra,
+    device_from_logical, enforced_ex_style_spec, ex_style_spec, hit_test_passes_through,
+    pointer_in_window, scale_from_dpi, work_area_logical, z_order,
 };
 
 // ---------------------------------------------------------------------------
@@ -311,6 +315,23 @@ unsafe fn isize_to_wndproc(value: isize) -> WNDPROC {
 // The overlay
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presentation {
+    CompositedClient,
+    LayeredBitmap,
+}
+
+impl Presentation {
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::CompositedClient => "layered client-composition path initialized",
+            Self::LayeredBitmap => {
+                "per-pixel UpdateLayeredWindow path selected (initialized before show)"
+            }
+        }
+    }
+}
+
 /// A winit window retrofitted into a Scrozz overlay.
 ///
 /// Holds a borrowed `HWND`: eframe owns the window and outlives this. Dropping
@@ -383,6 +404,30 @@ impl WindowsOverlay {
     /// [`Error::Platform`] if called off the owning thread;
     /// [`Error::TargetGone`] if the window died in the meantime.
     pub fn apply(&mut self, behavior: &OverlayBehavior) -> Result<OverlayReport> {
+        self.apply_with_presentation(behavior, Presentation::CompositedClient)
+    }
+
+    /// Applies overlay properties for pixels submitted by
+    /// [`LayeredPresenter`].
+    ///
+    /// Unlike [`Self::apply`], this deliberately does not call
+    /// `SetLayeredWindowAttributes`: Microsoft documents that doing so prevents
+    /// a later `UpdateLayeredWindow` until `WS_EX_LAYERED` is cleared and set
+    /// again. The presenter supplies the first transparent bitmap before the
+    /// hidden window is shown, so there is no uninitialized visible interval.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::apply`].
+    pub fn apply_layered_bitmap(&mut self, behavior: &OverlayBehavior) -> Result<OverlayReport> {
+        self.apply_with_presentation(behavior, Presentation::LayeredBitmap)
+    }
+
+    fn apply_with_presentation(
+        &mut self,
+        behavior: &OverlayBehavior,
+        presentation: Presentation,
+    ) -> Result<OverlayReport> {
         owning_thread(self.hwnd, "configuring an overlay window")?;
 
         let spec = ex_style_spec(behavior);
@@ -404,7 +449,7 @@ impl WindowsOverlay {
             )?;
         }
 
-        if spec.required & WS_EX_LAYERED.0 != 0 {
+        if spec.required & WS_EX_LAYERED.0 != 0 && presentation == Presentation::CompositedClient {
             // SAFETY: the style was just applied to this live top-level window.
             // Alpha 255 is an identity global multiplier; see `layered_note`.
             unsafe { SetLayeredWindowAttributes(self.hwnd, COLORREF(0), 255, LWA_ALPHA) }
@@ -430,7 +475,7 @@ impl WindowsOverlay {
 
         let detail = if self.non_activating {
             format!(
-                "HWND {:p}: ex-style 0x{after:08X}{}, layered path initialised, \
+                "HWND {:p}: ex-style 0x{after:08X}{}, {}, \
                  style guard installed on WM_STYLECHANGING and WM_NCHITTEST{}",
                 self.hwnd.0,
                 if refuse_activation {
@@ -438,6 +483,7 @@ impl WindowsOverlay {
                 } else {
                     " (activation permitted: this surface reads the keyboard)"
                 },
+                presentation.detail(),
                 if refuse_activation {
                     " and WM_MOUSEACTIVATE"
                 } else {
@@ -658,6 +704,290 @@ impl WindowsOverlay {
         self.guarded = true;
         Ok(())
     }
+}
+
+/// CPU-backed presenter for a per-pixel-alpha layered window.
+///
+/// A normal DXGI swap chain attached to an `HWND` may expose only
+/// `DXGI_ALPHA_MODE_IGNORE`; that is the case for WARP on Windows ARM VMs and
+/// turns a transparent full-screen overlay into a black sheet. This path avoids
+/// swap-chain alpha entirely: egui's RGBA frame is copied into a persistent
+/// top-down DIB and handed to DWM through `UpdateLayeredWindow`.
+pub struct LayeredPresenter {
+    hwnd: HWND,
+    dib: Option<MemoryDib>,
+}
+
+impl std::fmt::Debug for LayeredPresenter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayeredPresenter")
+            .field("hwnd", &self.hwnd.0)
+            .field(
+                "size",
+                &self.dib.as_ref().map(|dib| (dib.width, dib.height)),
+            )
+            .finish()
+    }
+}
+
+impl LayeredPresenter {
+    /// Binds a presenter to a live window on its owning thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a target or thread-affinity error for an invalid/off-thread
+    /// handle. The window must already carry `WS_EX_LAYERED`; the first
+    /// presentation initializes that path.
+    pub fn new(hwnd: isize) -> Result<Self> {
+        if hwnd == 0 {
+            return Err(Error::InvalidRequest(
+                "null HWND passed to LayeredPresenter::new".to_owned(),
+            ));
+        }
+        let hwnd = HWND(hwnd as *mut c_void);
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return Err(Error::TargetGone(
+                "the HWND passed to LayeredPresenter::new is not a live window".to_owned(),
+            ));
+        }
+        owning_thread(hwnd, "creating a layered-window presenter")?;
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        if style & WS_EX_LAYERED.0 == 0 {
+            return Err(Error::Platform(format!(
+                "creating a layered-window presenter: HWND {:p} lacks WS_EX_LAYERED \
+                 (ex-style 0x{style:08X})",
+                hwnd.0
+            )));
+        }
+        Ok(Self { hwnd, dib: None })
+    }
+
+    /// Initializes or clears the whole window to transparent pixels.
+    ///
+    /// Call this before making a newly-created window visible so an unpainted
+    /// black client area can never flash on screen.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explicit allocation or `UpdateLayeredWindow` error.
+    pub fn present_transparent(&mut self, width: u32, height: u32) -> Result<()> {
+        let hwnd = self.hwnd;
+        let dib = self.dib(width, height)?;
+        dib.bytes_mut()?.fill(0);
+        present_dib(hwnd, dib)
+    }
+
+    /// Presents one premultiplied-alpha RGBA frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request error when the buffer dimensions disagree,
+    /// or a native error when the DIB/presentation path fails.
+    pub fn present_premultiplied_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<()> {
+        let expected = buffer_len(width, height)?;
+        if rgba.len() != expected {
+            return Err(Error::InvalidRequest(format!(
+                "presenting a {width}x{height} layered frame needs {expected} RGBA bytes, got {}",
+                rgba.len()
+            )));
+        }
+
+        let hwnd = self.hwnd;
+        let dib = self.dib(width, height)?;
+        copy_premultiplied_rgba_to_bgra(rgba, dib.bytes_mut()?)?;
+        present_dib(hwnd, dib)
+    }
+
+    fn dib(&mut self, width: u32, height: u32) -> Result<&mut MemoryDib> {
+        let replace = self
+            .dib
+            .as_ref()
+            .is_none_or(|dib| dib.width != width || dib.height != height);
+        if replace {
+            self.dib = Some(MemoryDib::create(width, height)?);
+        }
+        self.dib.as_mut().ok_or_else(|| {
+            Error::Platform("the layered-window DIB was not retained after creation".to_owned())
+        })
+    }
+}
+
+struct MemoryDib {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut u8,
+    width: u32,
+    height: u32,
+}
+
+impl MemoryDib {
+    fn create(width: u32, height: u32) -> Result<Self> {
+        let _ = buffer_len(width, height)?;
+        let width_i32 = i32::try_from(width).map_err(|_| {
+            Error::InvalidRequest(format!("layered-window width {width} exceeds Win32 i32"))
+        })?;
+        let height_i32 = i32::try_from(height).map_err(|_| {
+            Error::InvalidRequest(format!("layered-window height {height} exceeds Win32 i32"))
+        })?;
+
+        let dc = unsafe { CreateCompatibleDC(None) };
+        if dc.is_invalid() {
+            return Err(Error::Platform(
+                "creating the layered-window memory DC failed".to_owned(),
+            ));
+        }
+
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(40),
+                biWidth: width_i32,
+                biHeight: -height_i32,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = core::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                Some(dc),
+                &raw const info,
+                DIB_RGB_COLORS,
+                &raw mut bits,
+                None,
+                0,
+            )
+        };
+        let bitmap = match bitmap {
+            Ok(bitmap) if !bitmap.is_invalid() && !bits.is_null() => bitmap,
+            _ => {
+                let _ = unsafe { DeleteDC(dc) };
+                return Err(Error::Platform(
+                    "creating the layered-window 32-bit DIB failed".to_owned(),
+                ));
+            }
+        };
+        let previous = unsafe { SelectObject(dc, HGDIOBJ(bitmap.0)) };
+        if previous.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(dc);
+            }
+            return Err(Error::Platform(
+                "selecting the layered-window DIB into its memory DC failed".to_owned(),
+            ));
+        }
+
+        Ok(Self {
+            dc,
+            bitmap,
+            previous,
+            bits: bits.cast(),
+            width,
+            height,
+        })
+    }
+
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        let len = buffer_len(self.width, self.height)?;
+        if self.bits.is_null() {
+            return Err(Error::Platform(
+                "the layered-window DIB lost its pixel address".to_owned(),
+            ));
+        }
+        Ok(unsafe { core::slice::from_raw_parts_mut(self.bits, len) })
+    }
+}
+
+impl Drop for MemoryDib {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+fn buffer_len(width: u32, height: u32) -> Result<usize> {
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidRequest(
+            "cannot present a zero-sized layered window".to_owned(),
+        ));
+    }
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!(
+                "layered-window dimensions {width}x{height} overflow addressable memory"
+            ))
+        })
+}
+
+fn present_dib(hwnd: HWND, dib: &MemoryDib) -> Result<()> {
+    owning_thread(hwnd, "presenting a layered-window frame")?;
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Err(Error::TargetGone(
+            "presenting a layered-window frame: the window was destroyed".to_owned(),
+        ));
+    }
+
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }
+        .map_err(|error| map_err(error, "reading the layered window position"))?;
+    let destination = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let size = SIZE {
+        cx: i32::try_from(dib.width).map_err(|_| {
+            Error::InvalidRequest(format!(
+                "layered-window width {} exceeds Win32 i32",
+                dib.width
+            ))
+        })?,
+        cy: i32::try_from(dib.height).map_err(|_| {
+            Error::InvalidRequest(format!(
+                "layered-window height {} exceeds Win32 i32",
+                dib.height
+            ))
+        })?,
+    };
+    let source = POINT::default();
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    unsafe {
+        UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&raw const destination),
+            Some(&raw const size),
+            Some(dib.dc),
+            Some(&raw const source),
+            COLORREF(0),
+            Some(&raw const blend),
+            ULW_ALPHA,
+        )
+    }
+    .map_err(|error| {
+        map_err(
+            error,
+            "submitting premultiplied pixels to UpdateLayeredWindow",
+        )
+    })
 }
 
 impl OverlayWindow for WindowsOverlay {

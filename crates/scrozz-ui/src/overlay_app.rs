@@ -588,12 +588,6 @@ pub fn native_options(geometry: OverlayGeometry) -> eframe::NativeOptions {
     }
 }
 
-#[cfg(target_os = "windows")]
-const fn native_renderer() -> eframe::Renderer {
-    eframe::Renderer::Wgpu
-}
-
-#[cfg(not(target_os = "windows"))]
 const fn native_renderer() -> eframe::Renderer {
     eframe::Renderer::Glow
 }
@@ -773,7 +767,31 @@ impl OverlayApp {
         handle: OverlayHandle,
         mut options: OverlayOptions,
     ) -> Self {
-        let ctx = &cc.egui_ctx;
+        let report = options.panel.take().map_or_else(
+            || PanelReport::unsupported("no native panel hook supplied"),
+            |hook| hook(cc),
+        );
+        Self::from_context(&cc.egui_ctx, handle, options, report)
+    }
+
+    /// Build the overlay for a native host that owns egui integration itself.
+    ///
+    /// The host supplies the native-window report explicitly because there is no
+    /// [`eframe::CreationContext`] on this path. Windows uses this to pair
+    /// `egui-winit` input with an `UpdateLayeredWindow` software presenter.
+    #[must_use]
+    pub fn from_context(
+        ctx: &egui::Context,
+        handle: OverlayHandle,
+        mut options: OverlayOptions,
+        report: PanelReport,
+    ) -> Self {
+        if options.panel.take().is_some() {
+            tracing::warn!(
+                "the explicit native panel report superseded an unused eframe panel hook"
+            );
+        }
+
         let theme = Theme::for_appearance(options.appearance);
         crate::theme::install_fonts(ctx);
         crate::theme::install_style(ctx, &theme);
@@ -782,10 +800,6 @@ impl OverlayApp {
             *slot = Some(ctx.clone());
         }
 
-        let report = options.panel.take().map_or_else(
-            || PanelReport::unsupported("no native panel hook supplied"),
-            |hook| hook(cc),
-        );
         if !report.non_activating {
             tracing::warn!(detail = %report.detail, "overlay window is not non-activating");
         }
@@ -823,6 +837,131 @@ impl OverlayApp {
             dock_collapsed: false,
             dragging: None,
         }
+    }
+
+    /// Advance and paint one overlay frame into an egui root UI.
+    ///
+    /// Kept independent of `eframe::Frame` so a native host can use the same
+    /// surface with a compositor-specific presenter.
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let m = Motion::from_context(&ctx);
+
+        self.run_commands(&ctx, &m);
+        self.ingest(&m);
+        self.reconcile(&ctx);
+        self.stack.advance(&m);
+
+        let was_empty = self.stack.is_empty();
+        let dock_was = self.stack.dock().is_collapsed();
+
+        let surface = Surface::new(&self.theme, &self.icons, m);
+        let frames = self.stack.frame(&m);
+
+        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
+        let mut hovered = None;
+        let mut action = None;
+        let mut drag_start = None;
+        let mut drag_to = None;
+        let mut drag_end = false;
+
+        for f in &frames {
+            let Some(entry) = self.content.get(&f.id) else {
+                continue;
+            };
+            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
+            if let Some(tex) = &entry.texture {
+                content.texture = Some(tex.id());
+            }
+            let response = card::draw_card(ui, &surface, f, &content);
+            hits.push(response.hit);
+
+            if response.body.hovered() {
+                hovered = Some(f.id);
+            }
+            if let Some(a) = response.action {
+                action = Some((f.id, a));
+            }
+            if response.body.drag_started() {
+                drag_start = response.body.interact_pointer_pos().map(|p| (f.id, p));
+            }
+            if response.body.dragged() {
+                drag_to = response.body.interact_pointer_pos();
+            }
+            if response.body.drag_stopped() {
+                drag_end = true;
+            }
+        }
+
+        let (dock_hit, dock_clicked) = self.draw_dock(ui, &surface, &m);
+        if let Some(rect) = dock_hit {
+            hits.push(rect);
+        }
+
+        // Gestures are applied after drawing so this frame's responses drive the
+        // next layout rather than tearing the current one.
+        if dock_clicked {
+            self.stack.expand(&m);
+        }
+        if hovered != self.hovered {
+            self.hovered = hovered;
+            self.stack.set_hover(hovered, &m);
+        }
+        if let Some((id, pointer)) = drag_start
+            && self.stack.begin_drag(id, pointer, &m)
+        {
+            self.dragging = Some(id);
+            self.emit(OverlayEvent::DragStarted { id, at: pointer });
+        }
+        if let Some(p) = drag_to {
+            self.stack.drag_to(p, &m);
+        }
+        if drag_end {
+            if let Some(release) = self
+                .stack
+                .release_drag_with_promised_file(&m, self.promised_file_drag)
+            {
+                let at = release.rect.center();
+                match release.intent {
+                    Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
+                        id: release.id,
+                        reason: DismissReason::Swipe,
+                    }),
+                    Intent::DragOut => {
+                        self.emit(OverlayEvent::DragOut { id: release.id, at });
+                        self.emit(OverlayEvent::Dismissed {
+                            id: release.id,
+                            reason: DismissReason::DragOut,
+                        });
+                    }
+                    Intent::Collapse | Intent::SpringBack => {}
+                }
+            }
+            self.dragging = None;
+        }
+        if let Some((id, action)) = action {
+            self.handle_action(id, action, &m);
+        }
+
+        let dock_now = self.stack.dock().is_collapsed();
+        if dock_now != dock_was {
+            self.emit(if dock_now {
+                OverlayEvent::DockCollapsed
+            } else {
+                OverlayEvent::DockExpanded
+            });
+        }
+        self.dock_collapsed = dock_now;
+        if !was_empty && self.stack.is_empty() && self.stack.departing().is_empty() {
+            self.emit(OverlayEvent::Emptied);
+        }
+
+        let pointer = self.pointer(&ctx);
+        self.apply_passthrough(&ctx, &hits, pointer);
+
+        // The single place repainting is requested: idle costs nothing, an
+        // animation gets a continuous repaint, and a pending wake gets a timer.
+        self.stack.activity(&m).apply(&ctx);
     }
 
     /// The stack this overlay is showing, for tests and diagnostics.
@@ -1080,124 +1219,7 @@ impl eframe::App for OverlayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let m = Motion::from_context(&ctx);
-
-        self.run_commands(&ctx, &m);
-        self.ingest(&m);
-        self.reconcile(&ctx);
-        self.stack.advance(&m);
-
-        let was_empty = self.stack.is_empty();
-        let dock_was = self.stack.dock().is_collapsed();
-
-        let surface = Surface::new(&self.theme, &self.icons, m);
-        let frames = self.stack.frame(&m);
-
-        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
-        let mut hovered = None;
-        let mut action = None;
-        let mut drag_start = None;
-        let mut drag_to = None;
-        let mut drag_end = false;
-
-        for f in &frames {
-            let Some(entry) = self.content.get(&f.id) else {
-                continue;
-            };
-            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
-            if let Some(tex) = &entry.texture {
-                content.texture = Some(tex.id());
-            }
-            let response = card::draw_card(ui, &surface, f, &content);
-            hits.push(response.hit);
-
-            if response.body.hovered() {
-                hovered = Some(f.id);
-            }
-            if let Some(a) = response.action {
-                action = Some((f.id, a));
-            }
-            if response.body.drag_started() {
-                drag_start = response.body.interact_pointer_pos().map(|p| (f.id, p));
-            }
-            if response.body.dragged() {
-                drag_to = response.body.interact_pointer_pos();
-            }
-            if response.body.drag_stopped() {
-                drag_end = true;
-            }
-        }
-
-        let (dock_hit, dock_clicked) = self.draw_dock(ui, &surface, &m);
-        if let Some(rect) = dock_hit {
-            hits.push(rect);
-        }
-
-        // Gestures, applied after drawing so this frame's responses drive the
-        // next frame's layout rather than tearing the current one.
-        if dock_clicked {
-            self.stack.expand(&m);
-        }
-        if hovered != self.hovered {
-            self.hovered = hovered;
-            self.stack.set_hover(hovered, &m);
-        }
-        if let Some((id, pointer)) = drag_start
-            && self.stack.begin_drag(id, pointer, &m)
-        {
-            self.dragging = Some(id);
-            self.emit(OverlayEvent::DragStarted { id, at: pointer });
-        }
-        if let Some(p) = drag_to {
-            self.stack.drag_to(p, &m);
-        }
-        if drag_end {
-            if let Some(release) = self
-                .stack
-                .release_drag_with_promised_file(&m, self.promised_file_drag)
-            {
-                let at = release.rect.center();
-                match release.intent {
-                    Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
-                        id: release.id,
-                        reason: DismissReason::Swipe,
-                    }),
-                    Intent::DragOut => {
-                        self.emit(OverlayEvent::DragOut { id: release.id, at });
-                        self.emit(OverlayEvent::Dismissed {
-                            id: release.id,
-                            reason: DismissReason::DragOut,
-                        });
-                    }
-                    Intent::Collapse | Intent::SpringBack => {}
-                }
-            }
-            self.dragging = None;
-        }
-        if let Some((id, a)) = action {
-            self.handle_action(id, a, &m);
-        }
-
-        let dock_now = self.stack.dock().is_collapsed();
-        if dock_now != dock_was {
-            self.emit(if dock_now {
-                OverlayEvent::DockCollapsed
-            } else {
-                OverlayEvent::DockExpanded
-            });
-        }
-        self.dock_collapsed = dock_now;
-        if !was_empty && self.stack.is_empty() && self.stack.departing().is_empty() {
-            self.emit(OverlayEvent::Emptied);
-        }
-
-        let pointer = self.pointer(&ctx);
-        self.apply_passthrough(&ctx, &hits, pointer);
-
-        // The single place repainting is requested: idle costs nothing, an
-        // animation gets a continuous repaint, and a pending wake gets a timer.
-        self.stack.activity(&m).apply(&ctx);
+        self.show(ui);
     }
 }
 

@@ -2517,6 +2517,131 @@ impl TextureStore {
     }
 }
 
+/// Stateful CPU rasterizer for a live egui surface.
+///
+/// Windows layered windows need premultiplied pixels, not an opaque GPU swap
+/// chain. This reuses the exact mesh and texture path that powers the golden
+/// harness, while retaining egui's texture atlas between frames.
+#[derive(Default)]
+pub struct LiveSoftwareRenderer {
+    textures: TextureStore,
+    framebuffer: Vec<[f32; 4]>,
+    pixels: Vec<u8>,
+}
+
+impl fmt::Debug for LiveSoftwareRenderer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveSoftwareRenderer")
+            .field("textures", &self.textures.map.len())
+            .field("pixels", &(self.pixels.len() / 4))
+            .finish()
+    }
+}
+
+/// One borrowed live frame in premultiplied RGBA8.
+///
+/// Unlike [`Image`], these channels are already multiplied by alpha. Native
+/// compositors such as `UpdateLayeredWindow` can therefore reorder the channels
+/// to BGRA without a lossy un-premultiply/re-premultiply round trip.
+#[derive(Debug, Clone, Copy)]
+pub struct PremultipliedFrame<'a> {
+    width: u32,
+    height: u32,
+    pixels: &'a [u8],
+}
+
+impl PremultipliedFrame<'_> {
+    /// Width in physical pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in physical pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Premultiplied RGBA8 bytes, one row after another.
+    #[must_use]
+    pub const fn as_rgba(&self) -> &[u8] {
+        self.pixels
+    }
+}
+
+impl LiveSoftwareRenderer {
+    /// Rasterizes one egui frame onto a transparent premultiplied RGBA image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero-sized target or for a paint callback. Scrozz
+    /// only emits meshes; silently dropping a callback would make part of the
+    /// live overlay disappear.
+    pub fn render(
+        &mut self,
+        ctx: &egui::Context,
+        textures_delta: egui::TexturesDelta,
+        shapes: Vec<egui::epaint::ClippedShape>,
+        pixels_per_point: f32,
+        width_px: u32,
+        height_px: u32,
+    ) -> Result<PremultipliedFrame<'_>> {
+        // A delta asserts on drop if it was not consumed. Apply it before
+        // validating the target so even an invalid or minimized caller cannot
+        // turn an ordinary error into a debug-only panic.
+        self.textures.apply(textures_delta);
+        if width_px == 0 || height_px == 0 {
+            return Err(Error::InvalidRequest(
+                "cannot render a zero-sized live surface".to_owned(),
+            ));
+        }
+        if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+            return Err(Error::InvalidRequest(format!(
+                "live surface pixels-per-point must be positive, got {pixels_per_point}"
+            )));
+        }
+
+        let pixel_count = (width_px as usize)
+            .checked_mul(height_px as usize)
+            .ok_or_else(|| {
+                Error::InvalidRequest(format!(
+                    "live surface dimensions {width_px}x{height_px} overflow addressable memory"
+                ))
+            })?;
+        self.framebuffer.resize(pixel_count, [0.0; 4]);
+        self.framebuffer.fill([0.0; 4]);
+
+        let primitives = ctx.tessellate(shapes, pixels_per_point);
+        rasterize_primitives_into(
+            primitives,
+            &self.textures,
+            width_px as usize,
+            height_px as usize,
+            pixels_per_point,
+            &mut self.framebuffer,
+            "live software surface",
+        )?;
+
+        self.pixels.resize(pixel_count * 4, 0);
+        let (pixels, remainder) = self.pixels.as_chunks_mut::<4>();
+        debug_assert!(remainder.is_empty());
+        for (source, destination) in self.framebuffer.iter().zip(pixels) {
+            let alpha = source[3].round().clamp(0.0, 255.0) as u8;
+            for channel in 0..3 {
+                destination[channel] = source[channel].round().clamp(0.0, f32::from(alpha)) as u8;
+            }
+            destination[3] = alpha;
+        }
+
+        Ok(PremultipliedFrame {
+            width: width_px,
+            height: height_px,
+            pixels: &self.pixels,
+        })
+    }
+}
+
 /// A `Color32` (already premultiplied `u8`) widened to `f32`.
 fn premul_f32(c: egui::Color32) -> [f32; 4] {
     [
@@ -2641,46 +2766,15 @@ impl RasterJob {
         textures.apply(out.textures_delta);
         let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
 
-        // Framebuffer in premultiplied sRGB, held at f32 so hundreds of blends
-        // accumulate at full precision and quantise exactly once, at the end.
-        let mut fb = self.background.framebuffer(w_px, h_px, self.seed);
-
-        for egui::ClippedPrimitive {
-            clip_rect,
-            primitive,
-        } in primitives
-        {
-            let mesh = match primitive {
-                egui::epaint::Primitive::Mesh(m) => m,
-                egui::epaint::Primitive::Callback(_) => {
-                    // Scrozz has no paint callbacks. If one ever appears it must
-                    // be rendered some other way rather than silently dropped.
-                    return Err(Error::Unsupported {
-                        what: "paint callback in a harness render".to_owned(),
-                        why: "the software renderer draws meshes only; a callback \
-                              would silently vanish from the golden"
-                            .to_owned(),
-                    });
-                }
-            };
-            if mesh.indices.is_empty() {
-                continue;
-            }
-            let Some(clip) = scale_clip(clip_rect, ppp, w_px, h_px) else {
-                continue;
-            };
-            let tex = textures.get(mesh.texture_id);
-            for tri in mesh.indices.as_chunks::<3>().0 {
-                let (a, b, c) = (
-                    mesh.vertices[tri[0] as usize],
-                    mesh.vertices[tri[1] as usize],
-                    mesh.vertices[tri[2] as usize],
-                );
-                raster_triangle(&mut fb, w_px, clip, ppp, a, b, c, tex);
-            }
-        }
-
-        Image::from_premultiplied_f32(self.width_px, self.height_px, &fb)
+        rasterize_primitives(
+            primitives,
+            &textures,
+            self.width_px,
+            self.height_px,
+            ppp,
+            self.background.framebuffer(w_px, h_px, self.seed),
+            "harness render",
+        )
     }
 }
 
@@ -2829,6 +2923,72 @@ impl SoftwareRenderer {
             })
             .collect()
     }
+}
+
+fn rasterize_primitives(
+    primitives: Vec<egui::ClippedPrimitive>,
+    textures: &TextureStore,
+    width_px: u32,
+    height_px: u32,
+    pixels_per_point: f32,
+    mut framebuffer: Vec<[f32; 4]>,
+    surface: &str,
+) -> Result<Image> {
+    rasterize_primitives_into(
+        primitives,
+        textures,
+        width_px as usize,
+        height_px as usize,
+        pixels_per_point,
+        &mut framebuffer,
+        surface,
+    )?;
+    Image::from_premultiplied_f32(width_px, height_px, &framebuffer)
+}
+
+fn rasterize_primitives_into(
+    primitives: Vec<egui::ClippedPrimitive>,
+    textures: &TextureStore,
+    width: usize,
+    height: usize,
+    pixels_per_point: f32,
+    framebuffer: &mut [[f32; 4]],
+    surface: &str,
+) -> Result<()> {
+    for egui::ClippedPrimitive {
+        clip_rect,
+        primitive,
+    } in primitives
+    {
+        let mesh = match primitive {
+            egui::epaint::Primitive::Mesh(mesh) => mesh,
+            egui::epaint::Primitive::Callback(_) => {
+                return Err(Error::Unsupported {
+                    what: format!("paint callback in a {surface}"),
+                    why:
+                        "the software renderer draws meshes only; a callback would silently vanish"
+                            .to_owned(),
+                });
+            }
+        };
+        if mesh.indices.is_empty() {
+            continue;
+        }
+        let Some(clip) = scale_clip(clip_rect, pixels_per_point, width, height) else {
+            continue;
+        };
+        let texture = textures.get(mesh.texture_id);
+        for triangle in mesh.indices.as_chunks::<3>().0 {
+            let (a, b, c) = (
+                mesh.vertices[triangle[0] as usize],
+                mesh.vertices[triangle[1] as usize],
+                mesh.vertices[triangle[2] as usize],
+            );
+            raster_triangle(framebuffer, width, clip, pixels_per_point, a, b, c, texture);
+        }
+    }
+
+    Ok(())
 }
 
 /// Converts a clip rect from points to whole pixels, clamped to the framebuffer.

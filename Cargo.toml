@@ -45,8 +45,10 @@ eframe = { version = "=0.36.1", default-features = false, features = [
     "wayland",
 ] }
 egui = "=0.36.1"
-# Needed to reach the underlying NSView from eframe's CreationContext, which is
-# how the overlay window is converted to a non-activating NSPanel (D27).
+egui-winit = { version = "=0.36.1", default-features = false }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+# Needed to reach the underlying NSView/HWND, where each platform applies its
+# non-activating overlay contract (D27).
 raw-window-handle = "0.6"
 
 thiserror = "2"

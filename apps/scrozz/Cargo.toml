@@ -35,5 +35,9 @@ clap.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+egui-winit.workspace = true
+winit.workspace = true
+
 [lints]
 workspace = true

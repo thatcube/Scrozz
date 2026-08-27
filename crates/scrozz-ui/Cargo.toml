@@ -18,11 +18,5 @@ eframe.workspace = true
 image.workspace = true
 resvg.workspace = true
 
-[target.'cfg(target_os = "windows")'.dependencies]
-# Windows VMs commonly expose Direct3D but no usable OpenGL swap-control
-# extension. Enable eframe's wgpu renderer there so the real overlay is not
-# gated on a hypervisor's OpenGL support.
-eframe = { workspace = true, features = ["wgpu"] }
-
 [lints]
 workspace = true

@@ -195,22 +195,33 @@ transparent bit is set, the same hook returns `HTTRANSPARENT` from
 `WM_NCHITTEST`; empty overlay regions pass through and card regions remain
 interactive.
 
-Layering has a separate startup requirement. The panel hook runs while eframe's
-window is hidden, and Windows does not guarantee that a hidden layered window
-will become visible until `SetLayeredWindowAttributes` or
-`UpdateLayeredWindow` initialises it. Scrozz uses
-`SetLayeredWindowAttributes(alpha=255)`: the global alpha is an identity
-multiplier, while DWM continues compositing the transparent client area winit
-created. The Windows target check proves the API surface and constants. Only a
-native desktop run can prove that the DWM pixels, focus and Z-order behave as
-intended.
+Layering has a separate startup requirement. Windows does not guarantee that a
+hidden layered window will become visible until `SetLayeredWindowAttributes` or
+`UpdateLayeredWindow` initializes it. The Windows host creates its winit window
+hidden, installs the style guard, submits a fully transparent bitmap through
+`UpdateLayeredWindow`, and only then shows it without activation. It must not
+call `SetLayeredWindowAttributes` first: Microsoft documents that a later
+`UpdateLayeredWindow` fails until `WS_EX_LAYERED` is cleared and set again.
 
-The Windows overlay uses eframe's `wgpu` renderer rather than Glow. VMware's
-Windows 11 ARM64 graphics driver exposes no usable OpenGL swap-control extension
-and Glow exits before the first card; `wgpu` can use the Windows DX12 software
-adapter when the virtual GPU is insufficient. macOS and Linux retain the
-already-qualified Glow path. Renderer choice does not alter the native `HWND`
-style, layering or hit-test hooks.
+Native VMware ARM64 runs closed two false renderer fixes. Glow failed before the
+first card because the virtual GPU exposed no usable OpenGL swap-control
+extension. Switching eframe to wgpu removed that failure, but DX12 selected the
+Microsoft Basic Render Driver (WARP), whose ordinary `HWND` surface exposed no
+transparent `CompositeAlphaMode`; DWM therefore showed an opaque black
+full-screen surface. A successful GPU API initialization was not a successful
+transparent overlay.
+
+The Windows host now avoids swap-chain alpha entirely. winit/egui-winit still
+own the main-thread event and input model, but Scrozz rasterizes egui's meshes on
+the CPU, retains the texture atlas and framebuffer between frames, converts
+premultiplied RGBA directly to a persistent top-down 32-bit BGRA DIB, and
+presents it with `UpdateLayeredWindow(..., ULW_ALPHA)`. This is independent of
+OpenGL, DXGI composition modes, the physical GPU, and WARP. macOS and Linux keep
+the qualified eframe/Glow path. Setup or presentation failure is a platform
+error; Windows does not silently return to Glow, wgpu, an ordinary opaque
+window, or headless mode. Cross-target checks prove the API surface and
+host-testable alpha arithmetic; the replacement presenter still requires a
+native desktop run to prove visible pixels, focus, input regions and Z-order.
 
 COM/WinRT membership is per thread, not per process. The direct CLI and the
 forwarded-command handler both enter through `commands::dispatch`, which holds

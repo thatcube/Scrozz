@@ -443,11 +443,12 @@ fn windows_has_two_z_bands_and_the_mapping_says_so() {
 // - That a window carrying these bits behaves as intended. Nothing here calls
 //   Windows; the adapter that does is held up by `cargo check`, `clippy` and
 //   `const` assertions against the real constants.
-// - That DWM preserves per-pixel transparency after the hidden layered window
-//   is initialised with `SetLayeredWindowAttributes(alpha=255)`.
+// - That DWM preserves per-pixel transparency after a hidden layered window
+//   receives its first premultiplied bitmap through `UpdateLayeredWindow`.
 // - That the `WM_STYLECHANGING` subclass survives winit's own subclassing, or
 //   unhooks cleanly on `WM_NCDESTROY`.
 // - That `MA_NOACTIVATE` keeps focus where it was during a real click.
 //
-// `tools/windows-smoke.ps1` is where those become answerable.
+// These remain manual native-desktop checks; `tools/windows-smoke.ps1`
+// deliberately does not claim it can prove focus or visible DWM pixels.
 // ---------------------------------------------------------------------------
