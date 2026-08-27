@@ -317,23 +317,17 @@ single card. Its primary interaction is **dragging a capture directly into
 another application** — above copy, above save. Swipe-to-dismiss is a primary
 gesture. Clipboard remains essential but is no longer described as "first".
 
-**Layout.** Each capture is a **discrete, fully-visible card**, arranged
-vertically with consistent gaps. **Nothing ever covers anything** — zero overlap,
-zero occlusion, full size and full opacity for every card. Each is independently
-hoverable, draggable and dismissable; hovering one reveals only its own chrome.
+**Layout.** Fixed slots anchored at the bottom-left; a new capture slides in from
+off-screen left into the next empty slot upward, building a tower with the oldest
+at the bottom. **Existing cards do not move on arrival.** Nothing ever covers
+anything — zero overlap, full size and opacity, consistent gaps. Each card is
+independently hoverable, draggable and dismissable; hovering one reveals only its
+own chrome. Full layout, overflow and gesture rules are in D21.
 
-**Direction.** A new capture enters at the **bottom** of the list — nearest the
-bottom-left corner, and therefore nearest the dock (D20). **Existing cards move
-up**; the newest is always closest to the corner. Removing a card lets the cards
-above it move **down** to close the gap.
-
-> Wherever these documents say a capture "stacks", it means **accumulates
-> vertically as a list** — never overlaps or occludes. An earlier draft described
-> a physical *card-stack* metaphor with cards peeking out behind one another;
-> that was a misreading of the reference, which plainly shows two fully separate
-> cards with a gap between them — older above, newer below. The corrected model
-> is also better UX: every capture stays visible and directly actionable instead
-> of buried in a pile.
+> Wherever these documents say captures "stack", it means a **physical tower of
+> discrete blocks** — accumulating in fixed slots, each fully visible — never
+> overlapping or occluding. Earlier drafts described both an overlapping
+> card-stack and a reflowing list; both were wrong.
 
 **Motion (see D19).** A new capture slides in from the anchored screen edge and
 takes the slot nearest the anchor corner; existing cards shift away with a spring
@@ -545,32 +539,65 @@ overlays" as a settings toggle, not a spatial, reversible, one-gesture affordanc
 
 ---
 
-## D21 — The complete overlay animation set
+## D21 — The overlay interaction and animation set
 
-**Decision.** The overlay animates in exactly five places, and nowhere else:
+### Layout: fixed slots, nothing reflows on arrival
 
-1. **Card enters** — slides in from the left, off-screen, into the **bottom** slot,
-   spring settle (D12).
-2. **Existing cards move up** — spring settle with a slight stagger.
-3. **Card leaves** — via **close, copy, save, or swipe-left**. All four dismiss
-   the card and animate it away.
-4. **Cards above move down** to close the gap — spring settle.
+The overlay is a column of **fixed slots** anchored at the bottom-left. A new
+capture slides in from off-screen left into the **next empty slot upward** —
+building a tower, oldest at the bottom. **Existing cards do not move.** No
+shifting, no reflow, no settle when a capture arrives.
+
+The slot count is **computed from display height** (≈6 on a 16" MacBook Pro),
+recomputed when the display changes. Never hardcoded.
+
+**Overflow.** When a capture arrives with every slot full, the **oldest card
+slides out to the left using the same exit animation as a manual dismiss** —
+maintainer: *"almost like you closed it yourself or swiped it yourself."* Nothing
+is lost; it remains in history (D14).
+
+**Departure.** Cards above a vacated slot fall down to close the gap. Arrival
+moves nothing; departure obeys gravity.
+
+### Gestures: direction is intent
+
+| Gesture on a card | Meaning | Behaviour |
+|---|---|---|
+| **Left** | Dismiss | Velocity-driven fling off-screen; springs back below threshold |
+| **Right or Up** | **Drag onto something** | Enters drag mode; on release the card drops and animates away; cancel springs it back |
+| **Down** | Collapse | The whole list collapses into the dock (D20); non-destructive |
+
+**Consequence: there is no drag handle and no drag button.** Direction alone
+expresses intent — throw it left to discard, push it right or up to hand it to
+another app, push it down to hide everything. This is what resolves D12's
+drag-first requirement against D12's "no chrome at rest" requirement.
+
+Drag mode is where the OS promised-file drag lives (D12), so a capture never
+written to disk can still be dropped into another application.
+
+### The animation set
+
+1. **Card enters** — slides in from off-screen left into the next slot up.
+2. **Card leaves** — via close, copy, save, or swipe-left. **One shared exit
+   animation**, also used for overflow retirement.
+3. **Cards above fall down** to close the gap.
+4. **Drag mode** — lift on right/up, hand off and animate away on release,
+   spring back on cancel.
 5. **Dock collapse and expand** (D20).
 
 **Button press animation is explicitly optional** and lowest priority.
 
-**The mental model is phone notifications:** a vertical list of discrete cards
-that accumulate, get swiped away individually, and can be collapsed out of the
-way.
+**The mental model is phone notifications:** discrete cards that accumulate, get
+swiped away individually, and can be collapsed out of the way.
 
-**Why copy and save also dismiss.** That is the actual workflow — capture, copy,
-gone. Leaving a card on screen after its action has been taken is clutter.
+**Why copy and save also dismiss.** That is the real workflow — capture, copy,
+gone. A card left on screen after its action has been taken is clutter.
 
-**Why so few.** Maintainer: *"im realizing theres not that much animation… it
-might be nice to animate button presses for example, but that's not a hard
-requirement."* Motion budget concentrated on the handful of moments that carry
-the product's feel beats motion sprinkled everywhere — and per D19, easing
-controls actively makes an app feel slower.
+**Why so few animations.** Maintainer: *"im realizing theres not that much
+animation… it might be nice to animate button presses for example, but that's not
+a hard requirement."* Motion concentrated on the few moments that carry the
+product's feel beats motion sprinkled everywhere — and per D19, easing controls
+actively makes an app feel slower.
 
 - **Q12 — UI stack (egui).** Provisional, pending the visual spike in
   `spikes/ui-spike/`. Decided on screenshots, not argument.
