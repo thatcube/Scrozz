@@ -14,18 +14,17 @@
 //!
 //! # The design
 //!
-//! A running instance listens on a socket. A CLI invocation that would benefit
-//! from the running app's state hands its whole `argv` over and relays the
-//! answer back. The forked process is a thin remote control, so
-//! `scrozz capture --json` produces byte-identical output whether or not the app
-//! happens to be running — which is the property that makes scripting against it
-//! safe.
+//! A running instance listens on a socket. Only an operation that requires live
+//! process-owned state is handed over; currently that is `record --stop`. Pure
+//! capture, OCR, barcode, history, settings, and query commands stay in the
+//! calling process, avoiding a GUI-thread hop and preserving native path and
+//! diagnostic behavior.
 //!
 //! # The wire format, and why it is not JSON both ways
 //!
 //! ```text
-//! -->  {"schema":1,"argv":["capture","--json"],"cwd":"/home/u"}\n   (then EOF)
-//! <--  SCROZZ/2 0 json 12 0\n
+//! -->  {"schema":3,"protocol":"SCROZZ/3","kind":"command",...}\n
+//! <--  SCROZZ/3 0 json 12 0\n
 //! <--  <12 stdout bytes><0 stderr bytes>
 //! ```
 //!
@@ -47,7 +46,12 @@
 //! commands forward. The **server** belongs to the GUI, which owns the event loop
 //! and the store.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
 
 use crate::{
     cli::Command,
@@ -56,10 +60,29 @@ use crate::{
 };
 
 /// The protocol version token that opens every response.
-pub const PROTOCOL_TOKEN: &str = "SCROZZ/2";
+pub const PROTOCOL_TOKEN: &str = "SCROZZ/3";
 
 /// The request schema version.
-pub const REQUEST_SCHEMA: i64 = 1;
+pub const REQUEST_SCHEMA: i64 = 3;
+
+/// First wire argument, deliberately rejected by older clap parsers.
+///
+/// The client negotiates before sending a command, and this sentinel is the
+/// fail-safe for a daemon replacement between negotiation and dispatch: an
+/// older daemon sees an unknown option rather than executing the remaining argv.
+pub const REQUEST_PROTOCOL_ARG: &str = "--scrozz-ipc=SCROZZ/3";
+
+/// Maximum request frame accepted by the GUI.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Maximum combined response frame accepted by a client.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
+
+/// No IPC peer gets to hold a process forever.
+#[cfg(unix)]
+const IO_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(unix)]
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Overrides the endpoint, for tests and for unusual sandboxes.
 pub const ENDPOINT_ENV: &str = "SCROZZ_IPC_SOCKET";
@@ -135,9 +158,8 @@ pub enum Forwarding {
 
 /// The forwarding policy for a command.
 ///
-/// The rule: forward anything that touches **shared mutable state** — the
-/// capture history, the overlay, an in-progress recording — and keep anything
-/// that is a pure query or a pure function local.
+/// The rule: forward only work that cannot function without live state owned by
+/// the existing process, and keep everything else local.
 #[must_use]
 pub fn policy(command: &Command) -> Forwarding {
     match command {
@@ -148,18 +170,13 @@ pub fn policy(command: &Command) -> Forwarding {
         // process.
         Command::Record(args) if args.stop => Forwarding::Require,
 
-        // These write to the store or put an overlay on screen. Two processes
-        // doing either concurrently is the bug this whole module exists to
-        // prevent.
-        Command::Capture(_) | Command::Record(_) => Forwarding::Prefer,
-        Command::History(_) => Forwarding::Prefer,
-        Command::Settings(args) if args.is_write() => Forwarding::Prefer,
-
-        // Pure reads and pure functions. `list` asks the compositor, not Scrozz;
-        // OCR and barcode work owns no GUI state and can block on native engines
-        // or subprocesses, so it must never occupy the GUI listener's main thread.
-        // Keeping it local also preserves stderr and human diagnostic rendering.
-        Command::Ocr(_)
+        // No other command currently acts on live GUI-owned state. Running each
+        // in its caller keeps native paths lossless and prevents capture, OCR,
+        // encoding, SQLite, or subprocess work from occupying the GUI listener.
+        Command::Capture(_)
+        | Command::Record(_)
+        | Command::History(_)
+        | Command::Ocr(_)
         | Command::Barcodes(_)
         | Command::Settings(_)
         | Command::List(_)
@@ -229,26 +246,136 @@ fn user_token() -> String {
 
 /// Encodes a request.
 ///
-/// The full `argv` is forwarded rather than a parsed structure so the running
-/// instance parses with the same code path a local run uses. A parser on each
-/// side is two parsers that can disagree.
+/// The full argument list after the program name is forwarded rather than a
+/// parsed structure so the running instance parses with the same code path a
+/// local run uses. A parser on each side is two parsers that can disagree.
 #[must_use]
-pub fn encode_request(argv: &[String], cwd: Option<&Path>) -> String {
+pub fn encode_request<S: AsRef<OsStr>>(argv: &[S], cwd: Option<&Path>) -> String {
+    encode_request_kind("command", argv, cwd)
+}
+
+pub(crate) fn encode_hello() -> String {
+    encode_request_kind("hello", &[] as &[OsString], None)
+}
+
+fn encode_request_kind<S: AsRef<OsStr>>(kind: &str, argv: &[S], cwd: Option<&Path>) -> String {
     let request = Json::obj([
         ("schema", Json::Int(REQUEST_SCHEMA)),
+        ("protocol", Json::str(PROTOCOL_TOKEN)),
+        ("kind", Json::str(kind)),
+        // Older daemons parse only this textual argv and reject the unknown
+        // sentinel before they can execute a command from a newer client.
+        ("argv", Json::arr([Json::str(REQUEST_PROTOCOL_ARG)])),
+        ("os_encoding", Json::str(os_encoding())),
         (
-            "argv",
-            Json::arr(argv.iter().map(|a| Json::str(a.as_str()))),
+            "arguments",
+            Json::arr(argv.iter().map(|argument| encode_os(argument.as_ref()))),
         ),
         // Relative `--output` paths resolve against the *caller's* directory,
         // not the daemon's. Without this, `scrozz capture -o shot.png` would
         // silently write somewhere else once the GUI is running.
-        (
-            "cwd",
-            Json::opt(cwd, |p| Json::str(p.to_string_lossy().into_owned())),
-        ),
+        ("cwd", Json::opt(cwd, |path| encode_os(path.as_os_str()))),
     ]);
     format!("{}\n", request.to_compact_string())
+}
+
+#[cfg(unix)]
+const fn os_encoding() -> &'static str {
+    "unix-bytes"
+}
+
+#[cfg(windows)]
+const fn os_encoding() -> &'static str {
+    "windows-wide"
+}
+
+#[cfg(not(any(unix, windows)))]
+const fn os_encoding() -> &'static str {
+    "utf8-bytes"
+}
+
+#[cfg(unix)]
+fn encode_os(value: &OsStr) -> Json {
+    use std::os::unix::ffi::OsStrExt as _;
+    Json::arr(
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| Json::Int(i64::from(*byte))),
+    )
+}
+
+#[cfg(windows)]
+fn encode_os(value: &OsStr) -> Json {
+    use std::os::windows::ffi::OsStrExt as _;
+    Json::arr(value.encode_wide().map(|unit| Json::Int(i64::from(unit))))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_os(value: &OsStr) -> Json {
+    Json::arr(
+        value
+            .to_string_lossy()
+            .as_bytes()
+            .iter()
+            .map(|byte| Json::Int(i64::from(*byte))),
+    )
+}
+
+/// Decodes one lossless operating-system string from a request.
+pub(crate) fn decode_os(value: &serde_json::Value, encoding: &str) -> CliResult<OsString> {
+    if encoding != os_encoding() {
+        return Err(CliError::ipc(format!(
+            "the request uses {encoding:?} strings, this platform requires {:?}",
+            os_encoding()
+        )));
+    }
+    let units = value
+        .as_array()
+        .ok_or_else(|| CliError::ipc("an operating-system string was not an array"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bytes = units
+            .iter()
+            .map(|unit| {
+                unit.as_u64()
+                    .and_then(|unit| u8::try_from(unit).ok())
+                    .ok_or_else(|| CliError::ipc("a Unix path byte was outside 0..=255"))
+            })
+            .collect::<CliResult<Vec<_>>>()?;
+        Ok(OsString::from_vec(bytes))
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt as _;
+        let wide = units
+            .iter()
+            .map(|unit| {
+                unit.as_u64()
+                    .and_then(|unit| u16::try_from(unit).ok())
+                    .ok_or_else(|| CliError::ipc("a Windows path unit was outside 0..=65535"))
+            })
+            .collect::<CliResult<Vec<_>>>()?;
+        Ok(OsString::from_wide(&wide))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = units
+            .iter()
+            .map(|unit| {
+                unit.as_u64()
+                    .and_then(|unit| u8::try_from(unit).ok())
+                    .ok_or_else(|| CliError::ipc("a path byte was outside 0..=255"))
+            })
+            .collect::<CliResult<Vec<_>>>()?;
+        String::from_utf8(bytes)
+            .map(OsString::from)
+            .map_err(|_| CliError::ipc("an operating-system string was not UTF-8"))
+    }
 }
 
 /// Parses a response.
@@ -303,6 +430,12 @@ pub fn parse_response(bytes: &[u8]) -> CliResult<Response> {
     let expected_len = stdout_len
         .checked_add(stderr_len)
         .ok_or_else(|| CliError::ipc("the response payload lengths overflowed"))?;
+    if expected_len > MAX_RESPONSE_BYTES {
+        return Err(CliError::ipc(format!(
+            "the response announced {expected_len} payload bytes, exceeding the \
+             {MAX_RESPONSE_BYTES}-byte response limit"
+        )));
+    }
     if body.len() != expected_len {
         return Err(CliError::ipc(format!(
             "the response announced {expected_len} payload bytes but sent {}",
@@ -360,12 +493,10 @@ pub fn probe() -> Status {
 
 #[cfg(unix)]
 fn probe_at(path: &Path) -> Status {
-    use std::os::unix::net::UnixStream;
-
     if !path.exists() {
         return Status::NotRunning;
     }
-    match UnixStream::connect(path) {
+    match connect_until(path, Instant::now() + PROBE_TIMEOUT) {
         Ok(_) => Status::Running,
         // A socket file with nothing behind it is the normal residue of a crash,
         // not a condition worth telling the user about.
@@ -388,30 +519,101 @@ fn probe_at(_path: &Path) -> Status {
 /// Returns [`CliError::Ipc`] when no instance is reachable or the exchange
 /// fails. Callers whose policy is [`Forwarding::Prefer`] treat that as a signal
 /// to do the work locally; only [`Forwarding::Require`] surfaces it.
-pub fn forward(argv: &[String]) -> CliResult<Response> {
+pub fn forward(argv: &[OsString]) -> CliResult<Response> {
     forward_to(&endpoint(), argv)
 }
 
 #[cfg(unix)]
-fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
+pub(crate) fn connect_until(
+    path: &Path,
+    deadline: Instant,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::OwnedFd;
+
+    let timeout = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| Error::new(ErrorKind::TimedOut, "the IPC connect deadline expired"))?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.connect_timeout(&SockAddr::unix(path)?, timeout)?;
+    let descriptor: OwnedFd = socket.into();
+    let stream = std::os::unix::net::UnixStream::from(descriptor);
+    // `socket2::connect_timeout` may leave the descriptor nonblocking. The
+    // exchange below uses absolute-deadline socket timeouts, which require a
+    // blocking stream on macOS.
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn forward_to(path: &Path, argv: &[OsString]) -> CliResult<Response> {
+    let deadline = Instant::now() + IO_TIMEOUT;
+    let hello = exchange_until(path, &encode_hello(), deadline)?;
+    if hello.code != 0 {
+        return Err(CliError::ipc(format!(
+            "the running instance rejected protocol negotiation: {}",
+            String::from_utf8_lossy(&hello.stderr).trim()
+        )));
+    }
+
+    let cwd = std::env::current_dir().ok();
+    exchange_until(path, &encode_request(argv, cwd.as_deref()), deadline)
+}
+
+#[cfg(all(unix, test))]
+fn exchange(path: &Path, request: &str) -> CliResult<Response> {
+    exchange_until(path, request, Instant::now() + IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn exchange_until(path: &Path, request: &str, deadline: Instant) -> CliResult<Response> {
     use std::{
-        io::{Read, Write},
+        io::{ErrorKind, Read, Write},
         net::Shutdown,
-        os::unix::net::UnixStream,
     };
 
-    let mut stream = UnixStream::connect(path).map_err(|e| {
+    if request.len() > MAX_REQUEST_BYTES {
+        return Err(CliError::ipc(format!(
+            "the command requires {} request bytes, exceeding the \
+             {MAX_REQUEST_BYTES}-byte IPC limit",
+            request.len()
+        )));
+    }
+
+    let mut stream = connect_until(path, deadline).map_err(|e| {
         CliError::ipc(format!(
             "could not reach the running Scrozz at {}: {e}",
             path.display()
         ))
     })?;
 
-    let cwd = std::env::current_dir().ok();
-    let request = encode_request(argv, cwd.as_deref());
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| CliError::ipc(format!("could not send the request: {e}")))?;
+    let bytes = request.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        let remaining = remaining(deadline)?;
+        stream
+            .set_write_timeout(Some(remaining))
+            .map_err(|e| CliError::ipc(format!("could not bound the IPC request write: {e}")))?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(CliError::ipc(
+                    "the running instance stopped accepting the IPC request",
+                ));
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Err(deadline_exceeded());
+            }
+            Err(error) => {
+                return Err(CliError::ipc(format!(
+                    "could not send the IPC request: {error}"
+                )));
+            }
+        }
+    }
     // Half-close so the far side sees EOF and knows the request is complete
     // without needing a length prefix.
     stream
@@ -419,15 +621,52 @@ fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
         .map_err(|e| CliError::ipc(format!("could not finish the request: {e}")))?;
 
     let mut buffer = Vec::new();
-    stream
-        .read_to_end(&mut buffer)
-        .map_err(|e| CliError::ipc(format!("could not read the response: {e}")))?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let remaining = remaining(deadline)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| CliError::ipc(format!("could not bound the IPC response read: {e}")))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                if buffer.len().saturating_add(count) > MAX_RESPONSE_BYTES {
+                    return Err(CliError::ipc(format!(
+                        "the running instance exceeded the {MAX_RESPONSE_BYTES}-byte response limit"
+                    )));
+                }
+                buffer.extend_from_slice(&chunk[..count]);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Err(deadline_exceeded());
+            }
+            Err(error) => {
+                return Err(CliError::ipc(format!(
+                    "could not read the IPC response: {error}"
+                )));
+            }
+        }
+    }
 
     parse_response(&buffer)
 }
 
+#[cfg(unix)]
+fn remaining(deadline: Instant) -> CliResult<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(deadline_exceeded)
+}
+
+#[cfg(unix)]
+fn deadline_exceeded() -> CliError {
+    CliError::ipc("the IPC exchange exceeded its absolute deadline")
+}
+
 #[cfg(not(unix))]
-fn forward_to(_path: &Path, _argv: &[String]) -> CliResult<Response> {
+fn forward_to(_path: &Path, _argv: &[OsString]) -> CliResult<Response> {
     Err(CliError::ipc(
         "handing a command to a running instance needs named-pipe support, \
          which this build does not have yet",
@@ -444,8 +683,8 @@ mod tests {
         Cli::try_parse_from(argv).unwrap().command.unwrap()
     }
 
-    fn argv(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| (*s).to_string()).collect()
+    fn argv(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
     }
 
     // -- policy ------------------------------------------------------------
@@ -461,38 +700,38 @@ mod tests {
     }
 
     #[test]
-    fn starting_a_recording_prefers_the_running_instance() {
+    fn starting_a_recording_stays_local_until_the_gui_owns_a_live_session() {
         assert_eq!(
             policy(&command_of(&["scrozz", "record"])),
-            Forwarding::Prefer
+            Forwarding::Never
         );
     }
 
     #[test]
-    fn captures_prefer_the_running_instance() {
+    fn captures_stay_local_instead_of_blocking_the_gui() {
         assert_eq!(
             policy(&command_of(&["scrozz", "capture"])),
-            Forwarding::Prefer
+            Forwarding::Never
         );
         assert_eq!(
             policy(&command_of(&["scrozz", "capture", "--region", "0,0,10,10"])),
-            Forwarding::Prefer
+            Forwarding::Never
         );
     }
 
     #[test]
-    fn history_prefers_the_running_instance_because_of_the_store() {
+    fn history_uses_the_store_from_the_calling_process() {
         for args in [
             vec!["scrozz", "history", "list"],
             vec!["scrozz", "history", "delete", "abc"],
             vec!["scrozz", "history", "pin", "abc"],
         ] {
-            assert_eq!(policy(&command_of(&args)), Forwarding::Prefer, "{args:?}");
+            assert_eq!(policy(&command_of(&args)), Forwarding::Never, "{args:?}");
         }
     }
 
     #[test]
-    fn writing_a_setting_forwards_but_reading_one_does_not() {
+    fn settings_reads_and_writes_stay_local() {
         assert_eq!(
             policy(&command_of(&[
                 "scrozz",
@@ -501,7 +740,7 @@ mod tests {
                 "capture.format",
                 "png"
             ])),
-            Forwarding::Prefer
+            Forwarding::Never
         );
         assert_eq!(
             policy(&command_of(&["scrozz", "settings", "get"])),
@@ -541,22 +780,47 @@ mod tests {
     #[test]
     fn the_request_shape_is_pinned() {
         let request = encode_request(&argv(&["capture", "--json"]), Some(Path::new("/home/u")));
+        let parsed: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(parsed["schema"], REQUEST_SCHEMA);
+        assert_eq!(parsed["protocol"], PROTOCOL_TOKEN);
+        assert_eq!(parsed["kind"], "command");
+        assert_eq!(parsed["argv"][0], REQUEST_PROTOCOL_ARG);
+        assert_eq!(parsed["os_encoding"], os_encoding());
         assert_eq!(
-            request,
-            "{\"schema\":1,\"argv\":[\"capture\",\"--json\"],\"cwd\":\"/home/u\"}\n"
+            decode_os(&parsed["arguments"][0], os_encoding()).unwrap(),
+            "capture"
         );
+        assert_eq!(
+            decode_os(&parsed["arguments"][1], os_encoding()).unwrap(),
+            "--json"
+        );
+        assert_eq!(
+            decode_os(&parsed["cwd"], os_encoding()).unwrap(),
+            Path::new("/home/u")
+        );
+    }
+
+    #[test]
+    fn negotiation_and_commands_are_safe_against_an_older_clap_parser() {
+        assert!(encode_hello().contains(REQUEST_PROTOCOL_ARG));
+        assert!(Cli::try_parse_from(["scrozz", REQUEST_PROTOCOL_ARG]).is_err());
     }
 
     #[test]
     fn a_missing_working_directory_is_null_not_absent() {
         let request = encode_request(&argv(&["capture"]), None);
-        assert!(request.contains(r#""cwd":null"#));
+        let parsed: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert!(parsed["cwd"].is_null());
     }
 
     #[test]
     fn arguments_containing_quotes_survive_encoding() {
         let request = encode_request(&argv(&["capture", "--window", r#"He said "hi""#]), None);
-        assert!(request.contains(r#"He said \"hi\""#));
+        let parsed: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(
+            decode_os(&parsed["arguments"][2], os_encoding()).unwrap(),
+            r#"He said "hi""#
+        );
         assert_eq!(request.matches('\n').count(), 1);
     }
 
@@ -566,14 +830,89 @@ mod tests {
         // it would be a remote-command-injection bug against the daemon.
         let request = encode_request(&argv(&["capture", "--window", "a\nb"]), None);
         assert_eq!(request.matches('\n').count(), 1);
-        assert!(request.contains(r"a\nb"));
+        let parsed: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(
+            decode_os(&parsed["arguments"][2], os_encoding()).unwrap(),
+            "a\nb"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_round_trip_losslessly() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let argument = OsString::from_vec(vec![b'n', b'a', b'm', b'e', 0xff]);
+        let request = encode_request(std::slice::from_ref(&argument), None);
+        let parsed: serde_json::Value = serde_json::from_str(&request).unwrap();
+        let decoded = decode_os(&parsed["arguments"][0], os_encoding()).unwrap();
+
+        assert_eq!(
+            decoded.as_os_str().as_bytes(),
+            argument.as_os_str().as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_requests_fail_before_connecting() {
+        let argument = OsString::from("x".repeat(MAX_REQUEST_BYTES));
+        let request = encode_request(&[argument], None);
+        assert!(request.len() > MAX_REQUEST_BYTES);
+
+        let error = exchange(Path::new("/does/not/exist"), &request).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("request bytes"), "{message}");
+        assert!(message.contains("IPC limit"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_drip_response_cannot_extend_the_absolute_deadline() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
+
+        let path = PathBuf::from(format!(
+            "/tmp/scrozz-ipc-deadline-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("test listener");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test connection");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("test request");
+            for byte in b"SCROZZ/3 0 text 0 0\n" {
+                std::thread::sleep(Duration::from_millis(30));
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let error =
+            exchange_until(&path, "{}\n", started + Duration::from_millis(120)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the absolute deadline was not enforced"
+        );
+        assert!(
+            error.to_string().contains("absolute deadline"),
+            "unexpected error: {error}"
+        );
+
+        server.join().expect("test server");
+        let _ = std::fs::remove_file(path);
     }
 
     // -- response parsing --------------------------------------------------
 
     #[test]
     fn a_well_formed_response_parses() {
-        let raw = b"SCROZZ/2 0 json 11 0\n{\"ok\":true}";
+        let raw = b"SCROZZ/3 0 json 11 0\n{\"ok\":true}";
         let response = parse_response(raw).unwrap();
         assert_eq!(response.code, 0);
         assert_eq!(response.stream, StreamKind::Json);
@@ -584,7 +923,7 @@ mod tests {
     #[test]
     fn a_binary_payload_survives_untouched() {
         let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff];
-        let mut raw = b"SCROZZ/2 0 binary 10 0\n".to_vec();
+        let mut raw = b"SCROZZ/3 0 binary 10 0\n".to_vec();
         raw.extend_from_slice(&png);
         let response = parse_response(&raw).unwrap();
         assert_eq!(response.stream, StreamKind::Binary);
@@ -594,7 +933,7 @@ mod tests {
 
     #[test]
     fn payloads_containing_newlines_are_not_truncated_or_mixed() {
-        let raw = b"SCROZZ/2 7 text 18 11\nline one\nline two\nerror\nmore\n";
+        let raw = b"SCROZZ/3 7 text 18 11\nline one\nline two\nerror\nmore\n";
         let response = parse_response(raw).unwrap();
         assert_eq!(response.stdout, b"line one\nline two\n");
         assert_eq!(response.stderr, b"error\nmore\n");
@@ -602,7 +941,7 @@ mod tests {
 
     #[test]
     fn an_empty_payload_is_valid() {
-        let response = parse_response(b"SCROZZ/2 3 text 0 0\n").unwrap();
+        let response = parse_response(b"SCROZZ/3 3 text 0 0\n").unwrap();
         assert_eq!(response.code, 3);
         assert!(response.stdout.is_empty());
         assert!(response.stderr.is_empty());
@@ -611,7 +950,7 @@ mod tests {
     #[test]
     fn every_exit_code_relays_verbatim() {
         for code in crate::exit::Exit::all() {
-            let raw = format!("SCROZZ/2 {} text 0 0\n", code.code());
+            let raw = format!("SCROZZ/3 {} text 0 0\n", code.code());
             let response = parse_response(raw.as_bytes()).unwrap();
             assert_eq!(response.code, code.code());
         }
@@ -628,22 +967,22 @@ mod tests {
         let err = parse_response(b"SCROZZ/1 0 json\n{}").unwrap_err();
         let message = err.to_string();
         assert!(message.contains("SCROZZ/1"), "{message}");
-        assert!(message.contains("SCROZZ/2"), "{message}");
+        assert!(message.contains("SCROZZ/3"), "{message}");
         assert!(message.contains("different versions"), "{message}");
     }
 
     #[test]
     fn malformed_headers_are_rejected_one_by_one() {
         let cases: [(&[u8], &str); 9] = [
-            (b"SCROZZ/2\n", "no exit code"),
-            (b"SCROZZ/2 abc json 0 0\n", "malformed exit code"),
-            (b"SCROZZ/2 0\n", "no stream kind"),
-            (b"SCROZZ/2 0 pictures 0 0\n", "unknown stream kind"),
-            (b"SCROZZ/2 0 text\n", "no stdout payload length"),
-            (b"SCROZZ/2 0 text abc 0\n", "malformed stdout"),
-            (b"SCROZZ/2 0 text 0 abc\n", "malformed stderr"),
-            (b"SCROZZ/2 0 text 0 0 extra\n", "unexpected trailing"),
-            (b"SCROZZ/2 0 text 1 0\n", "announced 1 payload bytes"),
+            (b"SCROZZ/3\n", "no exit code"),
+            (b"SCROZZ/3 abc json 0 0\n", "malformed exit code"),
+            (b"SCROZZ/3 0\n", "no stream kind"),
+            (b"SCROZZ/3 0 pictures 0 0\n", "unknown stream kind"),
+            (b"SCROZZ/3 0 text\n", "no stdout payload length"),
+            (b"SCROZZ/3 0 text abc 0\n", "malformed stdout"),
+            (b"SCROZZ/3 0 text 0 abc\n", "malformed stderr"),
+            (b"SCROZZ/3 0 text 0 0 extra\n", "unexpected trailing"),
+            (b"SCROZZ/3 0 text 1 0\n", "announced 1 payload bytes"),
         ];
         for (raw, expected) in cases {
             let err = parse_response(raw).unwrap_err();
@@ -657,7 +996,14 @@ mod tests {
 
     #[test]
     fn an_exit_code_beyond_a_byte_is_rejected() {
-        assert!(parse_response(b"SCROZZ/2 300 json 0 0\n").is_err());
+        assert!(parse_response(b"SCROZZ/3 300 json 0 0\n").is_err());
+    }
+
+    #[test]
+    fn an_announced_oversized_response_is_rejected_without_a_payload() {
+        let raw = format!("SCROZZ/3 0 binary {} 0\n", MAX_RESPONSE_BYTES + 1);
+        let error = parse_response(raw.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("response limit"), "{error}");
     }
 
     #[test]

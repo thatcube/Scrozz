@@ -72,11 +72,11 @@ pub struct GlobalArgs {
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 
-    /// Never hand the command to an already-running Scrozz instance.
+    /// Never hand live-state work to an already-running Scrozz instance.
     ///
-    /// By default a capture taken while the menu-bar app is running is performed
-    /// *by* that app, so the result joins the existing capture stack instead of
-    /// starting a second copy of Scrozz. This forces the work to happen here.
+    /// Commands that need process-owned state, such as `record --stop`, normally
+    /// ask the running menu-bar app to perform the operation. Pure capture, OCR,
+    /// barcode, history, settings, and query commands always run locally.
     #[arg(long, global = true)]
     pub no_ipc: bool,
 }

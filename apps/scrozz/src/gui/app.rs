@@ -77,6 +77,10 @@ pub const DEADLINE_ENV: &str = "SCROZZ_GUI_TIMEOUT_MS";
 /// The end-to-end path without touching the keyboard.
 pub const AUTOCAPTURE_ENV: &str = "SCROZZ_GUI_CAPTURE_ON_START";
 
+const IPC_REQUESTS_PER_TICK: usize = 8;
+const PIPELINE_OUTCOMES_PER_TICK: usize = 64;
+const NOTE_CAPACITY: usize = 256;
+
 /// How the GUI was asked to run.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -352,26 +356,21 @@ impl App {
         // Collected before any is served: serving needs `&mut self`, and the
         // listener is borrowed for as long as it is being polled.
         let mut pending = Vec::new();
-        if let Some(server) = &self.server {
-            while let Some(request) = server.poll() {
+        if let Some(server) = &mut self.server {
+            for _ in 0..IPC_REQUESTS_PER_TICK {
+                let Some(request) = server.poll() else {
+                    break;
+                };
                 pending.push(request);
             }
         }
 
         for request in pending {
             tracing::debug!(?request, "a forwarded command arrived");
-            // The command runs to completion here, on the main thread, because
-            // it must produce byte-identical output to a local run and the
-            // command layer is synchronous. A capture is tens of milliseconds;
-            // a recording returns as soon as it has started.
-            if let Some(command) = request.serve() {
-                self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
-                if matches!(command, crate::cli::Command::Gui) {
-                    // A second `scrozz gui` means "show yourself", not "start
-                    // again". There is nothing to show yet, so it is a no-op
-                    // that has at least been answered rather than ignored.
-                    self.note("a second launch was answered by this instance");
-                }
+            if !self.pipeline.post(Job::Forward(request)) {
+                tracing::warn!(
+                    "an IPC request was rejected because the worker queue is full or stopped"
+                );
             }
         }
 
@@ -383,7 +382,10 @@ impl App {
     }
 
     fn drain_pipeline(&mut self) {
-        while let Some(outcome) = self.pipeline.poll() {
+        for _ in 0..PIPELINE_OUTCOMES_PER_TICK {
+            let Some(outcome) = self.pipeline.poll() else {
+                break;
+            };
             match outcome {
                 Outcome::Ready(card) => {
                     self.captures += 1;
@@ -403,6 +405,11 @@ impl App {
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
+                Outcome::Forwarded(command) => {
+                    if let Some(command) = command {
+                        self.note(format!("processed forwarded {}", command.slug()));
+                    }
+                }
             }
         }
     }
@@ -416,26 +423,44 @@ impl App {
         for event in pending {
             match event {
                 CardEvent::Copy(id) => {
-                    self.pipeline.post(Job::Copy(id));
+                    if !self.pipeline.post(Job::Copy(id)) {
+                        self.note(format!(
+                            "{id} could not be copied because the worker is busy"
+                        ));
+                    }
                 }
                 CardEvent::Save(id) => {
-                    self.pipeline.post(Job::Save(id));
+                    if !self.pipeline.post(Job::Save(id)) {
+                        self.note(format!(
+                            "{id} could not be saved because the worker is busy"
+                        ));
+                    }
                 }
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
                     // The bytes are only worth holding while a card can still
                     // ask for them.
-                    self.pipeline.post(Job::Release(id));
+                    self.release_card(id);
                     self.note(format!("{id} dismissed"));
                 }
-                // Not yet routed. The drag payload is `scrozz-shell`'s
-                // `DragSource`, and collapsing into the dock is the capture
-                // stack's own animation — both belong to the surface that
-                // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
+                CardEvent::Drag(id) => {
+                    // The drag destination owns its copy now, and the overlay
+                    // has already removed the card from its address map.
+                    self.release_card(id);
+                    self.note(format!("{id} dragged out"));
+                }
+                // Not yet routed. Collapsing belongs to the stack animation,
+                // while Open needs the annotation editor.
+                CardEvent::Collapse(id) | CardEvent::Open(id) => {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
             }
+        }
+    }
+
+    fn release_card(&mut self, id: CardId) {
+        if !self.pipeline.post(Job::Release(id)) {
+            self.note(format!("{id} could not release its cached capture"));
         }
     }
 
@@ -486,13 +511,17 @@ impl App {
 
         let card = self.pipeline.allocate();
         if !self.pipeline.post(Job::Capture { kind, card }) {
-            self.note("the capture worker has gone");
+            self.note("the capture worker is busy or has stopped");
         }
     }
 
     fn note(&mut self, what: impl Into<String>) {
         let what = what.into();
         tracing::info!("{what}");
+        if self.notes.len() >= NOTE_CAPACITY {
+            let overflow = self.notes.len() + 1 - NOTE_CAPACITY;
+            self.notes.drain(..overflow);
+        }
         self.notes.push(what);
     }
 
@@ -634,6 +663,18 @@ mod tests {
         let (mut app, _) = app();
         assert_eq!(app.perform(Action::Quit), Tick::Stop);
         assert!(app.notes().iter().any(|n| n == "quit"));
+    }
+
+    #[test]
+    fn diagnostic_notes_have_a_fixed_memory_bound() {
+        let (mut app, _) = app();
+        for index in 0..=NOTE_CAPACITY {
+            app.note(format!("note-{index}"));
+        }
+
+        assert_eq!(app.notes().len(), NOTE_CAPACITY);
+        assert!(!app.notes().iter().any(|note| note == "note-0"));
+        assert_eq!(app.notes().last().map(String::as_str), Some("note-256"));
     }
 
     #[test]

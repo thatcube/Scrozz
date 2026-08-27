@@ -2,11 +2,10 @@
 //!
 //! # The problem this solves
 //!
-//! Once the menu-bar app is running it owns things a second process cannot see:
-//! the capture stack on screen, the recording in progress, the hotkey
-//! registrations. A `scrozz capture` typed into a terminal at that moment must
-//! therefore happen *inside* the running app, so the result joins the stack the
-//! user is already looking at rather than appearing nowhere.
+//! Once the menu-bar app is running it owns live state a second process cannot
+//! see, such as an in-progress recording. Operations against that state must
+//! happen inside the owning process; pure capture, OCR, barcode, history,
+//! settings, and query commands deliberately remain local.
 //!
 //! [`crate::ipc`] already has the client half — [`crate::ipc::forward`] is what
 //! the terminal process calls, and `main` already routes through it. This module
@@ -15,7 +14,7 @@
 //!
 //! # Fidelity
 //!
-//! A forwarded command must produce byte-identical output to a local one; the
+//! A forwarded operation must produce byte-identical output to a local one; the
 //! whole point is that a script cannot tell the difference. So the answer is
 //! built exactly the way [`crate::report::Reporter::emit`] builds it — raw bytes
 //! when there are raw bytes, the JSON envelope when `--json` was passed, the
@@ -27,7 +26,15 @@
 //! between servicing the tray and the hotkey queue, and a blocking `accept()`
 //! there would freeze the menu bar until someone happened to run a command.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     cli::{Cli, Command},
@@ -39,11 +46,15 @@ use crate::{
 
 /// A request from another process, waiting for its answer.
 pub struct Request {
-    /// The argument vector as typed, `argv[0]` included.
-    pub argv: Vec<String>,
-    /// The caller's working directory, so relative `--output` paths resolve
-    /// against *their* directory rather than the daemon's.
+    /// The argument vector after the caller's program name.
+    pub argv: Vec<OsString>,
+    /// The losslessly encoded caller directory carried by the protocol.
+    ///
+    /// It is not applied while the only forwardable operation is pathless
+    /// `record --stop`; changing cwd in a multithreaded GUI would be unsafe.
     pub cwd: Option<PathBuf>,
+    /// A negotiation/rejection response that must be sent without dispatch.
+    preflight: Option<Response>,
     #[cfg(unix)]
     stream: std::os::unix::net::UnixStream,
 }
@@ -53,12 +64,13 @@ impl std::fmt::Debug for Request {
         f.debug_struct("Request")
             .field("argv", &self.argv)
             .field("cwd", &self.cwd)
+            .field("preflight", &self.preflight.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl Request {
-    /// Runs the command and answers the caller.
+    /// Runs the command and prepares its answer for the response worker.
     ///
     /// Consumes the request, because the socket must be closed either way: a
     /// branch that forgot to reply would leave the terminal hanging on a read
@@ -66,28 +78,96 @@ impl Request {
     ///
     /// Returns what the command was, so the app can decide whether it also has
     /// local work to do — showing a card for a forwarded capture, or quitting.
-    pub fn serve(self) -> Option<Command> {
-        let (command, response) = run(&self.argv, self.cwd.as_deref());
-        self.reply(&response);
-        command
+    pub fn execute(mut self) -> (Option<Command>, Reply) {
+        let (command, response) = if let Some(response) = self.preflight.take() {
+            (None, response)
+        } else {
+            run(&self.argv, self.cwd.as_deref())
+        };
+        (command, self.into_reply(response))
     }
 
     #[cfg(unix)]
-    fn reply(self, response: &Response) {
-        use std::{io::Write, net::Shutdown};
-
-        let mut stream = self.stream;
-        let bytes = ipc::encode_response(response);
-        if let Err(err) = stream.write_all(&bytes) {
-            tracing::warn!("could not answer a forwarded command: {err}");
+    fn into_reply(self, response: Response) -> Reply {
+        Reply {
+            stream: self.stream,
+            bytes: ipc::encode_response(&response),
         }
-        let _ = stream.flush();
-        // The client reads to EOF, so it only sees the answer once we close.
-        let _ = stream.shutdown(Shutdown::Both);
     }
 
     #[cfg(not(unix))]
-    fn reply(self, _response: &Response) {}
+    fn into_reply(self, _response: Response) -> Reply {
+        Reply {}
+    }
+
+    #[cfg(test)]
+    fn serve(self) -> Option<Command> {
+        let (command, reply) = self.execute();
+        reply.send();
+        command
+    }
+}
+
+/// An encoded answer waiting for the dedicated response worker.
+pub struct Reply {
+    #[cfg(unix)]
+    stream: std::os::unix::net::UnixStream,
+    #[cfg(unix)]
+    bytes: Vec<u8>,
+}
+
+impl Reply {
+    /// Writes the answer without occupying the capture worker.
+    #[cfg(unix)]
+    pub fn send(mut self) {
+        use std::{
+            io::{ErrorKind, Write},
+            net::Shutdown,
+        };
+
+        const RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
+
+        if let Err(error) = self.stream.set_nonblocking(false) {
+            tracing::warn!("could not prepare an IPC response stream: {error}");
+            return;
+        }
+
+        let deadline = Instant::now() + RESPONSE_DEADLINE;
+        let mut written = 0;
+        while written < self.bytes.len() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                tracing::warn!("an IPC response exceeded its 5-second deadline");
+                return;
+            };
+            if remaining.is_zero() {
+                tracing::warn!("an IPC response exceeded its 5-second deadline");
+                return;
+            }
+            if let Err(error) = self.stream.set_write_timeout(Some(remaining)) {
+                tracing::warn!("could not bound an IPC response write: {error}");
+                return;
+            }
+            match self.stream.write(&self.bytes[written..]) {
+                Ok(0) => {
+                    tracing::warn!("an IPC client stopped accepting its response");
+                    return;
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    tracing::warn!("could not answer a forwarded command: {error}");
+                    return;
+                }
+            }
+        }
+
+        // The client reads to EOF, so it only sees the answer once we close.
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    /// No listener exists on this platform, so no response can be pending.
+    #[cfg(not(unix))]
+    pub const fn send(self) {}
 }
 
 /// Executes a forwarded argument vector, exactly as a local run would.
@@ -95,7 +175,7 @@ impl Request {
 /// Separated from [`Request`] so the fidelity rules can be tested without a
 /// socket, which is the part most likely to drift from
 /// [`crate::report::Reporter::emit`].
-fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+fn run(argv: &[OsString], _cwd: Option<&Path>) -> (Option<Command>, Response) {
     use clap::Parser as _;
 
     if argv.is_empty() {
@@ -114,7 +194,7 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     // `scrozz`. That failure is invisible: the response comes back well-formed,
     // for the wrong command.
     let mut with_argv0 = Vec::with_capacity(argv.len() + 1);
-    with_argv0.push("scrozz".to_owned());
+    with_argv0.push(OsString::from("scrozz"));
     with_argv0.extend_from_slice(argv);
 
     let cli = match Cli::try_parse_from(&with_argv0) {
@@ -126,14 +206,19 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
 
     let command = cli.command.clone().unwrap_or(Command::Gui);
     let slug = command.slug();
+    if ipc::policy(&command) == ipc::Forwarding::Never {
+        let error = CliError::ipc(format!(
+            "{} must run in the calling process rather than the GUI listener",
+            command.slug()
+        ));
+        return (Some(command), response_for_error(&cli, &slug, &error));
+    }
 
-    // Relative paths belong to the caller's directory, not the daemon's. The
-    // restore matters as much as the switch: this is the GUI's own process, and
-    // every later capture would otherwise inherit whatever directory the last
-    // forwarded command happened to run in.
-    let restore = enter(cwd);
+    // The only forwardable operation is `record --stop`, which takes no path.
+    // Never change a multithreaded GUI process's current directory: cwd is
+    // process-global, so even a perfectly restored temporary switch races every
+    // other thread resolving a relative path.
     let result = cli.validate().and_then(|()| commands::dispatch(&command));
-    restore();
 
     let response = match result {
         Ok(report) => {
@@ -159,31 +244,18 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
                 text(0, line(report.human))
             }
         }
-        Err(err) => {
-            let code = err.exit().code();
-            if cli.global.json {
-                json(code, line(error_envelope(&slug, &err).to_compact_string()))
-            } else {
-                stderr(code, err.to_human())
-            }
-        }
+        Err(err) => response_for_error(&cli, &slug, &err),
     };
 
     (Some(command), response)
 }
 
-/// Switches to `target`, returning how to switch back.
-fn enter(target: Option<&Path>) -> impl FnOnce() {
-    let previous = target.and_then(|dir| {
-        let here = std::env::current_dir().ok()?;
-        std::env::set_current_dir(dir).ok()?;
-        Some(here)
-    });
-
-    move || {
-        if let Some(here) = previous {
-            let _ = std::env::set_current_dir(here);
-        }
+fn response_for_error(cli: &Cli, slug: &str, error: &CliError) -> Response {
+    let code = error.exit().code();
+    if cli.global.json {
+        json(code, line(error_envelope(slug, error).to_compact_string()))
+    } else {
+        stderr(code, error.to_human())
     }
 }
 
@@ -227,6 +299,91 @@ pub struct Server {
     path: PathBuf,
     #[cfg(unix)]
     listener: std::os::unix::net::UnixListener,
+    #[cfg(unix)]
+    pending: VecDeque<Pending>,
+    #[cfg(unix)]
+    _instance_lock: std::fs::File,
+}
+
+#[cfg(unix)]
+struct Pending {
+    stream: std::os::unix::net::UnixStream,
+    raw: Vec<u8>,
+    accepted: Instant,
+}
+
+#[cfg(unix)]
+const MAX_PENDING: usize = 64;
+#[cfg(unix)]
+const ACCEPT_BUDGET: usize = 8;
+#[cfg(unix)]
+const PENDING_BUDGET: usize = 8;
+
+#[cfg(unix)]
+enum PendingProgress {
+    Waiting,
+    Drop,
+    Ready,
+    Reject(String),
+}
+
+#[cfg(unix)]
+impl Pending {
+    fn advance(&mut self) -> PendingProgress {
+        use std::io::{ErrorKind, Read};
+
+        const READ_BUDGET: usize = 64 * 1024;
+        const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
+
+        if self.accepted.elapsed() >= CONNECTION_DEADLINE {
+            return PendingProgress::Reject(
+                "the IPC request did not complete within 5 seconds".to_owned(),
+            );
+        }
+
+        let mut read = 0;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) if self.raw.is_empty() => return PendingProgress::Drop,
+                Ok(0) => {
+                    return PendingProgress::Reject(
+                        "the IPC request ended before its newline frame".to_owned(),
+                    );
+                }
+                Ok(count) => {
+                    self.raw.extend_from_slice(&chunk[..count]);
+                    read += count;
+                    if self.raw.len() > ipc::MAX_REQUEST_BYTES {
+                        return PendingProgress::Reject(format!(
+                            "the IPC request exceeded the {}-byte limit",
+                            ipc::MAX_REQUEST_BYTES
+                        ));
+                    }
+                    if let Some(end) = self.raw.iter().position(|byte| *byte == b'\n') {
+                        if end + 1 != self.raw.len() {
+                            return PendingProgress::Reject(
+                                "the IPC request carried bytes after its newline frame".to_owned(),
+                            );
+                        }
+                        return PendingProgress::Ready;
+                    }
+                    if read >= READ_BUDGET {
+                        return PendingProgress::Waiting;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    return PendingProgress::Waiting;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return PendingProgress::Reject(format!(
+                        "could not read the IPC request: {error}"
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl Server {
@@ -251,6 +408,7 @@ impl Server {
     /// As [`Server::bind`].
     #[cfg(unix)]
     pub fn bind_at(path: PathBuf) -> CliResult<Self> {
+        use std::fs::OpenOptions;
         use std::os::unix::net::UnixListener;
 
         if let Some(parent) = path.parent() {
@@ -262,6 +420,26 @@ impl Server {
             })?;
         }
 
+        let lock_path = instance_lock_path(&path);
+        let instance_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                CliError::ipc(format!(
+                    "could not open the instance lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        instance_lock.try_lock().map_err(|error| {
+            CliError::ipc(format!(
+                "another Scrozz is starting or running (instance lock {}: {error})",
+                lock_path.display()
+            ))
+        })?;
+
         clear_stale(&path)?;
 
         let listener = UnixListener::bind(&path)
@@ -271,7 +449,12 @@ impl Server {
         })?;
 
         tracing::debug!(path = %path.display(), "listening for forwarded commands");
-        Ok(Self { path, listener })
+        Ok(Self {
+            path,
+            listener,
+            pending: VecDeque::new(),
+            _instance_lock: instance_lock,
+        })
     }
 
     /// Named-pipe support is not built yet, so there is nothing to listen on.
@@ -283,46 +466,67 @@ impl Server {
     #[cfg(not(unix))]
     pub fn bind_at(path: PathBuf) -> CliResult<Self> {
         tracing::warn!(
-            "this build has no named-pipe listener, so `scrozz capture` from a \
-             terminal will run in its own process"
+            "this build has no named-pipe listener, so live-state operations \
+             such as `scrozz record --stop` cannot be forwarded"
         );
         Ok(Self { path })
     }
 
     /// Takes one pending request, if there is one. Never blocks.
     #[cfg(unix)]
-    pub fn poll(&self) -> Option<Request> {
-        use std::io::{ErrorKind, Read};
+    pub fn poll(&mut self) -> Option<Request> {
+        use std::io::ErrorKind;
 
-        let (mut stream, _) = match self.listener.accept() {
-            Ok(pair) => pair,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return None,
-            Err(e) => {
-                tracing::warn!("could not accept a forwarded command: {e}");
-                return None;
+        for _ in 0..ACCEPT_BUDGET {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    if self.pending.len() >= MAX_PENDING {
+                        tracing::warn!(
+                            "refusing an IPC connection because {MAX_PENDING} are already pending"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                    if let Err(error) = stream.set_nonblocking(true) {
+                        tracing::warn!("could not make an IPC connection nonblocking: {error}");
+                        continue;
+                    }
+                    self.pending.push_back(Pending {
+                        stream,
+                        raw: Vec::new(),
+                        accepted: Instant::now(),
+                    });
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    tracing::warn!("could not accept a forwarded command: {error}");
+                    break;
+                }
             }
-        };
-
-        // An accepted socket does not inherit non-blocking on every platform,
-        // and the client half-closes after writing, so a blocking read to EOF is
-        // bounded and correct.
-        let _ = stream.set_nonblocking(false);
-        let mut raw = Vec::new();
-        if let Err(e) = stream.read_to_end(&mut raw) {
-            tracing::warn!("could not read a forwarded command: {e}");
-            return None;
         }
 
-        let line = String::from_utf8_lossy(&raw);
-        let argv = string_array(&line, "argv")?;
-        let cwd = string_field(&line, "cwd").map(PathBuf::from);
-        Some(Request { argv, cwd, stream })
+        let pending_budget = self.pending.len().min(PENDING_BUDGET);
+        for _ in 0..pending_budget {
+            let mut pending = self
+                .pending
+                .pop_front()
+                .expect("the pending budget was derived from the queue length");
+            match pending.advance() {
+                PendingProgress::Waiting => self.pending.push_back(pending),
+                PendingProgress::Drop => {}
+                PendingProgress::Ready => return Some(parse_request(pending)),
+                PendingProgress::Reject(message) => {
+                    return Some(rejected_request(pending.stream, message));
+                }
+            }
+        }
+        None
     }
 
     /// Nothing arrives without a listener.
     #[cfg(not(unix))]
     #[must_use]
-    pub const fn poll(&self) -> Option<Request> {
+    pub const fn poll(&mut self) -> Option<Request> {
         None
     }
 
@@ -343,129 +547,191 @@ impl Drop for Server {
 
 /// Removes a socket file left behind by a crash.
 ///
-/// Done by connecting rather than by a lock file: a lock file records what a
-/// process *intended*, and a killed process leaves one behind saying it is still
-/// running. A connection refused is proof.
+/// The caller holds the instance lock across this check and the subsequent
+/// bind, so another launcher cannot race between the probe and removal.
 #[cfg(unix)]
 fn clear_stale(path: &Path) -> CliResult<()> {
-    use std::os::unix::net::UnixStream;
+    use std::{io::ErrorKind, os::unix::fs::FileTypeExt as _};
 
-    if !path.exists() {
-        return Ok(());
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CliError::ipc(format!(
+                "could not inspect the existing instance endpoint {}: {error}",
+                path.display()
+            )));
+        }
+    };
+
+    if metadata.file_type().is_socket() {
+        match ipc::connect_until(path, Instant::now() + Duration::from_millis(250)) {
+            Ok(_) => {
+                return Err(CliError::ipc(format!(
+                    "another Scrozz is already running and listening at {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == ErrorKind::ConnectionRefused => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(CliError::ipc(format!(
+                    "could not prove the existing instance socket {} is stale; \
+                     refusing to remove it: {error}",
+                    path.display()
+                )));
+            }
+        }
     }
-    if UnixStream::connect(path).is_ok() {
-        return Err(CliError::ipc(format!(
-            "another Scrozz is already running and listening at {}",
+
+    std::fs::remove_file(path).map_err(|error| {
+        CliError::ipc(format!(
+            "could not remove the stale instance socket {}: {error}",
             path.display()
-        )));
-    }
-    let _ = std::fs::remove_file(path);
+        ))
+    })?;
     Ok(())
 }
 
-/// Pulls a JSON string array out of the request line.
-///
-/// A full parser would be nicer, but this crate has no JSON reader and the input
-/// is not arbitrary: it is produced by [`crate::ipc::encode_request`] in the same
-/// protocol version, and the header check in
-/// [`crate::ipc::parse_response`] guards the version. What matters is that a
-/// malformed line yields `None` rather than a panic, because it arrives from
-/// outside this process.
-fn string_array(line: &str, key: &str) -> Option<Vec<String>> {
-    let bytes = line.as_bytes();
-    let mut at = line.find(&format!("\"{key}\":["))? + key.len() + 4;
-    let mut values = Vec::new();
+#[cfg(unix)]
+fn instance_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
 
-    loop {
-        match bytes.get(at)? {
-            b']' => return Some(values),
-            b'"' => {
-                let (value, end) = read_string(line, at + 1)?;
-                values.push(value);
-                at = end + 1;
-            }
-            // Whitespace and the separating commas.
-            _ => at += 1,
+#[cfg(unix)]
+fn parse_request(pending: Pending) -> Request {
+    let value: serde_json::Value = match serde_json::from_slice(&pending.raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return rejected_request(
+                pending.stream,
+                format!("the IPC request was not valid JSON: {error}"),
+            );
         }
+    };
+    let schema = value.get("schema").and_then(serde_json::Value::as_i64);
+    let protocol = value.get("protocol").and_then(serde_json::Value::as_str);
+    let guarded = value
+        .get("argv")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|argv| argv.first())
+        .and_then(serde_json::Value::as_str)
+        == Some(ipc::REQUEST_PROTOCOL_ARG);
+    if schema != Some(ipc::REQUEST_SCHEMA) || protocol != Some(ipc::PROTOCOL_TOKEN) || !guarded {
+        return Request {
+            argv: Vec::new(),
+            cwd: None,
+            preflight: Some(protocol_rejection(schema, protocol, guarded)),
+            stream: pending.stream,
+        };
+    }
+
+    let encoding = match value.get("os_encoding").and_then(serde_json::Value::as_str) {
+        Some(encoding) => encoding,
+        None => return rejected_request(pending.stream, "missing os_encoding".to_owned()),
+    };
+    let arguments = match value.get("arguments").and_then(serde_json::Value::as_array) {
+        Some(arguments) => arguments,
+        None => return rejected_request(pending.stream, "missing arguments".to_owned()),
+    };
+    let argv = match arguments
+        .iter()
+        .map(|argument| ipc::decode_os(argument, encoding))
+        .collect::<CliResult<Vec<_>>>()
+    {
+        Ok(argv) => argv,
+        Err(error) => return rejected_request(pending.stream, error.to_human()),
+    };
+    let cwd = match value.get("cwd") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(cwd) => match ipc::decode_os(cwd, encoding) {
+            Ok(cwd) => Some(PathBuf::from(cwd)),
+            Err(error) => return rejected_request(pending.stream, error.to_human()),
+        },
+    };
+    let kind = value.get("kind").and_then(serde_json::Value::as_str);
+    let preflight = match kind {
+        Some("hello") if argv.is_empty() && cwd.is_none() => Some(text(0, String::new())),
+        Some("command") => None,
+        _ => Some(protocol_rejection(schema, protocol, guarded)),
+    };
+    Request {
+        argv,
+        cwd,
+        preflight,
+        stream: pending.stream,
     }
 }
 
-/// Pulls a nullable JSON string field out of the request line.
-fn string_field(line: &str, key: &str) -> Option<String> {
-    let at = line.find(&format!("\"{key}\":\""))? + key.len() + 4;
-    read_string(line, at).map(|(value, _)| value)
+#[cfg(unix)]
+fn rejected_request(stream: std::os::unix::net::UnixStream, message: String) -> Request {
+    let error = CliError::ipc(message);
+    Request {
+        argv: Vec::new(),
+        cwd: None,
+        preflight: Some(stderr(error.exit().code(), error.to_human())),
+        stream,
+    }
 }
 
-/// Reads one JSON string body starting at `from`, just after the opening quote.
-///
-/// Returns the decoded value and the byte index of its closing quote.
-fn read_string(line: &str, from: usize) -> Option<(String, usize)> {
-    let bytes = line.as_bytes();
-    let mut out = String::new();
-    let mut at = from;
-
-    while at < bytes.len() {
-        match bytes[at] {
-            b'"' => return Some((out, at)),
-            b'\\' => {
-                at += 1;
-                let escaped = *bytes.get(at)?;
-                match escaped {
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'b' => out.push('\u{8}'),
-                    b'f' => out.push('\u{c}'),
-                    b'u' => {
-                        // `Json::str` only escapes control characters this way,
-                        // so four hex digits and never a surrogate pair.
-                        let hex = line.get(at + 1..at + 5)?;
-                        out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
-                        at += 4;
-                    }
-                    other => out.push(char::from(other)),
-                }
-                at += 1;
-            }
-            _ => {
-                // Multi-byte characters pass through whole; indexing on a char
-                // boundary is what makes the slice below safe.
-                let rest = line.get(at..)?;
-                let ch = rest.chars().next()?;
-                out.push(ch);
-                at += ch.len_utf8();
-            }
-        }
-    }
-    None
+fn protocol_rejection(schema: Option<i64>, protocol: Option<&str>, guarded: bool) -> Response {
+    let error = CliError::ipc(format!(
+        "the request protocol is incompatible (schema {schema:?}, protocol {protocol:?}, \
+         guarded argv {guarded}); this instance requires schema {} and {}",
+        ipc::REQUEST_SCHEMA,
+        ipc::PROTOCOL_TOKEN
+    ));
+    stderr(error.exit().code(), error.to_human())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| (*s).to_owned()).collect()
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    fn request_json(line: &str) -> serde_json::Value {
+        serde_json::from_str(line).expect("valid request JSON")
+    }
+
+    fn decoded_arguments(value: &serde_json::Value) -> Vec<OsString> {
+        let encoding = value["os_encoding"].as_str().expect("OS encoding");
+        value["arguments"]
+            .as_array()
+            .expect("argument array")
+            .iter()
+            .map(|argument| ipc::decode_os(argument, encoding).expect("encoded OS string"))
+            .collect()
     }
 
     #[test]
     fn an_argv_array_round_trips_through_the_wire_format() {
         let sent = argv(&["scrozz", "capture", "--json"]);
         let line = ipc::encode_request(&sent, None);
-        assert_eq!(string_array(&line, "argv"), Some(sent));
+        let value = request_json(&line);
+        assert_eq!(decoded_arguments(&value), sent);
+        assert_eq!(value["argv"][0], ipc::REQUEST_PROTOCOL_ARG);
+        assert_eq!(value["schema"], ipc::REQUEST_SCHEMA);
+        assert_eq!(value["protocol"], ipc::PROTOCOL_TOKEN);
     }
 
     #[test]
     fn a_cwd_round_trips_and_is_absent_when_not_sent() {
         let sent = argv(&["scrozz"]);
         let with = ipc::encode_request(&sent, Some(Path::new("/Users/someone/work")));
+        let value = request_json(&with);
         assert_eq!(
-            string_field(&with, "cwd").as_deref(),
-            Some("/Users/someone/work")
+            ipc::decode_os(&value["cwd"], value["os_encoding"].as_str().unwrap()).unwrap(),
+            OsStr::new("/Users/someone/work")
         );
 
         let without = ipc::encode_request(&sent, None);
-        assert_eq!(string_field(&without, "cwd"), None);
+        assert!(request_json(&without)["cwd"].is_null());
     }
 
     #[test]
@@ -473,44 +739,48 @@ mod tests {
         // The case a naive split on `","` gets wrong.
         let sent = argv(&["scrozz", "capture", "-o", r#"/a "quoted" name.png"#]);
         let line = ipc::encode_request(&sent, None);
-        assert_eq!(string_array(&line, "argv"), Some(sent));
+        assert_eq!(decoded_arguments(&request_json(&line)), sent);
     }
 
     #[test]
     fn an_argument_containing_a_backslash_survives() {
         let sent = argv(&["scrozz", r"C:\shots\a.png"]);
         let line = ipc::encode_request(&sent, None);
-        assert_eq!(string_array(&line, "argv"), Some(sent));
+        assert_eq!(decoded_arguments(&request_json(&line)), sent);
     }
 
     #[test]
     fn a_non_ascii_argument_survives() {
         let sent = argv(&["scrozz", "capture", "-o", "/captures/écran ✅.png"]);
         let line = ipc::encode_request(&sent, None);
-        assert_eq!(string_array(&line, "argv"), Some(sent));
+        assert_eq!(decoded_arguments(&request_json(&line)), sent);
     }
 
     #[test]
-    fn an_empty_argv_is_an_empty_vector_not_a_failure() {
-        let line = ipc::encode_request(&[], None);
-        assert_eq!(string_array(&line, "argv"), Some(Vec::new()));
+    fn an_empty_argv_still_carries_the_protocol_guard() {
+        let line = ipc::encode_request::<OsString>(&[], None);
+        let value = request_json(&line);
+        assert_eq!(value["argv"][0], ipc::REQUEST_PROTOCOL_ARG);
+        assert!(decoded_arguments(&value).is_empty());
     }
 
     #[test]
     fn a_truncated_line_is_rejected_rather_than_panicking() {
         // This arrives from outside the process, so it must never abort us.
-        assert_eq!(string_array(r#"{"argv":["scrozz"#, "argv"), None);
-        assert_eq!(string_array(r#"{"argv":["#, "argv"), None);
-        assert_eq!(string_array("{}", "argv"), None);
-        assert_eq!(string_field(r#"{"cwd":"#, "cwd"), None);
-        assert_eq!(string_field(r#"{"cwd":"unterminated"#, "cwd"), None);
+        for line in [
+            r#"{"argv":["scrozz"#,
+            r#"{"argv":["#,
+            r#"{"cwd":"#,
+            r#"{"cwd":"unterminated"#,
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_err());
+        }
     }
 
     #[test]
     fn a_missing_key_is_none() {
         let line = ipc::encode_request(&argv(&["scrozz"]), None);
-        assert_eq!(string_array(&line, "nope"), None);
-        assert_eq!(string_field(&line, "nope"), None);
+        assert!(request_json(&line).get("nope").is_none());
     }
 
     #[test]
@@ -568,32 +838,31 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_success_is_reported_verbatim() {
-        // `capture --dry-run` reaches no backend, so it succeeds anywhere.
+    fn a_non_forwardable_command_is_rejected_before_execution() {
         let (_, response) = run(&argv(&["capture", "--dry-run"]), None);
-        assert_eq!(response.code, 0);
+        assert_eq!(response.code, crate::exit::Exit::IpcFailed.code());
         assert_eq!(response.stream, StreamKind::Text);
-        assert!(response.stderr.is_empty());
-        let body = String::from_utf8_lossy(&response.stdout);
-        assert!(body.contains("Would capture"), "{body}");
+        assert!(response.stdout.is_empty());
+        let body = String::from_utf8_lossy(&response.stderr);
+        assert!(body.contains("calling process"), "{body}");
         assert!(body.ends_with('\n'));
     }
 
     #[test]
-    fn a_quiet_forwarded_command_says_nothing() {
+    fn a_quiet_non_forwardable_command_still_fails() {
         let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None);
-        assert_eq!(response.code, 0);
+        assert_eq!(response.code, crate::exit::Exit::IpcFailed.code());
         assert!(response.stdout.is_empty());
-        assert!(response.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&response.stderr).contains("calling process"));
     }
 
     #[test]
-    fn a_json_forwarded_success_is_an_envelope() {
+    fn a_json_non_forwardable_command_is_an_error_envelope() {
         let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None);
         assert_eq!(response.stream, StreamKind::Json);
         assert!(response.stderr.is_empty());
         let body = String::from_utf8_lossy(&response.stdout);
-        assert!(body.contains("\"ok\":true"), "{body}");
+        assert!(body.contains("\"ok\":false"), "{body}");
         assert!(body.contains("\"command\":\"capture\""), "{body}");
         assert!(body.ends_with('\n'));
     }
@@ -612,23 +881,43 @@ mod tests {
         assert_eq!(parsed.stderr, response.stderr);
     }
 
-    #[test]
-    fn the_working_directory_is_restored_afterwards() {
-        let before = std::env::current_dir().expect("a working directory");
-        let elsewhere = std::env::temp_dir();
-        let restore = enter(Some(&elsewhere));
-        restore();
-        assert_eq!(
-            std::env::current_dir().expect("a working directory"),
-            before
-        );
-    }
-
     #[cfg(unix)]
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("scrozz-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         dir
+    }
+
+    #[cfg(unix)]
+    fn await_request(server: &mut Server) -> Request {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(request) = server.poll() {
+                return request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the test client did not deliver an IPC request"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[cfg(unix)]
+    fn pending_command(label: &str) -> Pending {
+        use std::{io::Write, net::Shutdown, os::unix::net::UnixStream};
+
+        let (stream, mut client) = UnixStream::pair().expect("socket pair");
+        stream.set_nonblocking(true).expect("nonblocking server");
+        client
+            .write_all(ipc::encode_request(&argv(&["record", "--stop", label]), None).as_bytes())
+            .expect("pending request");
+        client.shutdown(Shutdown::Write).expect("finish request");
+        Pending {
+            stream,
+            raw: Vec::new(),
+            accepted: Instant::now(),
+        }
     }
 
     #[cfg(unix)]
@@ -665,11 +954,163 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_unbound_socket_is_taken_over_after_connection_refusal() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = scratch("stale-socket");
+        let path = dir.join("stale.sock");
+        drop(UnixListener::bind(&path).expect("stale socket fixture"));
+
+        let server =
+            Server::bind_at(path.clone()).expect("a definitively stale socket must be replaced");
+        assert_eq!(server.path(), path);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn polling_an_idle_server_yields_nothing() {
         let dir = scratch("idle");
-        let server = Server::bind_at(dir.join("idle.sock")).expect("binding");
+        let mut server = Server::bind_at(dir.join("idle.sock")).expect("binding");
         assert!(server.poll().is_none());
         assert!(server.poll().is_none());
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_requests_are_serviced_in_arrival_order() {
+        let dir = scratch("pending-order");
+        let mut server = Server::bind_at(dir.join("order.sock")).expect("binding");
+        for label in ["first", "second", "third"] {
+            server.pending.push_back(pending_command(label));
+        }
+
+        let first = server.poll().expect("first request");
+        let second = server.poll().expect("second request");
+        assert_eq!(
+            first.argv.last().map(OsString::as_os_str),
+            Some(OsStr::new("first"))
+        );
+        assert_eq!(
+            second.argv.last().map(OsString::as_os_str),
+            Some(OsStr::new("second"))
+        );
+
+        drop(first);
+        drop(second);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_poll_accepts_only_its_fixed_connection_budget() {
+        use std::os::unix::net::UnixStream;
+
+        let dir = scratch("accept-budget");
+        let path = dir.join("budget.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+        let clients = (0..ACCEPT_BUDGET + 3)
+            .map(|_| UnixStream::connect(&path).expect("client connection"))
+            .collect::<Vec<_>>();
+
+        assert!(server.poll().is_none());
+        assert_eq!(server.pending.len(), ACCEPT_BUDGET);
+
+        drop(clients);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_client_does_not_block_a_complete_client() {
+        use std::{
+            io::{Read, Write},
+            net::Shutdown,
+            os::unix::net::UnixStream,
+            time::Instant,
+        };
+
+        let dir = scratch("partial-client");
+        let path = dir.join("partial.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+        let mut partial = UnixStream::connect(&path).expect("partial connection");
+        partial
+            .write_all(br#"{"schema":3"#)
+            .expect("partial request");
+
+        let started = Instant::now();
+        assert!(server.poll().is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "poll must not wait for a slow client"
+        );
+
+        let complete = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = UnixStream::connect(path).expect("complete connection");
+                stream
+                    .write_all(ipc::encode_hello().as_bytes())
+                    .expect("hello");
+                stream.shutdown(Shutdown::Write).expect("finish hello");
+                let mut response = Vec::new();
+                stream
+                    .read_to_end(&mut response)
+                    .expect("read hello response");
+                ipc::parse_response(&response).expect("valid hello response")
+            }
+        });
+
+        let request = await_request(&mut server);
+        assert!(request.serve().is_none());
+        assert_eq!(complete.join().expect("complete client").code, 0);
+
+        drop(partial);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_client_does_not_hide_a_complete_request() {
+        use std::{
+            io::{Read, Write},
+            net::Shutdown,
+            os::unix::net::UnixStream,
+        };
+
+        let dir = scratch("dropped-client");
+        let path = dir.join("dropped.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+
+        drop(UnixStream::connect(&path).expect("dropped connection"));
+        let mut complete = UnixStream::connect(&path).expect("complete connection");
+        complete
+            .write_all(ipc::encode_hello().as_bytes())
+            .expect("hello");
+        complete.shutdown(Shutdown::Write).expect("finish hello");
+
+        let request = server
+            .poll()
+            .expect("poll must skip the dropped client and return the complete request");
+        assert!(request.serve().is_none());
+
+        let mut response = Vec::new();
+        complete
+            .read_to_end(&mut response)
+            .expect("read hello response");
+        assert_eq!(
+            ipc::parse_response(&response)
+                .expect("valid hello response")
+                .code,
+            0
+        );
+
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -696,11 +1137,11 @@ mod tests {
         // server half here, over a real socket.
         let dir = scratch("round-trip");
         let path = dir.join("live.sock");
-        let server = Server::bind_at(path.clone()).expect("binding");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
 
         // No program name: `try_forward` sends `env::args().skip(1)`, and the
         // server is the side that has to know that.
-        let sent = argv(&["capture", "--dry-run"]);
+        let sent = argv(&["record", "--stop"]);
         let client = std::thread::spawn({
             let path = path.clone();
             move || {
@@ -711,26 +1152,72 @@ mod tests {
             }
         });
 
-        let request = loop {
-            if let Some(request) = server.poll() {
-                break request;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        assert_eq!(request.argv.first().map(String::as_str), Some("capture"));
+        let hello = await_request(&mut server);
+        assert!(hello.argv.is_empty());
+        assert!(hello.serve().is_none());
+
+        let request = await_request(&mut server);
+        assert_eq!(
+            request.argv.first().map(OsString::as_os_str),
+            Some(OsStr::new("record"))
+        );
         let command = request.serve();
-        assert!(matches!(command, Some(Command::Capture(_))));
+        assert!(matches!(command, Some(Command::Record(_))));
 
         let response = client
             .join()
             .expect("the client thread")
             .expect("a well-formed answer");
-        assert_eq!(response.code, 0);
+        assert_ne!(response.code, crate::exit::Exit::IpcFailed.code());
         assert!(
-            String::from_utf8_lossy(&response.stdout).contains("Would capture"),
-            "the forwarded output must match a local run"
+            !String::from_utf8_lossy(&response.stderr).contains("calling process"),
+            "the only required forwarded operation must reach execution"
         );
-        assert!(response.stderr.is_empty());
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_old_request_is_rejected_before_dispatch() {
+        use std::{
+            io::{Read, Write},
+            net::Shutdown,
+            os::unix::net::UnixStream,
+        };
+
+        let dir = scratch("old-protocol");
+        let path = dir.join("old.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = UnixStream::connect(path).expect("connect");
+                stream
+                    .write_all(
+                        b"{\"schema\":1,\"argv\":[\"capture\",\"--dry-run\"],\"cwd\":null}\n",
+                    )
+                    .expect("write old request");
+                stream.shutdown(Shutdown::Write).expect("finish request");
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).expect("read rejection");
+                ipc::parse_response(&response).expect("current rejection response")
+            }
+        });
+
+        let request = await_request(&mut server);
+        assert!(
+            request.serve().is_none(),
+            "an incompatible request must not dispatch"
+        );
+        let response = client.join().expect("client thread");
+        assert_ne!(response.code, 0);
+        assert!(response.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&response.stderr).contains("incompatible"),
+            "{response:?}"
+        );
 
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);

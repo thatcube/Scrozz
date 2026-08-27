@@ -67,6 +67,7 @@ dirs = "6"
 tiny-skia = "0.12"
 resvg = "0.48"
 arboard = "3.6"
+socket2 = "0.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 # The barcode decoder (OCR-04). A maintained pure-Rust ZXing port, taken with
 # `default-features = false` on purpose: the defaults drag in `image`,

@@ -24,7 +24,11 @@
 
 use std::{
     collections::HashMap,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+    },
     thread::JoinHandle,
     time::SystemTime,
 };
@@ -35,13 +39,23 @@ use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
+    cli::Command,
     fault::{CliError, CliResult},
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
+        server::{Reply, Request},
     },
     platform,
 };
+
+const JOB_QUEUE_CAPACITY: usize = 32;
+const OUTCOME_QUEUE_CAPACITY: usize = 64;
+const REPLY_QUEUE_CAPACITY: usize = 8;
+const RESPONSE_WORKERS: usize = 4;
+// Cleanup jobs are best-effort under overload, so cached image bytes need an
+// independent hard ceiling.
+const CACHE_CAPACITY: usize = 64;
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
@@ -60,6 +74,8 @@ pub enum Job {
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Execute and answer one validated IPC request away from the GUI thread.
+    Forward(Request),
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -90,13 +106,19 @@ pub enum Outcome {
         /// Why.
         error: CliError,
     },
+    /// A forwarded command finished and left the shared capture worker.
+    ///
+    /// Response delivery is owned by the bounded responder pool and may still
+    /// fail independently if the caller disconnects or stops reading.
+    Forwarded(Option<Command>),
 }
 
 /// A handle to the capture thread.
 pub struct Pipeline {
-    jobs: Sender<Job>,
+    jobs: SyncSender<Job>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
+    responder: Option<Responder>,
     next_card: u64,
 }
 
@@ -110,12 +132,14 @@ impl Pipeline {
     /// reports and continues past, because a capture the user can see and copy
     /// is worth more than a capture refused because history was unavailable.
     pub fn start() -> CliResult<Self> {
-        let (jobs, job_rx) = channel();
-        let (outcome_tx, outcomes) = channel();
+        let (jobs, job_rx) = sync_channel(JOB_QUEUE_CAPACITY);
+        let (outcome_tx, outcomes) = sync_channel(OUTCOME_QUEUE_CAPACITY);
+        let responder = Responder::start()?;
+        let replies = responder.sender();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx).run(&job_rx))
+            .spawn(move || Worker::new(outcome_tx, replies).run(&job_rx))
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -126,6 +150,7 @@ impl Pipeline {
             jobs,
             outcomes,
             worker: Some(worker),
+            responder: Some(responder),
             next_card: 1,
         })
     }
@@ -137,9 +162,12 @@ impl Pipeline {
         id
     }
 
-    /// Posts a job. Returns `false` if the worker has gone.
+    /// Posts a job without blocking the GUI thread.
+    ///
+    /// Returns `false` when bounded backpressure refuses the job or the worker
+    /// has stopped.
     pub fn post(&self, job: Job) -> bool {
-        self.jobs.send(job).is_ok()
+        self.jobs.try_send(job).is_ok()
     }
 
     /// Takes one finished piece of work, if there is one. Never blocks.
@@ -152,9 +180,26 @@ impl Pipeline {
     /// Called from `Drop`, but exposed so a host can shut down deterministically
     /// rather than at an unspecified point during teardown.
     pub fn stop(&mut self) {
-        let _ = self.jobs.send(Job::Stop);
         if let Some(worker) = self.worker.take() {
+            let mut stop = Job::Stop;
+            loop {
+                match self.jobs.try_send(stop) {
+                    Ok(()) | Err(TrySendError::Disconnected(_)) => break,
+                    Err(TrySendError::Full(job)) => {
+                        stop = job;
+                        while self.outcomes.try_recv().is_ok() {}
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            while !worker.is_finished() {
+                while self.outcomes.try_recv().is_ok() {}
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let _ = worker.join();
+        }
+        if let Some(mut responder) = self.responder.take() {
+            responder.stop();
         }
     }
 }
@@ -171,13 +216,14 @@ struct Cached {
 }
 
 struct Worker {
-    outcomes: Sender<Outcome>,
+    outcomes: SyncSender<Outcome>,
+    replies: SyncSender<Reply>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>) -> Self {
+    fn new(outcomes: SyncSender<Outcome>, replies: SyncSender<Reply>) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -196,6 +242,7 @@ impl Worker {
 
         Self {
             outcomes,
+            replies,
             store,
             cache: HashMap::new(),
         }
@@ -210,6 +257,18 @@ impl Worker {
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
+                Job::Forward(request) => {
+                    let (command, reply) = request.execute();
+                    if let Err(error) = self.replies.try_send(reply) {
+                        let reason = match error {
+                            TrySendError::Full(_) => "the IPC response queue is full",
+                            TrySendError::Disconnected(_) => "the IPC response workers stopped",
+                        };
+                        tracing::warn!("{reason}; dropping the waiting client");
+                    }
+                    let _ = self.outcomes.send(Outcome::Forwarded(command));
+                }
+
                 Job::Stop => break,
             }
         }
@@ -260,7 +319,7 @@ impl Worker {
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
 
-        self.cache.insert(card, Cached { bytes });
+        self.cache_capture(card, bytes);
 
         Ok(Card {
             id: card,
@@ -289,6 +348,20 @@ impl Worker {
                 None
             }
         }
+    }
+
+    fn cache_capture(&mut self, card: CardId, bytes: Vec<u8>) {
+        if self.cache.len() >= CACHE_CAPACITY
+            && !self.cache.contains_key(&card)
+            && let Some(oldest) = self.cache.keys().min().copied()
+        {
+            self.cache.remove(&oldest);
+            tracing::warn!(
+                %oldest,
+                "evicted cached capture after reaching the fixed cache capacity"
+            );
+        }
+        self.cache.insert(card, Cached { bytes });
     }
 
     fn copy(&mut self, card: CardId) {
@@ -328,6 +401,85 @@ impl Worker {
     }
 }
 
+struct Responder {
+    sender: Option<SyncSender<Reply>>,
+    stopping: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl Responder {
+    fn start() -> CliResult<Self> {
+        let (sender, receiver) = sync_channel::<Reply>(REPLY_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let mut responder = Self {
+            sender: Some(sender),
+            stopping,
+            workers: Vec::with_capacity(RESPONSE_WORKERS),
+        };
+
+        for index in 0..RESPONSE_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            let stopping = Arc::clone(&responder.stopping);
+            let worker = std::thread::Builder::new()
+                .name(format!("scrozz-ipc-response-{index}"))
+                .spawn(move || response_worker(&receiver, &stopping));
+            match worker {
+                Ok(worker) => responder.workers.push(worker),
+                Err(error) => {
+                    responder.stop();
+                    return Err(CliError::Core(CoreError::Platform(format!(
+                        "could not start an IPC response worker: {error}"
+                    ))));
+                }
+            }
+        }
+
+        Ok(responder)
+    }
+
+    fn sender(&self) -> SyncSender<Reply> {
+        self.sender
+            .as_ref()
+            .expect("a live responder has a sender")
+            .clone()
+    }
+
+    fn stop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for Responder {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn response_worker(receiver: &Mutex<Receiver<Reply>>, stopping: &AtomicBool) {
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        let reply = match receiver.lock() {
+            Ok(receiver) => receiver.recv(),
+            Err(_) => {
+                tracing::warn!("the IPC response queue lock was poisoned");
+                break;
+            }
+        };
+        match reply {
+            Ok(_) if stopping.load(Ordering::Acquire) => break,
+            Ok(reply) => reply.send(),
+            Err(_) => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +497,48 @@ mod tests {
     fn polling_an_idle_pipeline_does_not_block() {
         let pipeline = Pipeline::start().expect("the worker should start");
         assert!(pipeline.poll().is_none());
+    }
+
+    #[test]
+    fn posting_applies_bounded_backpressure_without_waiting_for_a_worker() {
+        let (jobs, _job_rx) = sync_channel(JOB_QUEUE_CAPACITY);
+        let (_outcome_tx, outcomes) = sync_channel(1);
+        let pipeline = Pipeline {
+            jobs,
+            outcomes,
+            worker: None,
+            responder: None,
+            next_card: 1,
+        };
+
+        for card in 0..JOB_QUEUE_CAPACITY {
+            assert!(pipeline.post(Job::Release(CardId(u64::try_from(card).unwrap()))));
+        }
+        assert!(!pipeline.post(Job::Release(CardId(u64::MAX))));
+    }
+
+    #[test]
+    fn cached_capture_bytes_have_a_fixed_memory_bound() {
+        let (outcomes, _outcome_rx) = sync_channel(1);
+        let (replies, _reply_rx) = sync_channel(1);
+        let mut worker = Worker {
+            outcomes,
+            replies,
+            store: None,
+            cache: HashMap::new(),
+        };
+
+        for card in 0..=CACHE_CAPACITY {
+            worker.cache_capture(CardId(u64::try_from(card).unwrap()), vec![0]);
+        }
+
+        assert_eq!(worker.cache.len(), CACHE_CAPACITY);
+        assert!(!worker.cache.contains_key(&CardId(0)));
+        assert!(
+            worker
+                .cache
+                .contains_key(&CardId(u64::try_from(CACHE_CAPACITY).unwrap()))
+        );
     }
 
     #[test]

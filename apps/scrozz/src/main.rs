@@ -159,11 +159,17 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
 /// not a failure.
 fn try_forward(command: &Command) -> CliResult<Option<u8>> {
     let _ = command;
-    if !matches!(ipc::probe(), ipc::Status::Running) {
-        return Ok(None);
+    match ipc::probe() {
+        ipc::Status::Running => {}
+        ipc::Status::NotRunning => return Ok(None),
+        ipc::Status::Unusable(cause) => {
+            return Err(CliError::ipc(format!(
+                "the existing Scrozz instance endpoint could not be used: {cause}"
+            )));
+        }
     }
 
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let response = ipc::forward(&argv)?;
 
     // Relayed byte for byte and to the original destinations. Re-encoding here

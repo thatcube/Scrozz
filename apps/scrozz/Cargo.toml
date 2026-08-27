@@ -34,6 +34,10 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true
 
 [lints]
 workspace = true
