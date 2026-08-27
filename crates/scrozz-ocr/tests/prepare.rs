@@ -78,6 +78,47 @@ fn premultiplied_alpha_is_undone() {
 }
 
 #[test]
+fn bgra_premultiplied_is_both_swizzled_and_unpremultiplied() {
+    // The variant Windows.Graphics.Capture actually produces. Half-transparent
+    // white arrives as B=128,G=128,R=128,A=128 and must come back as straight
+    // R=255,G=255,B=255,A=128. Handling only one of the two transforms is the
+    // easy mistake, and either half alone silently corrupts every WGC capture.
+    let f = frame(
+        1,
+        1,
+        PixelFormat::BgraPremultiplied8,
+        1.0,
+        0,
+        [64, 128, 192, 128],
+    );
+    let image = Rgba8Image::from_frame(&f).expect("well-formed frame");
+    assert_eq!(image.data[3], 128, "alpha must survive un-premultiplication");
+    // Stored BGR 64,128,192 is RGB 192,128,64 premultiplied by 0.5, so straight
+    // alpha doubles each back to 255 (clamped), 255, 128.
+    assert_eq!(image.data[0], 255, "R: 192/0.5 clamps to 255");
+    assert_eq!(image.data[1], 255, "G: 128/0.5 clamps to 255");
+    assert!(
+        (i32::from(image.data[2]) - 128).abs() <= 1,
+        "B: 64/0.5 is ~128, got {}",
+        image.data[2]
+    );
+}
+
+#[test]
+fn opaque_bgra_premultiplied_only_swizzles() {
+    let f = frame(
+        1,
+        1,
+        PixelFormat::BgraPremultiplied8,
+        1.0,
+        0,
+        [30, 20, 10, 255],
+    );
+    let image = Rgba8Image::from_frame(&f).expect("well-formed frame");
+    assert_eq!(&image.data[..], &[10, 20, 30, 255]);
+}
+
+#[test]
 fn fully_transparent_pixels_do_not_divide_by_zero() {
     let f = frame(1, 1, PixelFormat::RgbaPremultiplied8, 1.0, 0, [0, 0, 0, 0]);
     let image = Rgba8Image::from_frame(&f).expect("well-formed frame");

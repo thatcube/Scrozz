@@ -105,8 +105,14 @@ pub enum Accuracy {
 pub struct Options {
     /// BCP-47 tags in priority order, e.g. `["en-US", "de-DE"]`.
     ///
-    /// Empty means "use the languages the user has configured", which is both
-    /// the right default and the only thing Windows can express.
+    /// Empty means "use the languages the user has configured", which is the
+    /// right default on both platforms.
+    ///
+    /// A tag with no installed recogniser is skipped. If *none* of the requested
+    /// languages is available, macOS falls back to automatic language detection
+    /// and Windows returns [`Error::Unsupported`] naming what is installed —
+    /// Windows has no detection mode, and recognising text with the wrong
+    /// recogniser yields plausible nonsense rather than a visible failure.
     pub languages: Vec<String>,
     /// Quality/latency trade-off.
     pub accuracy: Accuracy,
