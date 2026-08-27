@@ -1357,9 +1357,13 @@ mod tests {
         app.recording = None;
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
-        assert!(notes.contains("no native engine"), "{notes}");
         assert!(notes.contains("history window"), "{notes}");
         assert!(notes.contains("settings window"), "{notes}");
+        assert!(
+            notes.contains("screen recording unavailable")
+                || notes.contains("recording countdown started"),
+            "{notes}"
+        );
     }
 
     #[test]

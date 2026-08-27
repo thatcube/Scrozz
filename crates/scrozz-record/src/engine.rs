@@ -144,7 +144,12 @@ pub fn detect_native_engine() -> Option<Box<dyn RecordingEngine>> {
         Some(Box::new(crate::macos::MacEngine))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Some(Box::new(crate::windows::WindowsEngine))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }

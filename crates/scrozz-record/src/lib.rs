@@ -30,6 +30,8 @@ pub mod overlay;
 pub mod selection;
 pub mod settings;
 pub mod transcode;
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub use engine::{
     EngineCapabilities, RecordingEngine, detect_native_engine, validate_capabilities,
