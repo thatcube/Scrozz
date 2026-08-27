@@ -77,6 +77,7 @@ grep -q '"signed_manifest": false' tools/package.sh ||
 MANIFEST="packaging/windows/AppxManifest.xml.in"
 WINDOWS_PACKAGE="tools/package-windows.ps1"
 WINDOWS_PACKAGE_TEST="tools/test-windows-packaging.ps1"
+RELEASE_WORKFLOW=".github/workflows/release.yml"
 [[ -f "$MANIFEST" ]] || fail "Windows AppxManifest template is absent"
 [[ -f "$WINDOWS_PACKAGE" ]] || fail "Windows package script is absent"
 [[ -f "$WINDOWS_PACKAGE_TEST" ]] || fail "Windows artifact test is absent"
@@ -123,14 +124,6 @@ grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no all-artifact determinism check"
 grep -q 'determinism-check.zip' "$WINDOWS_PACKAGE" ||
   fail "portable ZIP is excluded from reproducibility verification"
-grep -q 'SCROZZ_TESSERACT_DIR' "$WINDOWS_PACKAGE" ||
-  fail "portable packaging does not require an explicit Tesseract payload"
-grep -Fq 'tessdata\eng.traineddata' "$WINDOWS_PACKAGE" ||
-  fail "portable packaging does not require English trained data"
-grep -Fq '"tesseract.exe"' "$WINDOWS_PACKAGE_TEST" ||
-  fail "Windows artifact test does not verify the Tesseract executable"
-grep -Fq 'tessdata/eng.traineddata"' "$WINDOWS_PACKAGE_TEST" ||
-  fail "Windows artifact test does not verify English trained data"
 grep -q 'SCROZZ_MSIX_SIGN_PFX' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no external PFX signing hook"
 grep -q 'SCROZZ_MSIX_SIGN_CERT_SHA1' "$WINDOWS_PACKAGE" ||
@@ -141,20 +134,36 @@ if ! grep -Fq -- '-PackageKind "portable"' "$WINDOWS_PACKAGE" ||
   ! grep -Fq -- '-OcrBackend "tesseract"' "$WINDOWS_PACKAGE"; then
   fail "portable metadata does not declare the Tesseract backend"
 fi
+grep -q 'SCROZZ_TESSERACT_DIR' "$WINDOWS_PACKAGE" ||
+  fail "portable packaging does not require an explicit Tesseract payload"
+grep -q 'Copy-PortableTesseract' "$WINDOWS_PACKAGE" ||
+  fail "portable packaging does not stage its local Tesseract payload"
 if ! grep -Fq -- '-PackageKind "msix"' "$WINDOWS_PACKAGE" ||
   ! grep -Fq -- '-OcrBackend "windows-media-ocr"' "$WINDOWS_PACKAGE"; then
   fail "MSIX metadata does not declare the Windows.Media.Ocr backend"
 fi
-grep -Fq "Test-ArtifactMetadata \$Portable \"portable\" \"tesseract\" \"\"" \
-  "$WINDOWS_PACKAGE_TEST" ||
+if ! grep -Fq '"windows-portable-zip"' "$WINDOWS_PACKAGE_TEST" ||
+  ! grep -Fq '"tesseract"' "$WINDOWS_PACKAGE_TEST"; then
   fail "Windows artifact test does not verify the portable OCR contract"
-grep -Fq "Test-ArtifactMetadata \$Msix \"msix\" \"windows-media-ocr\"" \
-  "$WINDOWS_PACKAGE_TEST" ||
+fi
+if ! grep -Fq '"windows-msix"' "$WINDOWS_PACKAGE_TEST" ||
+  ! grep -Fq '"windows-media-ocr"' "$WINDOWS_PACKAGE_TEST"; then
   fail "Windows artifact test does not verify the MSIX OCR contract"
+fi
+grep -q 'tesseract/tessdata/eng.traineddata' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not verify the packaged English OCR model"
 grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE_TEST" ||
   fail "Windows artifact test does not exercise reproducible packaging"
 grep -q 'package-windows.ps1' tools/package.sh ||
   fail "the cross-platform package hook does not delegate Windows packaging"
+grep -q 'WINDOWS_TESSERACT_ARCHIVE_URL' "$RELEASE_WORKFLOW" ||
+  fail "release packaging does not use a human-configured Tesseract payload"
+grep -q 'WINDOWS_TESSERACT_ARCHIVE_SHA256' "$RELEASE_WORKFLOW" ||
+  fail "release packaging does not pin the Tesseract payload digest"
+grep -q -- '--proto-redir "=https"' "$RELEASE_WORKFLOW" ||
+  fail "release payload redirects are not constrained to HTTPS"
+grep -q -- '--max-filesize 536870912' "$RELEASE_WORKFLOW" ||
+  fail "release payload downloads are not size bounded"
 for asset in Square44x44Logo.png Square150x150Logo.png StoreLogo.png; do
   [[ -f "packaging/windows/Assets/$asset" ]] ||
     fail "MSIX asset is absent: $asset"

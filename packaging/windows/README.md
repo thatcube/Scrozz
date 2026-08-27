@@ -47,6 +47,22 @@ The certificate subject must match `SCROZZ_MSIX_PUBLISHER`. `SCROZZ_SIGNTOOL`,
 timestamp locations. No certificate, password, Store identity, or private key
 belongs in the repository.
 
+## Portable OCR payload
+
+`SCROZZ_TESSERACT_DIR` must name an absolute directory containing
+`tesseract.exe`, its adjacent dependent DLLs, and
+`tessdata/eng.traineddata`. Packaging copies that payload into
+`tesseract/` beside `scrozz.exe`; the portable runtime never searches `PATH`.
+The MSIX does not contain this payload because package identity selects
+`Windows.Media.Ocr`.
+
+The release workflow obtains that directory from the human-approved
+`release-signing` environment. `WINDOWS_TESSERACT_ARCHIVE_URL` and
+`WINDOWS_TESSERACT_ARCHIVE_SHA256` must identify a ZIP and its pinned digest.
+The workflow rejects non-HTTPS downloads, hash mismatches, path traversal,
+reparse points, oversized expansion, and ambiguous Tesseract roots before
+packaging.
+
 Set `SCROZZ_WINDOWS_VERIFY_DETERMINISM=1` to package the normalized staging
 trees twice and require byte-identical portable ZIP and unsigned MSIX output
 before signing. The legacy `SCROZZ_MSIX_VERIFY_DETERMINISM` name remains
@@ -56,24 +72,10 @@ Each artifact has an adjacent `.artifact.json` file. Its `package_kind` and
 `ocr_backend` fields make the distribution contract explicit: portable means
 `tesseract`, while MSIX means `windows-media-ocr`.
 
-The portable build requires `SCROZZ_TESSERACT_DIR` to be an absolute directory
-with this shape:
-
-```text
-tesseract.exe
-*.dll
-tessdata/
-  eng.traineddata
-```
-
-The complete directory is copied to `tesseract/` beside `scrozz.exe`. Packaging
-fails if the executable or English model is absent, if the source overlaps the
-output directory, or if the payload contains reparse points. Scrozz never uses
-an ambient `tesseract.exe` from `PATH`. Structural packaging cannot infer a
-native executable's complete DLL import closure, so `tools/windows-smoke.ps1`
-also starts the staged executable with ambient `PATH` removed and then performs
-a real recognition through Scrozz; that native smoke is the executable proof
-that the supplied payload is complete.
+Structural packaging cannot infer a native executable's complete DLL import
+closure, so `tools/windows-smoke.ps1` also starts the staged executable with
+ambient `PATH` removed and performs a real recognition through Scrozz. That
+native smoke is the executable proof that the supplied payload is complete.
 
 On a Windows SDK host, `powershell -NoProfile -File tools/test-windows-packaging.ps1`
 runs MakeAppx against normalized inputs and checks both archive layouts,

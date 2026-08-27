@@ -125,6 +125,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check system packaging guards
+        run: tools/test-system-packaging.sh
+
   # ---------------------------------------------------------------------------
   # LAYER 2 — real builds, real tests, real linking, on real platforms.
   #
@@ -186,6 +189,99 @@ jobs:
             echo "::error title=Tests failed on ${{ matrix.name }}::If this passes on the other two platforms, the cause is platform-specific — that is precisely what this job exists to find."
             exit 1
           fi
+
+  # Build the exact release payload and exercise the native packaging path on
+  # every host. Capture-gated platforms emit clearly labelled preview artifacts.
+  package:
+    name: Package — ${{ matrix.name }}
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (arm64)
+          - os: ubuntu-latest
+            name: Linux (x86_64)
+          - os: windows-latest
+            name: Windows (x86_64)
+    env:
+      SCROZZ_WINDOWS_VERIFY_DETERMINISM: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-${{ matrix.os }}
+
+      - name: Build release executable
+        run: cargo build --locked --release -p scrozz
+
+      - name: Smoke release executable
+        run: tools/smoke.sh
+
+      - name: Prepare Windows portable OCR fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Root = Join-Path $env:RUNNER_TEMP "scrozz-tesseract-fixture"
+          New-Item -ItemType Directory -Path (Join-Path $Root "tessdata") -Force | Out-Null
+          [IO.File]::WriteAllBytes(
+            (Join-Path $Root "tesseract.exe"),
+            [byte[]] @(0x4d, 0x5a)
+          )
+          [IO.File]::WriteAllBytes(
+            (Join-Path $Root "tesseract55.dll"),
+            [byte[]] @(0x4d, 0x5a)
+          )
+          [IO.File]::WriteAllText(
+            (Join-Path $Root "tessdata\eng.traineddata"),
+            "CI packaging fixture",
+            [Text.Encoding]::ASCII
+          )
+          "SCROZZ_TESSERACT_DIR=$Root" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Test Windows package artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: tools/test-windows-packaging.ps1
+
+      - name: Package native artifacts
+        run: tools/package.sh dist
+
+      - name: Verify Linux package determinism
+        if: runner.os == 'Linux'
+        run: |
+          tools/package.sh dist-repeat
+          cmp dist/*.tar.gz dist-repeat/*.tar.gz
+          cmp dist/*.tar.gz.sha256 dist-repeat/*.tar.gz.sha256
+          cmp dist/*.tar.gz.artifact.json dist-repeat/*.tar.gz.artifact.json
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ runner.os }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.msix
+            dist/*.sha256
+            dist/*.artifact.json
+            dist/PREVIEW.txt
+          if-no-files-found: error
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # LAYER 3 — headless golden images (decision D25).
@@ -280,7 +376,7 @@ jobs:
   ci-ok:
     name: CI passed
     if: always()
-    needs: [gate, test, golden]
+    needs: [gate, test, package, golden]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -288,11 +384,13 @@ jobs:
         run: |
           echo "gate:   ${{ needs.gate.result }}"
           echo "test:   ${{ needs.test.result }}"
+          echo "package:${{ needs.package.result }}"
           echo "golden: ${{ needs.golden.result }}"
 
           failed=0
           for pair in "gate:${{ needs.gate.result }}" \
                       "test:${{ needs.test.result }}" \
+                      "package:${{ needs.package.result }}" \
                       "golden:${{ needs.golden.result }}"; do
             name="${pair%%:*}"
             result="${pair#*:}"

@@ -10,7 +10,6 @@ $Root = Join-Path ([IO.Path]::GetTempPath()) (
 )
 $Output = Join-Path $Root "artifacts"
 $Binary = Join-Path $Root "scrozz.exe"
-$Tesseract = Join-Path $Root "tesseract-payload"
 $EnvironmentNames = @(
     "SCROZZ_WINDOWS_VERIFY_DETERMINISM",
     "SCROZZ_MSIX_VERIFY_DETERMINISM",
@@ -18,10 +17,13 @@ $EnvironmentNames = @(
     "SCROZZ_MSIX_PUBLISHER",
     "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME",
     "SCROZZ_MSIX_VERSION",
-    "SCROZZ_TESSERACT_DIR",
     "SCROZZ_MSIX_SIGN_PFX",
     "SCROZZ_MSIX_SIGN_PFX_PASSWORD",
-    "SCROZZ_MSIX_SIGN_CERT_SHA1"
+    "SCROZZ_MSIX_SIGN_CERT_SHA1",
+    "SCROZZ_PREVIEW",
+    "SCROZZ_PREVIEW_NOTICE",
+    "SCROZZ_WINDOWS_BINARY_SIGNED",
+    "SCROZZ_TESSERACT_DIR"
 )
 $SavedEnvironment = @{}
 
@@ -74,8 +76,10 @@ function Test-ArtifactMetadata {
     param(
         [string] $Artifact,
         [string] $PackageKind,
+        [string] $ArtifactKind,
         [string] $OcrBackend,
-        [string] $PackageIdentity
+        [string] $PackageIdentity,
+        [bool] $Preview
     )
     $MetadataPath = "$Artifact.artifact.json"
     $HashPath = "$Artifact.sha256"
@@ -93,7 +97,11 @@ function Test-ArtifactMetadata {
     Assert-Equal $Metadata.file ([IO.Path]::GetFileName($Artifact)) "metadata filename"
     Assert-Equal $Metadata.sha256 $Hash "metadata hash"
     Assert-Equal $Metadata.size $Length "metadata length"
+    Assert-Equal $Metadata.artifact_kind $ArtifactKind "metadata artifact kind"
     Assert-Equal $Metadata.package_kind $PackageKind "metadata package kind"
+    Assert-Equal $Metadata.preview $Preview "metadata preview state"
+    Assert-Equal $Metadata.payload_signed $false "metadata payload-signing state"
+    Assert-Equal $Metadata.notarized $false "metadata notarization state"
     Assert-Equal $Metadata.ocr_backend $OcrBackend "metadata OCR backend"
     Assert-Equal $Metadata.package_identity $PackageIdentity "metadata package identity"
     Assert-Equal $Metadata.signed $false "metadata signed state"
@@ -112,6 +120,26 @@ try {
         [Environment]::SetEnvironmentVariable($Name, $null)
     }
     [Environment]::SetEnvironmentVariable("SCROZZ_WINDOWS_VERIFY_DETERMINISM", "1")
+    $PreviewNotice = Join-Path $Root "PREVIEW.txt"
+    [IO.File]::WriteAllText($PreviewNotice, "preview build`n", [Text.Encoding]::ASCII)
+    [Environment]::SetEnvironmentVariable("SCROZZ_PREVIEW", "1")
+    [Environment]::SetEnvironmentVariable("SCROZZ_PREVIEW_NOTICE", $PreviewNotice)
+    $Tesseract = Join-Path $Root "tesseract"
+    New-Item -ItemType Directory -Path (Join-Path $Tesseract "tessdata") -Force | Out-Null
+    [IO.File]::WriteAllBytes(
+        (Join-Path $Tesseract "tesseract.exe"),
+        [byte[]] @(0x4d, 0x5a)
+    )
+    [IO.File]::WriteAllBytes(
+        (Join-Path $Tesseract "tesseract55.dll"),
+        [byte[]] @(0x4d, 0x5a)
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $Tesseract "tessdata\eng.traineddata"),
+        "fixture",
+        [Text.Encoding]::ASCII
+    )
+    [Environment]::SetEnvironmentVariable("SCROZZ_TESSERACT_DIR", $Tesseract)
 
     # MakeAppx validates package structure and manifest references, but does not
     # execute the payload. A minimal MZ marker keeps this test independent of a
@@ -138,22 +166,6 @@ try {
     if (-not $RejectedMissingPayload) {
         throw "Windows packaging accepted a missing Tesseract payload"
     }
-
-    New-Item -ItemType Directory -Path (Join-Path $Tesseract "tessdata") -Force |
-        Out-Null
-    [IO.File]::WriteAllBytes(
-        (Join-Path $Tesseract "tesseract.exe"),
-        [byte[]] @(0x4d, 0x5a)
-    )
-    [IO.File]::WriteAllBytes(
-        (Join-Path $Tesseract "libtesseract-5.dll"),
-        [byte[]] @(0x4d, 0x5a)
-    )
-    [IO.File]::WriteAllText(
-        (Join-Path $Tesseract "tessdata\eng.traineddata"),
-        "fixture",
-        [Text.Encoding]::ASCII
-    )
     [Environment]::SetEnvironmentVariable("SCROZZ_TESSERACT_DIR", $Tesseract)
 
     & (Join-Path $RepoRoot "tools\package-windows.ps1") `
@@ -163,8 +175,8 @@ try {
         -Stamp "artifact-test" `
         -Architecture "x86_64"
 
-    $Portable = Join-Path $Output "scrozz-1.2.3-artifact-test-windows-x86_64.zip"
-    $Msix = Join-Path $Output "scrozz-1.2.3-artifact-test-windows-x86_64.msix"
+    $Portable = Join-Path $Output "scrozz-1.2.3-artifact-test-windows-x86_64-preview.zip"
+    $Msix = Join-Path $Output "scrozz-1.2.3-artifact-test-windows-x86_64-preview.msix"
     if (-not (Test-Path -LiteralPath $Portable -PathType Leaf)) {
         throw "Portable ZIP was not emitted"
     }
@@ -172,21 +184,32 @@ try {
         throw "MSIX was not emitted"
     }
 
-    Test-ArtifactMetadata $Portable "portable" "tesseract" ""
-    Test-ArtifactMetadata $Msix "msix" "windows-media-ocr" "com.thatcube.Scrozz"
+    Test-ArtifactMetadata `
+        $Portable "portable" "windows-portable-zip" "tesseract" "" $true
+    Test-ArtifactMetadata `
+        $Msix "msix" "windows-msix" "windows-media-ocr" "com.thatcube.Scrozz" $true
 
     $PortableEntries = Get-ArchiveEntryNames $Portable
     Assert-ArchiveEntry `
         $PortableEntries `
-        "scrozz-1.2.3-artifact-test-windows-x86_64/scrozz.exe" `
+        "scrozz-1.2.3-artifact-test-windows-x86_64-preview/scrozz.exe" `
         "portable ZIP"
-    foreach ($Entry in @(
-        "scrozz-1.2.3-artifact-test-windows-x86_64/tesseract/tesseract.exe",
-        "scrozz-1.2.3-artifact-test-windows-x86_64/tesseract/libtesseract-5.dll",
-        "scrozz-1.2.3-artifact-test-windows-x86_64/tesseract/tessdata/eng.traineddata"
-    )) {
-        Assert-ArchiveEntry $PortableEntries $Entry "portable ZIP OCR payload"
-    }
+    Assert-ArchiveEntry `
+        $PortableEntries `
+        "scrozz-1.2.3-artifact-test-windows-x86_64-preview/PREVIEW.txt" `
+        "portable ZIP"
+    Assert-ArchiveEntry `
+        $PortableEntries `
+        "scrozz-1.2.3-artifact-test-windows-x86_64-preview/tesseract/tesseract.exe" `
+        "portable ZIP"
+    Assert-ArchiveEntry `
+        $PortableEntries `
+        "scrozz-1.2.3-artifact-test-windows-x86_64-preview/tesseract/tesseract55.dll" `
+        "portable ZIP"
+    Assert-ArchiveEntry `
+        $PortableEntries `
+        "scrozz-1.2.3-artifact-test-windows-x86_64-preview/tesseract/tessdata/eng.traineddata" `
+        "portable ZIP"
     if ($PortableEntries -contains "AppxManifest.xml") {
         throw "Portable ZIP unexpectedly contains package identity"
     }
@@ -198,6 +221,7 @@ try {
         "Assets/Square44x44Logo.png",
         "Assets/Square150x150Logo.png",
         "Assets/StoreLogo.png",
+        "PREVIEW.txt",
         "scrozz.exe"
     )) {
         Assert-ArchiveEntry $MsixEntries $Entry "MSIX"
