@@ -1,4 +1,8 @@
-//! Windows text recognition via `Windows.Media.Ocr`.
+//! Dual Windows OCR for packaged and portable Scrozz artifacts.
+//!
+//! A process with package identity uses `Windows.Media.Ocr`. An unpackaged
+//! process uses the artifact-local Tesseract payload. Selection happens before
+//! recognition, so a real native OCR error is never hidden by a retry.
 //!
 //! # Why the OS engine
 //!
@@ -32,7 +36,9 @@
 
 use std::time::{Duration, Instant};
 
+use crate::apartment;
 use scrozz_core::{Error, Frame, Result};
+use scrozz_shell::windows::identity::PackageIdentity;
 use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
@@ -40,7 +46,10 @@ use windows::Storage::Streams::DataWriter;
 use windows::core::HSTRING;
 
 use crate::layout;
-use crate::prepare::{self, Prepared, Rgba8Image};
+use crate::prepare::{self, Prepared};
+use crate::windows_runtime::{
+    Backend, backend_for_package_identity, bgra_premultiplied_on_white, dispatch,
+};
 use crate::{Options, TextBlock};
 
 /// `AsyncStatus::Started`. Spelled out because `windows_future` is not a direct
@@ -57,31 +66,43 @@ const ASYNC_CANCELED: i32 = 2;
 /// so a wedged engine surfaces as an error instead of a hung UI thread.
 const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Recognises text in a frame using the Windows OCR engine.
+fn active_backend() -> Result<Backend> {
+    match scrozz_shell::windows::identity::current() {
+        PackageIdentity::Packaged { .. } => Ok(backend_for_package_identity(true)),
+        PackageIdentity::Unpackaged => Ok(backend_for_package_identity(false)),
+        PackageIdentity::Unknown { status, detail } => Err(Error::Platform(format!(
+            "cannot select the Windows OCR backend because package identity is unknown \
+             (Win32 status {status}): {detail}"
+        ))),
+    }
+}
+
+/// Name of the backend selected for this process artifact.
+pub(crate) fn engine_name() -> Result<&'static str> {
+    Ok(active_backend()?.engine_name())
+}
+
+/// Recognises text using the one backend selected from process package identity.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidRequest`] for a malformed frame, [`Error::Unsupported`] if
-/// the machine has no OCR language pack installed, [`Error::Platform`] for any
-/// other WinRT failure.
+/// the selected backend or requested language is unavailable, and
+/// [`Error::Platform`] for native or subprocess failures.
 pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
-    match scrozz_shell::windows::identity::current() {
-        scrozz_shell::windows::identity::PackageIdentity::Packaged { .. } => {}
-        scrozz_shell::windows::identity::PackageIdentity::Unpackaged => {
-            return Err(Error::Unsupported {
-                what: "text recognition in a portable Windows build".to_owned(),
-                why: "Windows.Media.Ocr requires package identity and this build does not yet \
-                      include the reviewed artifact-local Tesseract payload"
-                    .to_owned(),
-            });
-        }
-        scrozz_shell::windows::identity::PackageIdentity::Unknown { status, detail } => {
-            return Err(Error::Platform(format!(
-                "cannot select the Windows OCR backend because package identity is unknown \
-                 (Win32 status {status}): {detail}"
-            )));
-        }
-    }
+    dispatch(
+        active_backend()?,
+        || recognize_native(frame, options),
+        || crate::tesseract::recognize(frame, options),
+    )
+}
+
+fn recognize_native(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    let apartment = apartment::Apartment::enter_multithreaded()?;
+    tracing::debug!(
+        owned = apartment.owns(),
+        "Windows OCR caller has a COM apartment"
+    );
 
     // Ask the engine for its ceiling first: the answer feeds the upscale
     // decision, so an image is never enlarged past what the engine will accept
@@ -277,7 +298,7 @@ fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
     let writer =
         DataWriter::new().map_err(|e| Error::Platform(format!("DataWriter::new failed: {e}")))?;
     writer
-        .WriteBytes(&bgra_premultiplied(&prepared.image))
+        .WriteBytes(&bgra_premultiplied_on_white(&prepared.image))
         .map_err(|e| Error::Platform(format!("DataWriter::WriteBytes failed: {e}")))?;
     let buffer = writer
         .DetachBuffer()
@@ -285,37 +306,8 @@ fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
 
     // `CreateCopyFromBuffer` assumes rows are tightly packed at `width * 4`,
     // which is exactly what `Rgba8Image` guarantees, so there is no stride to
-    // reconcile. It also yields a premultiplied bitmap, which is why the bytes
-    // are premultiplied on the way in.
+    // reconcile. Transparent pixels were composited on white and the resulting
+    // opaque bytes are valid premultiplied input.
     SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Bgra8, width, height)
         .map_err(|e| Error::Platform(format!("SoftwareBitmap::CreateCopyFromBuffer failed: {e}")))
-}
-
-/// Converts straight-alpha RGBA into the premultiplied BGRA `SoftwareBitmap`
-/// expects, in one pass.
-fn bgra_premultiplied(image: &Rgba8Image) -> Vec<u8> {
-    let mut out = vec![0u8; image.data.len()];
-    for (s, d) in image
-        .data
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<4>().0.iter_mut())
-    {
-        let a = s[3];
-        d[0] = premultiply(s[2], a);
-        d[1] = premultiply(s[1], a);
-        d[2] = premultiply(s[0], a);
-        d[3] = a;
-    }
-    out
-}
-
-/// Scales a straight-alpha channel by its alpha.
-fn premultiply(channel: u8, alpha: u8) -> u8 {
-    match alpha {
-        255 => channel,
-        0 => 0,
-        a => ((u32::from(channel) * u32::from(a) + 127) / 255) as u8,
-    }
 }

@@ -1793,10 +1793,9 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
     if !platform::ocr_available() {
         return Err(CliError::Core(CoreError::Unsupported {
             what: "recognising text".to_string(),
-            why: "this build has no OCR engine. macOS uses Vision and Windows \
-                  uses Windows.Media.Ocr, both supplied by the system; Linux has \
-                  no system recogniser, and bundling one would add tens of \
-                  megabytes of language model to every install."
+            why: "this build has no OCR engine. macOS uses Vision, packaged Windows \
+                  uses Windows.Media.Ocr, and portable Windows uses its artifact-local \
+                  Tesseract payload; Linux has no configured recogniser."
                 .to_string(),
         }));
     }
@@ -1810,8 +1809,14 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
                 ))));
             }
             let frame = platform::decode_image_file(&path)?;
-            let blocks = platform::ocr_engine().recognize(&frame)?;
-            Ok(ocr_report(&blocks, &path.display().to_string()))
+            let engine = platform::ocr_engine();
+            let engine_name = scrozz_ocr::SystemOcr::engine_name()?;
+            let blocks = engine.recognize(&frame)?;
+            Ok(ocr_report(
+                &blocks,
+                &path.display().to_string(),
+                engine_name,
+            ))
         }
         OcrSubject::Capture(_) => {
             let _store = platform::store()?;
@@ -1830,7 +1835,7 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
 /// belong in `--json`, where a consumer asked for structure; printing them in
 /// the human path would corrupt the far more common case of piping the text
 /// somewhere.
-fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
+fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str, engine: &str) -> Report {
     let text = blocks
         .iter()
         .map(|b| b.text.as_str())
@@ -1839,6 +1844,7 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 
     let data = Json::obj([
         ("source", Json::str(source)),
+        ("engine", Json::str(engine)),
         ("block_count", Json::Int(blocks.len() as i64)),
         ("text", Json::str(text.as_str())),
         (
@@ -2709,6 +2715,15 @@ mod tests {
         }
         let err = run(&["scrozz", "ocr", "--file", "./definitely-not-here.png"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Io);
+    }
+
+    #[test]
+    fn ocr_json_contract_includes_the_stable_engine_key() {
+        let report = ocr_report(&[], "fixture.png", "windows-media-ocr");
+        assert_eq!(
+            report.data.to_compact_string(),
+            r#"{"source":"fixture.png","engine":"windows-media-ocr","block_count":0,"text":"","blocks":[]}"#
+        );
     }
 
     // -- shared rendering --------------------------------------------------
