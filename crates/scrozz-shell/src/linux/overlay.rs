@@ -86,7 +86,11 @@ impl LinuxOverlay {
             compositor: session.compositor,
             desktop: session.desktop.clone(),
         };
-        let plan = super::overlay_plan(&actual);
+        let plan = super::capability::adopted_plan(
+            actual.server,
+            actual.compositor,
+            super::probe_layer_shell(),
+        );
 
         let x11 = match handle {
             LinuxWindowHandle::X11 { .. } => Some(X11Backend::connect()?),

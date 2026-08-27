@@ -487,7 +487,8 @@ impl App {
         }
     }
 
-    fn note(&mut self, what: impl Into<String>) {
+    /// Records a runtime degradation that another GUI component observed.
+    pub(crate) fn note(&mut self, what: impl Into<String>) {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);

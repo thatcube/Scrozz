@@ -55,9 +55,8 @@ use scrozz_ui::{PanelAttachment, PanelReport};
 /// `wl_surface` holds exactly one role for its lifetime — asking
 /// `zwlr_layer_shell_v1` to promote it raises a protocol error, which on Wayland
 /// is fatal and kills the whole client connection. So the backend refuses, and
-/// the refusal says which of the two very different reasons applies: the
-/// compositor supports layer-shell and Scrozz cannot yet reach it, or the
-/// compositor refuses layer-shell outright.
+/// the refusal applies only to this fallback window. Sessions selected for the
+/// owned layer-shell host never call this conversion at all.
 #[cfg(target_os = "linux")]
 #[must_use]
 fn convert_linux_window(
@@ -123,8 +122,8 @@ fn convert_linux_window(
             }
         }
         // This is winit's xdg_toplevel. Its whole-window passthrough command is
-        // legal, but retaining the protocol-only layer-shell object here would
-        // not make this surface a layer surface.
+        // legal, but creating some separate layer-shell object here would not
+        // make this surface a layer surface.
         scrozz_shell::LinuxWindowHandle::Wayland => PanelAttachment::report_only(report),
     }
 }

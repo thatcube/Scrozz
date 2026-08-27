@@ -72,6 +72,7 @@ arboard = "3.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 global-hotkey = "0.8"
 tray-icon = "0.24"
+gtk = "0.18"
 
 # --- macOS ---
 objc2 = "0.6"
@@ -112,7 +113,9 @@ ashpd = { version = "0.13", features = [
 # this pulls in no libwayland linkage and stays checkable from a Mac; see
 # docs/platforms.md layer 1.
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+rustix = { version = "1", features = ["event", "fs", "mm"] }
 
 [workspace.lints.rust]
 # An unimplemented contract must still compile. Phase 0 is deliberately a tree

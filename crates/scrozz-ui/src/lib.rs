@@ -94,7 +94,7 @@ pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, InputRegionHook, OverlayApp, OverlayEvent, OverlayGeometry,
-    OverlayHandle, OverlayOptions, PanelAttachment, PanelHook, PanelReport, Passthrough,
-    PointerProbe,
+    OverlayHandle, OverlayOptions, OwnedOverlayFrame, PanelAttachment, PanelHook, PanelReport,
+    Passthrough, PointerProbe, layer_shell_geometry,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

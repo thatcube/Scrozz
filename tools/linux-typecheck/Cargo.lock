@@ -249,10 +249,12 @@ name = "scrozz-linux-typecheck"
 version = "0.0.0"
 dependencies = [
  "global-hotkey",
+ "rustix",
  "scrozz-core",
  "thiserror",
  "tracing",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-wlr",
  "x11rb 0.14.0",
 ]

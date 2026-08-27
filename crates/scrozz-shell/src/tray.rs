@@ -260,6 +260,7 @@ impl Tray {
     ///
     /// As [`Tray::new`].
     pub fn with_tooltip(tooltip: &str) -> Result<Self> {
+        initialize_platform_tray()?;
         let menu = Menu::new();
         let mut record_item = None;
 
@@ -317,6 +318,7 @@ impl Tray {
     /// process-global and shared with any other menu in the process.
     #[must_use]
     pub fn poll(&self) -> Option<TrayAction> {
+        pump_platform_tray();
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if let Some(action) = TrayAction::from_id(event.id.as_ref()) {
                 return Some(action);
@@ -330,6 +332,7 @@ impl Tray {
     /// Prefer this to [`MenuEvent::set_event_handler`], a process-global
     /// `OnceCell` whose first setter silently starves every other consumer.
     pub fn drain(&self, mut handler: impl FnMut(TrayAction)) {
+        pump_platform_tray();
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if let Some(action) = TrayAction::from_id(event.id.as_ref()) {
                 handler(action);
@@ -373,3 +376,26 @@ fn append(menu: &Menu, item: &dyn IsMenuItem) -> Result<()> {
     menu.append(item)
         .map_err(|err| Error::Platform(format!("could not build the tray menu: {err}")))
 }
+
+#[cfg(target_os = "linux")]
+fn initialize_platform_tray() -> Result<()> {
+    gtk::init()
+        .map_err(|error| Error::Platform(format!("could not initialise the GTK tray: {error}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn initialize_platform_tray() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pump_platform_tray() {
+    if gtk::is_initialized() {
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pump_platform_tray() {}

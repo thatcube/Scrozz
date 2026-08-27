@@ -1143,6 +1143,62 @@ pub struct Image {
     pixels: Vec<u8>,
 }
 
+/// A live surface frame in premultiplied RGBA8.
+///
+/// Unlike [`Image`], this is ready for native compositors rather than PNG:
+/// every colour channel is already multiplied by alpha, so a Wayland SHM
+/// backend only needs to reorder RGBA bytes into its native ARGB8888 layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PremultipliedImage {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl PremultipliedImage {
+    /// Width in physical pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in physical pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Row-major premultiplied RGBA8 pixels.
+    #[must_use]
+    pub fn as_rgba(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    fn from_premultiplied_f32(width: u32, height: u32, fb: &[[f32; 4]]) -> Result<Self> {
+        let expected = width as usize * height as usize;
+        if fb.len() != expected {
+            return Err(Error::InvalidRequest(format!(
+                "expected {expected} pixels for a {width}x{height} frame, got {}",
+                fb.len()
+            )));
+        }
+
+        let mut pixels = Vec::with_capacity(expected * 4);
+        for pixel in fb {
+            pixels.extend(
+                pixel
+                    .iter()
+                    .map(|channel| channel.round().clamp(0.0, 255.0) as u8),
+            );
+        }
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+}
+
 impl fmt::Debug for Image {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Image")
@@ -2567,39 +2623,8 @@ impl RasterJob {
         let h_pt = self.height_px as f32 / ppp;
 
         let ctx = egui::Context::default();
+        configure_software_context(&ctx, self.theme);
         ctx.set_pixels_per_point(ppp);
-        ctx.set_theme(self.theme);
-
-        // Pin everything the tessellator could reasonably change between
-        // versions or platforms. Anti-aliasing stays *on*: turning it off would
-        // hide exactly the rounded-corner defects D9 exists to catch, and it is
-        // deterministic anyway.
-        ctx.tessellation_options_mut(|o| {
-            o.feathering = true;
-            o.feathering_size_in_pixels = 1.0;
-            o.coarse_tessellation_culling = true;
-            o.prerasterized_discs = true;
-            o.round_text_to_pixels = true;
-            o.round_line_segments_to_pixels = false;
-            o.round_rects_to_pixels = true;
-            o.debug_paint_clip_rects = false;
-            o.debug_paint_text_rects = false;
-            o.debug_ignore_clip_rects = false;
-            o.validate_meshes = false;
-        });
-
-        // egui's own implicit animations (`animate_bool`, collapsing headers,
-        // scroll easing) accumulate across passes and snap to their target the
-        // first time they see an `Id`. Collapsing them to zero removes a whole
-        // class of first-frame flake; Scrozz's real motion is explicit and reads
-        // the virtual clock instead.
-        ctx.all_styles_mut(|s| {
-            s.animation_time = 0.0;
-            s.explanation_tooltips = false;
-        });
-        ctx.options_mut(|o| {
-            o.warn_on_id_clash = false;
-        });
 
         setup(&ctx);
 
@@ -2638,49 +2663,216 @@ impl RasterJob {
         }
 
         let out = pass(input.clone(), &mut draw);
-        textures.apply(out.textures_delta);
-        let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let fb = rasterize_output(
+            &ctx,
+            &mut textures,
+            out,
+            self.width_px,
+            self.height_px,
+            self.background,
+            self.seed,
+        )?;
+        Image::from_premultiplied_f32(self.width_px, self.height_px, &fb)
+    }
+}
 
-        // Framebuffer in premultiplied sRGB, held at f32 so hundreds of blends
-        // accumulate at full precision and quantise exactly once, at the end.
-        let mut fb = self.background.framebuffer(w_px, h_px, self.seed);
+fn configure_software_context(ctx: &egui::Context, theme: egui::Theme) {
+    ctx.set_theme(theme);
 
-        for egui::ClippedPrimitive {
-            clip_rect,
-            primitive,
-        } in primitives
+    // Pin everything the tessellator could reasonably change between versions
+    // or platforms. The live Wayland surface shares this exact path with the
+    // golden renderer, so a tested card and a shipped card rasterise alike.
+    ctx.tessellation_options_mut(|o| {
+        o.feathering = true;
+        o.feathering_size_in_pixels = 1.0;
+        o.coarse_tessellation_culling = true;
+        o.prerasterized_discs = true;
+        o.round_text_to_pixels = true;
+        o.round_line_segments_to_pixels = false;
+        o.round_rects_to_pixels = true;
+        o.debug_paint_clip_rects = false;
+        o.debug_paint_text_rects = false;
+        o.debug_ignore_clip_rects = false;
+        o.validate_meshes = false;
+    });
+
+    ctx.all_styles_mut(|style| {
+        style.animation_time = 0.0;
+        style.explanation_tooltips = false;
+    });
+    ctx.options_mut(|options| {
+        options.warn_on_id_clash = false;
+    });
+}
+
+fn rasterize_output(
+    ctx: &egui::Context,
+    textures: &mut TextureStore,
+    out: egui::FullOutput,
+    width_px: u32,
+    height_px: u32,
+    background: Background,
+    seed: u64,
+) -> Result<Vec<[f32; 4]>> {
+    let w_px = width_px as usize;
+    let h_px = height_px as usize;
+    let ppp = out.pixels_per_point;
+    textures.apply(out.textures_delta);
+    let primitives = ctx.tessellate(out.shapes, ppp);
+
+    // Framebuffer in premultiplied sRGB, held at f32 so hundreds of blends
+    // accumulate at full precision and quantise exactly once, at the end.
+    let mut fb = background.framebuffer(w_px, h_px, seed);
+
+    for egui::ClippedPrimitive {
+        clip_rect,
+        primitive,
+    } in primitives
+    {
+        let mesh = match primitive {
+            egui::epaint::Primitive::Mesh(mesh) => mesh,
+            egui::epaint::Primitive::Callback(_) => {
+                return Err(Error::Unsupported {
+                    what: "paint callback in a software render".to_owned(),
+                    why: "the software renderer draws meshes only; silently dropping a \
+                          callback would make the live surface differ from the tested scene"
+                        .to_owned(),
+                });
+            }
+        };
+        if mesh.indices.is_empty() {
+            continue;
+        }
+        let Some(clip) = scale_clip(clip_rect, ppp, w_px, h_px) else {
+            continue;
+        };
+        let texture = textures.get(mesh.texture_id);
+        for triangle in mesh.indices.as_chunks::<3>().0 {
+            let (a, b, c) = (
+                mesh.vertices[triangle[0] as usize],
+                mesh.vertices[triangle[1] as usize],
+                mesh.vertices[triangle[2] as usize],
+            );
+            raster_triangle(&mut fb, w_px, clip, ppp, a, b, c, texture);
+        }
+    }
+
+    Ok(fb)
+}
+
+/// Stateful CPU renderer for a live native surface.
+///
+/// It retains egui's context and texture atlas between frames, while sharing the
+/// same tessellation and rasterisation code as [`SoftwareRenderer`]. The caller
+/// owns the window protocol and supplies physical dimensions, scale, time, input
+/// events, and the UI closure for each committed frame.
+pub struct LiveRenderer {
+    ctx: egui::Context,
+    textures: TextureStore,
+}
+
+/// Inputs for one [`LiveRenderer`] frame.
+#[derive(Clone, Debug)]
+pub struct LiveRenderInput {
+    /// Buffer width in physical pixels.
+    pub width_px: u32,
+    /// Buffer height in physical pixels.
+    pub height_px: u32,
+    /// Physical pixels per logical egui point.
+    pub pixels_per_point: f32,
+    /// Compositor-configured surface size in logical egui points.
+    ///
+    /// This is explicit because fractional scaling rounds the physical buffer
+    /// outward; deriving it back from the buffer would make the UI fractionally
+    /// larger than the layer surface on non-integral dimensions.
+    pub logical_size: egui::Vec2,
+    /// Monotonic seconds since the live surface started.
+    pub time: f64,
+    /// Predicted interval until the next frame.
+    pub predicted_dt: f32,
+    /// Pointer and keyboard-independent input collected from the native surface.
+    pub events: Vec<egui::Event>,
+}
+
+impl LiveRenderer {
+    /// Creates a transparent live renderer.
+    #[must_use]
+    pub fn new(theme: egui::Theme) -> Self {
+        let ctx = egui::Context::default();
+        configure_software_context(&ctx, theme);
+        Self {
+            ctx,
+            textures: TextureStore::default(),
+        }
+    }
+
+    /// The persistent egui context backing the surface.
+    #[must_use]
+    pub const fn context(&self) -> &egui::Context {
+        &self.ctx
+    }
+
+    /// Renders one live frame into premultiplied RGBA8.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for invalid dimensions or scale and
+    /// [`Error::Unsupported`] if the scene emits a paint callback, which the
+    /// shared CPU rasteriser cannot represent.
+    pub fn render(
+        &mut self,
+        input: LiveRenderInput,
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) -> Result<PremultipliedImage> {
+        if input.width_px == 0 || input.height_px == 0 {
+            return Err(Error::InvalidRequest(
+                "cannot render a zero-sized live surface".to_owned(),
+            ));
+        }
+        if !input.pixels_per_point.is_finite() || input.pixels_per_point <= 0.0 {
+            return Err(Error::InvalidRequest(format!(
+                "live surface scale {} is not positive and finite",
+                input.pixels_per_point
+            )));
+        }
+        if !input.logical_size.is_finite()
+            || input.logical_size.x <= 0.0
+            || input.logical_size.y <= 0.0
         {
-            let mesh = match primitive {
-                egui::epaint::Primitive::Mesh(m) => m,
-                egui::epaint::Primitive::Callback(_) => {
-                    // Scrozz has no paint callbacks. If one ever appears it must
-                    // be rendered some other way rather than silently dropped.
-                    return Err(Error::Unsupported {
-                        what: "paint callback in a harness render".to_owned(),
-                        why: "the software renderer draws meshes only; a callback \
-                              would silently vanish from the golden"
-                            .to_owned(),
-                    });
-                }
-            };
-            if mesh.indices.is_empty() {
-                continue;
-            }
-            let Some(clip) = scale_clip(clip_rect, ppp, w_px, h_px) else {
-                continue;
-            };
-            let tex = textures.get(mesh.texture_id);
-            for tri in mesh.indices.as_chunks::<3>().0 {
-                let (a, b, c) = (
-                    mesh.vertices[tri[0] as usize],
-                    mesh.vertices[tri[1] as usize],
-                    mesh.vertices[tri[2] as usize],
-                );
-                raster_triangle(&mut fb, w_px, clip, ppp, a, b, c, tex);
-            }
+            return Err(Error::InvalidRequest(format!(
+                "live surface logical size {:?} is not positive and finite",
+                input.logical_size
+            )));
         }
 
-        Image::from_premultiplied_f32(self.width_px, self.height_px, &fb)
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                input.logical_size,
+            )),
+            time: Some(input.time),
+            predicted_dt: input.predicted_dt,
+            focused: false,
+            events: input.events,
+            ..Default::default()
+        };
+        let viewport = raw.viewport_id;
+        raw.viewports
+            .entry(viewport)
+            .or_default()
+            .native_pixels_per_point = Some(input.pixels_per_point);
+
+        let out = self.ctx.run_ui(raw, &mut draw);
+        let fb = rasterize_output(
+            &self.ctx,
+            &mut self.textures,
+            out,
+            input.width_px,
+            input.height_px,
+            Background::Transparent,
+            0,
+        )?;
+        PremultipliedImage::from_premultiplied_f32(input.width_px, input.height_px, &fb)
     }
 }
 

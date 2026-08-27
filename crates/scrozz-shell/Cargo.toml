@@ -32,7 +32,10 @@ windows = { workspace = true, features = [
 ashpd.workspace = true
 x11rb.workspace = true
 wayland-client.workspace = true
+wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
+rustix.workspace = true
+gtk.workspace = true
 
 [lints]
 workspace = true

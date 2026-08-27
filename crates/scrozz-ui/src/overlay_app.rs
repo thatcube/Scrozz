@@ -68,7 +68,7 @@ use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
-use crate::stack::{CaptureStack, CardId, Intent, dock};
+use crate::stack::{CaptureStack, CardId, CardMetrics, Intent, MAX_SLOTS, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
@@ -578,6 +578,20 @@ impl OverlayHandle {
         }
     }
 
+    /// Whether a producer queued work that the owned host has not rendered yet.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.shared
+            .inbox
+            .lock()
+            .is_ok_and(|queue| !queue.is_empty())
+            || self
+                .shared
+                .commands
+                .lock()
+                .is_ok_and(|queue| !queue.is_empty())
+    }
+
     fn command(&self, cmd: Command) {
         if let Ok(mut q) = self.shared.commands.lock() {
             q.push(cmd);
@@ -795,6 +809,19 @@ struct InputRegionSnapshot {
     pixels_per_point: f32,
 }
 
+/// Native-facing state produced by one owned-surface render.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OwnedOverlayFrame {
+    /// Surface-local logical rectangles that accept pointer input.
+    pub hit_regions: Vec<Rect>,
+    /// Whether any card or dock pixels are still visible.
+    pub visible: bool,
+    /// Whether the application asked this surface to close.
+    pub close_requested: bool,
+    /// When the owned native host needs to render again.
+    pub activity: crate::motion::Activity,
+}
+
 /// The `eframe` application that hosts the capture stack.
 pub struct OverlayApp {
     stack: CaptureStack,
@@ -816,6 +843,7 @@ pub struct OverlayApp {
     hovered: Option<CardId>,
     dock_collapsed: bool,
     dragging: Option<CardId>,
+    close_requested: bool,
 }
 
 impl OverlayApp {
@@ -829,7 +857,39 @@ impl OverlayApp {
         handle: OverlayHandle,
         mut options: OverlayOptions,
     ) -> Self {
-        let ctx = &cc.egui_ctx;
+        let attachment = options.panel.take().map_or_else(
+            || {
+                PanelAttachment::report_only(PanelReport::unsupported(
+                    "no native panel hook supplied",
+                ))
+            },
+            |hook| hook(cc),
+        );
+        Self::from_context(&cc.egui_ctx, handle, options, attachment)
+    }
+
+    /// Builds the same capture-card scene for a Scrozz-owned native surface.
+    ///
+    /// Unlike [`Self::new`], this path has no eframe window to convert. The
+    /// caller supplies the native surface's truthful report and commits the
+    /// returned software-rendered pixels itself.
+    #[must_use]
+    pub fn new_owned(
+        ctx: &egui::Context,
+        handle: OverlayHandle,
+        mut options: OverlayOptions,
+        report: PanelReport,
+    ) -> Self {
+        options.panel = None;
+        Self::from_context(ctx, handle, options, PanelAttachment::report_only(report))
+    }
+
+    fn from_context(
+        ctx: &egui::Context,
+        handle: OverlayHandle,
+        mut options: OverlayOptions,
+        attachment: PanelAttachment,
+    ) -> Self {
         let theme = Theme::for_appearance(options.appearance);
         crate::theme::install_fonts(ctx);
         crate::theme::install_style(ctx, &theme);
@@ -842,14 +902,7 @@ impl OverlayApp {
             report,
             input_region,
             geometry,
-        } = options.panel.take().map_or_else(
-            || {
-                PanelAttachment::report_only(PanelReport::unsupported(
-                    "no native panel hook supplied",
-                ))
-            },
-            |hook| hook(cc),
-        );
+        } = attachment;
         if let Some(geometry) = geometry {
             options.geometry = geometry;
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
@@ -890,6 +943,7 @@ impl OverlayApp {
             hovered: None,
             dock_collapsed: false,
             dragging: None,
+            close_requested: false,
         }
     }
 
@@ -990,7 +1044,10 @@ impl OverlayApp {
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
-                Command::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Command::Close => {
+                    self.close_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
     }
@@ -1198,14 +1255,9 @@ impl OverlayApp {
     }
 }
 
-impl eframe::App for OverlayApp {
-    /// Fully transparent. eframe's default is a dark translucent wash, which on
-    /// an overlay is a grey sheet over the entire work area.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl OverlayApp {
+    /// Draws one frame for either eframe or a Scrozz-owned native surface.
+    pub fn render_frame(&mut self, ui: &mut egui::Ui) -> OwnedOverlayFrame {
         let ctx = ui.ctx().clone();
         let m = Motion::from_context(&ctx);
 
@@ -1319,7 +1371,27 @@ impl eframe::App for OverlayApp {
 
         // The single place repainting is requested: idle costs nothing, an
         // animation gets a continuous repaint, and a pending wake gets a timer.
-        self.stack.activity(&m).apply(&ctx);
+        let activity = self.stack.activity(&m);
+        activity.apply(&ctx);
+
+        OwnedOverlayFrame {
+            visible: !frames.is_empty() || dock_hit.is_some(),
+            hit_regions: hits,
+            close_requested: self.close_requested,
+            activity,
+        }
+    }
+}
+
+impl eframe::App for OverlayApp {
+    /// Fully transparent. eframe's default is a dark translucent wash, which on
+    /// an overlay is a grey sheet over the entire work area.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let _ = self.render_frame(ui);
     }
 }
 
@@ -1331,6 +1403,23 @@ pub fn dock_rect(geometry: OverlayGeometry) -> Rect {
     let layout =
         crate::stack::StackLayout::new(geometry.local(), crate::stack::CardMetrics::default());
     dock::rect_for_slot0(layout.slot_rect(0))
+}
+
+/// Tight logical geometry for the owned Wayland capture stack.
+///
+/// Layer-shell positions the surface itself, so it does not need a transparent
+/// display-sized window. This holds exactly six D28 slots plus the stack's
+/// existing inner margin, keeping buffer allocation and damage bounded.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn layer_shell_geometry() -> OverlayGeometry {
+    let metrics = CardMetrics::default();
+    let slots = MAX_SLOTS as f32;
+    let size = Vec2::new(
+        metrics.width + 2.0 * metrics.margin,
+        slots * metrics.height + (slots - 1.0) * metrics.gap + 2.0 * metrics.margin,
+    );
+    OverlayGeometry::new(Rect::from_min_size(Pos2::ZERO, size))
 }
 
 #[cfg(test)]
@@ -1383,6 +1472,7 @@ mod tests {
             (100, 50),
         ));
         assert_eq!(h.shared.inbox.lock().unwrap().len(), 1);
+        assert!(h.has_pending_work());
         assert!(h.drain_events().is_empty());
         assert!(h.panel_report().is_none());
     }

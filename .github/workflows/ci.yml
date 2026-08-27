@@ -162,6 +162,10 @@ jobs:
         if: runner.os == 'Linux'
         run: tools/ci-linux-deps.sh
 
+      - name: Install headless layer-shell compositor
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends sway
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
@@ -186,6 +190,10 @@ jobs:
             echo "::error title=Tests failed on ${{ matrix.name }}::If this passes on the other two platforms, the cause is platform-specific — that is precisely what this job exists to find."
             exit 1
           fi
+
+      - name: Map an owned layer-shell surface under headless Sway
+        if: runner.os == 'Linux'
+        run: tools/linux-smoke/headless-sway.sh
 
   # ---------------------------------------------------------------------------
   # LAYER 3 — headless golden images (decision D25).

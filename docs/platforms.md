@@ -114,13 +114,39 @@ tools/linux-smoke/wlroots.sh
 Each script prints `SKIP` and exits successfully unless it detects its exact
 Linux session. In a matching session, X11 creates a real server-side window and
 verifies that two per-card SHAPE rectangles can be replaced by one and then by
-an empty input region. KDE and wlroots verify that the compositor accepts
-Scrozz's owned **protocol-only** layer surface, while also asserting that the
-active eframe renderer remains an ordinary compositor-positioned
-`xdg_toplevel`. GNOME asserts D31's compositor-positioned fallback and its
-portal explanation. The Wayland probes do not claim rendered layer-shell
-coverage; Scrozz still needs an owned renderer before that backend can become
-the active surface.
+an empty input region. KDE and wlroots create the same Scrozz-owned layer surface
+the app selects, commit a real SHM pixel buffer, replace its input regions,
+unmap it while empty, and remap it through a fresh configure. GNOME asserts
+D31's compositor-positioned fallback and its portal explanation.
+
+The owned capture surface performs one bufferless all-edge configure to measure
+the selected output's available work area, then clamps its requested dimensions
+and restores the final bottom-left anchor before mapping. A short or narrow
+output therefore reduces stack capacity instead of clipping the newest cards.
+
+Linux CI additionally installs Sway and runs the mapped-buffer probe under its
+headless wlroots backend:
+
+```bash
+tools/linux-smoke/headless-sway.sh
+```
+
+That automated probe uses a 720-point-tall output to validate extent clamping,
+protocol, buffer, scale, output-selection, input-region and map/unmap lifecycle.
+It still cannot judge visual placement,
+focus behaviour, mixed-DPI output movement, or interaction with real desktop
+panels; those remain the explicit KDE and wlroots human checks above.
+
+On a multi-output Wayland session, `SCROZZ_WAYLAND_OUTPUT=DP-1` selects the exact
+stable `wl_output.name`. An absent or empty value leaves output choice to the
+compositor. An unknown name is an error rather than a silent move to a different
+display.
+
+A socket-activated launch that exposes only `WAYLAND_SOCKET` cannot safely open
+a second capability-probe client: duplicated descriptors share one Wayland
+protocol stream. Scrozz leaves that inherited descriptor untouched and uses the
+honest compositor-positioned fallback unless `WAYLAND_DISPLAY` is also available
+for an independent probe connection.
 
 ---
 
@@ -160,7 +186,10 @@ These are the dangerous class: the call returns success and nothing works.
    and return `Error::Unsupported` per D11 rather than believing the crate.
 3. **`tray-icon` and `muda` types are `Rc`-based and `!Send`**, and — along with
    `GlobalHotKeyManager` — require the main thread with a live event loop.
-   Failure to satisfy that is also silent.
+   Failure to satisfy that is also silent. On Linux, creating Scrozz's tray
+   initialises GTK and each tray poll first drains GTK's pending events; an
+   owned Wayland loop that only pumps the Wayland socket would leave a visible
+   but unresponsive menu.
 
 ### Process-global state
 

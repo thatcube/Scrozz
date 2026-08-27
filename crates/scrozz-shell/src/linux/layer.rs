@@ -33,7 +33,9 @@
 //! **The size.** `set_size(0, _)` means "compositor, you choose", and the
 //! protocol makes it a *protocol error* — fatal to the connection — to pass 0
 //! for a dimension whose opposite edges are not both anchored. The capture stack
-//! is anchored bottom+left only, so both of its dimensions must be concrete.
+//! ends bottom+left with concrete dimensions. Before it maps, the transport uses
+//! one bufferless all-edge configure to learn the output's available extent,
+//! clamps the requested stack to it, then restores the final bottom-left anchor.
 //!
 //! No `cfg(target_os)`, no Wayland types: this compiles and is tested
 //! everywhere, and [`super::wayland`] is the thin part that turns it into
@@ -283,6 +285,35 @@ impl LayerSurfaceConfig {
     }
 }
 
+pub(super) fn extent_probe_config(config: &LayerSurfaceConfig) -> Option<LayerSurfaceConfig> {
+    if config.width == 0
+        || config.height == 0
+        || !config.anchor.contains(Anchor::BOTTOM_LEFT)
+        || config.anchor.contains(Anchor::TOP)
+        || config.anchor.contains(Anchor::RIGHT)
+    {
+        return None;
+    }
+
+    let mut probe = config.clone();
+    probe.anchor = Anchor::ALL;
+    probe.width = 0;
+    probe.height = 0;
+    probe.margins.top = 0;
+    probe.margins.right = 0;
+    Some(probe)
+}
+
+pub(super) fn clamp_to_available(
+    config: &LayerSurfaceConfig,
+    available: LogicalSize,
+) -> LayerSurfaceConfig {
+    let mut clamped = config.clone();
+    clamped.width = clamped.width.min(round_extent(available.width));
+    clamped.height = clamped.height.min(round_extent(available.height));
+    clamped
+}
+
 /// Maps an overlay level onto a layer-shell layer.
 ///
 /// [`OverlayLevel::Normal`] has no layer-shell equivalent — ordinary windows sit
@@ -348,4 +379,39 @@ fn round_margin(value: f64) -> i32 {
     value
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_left_surface_can_probe_available_extent_without_mapping() {
+        let config = LayerSurfaceConfig::for_behavior(
+            &OverlayBehavior::capture_card(),
+            LogicalSize::new(264.0, 962.0),
+            0.0,
+        );
+        let probe = extent_probe_config(&config).expect("capture stack needs an extent probe");
+
+        assert_eq!(probe.anchor, Anchor::ALL);
+        assert_eq!((probe.width, probe.height), (0, 0));
+        assert_eq!(probe.exclusive_zone, 0);
+        assert_eq!(probe.keyboard_interactivity, KeyboardInteractivity::None);
+        assert!(probe.rejection_reason().is_none());
+    }
+
+    #[test]
+    fn final_surface_clamps_to_short_outputs_and_restores_bottom_left() {
+        let config = LayerSurfaceConfig::for_behavior(
+            &OverlayBehavior::capture_card(),
+            LogicalSize::new(264.0, 962.0),
+            0.0,
+        );
+        let clamped = clamp_to_available(&config, LogicalSize::new(1920.0, 700.0));
+
+        assert_eq!(clamped.anchor, Anchor::BOTTOM_LEFT);
+        assert_eq!((clamped.width, clamped.height), (264, 700));
+        assert!(clamped.rejection_reason().is_none());
+    }
 }

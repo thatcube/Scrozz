@@ -10,7 +10,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scrozz_ui::{
@@ -127,6 +127,14 @@ pub fn for_platform(_config: &Config, emit: Emit) -> CliResult<Box<dyn Host>> {
     }
 
     if HAS_WINDOW {
+        #[cfg(target_os = "linux")]
+        {
+            let session = scrozz_shell::Session::detect();
+            let plan = scrozz_shell::linux::overlay_plan(&session);
+            if window_host_for(plan.backend) == WindowHostKind::LayerShell {
+                return Ok(Box::new(LayerShellWindowed::new(emit, plan)));
+            }
+        }
         return Ok(Box::new(Windowed::new(emit)));
     }
 
@@ -141,6 +149,23 @@ pub fn for_platform(_config: &Config, emit: Emit) -> CliResult<Box<dyn Host>> {
 /// A plain constant rather than a Cargo feature, because a feature would imply
 /// the code exists and is switched off.
 pub const HAS_WINDOW: bool = true;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowHostKind {
+    Eframe,
+    LayerShell,
+}
+
+const fn window_host_for(
+    backend: scrozz_shell::linux::capability::OverlayBackend,
+) -> WindowHostKind {
+    match backend {
+        scrozz_shell::linux::capability::OverlayBackend::LayerShell => WindowHostKind::LayerShell,
+        scrozz_shell::linux::capability::OverlayBackend::X11Retrofit
+        | scrozz_shell::linux::capability::OverlayBackend::CompositorPlaced
+        | scrozz_shell::linux::capability::OverlayBackend::Headless => WindowHostKind::Eframe,
+    }
+}
 
 /// Why there would be no window, if there were none.
 ///
@@ -251,6 +276,394 @@ impl Host for Windowed {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
         Box::new(OverlayCards::new(self.handle.clone()))
+    }
+}
+
+/// Selects a named Wayland output for the owned surface.
+///
+/// The value is the exact `wl_output.name` (for example `DP-1`). Empty or
+/// missing leaves selection to the compositor.
+pub const WAYLAND_OUTPUT_ENV: &str = "SCROZZ_WAYLAND_OUTPUT";
+
+fn output_selector(raw: Option<&str>) -> scrozz_shell::linux::OutputSelector {
+    match raw.map(str::trim) {
+        Some(name) if !name.is_empty() => {
+            scrozz_shell::linux::OutputSelector::Named(name.to_owned())
+        }
+        _ => scrozz_shell::linux::OutputSelector::CompositorDefault,
+    }
+}
+
+/// Drives the real card scene on a Scrozz-owned Wayland layer surface.
+#[cfg(target_os = "linux")]
+pub struct LayerShellWindowed {
+    handle: OverlayHandle,
+    plan: scrozz_shell::linux::capability::OverlayPlan,
+    // Only the converted macOS panel needs to emit before returning. Retaining
+    // this still keeps host construction uniform and the reporter alive.
+    _emit: Emit,
+}
+
+#[cfg(target_os = "linux")]
+impl LayerShellWindowed {
+    fn new(emit: Emit, plan: scrozz_shell::linux::capability::OverlayPlan) -> Self {
+        Self {
+            handle: OverlayHandle::new(),
+            plan,
+            _emit: emit,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Host for LayerShellWindowed {
+    fn run(self: Box<Self>, mut app: App) -> CliResult<Report> {
+        use scrozz_core::LogicalSize;
+        use scrozz_shell::linux::{
+            FrameCommit, LayerShellSession, SurfaceSize, layer::LayerSurfaceConfig,
+        };
+        use scrozz_shell::overlay::OverlayBehavior;
+        use scrozz_ui::{
+            Motion, PanelReport, Passthrough,
+            harness::{LiveRenderInput, LiveRenderer},
+            layer_shell_geometry,
+        };
+
+        let requested_geometry = layer_shell_geometry();
+        let logical = requested_geometry.size();
+        // The card stack already owns its 16-point inset. A second layer-shell
+        // margin would put visible pixels 32 points from D28's bottom-left edge.
+        let config = LayerSurfaceConfig::for_behavior(
+            &OverlayBehavior::capture_card(),
+            LogicalSize::new(f64::from(logical.x), f64::from(logical.y)),
+            0.0,
+        );
+        let raw_output = std::env::var(WAYLAND_OUTPUT_ENV).ok();
+        let selector = output_selector(raw_output.as_deref());
+        let mut session = LayerShellSession::with_output(&config, selector)?;
+        let initial_size = session.configured_logical_size().ok_or_else(|| {
+            CoreError::Platform(
+                "the Wayland overlay received no configured logical surface size".to_owned(),
+            )
+        })?;
+        let geometry = geometry_for_surface(initial_size);
+        tracing::info!(
+            version = session.version(),
+            scale = session.current_scale().factor(),
+            fractional_scale = session.uses_fractional_scale(),
+            output = ?session.output_selector(),
+            "opening the Scrozz-owned layer-shell overlay"
+        );
+
+        let mut renderer = LiveRenderer::new(egui::Theme::Dark);
+        let ctx = renderer.context().clone();
+        let mut overlay = OverlayApp::new_owned(
+            &ctx,
+            self.handle.clone(),
+            OverlayOptions {
+                geometry,
+                // Input shaping is committed directly to wl_surface below.
+                passthrough: Passthrough::Never,
+                ..Default::default()
+            },
+            PanelReport::converted(self.plan.detail.clone()),
+        );
+        let started = std::time::Instant::now();
+        let mut applied_region = None;
+        let mut repaint_at = Some(Instant::now());
+
+        let exit_note = 'running: loop {
+            let frame_started = std::time::Instant::now();
+            if app.tick() == Tick::Stop {
+                break None;
+            }
+
+            if let Err(error) = session.poll_events() {
+                break Some(format!("the Wayland overlay event pump failed: {error}"));
+            }
+            let extent_refreshed = match session.refresh_extent_if_needed() {
+                Ok(refreshed) => {
+                    if refreshed {
+                        applied_region = None;
+                    }
+                    refreshed
+                }
+                Err(error) => {
+                    break Some(format!(
+                        "the Wayland overlay could not refresh its output extent: {error}"
+                    ));
+                }
+            };
+            let native_events = session.drain_events();
+            if session.is_closed() {
+                break Some(format!(
+                    "the Wayland compositor closed the overlay: {}",
+                    session.close_reason().map_or_else(
+                        || "unknown reason".to_owned(),
+                        |reason| format!("{reason:?}")
+                    )
+                ));
+            }
+
+            let surface_changed = native_events.iter().any(|event| {
+                matches!(
+                    event,
+                    scrozz_shell::linux::LayerSurfaceEvent::Configured { .. }
+                        | scrozz_shell::linux::LayerSurfaceEvent::ScaleChanged { .. }
+                )
+            });
+            let egui_events = egui_pointer_events(&native_events);
+            let repaint_due = repaint_at.is_some_and(|deadline| deadline <= Instant::now());
+            let should_render = repaint_due
+                || extent_refreshed
+                || surface_changed
+                || self.handle.has_pending_work()
+                || !egui_events.is_empty();
+            if should_render {
+                repaint_at = None;
+                let Some(logical_size) = session.configured_logical_size() else {
+                    break Some("the Wayland overlay lost its configured logical size".to_owned());
+                };
+                let Some(buffer_size) = session.current_buffer_size() else {
+                    break Some("the Wayland overlay lost its physical buffer size".to_owned());
+                };
+                let next_geometry = geometry_for_surface(logical_size);
+                if next_geometry != overlay.geometry() {
+                    overlay.set_geometry(next_geometry, &ctx, &Motion::from_context(&ctx));
+                    applied_region = None;
+                }
+                let mut overlay_frame = None;
+                let render_input = LiveRenderInput {
+                    width_px: buffer_size.width,
+                    height_px: buffer_size.height,
+                    pixels_per_point: scale_as_f32(session.current_scale()),
+                    logical_size: size_as_vec2(logical_size),
+                    time: started.elapsed().as_secs_f64(),
+                    predicted_dt: IDLE.as_secs_f32(),
+                    events: egui_events,
+                };
+                let image = match renderer.render(render_input, |ui| {
+                    overlay_frame = Some(overlay.render_frame(ui));
+                }) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        break Some(format!("the owned overlay could not render: {error}"));
+                    }
+                };
+                let frame = overlay_frame.expect("the renderer invokes its UI closure");
+                if frame.close_requested {
+                    break Some("the owned overlay requested a clean shutdown".to_owned());
+                }
+                repaint_at = repaint_deadline(frame.activity, Instant::now());
+
+                let region = input_region_for(logical_size, &frame.hit_regions);
+                if frame.visible {
+                    let stride = match usize::try_from(image.width())
+                        .ok()
+                        .and_then(|width| width.checked_mul(4))
+                    {
+                        Some(stride) => stride,
+                        None => {
+                            break Some("the owned overlay pixel stride overflowed".to_owned());
+                        }
+                    };
+                    let region_changed = applied_region.as_ref() != Some(&region);
+                    let commit = if region_changed {
+                        session.commit_pixels_with_input_region(
+                            SurfaceSize::new(image.width(), image.height()),
+                            stride,
+                            image.as_rgba(),
+                            &region,
+                        )
+                    } else {
+                        session.commit_pixels(
+                            SurfaceSize::new(image.width(), image.height()),
+                            stride,
+                            image.as_rgba(),
+                        )
+                    };
+                    match commit {
+                        Ok(FrameCommit::Committed) => {
+                            if region_changed {
+                                applied_region = Some(region);
+                            }
+                        }
+                        Ok(
+                            FrameCommit::BuffersBusy
+                            | FrameCommit::AwaitingConfigure
+                            | FrameCommit::SurfaceChanged,
+                        ) => repaint_at = Some(Instant::now()),
+                        Err(error) => {
+                            break Some(format!(
+                                "the owned Wayland overlay frame could not commit: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    if session.is_mapped()
+                        && let Err(error) = session.unmap()
+                    {
+                        break Some(format!(
+                            "the empty Wayland overlay could not unmap: {error}"
+                        ));
+                    }
+                    applied_region = None;
+                }
+            }
+
+            let wait = IDLE.saturating_sub(frame_started.elapsed());
+            if let Err(error) = session.pump_events(wait) {
+                break 'running Some(format!("the Wayland overlay event pump failed: {error}"));
+            }
+        };
+
+        if let Some(note) = exit_note {
+            app.note(note);
+        }
+        if let Err(error) = session.shutdown() {
+            app.note(format!(
+                "the Wayland overlay did not tear down cleanly: {error}"
+            ));
+        }
+        let report = app.report();
+        app.shut_down();
+        Ok(report)
+    }
+
+    fn describe(&self) -> &'static str {
+        "owned layer-shell overlay"
+    }
+
+    fn surface(&self) -> Box<dyn CardSurface> {
+        Box::new(OverlayCards::new(self.handle.clone()))
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn scale_as_f32(scale: scrozz_shell::linux::SurfaceScale) -> f32 {
+    scale.factor() as f32
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn size_as_vec2(size: scrozz_shell::linux::SurfaceSize) -> egui::Vec2 {
+    egui::vec2(size.width as f32, size.height as f32)
+}
+
+fn geometry_for_surface(size: scrozz_shell::linux::SurfaceSize) -> OverlayGeometry {
+    OverlayGeometry::new(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        size_as_vec2(size),
+    ))
+}
+
+fn repaint_deadline(activity: scrozz_ui::Activity, now: Instant) -> Option<Instant> {
+    if activity.is_animating() {
+        return Some(now);
+    }
+    activity
+        .wake_after()
+        .and_then(|seconds| Duration::try_from_secs_f32(seconds).ok())
+        .and_then(|delay| now.checked_add(delay))
+}
+
+fn input_region_for(
+    surface: scrozz_shell::linux::SurfaceSize,
+    hits: &[egui::Rect],
+) -> scrozz_shell::linux::region::InputRegion {
+    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+
+    let surface = LogicalRect::new(
+        LogicalPoint::new(0.0, 0.0),
+        LogicalSize::new(f64::from(surface.width), f64::from(surface.height)),
+    );
+    let hits = hits
+        .iter()
+        .map(|hit| {
+            LogicalRect::new(
+                LogicalPoint::new(f64::from(hit.left()), f64::from(hit.top())),
+                LogicalSize::new(f64::from(hit.width()), f64::from(hit.height())),
+            )
+        })
+        .collect::<Vec<_>>();
+    scrozz_shell::linux::region::input_region(surface, &hits, true)
+}
+
+fn egui_pointer_events(events: &[scrozz_shell::linux::LayerSurfaceEvent]) -> Vec<egui::Event> {
+    use scrozz_shell::linux::{
+        LayerSurfaceEvent, PointerAxis, PointerButtonState, SurfacePointerEvent,
+    };
+
+    let mut translated = Vec::new();
+    for event in events {
+        let LayerSurfaceEvent::Pointer(event) = event else {
+            continue;
+        };
+        match event {
+            SurfacePointerEvent::Enter { position, .. }
+            | SurfacePointerEvent::Motion { position, .. } => {
+                translated.push(egui::Event::PointerMoved(point_as_pos2(*position)));
+            }
+            SurfacePointerEvent::Leave { .. } => translated.push(egui::Event::PointerGone),
+            SurfacePointerEvent::Button {
+                button,
+                state,
+                position,
+                ..
+            } => {
+                let Some(button) = egui_button(*button) else {
+                    continue;
+                };
+                let pos = point_as_pos2(*position);
+                translated.push(egui::Event::PointerMoved(pos));
+                translated.push(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: *state == PointerButtonState::Pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            SurfacePointerEvent::Axis {
+                axis,
+                value,
+                position,
+                ..
+            } => {
+                translated.push(egui::Event::PointerMoved(point_as_pos2(*position)));
+                let value = *value as f32;
+                let delta = match axis {
+                    PointerAxis::Vertical => egui::vec2(0.0, value),
+                    PointerAxis::Horizontal => egui::vec2(value, 0.0),
+                };
+                translated.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            SurfacePointerEvent::AxisDiscrete { .. }
+            | SurfacePointerEvent::AxisValue120 { .. }
+            | SurfacePointerEvent::AxisStop { .. }
+            | SurfacePointerEvent::AxisSource(_)
+            | SurfacePointerEvent::Frame => {}
+        }
+    }
+    translated
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn point_as_pos2(point: scrozz_shell::linux::SurfacePoint) -> egui::Pos2 {
+    egui::pos2(point.x as f32, point.y as f32)
+}
+
+const fn egui_button(button: u32) -> Option<egui::PointerButton> {
+    match button {
+        0x110 => Some(egui::PointerButton::Primary),
+        0x111 => Some(egui::PointerButton::Secondary),
+        0x112 => Some(egui::PointerButton::Middle),
+        0x113 => Some(egui::PointerButton::Extra1),
+        0x114 => Some(egui::PointerButton::Extra2),
+        _ => None,
     }
 }
 
@@ -509,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_window_build_chooses_the_window_host() {
+    fn a_window_build_chooses_a_real_window_host() {
         // The inverse of the test this replaces. While `eframe` was missing,
         // the property worth pinning was that a missing window is an error
         // rather than a silent fallback; now that it is present, the property
@@ -521,7 +934,14 @@ mod tests {
         }
         let host = for_platform(&Config::sealed(), Box::new(|_| {}))
             .expect("this build can open a window");
-        assert_eq!(host.describe(), "eframe overlay");
+        assert!(
+            matches!(
+                host.describe(),
+                "eframe overlay" | "owned layer-shell overlay"
+            ),
+            "unexpected window host: {}",
+            host.describe()
+        );
     }
 
     #[test]
@@ -546,5 +966,116 @@ mod tests {
     fn the_probe_gap_names_the_fix_rather_than_apologising() {
         assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
         assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    }
+
+    #[test]
+    fn only_the_real_layer_shell_backend_selects_the_owned_host() {
+        use scrozz_shell::linux::capability::OverlayBackend;
+
+        assert_eq!(
+            window_host_for(OverlayBackend::LayerShell),
+            WindowHostKind::LayerShell
+        );
+        for backend in [
+            OverlayBackend::X11Retrofit,
+            OverlayBackend::CompositorPlaced,
+            OverlayBackend::Headless,
+        ] {
+            assert_eq!(window_host_for(backend), WindowHostKind::Eframe);
+        }
+    }
+
+    #[test]
+    fn a_named_wayland_output_is_explicit_and_empty_means_default() {
+        use scrozz_shell::linux::OutputSelector;
+
+        assert_eq!(
+            output_selector(Some(" DP-1 ")),
+            OutputSelector::Named("DP-1".to_owned())
+        );
+        assert_eq!(
+            output_selector(Some("  ")),
+            OutputSelector::CompositorDefault
+        );
+        assert_eq!(output_selector(None), OutputSelector::CompositorDefault);
+    }
+
+    #[test]
+    fn card_hits_become_outward_rounded_wayland_regions() {
+        use scrozz_shell::linux::{SurfaceSize, region::RegionRect};
+
+        let region = input_region_for(
+            SurfaceSize::new(264, 962),
+            &[egui::Rect::from_min_max(
+                egui::pos2(15.2, 800.4),
+                egui::pos2(248.1, 946.2),
+            )],
+        );
+        assert_eq!(
+            region,
+            scrozz_shell::linux::region::InputRegion::Rects(vec![RegionRect {
+                x: 15,
+                y: 800,
+                width: 234,
+                height: 147,
+            }])
+        );
+    }
+
+    #[test]
+    fn negotiated_wayland_size_controls_the_owned_stack_geometry() {
+        use scrozz_shell::linux::SurfaceSize;
+
+        let geometry = geometry_for_surface(SurfaceSize::new(264, 700));
+        assert_eq!(geometry.position(), egui::Pos2::ZERO);
+        assert_eq!(geometry.size(), egui::vec2(264.0, 700.0));
+    }
+
+    #[test]
+    fn owned_surface_sleeps_when_idle_and_wakes_for_motion_or_deadlines() {
+        let now = Instant::now();
+        assert_eq!(repaint_deadline(scrozz_ui::Activity::IDLE, now), None);
+        assert_eq!(
+            repaint_deadline(scrozz_ui::Activity::animating(), now),
+            Some(now)
+        );
+
+        let delayed = repaint_deadline(scrozz_ui::Activity::waiting(0.25), now).expect("timer");
+        assert!(delayed >= now + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn wayland_pointer_events_drive_the_owned_egui_scene() {
+        use scrozz_shell::linux::{
+            LayerSurfaceEvent, PointerButtonState, SurfacePoint, SurfacePointerEvent,
+        };
+
+        let events = egui_pointer_events(&[
+            LayerSurfaceEvent::Pointer(SurfacePointerEvent::Motion {
+                time: 1,
+                position: SurfacePoint { x: 24.0, y: 40.0 },
+            }),
+            LayerSurfaceEvent::Pointer(SurfacePointerEvent::Button {
+                serial: 2,
+                time: 3,
+                button: 0x110,
+                state: PointerButtonState::Pressed,
+                position: SurfacePoint { x: 24.0, y: 40.0 },
+            }),
+        ]);
+
+        assert_eq!(events[0], egui::Event::PointerMoved(egui::pos2(24.0, 40.0)));
+        assert!(matches!(
+            events.as_slice(),
+            [
+                egui::Event::PointerMoved(_),
+                egui::Event::PointerMoved(_),
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                }
+            ]
+        ));
     }
 }

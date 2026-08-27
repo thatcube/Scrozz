@@ -5,9 +5,10 @@
 //!
 //! - **X11** — a client may set absolute window coordinates and may shape its
 //!   own input region. Everything Scrozz's design assumes is achievable.
-//! - **Wayland with `wlr-layer-shell`** — a Scrozz-owned surface could ask to be
-//!   anchored to a screen edge with margins. KDE/KWin and the wlroots family
-//!   implement this, but eframe's existing `xdg_toplevel` cannot be promoted.
+//! - **Wayland with `wlr-layer-shell`** — Scrozz owns a rendered surface and asks
+//!   the compositor to anchor it to a screen edge with margins. KDE/KWin and the
+//!   wlroots family implement this. eframe's `xdg_toplevel` remains a separate
+//!   fallback and is never promoted.
 //! - **Wayland without `wlr-layer-shell`** — a client can neither position nor
 //!   anchor. GNOME/Mutter is here *by choice*, not by omission (decision D31),
 //!   so there is no version to wait for and no flag to set.
@@ -102,8 +103,8 @@ pub enum OverlayBackend {
     /// Wayland `zwlr_layer_shell_v1`: reserved for a Scrozz-owned rendered
     /// surface anchored by the compositor.
     ///
-    /// Merely discovering the global does not select this backend. A winit
-    /// window already has the `xdg_toplevel` role and cannot be promoted.
+    /// Selected only for Scrozz's own surface. A winit window already has the
+    /// `xdg_toplevel` role and cannot be promoted.
     LayerShell,
     /// Wayland `xdg_shell` only: an ordinary toplevel the compositor places
     /// wherever it likes. The D31 fallback.
@@ -200,10 +201,10 @@ impl OverlayPlan {
 /// Chooses the overlay backend for a session.
 ///
 /// `probe` is the result of a live registry enumeration. It is ignored on X11,
-/// where layer-shell is irrelevant. On Wayland it changes the explanation, but
-/// does not select [`OverlayBackend::LayerShell`] until Scrozz owns both the
-/// surface and its renderer. The eframe/winit window is already an
-/// `xdg_toplevel` and cannot legally be promoted.
+/// where layer-shell is irrelevant. On Wayland an advertised global selects
+/// Scrozz's owned layer surface except on GNOME, where D31 deliberately retains
+/// the ordinary compositor-positioned window. The eframe/winit fallback is
+/// already an `xdg_toplevel` and is never promoted.
 ///
 /// # The GNOME case is a decision, not a defect
 ///
@@ -248,20 +249,58 @@ pub fn plan(server: DisplayServer, compositor: Compositor, probe: LayerShellProb
     }
 }
 
+/// Reports what an already-role-bearing native window can actually do.
+///
+/// An adopted Wayland window is an `xdg_toplevel`; advertising layer-shell on
+/// the same compositor cannot promote that surface to a second, incompatible
+/// role. Owned layer-shell hosts use [`plan`], while winit adoption uses this
+/// function and therefore always reports the compositor-positioned fallback.
+#[must_use]
+pub fn adopted_plan(
+    server: DisplayServer,
+    compositor: Compositor,
+    probe: LayerShellProbe,
+) -> OverlayPlan {
+    if server == DisplayServer::Wayland {
+        compositor_placed(compositor, probe)
+    } else {
+        plan(server, compositor, probe)
+    }
+}
+
 /// The Wayland half of [`plan`], split out because it is the half with rules.
 fn wayland_plan(compositor: Compositor, probe: LayerShellProbe) -> OverlayPlan {
+    if compositor != Compositor::Gnome
+        && let LayerShellProbe::Present { version } = probe
+    {
+        return OverlayPlan {
+            backend: OverlayBackend::LayerShell,
+            placement: Placement::Anchored,
+            input_shaping: true,
+            stays_above: true,
+            controls_focus: true,
+            detail: format!(
+                "Wayland: Scrozz is using its rendered wlr-layer-shell v{version} surface, \
+                 anchored bottom-left above ordinary windows with per-card input regions and \
+                 no keyboard focus."
+            ),
+        };
+    }
     compositor_placed(compositor, probe)
 }
 
-/// The current Wayland plan, with a reason that distinguishes compositor
-/// capability from the surface Scrozz actually owns.
+/// The fallback Wayland plan, with a reason that distinguishes compositor
+/// capability from a registry Scrozz could not use.
 fn compositor_placed(compositor: Compositor, probe: LayerShellProbe) -> OverlayPlan {
     let detail = match (compositor, probe) {
+        (Compositor::Gnome, LayerShellProbe::Present { version }) => format!(
+            "GNOME/Wayland: this Mutter build advertises wlr-layer-shell v{version}, but D31 \
+             deliberately keeps the capture stack on the ordinary compositor-positioned \
+             window path; region selection still uses the screenshot portal."
+        ),
         (_, LayerShellProbe::Present { version }) => format!(
-            "Wayland: this compositor offers wlr-layer-shell v{version}, but Scrozz's \
-             current eframe window already has the xdg_toplevel role and Scrozz does not \
-             yet own a layer-shell renderer. The capture stack is an ordinary window the \
-             compositor places."
+            "Wayland: wlr-layer-shell v{version} was advertised, but the owned surface was not \
+             selected. Scrozz is explicitly using an ordinary compositor-positioned window."
         ),
         (Compositor::Gnome, LayerShellProbe::Absent | LayerShellProbe::NotProbed) => {
             "GNOME/Wayland: Mutter does not implement wlr-layer-shell, so no client can \
@@ -278,8 +317,8 @@ fn compositor_placed(compositor: Compositor, probe: LayerShellProbe) -> OverlayP
             if layer_shell_expectation(compositor) == Expectation::Implements =>
         {
             "Wayland: this compositor is expected to offer wlr-layer-shell, but Scrozz has \
-             not asked it yet and does not yet own a layer-shell renderer. The capture stack \
-             is an ordinary window the compositor places."
+             not been able to verify the live registry. The capture stack is an ordinary \
+             window the compositor places."
                 .to_string()
         }
         (_, LayerShellProbe::NotProbed) => {

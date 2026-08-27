@@ -23,7 +23,8 @@
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_shell::hotkey::{Compositor, DisplayServer};
 use scrozz_shell::linux::capability::{
-    Expectation, LayerShellProbe, OverlayBackend, Placement, layer_shell_expectation, plan,
+    Expectation, LayerShellProbe, OverlayBackend, Placement, adopted_plan, layer_shell_expectation,
+    plan,
 };
 use scrozz_shell::linux::ewmh::{
     ALL_DESKTOPS, Managed, WM_HINTS_INPUT_FLAG, WM_HINTS_WORDS, WindowType, WmState,
@@ -66,17 +67,14 @@ mod choosing_a_backend {
     }
 
     #[test]
-    fn advertising_layer_shell_does_not_promote_winits_xdg_toplevel() {
-        // Capability is not ownership. A patched Mutter, a fork, or a compositor
-        // Scrozz has never heard of may advertise the global, but eframe's
-        // surface already has the xdg_toplevel role. Reporting layer-shell here
-        // would claim controlled placement from a backend the app is not using.
+    fn advertising_layer_shell_selects_scrozzs_owned_surface() {
+        // Capability is paired with ownership: these plans select the native
+        // host, never an attempt to promote eframe's xdg_toplevel.
         for compositor in [
             Compositor::Sway,
             Compositor::Kde,
             Compositor::Niri,
             Compositor::Other,
-            Compositor::Gnome,
         ] {
             let chosen = plan(
                 DisplayServer::Wayland,
@@ -85,17 +83,27 @@ mod choosing_a_backend {
             );
             assert_eq!(
                 chosen.backend,
-                OverlayBackend::CompositorPlaced,
-                "{compositor:?} advertised layer-shell but the active surface is a toplevel"
+                OverlayBackend::LayerShell,
+                "{compositor:?} advertised layer-shell"
             );
-            assert_eq!(chosen.placement, Placement::CompositorChosen);
-            assert!(chosen.detail.contains("offers wlr-layer-shell"));
-            assert!(
-                chosen
-                    .detail
-                    .contains("does not yet own a layer-shell renderer")
-            );
+            assert_eq!(chosen.placement, Placement::Anchored);
+            assert!(chosen.input_shaping);
+            assert!(chosen.stays_above);
+            assert!(chosen.controls_focus);
+            assert!(chosen.detail.contains("rendered wlr-layer-shell"));
         }
+    }
+
+    #[test]
+    fn gnome_keeps_d31_even_if_a_patched_mutter_advertises_layer_shell() {
+        let chosen = plan(
+            DisplayServer::Wayland,
+            Compositor::Gnome,
+            LayerShellProbe::Present { version: 4 },
+        );
+        assert_eq!(chosen.backend, OverlayBackend::CompositorPlaced);
+        assert_eq!(chosen.placement, Placement::CompositorChosen);
+        assert!(chosen.detail.contains("D31"));
     }
 
     #[test]
@@ -133,8 +141,8 @@ mod choosing_a_backend {
 
     #[test]
     fn an_unprobed_wlroots_compositor_uses_the_fallback_and_says_why() {
-        // "Expected to offer" is only a capability prior. Until Scrozz owns a
-        // rendered layer surface, the active eframe window remains a toplevel.
+        // "Expected to offer" is only a capability prior. Without a successful
+        // live probe, the ordinary eframe window is the safe path.
         let chosen = plan(
             DisplayServer::Wayland,
             Compositor::Sway,
@@ -143,11 +151,10 @@ mod choosing_a_backend {
         assert_eq!(chosen.backend, OverlayBackend::CompositorPlaced);
         assert_eq!(chosen.placement, Placement::CompositorChosen);
         assert!(
-            chosen.detail.contains("not asked"),
+            chosen.detail.contains("not been able to verify"),
             "an unverified plan must not read as a verified one: {}",
             chosen.detail
         );
-        assert!(chosen.detail.contains("does not yet own"));
     }
 
     #[test]
@@ -310,10 +317,10 @@ mod reporting_the_fallback {
     }
 
     #[test]
-    fn advertised_layer_shell_is_not_controlled_until_scrozz_owns_the_surface() {
+    fn advertised_layer_shell_is_fully_controlled_by_the_owned_surface() {
         // `is_fully_controlled` gates the "overlay: ready" line in diagnostics.
-        // A protocol global must not turn that line green while the actual
-        // eframe surface remains compositor-positioned.
+        // It turns green only because this plan selects the owned rendered
+        // surface rather than the compositor-positioned eframe fallback.
         let x11 = plan(
             DisplayServer::X11,
             Compositor::Other,
@@ -325,9 +332,23 @@ mod reporting_the_fallback {
             LayerShellProbe::Present { version: 4 },
         );
         assert!(x11.is_fully_controlled());
-        assert!(!layer.is_fully_controlled());
-        assert_eq!(layer.backend, OverlayBackend::CompositorPlaced);
-        assert_eq!(layer.placement, Placement::CompositorChosen);
+        assert!(layer.is_fully_controlled());
+        assert_eq!(layer.backend, OverlayBackend::LayerShell);
+        assert_eq!(layer.placement, Placement::Anchored);
+    }
+
+    #[test]
+    fn an_adopted_wayland_toplevel_is_never_promoted_to_layer_shell() {
+        let adopted = adopted_plan(
+            DisplayServer::Wayland,
+            Compositor::Sway,
+            LayerShellProbe::Present { version: 4 },
+        );
+
+        assert_eq!(adopted.backend, OverlayBackend::CompositorPlaced);
+        assert_eq!(adopted.placement, Placement::CompositorChosen);
+        assert!(!adopted.is_fully_controlled());
+        assert!(adopted.detail.contains("ordinary compositor-positioned"));
     }
 }
 

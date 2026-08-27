@@ -6,10 +6,9 @@
 //! - **X11** lets a client do anything. Scrozz gets real anchoring, real
 //!   stacking and real click-through, via [`x11`].
 //! - **Wayland with `wlr-layer-shell`** (KDE, Sway, Hyprland, River, Niri,
-//!   Wayfire) has a protocol built for exactly this. [`wayland`] contains a
-//!   Scrozz-owned protocol surface, but it has no renderer yet. The active
-//!   eframe window remains an `xdg_toplevel`, so it uses the same honest
-//!   compositor-positioned fallback until Scrozz owns the rendered surface.
+//!   Wayfire) uses a Scrozz-owned layer surface, SHM swapchain and software
+//!   rendering of the real capture-card scene. eframe's `xdg_toplevel` remains
+//!   only as the explicit compositor-positioned fallback.
 //! - **Wayland without it** (GNOME/Mutter) has no mechanism at all. `xdg-shell`
 //!   deliberately omits absolute positioning, and Mutter has declined
 //!   `layer-shell` as a matter of policy, not backlog. Per decision D31 Scrozz
@@ -17,7 +16,8 @@
 //!
 //! The point of this module is that the fallback is visible rather than silent.
 //! Every path produces an [`capability::OverlayPlan`] describing what will
-//! actually happen, and advertising a protocol never counts as using it.
+//! actually happen, and advertising a protocol selects layer-shell only when the
+//! owned rendering host is the surface that will be run.
 //!
 //! # Layout
 //!
@@ -36,6 +36,7 @@ pub mod capability;
 pub mod ewmh;
 pub mod layer;
 pub mod region;
+pub mod surface;
 
 #[cfg(target_os = "linux")]
 mod overlay;
@@ -49,8 +50,13 @@ mod x11;
 
 #[cfg(target_os = "linux")]
 pub use overlay::{LinuxOverlay, LinuxWindowHandle, work_area};
+pub use surface::{
+    FrameCommit, LayerSurfaceEvent, OutputInfo, OutputSelector, PointerAxis, PointerAxisSource,
+    PointerButtonState, SurfaceCloseReason, SurfacePoint, SurfacePointerEvent, SurfaceScale,
+    SurfaceSize, scaled_buffer_size,
+};
 #[cfg(target_os = "linux")]
-pub use wayland::LayerShellSession;
+pub use wayland::{LayerShellSession, enumerate_outputs};
 
 use crate::hotkey::Session;
 use capability::{LayerShellProbe, OverlayPlan};

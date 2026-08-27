@@ -162,19 +162,19 @@ impl X11Backend {
             done.push(format!("set {}", listed.join(", ")));
         }
 
-        if plan.all_desktops {
-            if let Some(atom) = self.atoms.get("_NET_WM_DESKTOP") {
-                self.conn
-                    .change_property32(
-                        PropMode::REPLACE,
-                        window,
-                        atom,
-                        AtomEnum::CARDINAL,
-                        &[ewmh::ALL_DESKTOPS],
-                    )
-                    .map_err(platform)?;
-                done.push("pinned to all desktops".into());
-            }
+        if plan.all_desktops
+            && let Some(atom) = self.atoms.get("_NET_WM_DESKTOP")
+        {
+            self.conn
+                .change_property32(
+                    PropMode::REPLACE,
+                    window,
+                    atom,
+                    AtomEnum::CARDINAL,
+                    &[ewmh::ALL_DESKTOPS],
+                )
+                .map_err(platform)?;
+            done.push("pinned to all desktops".into());
         }
 
         // The ICCCM way to say "do not give me the keyboard". Only meaningful
@@ -383,8 +383,9 @@ impl X11Backend {
             .read_cardinals(root, "_NET_CURRENT_DESKTOP")
             .and_then(|bytes| {
                 bytes
-                    .chunks_exact(4)
-                    .next()
+                    .as_chunks::<4>()
+                    .0
+                    .first()
                     .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
             })
             .unwrap_or(0);
