@@ -23,6 +23,12 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use macos::ScreenCaptureKitBackend;
+
 use scrozz_core::{CaptureBackend, Result};
 
 /// Constructs the best capture backend for the running system.
@@ -32,5 +38,13 @@ use scrozz_core::{CaptureBackend, Result};
 /// Returns [`scrozz_core::Error::Unsupported`] if no backend can serve this
 /// platform or compositor.
 pub fn backend() -> Result<Box<dyn CaptureBackend>> {
-    todo!("select and construct the platform capture backend")
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::ScreenCaptureKitBackend::new()))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        todo!("select and construct the platform capture backend")
+    }
 }
