@@ -25,11 +25,15 @@ const BRIDGE_POLL: Duration = Duration::from_millis(25);
 /// A selector owned by the long-running app.
 ///
 /// The core trait ends when the user chooses a target. A desktop overlay must
-/// remain hidden until that target has actually been captured, so the app adds
-/// the lifecycle notifications the platform-neutral contract cannot know.
+/// stay excluded or hidden until that target has actually been captured, so the
+/// app adds the lifecycle notifications the platform-neutral contract cannot
+/// know.
 pub trait CaptureSelector: RegionSelector {
-    /// Hides and reserves the app surface for a capture that needs no picker.
-    fn begin_capture(&self) -> Result<()> {
+    /// Reserves the app surface for a capture that needs no picker.
+    ///
+    /// `surface_can_remain_visible` is true only when the capture backend
+    /// guarantees that current-process windows are absent from the result.
+    fn begin_capture(&self, _surface_can_remain_visible: bool) -> Result<()> {
         Ok(())
     }
 
@@ -38,6 +42,7 @@ pub trait CaptureSelector: RegionSelector {
         &self,
         options: &SelectionOptions,
         _cursor: CursorMode,
+        _surface_can_remain_visible: bool,
     ) -> Result<SelectionOutcome> {
         self.select(options)
     }
@@ -115,10 +120,10 @@ impl RegionSelector for UnsupportedSelector {
 }
 
 impl CaptureSelector for UnsupportedSelector {
-    fn begin_capture(&self) -> Result<()> {
-        self.lifecycle
-            .as_ref()
-            .map_or(Ok(()), |lifecycle| lifecycle.begin_capture())
+    fn begin_capture(&self, surface_can_remain_visible: bool) -> Result<()> {
+        self.lifecycle.as_ref().map_or(Ok(()), |lifecycle| {
+            lifecycle.begin_capture(surface_can_remain_visible)
+        })
     }
 
     fn capture_finished(&self) {
@@ -225,10 +230,12 @@ enum BridgeEvent {
     BeginCapture {
         id: u64,
         hidden: Sender<()>,
+        surface_can_remain_visible: bool,
     },
     Begin {
         id: u64,
         hidden: Sender<()>,
+        surface_can_remain_visible: bool,
     },
     Prepared {
         id: u64,
@@ -271,6 +278,15 @@ enum ControllerPhase {
     },
     WaitingForPreparation {
         id: u64,
+    },
+    PreparingWithCards {
+        id: u64,
+    },
+    ReadyToSelect {
+        id: u64,
+        prepared: Box<PreparedSelection>,
+        decision: Sender<Result<SelectionOutcome>>,
+        saw_quiet_frame: bool,
     },
     Selecting {
         id: u64,
@@ -419,6 +435,7 @@ impl ClientOverlaySelector {
         id: u64,
         options: &SelectionOptions,
         cursor: CursorMode,
+        surface_can_remain_visible: bool,
     ) -> Result<SelectionOutcome> {
         if let Some(delay) = options.delay
             && let Err(error) = self.wait_delay(delay)
@@ -432,6 +449,7 @@ impl ClientOverlaySelector {
             .send(BridgeEvent::Begin {
                 id,
                 hidden: hidden_tx,
+                surface_can_remain_visible,
             })
             .map_err(|_| bridge_error("the selector window closed before it could hide"))?;
         self.receive(
@@ -468,9 +486,10 @@ impl ClientOverlaySelector {
         &self,
         options: &SelectionOptions,
         cursor: CursorMode,
+        surface_can_remain_visible: bool,
     ) -> Result<SelectionOutcome> {
         let id = self.acquire()?;
-        let result = self.run_selection(id, options, cursor);
+        let result = self.run_selection(id, options, cursor, surface_can_remain_visible);
         if result.is_err() && self.is_stopped() {
             self.release(id);
         }
@@ -512,12 +531,12 @@ impl RegionSelector for ClientOverlaySelector {
     }
 
     fn select(&self, options: &SelectionOptions) -> Result<SelectionOutcome> {
-        self.select_internal(options, CursorMode::Hidden)
+        self.select_internal(options, CursorMode::Hidden, false)
     }
 }
 
 impl CaptureSelector for ClientOverlaySelector {
-    fn begin_capture(&self) -> Result<()> {
+    fn begin_capture(&self, surface_can_remain_visible: bool) -> Result<()> {
         let id = self.acquire()?;
         let (hidden_tx, hidden_rx) = channel();
         if self
@@ -525,6 +544,7 @@ impl CaptureSelector for ClientOverlaySelector {
             .send(BridgeEvent::BeginCapture {
                 id,
                 hidden: hidden_tx,
+                surface_can_remain_visible,
             })
             .is_err()
         {
@@ -547,8 +567,9 @@ impl CaptureSelector for ClientOverlaySelector {
         &self,
         options: &SelectionOptions,
         cursor: CursorMode,
+        surface_can_remain_visible: bool,
     ) -> Result<SelectionOutcome> {
-        self.select_internal(options, cursor)
+        self.select_internal(options, cursor, surface_can_remain_visible)
     }
 
     fn take_frozen_capture(&self, request: &CaptureRequest) -> Option<Capture> {
@@ -689,7 +710,12 @@ impl ClientOverlayController {
     /// Whether the card UI should yield the frame to selection.
     #[must_use]
     pub fn owns_surface(&self) -> bool {
-        !matches!(self.phase, ControllerPhase::Cards)
+        !matches!(
+            self.phase,
+            ControllerPhase::Cards
+                | ControllerPhase::PreparingWithCards { .. }
+                | ControllerPhase::ReadyToSelect { .. }
+        )
     }
 
     fn advance(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
@@ -702,6 +728,25 @@ impl ClientOverlayController {
             ControllerPhase::HideBeforePreparation { id, hidden } => {
                 let _ = hidden.send(());
                 ControllerPhase::WaitingForPreparation { id }
+            }
+            ControllerPhase::ReadyToSelect {
+                id,
+                prepared,
+                decision,
+                saw_quiet_frame,
+            } => {
+                let quiet = input_is_quiescent(ctx, egui::ViewportId::ROOT);
+                if quiet && saw_quiet_frame {
+                    activate_selection(ctx, native, id, prepared, decision)
+                } else {
+                    ctx.request_repaint();
+                    ControllerPhase::ReadyToSelect {
+                        id,
+                        prepared,
+                        decision,
+                        saw_quiet_frame: quiet,
+                    }
+                }
             }
             ControllerPhase::ReleaseBeforeHide {
                 id,
@@ -751,16 +796,37 @@ impl ClientOverlayController {
         event: BridgeEvent,
     ) {
         match event {
-            BridgeEvent::BeginCapture { id, hidden }
-                if matches!(self.phase, ControllerPhase::Cards) =>
-            {
+            BridgeEvent::BeginCapture {
+                id,
+                hidden,
+                surface_can_remain_visible: true,
+            } if matches!(self.phase, ControllerPhase::Cards) => {
+                let _ = hidden.send(());
+            }
+            BridgeEvent::BeginCapture {
+                id,
+                hidden,
+                surface_can_remain_visible: false,
+            } if matches!(self.phase, ControllerPhase::Cards) => {
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforeCapture { id, hidden };
             }
-            BridgeEvent::Begin { id, hidden } if matches!(self.phase, ControllerPhase::Cards) => {
+            BridgeEvent::Begin {
+                id,
+                hidden,
+                surface_can_remain_visible: true,
+            } if matches!(self.phase, ControllerPhase::Cards) => {
+                let _ = hidden.send(());
+                self.phase = ControllerPhase::PreparingWithCards { id };
+            }
+            BridgeEvent::Begin {
+                id,
+                hidden,
+                surface_can_remain_visible: false,
+            } if matches!(self.phase, ControllerPhase::Cards) => {
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -773,21 +839,26 @@ impl ClientOverlayController {
                 decision,
             } if matches!(
                 self.phase,
+                ControllerPhase::PreparingWithCards { id: waiting } if waiting == id
+            ) =>
+            {
+                self.phase = ControllerPhase::ReadyToSelect {
+                    id,
+                    prepared,
+                    decision,
+                    saw_quiet_frame: false,
+                };
+            }
+            BridgeEvent::Prepared {
+                id,
+                prepared,
+                decision,
+            } if matches!(
+                self.phase,
                 ControllerPhase::WaitingForPreparation { id: waiting } if waiting == id
             ) =>
             {
-                configure_viewport(ctx, prepared.viewports.root.geometry, true);
-                native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
-                let selector =
-                    SelectionUi::new(prepared.options, prepared.displays, prepared.frozen)
-                        .with_windows(prepared.windows)
-                        .with_capabilities(SelectionCapabilities::CLIENT_OVERLAY);
-                self.phase = ControllerPhase::Selecting {
-                    id,
-                    ui: Box::new(selector),
-                    viewports: prepared.viewports,
-                    decision,
-                };
+                self.phase = activate_selection(ctx, native, id, prepared, decision);
             }
             BridgeEvent::PreparationFailed { id }
                 if matches!(
@@ -796,6 +867,14 @@ impl ClientOverlayController {
                 ) =>
             {
                 self.phase = ControllerPhase::AwaitingCapture { id };
+            }
+            BridgeEvent::PreparationFailed { id }
+                if matches!(
+                    self.phase,
+                    ControllerPhase::PreparingWithCards { id: waiting } if waiting == id
+                ) =>
+            {
+                self.phase = ControllerPhase::Cards;
             }
             BridgeEvent::PreparationFailed { id }
                 if matches!(self.phase, ControllerPhase::Cards) =>
@@ -847,6 +926,26 @@ impl ClientOverlayController {
                 tracing::warn!("ignored an out-of-order selector lifecycle event");
             }
         }
+    }
+}
+
+fn activate_selection(
+    ctx: &egui::Context,
+    native: &crate::gui::panel::BehaviorController,
+    id: u64,
+    prepared: Box<PreparedSelection>,
+    decision: Sender<Result<SelectionOutcome>>,
+) -> ControllerPhase {
+    configure_viewport(ctx, prepared.viewports.root.geometry, true);
+    native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
+    let selector = SelectionUi::new(prepared.options, prepared.displays, prepared.frozen)
+        .with_windows(prepared.windows)
+        .with_capabilities(SelectionCapabilities::CLIENT_OVERLAY);
+    ControllerPhase::Selecting {
+        id,
+        ui: Box::new(selector),
+        viewports: prepared.viewports,
+        decision,
     }
 }
 
@@ -916,6 +1015,18 @@ fn require_visible_window(options: &SelectionOptions, windows: &[Window]) -> Res
         });
     }
     Ok(())
+}
+
+/// Whether every display snapshot used to prepare selection omits Scrozz while
+/// leaving its windows visible to the user.
+pub(crate) fn display_captures_exclude_current_process(
+    backend: &dyn CaptureBackend,
+) -> Result<bool> {
+    let displays = backend.displays()?;
+    Ok(!displays.is_empty()
+        && displays.iter().all(|display| {
+            backend.excludes_current_process(&CaptureTarget::Display(display.id.clone()))
+        }))
 }
 
 fn frozen_capture_for_outcome(
@@ -1850,7 +1961,7 @@ mod tests {
         let (finish_tx, finish_rx) = channel();
         let worker_selector = Arc::clone(&selector);
         let worker = std::thread::spawn(move || {
-            let _ = begun_tx.send(worker_selector.begin_capture());
+            let _ = begun_tx.send(worker_selector.begin_capture(false));
             let _ = finish_rx.recv();
             worker_selector.capture_finished();
         });
@@ -1881,6 +1992,173 @@ mod tests {
         controller.logic(&ctx, &native);
         worker.join().expect("fixed capture worker");
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
+    }
+
+    #[test]
+    fn fixed_capture_keeps_cards_visible_when_the_backend_excludes_them() {
+        let prepare: Arc<PrepareFn> =
+            Arc::new(|_, _| panic!("a fixed capture must not prepare a selector"));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let (begun_tx, begun_rx) = channel();
+        let (finish_tx, finish_rx) = channel();
+        let (finished_tx, finished_rx) = channel();
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let _ = begun_tx.send(worker_selector.begin_capture(true));
+            let _ = finish_rx.recv();
+            worker_selector.capture_finished();
+            let _ = finished_tx.send(());
+        });
+        let ctx = egui::Context::default();
+        let (native, behavior_log) = crate::gui::panel::BehaviorController::recording();
+        let mut begun = None;
+
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            if let Ok(result) = begun_rx.try_recv() {
+                begun = Some(result);
+            }
+            begun.is_some()
+        });
+        begun.expect("begin result").expect("capture should begin");
+        assert!(matches!(&controller.phase, ControllerPhase::Cards));
+        assert!(!controller.owns_surface());
+        assert!(
+            behavior_log.borrow().is_empty(),
+            "native cards must not be hidden when the backend excludes them"
+        );
+
+        finish_tx.send(()).expect("finish signal");
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            finished_rx.try_recv().is_ok()
+        });
+        worker.join().expect("fixed capture worker");
+        assert!(matches!(&controller.phase, ControllerPhase::Cards));
+        assert!(behavior_log.borrow().is_empty());
+    }
+
+    #[test]
+    fn selection_prepares_behind_visible_cards_when_exclusion_is_supported() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let prepare_barrier = Arc::clone(&barrier);
+        let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor| {
+            prepare_barrier.wait();
+            let bounds =
+                LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+            let displays = vec![Display {
+                id: DisplayId("main".to_owned()),
+                name: "Main".to_owned(),
+                bounds,
+                work_area: bounds,
+                scale: ScaleFactor::new(2.0),
+                is_primary: true,
+            }];
+            Ok(PreparedSelection {
+                viewports: selector_viewports_for(&displays, false)
+                    .expect("test display has geometry"),
+                options,
+                displays,
+                windows: Vec::new(),
+                frozen: Vec::new(),
+                frozen_sources: Vec::new(),
+            })
+        });
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            worker_selector.select_for_capture(
+                &SelectionOptions {
+                    freeze: false,
+                    magnifier: false,
+                    ..SelectionOptions::region()
+                },
+                CursorMode::Hidden,
+                true,
+            )
+        });
+        let ctx = egui::Context::default();
+        let (native, behavior_log) = crate::gui::panel::BehaviorController::recording();
+
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(
+                &controller.phase,
+                ControllerPhase::PreparingWithCards { .. }
+            )
+        });
+        assert!(!controller.owns_surface());
+        assert!(behavior_log.borrow().is_empty());
+
+        let pointer = egui::pos2(60.0, 60.0);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+
+        barrier.wait();
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::ReadyToSelect { .. })
+        });
+        assert!(
+            !controller.owns_surface(),
+            "the cards keep the release frame so a press cannot leak into selection"
+        );
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::ReadyToSelect {
+                saw_quiet_frame: true,
+                ..
+            }
+        ));
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::Selecting { .. }
+        ));
+        assert_eq!(
+            *behavior_log.borrow(),
+            vec![scrozz_shell::OverlayBehavior::selection_overlay()]
+        );
+
+        selector.cancel();
+        controller.logic(&ctx, &native);
+        assert!(worker.join().expect("selection worker").is_err());
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool) {

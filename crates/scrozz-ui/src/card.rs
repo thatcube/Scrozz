@@ -2,15 +2,15 @@
 //!
 //! [`stack`](crate::stack) decides where every card is and how far through each
 //! animation it has travelled. This module turns one of its [`CardFrame`]s into
-//! pixels: the capture itself, a caption, and the chrome that appears on hover.
+//! pixels: the capture itself and the controls that appear on hover.
 //!
 //! # What a card is made of
 //!
-//! At rest a card is the capture and a caption strip, and nothing else (D12).
-//! On hover a scrim fades in carrying two prominent pills — **Copy** and
-//! **Save**, the two things people actually do with a screenshot — and four
-//! quiet corner icons for pin, close, annotate and upload (D21). The card body
-//! *is* the drag handle; there is no separate grab affordance.
+//! At rest a card is only the capture (D12). On hover a scrim fades in carrying
+//! a vertical pair of prominent pills — **Copy** and **Save**, the two things
+//! people actually do with a screenshot — and four quiet corner icons for pin,
+//! close, annotate and upload (D21). The card body *is* the drag handle; there
+//! is no separate grab affordance.
 //!
 //! # Motion applies to the card, not to its buttons
 //!
@@ -28,16 +28,14 @@
 //! capture handed to the clipboard, file encoder and editor is untouched.
 
 use egui::epaint::{Mesh, Vertex};
-use egui::{
-    Align2, Color32, Id, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
-};
+use egui::{Color32, Id, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use scrozz_core::Provenance;
 
 use crate::icons::Icon;
 use crate::motion::fade;
 use crate::paint::{self, ControlState, Reveal, Surface};
 use crate::stack::{CardFrame, CardId, MAX_LEAN};
-use crate::theme::{Radius, Space, Text, corner};
+use crate::theme::{Radius, Space, corner};
 
 /// Height of a revealed pill button.
 const PILL_H: f32 = 30.0;
@@ -47,10 +45,6 @@ const ICON_BTN: f32 = 28.0;
 const CHROME_INSET: f32 = Space::SM;
 /// Peak alpha of the hover scrim.
 const HOVER_SCRIM: f32 = 132.0;
-/// Peak alpha of the caption scrim, matching [`paint::caption_strip`].
-const CAPTION_SCRIM: f32 = 205.0;
-/// Height of the caption scrim, matching [`paint::caption_strip`].
-const CAPTION_H: f32 = 58.0;
 /// Width below which primary actions collapse to icon-only controls.
 const COMPACT_CHROME_W: f32 = 154.0;
 /// Height below which the two-row chrome collapses to icon-only controls.
@@ -89,7 +83,7 @@ impl CardChrome {
     /// Padding between the card edge and the capture.
     ///
     /// Zero by design: the image is the thumbnail surface and fills it edge to
-    /// edge. Aspect-hugging avoids both cropping and letterboxing.
+    /// edge; cover-fit UVs handle the intentional preview-only crop.
     pub const PADDING: f32 = 0.0;
 
     /// The chrome permitted for a capture of this provenance.
@@ -140,7 +134,7 @@ impl CardChrome {
 pub struct CardGeometry {
     /// Shared outer plate, shadow, hover surface and interaction hitbox.
     pub container: Rect,
-    /// Aspect-preserving thumbnail rectangle inside the container.
+    /// Complete thumbnail rectangle; aspect preservation happens in its UV crop.
     pub capture: Rect,
 }
 
@@ -154,9 +148,9 @@ pub struct CardGeometry {
 /// a still render can synthesise one without allocating a capture.
 #[derive(Clone, Copy, Debug)]
 pub struct CardContent<'a> {
-    /// File name, shown at the left of the caption.
+    /// File name retained for accessibility and future detail surfaces.
     pub name: &'a str,
-    /// Capture size in pixels, shown at the right of the caption.
+    /// Capture size in pixels, retained for accessibility and detail surfaces.
     pub source_px: (u32, u32),
     /// Where the pixels came from. Decides the chrome (D9).
     pub provenance: Provenance,
@@ -357,23 +351,7 @@ pub fn draw_card(
     let capture = geometry.capture;
     draw_capture(ui, surface, content, chrome, capture, angle, alpha);
 
-    // The caption belongs to the resting card; the hover chrome replaces it, so
-    // they cross-fade rather than colliding at the bottom edge.
     let reveal = frame.reveal.clamp(0.0, 1.0) * flat;
-    let caption_alpha = alpha * (1.0 - reveal) * flat;
-    if caption_alpha > 0.004 {
-        draw_caption(
-            ui,
-            surface,
-            rect,
-            chrome,
-            content,
-            caption_alpha,
-            reveal,
-            angle,
-        );
-    }
-
     let action = draw_chrome(ui, surface, frame, chrome, rect, alpha * reveal);
 
     CardResponse {
@@ -440,62 +418,6 @@ fn draw_capture(
     }
 }
 
-/// Name on the left, dimensions on the right, over the shared card container.
-#[allow(clippy::too_many_arguments)]
-fn draw_caption(
-    ui: &mut Ui,
-    surface: &Surface<'_>,
-    container: Rect,
-    chrome: CardChrome,
-    content: &CardContent<'_>,
-    alpha: f32,
-    _reveal: f32,
-    angle: f32,
-) {
-    if angle.abs() > f32::EPSILON {
-        // Rotated text is not expressible in egui at all, so a leaning card
-        // simply has no caption. It is mid-gesture; the label is not what the
-        // user is looking at.
-        return;
-    }
-    let painter = ui.painter();
-
-    if container.width() < 132.0 {
-        return;
-    }
-
-    // `bottom_scrim` rounds its bottom corners to the container radius.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let peak = (CAPTION_SCRIM * alpha).round().clamp(0.0, 255.0) as u8;
-    if peak > 0 {
-        paint::bottom_scrim(
-            painter,
-            container,
-            CAPTION_H.min(container.height()),
-            chrome.overlay_radius,
-            peak,
-        );
-    }
-
-    let cy = container.bottom() - 15.0;
-    painter.text(
-        pos2(container.left() + 13.0, cy),
-        Align2::LEFT_CENTER,
-        content.name,
-        surface.font(Text::Label),
-        fade(Color32::from_rgb(255, 255, 255), alpha * 0.925),
-    );
-    if container.width() >= 190.0 {
-        painter.text(
-            pos2(container.right() - 13.0, cy),
-            Align2::RIGHT_CENTER,
-            content.dimensions(),
-            surface.font(Text::Caption),
-            fade(Color32::from_rgb(255, 255, 255), alpha * 0.59),
-        );
-    }
-}
-
 /// The hover chrome: a scrim, two primary pills, four quiet corner icons.
 ///
 /// Returns the action pressed this frame. The controls themselves are drawn by
@@ -551,16 +473,11 @@ fn draw_chrome(
         return pressed;
     }
 
-    // Primary: Copy and Save, side by side, centred.
-    let gap = Space::SM;
-    let pill_w = ((inner.width() - gap) * 0.5).min(112.0);
-    let pill_y = inner.center().y - PILL_H * 0.5;
-    let total = pill_w.mul_add(2.0, gap);
-    let pill_x = inner.center().x - total * 0.5;
-    for (i, action) in [CardAction::Copy, CardAction::Save].into_iter().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
-        let x = (pill_w + gap).mul_add(i as f32, pill_x);
-        let r = Rect::from_min_size(pos2(x, pill_y), vec2(pill_w, PILL_H));
+    // Primary: Copy above Save in one centred action spine.
+    for (r, action) in primary_pill_rects(inner)?
+        .into_iter()
+        .zip([CardAction::Copy, CardAction::Save])
+    {
         let resp = paint::pill_button(
             ui,
             surface,
@@ -576,25 +493,17 @@ fn draw_chrome(
         }
     }
 
-    // Secondary: four corners. Pin and Close on top, Annotate and Upload below,
-    // so the destructive one is farthest from the primary pair.
+    // Secondary: four corners. Close follows native window convention: left on
+    // macOS, right on Windows and Linux.
     let size = vec2(ICON_BTN, ICON_BTN);
-    let corners = [
-        (CardAction::Pin, inner.left_top()),
-        (
-            CardAction::Close,
-            pos2(inner.right() - ICON_BTN, inner.top()),
-        ),
-        (
-            CardAction::Annotate,
-            pos2(inner.left(), inner.bottom() - ICON_BTN),
-        ),
-        (
-            CardAction::Upload,
-            pos2(inner.right() - ICON_BTN, inner.bottom() - ICON_BTN),
-        ),
+    let corners = corner_actions();
+    let origins = [
+        inner.left_top(),
+        pos2(inner.right() - ICON_BTN, inner.top()),
+        pos2(inner.left(), inner.bottom() - ICON_BTN),
+        pos2(inner.right() - ICON_BTN, inner.bottom() - ICON_BTN),
     ];
-    for (action, origin) in corners {
+    for (action, origin) in corners.into_iter().zip(origins) {
         let r = Rect::from_min_size(origin, size);
         let resp = paint::icon_button(
             ui,
@@ -612,6 +521,36 @@ fn draw_chrome(
     }
 
     pressed
+}
+
+fn corner_actions_for(close_on_left: bool) -> [CardAction; 4] {
+    let top = if close_on_left {
+        [CardAction::Close, CardAction::Pin]
+    } else {
+        [CardAction::Pin, CardAction::Close]
+    };
+    [top[0], top[1], CardAction::Annotate, CardAction::Upload]
+}
+
+fn corner_actions() -> [CardAction; 4] {
+    corner_actions_for(cfg!(target_os = "macos"))
+}
+
+fn primary_pill_rects(inner: Rect) -> Option<[Rect; 2]> {
+    let gap = Space::SM;
+    let total_h = PILL_H.mul_add(2.0, gap);
+    if inner.width() < PILL_H || inner.height() < total_h {
+        return None;
+    }
+    let width = inner.width().min(112.0);
+    let first = Rect::from_min_size(
+        pos2(
+            inner.center().x - width * 0.5,
+            inner.center().y - total_h * 0.5,
+        ),
+        vec2(width, PILL_H),
+    );
+    Some([first, first.translate(vec2(0.0, PILL_H + gap))])
 }
 
 // ---------------------------------------------------------------------------
@@ -795,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_primary_actions_fit_panorama_and_portrait_previews() {
+    fn primary_actions_form_one_vertical_spine() {
         let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(210.0, 150.0));
         let chrome = CardChrome::for_provenance(Provenance::Display);
         for source in [
@@ -806,11 +745,21 @@ mod tests {
             (300, 3000),
         ] {
             let inner = chrome.geometry(slot, source).container.shrink(CHROME_INSET);
-            let controls = compact_primary_rects(inner)
+            let controls = primary_pill_rects(inner)
                 .unwrap_or_else(|| panic!("{source:?} lost Copy and Save controls"));
             assert!(inner.contains_rect(controls[0]), "{source:?}");
             assert!(inner.contains_rect(controls[1]), "{source:?}");
+            assert_eq!(controls[0].center().x, controls[1].center().x);
+            assert!(controls[0].bottom() < controls[1].top());
         }
+    }
+
+    #[test]
+    fn close_follows_mac_and_windows_corner_conventions() {
+        assert_eq!(corner_actions_for(true)[0], CardAction::Close);
+        assert_eq!(corner_actions_for(true)[1], CardAction::Pin);
+        assert_eq!(corner_actions_for(false)[0], CardAction::Pin);
+        assert_eq!(corner_actions_for(false)[1], CardAction::Close);
     }
 
     #[test]

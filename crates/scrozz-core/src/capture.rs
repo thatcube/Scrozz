@@ -86,6 +86,16 @@ pub struct Capture {
 /// [`crate::Error::PermissionDenied`]; per decision D15 permission is requested
 /// at first use rather than up front, so this is an ordinary early-life outcome.
 pub trait CaptureBackend: TargetEnumerator + Send + Sync {
+    /// Whether this target is guaranteed to omit windows owned by Scrozz's
+    /// current process while leaving the process visible on the desktop.
+    ///
+    /// Overlay hosts use this only to avoid a distracting hide/restore cycle.
+    /// The conservative default keeps the old behaviour on backends that cannot
+    /// exclude application windows without changing the captured pixels.
+    fn excludes_current_process(&self, _target: &CaptureTarget) -> bool {
+        false
+    }
+
     /// Takes a single capture.
     ///
     /// # Errors

@@ -298,8 +298,10 @@ more intuitive than copying to clipboard."*
 
 **Chrome model — at rest the capture is the only interface.** A card at rest
 shows the image and nothing else: no icons, no buttons, no handle. **On hover** a
-scrim fades in with **Copy and Save as prominent pill buttons** plus four small
-secondary icons at the corners (pin, close, annotate, upload).
+scrim fades in with **Copy above Save in a vertical pair of prominent pill
+buttons** plus four small secondary icons at the corners (pin, close, annotate,
+upload). Close follows the host convention: top-left on macOS and top-right on
+Windows and Linux.
 
 This resolves cleanly against drag-first rather than conflicting with it: **the
 card itself is the drag handle**, so the hero interaction needs no chrome at all.
@@ -847,6 +849,13 @@ whether a capture is still being processed. Keyboard ownership may remain only
 long enough to consume the key-up that committed or cancelled selection; pointer
 input is released independently and immediately.
 
+Outside active selection, Scrozz's visible UI should not blink merely to keep
+itself out of a screenshot. A capture backend that can exclude the current
+process must do so and declare that guarantee; the cards then remain visible to
+the user while native capture reconstructs the pixels behind them. Backends
+without that guarantee retain the fail-safe hide/capture/restore path rather
+than leaking Scrozz chrome into the image.
+
 **Ordinary windows are genuinely ordinary.** Settings and the annotation editor
 are real, native, movable, resizable windows with normal chrome. They are opened
 deliberately, they are long-lived, and they must behave exactly like every other
@@ -899,7 +908,7 @@ comparable tools. It must clamp sensibly on small displays.
 
 **Settled geometry is exact:** every card is 210 × 150 points, adjacent cards
 have an 8-point visible gap, the shared left edge is 40 points from the work
-area, and the bottom card is 16 points above the Dock or taskbar. The native
+area, and the bottom card is 8 points above the Dock or taskbar. The native
 overlay window is re-anchored to the operating system's live work area after any
 selector or display transition; window-manager placement hints are not accepted
 as proof that the Dock has been excluded.

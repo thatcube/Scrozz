@@ -7,6 +7,8 @@
 //! needs no permission, and reports the true backing-scale factor. Windows and
 //! captures go through ScreenCaptureKit, which does need permission — and asks
 //! for it, per decision D15, at the moment of first use rather than up front.
+//! Display filters exclude every window owned by the current process, allowing
+//! Scrozz's capture cards to stay visually stable without appearing in output.
 //!
 //! # macOS version floor
 //!
@@ -25,8 +27,8 @@ mod window;
 use objc2::rc::Retained;
 use objc2_foundation::NSArray;
 use objc2_screen_capture_kit::{
-    SCCaptureResolutionType, SCContentFilter, SCDisplay, SCShareableContent, SCStreamConfiguration,
-    SCWindow,
+    SCCaptureResolutionType, SCContentFilter, SCDisplay, SCRunningApplication, SCShareableContent,
+    SCStreamConfiguration, SCWindow,
 };
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display, Error,
@@ -66,6 +68,10 @@ impl TargetEnumerator for ScreenCaptureKitBackend {
 }
 
 impl CaptureBackend for ScreenCaptureKitBackend {
+    fn excludes_current_process(&self, target: &CaptureTarget) -> bool {
+        matches!(target, CaptureTarget::Display(_))
+    }
+
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
         let (frame, provenance) = match &request.target {
             CaptureTarget::Display(id) => capture_display(id, request)?,
@@ -96,15 +102,7 @@ fn capture_display(
     // SAFETY: `displayID` is a plain property read.
     let scale = display::scale_factor(unsafe { target.displayID() });
 
-    // SAFETY: the designated initialiser for a whole-display filter. An empty
-    // exclusion list means "capture everything on this display".
-    let filter = unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(
-            sck::alloc_filter(),
-            &target,
-            &NSArray::new(),
-        )
-    };
+    let filter = display_filter_excluding_current_process(&content, &target);
 
     let config = configure(&filter, request, scale, None)?;
     let image = sck::capture_image(&filter, &config)?;
@@ -197,14 +195,7 @@ fn capture_region(
     let content = sck::shareable_content()?;
     let target = find_display(&content, &home.id)?;
 
-    // SAFETY: whole-display filter, cropped below by `sourceRect`.
-    let filter = unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(
-            sck::alloc_filter(),
-            &target,
-            &NSArray::new(),
-        )
-    };
+    let filter = display_filter_excluding_current_process(&content, &target);
 
     // `sourceRect` is in the display's own points, not global desktop points.
     let local = LogicalRect::new(
@@ -319,6 +310,40 @@ fn configure(
     }
 
     Ok(config)
+}
+
+/// Builds a display filter that leaves Scrozz visible to the user but absent
+/// from the resulting pixels.
+///
+/// ScreenCaptureKit restores whatever is behind excluded application windows;
+/// it does not paint a blank rectangle. This is the native mechanism that lets
+/// the capture stack remain visually stable during a whole-display capture.
+fn display_filter_excluding_current_process(
+    content: &SCShareableContent,
+    display: &SCDisplay,
+) -> Retained<SCContentFilter> {
+    let current_pid = i32::try_from(std::process::id()).ok();
+    // SAFETY: these are immutable property reads from one shareable-content
+    // snapshot.
+    let excluded: Vec<Retained<SCRunningApplication>> = unsafe {
+        content
+            .applications()
+            .iter()
+            .filter(|application| Some(application.processID()) == current_pid)
+            .collect()
+    };
+    let excluded = NSArray::from_retained_slice(&excluded);
+
+    // SAFETY: designated whole-display filter initialiser. With no matching
+    // application this is equivalent to an empty exclusion list.
+    unsafe {
+        SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+            sck::alloc_filter(),
+            display,
+            &excluded,
+            &NSArray::new(),
+        )
+    }
 }
 
 fn find_display(
@@ -469,5 +494,18 @@ mod tests {
     #[test]
     fn the_backend_names_itself_for_bug_reports() {
         assert_eq!(ScreenCaptureKitBackend::new().name(), "ScreenCaptureKit");
+    }
+
+    #[test]
+    fn only_filtered_display_captures_promise_current_process_exclusion() {
+        let backend = ScreenCaptureKitBackend::new();
+        assert!(backend.excludes_current_process(&CaptureTarget::Display(DisplayId("1".into()))));
+        assert!(!backend.excludes_current_process(&CaptureTarget::Region(rect(0.0, 100.0))));
+        assert!(!backend.excludes_current_process(&CaptureTarget::AllDisplays));
+        assert!(
+            !backend.excludes_current_process(&CaptureTarget::Window(scrozz_core::WindowId(
+                "1".into()
+            )))
+        );
     }
 }

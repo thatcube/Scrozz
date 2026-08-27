@@ -18,13 +18,21 @@ use scrozz_core::{Display, DisplayId, LogicalRect, Result, Window, WindowId};
 pub(crate) fn windows(content: &SCShareableContent, displays: &[Display]) -> Result<Vec<Window>> {
     // SAFETY: reading properties of the shareable content snapshot.
     let list = unsafe { content.windows() };
+    let current_pid = i32::try_from(std::process::id()).ok();
 
     Ok(list
         .iter()
         .filter(|window| {
-            // SAFETY: `windowLayer` is a plain property read.
-            let layer = unsafe { window.windowLayer() };
-            layer == 0
+            // SAFETY: immutable property reads from one content snapshot.
+            let (layer, owner_pid) = unsafe {
+                (
+                    window.windowLayer(),
+                    window
+                        .owningApplication()
+                        .map(|application| application.processID()),
+                )
+            };
+            layer == 0 && owner_pid != current_pid
         })
         .map(|window| to_window(&window, displays))
         .collect())

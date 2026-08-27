@@ -133,7 +133,7 @@ fn the_stack_grows_upward() {
 fn adjacent_slots_are_separated_by_exactly_one_gap() {
     let layout = StackLayout::default();
     assert_eq!(layout.gap, 8.0);
-    assert_eq!(layout.margin, 16.0);
+    assert_eq!(layout.margin, 8.0);
     assert_eq!(layout.left_margin, 40.0);
     assert_eq!(layout.card, LogicalSize::new(210.0, 150.0));
     let area = work_area();
@@ -244,7 +244,7 @@ fn the_stack_can_use_a_larger_left_inset_than_bottom_inset() {
     let slot = layout.slot_frame(area, 0);
     assert_eq!(uniformly_anchored.origin.y, slot.origin.y);
     assert_eq!(slot.origin.x - area.origin.x, 40.0);
-    assert_eq!(uniformly_anchored.origin.x - area.origin.x, 16.0);
+    assert_eq!(uniformly_anchored.origin.x - area.origin.x, 8.0);
 }
 
 #[test]

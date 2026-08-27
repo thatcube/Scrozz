@@ -6,7 +6,7 @@
 //!    silently draws nothing would pass every logic test in the crate.
 //! 2. **Every provenance shares one fixed preview silhouette.** Exported pixels
 //!    remain sacred (D9), while every transient thumbnail cover-fills the same
-//!    frame and every caption or hover wash follows that same outer curve.
+//!    frame and every hover wash follows that same outer curve.
 //!
 //! Everything renders through [`scrozz_ui::harness`]: pure CPU, virtual clock,
 //! no window, no GPU, bit-identical on every machine. Nothing in this file
@@ -78,6 +78,7 @@ fn alpha_at(image: &Image, x: f32, y: f32) -> u8 {
 /// no-texture path draws a neutral holding fill with exactly the rounding the
 /// real thumbnail would get, which is the geometry the corner probes read.
 struct CardScene {
+    name: &'static str,
     provenance: Provenance,
     source_px: (u32, u32),
     reveal: f32,
@@ -88,6 +89,7 @@ struct CardScene {
 impl CardScene {
     const fn resting(provenance: Provenance) -> Self {
         Self {
+            name: "capture-01.png",
             provenance,
             source_px: (1600, 1000),
             reveal: 0.0,
@@ -98,12 +100,19 @@ impl CardScene {
 
     const fn hovered(provenance: Provenance) -> Self {
         Self {
+            name: "capture-01.png",
             provenance,
             source_px: (1600, 1000),
             reveal: 1.0,
             lift: 0.0,
             angle: 0.0,
         }
+    }
+
+    const fn with_metadata(mut self, name: &'static str, source_px: (u32, u32)) -> Self {
+        self.name = name;
+        self.source_px = source_px;
+        self
     }
 }
 
@@ -136,7 +145,7 @@ impl Scene for CardScene {
             angle: self.angle,
             state: CardState::Resting,
         };
-        let content = CardContent::new("capture-01.png", self.source_px, self.provenance);
+        let content = CardContent::new(self.name, self.source_px, self.provenance);
 
         card::draw_card(ui, &surface, &frame, &content);
     }
@@ -300,19 +309,17 @@ fn the_hover_scrim_does_not_square_the_container() {
 }
 
 #[test]
-fn the_caption_scrim_uses_the_fixed_container() {
-    let image = render(CardScene::resting(Provenance::Display));
-    let rect = preview_rect(Provenance::Display, (1600, 1000));
-
-    let scrimmed = image.pixel(px(rect.center().x), px(rect.bottom() - 6.0));
-    let clear = image.pixel(px(rect.center().x), px(rect.top() + 20.0));
-    assert!(
-        scrimmed[3] > 200 && clear[3] > 200,
-        "both probes should be inside the preview"
+fn resting_pixels_do_not_change_with_name_or_resolution() {
+    let first =
+        render(CardScene::resting(Provenance::Display).with_metadata("first.png", (1600, 1000)));
+    let second = render(
+        CardScene::resting(Provenance::Display)
+            .with_metadata("a completely different name.png", (3840, 2160)),
     );
-    assert!(
-        i32::from(scrimmed[0]) < i32::from(clear[0]),
-        "caption scrim did not darken the preview bottom: {scrimmed:?} vs {clear:?}"
+    assert_eq!(
+        first.fingerprint(),
+        second.fingerprint(),
+        "idle cards must paint the thumbnail only, never name or resolution"
     );
 }
 

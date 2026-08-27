@@ -108,7 +108,7 @@ impl Default for CardMetrics {
             width: 210.0,
             height: 150.0,
             gap: 8.0,
-            margin: 16.0,
+            margin: 8.0,
             left_margin: 40.0,
             clearance: 24.0,
         }

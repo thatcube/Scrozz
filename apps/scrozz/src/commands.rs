@@ -32,7 +32,7 @@ use crate::{
         InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
     },
     fault::{CliError, CliResult},
-    gui::selection::CaptureSelector,
+    gui::selection::{CaptureSelector, display_captures_exclude_current_process},
     hotkey_config, ipc,
     json::Json,
     platform,
@@ -137,7 +137,10 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             let options = args
                 .selection_options(remembered)?
                 .expect("an interactive target has selection options");
-            let (outcome, frozen) = select_target(&options, args, selector)?;
+            let surface_can_remain_visible =
+                display_captures_exclude_current_process(backend.as_ref())?;
+            let (outcome, frozen) =
+                select_target(&options, args, selector, surface_can_remain_visible)?;
             (outcome.target.clone(), Some(outcome), frozen)
         }
         concrete => (capture_target(&concrete)?, None, None),
@@ -161,7 +164,7 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
     if selection_outcome.is_none()
         && let Some(selector) = selector
     {
-        selector.begin_capture()?;
+        selector.begin_capture(backend.excludes_current_process(&request.target))?;
     }
 
     let capture = match frozen_capture {
@@ -274,6 +277,7 @@ fn select_target(
     options: &SelectionOptions,
     args: &CaptureArgs,
     selector: Option<&dyn CaptureSelector>,
+    surface_can_remain_visible: bool,
 ) -> CliResult<(SelectionOutcome, Option<Capture>)> {
     let cursor = if args.cursor {
         CursorMode::Visible
@@ -303,7 +307,11 @@ fn select_target(
                 "the platform selector cannot draw every requested aid"
             );
         }
-        let outcome = selector.select_for_capture(&capabilities.honour(options), cursor)?;
+        let outcome = selector.select_for_capture(
+            &capabilities.honour(options),
+            cursor,
+            surface_can_remain_visible,
+        )?;
         let request = CaptureRequest {
             target: outcome.target.clone(),
             cursor,

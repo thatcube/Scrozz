@@ -343,7 +343,7 @@ pub fn select_once(
         .name("scrozz-one-shot-selector".to_owned())
         .spawn(move || {
             let result = worker_selector
-                .select_for_capture(&worker_options, cursor)
+                .select_for_capture(&worker_options, cursor, false)
                 .map(|outcome| {
                     let request = CaptureRequest {
                         target: outcome.target.clone(),

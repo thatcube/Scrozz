@@ -45,7 +45,7 @@ use crate::{
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
-        selection::CaptureSelector,
+        selection::{CaptureSelector, display_captures_exclude_current_process},
     },
     platform,
 };
@@ -254,14 +254,7 @@ impl Worker {
 
     fn capture(&mut self, kind: CaptureKind, card: CardId) {
         let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
-        let result = if matches!(kind, CaptureKind::Fullscreen | CaptureKind::AllDisplays) {
-            self.selector
-                .begin_capture()
-                .map_err(CliError::Core)
-                .and_then(|()| self.take(kind, card, &mut lifecycle))
-        } else {
-            self.take(kind, card, &mut lifecycle)
-        };
+        let result = self.take(kind, card, &mut lifecycle);
         match result {
             Ok(built) => {
                 let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
@@ -286,8 +279,18 @@ impl Worker {
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
-            CaptureKind::Fullscreen => CaptureTarget::Display(backend.active_display()?.id),
-            CaptureKind::AllDisplays => CaptureTarget::AllDisplays,
+            CaptureKind::Fullscreen => {
+                let target = CaptureTarget::Display(backend.active_display()?.id);
+                self.selector
+                    .begin_capture(backend.excludes_current_process(&target))?;
+                target
+            }
+            CaptureKind::AllDisplays => {
+                let target = CaptureTarget::AllDisplays;
+                self.selector
+                    .begin_capture(backend.excludes_current_process(&target))?;
+                target
+            }
             CaptureKind::AllInOne | CaptureKind::Region | CaptureKind::Window => {
                 let options = Self::options_for(kind);
                 let capabilities = self.selector.capabilities();
@@ -301,9 +304,13 @@ impl Worker {
                         ),
                     }));
                 }
-                let outcome = self
-                    .selector
-                    .select_for_capture(&capabilities.honour(&options), CursorMode::Hidden)?;
+                let surface_can_remain_visible =
+                    display_captures_exclude_current_process(backend.as_ref())?;
+                let outcome = self.selector.select_for_capture(
+                    &capabilities.honour(&options),
+                    CursorMode::Hidden,
+                    surface_can_remain_visible,
+                )?;
                 selection_outcome = Some(outcome.clone());
                 outcome.target
             }

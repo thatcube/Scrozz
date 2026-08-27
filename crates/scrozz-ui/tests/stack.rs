@@ -104,7 +104,7 @@ fn sixteen_inch_macbook_pro_gets_six_slots() {
     assert_eq!(metrics.width, 210.0);
     assert_eq!(metrics.height, 150.0);
     assert_eq!(metrics.gap, 8.0);
-    assert_eq!(metrics.margin, 16.0);
+    assert_eq!(metrics.margin, 8.0);
     assert_eq!(metrics.left_margin, 40.0);
     assert_eq!(StackLayout::new(mbp16(), metrics).slots(), 6);
 }
