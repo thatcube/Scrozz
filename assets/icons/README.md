@@ -52,16 +52,29 @@ reduced from Brandon's 32px master rather than substituted with a simplified
 face: a first optical-size redraw made the `zz` eyes look like generic equals
 signs, weakening the family identity more than any extra crispness helped.
 
+Both small legacy representations use Brandon's original **opaque, edge-to-edge
+dark plate**. Transparent rounded corners caused Tahoe's compatibility treatment
+to show gray around the icon in Finder list view. Keeping the entire 16/32px
+canvas dark guarantees that even a legacy small rendition has no transparent area
+for the system to fill.
+
 ### macOS 26 uses a native layered icon
 
-Tahoe puts legacy `.icns` artwork with transparent corners inside a white/silver
-compatibility container. The large icon looked fine in Finder grid view, while
-list view exposed the icon shrunk inside that conspicuous outer tile. That tile
-is added by macOS; changing pixels inside the `.icns` cannot remove it.
+Tahoe puts legacy `.icns` artwork inside a white/silver compatibility container.
+The large icon looked acceptable in Finder grid view, while list view exposed
+the dark icon shrunk inside that conspicuous outer tile. That tile is added by
+macOS; changing pixels inside the `.icns` cannot remove it.
 
 `Scrozz.icon/` is the Icon Composer source compiled by `actool` into `Assets.car`.
-`CFBundleIconName` selects it on macOS 26, while `CFBundleIconFile` keeps
-`Scrozz.icns` as the fallback for Sequoia and earlier.
+`CFBundleIconName` selects it on macOS 26. **The development bundle does not also
+declare `CFBundleIconFile`**: Finder list view gives that legacy key precedence
+and keeps using the jailed small rendition even with a valid native icon stack
+beside it.
+
+`Scrozz.icns` remains in the resources and can be selected by building with
+`SCROZZ_INCLUDE_LEGACY_ICON=1`, but that is a legacy diagnostic escape hatch, not
+the default. A production strategy for Sequoia-and-earlier support must be tested
+on those systems rather than reintroducing the Tahoe defect blindly.
 
 The layered icon deliberately keeps the **dark plate in every appearance**.
 An attempted pale-lavender light appearance looked like a large gray backing

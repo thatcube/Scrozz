@@ -17,6 +17,7 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 # the wrong copy.
 APP="${1:-/Applications/Scrozz.app}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/scrozz-rel}"
+BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-$(date +%s)}"
 
 echo "==> building release binary"
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
@@ -57,8 +58,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key>       <string>Scrozz</string>
   <key>CFBundleExecutable</key>        <string>Scrozz</string>
   <key>CFBundleIdentifier</key>        <string>com.thatcube.Scrozz</string>
-  <key>CFBundleIconFile</key>          <string>Scrozz</string>
-  <!-- Native macOS 26 layered icon from Assets.car; no extension here. -->
+  <!--
+    Native macOS 26 layered icon from Assets.car; no extension here.
+    Do not also declare CFBundleIconFile by default: Finder list view gives the
+    legacy .icns key precedence and puts that rendition in the gray/silver
+    compatibility container even though a native icon stack is present.
+  -->
   <key>CFBundleIconName</key>          <string>Scrozz</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -76,6 +81,19 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# Finder/IconServices keys icon caches by bundle identity and build. Reusing
+# build 1 while iterating served an old 16px jailed icon even after Assets.car
+# and the .icns changed.
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" \
+  "$APP/Contents/Info.plist"
+
+# Diagnostic/legacy escape hatch only. On macOS 26 this opts back into the
+# compatibility container, so release packaging must not enable it blindly.
+if [[ "${SCROZZ_INCLUDE_LEGACY_ICON:-0}" == "1" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string Scrozz" \
+    "$APP/Contents/Info.plist"
+fi
 
 echo "==> signing (ad-hoc, stable identifier)"
 # An ad-hoc signature is enough for TCC to keep the grant across rebuilds, as
