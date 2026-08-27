@@ -531,6 +531,34 @@ impl NativeSurface {
     }
 }
 
+/// Finds the native content surface of one of this process's application
+/// windows by title.
+///
+/// Secondary egui viewports do not expose a raw window handle to their parent
+/// callback. The native drag must still begin from the window where the gesture
+/// occurred, so the platform backend resolves that ordinary application window
+/// immediately before starting the drag.
+///
+/// # Errors
+///
+/// Returns [`Error::TargetGone`] if the window closed or has no content surface,
+/// or [`Error::Unsupported`] on platforms whose native drag backend is not
+/// implemented yet.
+pub fn native_surface_for_window(title: &str) -> Result<NativeSurface> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::drag::surface_for_window_title(title)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Unsupported {
+            what: "secondary-window drag source lookup".to_owned(),
+            why: format!("native window lookup is not implemented for {title:?} on this platform"),
+        })
+    }
+}
+
 /// The geometry of the moment the user committed to a drag.
 ///
 /// All coordinates are **window-local logical points with a top-left origin** —
@@ -661,15 +689,23 @@ impl DragOutcome {
 }
 
 #[derive(Debug, Default)]
+struct SessionProgress {
+    outcome: Option<DragOutcome>,
+    pending_acceptance: Option<DragOperation>,
+    waits_for_delivery: bool,
+    delivered: bool,
+}
+
+#[derive(Debug, Default)]
 struct SessionState {
-    outcome: Mutex<Option<DragOutcome>>,
+    progress: Mutex<SessionProgress>,
 }
 
 /// A drag in flight.
 ///
 /// Handed back by [`DragSource::begin`] and cheap to clone. The UI polls
-/// [`Self::outcome`] each frame; until it returns `Some`, the card stays in
-/// drag mode.
+/// [`Self::outcome`] each frame; until it returns `Some`, the source remains
+/// resident and its cached payload stays alive.
 ///
 /// Deliberately poll-based rather than callback-based. The alternative is a
 /// closure invoked from AppKit's drag callback, which would run *inside* the
@@ -696,6 +732,20 @@ impl DragSession {
         }
     }
 
+    /// A session whose accepted drop is not complete until its lazy bytes were
+    /// delivered successfully.
+    #[must_use]
+    pub fn awaiting_delivery() -> Self {
+        let session = Self::new();
+        session
+            .state
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waits_for_delivery = true;
+        session
+    }
+
     /// A session that has already finished, for a backend that failed before
     /// the drag could start.
     #[must_use]
@@ -705,24 +755,61 @@ impl DragSession {
         session
     }
 
-    /// Records the outcome. The first call wins; later ones are ignored.
+    /// Records the drag operation.
     ///
-    /// Later calls are ignored rather than overwriting because AppKit can
-    /// deliver `draggingSession:endedAtPoint:operation:` after the promise has
-    /// already reported a failure, and the *first* thing that went wrong is the
-    /// one worth showing.
+    /// Delivery-gated sessions hold an acceptance until a file promise or lazy
+    /// image provider confirms that bytes reached the destination. A failure
+    /// reported first remains terminal when the platform later reports its
+    /// operation mask.
     pub fn finish(&self, outcome: DragOutcome) {
         // A poisoned lock here means a previous holder panicked while recording
         // an outcome. Recovering is strictly better than propagating: the drag
         // is over either way, and a panic in the UI thread over a finished drag
         // helps nobody.
-        let mut slot = self
+        let mut progress = self
             .state
-            .outcome
+            .progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_none() {
-            *slot = Some(outcome);
+        if progress.outcome.is_some() {
+            return;
+        }
+        if let DragOutcome::Accepted(operation) = outcome
+            && progress.waits_for_delivery
+            && !progress.delivered
+        {
+            progress.pending_acceptance = Some(operation);
+        } else {
+            progress.pending_acceptance = None;
+            progress.outcome = Some(outcome);
+        }
+    }
+
+    /// Confirms that a lazy file or image provider delivered its bytes.
+    pub fn delivery_succeeded(&self) {
+        let mut progress = self
+            .state
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.delivered = true;
+        if progress.outcome.is_none()
+            && let Some(operation) = progress.pending_acceptance.take()
+        {
+            progress.outcome = Some(DragOutcome::Accepted(operation));
+        }
+    }
+
+    /// Reports that a lazy file or image provider could not deliver its bytes.
+    pub fn delivery_failed(&self, reason: impl Into<String>) {
+        let mut progress = self
+            .state
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if progress.outcome.is_none() {
+            progress.pending_acceptance = None;
+            progress.outcome = Some(DragOutcome::Failed(reason.into()));
         }
     }
 
@@ -730,9 +817,10 @@ impl DragSession {
     #[must_use]
     pub fn outcome(&self) -> Option<DragOutcome> {
         self.state
-            .outcome
+            .progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome
             .clone()
     }
 
