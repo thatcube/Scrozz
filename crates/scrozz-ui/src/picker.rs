@@ -593,9 +593,14 @@ pub fn is_scrozz_window(window: &Window) -> bool {
         .is_some_and(|name| name.trim().eq_ignore_ascii_case("scrozz"));
     let identifier_is_scrozz = window.application_id.as_deref().is_some_and(|identifier| {
         let identifier = identifier.trim().to_ascii_lowercase();
-        identifier == "scrozz"
-            || identifier == "scrozz.exe"
-            || identifier.split('.').any(|component| component == "scrozz")
+        matches!(
+            identifier.as_str(),
+            "scrozz"
+                | "scrozz.exe"
+                | "com.thatcube.scrozz"
+                | "com.scrozz.overlay"
+                | "com.scrozz.window-picker"
+        )
     });
 
     application_is_scrozz || identifier_is_scrozz
@@ -826,6 +831,18 @@ mod tests {
         assert!(
             !is_scrozz_window(&foreign),
             "a foreign window title must not make it look like our overlay"
+        );
+    }
+
+    #[test]
+    fn a_separate_app_with_scrozz_in_its_bundle_id_remains_selectable() {
+        let mut target = fixtures::overlapping().windows[0].clone();
+        target.application = Some("Scrozz Native Window Target".to_owned());
+        target.application_id = Some("com.thatcube.scrozz.native-window-target".to_owned());
+
+        assert!(
+            !is_scrozz_window(&target),
+            "bundle-id components are not proof that a window belongs to this process"
         );
     }
 
