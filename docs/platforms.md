@@ -349,8 +349,9 @@ Honestly, and in order of risk:
    `SPA_PARAM_BUFFERS_dataType = MemFd | MemPtr` response produces shared-memory
    buffers**, rather than failing to negotiate or returning DMA-BUF.
 4. **That GNOME and KDE accept the opaque-only `BGRx`/`RGBx` offer**, and that
-   their portal stream geometry agrees with XWayland closely enough to prove an
-   exact display identity without guessing.
+   their portal stream geometry agrees with compositor-native `wl_output` and
+   xdg-output facts closely enough to prove an exact display identity without
+   guessing.
 5. **The portal dialog**, including that dismissing it produces
    `Error::Cancelled` and not something alarming.
 6. **The restore-token round trip**, including per-display isolation,
