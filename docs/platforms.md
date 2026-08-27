@@ -205,6 +205,13 @@ created. The Windows target check proves the API surface and constants. Only a
 native desktop run can prove that the DWM pixels, focus and Z-order behave as
 intended.
 
+The Windows overlay uses eframe's `wgpu` renderer rather than Glow. VMware's
+Windows 11 ARM64 graphics driver exposes no usable OpenGL swap-control extension
+and Glow exits before the first card; `wgpu` can use the Windows DX12 software
+adapter when the virtual GPU is insufficient. macOS and Linux retain the
+already-qualified Glow path. Renderer choice does not alter the native `HWND`
+style, layering or hit-test hooks.
+
 COM/WinRT membership is per thread, not per process. The direct CLI and the
 forwarded-command handler both enter through `commands::dispatch`, which holds
 an apartment around backend construction, capture, clipboard delivery and OCR.

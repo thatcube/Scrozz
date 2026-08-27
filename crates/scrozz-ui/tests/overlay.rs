@@ -489,6 +489,10 @@ fn native_options_carry_the_viewport_and_never_persist_geometry() {
         "a restored window position would drop the overlay somewhere other \
          than the corner of the work area"
     );
+    #[cfg(target_os = "windows")]
+    assert_eq!(options.renderer, eframe::Renderer::Wgpu);
+    #[cfg(not(target_os = "windows"))]
+    assert_eq!(options.renderer, eframe::Renderer::Glow);
 }
 
 // ---------------------------------------------------------------------------

@@ -580,11 +580,22 @@ pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
 pub fn native_options(geometry: OverlayGeometry) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: viewport(geometry),
+        renderer: native_renderer(),
         // The overlay is transient: nothing about it is worth restoring, and a
         // restored position would fight the work-area anchor.
         persist_window: false,
         ..Default::default()
     }
+}
+
+#[cfg(target_os = "windows")]
+const fn native_renderer() -> eframe::Renderer {
+    eframe::Renderer::Wgpu
+}
+
+#[cfg(not(target_os = "windows"))]
+const fn native_renderer() -> eframe::Renderer {
+    eframe::Renderer::Glow
 }
 
 // ---------------------------------------------------------------------------
