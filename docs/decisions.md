@@ -1034,6 +1034,24 @@ OCR and history, with compositor-owned region selection and a
 compositor-positioned capture stack.** That is a real difference and it belongs in
 the comparison table, not buried in a footnote.
 
+## D32 — Releases use Plozz-style calendar versions
+
+**Decision.** Scrozz's user-facing version is the build date in unpadded
+`YYYY.M.D` form. A build made on August 27, 2026 is version **`2026.8.27`** and
+the corresponding Git tag is **`v2026.8.27`**. Same-day builds share the
+marketing version and are distinguished by a separate monotonically increasing
+numeric build number.
+
+The initial public builds may still be marked as pre-releases on GitHub while
+their maturity warrants it. "Pre-release" is a distribution-channel state, not
+part of the version string: there is no `alpha`, `beta` or `rc` suffix in the
+app's version.
+
+**Why.** This is the established Plozz convention, needs no manual version
+bookkeeping, communicates recency directly, and sorts correctly because every
+component is numeric. Keeping maturity out of the version also avoids feeding
+Apple an invalid `CFBundleShortVersionString`.
+
 ---
 
 # Open questions

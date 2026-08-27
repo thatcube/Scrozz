@@ -146,7 +146,6 @@ case "$OS" in
     # the build is a no-op rebuild rather than a second full compile.
     if ! CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" \
       SCROZZ_PREBUILT_BIN="$BIN" \
-      SCROZZ_BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-1}" \
       tools/make-app-bundle.sh "$STAGE/Scrozz.app"; then
       echo "package: make-app-bundle.sh failed" >&2
       exit 1

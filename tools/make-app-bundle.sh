@@ -78,7 +78,55 @@ if [[ -e "$APP" && ! -d "$APP" ]]; then
 fi
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-$(date +%s)}"
+if [[ -n "${SCROZZ_APP_VERSION:-}" ]]; then
+  APP_VERSION="$SCROZZ_APP_VERSION"
+  VERSION_SOURCE="SCROZZ_APP_VERSION override"
+else
+  YEAR="$(date +%Y)"
+  MONTH="$(date +%m)"
+  DAY="$(date +%d)"
+  APP_VERSION="${YEAR}.$((10#$MONTH)).$((10#$DAY))"
+  VERSION_SOURCE="CalVer build date"
+fi
+
+if [[ -n "${SCROZZ_BUILD_NUMBER:-}" ]]; then
+  BUILD_NUMBER="$SCROZZ_BUILD_NUMBER"
+  BUILD_SOURCE="SCROZZ_BUILD_NUMBER override"
+elif BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null)" &&
+     [[ -n "$BUILD_NUMBER" ]]; then
+  BUILD_SOURCE="git commit count"
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    COUNTER_FILE=".scrozz-dev-build"
+    DEV_NUMBER=1
+    if [[ -f "$COUNTER_FILE" ]]; then
+      STORED_BASE="$(awk '{print $1}' "$COUNTER_FILE" 2>/dev/null || true)"
+      STORED_NUMBER="$(awk '{print $2}' "$COUNTER_FILE" 2>/dev/null || true)"
+      if [[ "$STORED_BASE" == "$BUILD_NUMBER" &&
+            "$STORED_NUMBER" =~ ^[0-9]+$ ]]; then
+        DEV_NUMBER=$((STORED_NUMBER + 1))
+      fi
+    fi
+    printf '%s %s\n' "$BUILD_NUMBER" "$DEV_NUMBER" >"$COUNTER_FILE"
+    BUILD_NUMBER="${BUILD_NUMBER}.${DEV_NUMBER}"
+    BUILD_SOURCE="git commit count + dirty-tree dev suffix"
+  fi
+else
+  BUILD_NUMBER=1
+  BUILD_SOURCE="fallback"
+fi
+
+VERSION_PATTERN='^[0-9]+(\.[0-9]+){1,2}$'
+BUILD_PATTERN='^[0-9]+(\.[0-9]+){0,2}$'
+if [[ ! "$APP_VERSION" =~ $VERSION_PATTERN ]]; then
+  echo "make-app-bundle: invalid app version '$APP_VERSION'." >&2
+  echo "                 Expected a dotted numeric version such as 2026.8.27." >&2
+  exit 1
+fi
+if [[ ! "$BUILD_NUMBER" =~ $BUILD_PATTERN ]]; then
+  echo "make-app-bundle: invalid build number '$BUILD_NUMBER'." >&2
+  echo "                 Expected one to three numeric components." >&2
+  exit 1
+fi
 
 # --- where the executable comes from ---------------------------------------
 #
@@ -98,8 +146,9 @@ if [[ -n "$PREBUILT" ]]; then
   echo "==> using prebuilt binary $PREBUILT"
   SOURCE_BIN="$PREBUILT"
 else
-  echo "==> building release binary"
-  CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
+  echo "==> building release binary (Scrozz $APP_VERSION)"
+  SCROZZ_VERSION="$APP_VERSION" \
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
   SOURCE_BIN="$TARGET_DIR/release/scrozz"
 fi
 
@@ -148,7 +197,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   -->
   <key>CFBundleIconName</key>          <string>Scrozz</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
   <key>CFBundleVersion</key>           <string>1</string>
   <key>LSMinimumSystemVersion</key>    <string>12.3</string>
 
@@ -170,15 +219,13 @@ PLIST
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" \
   "$APP/Contents/Info.plist"
 
-# The plist above carries the development version. A tagged release knows
-# better — release.yml passes the tag — and shipping a .app whose Get Info
-# panel disagrees with the release it came from is a small lie that is
-# genuinely annoying to debug later.
-if [[ -n "${SCROZZ_APP_VERSION:-}" ]]; then
-  /usr/libexec/PlistBuddy \
-    -c "Set :CFBundleShortVersionString ${SCROZZ_APP_VERSION}" \
-    "$APP/Contents/Info.plist"
-fi
+# Match Plozz's user-facing version model: an unpadded CalVer date by default,
+# with a separate build number distinguishing same-day builds. Tagged releases
+# pass the same value explicitly so bundle metadata, filenames and `--version`
+# cannot disagree.
+/usr/libexec/PlistBuddy \
+  -c "Set :CFBundleShortVersionString $APP_VERSION" \
+  "$APP/Contents/Info.plist"
 
 # Diagnostic/legacy escape hatch only. On macOS 26 this opts back into the
 # compatibility container, so release packaging must not enable it blindly.
@@ -218,6 +265,8 @@ fi
 
 echo
 echo "built: $APP"
+echo "version: $APP_VERSION ($VERSION_SOURCE)"
+echo "build: $BUILD_NUMBER ($BUILD_SOURCE)"
 echo
 echo "First run needs Screen Recording:"
 echo "  open $APP"

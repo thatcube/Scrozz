@@ -35,12 +35,12 @@ name: Release
 on:
   push:
     tags:
-      # v1.2.3, v1.2.3-beta.1, and so on.
+      # Plozz-style CalVer, for example v2026.8.27.
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (e.g. v0.1.0)"
+        description: "Existing CalVer tag to build (e.g. v2026.8.27)"
         required: true
         type: string
 
@@ -134,11 +134,17 @@ jobs:
       - name: Determine version
         id: version
         run: |
+          set -euo pipefail
           REF="${{ inputs.tag || github.ref_name }}"
-          # Strip a leading 'v' so the filename reads scrozz-0.1.0-... rather
-          # than scrozz-v0.1.0-...
+          # The tag has a conventional leading v; the app and filenames do not.
           VERSION="${REF#v}"
+          CALVER_PATTERN='^[0-9]{4}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])$'
+          if [[ ! "$VERSION" =~ $CALVER_PATTERN ]]; then
+            echo "::error title=Invalid release tag::$REF is not Plozz-style CalVer. Expected vYYYY.M.D, for example v2026.8.27."
+            exit 1
+          fi
           echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "build_number=${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >>"$GITHUB_OUTPUT"
           echo "Building version $VERSION from $REF"
 
       # --- Compile ------------------------------------------------------------
@@ -148,8 +154,10 @@ jobs:
           # Two builds and a lipo, rather than one build, because a universal
           # binary is the only kind that runs natively on both Apple Silicon
           # and the Intel Macs still in use.
-          cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
-          cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
+          SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+            cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
+          SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+            cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
           mkdir -p dist
           lipo -create -output dist/scrozz \
             target/aarch64-apple-darwin/release/scrozz \
@@ -176,6 +184,7 @@ jobs:
           set -euo pipefail
           SCROZZ_PREBUILT_BIN="$PWD/dist/scrozz" \
           SCROZZ_APP_VERSION="${{ steps.version.outputs.version }}" \
+          SCROZZ_BUILD_NUMBER="${{ steps.version.outputs.build_number }}" \
           SCROZZ_SKIP_SIGN=1 \
             tools/make-app-bundle.sh "$PWD/dist/Scrozz.app"
 
@@ -191,7 +200,8 @@ jobs:
       - name: Build (single target)
         if: matrix.os != 'macos-latest'
         run: |
-          cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
+          SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+            cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
           mkdir -p dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "target/${{ matrix.target }}/release/scrozz.exe" dist/
@@ -484,10 +494,11 @@ jobs:
           # --verify-tag refuses to invent a tag that does not exist, which
           # turns a typo in workflow_dispatch into an error rather than a
           # release built from the wrong commit.
+          VERSION="${TAG#v}"
           gh release create "$TAG" \
             --draft \
             --verify-tag \
-            --title "Scrozz $TAG" \
+            --title "Scrozz $VERSION" \
             --generate-notes \
             artifacts/*
 

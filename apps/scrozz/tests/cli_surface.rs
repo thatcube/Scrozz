@@ -97,7 +97,8 @@ fn help_goes_to_stdout_and_succeeds() {
 fn version_goes_to_stdout_and_succeeds() {
     let out = scrozz(["--version"]);
     assert_eq!(code(&out), 0);
-    assert!(stdout(&out).contains(env!("CARGO_PKG_VERSION")));
+    let expected = option_env!("SCROZZ_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    assert!(stdout(&out).contains(expected));
 }
 
 #[test]

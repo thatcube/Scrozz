@@ -29,11 +29,16 @@ use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 
 use crate::fault::{CliError, CliResult};
 
+const VERSION: &str = match option_env!("SCROZZ_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Scrozz — screenshots and screen recording for macOS, Windows and Linux.
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "scrozz",
-    version,
+    version = VERSION,
     about = "Screenshots and screen recording for macOS, Windows and Linux.",
     long_about = "Screenshots and screen recording for macOS, Windows and Linux.\n\n\
                   Every capture the app can take is available here, headlessly. On sway and \

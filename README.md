@@ -120,6 +120,13 @@ Screen Recording**, and the grant sticks across rebuilds.
 Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.
 
+### Version numbers
+
+Scrozz follows Plozz's CalVer model: the user-facing version is the unpadded
+build date `YYYY.M.D`, so a build made on August 27, 2026 is **`2026.8.27`** and
+its release tag is **`v2026.8.27`**. Same-day builds share that version and are
+distinguished by the separate numeric build number.
+
 ### From the command line
 
 The CLI is not a wrapper around the app; it is the same capability, headless, and
