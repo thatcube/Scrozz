@@ -78,6 +78,41 @@ pub enum Event {
     TimedOut,
 }
 
+/// Keeps the most significant result while one `process` callback drains every
+/// queued buffer.
+///
+/// A malformed buffer is structural and outranks everything, a usable frame
+/// outranks an empty priming buffer, and emptiness is retained only when no
+/// better result arrived. Equal-priority events keep the first diagnosis while
+/// the pixel slot itself is still updated to the newest good frame.
+#[must_use]
+pub fn prefer_process_event(current: Event, next: Event) -> Event {
+    debug_assert!(is_process_event(&current));
+    debug_assert!(is_process_event(&next));
+
+    if process_priority(&next) > process_priority(&current) {
+        next
+    } else {
+        current
+    }
+}
+
+const fn is_process_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::FrameReady | Event::EmptyBuffer | Event::BufferRejected(_)
+    )
+}
+
+const fn process_priority(event: &Event) -> u8 {
+    match event {
+        Event::BufferRejected(_) => 3,
+        Event::FrameReady => 2,
+        Event::EmptyBuffer => 1,
+        _ => 0,
+    }
+}
+
 /// What the driving loop should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

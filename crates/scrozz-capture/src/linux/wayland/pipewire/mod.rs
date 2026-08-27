@@ -76,7 +76,7 @@ pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// failures — each with enough text for the user to know what to do next.
 pub fn acquire_frame(fd: OwnedFd, node_id: u32, scale: ScaleFactor) -> Result<Frame> {
     let library = sys::Library::open()?;
-    let raw = stream::capture_one(&library, fd, node_id, FRAME_TIMEOUT)?;
+    let raw = stream::capture_one(library, fd, node_id, FRAME_TIMEOUT)?;
 
     let format = raw.format;
     let frame = Frame {

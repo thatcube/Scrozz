@@ -240,11 +240,19 @@ pub enum PortalFailure {
     },
     /// The portal agreed but returned no video stream.
     NoStreams,
+    /// `SelectSources` specifically rejected the supplied restore token.
+    RestoreRejected(String),
     /// A D-Bus or protocol failure.
     Bus(String),
 }
 
 impl PortalFailure {
+    /// Whether retrying once without the stored token can change this outcome.
+    #[must_use]
+    pub const fn should_retry_without_restore(&self) -> bool {
+        matches!(self, Self::RestoreRejected(_))
+    }
+
     /// Turns the failure into the error a caller should see.
     ///
     /// `compositor` is woven into the text because "screen capture failed" is
@@ -280,11 +288,26 @@ impl PortalFailure {
                 "the portal on {compositor} approved the capture but returned no video stream, \
                  which means its screen-cast backend started and then produced nothing"
             )),
+            Self::RestoreRejected(detail) => Error::Platform(format!(
+                "the desktop portal on {compositor} rejected the stored screen-cast restore token: \
+                 {detail}"
+            )),
             Self::Bus(detail) => Error::Platform(format!(
                 "the desktop portal on {compositor} failed: {detail}"
             )),
         }
     }
+}
+
+/// Recognises xdg-desktop-portal's restore-token-specific `InvalidArgument`.
+///
+/// `SelectSources` can reject several unrelated options with the same D-Bus
+/// error name, so the stage and the fixed portal message both matter. Retrying
+/// every `InvalidArgument` would duplicate a failure that removing the token
+/// cannot possibly repair.
+#[must_use]
+pub fn is_restore_token_rejection(detail: &str) -> bool {
+    detail.to_ascii_lowercase().contains("restore token")
 }
 
 /// Renders a source-type mask in words.

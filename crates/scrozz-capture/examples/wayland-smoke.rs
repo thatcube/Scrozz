@@ -191,11 +191,12 @@ fn run() -> Result<(), Outcome> {
             );
         }
         Err(Error::Cancelled) => {
-            eprintln!(
-                "wayland-smoke: WARNING — the second capture was cancelled, which means a \
-                 dialog appeared. Either the compositor does not persist tokens, or token \
-                 storage is broken. Check $XDG_STATE_HOME/scrozz/wayland-restore-tokens."
-            );
+            return Err(Outcome::Failed(
+                "the second capture was cancelled, which proves a second dialog appeared. Either \
+                 the compositor does not persist tokens, or token storage is broken. Check \
+                 $XDG_STATE_HOME/scrozz/portal-tokens."
+                    .into(),
+            ));
         }
         Err(error) => return Err(classify(error)),
     }

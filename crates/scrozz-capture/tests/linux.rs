@@ -1710,6 +1710,22 @@ mod spa_pod {
         assert_eq!(u32_at(&encoded, 32), 60);
     }
 
+    /// Flags are one mask value, not an enum whose individual bits are emitted
+    /// as separate alternatives.
+    #[test]
+    fn a_flags_choice_encodes_one_integer_mask() {
+        let encoded = Choice::flags(Scalar::int(0b110))
+            .encode()
+            .expect("one integer is uniform");
+
+        assert_eq!(encoded.len(), 32);
+        assert_eq!(u32_at(&encoded, 0), 20);
+        assert_eq!(u32_at(&encoded, 8), choice::FLAGS);
+        assert_eq!(u32_at(&encoded, 16), 4);
+        assert_eq!(u32_at(&encoded, 20), kind::INT);
+        assert_eq!(u32_at(&encoded, 24), 0b110);
+    }
+
     /// A choice whose alternatives disagree about their type cannot be encoded:
     /// the body carries one child header for all of them.
     #[test]
@@ -1798,6 +1814,29 @@ mod spa_pod {
             ObjectRef::parse(&Scalar::id(1).encode()).is_none(),
             "a scalar is not an object"
         );
+
+        let mut malformed_property = encoded.clone();
+        malformed_property[24..28].copy_from_slice(&12u32.to_ne_bytes());
+        assert!(
+            ObjectRef::parse(&malformed_property).is_none(),
+            "a nested value cannot extend past its enclosing object"
+        );
+
+        let mut trailing_junk = encoded.clone();
+        trailing_junk.extend_from_slice(&[0; 8]);
+        let enlarged = u32_at(&trailing_junk, 0) + 8;
+        trailing_junk[..4].copy_from_slice(&enlarged.to_ne_bytes());
+        assert!(
+            ObjectRef::parse(&trailing_junk).is_none(),
+            "an incomplete trailing property makes the whole object malformed"
+        );
+
+        let mut impossible = encoded;
+        impossible[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(
+            ObjectRef::parse(&impossible).is_none(),
+            "a peer-controlled length cannot over-read the callback buffer"
+        );
     }
 }
 
@@ -1807,10 +1846,11 @@ mod format_negotiation {
     use scrozz_core::{ColorSpace, PixelFormat};
 
     use super::wayland::pipewire::format::{
-        self, FormatError, MEDIA_SUBTYPE_RAW, MEDIA_TYPE_VIDEO, Negotiated, OBJECT_FORMAT,
-        PREFERRED_FORMATS, key, param, primaries, video_format,
+        self, FormatError, MAX_DIMENSION, MEDIA_SUBTYPE_RAW, MEDIA_TYPE_VIDEO, Negotiated,
+        OBJECT_FORMAT, OBJECT_PARAM_BUFFERS, PREFERRED_FORMATS, buffer_key, data_type, key, param,
+        primaries, video_format,
     };
-    use super::wayland::pipewire::pod::{Object, ObjectRef, Property, Scalar};
+    use super::wayland::pipewire::pod::{Object, ObjectRef, Property, Scalar, choice};
 
     fn format_object(properties: Vec<Property>) -> Vec<u8> {
         Object {
@@ -1857,15 +1897,36 @@ mod format_negotiation {
         assert!(parsed.property(key::VIDEO_FRAMERATE).is_some());
     }
 
-    /// No modifier is offered, and that is a decision rather than an oversight:
-    /// a client that names no DMA-BUF modifier cannot be handed a DMA-BUF, so
-    /// the server falls back to shared memory and no EGL, GBM or libdrm is
-    /// needed anywhere in this crate.
+    /// No modifier is offered, and that is a decision rather than an oversight.
+    /// The follow-up ParamBuffers response makes the shared-memory fallback
+    /// explicit rather than relying on a producer default.
     #[test]
     fn the_offer_names_no_dma_buf_modifier() {
         let offered = format::enum_format_param();
         let parsed = ObjectRef::parse(&offered).expect("valid");
         assert!(parsed.property(key::VIDEO_MODIFIER).is_none());
+    }
+
+    #[test]
+    fn the_buffer_response_allows_only_shared_memory() {
+        let response = format::shared_memory_buffer_param();
+        let parsed = ObjectRef::parse(&response).expect("valid ParamBuffers object");
+        assert_eq!(parsed.object_type, OBJECT_PARAM_BUFFERS);
+        assert_eq!(parsed.id, param::BUFFERS);
+
+        let data_types = parsed
+            .property(buffer_key::DATA_TYPE)
+            .expect("memory types are explicit");
+        assert_eq!(data_types.choice_flavour(), Some(choice::FLAGS));
+        assert_eq!(data_types.as_int(), Some(data_type::SHARED_MEMORY_MASK));
+        assert_eq!(
+            data_type::SHARED_MEMORY_MASK,
+            (1_i32 << data_type::MEM_PTR) | (1_i32 << data_type::MEM_FD)
+        );
+        assert_eq!(
+            data_type::SHARED_MEMORY_MASK & (1_i32 << data_type::DMA_BUF),
+            0
+        );
     }
 
     /// The framerate is a range including zero. An idle screen-cast source
@@ -2045,12 +2106,36 @@ mod format_negotiation {
             format::parse_format(&never_offered),
             Err(FormatError::UnsupportedFormat(9))
         );
+
+        let oversized = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(MAX_DIMENSION + 1, 64)),
+        ]);
+        assert_eq!(
+            format::parse_format(&oversized),
+            Err(FormatError::UnsupportedSize {
+                width: MAX_DIMENSION + 1,
+                height: 64,
+            })
+        );
+
+        let modifier = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+            Property::scalar(key::VIDEO_MODIFIER, &Scalar::long(0)),
+        ]);
+        assert_eq!(
+            format::parse_format(&modifier),
+            Err(FormatError::UnexpectedModifier)
+        );
     }
 }
 
 /// Stride handling: the single most common way a screenshot comes out skewed.
 mod stride_packing {
-    use super::wayland::pipewire::format::{BufferError, pack_rows};
+    use std::borrow::Cow;
+
+    use super::wayland::pipewire::format::{BufferError, linear_chunk, pack_rows};
 
     /// A padded buffer must be read row by row at the producer's stride and
     /// written at the packed one. Reading it linearly gives the classic
@@ -2152,6 +2237,42 @@ mod stride_packing {
             })
         );
     }
+
+    #[test]
+    fn invalid_geometry_is_rejected_before_arithmetic_or_allocation() {
+        assert_eq!(
+            pack_rows(&[], 4, 0, 1, false),
+            Err(BufferError::InvalidDimensions {
+                width: 0,
+                height: 1,
+            })
+        );
+        assert!(matches!(
+            pack_rows(&[], i32::MAX, u32::MAX, u32::MAX, false),
+            Err(BufferError::SizeOverflow { .. })
+        ));
+    }
+
+    /// SPA defines a chunk offset modulo maxsize. Rejecting an offset at or past
+    /// the mapping length incorrectly drops valid ring-buffer data.
+    #[test]
+    fn chunk_offsets_wrap_and_wrapped_data_is_linearized() {
+        let mapping = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        let contiguous = linear_chunk(&mapping, 10, 3);
+        assert!(matches!(&contiguous, Cow::Borrowed(_)));
+        assert_eq!(contiguous.as_ref(), &[2, 3, 4]);
+
+        let wrapped = linear_chunk(&mapping, 6, 5);
+        assert!(matches!(&wrapped, Cow::Owned(_)));
+        assert_eq!(wrapped.as_ref(), &[6, 7, 0, 1, 2]);
+
+        assert_eq!(
+            linear_chunk(&mapping, 0, u32::MAX).as_ref(),
+            mapping.as_slice(),
+            "chunk size is clamped to maxsize"
+        );
+    }
 }
 
 /// The capture lifecycle, which decides when to keep waiting and when to give
@@ -2161,7 +2282,7 @@ mod stream_lifecycle {
 
     use super::wayland::pipewire::format::Negotiated;
     use super::wayland::pipewire::lifecycle::{
-        Action, Event, Failure, Lifecycle, Phase, StreamState,
+        Action, Event, Failure, Lifecycle, Phase, StreamState, prefer_process_event,
     };
 
     fn negotiated() -> Negotiated {
@@ -2219,6 +2340,31 @@ mod stream_lifecycle {
         }
         assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
         assert!(lifecycle.outcome().is_ok());
+    }
+
+    #[test]
+    fn draining_buffers_preserves_frame_and_failure_precedence() {
+        assert_eq!(
+            prefer_process_event(Event::FrameReady, Event::EmptyBuffer),
+            Event::FrameReady,
+            "a later empty buffer cannot erase pixels already copied"
+        );
+        assert_eq!(
+            prefer_process_event(Event::EmptyBuffer, Event::FrameReady),
+            Event::FrameReady
+        );
+        assert_eq!(
+            prefer_process_event(Event::FrameReady, Event::BufferRejected("bad plane".into())),
+            Event::BufferRejected("bad plane".into()),
+            "a structural rejection outranks a plausible frame"
+        );
+        assert_eq!(
+            prefer_process_event(
+                Event::BufferRejected("first diagnosis".into()),
+                Event::BufferRejected("later diagnosis".into())
+            ),
+            Event::BufferRejected("first diagnosis".into())
+        );
     }
 
     /// PipeWire keeps firing callbacks while a stream is torn down. A late
@@ -2364,7 +2510,9 @@ mod stream_lifecycle {
 mod portal_errors {
     use scrozz_core::Error;
 
-    use super::wayland::portal::{PortalFailure, describe_sources, source_type};
+    use super::wayland::portal::{
+        PortalFailure, describe_sources, is_restore_token_rejection, source_type,
+    };
 
     /// The single most important mapping in this backend. Pressing Escape in the
     /// portal's picker is not a fault, and a screenshot tool that shows an error
@@ -2426,6 +2574,31 @@ mod portal_errors {
         };
         assert!(message.contains("KDE"));
         assert!(message.contains("timed out"));
+    }
+
+    #[test]
+    fn only_an_identified_restore_rejection_is_retryable() {
+        let rejected = PortalFailure::RestoreRejected("Restore token is not valid".into());
+        assert!(rejected.should_retry_without_restore());
+
+        for failure in [
+            PortalFailure::Cancelled,
+            PortalFailure::Missing("portal absent".into()),
+            PortalFailure::NoSources {
+                wanted: source_type::WINDOW,
+                available: source_type::MONITOR,
+            },
+            PortalFailure::NoStreams,
+            PortalFailure::Bus("connection closed".into()),
+        ] {
+            assert!(
+                !failure.should_retry_without_restore(),
+                "{failure:?} cannot be repaired by deleting a token"
+            );
+        }
+
+        assert!(is_restore_token_rejection("Restore token is not valid"));
+        assert!(!is_restore_token_rejection("Source type is not supported"));
     }
 
     #[test]

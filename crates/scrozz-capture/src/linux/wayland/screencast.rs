@@ -12,6 +12,8 @@
 //! SelectSources      -> what to offer, and the restore token
 //! Start              -> the picker; stream node ids; a restore token back
 //! OpenPipeWireRemote -> a socket fd for the PipeWire graph
+//! caller copies frame
+//! Session.Close      -> compositor and portal resources are released
 //! ```
 //!
 //! `SelectSources` is where a stored restore token goes in and `Start` is where
@@ -42,11 +44,12 @@ use ashpd::desktop::screencast::{
     CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
     StartCastOptions,
 };
-use ashpd::desktop::{CreateSessionOptions, PersistMode, ResponseError};
+use ashpd::desktop::{CreateSessionOptions, PersistMode, ResponseError, Session};
 use ashpd::enumflags2::BitFlags;
 
 use super::portal::{
-    PortalFailure, SessionPlan, StreamInfo, cursor_mode, persist_mode, source_type,
+    PortalFailure, SessionPlan, StreamInfo, cursor_mode, is_restore_token_rejection, persist_mode,
+    source_type,
 };
 
 /// Everything a successful negotiation yields.
@@ -56,8 +59,26 @@ pub struct Negotiation {
     pub streams: Vec<StreamInfo>,
     /// The token to present next time, when the portal issued one.
     pub restore_token: Option<String>,
-    /// The PipeWire socket. Consumed by [`super::pipewire::acquire_frame`].
+    /// The PipeWire socket, duplicated into [`super::pipewire::acquire_frame`].
     pub remote: OwnedFd,
+    /// Kept alive until the frame is copied, then explicitly closed.
+    ///
+    /// Dropping ashpd's proxy does not call `org.freedesktop.portal.Session.Close`;
+    /// without this handle, every capture would leak a compositor session until
+    /// the D-Bus connection or process ended.
+    session: Session<Screencast>,
+}
+
+impl Negotiation {
+    /// Closes the portal session after its PipeWire frame has been copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified D-Bus failure so the caller can report cleanup
+    /// trouble without hiding the capture's primary result.
+    pub fn close(&self) -> Result<(), PortalFailure> {
+        futures_lite::future::block_on(self.session.close()).map_err(classify)
+    }
 }
 
 /// Runs the whole ScreenCast conversation, blocking until it settles.
@@ -105,6 +126,33 @@ async fn negotiate_async(
         .await
         .map_err(classify)?;
 
+    let result = complete_session(&proxy, &session, narrowed, restore_token).await;
+    match result {
+        Ok((streams, restore_token, remote)) => Ok(Negotiation {
+            streams,
+            restore_token,
+            remote,
+            session,
+        }),
+        Err(failure) => {
+            if let Err(close_error) = session.close().await {
+                tracing::warn!(
+                    ?close_error,
+                    ?failure,
+                    "could not close a failed desktop-portal ScreenCast session"
+                );
+            }
+            Err(failure)
+        }
+    }
+}
+
+async fn complete_session(
+    proxy: &Screencast,
+    session: &Session<Screencast>,
+    narrowed: SessionPlan,
+    restore_token: Option<&str>,
+) -> Result<(Vec<StreamInfo>, Option<String>, OwnedFd), PortalFailure> {
     let options = SelectSourcesOptions::default()
         .set_multiple(narrowed.multiple)
         .set_cursor_mode(to_cursor_mode(narrowed.cursor))
@@ -113,17 +161,17 @@ async fn negotiate_async(
         .set_restore_token(restore_token);
 
     proxy
-        .select_sources(&session, options)
+        .select_sources(session, options)
         .await
-        .map_err(classify)?
+        .map_err(|error| classify_select_sources(error, restore_token.is_some()))?
         .response()
-        .map_err(classify)?;
+        .map_err(|error| classify_select_sources(error, restore_token.is_some()))?;
 
     // No parent window identifier: capture is triggered from a hotkey or the
     // tray, and there is no Scrozz window for the dialog to be modal to. Passing
     // a stale identifier parks the picker behind whatever was last focused.
     let response = proxy
-        .start(&session, None, StartCastOptions::default())
+        .start(session, None, StartCastOptions::default())
         .await
         .map_err(classify)?
         .response()
@@ -144,15 +192,32 @@ async fn negotiate_async(
     }
 
     let remote = proxy
-        .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
+        .open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default())
         .await
         .map_err(classify)?;
 
-    Ok(Negotiation {
+    Ok((
         streams,
-        restore_token: response.restore_token().map(ToOwned::to_owned),
+        response.restore_token().map(ToOwned::to_owned),
         remote,
-    })
+    ))
+}
+
+/// Classifies only the token-specific `SelectSources` failure as retryable.
+///
+/// `InvalidArgument` also covers source and cursor options. Retrying every one
+/// of those after deleting a token would duplicate an unrelated failure.
+fn classify_select_sources(error: ashpd::Error, used_restore_token: bool) -> PortalFailure {
+    use ashpd::{Error as Ashpd, PortalError};
+
+    match error {
+        Ashpd::Portal(PortalError::InvalidArgument(detail))
+            if used_restore_token && is_restore_token_rejection(&detail) =>
+        {
+            PortalFailure::RestoreRejected(detail)
+        }
+        other => classify(other),
+    }
 }
 
 /// Maps an `ashpd` error onto the classification the rest of the code reasons

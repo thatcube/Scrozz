@@ -18,12 +18,14 @@
 //! and alpha channels are swapped. A compositor that can only produce those is
 //! better met with a negotiation failure it can report than with wrong colour.
 //!
-//! `SPA_FORMAT_VIDEO_modifier` is also deliberately absent, and that absence is
-//! load-bearing: a client that offers no modifier cannot be given DMA-BUF
-//! buffers, so the server falls back to shared memory. That costs a GPU
-//! read-back, which for one still frame is unmeasurable, and it buys freedom
-//! from EGL, GBM, `libdrm` and per-driver import quirks. A recorder would want
-//! the opposite trade; a screenshot tool does not.
+//! `SPA_FORMAT_VIDEO_modifier` is also deliberately absent. After PipeWire
+//! fixates that modifier-less offer, [`shared_memory_buffer_param`] explicitly
+//! limits buffer allocation to `MemFd` and `MemPtr`. Both steps are required by
+//! PipeWire's DMA-BUF negotiation contract; merely omitting the modifier leaves
+//! the memory type underspecified. Shared memory costs a GPU read-back, which for
+//! one still frame is unmeasurable, and it buys freedom from EGL, GBM, `libdrm`
+//! and per-driver import quirks. A recorder would want the opposite trade; a
+//! screenshot tool does not.
 //!
 //! # Alpha, told truthfully
 //!
@@ -37,10 +39,21 @@
 
 use scrozz_core::{ColorSpace, PixelFormat};
 
+use std::borrow::Cow;
+
 use super::pod::{Choice, Object, Property, Scalar};
 
 /// `SPA_TYPE_OBJECT_Format`.
 pub const OBJECT_FORMAT: u32 = 0x0004_0003;
+/// `SPA_TYPE_OBJECT_ParamBuffers`.
+pub const OBJECT_PARAM_BUFFERS: u32 = 0x0004_0004;
+
+/// Largest dimension offered during negotiation.
+///
+/// A server may only fixate inside the offered range. Checking the answer keeps
+/// all later stride and allocation arithmetic bounded even if the peer is
+/// buggy.
+pub const MAX_DIMENSION: u32 = 16_384;
 
 /// Parameter ids from `enum spa_param_type`.
 pub mod param {
@@ -74,6 +87,25 @@ pub mod key {
     pub const VIDEO_TRANSFER: u32 = 0x0002_000E;
     /// `SPA_FORMAT_VIDEO_colorPrimaries`.
     pub const VIDEO_PRIMARIES: u32 = 0x0002_000F;
+}
+
+/// Property keys inside a `ParamBuffers` object.
+pub mod buffer_key {
+    /// `SPA_PARAM_BUFFERS_dataType`.
+    pub const DATA_TYPE: u32 = 6;
+}
+
+/// `enum spa_data_type` values used by the negotiated buffer policy.
+pub mod data_type {
+    /// `SPA_DATA_MemPtr`.
+    pub const MEM_PTR: u32 = 1;
+    /// `SPA_DATA_MemFd`.
+    pub const MEM_FD: u32 = 2;
+    /// `SPA_DATA_DmaBuf`.
+    pub const DMA_BUF: u32 = 3;
+
+    /// Flags-choice mask limiting allocation to shared-memory types.
+    pub const SHARED_MEMORY_MASK: i32 = (1_i32 << MEM_PTR) | (1_i32 << MEM_FD);
 }
 
 /// `SPA_MEDIA_TYPE_video`.
@@ -149,7 +181,7 @@ pub fn enum_format_param() -> Vec<u8> {
         &Choice::range(
             Scalar::rectangle(1920, 1080),
             Scalar::rectangle(1, 1),
-            Scalar::rectangle(16384, 16384),
+            Scalar::rectangle(MAX_DIMENSION, MAX_DIMENSION),
         ),
     ) {
         properties.push(property);
@@ -174,6 +206,25 @@ pub fn enum_format_param() -> Vec<u8> {
     .encode()
 }
 
+/// Builds the `ParamBuffers` response sent after format fixation.
+///
+/// PipeWire requires consumers that negotiated no video modifier to declare
+/// their usable memory types here. A flags choice allows the producer to choose
+/// either mapped `MemFd` storage or a direct `MemPtr`, while excluding DMA-BUF.
+#[must_use]
+pub fn shared_memory_buffer_param() -> Vec<u8> {
+    let memory_types = Choice::flags(Scalar::int(data_type::SHARED_MEMORY_MASK));
+    let memory_types = Property::choice(buffer_key::DATA_TYPE, &memory_types)
+        .expect("a one-value flags choice is always uniform");
+
+    Object {
+        object_type: OBJECT_PARAM_BUFFERS,
+        id: param::BUFFERS,
+        properties: vec![memory_types],
+    }
+    .encode()
+}
+
 /// Why a negotiated format could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
@@ -190,6 +241,15 @@ pub enum FormatError {
     MissingFormat,
     /// The `size` property was absent, or was zero in a dimension.
     MissingSize,
+    /// The server returned dimensions outside the range the client offered.
+    UnsupportedSize {
+        /// Width the server selected.
+        width: u32,
+        /// Height the server selected.
+        height: u32,
+    },
+    /// The server selected a DMA-BUF modifier even though none was offered.
+    UnexpectedModifier,
     /// The server fixated on a format outside [`PREFERRED_FORMATS`].
     ///
     /// Should be unreachable — a server may only pick from what the client
@@ -212,6 +272,16 @@ impl std::fmt::Display for FormatError {
             ),
             Self::MissingFormat => write!(f, "the agreed format omitted the pixel format"),
             Self::MissingSize => write!(f, "the agreed format omitted a usable frame size"),
+            Self::UnsupportedSize { width, height } => write!(
+                f,
+                "the server chose a {width}x{height} frame, outside the offered 1x1 to \
+                 {MAX_DIMENSION}x{MAX_DIMENSION} range"
+            ),
+            Self::UnexpectedModifier => write!(
+                f,
+                "the server selected a DMA-BUF modifier even though the client offered only the \
+                 modifier-less shared-memory path"
+            ),
             Self::UnsupportedFormat(value) => write!(
                 f,
                 "the server chose spa_video_format {value}, which was never offered"
@@ -289,7 +359,7 @@ pub const fn color_space(primaries: Option<u32>) -> ColorSpace {
 /// the pixel format or size, or names a format that was never offered.
 pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
     let object = super::pod::ObjectRef::parse(bytes).ok_or(FormatError::NotAFormat)?;
-    if object.object_type != OBJECT_FORMAT {
+    if object.object_type != OBJECT_FORMAT || object.id != param::FORMAT {
         return Err(FormatError::NotAFormat);
     }
 
@@ -315,11 +385,18 @@ pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
     let (pixel_format, opaque_padding) =
         pixel_format(spa_format).ok_or(FormatError::UnsupportedFormat(spa_format))?;
 
+    if object.property(key::VIDEO_MODIFIER).is_some() {
+        return Err(FormatError::UnexpectedModifier);
+    }
+
     let (width, height) = object
         .property(key::VIDEO_SIZE)
         .and_then(|property| property.as_rectangle())
         .filter(|(width, height)| *width > 0 && *height > 0)
         .ok_or(FormatError::MissingSize)?;
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(FormatError::UnsupportedSize { width, height });
+    }
 
     Ok(Negotiated {
         width,
@@ -337,6 +414,20 @@ pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
 /// Why a buffer could not be turned into a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferError {
+    /// Zero dimensions cannot describe a frame.
+    InvalidDimensions {
+        /// Width supplied by the caller.
+        width: u32,
+        /// Height supplied by the caller.
+        height: u32,
+    },
+    /// The geometry cannot be represented safely as byte lengths.
+    SizeOverflow {
+        /// Width supplied by the caller.
+        width: u32,
+        /// Height supplied by the caller.
+        height: u32,
+    },
     /// The chunk reported a stride that cannot describe rows of this width.
     ///
     /// Includes zero and negative strides. SPA types `stride` as signed and a
@@ -360,6 +451,13 @@ pub enum BufferError {
 impl std::fmt::Display for BufferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidDimensions { width, height } => {
+                write!(f, "a {width}x{height} buffer cannot describe a frame")
+            }
+            Self::SizeOverflow { width, height } => write!(
+                f,
+                "a {width}x{height} frame is too large to represent safely in memory"
+            ),
             Self::BadStride { stride, needed } => write!(
                 f,
                 "the buffer reported a row stride of {stride} bytes, which cannot hold a row \
@@ -395,7 +493,20 @@ pub fn pack_rows(
     height: u32,
     opaque_padding: bool,
 ) -> Result<Vec<u8>, BufferError> {
-    let row = width as usize * 4;
+    if width == 0 || height == 0 {
+        return Err(BufferError::InvalidDimensions { width, height });
+    }
+
+    let dimensions_overflow = || BufferError::SizeOverflow { width, height };
+    let row = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(dimensions_overflow)?;
+    let output_len = row
+        .checked_mul(usize::try_from(height).map_err(|_| dimensions_overflow())?)
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or_else(dimensions_overflow)?;
+
     let stride_usize = usize::try_from(stride).unwrap_or(0);
     if stride_usize < row || stride_usize == 0 {
         return Err(BufferError::BadStride {
@@ -408,8 +519,10 @@ pub fn pack_rows(
     // entitled to end the mapping there, and demanding the padding would reject
     // a perfectly good buffer.
     let needed = stride_usize
-        .saturating_mul(height.saturating_sub(1) as usize)
-        .saturating_add(row);
+        .checked_mul(height.saturating_sub(1) as usize)
+        .and_then(|prefix| prefix.checked_add(row))
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or_else(dimensions_overflow)?;
     if source.len() < needed {
         return Err(BufferError::Short {
             available: source.len(),
@@ -417,7 +530,7 @@ pub fn pack_rows(
         });
     }
 
-    let mut out = Vec::with_capacity(row * height as usize);
+    let mut out = Vec::with_capacity(output_len);
     for index in 0..height as usize {
         let start = index * stride_usize;
         out.extend_from_slice(&source[start..start + row]);
@@ -430,4 +543,29 @@ pub fn pack_rows(
     }
 
     Ok(out)
+}
+
+/// Presents one SPA chunk as a linear byte sequence.
+///
+/// `spa_chunk.offset` is explicitly modulo the mapping size, and a chunk may
+/// wrap from the end of the mapping back to its beginning. The common
+/// contiguous case is borrowed without allocation; only a wrapped chunk is
+/// copied.
+#[must_use]
+pub fn linear_chunk(mapping: &[u8], offset: u32, size: u32) -> Cow<'_, [u8]> {
+    if mapping.is_empty() || size == 0 {
+        return Cow::Borrowed(&mapping[..0]);
+    }
+
+    let size = (size as usize).min(mapping.len());
+    let offset = offset as usize % mapping.len();
+    let tail = mapping.len() - offset;
+    if size <= tail {
+        return Cow::Borrowed(&mapping[offset..offset + size]);
+    }
+
+    let mut linear = Vec::with_capacity(size);
+    linear.extend_from_slice(&mapping[offset..]);
+    linear.extend_from_slice(&mapping[..size - tail]);
+    Cow::Owned(linear)
 }

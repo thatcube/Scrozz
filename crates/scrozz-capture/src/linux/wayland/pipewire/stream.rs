@@ -42,14 +42,19 @@
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::ptr;
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use scrozz_core::Error;
 
 use super::format::{self, Negotiated};
-use super::lifecycle::{Action, Event, Lifecycle, StreamState};
+use super::lifecycle::{Action, Event, Lifecycle, StreamState, prefer_process_event};
 use super::sys::{self, Library, Symbols, pw_stream_events, spa_hook, spa_pod};
+
+const MAX_PARAM_BODY_SIZE: usize = 64 * 1024;
+const CHUNK_FLAG_CORRUPTED: u32 = 1 << 0;
+const CHUNK_FLAG_EMPTY: u32 = 1 << 1;
+const ERRNO_TIMED_OUT: c_int = 110;
 
 /// One frame, packed and described.
 #[derive(Debug)]
@@ -114,25 +119,102 @@ unsafe extern "C" fn on_state_changed(
 unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const spa_pod) {
     let listener = unsafe { &*data.cast::<Listener>() };
 
-    // A null parameter means "cleared", which happens during renegotiation and
-    // is not an error.
-    if id != format::param::FORMAT || param.is_null() {
+    if id != format::param::FORMAT {
+        return;
+    }
+    // A null parameter means "cleared", which happens during renegotiation.
+    // Discard the old interpretation before any buffer from the new format can
+    // arrive.
+    if param.is_null() {
+        if let Ok(mut shared) = listener.shared.lock() {
+            shared.negotiated = None;
+        }
         return;
     }
 
-    let header = unsafe { *param };
-    let total = 8usize.saturating_add(header.size as usize);
-    let bytes = unsafe { std::slice::from_raw_parts(param.cast::<u8>(), total) };
+    let bytes = match unsafe { copy_spa_pod(param) } {
+        Ok(bytes) => bytes,
+        Err(why) => {
+            listener.push(Event::FormatRejected(why));
+            return;
+        }
+    };
 
-    match format::parse_format(bytes) {
+    match format::parse_format(&bytes) {
         Ok(negotiated) => {
+            let stream = match listener.stream.lock() {
+                Ok(stream) => *stream,
+                Err(_) => {
+                    listener.push(Event::FormatRejected(
+                        "the PipeWire stream handle became unavailable during format negotiation"
+                            .into(),
+                    ));
+                    return;
+                }
+            };
+            if stream.is_null() {
+                listener.push(Event::FormatRejected(
+                    "PipeWire agreed a format before the stream handle was installed".into(),
+                ));
+                return;
+            }
+
+            // Publish the format before completing buffer negotiation. PipeWire
+            // normally delivers process callbacks asynchronously, but the API
+            // permits re-entrant callbacks while this recursive loop lock is
+            // held; those buffers must see the new layout, and the lifecycle
+            // must observe FormatAgreed before FrameReady.
             if let Ok(mut shared) = listener.shared.lock() {
                 shared.negotiated = Some(negotiated);
             }
             listener.push(Event::FormatAgreed(negotiated));
+
+            // A modifier-less EnumFormat is only half of shared-memory
+            // negotiation. PipeWire requires the consumer to answer the fixed
+            // format with a ParamBuffers dataType flags choice.
+            let buffers = format::shared_memory_buffer_param();
+            let mut params = [buffers.as_ptr().cast::<spa_pod>()];
+            let rc = unsafe {
+                ((*listener.symbols).pw_stream_update_params)(
+                    stream,
+                    params.as_mut_ptr(),
+                    params.len() as u32,
+                )
+            };
+            if rc < 0 {
+                if let Ok(mut shared) = listener.shared.lock() {
+                    shared.negotiated = None;
+                }
+                listener.push(Event::FormatRejected(format!(
+                    "PipeWire accepted the video format but rejected the shared-memory buffer \
+                     requirement ({})",
+                    errno_text(rc)
+                )));
+            }
         }
         Err(why) => listener.push(Event::FormatRejected(why.to_string())),
     }
+}
+
+/// Copies one callback-owned POD after bounding its peer-controlled body size.
+///
+/// # Safety
+///
+/// `param` must point to a live `spa_pod` supplied to `param_changed`.
+unsafe fn copy_spa_pod(param: *const spa_pod) -> Result<Vec<u8>, String> {
+    let header = unsafe { *param };
+    let body = header.size as usize;
+    if body > MAX_PARAM_BODY_SIZE {
+        return Err(format!(
+            "the PipeWire format parameter declared a {body}-byte body; the supported maximum is \
+             {MAX_PARAM_BODY_SIZE} bytes"
+        ));
+    }
+    let total = std::mem::size_of::<spa_pod>()
+        .checked_add(body)
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or_else(|| "the PipeWire format parameter length overflowed".to_owned())?;
+    Ok(unsafe { std::slice::from_raw_parts(param.cast::<u8>(), total) }.to_vec())
 }
 
 unsafe extern "C" fn on_process(data: *mut c_void) {
@@ -147,14 +229,17 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         return;
     }
 
-    let negotiated = match listener.shared.lock() {
-        Ok(shared) => shared.negotiated,
+    let (negotiated, store_pixels) = match listener.shared.lock() {
+        Ok(shared) => (shared.negotiated, shared.pixels.is_none()),
         Err(_) => return,
     };
 
     // Drain the queue rather than taking the first buffer. Compositors commonly
     // deliver an empty priming buffer, and if several have piled up the newest
-    // is the one the user actually asked for.
+    // is the one the user actually asked for. Once a completed process callback
+    // has published a frame, later callbacks must not overwrite it: a format
+    // renegotiation could otherwise pair the first FrameReady event with pixels
+    // copied under a later layout.
     let mut outcome: Option<Event> = None;
     loop {
         let buffer = unsafe { (symbols.pw_stream_dequeue_buffer)(stream) };
@@ -162,14 +247,22 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             break;
         }
 
-        let event = unsafe { read_buffer(buffer, negotiated.as_ref(), listener) };
-        unsafe { (symbols.pw_stream_queue_buffer)(stream, buffer) };
+        let mut event = unsafe { read_buffer(buffer, negotiated.as_ref(), listener, store_pixels) };
+        let queued = unsafe { (symbols.pw_stream_queue_buffer)(stream, buffer) };
+        if queued < 0 {
+            event = Event::BufferRejected(format!(
+                "PipeWire would not take a dequeued buffer back ({})",
+                errno_text(queued)
+            ));
+        }
 
-        // A later good frame supersedes an earlier empty one, but a failure is
-        // kept: it means something is structurally wrong, not merely idle.
-        match (&outcome, &event) {
-            (Some(Event::BufferRejected(_)), _) => {}
-            _ => outcome = Some(event),
+        outcome = Some(match outcome {
+            Some(current) => prefer_process_event(current, event),
+            None => event,
+        });
+
+        if queued < 0 {
+            break;
         }
     }
 
@@ -187,6 +280,7 @@ unsafe fn read_buffer(
     buffer: *mut sys::pw_buffer,
     negotiated: Option<&Negotiated>,
     listener: &Listener,
+    store_pixels: bool,
 ) -> Event {
     let Some(negotiated) = negotiated else {
         return Event::EmptyBuffer;
@@ -196,56 +290,89 @@ unsafe fn read_buffer(
     if spa.is_null() || unsafe { (*spa).n_datas } == 0 {
         return Event::EmptyBuffer;
     }
+    if unsafe { (*spa).datas }.is_null() {
+        return Event::BufferRejected(
+            "the SPA buffer reports data planes but its plane array is null".into(),
+        );
+    }
 
     let plane = unsafe { &*(*spa).datas };
 
-    if plane.type_ == sys::data_type::DMA_BUF {
-        // Cannot happen with the parameters this client offers — no modifier is
-        // advertised, so the server has no way to negotiate DMA-BUF — but if a
-        // server does it anyway, saying so is far better than reading a pointer
-        // that was never mapped.
-        return Event::BufferRejected(
-            "the compositor delivered a DMA-BUF frame, which needs GPU import that Scrozz does \
-             not do; this build only accepts shared-memory frames"
-                .into(),
-        );
+    match plane.type_ {
+        format::data_type::MEM_PTR | format::data_type::MEM_FD => {}
+        format::data_type::DMA_BUF => {
+            return Event::BufferRejected(
+                "the compositor delivered a DMA-BUF frame despite the negotiated shared-memory \
+                 requirement; importing it safely would require the compositor's GPU modifier and \
+                 synchronization protocol"
+                    .into(),
+            );
+        }
+        other => {
+            return Event::BufferRejected(format!(
+                "the compositor delivered SPA memory type {other}, but the stream negotiated only \
+                 MemPtr and MemFd"
+            ));
+        }
     }
 
     if plane.chunk.is_null() {
         return Event::EmptyBuffer;
     }
     let chunk = unsafe { *plane.chunk };
-
-    // The idle case: a real buffer carrying nothing. Not an error.
-    if chunk.size == 0 || plane.data.is_null() {
-        return Event::EmptyBuffer;
+    let flags = chunk.flags.cast_unsigned();
+    if flags & CHUNK_FLAG_CORRUPTED != 0 {
+        return Event::BufferRejected(
+            "the compositor marked the PipeWire buffer as corrupted".into(),
+        );
     }
 
-    let offset = chunk.offset as usize;
+    // The idle case: a real buffer carrying no usable pixels. For a still
+    // capture, accepting SPA's neutral/black EMPTY value would be
+    // indistinguishable from the common empty priming-buffer failure.
+    if chunk.size == 0 || flags & CHUNK_FLAG_EMPTY != 0 {
+        return Event::EmptyBuffer;
+    }
+    if plane.data.is_null() {
+        return Event::BufferRejected(
+            "the shared-memory buffer has bytes but PipeWire did not map them".into(),
+        );
+    }
+
     let maxsize = plane.maxsize as usize;
-    if offset >= maxsize {
+    if maxsize == 0 {
         return Event::BufferRejected(format!(
-            "the buffer's chunk starts at byte {offset} of a {maxsize}-byte mapping"
+            "the buffer carries {} bytes in a zero-length mapping",
+            chunk.size
+        ));
+    }
+    if maxsize > isize::MAX as usize {
+        return Event::BufferRejected(format!(
+            "the buffer's {maxsize}-byte mapping is too large to address safely"
         ));
     }
 
-    let available = (maxsize - offset).min(chunk.size as usize);
-    let source =
-        unsafe { std::slice::from_raw_parts(plane.data.cast::<u8>().add(offset), available) };
+    let mapping = unsafe { std::slice::from_raw_parts(plane.data.cast::<u8>(), maxsize) };
+    let source = format::linear_chunk(mapping, chunk.offset, chunk.size);
 
     match format::pack_rows(
-        source,
+        source.as_ref(),
         chunk.stride,
         negotiated.width,
         negotiated.height,
         negotiated.opaque_padding,
     ) {
-        Ok(pixels) => {
-            if let Ok(mut shared) = listener.shared.lock() {
-                shared.pixels = Some(pixels);
+        Ok(pixels) => match listener.shared.lock() {
+            Ok(mut shared) => {
+                if store_pixels {
+                    shared.pixels = Some(pixels);
+                }
+                Event::FrameReady
             }
-            Event::FrameReady
-        }
+            Err(_) => Event::BufferRejected(
+                "the captured pixels could not be stored because shared state was poisoned".into(),
+            ),
+        },
         Err(why) => Event::BufferRejected(why.to_string()),
     }
 }
@@ -310,8 +437,6 @@ impl Drop for Session<'_> {
     }
 }
 
-static PW_INIT: Once = Once::new();
-
 /// Captures a single frame from a portal-provided PipeWire node.
 ///
 /// `fd` is the remote returned by `org.freedesktop.portal.ScreenCast.
@@ -331,8 +456,6 @@ pub fn capture_one(
     timeout: Duration,
 ) -> Result<RawFrame, Error> {
     let symbols = &library.symbols;
-
-    PW_INIT.call_once(|| unsafe { (symbols.pw_init)(ptr::null_mut(), ptr::null_mut()) });
 
     // Declared before `session` so that it is dropped *after* it: the stream
     // holds a pointer to the listener and must be destroyed first.
@@ -380,10 +503,32 @@ pub fn capture_one(
     }
     session.started = true;
 
-    unsafe { (symbols.pw_thread_loop_lock)(thread_loop) };
-    let result = run_locked(&mut session, &mut listener, &mut hook, fd, node_id, timeout);
-    unsafe { (symbols.pw_thread_loop_unlock)(thread_loop) };
-    result
+    {
+        let _lock = LoopLock::new(symbols, thread_loop);
+        run_locked(&mut session, &mut listener, &mut hook, fd, node_id, timeout)
+    }
+}
+
+/// Releases the recursive thread-loop lock on every return and unwind path.
+struct LoopLock<'a> {
+    symbols: &'a Symbols,
+    thread_loop: *mut c_void,
+}
+
+impl<'a> LoopLock<'a> {
+    fn new(symbols: &'a Symbols, thread_loop: *mut c_void) -> Self {
+        unsafe { (symbols.pw_thread_loop_lock)(thread_loop) };
+        Self {
+            symbols,
+            thread_loop,
+        }
+    }
+}
+
+impl Drop for LoopLock<'_> {
+    fn drop(&mut self) {
+        unsafe { (self.symbols.pw_thread_loop_unlock)(self.thread_loop) };
+    }
 }
 
 /// The part that must happen with the loop lock held.
@@ -466,7 +611,9 @@ fn wait_for_frame(
     let symbols = session.symbols;
     let seconds = u32::try_from(timeout.as_secs().max(1)).unwrap_or(u32::MAX);
     let mut lifecycle = Lifecycle::new(seconds);
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::Platform("the PipeWire frame deadline overflowed".into()))?;
 
     loop {
         // Drain whatever the callbacks queued while the lock was released.
@@ -497,9 +644,17 @@ fn wait_for_frame(
         // rather than spinning.
         let wait_secs = remaining.as_secs().saturating_add(1).min(i32::MAX as u64) as c_int;
         let rc = unsafe { (symbols.pw_thread_loop_timed_wait)(session.thread_loop, wait_secs) };
-        if rc < 0 && Instant::now() >= deadline {
-            lifecycle.observe(Event::TimedOut);
-            break;
+        if rc < 0 {
+            if rc != -ERRNO_TIMED_OUT {
+                return Err(Error::Platform(format!(
+                    "waiting for the PipeWire event loop failed ({})",
+                    errno_text(rc)
+                )));
+            }
+            if Instant::now() >= deadline {
+                lifecycle.observe(Event::TimedOut);
+                break;
+            }
         }
     }
 
@@ -549,7 +704,7 @@ fn stream_properties(symbols: &Symbols) -> *mut c_void {
 
 /// Renders a negative PipeWire return code as something a human can act on.
 fn errno_text(rc: c_int) -> String {
-    let code = -rc;
+    let code = rc.unsigned_abs();
     match code {
         2 => "no such node".into(),
         13 => "permission denied".into(),

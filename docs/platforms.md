@@ -12,10 +12,11 @@ different class of defect, and each one cheaper than the layer below it.
 
 ## Layer 1 — Cross-target type checking (local, seconds, free)
 
-`cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-Both targets check cleanly from macOS today for **every crate that contains
-platform-specific code** — including the real platform bindings: the `windows`
-crate, `x11rb`, and `ashpd` with its zbus stack.
+`cargo check` does not link, so Rust bindings need no Windows SDK or target
+linker. It still runs build scripts, which means a dependency that compiles C or
+queries target-native libraries can need a foreign toolchain or sysroot even
+though no executable is produced. Subject to that exact boundary, the compiler
+checks against the real `windows`, `x11rb`, and `ashpd`/zbus APIs.
 
 ```bash
 tools/check-all-platforms.sh
@@ -28,24 +29,44 @@ error on this machine** rather than a surprise days later. It is the difference
 between writing platform code blind and writing it with the type checker
 watching.
 
-### The one exception, and why it does not matter
+### The build-script exceptions, stated exactly
 
-**Crates whose dependencies compile C cannot be cross-checked without a cross C
-toolchain.** `cargo check` still runs build scripts, and `rusqlite`'s `bundled`
-feature compiles `sqlite3.c` *for the target*, which fails on this machine with
-`fatal error: 'stdlib.h' file not found`. `scrozz-store` and the `scrozz` binary
-that depends on it are therefore excluded, via `SCROZZ_XCHECK_EXCLUDE`.
+There are two distinct limitations:
 
-This costs nothing real. Only four crates are permitted to contain
-`cfg(target_os)` at all — `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and
-`scrozz-shell` — and **all four are still fully checked on all three targets**.
-`scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
-almost nothing, and CI compiles it natively on all three runners anyway (layer
-2), which is a strictly stronger check.
+1. **Target C compilation.** `rusqlite`'s `bundled` feature compiles `sqlite3.c`
+   for the target. On a foreign target that needs a cross C compiler and sysroot;
+   without them the macOS host fails with `fatal error: 'stdlib.h' file not
+   found`. `scrozz-store` and the `scrozz` binary that depends on it are therefore
+   excluded from cross targets through `SCROZZ_XCHECK_EXCLUDE`. Neither contains
+   platform-conditional code, and CI compiles both natively on every runner.
+2. **Target `pkg-config` probes.** On Linux, `scrozz-shell` reaches
+   libappindicator and GTK through `tray-icon`. The `glib-sys`, `gobject-sys`,
+   `gio-sys`, `pango-sys`, and GTK-family build scripts still run during `cargo
+   check` and require Linux `.pc` files. A macOS host has neither a Linux
+   GLib/GTK sysroot nor target `pkg-config` metadata, so the **full**
+   `x86_64-unknown-linux-gnu` workspace check fails there with `pkg-config has
+   not been configured to support cross-compilation`. Setting
+   `PKG_CONFIG_ALLOW_CROSS=1` is not a fix: it would describe Darwin libraries to
+   a Linux target.
 
-Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
-dependency, which matters far more than local cross-check coverage of a crate
-that has no platform code in it.
+`scrozz-shell` is deliberately not put in the standard exclusion list because it
+does contain Linux platform code; excluding it would make a full check look green
+by hiding the code the command exists to check. The CI gate runs on Ubuntu after
+`tools/ci-linux-deps.sh`, so it has native GLib/GObject/GIO/GTK metadata and
+checks the full shell. The PipeWire work itself has no build-time system
+dependency and passes independently from macOS:
+
+```bash
+cargo check --package scrozz-capture --all-targets \
+  --target x86_64-unknown-linux-gnu
+cargo clippy --package scrozz-capture --all-targets \
+  --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
+Keeping bundled SQLite is deliberate: shipped builds carry no system SQLite
+dependency. Keeping the shell failure visible is equally deliberate: it records
+the real limit of a macOS-only cross check rather than claiming coverage that did
+not happen.
 
 Its limit is exact: this layer proves the code is *well-formed*, never that it
 *works*.
@@ -178,8 +199,9 @@ Honestly, and in order of risk:
 2. **That the hand-encoded POD is one a server accepts.** The tests prove it
    matches the documented format; only a server proves the format was read
    correctly.
-3. **That offering no DMA-BUF modifier really does force a shared-memory
-   fallback**, rather than failing to negotiate at all.
+3. **That the modifier-less format offer plus the explicit
+   `SPA_PARAM_BUFFERS_dataType = MemFd | MemPtr` response produces shared-memory
+   buffers**, rather than failing to negotiate or returning DMA-BUF.
 4. **The portal dialog**, including that dismissing it produces
    `Error::Cancelled` and not something alarming.
 5. **The restore-token round trip**, including the rejection-and-retry path. A
@@ -240,21 +262,28 @@ These are the dangerous class: the call returns success and nothing works.
    consistency" produces a POD the server reads as garbage — see the previous
    entry for how that presents.
 
+7. **A full Linux workspace check from macOS reaches target `pkg-config`.**
+   `scrozz-shell -> tray-icon -> libappindicator -> GTK` asks for Linux
+   GLib/GObject/GIO/Pango/GTK metadata even though `cargo check` never links.
+   Without a Linux sysroot that failure is expected; check `scrozz-capture`
+   independently and let the Ubuntu CI gate check the native shell. Never point
+   `PKG_CONFIG_ALLOW_CROSS` at the host's Darwin libraries.
+
 ### Process-global state
 
-7. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
+8. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
    Setting it once permanently starves the process-global receiver channel for
    *every* other consumer in the process. Use `receiver()` instead; a library
    crate must never claim the handler.
 
 ### Coordinate systems
 
-8. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
+9. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
    `visibleFrame` and Vision's normalised text boxes all need flipping. This is
    the classic "everything is upside down" bug and it is easy to get almost-right.
-9. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
+10. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
    or above the primary. Never assume the origin is `(0, 0)`.
-10. **A PipeWire stride is not `width * 4`.** The producer picks it, and it is
+11. **A PipeWire stride is not `width * 4`.** The producer picks it, and it is
     routinely larger. Reading the buffer linearly gives the classic diagonal
     shear, which looks like a decoding bug and is not. The last row is also
     entitled to end after `width * 4` bytes rather than a full stride, so
@@ -262,10 +291,10 @@ These are the dangerous class: the call returns success and nothing works.
 
 ### Scale
 
-11. **There is no single app-wide scale factor on Windows or Wayland.** Windows
+12. **There is no single app-wide scale factor on Windows or Wayland.** Windows
     desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
     Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
-12. **On Wayland, do not use a display's scale factor to convert a region to
+13. **On Wayland, do not use a display's scale factor to convert a region to
     pixels.** Under fractional scaling the compositor rounds the output's pixel
     size, so the nominal scale and the real ratio disagree. The delivered frame
     and the portal's reported logical size describe the same monitor, so their
@@ -273,12 +302,12 @@ These are the dangerous class: the call returns success and nothing works.
 
 ### Testing platform code
 
-13. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
+14. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
     thread.** Anything needing the main run loop — `NSApplication`, windows, tray
     items, hotkey managers — is unreachable from an ordinary test. Doctests run on
     the main thread and are the workaround; failing that, test the
     off-main-thread guard and verify real behaviour another way.
-14. **A skipped test that exits 0 is worse than no test.** It is
+15. **A skipped test that exits 0 is worse than no test.** It is
     indistinguishable from a pass, so it records verification that never
     happened. `tools/wayland-smoke.sh` exits 77 with the reason on stderr
     instead.

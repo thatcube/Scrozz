@@ -84,7 +84,7 @@ pub mod choice {
     pub const STEP: u32 = 2;
     /// `default` followed by every other acceptable value.
     pub const ENUM: u32 = 3;
-    /// `default, mask…`.
+    /// A bit mask of acceptable flags.
     pub const FLAGS: u32 = 4;
 }
 
@@ -92,6 +92,10 @@ pub mod choice {
 #[must_use]
 pub const fn pad_to_8(len: usize) -> usize {
     len.div_ceil(8) * 8
+}
+
+fn checked_pad_to_8(len: usize) -> Option<usize> {
+    len.checked_add(7).map(|padded| padded / 8 * 8)
 }
 
 /// A POD value's type together with its unpadded body bytes.
@@ -208,6 +212,18 @@ impl Choice {
         }
     }
 
+    /// A bit mask of acceptable flags.
+    ///
+    /// Unlike an enum or range, SPA encodes a flags choice as one value whose
+    /// set bits are the alternatives.
+    #[must_use]
+    pub fn flags(value: Scalar) -> Self {
+        Self {
+            flavour: choice::FLAGS,
+            values: vec![value],
+        }
+    }
+
     /// The complete POD, or `None` if the values disagree about type or width.
     ///
     /// A mismatched list cannot be encoded at all — the child header describes
@@ -226,8 +242,10 @@ impl Choice {
             return None;
         }
 
-        let body_len = 16 + child_size * self.values.len();
-        let mut out = Vec::with_capacity(pad_to_8(8 + body_len));
+        let values_len = child_size.checked_mul(self.values.len())?;
+        let body_len = 16usize.checked_add(values_len)?;
+        let total_len = 8usize.checked_add(body_len)?;
+        let mut out = Vec::with_capacity(checked_pad_to_8(total_len)?);
         push_header(&mut out, body_len, kind::CHOICE);
         out.extend_from_slice(&self.flavour.to_ne_bytes());
         out.extend_from_slice(&0u32.to_ne_bytes()); // flags
@@ -347,6 +365,12 @@ pub struct PropertyRef<'a> {
 }
 
 impl PropertyRef<'_> {
+    /// The flavour when this property is a `Choice`.
+    #[must_use]
+    pub fn choice_flavour(&self) -> Option<u32> {
+        (self.kind == kind::CHOICE && self.body.len() >= 4).then(|| read_u32(self.body, 0))
+    }
+
     /// Reads the value as an `Id`, unwrapping a single-value choice.
     #[must_use]
     pub fn as_id(&self) -> Option<u32> {
@@ -391,7 +415,8 @@ impl PropertyRef<'_> {
         }
         let child_size = read_u32(self.body, 8) as usize;
         let child_kind = read_u32(self.body, 12);
-        let default = self.body.get(16..16 + child_size)?;
+        let child_end = 16usize.checked_add(child_size)?;
+        let default = self.body.get(16..child_end)?;
         Some((child_kind, default))
     }
 }
@@ -421,11 +446,16 @@ impl<'a> ObjectRef<'a> {
         if read_u32(bytes, 4) != kind::OBJECT || size < 8 {
             return None;
         }
-        let body = bytes.get(8..8 + size)?;
+        let body_end = 8usize.checked_add(size)?;
+        let body = bytes.get(8..body_end)?;
+        let properties = &body[8..];
+        if !properties_well_formed(properties) {
+            return None;
+        }
         Some(Self {
             object_type: read_u32(body, 0),
             id: read_u32(body, 4),
-            properties: &body[8..],
+            properties,
         })
     }
 
@@ -441,6 +471,27 @@ impl<'a> ObjectRef<'a> {
     pub fn property(&self, key: u32) -> Option<PropertyRef<'a>> {
         self.properties().find(|property| property.key == key)
     }
+}
+
+fn properties_well_formed(mut rest: &[u8]) -> bool {
+    while !rest.is_empty() {
+        if rest.len() < 16 {
+            return false;
+        }
+        let size = read_u32(rest, 8) as usize;
+        let Some(advance) = size
+            .checked_add(8)
+            .and_then(checked_pad_to_8)
+            .and_then(|len| len.checked_add(8))
+        else {
+            return false;
+        };
+        let Some(next) = rest.get(advance..) else {
+            return false;
+        };
+        rest = next;
+    }
+    true
 }
 
 struct Properties<'a> {
@@ -459,13 +510,24 @@ impl<'a> Iterator for Properties<'a> {
         let flags = read_u32(self.rest, 4);
         let size = read_u32(self.rest, 8) as usize;
         let kind = read_u32(self.rest, 12);
-        let Some(body) = self.rest.get(16..16 + size) else {
+        let Some(body_end) = 16usize.checked_add(size) else {
+            self.rest = &[];
+            return None;
+        };
+        let Some(body) = self.rest.get(16..body_end) else {
             self.rest = &[];
             return None;
         };
 
         // Rule 1: the next property starts after this value's padding.
-        let advance = 8 + pad_to_8(8 + size);
+        let Some(value_len) = 8usize.checked_add(size) else {
+            self.rest = &[];
+            return None;
+        };
+        let Some(advance) = checked_pad_to_8(value_len).and_then(|len| len.checked_add(8)) else {
+            self.rest = &[];
+            return None;
+        };
         self.rest = self.rest.get(advance..).unwrap_or(&[]);
         Some(PropertyRef {
             key,

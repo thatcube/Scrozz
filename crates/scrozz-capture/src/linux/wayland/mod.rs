@@ -59,6 +59,9 @@ pub struct WaylandBackend {
     compositor: Compositor,
     capabilities: PortalCapabilities,
     kind: SessionKind,
+    /// Serialises captures so a single-use restore token is never presented by
+    /// two concurrent portal sessions.
+    capture_gate: Mutex<()>,
     tokens: Mutex<TokenStore>,
     token_path: Option<std::path::PathBuf>,
     /// XWayland, used only to read output geometry — never to capture.
@@ -131,6 +134,7 @@ impl WaylandBackend {
             compositor,
             capabilities,
             kind,
+            capture_gate: Mutex::new(()),
             tokens: Mutex::new(tokens),
             token_path,
             geometry,
@@ -204,14 +208,12 @@ impl WaylandBackend {
 
     /// Negotiates a ScreenCast session, reusing a stored grant where possible.
     ///
-    /// A stored token that the portal no longer accepts is the interesting case.
-    /// It happens routinely — the user revoked the grant in system settings, the
-    /// monitor it referred to was unplugged, the portal was upgraded — and the
-    /// portal's answer is a plain failure, not a distinguishable "bad token"
-    /// code. Treating that as fatal would leave the user permanently unable to
-    /// capture with no way to discover why, so a first attempt made *with* a
-    /// token is retried once *without* one. That costs a picker dialog, which is
-    /// the correct price, and the stale token is discarded on the way past.
+    /// A syntactically invalid token is rejected by `SelectSources` as
+    /// `InvalidArgument` with a token-specific message. Only that classified
+    /// failure is retried without the token. Missing portals, unsupported source
+    /// types, empty stream sets and PipeWire-remote failures cannot be repaired
+    /// by deleting a token, and retrying them would duplicate arbitrary failures
+    /// or show a second picker.
     ///
     /// Cancellation is never retried: the user said no, and asking again
     /// immediately is precisely the behaviour that makes a tool feel hostile.
@@ -227,7 +229,7 @@ impl WaylandBackend {
         let negotiation = match outcome {
             Ok(negotiation) => negotiation,
             Err(PortalFailure::Cancelled) => return Err(Error::Cancelled),
-            Err(failure) if stored.is_some() => {
+            Err(failure) if stored.is_some() && failure.should_retry_without_restore() => {
                 tracing::info!(
                     ?failure,
                     "the stored portal restore token was not accepted; asking again without it"
@@ -243,8 +245,16 @@ impl WaylandBackend {
         // Store on every success, not only when the token changed: the portal is
         // entitled to rotate a token it accepted, and dropping the rotation is a
         // silent regression to a prompt on the capture after next.
-        if let Some(token) = &negotiation.restore_token {
-            self.remember_token(plan.restore_key, token);
+        match &negotiation.restore_token {
+            Some(token) => self.remember_token(plan.restore_key, token),
+            // A successful restore consumes the old token. If the portal did
+            // not issue a replacement, retaining the old value guarantees a
+            // stale restore attempt on the next capture.
+            None if stored.is_some() => {
+                self.forget_token(plan.restore_key);
+                self.persist_tokens();
+            }
+            None => {}
         }
 
         Ok(negotiation)
@@ -349,6 +359,11 @@ impl TargetEnumerator for WaylandBackend {
 
 impl CaptureBackend for WaylandBackend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
+        let _capture = self.capture_gate.lock().map_err(|_| {
+            Error::Platform(
+                "the Wayland capture gate was poisoned by an earlier failed capture".into(),
+            )
+        })?;
         let plan = SessionPlan::for_target(&request.target, request.cursor == CursorMode::Visible);
 
         if request.target.is_window() && self.kind == SessionKind::Wayland {
@@ -359,7 +374,14 @@ impl CaptureBackend for WaylandBackend {
         }
 
         let negotiation = self.open_session(&plan)?;
-        let (frame, stream) = self.frame_from(&negotiation)?;
+        let frame = self.frame_from(&negotiation);
+        if let Err(close_failure) = negotiation.close() {
+            tracing::warn!(
+                ?close_failure,
+                "could not close the desktop-portal ScreenCast session after capture"
+            );
+        }
+        let (frame, stream) = frame?;
 
         let frame = match &request.target {
             CaptureTarget::Region(rect) => {

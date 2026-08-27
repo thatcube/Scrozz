@@ -24,9 +24,10 @@
 //! The cost is this file: the structs and signatures are transcribed from the
 //! PipeWire headers by hand, and a mistake here is a crash rather than a
 //! compile error. They are therefore written out in full, with the C
-//! declaration beside each one, and nothing is guessed. What cannot be done is
-//! *test* them without a real PipeWire — see `tools/wayland-smoke.sh`, which
-//! exists precisely to be the thing that does.
+//! declaration beside each one, or as the documented stable prefix when
+//! PipeWire permits a structure to grow; nothing is guessed. What cannot be
+//! done is *test* them without a real PipeWire — see `tools/wayland-smoke.sh`,
+//! which exists precisely to be the thing that does.
 //!
 //! # What is not here
 //!
@@ -37,6 +38,7 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::sync::{Mutex, OnceLock};
 
 use scrozz_core::Error;
 
@@ -58,16 +60,6 @@ pub const STREAM_FLAG_MAP_BUFFERS: u32 = 1 << 2;
 /// A still capture that silently reconnects to a *different* node after the
 /// original disappeared would return someone else's pixels.
 pub const STREAM_FLAG_DONT_RECONNECT: u32 = 1 << 7;
-
-/// `enum spa_data_type` values worth distinguishing.
-pub mod data_type {
-    /// `SPA_DATA_MemPtr`.
-    pub const MEM_PTR: u32 = 1;
-    /// `SPA_DATA_MemFd`.
-    pub const MEM_FD: u32 = 2;
-    /// `SPA_DATA_DmaBuf` — never usable here; see [`super::super::format`].
-    pub const DMA_BUF: u32 = 3;
-}
 
 /// `struct spa_list`.
 #[repr(C)]
@@ -195,27 +187,25 @@ pub struct spa_buffer {
     pub datas: *mut spa_data,
 }
 
-/// `struct pw_buffer`.
+/// Stable prefix of `struct pw_buffer`.
+///
+/// PipeWire explicitly permits this structure to grow. Scrozz reads only the
+/// first field, so declaring only that ABI-stable prefix avoids requiring an
+/// older runtime's allocation to be large enough for newer trailing fields.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct pw_buffer {
     /// The SPA buffer this wraps.
     pub buffer: *mut spa_buffer,
-    /// Client-attached data.
-    pub user_data: *mut c_void,
-    /// Set by the client for queue accounting.
-    pub size: u64,
-    /// Suggested amount for playback streams; zero here.
-    pub requested: u64,
-    /// Cycle time in nanoseconds, since PipeWire 1.0.5.
-    pub time: u64,
 }
 
-/// `struct pw_stream_events`, version 2.
+/// `struct pw_stream_events`, laid out through version 2.
 ///
 /// The field order is load-bearing — this is a vtable, not a bag of options.
 /// Every pointer is `Option<…>` so unused callbacks are a null entry, which is
-/// what PipeWire checks for.
+/// what PipeWire checks for. Scrozz advertises version 0 because every callback
+/// it uses belongs to the original prefix; that keeps the listener valid on old
+/// PipeWire 0.3 runtimes while the trailing fields preserve the current layout.
 #[repr(C)]
 pub struct pw_stream_events {
     /// Must be `PW_VERSION_STREAM_EVENTS`.
@@ -244,8 +234,39 @@ pub struct pw_stream_events {
     pub trigger_done: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
-/// `PW_VERSION_STREAM_EVENTS`.
-pub const VERSION_STREAM_EVENTS: u32 = 2;
+/// Oldest stream-event ABI containing every callback Scrozz uses.
+pub const VERSION_STREAM_EVENTS: u32 = 0;
+
+// These are compile-time checks against the 64-bit PipeWire/SPA headers. They
+// cannot prove that a live library behaves correctly, but they do make a Rust
+// field-order or signature edit fail the Linux target build instead of turning
+// into a garbage pointer at runtime.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<spa_list>() == 16);
+    assert!(std::mem::size_of::<spa_callbacks>() == 16);
+    assert!(std::mem::size_of::<spa_hook>() == 48);
+    assert!(std::mem::offset_of!(spa_hook, cb) == 16);
+    assert!(std::mem::offset_of!(spa_hook, removed) == 32);
+    assert!(std::mem::offset_of!(spa_hook, priv_) == 40);
+
+    assert!(std::mem::size_of::<spa_pod>() == 8);
+    assert!(std::mem::size_of::<spa_chunk>() == 16);
+    assert!(std::mem::size_of::<spa_data>() == 40);
+    assert!(std::mem::offset_of!(spa_data, fd) == 8);
+    assert!(std::mem::offset_of!(spa_data, data) == 24);
+    assert!(std::mem::offset_of!(spa_data, chunk) == 32);
+    assert!(std::mem::size_of::<spa_buffer>() == 24);
+    assert!(std::mem::offset_of!(spa_buffer, datas) == 16);
+    assert!(std::mem::size_of::<pw_buffer>() == 8);
+    assert!(std::mem::offset_of!(pw_buffer, buffer) == 0);
+
+    assert!(std::mem::size_of::<pw_stream_events>() == 96);
+    assert!(std::mem::offset_of!(pw_stream_events, state_changed) == 16);
+    assert!(std::mem::offset_of!(pw_stream_events, param_changed) == 40);
+    assert!(std::mem::offset_of!(pw_stream_events, process) == 64);
+    assert!(std::mem::offset_of!(pw_stream_events, trigger_done) == 88);
+};
 
 macro_rules! symbols {
     ($($field:ident : $ty:ty = $name:literal),+ $(,)?) => {
@@ -279,7 +300,6 @@ macro_rules! symbols {
 
 symbols! {
     pw_init: unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char) = b"pw_init\0",
-    pw_deinit: unsafe extern "C" fn() = b"pw_deinit\0",
 
     pw_thread_loop_new:
         unsafe extern "C" fn(*const c_char, *const c_void) -> *mut c_void = b"pw_thread_loop_new\0",
@@ -315,6 +335,9 @@ symbols! {
     pw_stream_connect:
         unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut *const spa_pod, u32) -> c_int
         = b"pw_stream_connect\0",
+    pw_stream_update_params:
+        unsafe extern "C" fn(*mut c_void, *mut *const spa_pod, u32) -> c_int
+        = b"pw_stream_update_params\0",
     pw_stream_disconnect: unsafe extern "C" fn(*mut c_void) -> c_int = b"pw_stream_disconnect\0",
     pw_stream_dequeue_buffer:
         unsafe extern "C" fn(*mut c_void) -> *mut pw_buffer = b"pw_stream_dequeue_buffer\0",
@@ -351,42 +374,93 @@ impl Library {
     /// package name for the common distributions. This is a first-class outcome
     /// rather than an exceptional one: plenty of machines that run Scrozz
     /// perfectly well over X11 have no PipeWire at all.
-    pub fn open() -> Result<Self, Error> {
+    pub fn open() -> Result<&'static Self, Error> {
+        static PIPEWIRE: OnceLock<Library> = OnceLock::new();
+        static LOAD_GATE: Mutex<()> = Mutex::new(());
+
+        if let Some(library) = PIPEWIRE.get() {
+            return Ok(library);
+        }
+
+        // `OnceLock::get_or_init` would also cache a failed dlopen, making the
+        // remediation in the returned error ineffective until process restart.
+        // Serialise cold attempts, re-check after acquiring the gate, and publish
+        // only a successfully initialized mapping.
+        let _load = LOAD_GATE.lock().map_err(|_| {
+            Error::Platform("the process-wide PipeWire loader gate was poisoned".into())
+        })?;
+        if let Some(library) = PIPEWIRE.get() {
+            return Ok(library);
+        }
+
+        let loaded = Self::load().map_err(|failure| failure.to_error())?;
+        if PIPEWIRE.set(loaded).is_err() {
+            return PIPEWIRE.get().ok_or_else(|| {
+                Error::Platform(
+                    "PipeWire initialized but its library mapping was not retained".into(),
+                )
+            });
+        }
+        PIPEWIRE.get().ok_or_else(|| {
+            Error::Platform("PipeWire initialized but its library mapping was not retained".into())
+        })
+    }
+
+    fn load() -> Result<Self, LoadFailure> {
         // The versioned soname first: it is what a runtime package installs,
         // and the unversioned symlink exists only with the -dev package.
         let mut last = String::new();
         for name in [LIBRARY_SONAME, LIBRARY_DEV_NAME] {
             match unsafe { libloading::Library::new(name) } {
                 Ok(library) => {
-                    let symbols = unsafe { Symbols::resolve(&library) }.map_err(|why| {
-                        Error::Unsupported {
-                            what: "capturing on Wayland".into(),
-                            why: format!(
-                                "{why}. This build needs PipeWire 0.3 or newer; the installed \
-                                 library is older than that"
-                            ),
-                        }
-                    })?;
-                    return Ok(Self {
+                    let symbols =
+                        unsafe { Symbols::resolve(&library) }.map_err(LoadFailure::TooOld)?;
+                    let loaded = Self {
                         symbols,
                         _library: library,
-                    });
+                    };
+                    // PipeWire process state and the code that owns it now share
+                    // this OnceLock lifetime. The library is never unloaded, and
+                    // `pw_init` is therefore run exactly once for that mapping.
+                    unsafe {
+                        (loaded.symbols.pw_init)(std::ptr::null_mut(), std::ptr::null_mut());
+                    }
+                    return Ok(loaded);
                 }
                 Err(err) => last = err.to_string(),
             }
         }
 
-        Err(Error::Unsupported {
-            what: "capturing on Wayland".into(),
-            why: format!(
+        Err(LoadFailure::Missing(last))
+    }
+}
+
+#[derive(Debug)]
+enum LoadFailure {
+    Missing(String),
+    TooOld(String),
+}
+
+impl LoadFailure {
+    fn to_error(&self) -> Error {
+        let why = match self {
+            Self::Missing(detail) => format!(
                 "PipeWire is not installed, so the frames the desktop portal offers cannot be \
                  read. Wayland has no other route to screen pixels. Install it with `sudo apt \
                  install pipewire libpipewire-0.3-0` on Debian or Ubuntu, `sudo dnf install \
                  pipewire` on Fedora, or `sudo pacman -S pipewire` on Arch, and make sure the \
                  `pipewire.service` user unit is running. X11 capture is unaffected. \
-                 (dlopen said: {last})"
+                 (dlopen said: {detail})"
             ),
-        })
+            Self::TooOld(detail) => format!(
+                "{detail}. This build needs PipeWire 0.3 or newer; the installed library is older \
+                 than that"
+            ),
+        };
+        Error::Unsupported {
+            what: "capturing on Wayland".into(),
+            why,
+        }
     }
 }
 
