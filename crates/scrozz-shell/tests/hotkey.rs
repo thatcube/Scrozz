@@ -678,7 +678,7 @@ fn the_recording_entry_says_what_the_click_will_do() {
 #[test]
 fn the_generated_menu_bar_icon_is_a_well_formed_template_image() {
     let rgba = default_icon_rgba();
-    assert_eq!(rgba.len(), 50 * 50 * 4, "50x50 RGBA, displayed at 18pt");
+    assert_eq!(rgba.len(), 36 * 36 * 4, "36x36 RGBA, displayed at 18pt");
 
     let opaque = rgba
         .as_chunks::<4>()
@@ -688,7 +688,7 @@ fn the_generated_menu_bar_icon_is_a_well_formed_template_image() {
         .count();
     assert!(opaque > 0, "the icon must have some ink or nothing shows");
     assert!(
-        opaque < 50 * 50,
+        opaque < 36 * 36,
         "a fully opaque square is a solid block, not a glyph"
     );
 

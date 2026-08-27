@@ -9,7 +9,8 @@ truth. Do not edit the PNGs, the `.icns` or the `.ico` by hand — regenerate th
 | `scrozz-icon-32.svg` | Pixel-snapped Finder-list/Dock artwork |
 | `scrozz-icon-16.svg` | 16px derivative of the exact 32px master |
 | `Scrozz.icon/` | Native layered macOS 26 icon (light and dark appearances) |
-| `scrozz-menu-50.png` | Maximized monochrome menu-bar template preview |
+| `scrozz-menu.svg` | Brandon's exact 36×36 menu-bar master |
+| `scrozz-menu-36.png` | Raster preview of the menu-bar template |
 | `scrozz-mark.svg` | The bare 32px mark on a flat plate, for in-app use and favicons |
 | `Scrozz.icns` | macOS app bundle |
 | `Scrozz.ico` | Windows executable and installer |
@@ -70,14 +71,13 @@ below the first version—so it reads as ambient light rather than a visible dis
 ### Menu-bar mark
 
 The menu bar uses the logo, not a generic camera glyph. `tray-icon` fixes status
-images at 18 points regardless of input bitmap dimensions. Brandon's exact 32px
-mark is therefore doubled to 64px—preserving every pixel-grid decision—and
-cropped to a 50px canvas with one physical pixel of safety on every side.
+images at 18 points. `scrozz-menu.svg` was designed by Brandon on an exact 36×36
+frame, so it maps 2:1 to a Retina menu bar with no scaling or fractional
+placement. It intentionally reaches the canvas edges to use the whole available
+slot.
 
-The painted 48px bounds occupy **17.28 of the available 18 points**, as large as
-the slot safely permits without clipping. The RGBA source is pure black with a
-shaped alpha channel so macOS recolors it correctly for light, dark, and
-highlighted menu bars.
+The compiled RGBA source is pure black with a shaped alpha channel so macOS
+recolors it correctly for light, dark, and highlighted menu bars.
 
 ## Regenerating
 
