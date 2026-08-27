@@ -114,6 +114,24 @@ impl WgcDevice {
             .cast()
             .map_err(|e| Error::Platform(format!("not an IDirect3DDevice: {e}")))?;
 
+        // IsSupported exists on 1803, but the worker-thread capture path below
+        // requires CreateFreeThreaded from 1903. Probe the exact API here so
+        // 1803/1809 machines select the working GDI fallback up front.
+        let probe = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            1,
+            SizeInt32 {
+                Width: 1,
+                Height: 1,
+            },
+        )
+        .map_err(|e| Error::Unsupported {
+            what: "Windows.Graphics.Capture".into(),
+            why: format!("the free-threaded frame-pool API requires Windows 10 1903+: {e}"),
+        })?;
+        let _ = probe.Close();
+
         Ok(Self {
             device,
             context,

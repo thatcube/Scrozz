@@ -1,7 +1,7 @@
 //! History as the app actually uses it: insert, read back, page, search, delete.
 
 use scrozz_annotate::{Annotation, Style};
-use scrozz_core::LogicalPoint;
+use scrozz_core::{LogicalPoint, SourceApp};
 use scrozz_store::{
     DocumentState, History as _, ImageState, NewCapture, Page, SearchQuery, SqliteStore,
     Store as _, Timestamp,
@@ -17,21 +17,22 @@ fn store(label: &str) -> (ScratchDir, SqliteStore) {
 #[test]
 fn a_capture_survives_a_round_trip_through_history() {
     let (_dir, mut store) = store("round-trip");
-    let document = richly_annotated_document(7);
+    let mut document = richly_annotated_document(7);
+    document.source.source_app = SourceApp {
+        name: Some("Safari".into()),
+        identifier: Some("com.apple.Safari".into()),
+        window_title: Some("Quarterly invoice".into()),
+    };
+    document.source.window_shadow = Some(false);
     let original_pixels = document.source.frame.data.clone();
 
     let id = store
-        .insert(
-            NewCapture::new(&document)
-                .from_app("Safari")
-                .titled("Quarterly invoice")
-                .with_ocr("Total due: 1,240.00"),
-        )
+        .insert(NewCapture::new(&document).with_ocr("Total due: 1,240.00"))
         .expect("insert");
 
     let record = store.record(&id).expect("read").expect("present");
-    assert_eq!(record.app_name.as_deref(), Some("Safari"));
-    assert_eq!(record.window_title.as_deref(), Some("Quarterly invoice"));
+    assert_eq!(record.source_app, document.source.source_app);
+    assert_eq!(record.window_shadow, Some(false));
     assert_eq!(record.annotation_count, 3);
     assert!(record.image.is_present());
     assert!(!record.pinned);
@@ -46,6 +47,53 @@ fn a_capture_survives_a_round_trip_through_history() {
     );
     assert_eq!(back.annotations().len(), 3);
     assert!(back.beautification().is_some());
+    assert_eq!(back.source.source_app, document.source.source_app);
+    assert_eq!(back.source.window_shadow, Some(false));
+}
+
+#[test]
+fn source_metadata_and_every_shadow_state_round_trip_through_both_stores() {
+    let (_dir, mut store) = store("source-round-trip");
+
+    for (seed, shadow) in [(1, Some(true)), (2, Some(false)), (3, None)] {
+        let mut document = sample_document(8, 8, seed, 0);
+        document.source.source_app = SourceApp {
+            name: Some(format!("App {seed}")),
+            identifier: Some(format!("com.example.app{seed}")),
+            window_title: Some(format!("Window {seed}")),
+        };
+        document.source.window_shadow = shadow;
+
+        let id = store
+            .insert(NewCapture::new(&document))
+            .expect("insert metadata");
+        let indexed = store.record(&id).expect("read index").expect("record");
+        assert_eq!(indexed.source_app, document.source.source_app);
+        assert_eq!(indexed.window_shadow, shadow);
+        let by_identifier = store
+            .search(&SearchQuery::all().text(format!("com.example.app{seed}")))
+            .expect("search identifier");
+        assert_eq!(by_identifier.len(), 1);
+        assert_eq!(by_identifier[0].id, id);
+
+        let sidecar = store
+            .layout()
+            .read_record(&id)
+            .expect("read sidecar")
+            .expect("sidecar");
+        assert_eq!(sidecar.source_app, document.source.source_app);
+        assert_eq!(sidecar.window_shadow, shadow);
+
+        let DocumentState::Complete(loaded) = store
+            .document(&id)
+            .expect("load document")
+            .expect("document")
+        else {
+            panic!("new image must be present");
+        };
+        assert_eq!(loaded.source.source_app, document.source.source_app);
+        assert_eq!(loaded.source.window_shadow, shadow);
+    }
 }
 
 #[test]
@@ -100,8 +148,14 @@ fn history_lists_newest_first_and_pages_without_repeating() {
     let third = store.page(Page::new(5, 10)).expect("page");
     assert_eq!((first.len(), second.len(), third.len()), (5, 5, 2));
 
-    assert_eq!(first[0].window_title.as_deref(), Some("capture 11"));
-    assert_eq!(third[1].window_title.as_deref(), Some("capture 0"));
+    assert_eq!(
+        first[0].source_app.window_title.as_deref(),
+        Some("capture 11")
+    );
+    assert_eq!(
+        third[1].source_app.window_title.as_deref(),
+        Some("capture 0")
+    );
 
     let mut seen: Vec<_> = first
         .iter()
@@ -223,7 +277,10 @@ fn search_treats_sql_wildcards_as_ordinary_characters() {
         1,
         "an underscore the user typed is an underscore, not a SQL wildcard"
     );
-    assert_eq!(found[0].window_title.as_deref(), Some("report_2024"));
+    assert_eq!(
+        found[0].source_app.window_title.as_deref(),
+        Some("report_2024")
+    );
 
     let percent = store
         .search(&SearchQuery::all().titled("%"))

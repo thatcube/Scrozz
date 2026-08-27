@@ -56,8 +56,11 @@ fn assert_history_intact(store: &mut SqliteStore, ids: &[CaptureId]) {
             .record(id)
             .expect("read")
             .expect("every capture must come back");
-        assert_eq!(record.app_name.as_deref(), Some("Safari"));
-        assert_eq!(record.window_title.as_deref(), Some(&*format!("tab {n}")));
+        assert_eq!(record.source_app.name.as_deref(), Some("Safari"));
+        assert_eq!(
+            record.source_app.window_title.as_deref(),
+            Some(&*format!("tab {n}"))
+        );
         assert_eq!(record.ocr_text.as_deref(), Some(&*format!("body text {n}")));
         assert_eq!(record.annotation_count, 2, "the edits came back too");
         assert!(record.image.is_present(), "and so did the pixels");
@@ -229,7 +232,7 @@ fn a_record_written_before_the_commit_landed_is_adopted_on_the_next_open() {
         .record(&orphan_id)
         .expect("read")
         .expect("the orphan must be adopted");
-    assert_eq!(adopted.window_title, record.window_title);
+    assert_eq!(adopted.source_app, record.source_app);
     assert!(adopted.annotation_count >= 3);
     assert!(store.record(&known).expect("read").is_some());
 
@@ -395,6 +398,7 @@ fn a_rebuilt_store_is_immediately_writable_again() {
             .record(&fresh)
             .expect("read")
             .expect("present")
+            .source_app
             .window_title
             .as_deref(),
         Some("after the crash")

@@ -252,7 +252,7 @@ impl Setting {
 
 use Section::{
     Annotation, Capture, Clipboard, History, Ocr, Onboarding, QuickAccess, Recording, Shortcuts,
-    System, Updates,
+    System,
 };
 
 const CAPTURE_REGION_HOTKEY: &str = if cfg!(target_os = "macos") {

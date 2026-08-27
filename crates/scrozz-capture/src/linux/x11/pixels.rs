@@ -10,7 +10,26 @@
 //!
 //! All of it is arithmetic on numbers, so all of it is tested on any platform.
 
-use scrozz_core::PixelFormat;
+use scrozz_core::{PixelFormat, ShadowSupport, WindowPickingCapability};
+
+/// Interactive window fidelity guaranteed by the X11 `GetImage` path.
+///
+/// Compositor shadows live in the root image, outside the window drawable, and
+/// ordinary frame visuals are depth 24 with an undefined fourth byte that this
+/// module correctly forces opaque. Some ARGB client visuals happen to preserve
+/// alpha, but the backend cannot promise that for a decorated window, so the
+/// backend-level capability is deliberately conservative.
+#[must_use]
+pub fn window_picking_capability() -> WindowPickingCapability {
+    WindowPickingCapability::in_process(
+        ShadowSupport::AlwaysExcluded {
+            why: "X11 compositor shadows are separate root-window pixels; including one would \
+                  require guessing its bounds and compositing it back onto the window"
+                .to_owned(),
+        },
+        false,
+    )
+}
 
 /// Bytes per row for a ZPixmap image.
 ///
@@ -192,4 +211,21 @@ pub fn repack(
 #[must_use]
 pub const fn all_planes() -> u32 {
     u32::MAX
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_picking_capability;
+    use scrozz_core::{ShadowSupport, WindowSelection};
+
+    #[test]
+    fn x11_picker_reports_only_output_the_get_image_path_guarantees() {
+        let capability = window_picking_capability();
+        assert_eq!(capability.selection, WindowSelection::InProcess);
+        assert!(matches!(
+            capability.shadow,
+            ShadowSupport::AlwaysExcluded { .. }
+        ));
+        assert!(!capability.native_alpha);
+    }
 }

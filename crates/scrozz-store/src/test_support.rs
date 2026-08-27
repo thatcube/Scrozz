@@ -21,7 +21,7 @@ use std::{
 use scrozz_annotate::{Annotation, Background, Beautification, Document, Style};
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, DisplayId, Frame, LogicalPoint, LogicalRect, LogicalSize,
-    PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
+    PhysicalSize, PixelFormat, Provenance, ScaleFactor, SourceApp, WindowId,
 };
 
 use crate::{
@@ -117,21 +117,21 @@ pub fn sample_frame(width: u32, height: u32, seed: u8) -> Frame {
 /// A window capture of the given size and content.
 #[must_use]
 pub fn sample_capture(width: u32, height: u32, seed: u8) -> Capture {
-    Capture {
-        frame: sample_frame(width, height, seed),
-        provenance: Provenance::Window,
-        target: CaptureTarget::Window(WindowId(format!("window-{seed}"))),
-    }
+    Capture::new(
+        sample_frame(width, height, seed),
+        Provenance::Window,
+        CaptureTarget::Window(WindowId(format!("window-{seed}"))),
+    )
 }
 
 /// A display capture, which unlike a window capture may be beautified.
 #[must_use]
 pub fn sample_display_capture(width: u32, height: u32, seed: u8) -> Capture {
-    Capture {
-        frame: sample_frame(width, height, seed),
-        provenance: Provenance::Display,
-        target: CaptureTarget::Display(DisplayId("built-in".into())),
-    }
+    Capture::new(
+        sample_frame(width, height, seed),
+        Provenance::Display,
+        CaptureTarget::Display(DisplayId("built-in".into())),
+    )
 }
 
 /// A document with `annotations` arrows on a `width` × `height` capture.
@@ -190,8 +190,12 @@ pub fn sample_record(app: &str, created_at: i64) -> StoredRecord {
         Timestamp(created_at),
         Timestamp(created_at),
         false,
-        Some(app.to_owned()),
-        Some(format!("{app} — window")),
+        SourceApp {
+            name: Some(app.to_owned()),
+            identifier: None,
+            window_title: Some(format!("{app} — window")),
+        },
+        None,
         Provenance::Window,
         &CaptureTarget::Window(WindowId("1".into())),
         FrameHeader {

@@ -28,7 +28,7 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_core::Frame;
+use scrozz_core::{Frame, SourceApp};
 use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
@@ -215,6 +215,8 @@ pub struct Card {
     pub source_height: u32,
     /// Pixels per point of the display it came from.
     pub scale: f64,
+    /// Application and window metadata captured with the pixels.
+    pub source_app: SourceApp,
     /// What to draw, if the pixels are available.
     pub thumbnail: Option<Thumbnail>,
     /// Where the capture was written, if anywhere.
@@ -234,6 +236,7 @@ impl Card {
             source_width: 0,
             source_height: 0,
             scale: 1.0,
+            source_app: SourceApp::default(),
             thumbnail: None,
             written: Vec::new(),
             taken_at: SystemTime::now(),
@@ -253,6 +256,10 @@ impl Card {
         if !self.written.is_empty() {
             text.push_str(" → ");
             text.push_str(&self.written.join(", "));
+        }
+        if let Some(source) = self.source_app.badge() {
+            text.push_str(" from ");
+            text.push_str(source);
         }
         text
     }
@@ -279,6 +286,12 @@ impl Card {
                     .map(|name| name.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| self.kind.label().to_owned())
+    }
+
+    /// The application label shown with window captures.
+    #[must_use]
+    pub fn source_badge(&self) -> Option<&str> {
+        self.source_app.badge()
     }
 }
 

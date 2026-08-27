@@ -22,8 +22,8 @@
 //! what it could not decode.
 
 use scrozz_annotate::DocumentData;
-use scrozz_core::{CaptureTarget, Error, Provenance, Result};
-use serde::{Deserialize, Serialize};
+use scrozz_core::{CaptureTarget, Error, Provenance, Result, SourceApp};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     CaptureId,
@@ -35,7 +35,7 @@ use crate::{
 pub const RECORD_FORMAT: u32 = 1;
 
 /// Everything persisted about one capture except its pixels.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StoredRecord {
     /// Sidecar format version.
     #[serde(default = "default_format")]
@@ -50,12 +50,12 @@ pub struct StoredRecord {
     /// Exempt from eviction.
     #[serde(default)]
     pub pinned: bool,
-    /// Owning application.
+    /// Application and window metadata captured with the pixels.
     #[serde(default)]
-    pub app_name: Option<String>,
-    /// Window title.
+    pub source_app: SourceApp,
+    /// Whether the captured window pixels include their native shadow.
     #[serde(default)]
-    pub window_title: Option<String>,
+    pub window_shadow: Option<bool>,
     /// How the capture was produced.
     pub provenance: ProvenanceRepr,
     /// What it was aimed at.
@@ -102,8 +102,8 @@ impl StoredRecord {
         created_at: Timestamp,
         stored_at: Timestamp,
         pinned: bool,
-        app_name: Option<String>,
-        window_title: Option<String>,
+        source_app: SourceApp,
+        window_shadow: Option<bool>,
         provenance: Provenance,
         target: &CaptureTarget,
         frame: FrameHeader,
@@ -118,8 +118,8 @@ impl StoredRecord {
             created_at: created_at.0,
             stored_at: stored_at.0,
             pinned,
-            app_name,
-            window_title,
+            source_app,
+            window_shadow,
             provenance: provenance.into(),
             target: TargetRepr::from(target),
             frame,
@@ -200,8 +200,8 @@ impl StoredRecord {
             id: CaptureId(self.id.clone()),
             created_at: Timestamp(self.created_at),
             pinned: self.pinned,
-            app_name: self.app_name.clone(),
-            window_title: self.window_title.clone(),
+            source_app: self.source_app.clone(),
+            window_shadow: self.window_shadow,
             provenance: self.provenance.into(),
             target: self.target.clone().into(),
             frame: self.frame.clone(),
@@ -219,8 +219,9 @@ impl StoredRecord {
     pub fn search_text(&self) -> String {
         let mut haystack = String::new();
         for part in [
-            self.app_name.as_deref(),
-            self.window_title.as_deref(),
+            self.source_app.name.as_deref(),
+            self.source_app.identifier.as_deref(),
+            self.source_app.window_title.as_deref(),
             self.ocr_text.as_deref(),
         ]
         .into_iter()
@@ -260,6 +261,72 @@ impl StoredRecord {
     }
 }
 
+#[derive(Deserialize)]
+struct StoredRecordWire {
+    #[serde(default = "default_format")]
+    format: u32,
+    id: String,
+    created_at: i64,
+    #[serde(default)]
+    stored_at: i64,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    source_app: Option<SourceApp>,
+    #[serde(default)]
+    window_shadow: Option<bool>,
+    #[serde(default)]
+    app_name: Option<String>,
+    #[serde(default)]
+    window_title: Option<String>,
+    provenance: ProvenanceRepr,
+    target: TargetRepr,
+    frame: FrameHeader,
+    #[serde(default)]
+    image_hash: Option<String>,
+    #[serde(default)]
+    image_bytes: u64,
+    #[serde(default)]
+    image_evicted_at: Option<i64>,
+    #[serde(default)]
+    ocr_text: Option<String>,
+    #[serde(default = "empty_document")]
+    document: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for StoredRecord {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StoredRecordWire::deserialize(deserializer)?;
+        let mut source_app = wire.source_app.unwrap_or_default();
+        if source_app.name.is_none() {
+            source_app.name = wire.app_name;
+        }
+        if source_app.window_title.is_none() {
+            source_app.window_title = wire.window_title;
+        }
+        Ok(Self {
+            format: wire.format,
+            id: wire.id,
+            created_at: wire.created_at,
+            stored_at: wire.stored_at,
+            pinned: wire.pinned,
+            source_app,
+            window_shadow: wire.window_shadow,
+            provenance: wire.provenance,
+            target: wire.target,
+            frame: wire.frame,
+            image_hash: wire.image_hash,
+            image_bytes: wire.image_bytes,
+            image_evicted_at: wire.image_evicted_at,
+            ocr_text: wire.ocr_text,
+            document: wire.document,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use scrozz_annotate::{Annotation, Background, Beautification, Document, Style};
@@ -281,8 +348,8 @@ mod tests {
     }
 
     fn document_data() -> DocumentData {
-        let mut document = Document::new(Capture {
-            frame: Frame {
+        let mut document = Document::new(Capture::new(
+            Frame {
                 data: vec![0; 128],
                 size: PhysicalSize::new(8.0, 4.0),
                 stride: 32,
@@ -290,9 +357,9 @@ mod tests {
                 color_space: ColorSpace::DisplayP3,
                 scale: ScaleFactor::new(2.0),
             },
-            provenance: Provenance::Region,
-            target: CaptureTarget::AllDisplays,
-        });
+            Provenance::Region,
+            CaptureTarget::AllDisplays,
+        ));
         document.add(
             Annotation::Rectangle(LogicalRect::new(
                 LogicalPoint::new(1.0, 1.0),
@@ -312,8 +379,12 @@ mod tests {
             Timestamp(1_700_000_000_000),
             Timestamp(1_700_000_000_001),
             false,
-            Some("Safari".into()),
-            Some("Invoice".into()),
+            SourceApp {
+                name: Some("Safari".into()),
+                identifier: Some("com.apple.Safari".into()),
+                window_title: Some("Invoice".into()),
+            },
+            Some(false),
             Provenance::Region,
             &CaptureTarget::Display(DisplayId("main".into())),
             header(),
@@ -364,7 +435,7 @@ mod tests {
         let bytes = drifted.to_json().expect("encode");
         let back = StoredRecord::from_json(&bytes).expect("record still decodes");
 
-        assert_eq!(back.app_name.as_deref(), Some("Safari"));
+        assert_eq!(back.source_app.name.as_deref(), Some("Safari"));
         assert_eq!(
             back.annotation_count(),
             1,
@@ -375,7 +446,7 @@ mod tests {
             "the unreadable annotation should surface as an error, not a panic"
         );
         assert_eq!(
-            back.to_capture_record().window_title.as_deref(),
+            back.to_capture_record().source_app.window_title.as_deref(),
             Some("Invoice")
         );
     }
@@ -412,7 +483,7 @@ mod tests {
     #[test]
     fn search_text_folds_non_ascii_case() {
         let mut record = record();
-        record.window_title = Some("PRÄSENTATION".into());
+        record.source_app.window_title = Some("PRÄSENTATION".into());
         assert!(record.search_text().contains("präsentation"));
     }
 
@@ -436,9 +507,37 @@ mod tests {
         assert_eq!(record.annotation_count(), 0);
         assert_eq!(record.image_state(), ImageState::Absent);
         assert!(!record.pinned);
+        assert_eq!(record.source_app, SourceApp::default());
+        assert_eq!(record.window_shadow, None);
         assert!(
             record.document_data().is_ok(),
             "a record with no document should still yield an empty one"
         );
+    }
+
+    #[test]
+    fn old_sidecars_preserve_legacy_names_and_default_new_metadata() {
+        let old = serde_json::json!({
+            "format": 1,
+            "id": "01OLD",
+            "created_at": 1,
+            "app_name": "Safari",
+            "window_title": "Invoice",
+            "provenance": "window",
+            "target": { "kind": "all_displays" },
+            "frame": {
+                "size": { "width": 4.0, "height": 4.0 },
+                "stride": 16,
+                "format": "Rgba8",
+                "color_space": "Srgb",
+                "scale": 1.0
+            }
+        });
+        let record = StoredRecord::from_json(&serde_json::to_vec(&old).expect("encode"))
+            .expect("decode old sidecar");
+        assert_eq!(record.source_app.name.as_deref(), Some("Safari"));
+        assert_eq!(record.source_app.window_title.as_deref(), Some("Invoice"));
+        assert_eq!(record.source_app.identifier, None);
+        assert_eq!(record.window_shadow, None);
     }
 }

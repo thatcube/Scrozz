@@ -7,9 +7,9 @@
 
 use rusqlite::Connection;
 use scrozz_store::{
-    History as _, NewCapture, SqliteStore, Store as _, Timestamp,
+    SqliteStore,
     schema::{MIGRATIONS, Migration, latest_version, migrate, schema_version},
-    test_support::{sample_document, scratch_dir},
+    test_support::scratch_dir,
 };
 
 #[test]
@@ -53,58 +53,40 @@ fn the_ladder_has_no_gaps_duplicates_or_backward_steps() {
 
 #[test]
 fn an_old_database_climbs_forward_with_every_row_intact() {
-    // Stand up a database at rung 1 only — the shape an older build left behind —
-    // then put real rows in it before letting the current build migrate it.
-    let dir = scratch_dir("old-database");
-    let mut store = SqliteStore::open(dir.path()).expect("open");
-    let base = 1_700_000_000_000;
-    let ids: Vec<_> = (0..4)
-        .map(|i| {
-            let document = sample_document(8, 8, i, 1);
-            store
-                .insert(
-                    NewCapture::new(&document)
-                        .taken_at(Timestamp(base + i64::from(i)))
-                        .from_app("Xcode")
-                        .titled(format!("window {i}")),
-                )
-                .expect("insert")
-        })
-        .collect();
-    store.set_pinned(&ids[0], true).expect("pin");
-    let current = store.schema_version().expect("version");
-    let index = store.layout().index_path();
-    drop(store);
+    let mut conn = Connection::open_in_memory().expect("memory database");
+    migrate(&mut conn, &MIGRATIONS[..1]).expect("create v1 database");
+    conn.execute(
+        "INSERT INTO captures (
+             id, created_at, stored_at, pinned, app_name, window_title, provenance,
+             target_json, frame_json, image_bytes, annotation_count
+         ) VALUES (
+             'old', 1700000000000, 1700000000001, 1, 'Xcode', 'window 0',
+             'window', '{}', '{}', 1024, 1
+         )",
+        [],
+    )
+    .expect("insert old row");
 
-    // Wind the recorded version backwards. The tables are already current, so a
-    // correct migration ladder must be safe to re-apply; an incorrect one that
-    // does `CREATE TABLE` without `IF NOT EXISTS` fails loudly right here.
-    let conn = Connection::open(&index).expect("raw open");
-    conn.pragma_update(None, "user_version", 0).expect("rewind");
-    drop(conn);
-
-    let store = SqliteStore::open(dir.path()).expect("reopen migrates");
-
-    assert_eq!(store.schema_version().expect("version"), current);
-    assert_eq!(store.count().expect("count"), 4, "no history was lost");
-    for (i, id) in ids.iter().enumerate() {
-        let record = store.record(id).expect("read").expect("present");
-        assert_eq!(
-            record.window_title.as_deref(),
-            Some(&*format!("window {i}"))
-        );
-        assert_eq!(record.app_name.as_deref(), Some("Xcode"));
-        assert_eq!(record.annotation_count, 1);
-        assert!(record.image.is_present());
-    }
-    assert!(
-        store
-            .record(&ids[0])
-            .expect("read")
-            .expect("present")
-            .pinned,
-        "a pin set by the old build survives the upgrade"
-    );
+    assert_eq!(migrate(&mut conn, MIGRATIONS).expect("upgrade"), 2);
+    let row: (i64, String, String, i64, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT pinned, app_name, window_title, annotation_count,
+                    app_identifier, window_shadow
+             FROM captures WHERE id = 'old'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("old row survives");
+    assert_eq!(row, (1, "Xcode".into(), "window 0".into(), 1, None, None));
 }
 
 #[test]

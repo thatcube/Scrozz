@@ -151,8 +151,8 @@ fn an_evicted_capture_still_lists_with_its_edits_intact() {
     assert!(store.list().expect("list").contains(&old));
 
     let record = store.record(&old).expect("read").expect("still listed");
-    assert_eq!(record.app_name.as_deref(), Some("Mail"));
-    assert_eq!(record.window_title.as_deref(), Some("Contract"));
+    assert_eq!(record.source_app.name.as_deref(), Some("Mail"));
+    assert_eq!(record.source_app.window_title.as_deref(), Some("Contract"));
     assert_eq!(record.ocr_text.as_deref(), Some("Signature required"));
     assert_eq!(
         record.annotation_count, 2,

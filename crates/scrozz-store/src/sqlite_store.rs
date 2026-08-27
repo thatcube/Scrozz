@@ -6,7 +6,7 @@ use rusqlite::{
     Connection, OptionalExtension as _, Row, ToSql, TransactionBehavior, params, params_from_iter,
 };
 use scrozz_annotate::{AnnotationObject, Document, DocumentData};
-use scrozz_core::{Capture, Error, Frame, Result};
+use scrozz_core::{Capture, Error, Frame, Result, SourceApp};
 
 use crate::{
     CaptureId, RetentionPolicy, Store, db, hash,
@@ -21,26 +21,24 @@ use crate::{
 };
 
 /// Columns every record query selects, in the order [`row_to_record`] reads.
-const RECORD_COLUMNS: &str = "id, created_at, pinned, app_name, window_title, provenance, \
-     target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text, \
-     annotation_count";
+const RECORD_COLUMNS: &str = "id, created_at, pinned, app_name, app_identifier, window_title, \
+     window_shadow, provenance, target_json, frame_json, image_hash, image_bytes, \
+     image_evicted_at, ocr_text, annotation_count";
 
 /// A capture on its way into history.
 ///
-/// Metadata the platform knows but the document does not — which application
-/// owned the window, what its title was — arrives here rather than being dug
-/// out of the capture, because on Wayland there may be no title at all and the
-/// store must not care.
+/// Capture metadata is copied from the document by [`NewCapture::new`], so
+/// callers cannot accidentally drop information collected by the backend.
 #[derive(Debug, Clone)]
 pub struct NewCapture<'a> {
     /// The document to persist. Its source pixels become the stored image.
     pub document: &'a Document,
     /// When the capture was taken. Defaults to now.
     pub created_at: Timestamp,
-    /// Owning application, if known.
-    pub app_name: Option<String>,
-    /// Window title, if known.
-    pub window_title: Option<String>,
+    /// Application and window metadata captured with the pixels.
+    pub source_app: SourceApp,
+    /// Whether the captured window pixels include their native shadow.
+    pub window_shadow: Option<bool>,
     /// Recognised text, if OCR has already run.
     pub ocr_text: Option<String>,
     /// Whether to pin it immediately, exempting it from eviction.
@@ -48,14 +46,14 @@ pub struct NewCapture<'a> {
 }
 
 impl<'a> NewCapture<'a> {
-    /// A capture of `document`, taken now, with no platform metadata.
+    /// A capture of `document`, taken now, including its source metadata.
     #[must_use]
     pub fn new(document: &'a Document) -> Self {
         Self {
             document,
             created_at: Timestamp::now(),
-            app_name: None,
-            window_title: None,
+            source_app: document.source.source_app.clone(),
+            window_shadow: document.source.window_shadow,
             ocr_text: None,
             pinned: false,
         }
@@ -64,14 +62,28 @@ impl<'a> NewCapture<'a> {
     /// Records the owning application.
     #[must_use]
     pub fn from_app(mut self, app: impl Into<String>) -> Self {
-        self.app_name = Some(app.into());
+        self.source_app.name = Some(app.into());
         self
     }
 
     /// Records the window title.
     #[must_use]
     pub fn titled(mut self, title: impl Into<String>) -> Self {
-        self.window_title = Some(title.into());
+        self.source_app.window_title = Some(title.into());
+        self
+    }
+
+    /// Overrides all source-application metadata, for imports.
+    #[must_use]
+    pub fn with_source_app(mut self, source_app: SourceApp) -> Self {
+        self.source_app = source_app;
+        self
+    }
+
+    /// Overrides the resolved native-window-shadow state, for imports.
+    #[must_use]
+    pub const fn with_window_shadow(mut self, window_shadow: Option<bool>) -> Self {
+        self.window_shadow = window_shadow;
         self
     }
 
@@ -661,8 +673,8 @@ impl History for SqliteStore {
             capture.created_at,
             now,
             capture.pinned,
-            capture.app_name,
-            capture.window_title,
+            capture.source_app,
+            capture.window_shadow,
             capture.document.source.provenance,
             &capture.document.source.target,
             FrameHeader::of(frame),
@@ -737,8 +749,8 @@ impl History for SqliteStore {
         };
 
         let header = &record.frame;
-        let capture = Capture {
-            frame: Frame {
+        let mut capture = Capture::new(
+            Frame {
                 data: pixels,
                 size: header.size,
                 stride: header.stride,
@@ -746,9 +758,13 @@ impl History for SqliteStore {
                 color_space: header.color_space,
                 scale: header.scale,
             },
-            provenance: record.provenance.into(),
-            target: record.target.clone().into(),
-        };
+            record.provenance.into(),
+            record.target.clone().into(),
+        )
+        .with_source_app(record.source_app.clone());
+        if let Some(window_shadow) = record.window_shadow {
+            capture = capture.with_window_shadow(window_shadow);
+        }
         Ok(Some(DocumentState::Complete(Document::from_data(
             capture, data,
         )?)))
@@ -1027,18 +1043,22 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
 
     conn.execute(
         "INSERT INTO captures (
-             id, created_at, stored_at, pinned, app_name, window_title, provenance,
-             target_json, frame_json, image_hash, image_bytes, image_evicted_at,
-             ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold
+             id, created_at, stored_at, pinned, app_name, app_identifier, window_title,
+             window_shadow, provenance, target_json, frame_json, image_hash, image_bytes,
+             image_evicted_at, ocr_text, annotation_count, search_fold, app_fold,
+             title_fold, ocr_fold
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+             ?16, ?17, ?18, ?19, ?20
          )
          ON CONFLICT (id) DO UPDATE SET
              created_at = excluded.created_at,
              stored_at = excluded.stored_at,
              pinned = excluded.pinned,
              app_name = excluded.app_name,
+             app_identifier = excluded.app_identifier,
              window_title = excluded.window_title,
+             window_shadow = excluded.window_shadow,
              provenance = excluded.provenance,
              target_json = excluded.target_json,
              frame_json = excluded.frame_json,
@@ -1056,8 +1076,10 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
             record.created_at,
             record.stored_at,
             i64::from(record.pinned),
-            record.app_name,
-            record.window_title,
+            record.source_app.name,
+            record.source_app.identifier,
+            record.source_app.window_title,
+            record.window_shadow.map(i64::from),
             record.provenance.as_token(),
             target_json,
             frame_json,
@@ -1067,8 +1089,12 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
             record.ocr_text,
             i64::try_from(record.annotation_count()).unwrap_or(i64::MAX),
             record.search_text(),
-            record.app_name.as_ref().map(|t| t.to_lowercase()),
-            record.window_title.as_ref().map(|t| t.to_lowercase()),
+            record.source_app.name.as_ref().map(|t| t.to_lowercase()),
+            record
+                .source_app
+                .window_title
+                .as_ref()
+                .map(|t| t.to_lowercase()),
             record.ocr_text.as_ref().map(|t| t.to_lowercase()),
         ],
     )
@@ -1185,15 +1211,17 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let created_at: i64 = get(row, 1)?;
     let pinned: i64 = get(row, 2)?;
     let app_name: Option<String> = get(row, 3)?;
-    let window_title: Option<String> = get(row, 4)?;
-    let provenance: String = get(row, 5)?;
-    let target_json: String = get(row, 6)?;
-    let frame_json: String = get(row, 7)?;
-    let image_hash: Option<String> = get(row, 8)?;
-    let image_bytes: i64 = get(row, 9)?;
-    let image_evicted_at: Option<i64> = get(row, 10)?;
-    let ocr_text: Option<String> = get(row, 11)?;
-    let annotation_count: i64 = get(row, 12)?;
+    let app_identifier: Option<String> = get(row, 4)?;
+    let window_title: Option<String> = get(row, 5)?;
+    let window_shadow: Option<i64> = get(row, 6)?;
+    let provenance: String = get(row, 7)?;
+    let target_json: String = get(row, 8)?;
+    let frame_json: String = get(row, 9)?;
+    let image_hash: Option<String> = get(row, 10)?;
+    let image_bytes: i64 = get(row, 11)?;
+    let image_evicted_at: Option<i64> = get(row, 12)?;
+    let ocr_text: Option<String> = get(row, 13)?;
+    let annotation_count: i64 = get(row, 14)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
@@ -1220,8 +1248,12 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         id: CaptureId(id),
         created_at: Timestamp(created_at),
         pinned: pinned != 0,
-        app_name,
-        window_title,
+        source_app: SourceApp {
+            name: app_name,
+            identifier: app_identifier,
+            window_title,
+        },
+        window_shadow: window_shadow.map(|value| value != 0),
         provenance: ProvenanceRepr::from_token(&provenance)?.into(),
         target: target.into(),
         frame,

@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scrozz_core::{
     CaptureTarget, ColorSpace, DisplayId, Error, LogicalRect, PhysicalSize, PixelFormat,
-    Provenance, Result, ScaleFactor, WindowId,
+    Provenance, Result, ScaleFactor, SourceApp, WindowId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,10 +161,10 @@ pub struct CaptureRecord {
     pub created_at: Timestamp,
     /// Exempt from eviction. Decision D23: pinned captures are never evicted.
     pub pinned: bool,
-    /// Owning application, where the platform reported one.
-    pub app_name: Option<String>,
-    /// Window title, where the platform reported one.
-    pub window_title: Option<String>,
+    /// Application and window metadata captured with the pixels.
+    pub source_app: SourceApp,
+    /// Whether the captured window pixels include their native shadow.
+    pub window_shadow: Option<bool>,
     /// How the capture was produced.
     pub provenance: Provenance,
     /// What it was aimed at.

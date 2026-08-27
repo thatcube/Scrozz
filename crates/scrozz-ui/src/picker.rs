@@ -61,6 +61,7 @@ pub mod paint;
 use scrozz_core::{
     Display, DisplayId, LogicalPoint, LogicalRect, ScaleFactor, SourceApp, Window, WindowId,
 };
+use std::sync::{Arc, Mutex};
 
 /// What the picker is currently pointing at.
 #[derive(Debug, Clone, PartialEq)]
@@ -175,7 +176,6 @@ impl WindowPicker {
     /// Excludes Scrozz's own windows, anything not currently on screen, and
     /// anything with no area — all three of which are present in real window
     /// lists and none of which can be hovered.
-    #[must_use]
     pub fn candidates(&self) -> impl Iterator<Item = &Window> {
         self.windows.iter().filter(move |window| {
             window.is_visible && !window.bounds.is_empty() && !self.excluded.contains(&window.id)
@@ -203,6 +203,9 @@ impl WindowPicker {
     /// Returns `true` when the focused window changed, so a caller can repaint
     /// only when something moved rather than every mouse event.
     pub fn point_at(&mut self, position: LogicalPoint) -> bool {
+        if self.pointer == Some(position) {
+            return false;
+        }
         self.pointer = Some(position);
         let hit = self.window_at(position).map(|window| window.id.clone());
         let changed = hit != self.focused;
@@ -316,6 +319,9 @@ impl WindowPicker {
         self.windows = windows;
 
         if let Some(pointer) = self.pointer {
+            // Force a fresh hit-test even though the physical pointer did not
+            // move: the windows underneath it may have.
+            self.pointer = None;
             self.point_at(pointer);
             return;
         }
@@ -361,6 +367,16 @@ impl WindowPicker {
     #[must_use]
     pub fn displays(&self) -> &[Display] {
         &self.displays
+    }
+
+    /// The smallest global logical rectangle containing every connected display.
+    ///
+    /// This is the single picker window's geometry on platforms with one global
+    /// logical coordinate transform. Windows uses one native viewport per display
+    /// instead because mixed DPI makes that transform discontinuous.
+    #[must_use]
+    pub fn desktop_bounds(&self) -> LogicalRect {
+        desktop_bounds(&self.displays)
     }
 
     /// The scale a window will be captured at, and whether it straddles.
@@ -422,6 +438,308 @@ fn overlap_area(a: LogicalRect, b: LogicalRect) -> f64 {
     ((right - left).max(0.0)) * ((bottom - top).max(0.0))
 }
 
+/// The smallest global logical rectangle containing `displays`.
+///
+/// Falls back to a useful desktop-sized rectangle when enumeration returned no
+/// usable bounds. The picker can then render its "no visible windows" state
+/// rather than asking a windowing library to create a zero-sized window.
+#[must_use]
+pub fn desktop_bounds(displays: &[Display]) -> LogicalRect {
+    let mut usable = displays
+        .iter()
+        .map(|display| display.bounds)
+        .filter(|bounds| !bounds.is_empty());
+    let Some(first) = usable.next() else {
+        return LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            scrozz_core::LogicalSize::new(1440.0, 900.0),
+        );
+    };
+
+    let mut left = first.origin.x;
+    let mut top = first.origin.y;
+    let mut right = first.origin.x + first.size.width;
+    let mut bottom = first.origin.y + first.size.height;
+    for bounds in usable {
+        left = left.min(bounds.origin.x);
+        top = top.min(bounds.origin.y);
+        right = right.max(bounds.origin.x + bounds.size.width);
+        bottom = bottom.max(bounds.origin.y + bounds.size.height);
+    }
+
+    LogicalRect::new(
+        LogicalPoint::new(left, top),
+        scrozz_core::LogicalSize::new(right - left, bottom - top),
+    )
+}
+
+/// A native viewport covering the full logical desktop for window selection.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn viewport(bounds: LogicalRect) -> egui::ViewportBuilder {
+    base_viewport()
+        .with_position(egui::pos2(bounds.origin.x as f32, bounds.origin.y as f32))
+        .with_inner_size(egui::vec2(
+            bounds.size.width as f32,
+            bounds.size.height as f32,
+        ))
+}
+
+fn base_viewport() -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Choose a window")
+        .with_app_id("com.scrozz.window-picker")
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_transparent(true)
+        .with_has_shadow(false)
+        .with_taskbar(false)
+        .with_window_level(egui::WindowLevel::AlwaysOnTop)
+        .with_active(true);
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    let builder = builder
+        .with_window_type(egui::X11WindowType::Dock)
+        .with_override_redirect(true);
+
+    builder
+}
+
+/// One monitor-sized native picker viewport.
+///
+/// Windows needs one viewport per monitor because its mixed-DPI desktop has no
+/// single logical coordinate transform. `with_monitor` lets winit place each
+/// borderless surface directly in the monitor's real pixel space.
+#[must_use]
+pub fn display_viewport(index: usize) -> egui::ViewportBuilder {
+    base_viewport().with_monitor(index)
+}
+
+/// Stable identity for one monitor's picker viewport.
+#[must_use]
+pub fn display_viewport_id(display: &Display) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("scrozz.window-picker", &display.id.0))
+}
+
+/// Stable identity for the single-desktop picker viewport.
+#[must_use]
+pub fn viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("scrozz.window-picker")
+}
+
+/// Shows one picker surface per display and combines their input.
+///
+/// This is used on Windows, where each monitor can have a different native
+/// scale and therefore cannot share one correctly mapped logical viewport.
+pub fn interact_display_viewports(
+    root: &egui::Context,
+    picker: &mut WindowPicker,
+    theme: &crate::Theme,
+    notice: Option<&str>,
+) -> (paint::Intent, bool) {
+    let displays = picker.displays.clone();
+    let mut combined = paint::Intent::None;
+    let mut close_requested = false;
+
+    for (index, display) in displays.iter().enumerate() {
+        let mut intent = paint::Intent::None;
+        root.show_viewport_immediate(
+            display_viewport_id(display),
+            display_viewport(index),
+            |ctx, _class| {
+                close_requested |= ctx.input(|input| input.viewport().close_requested());
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
+                    .show(ctx, |ui| {
+                        intent = paint::interact_display(
+                            ui,
+                            picker,
+                            display.bounds.origin,
+                            theme,
+                            notice,
+                        );
+                    });
+            },
+        );
+
+        combined = match (combined, intent) {
+            (paint::Intent::Cancel, _) | (_, paint::Intent::Cancel) => paint::Intent::Cancel,
+            (paint::Intent::Commit, _) | (_, paint::Intent::Commit) => paint::Intent::Commit,
+            _ => paint::Intent::None,
+        };
+    }
+
+    (combined, close_requested)
+}
+
+/// Closes every picker viewport that may be alive.
+pub fn close_viewports(ctx: &egui::Context, displays: &[Display]) {
+    ctx.send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Close);
+    for display in displays {
+        ctx.send_viewport_cmd_to(display_viewport_id(display), egui::ViewportCommand::Close);
+    }
+}
+
+/// Whether a window belongs to this Scrozz process.
+///
+/// Application identity is the only reliable discriminator. Window titles are
+/// deliberately ignored: a browser page titled "Scrozz" is still a perfectly
+/// valid capture target.
+#[must_use]
+pub fn is_scrozz_window(window: &Window) -> bool {
+    let application_is_scrozz = window
+        .application
+        .as_deref()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("scrozz"));
+    let identifier_is_scrozz = window.application_id.as_deref().is_some_and(|identifier| {
+        let identifier = identifier.trim().to_ascii_lowercase();
+        identifier == "scrozz"
+            || identifier == "scrozz.exe"
+            || identifier.split('.').any(|component| component == "scrozz")
+    });
+
+    application_is_scrozz || identifier_is_scrozz
+}
+
+/// Runs a standalone in-process window picker and returns the chosen id.
+///
+/// The menu-bar app embeds the same state machine in its existing eframe loop;
+/// this entry point is for `scrozz capture --interactive window` when no GUI
+/// instance is handling the command.
+///
+/// # Errors
+///
+/// Returns a platform error when the native selection window cannot open, or
+/// propagates a fresh-enumeration error encountered while committing.
+pub fn pick_window(
+    mut windows: Vec<Window>,
+    displays: Vec<Display>,
+    refresh: Arc<dyn Fn() -> scrozz_core::Result<Vec<Window>> + Send + Sync>,
+) -> scrozz_core::Result<Outcome> {
+    windows.retain(|window| !is_scrozz_window(window));
+    let result: Arc<Mutex<Option<scrozz_core::Result<Outcome>>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&result);
+    #[cfg(target_os = "windows")]
+    let host_viewport = base_viewport()
+        .with_inner_size(egui::vec2(1.0, 1.0))
+        .with_visible(false);
+    #[cfg(not(target_os = "windows"))]
+    let host_viewport = viewport(desktop_bounds(&displays));
+
+    eframe::run_native(
+        "Choose a window",
+        eframe::NativeOptions {
+            viewport: host_viewport,
+            persist_window: false,
+            ..Default::default()
+        },
+        Box::new(move |cc| {
+            crate::theme::install_fonts(&cc.egui_ctx);
+            let theme = crate::theme::Theme::dark();
+            crate::theme::install_style(&cc.egui_ctx, &theme);
+            Ok(Box::new(PickerApp {
+                picker: WindowPicker::new(windows, displays),
+                refresh,
+                result: sink,
+                theme,
+                notice: None,
+            }))
+        }),
+    )
+    .map_err(|error| {
+        scrozz_core::Error::Platform(format!("the window picker could not open: {error}"))
+    })?;
+
+    result
+        .lock()
+        .map_err(|_| scrozz_core::Error::Platform("the window picker panicked".to_owned()))?
+        .take()
+        .unwrap_or(Ok(Outcome::Cancelled))
+}
+
+struct PickerApp {
+    picker: WindowPicker,
+    refresh: Arc<dyn Fn() -> scrozz_core::Result<Vec<Window>> + Send + Sync>,
+    result: Arc<Mutex<Option<scrozz_core::Result<Outcome>>>>,
+    theme: crate::theme::Theme,
+    notice: Option<String>,
+}
+
+impl PickerApp {
+    fn finish(&self, ctx: &egui::Context, outcome: scrozz_core::Result<Outcome>) {
+        if let Ok(mut slot) = self.result.lock() {
+            *slot = Some(outcome);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn commit(&mut self, ctx: &egui::Context) {
+        let live = match (self.refresh)() {
+            Ok(mut windows) => {
+                windows.retain(|window| !is_scrozz_window(window));
+                windows
+            }
+            Err(error) => {
+                self.finish(ctx, Err(error));
+                return;
+            }
+        };
+
+        match self.picker.commit(&live) {
+            Outcome::Selected(id) => self.finish(ctx, Ok(Outcome::Selected(id))),
+            Outcome::Cancelled => self.finish(ctx, Ok(Outcome::Cancelled)),
+            Outcome::Vanished(id) => {
+                self.picker.refresh(live);
+                self.notice = Some(format!(
+                    "That window closed. Choose another window. ({})",
+                    id.0
+                ));
+            }
+        }
+    }
+}
+
+impl eframe::App for PickerApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let root_close_requested = ctx.input(|input| input.viewport().close_requested());
+
+        #[cfg(target_os = "windows")]
+        let (intent, child_close_requested) =
+            interact_display_viewports(&ctx, &mut self.picker, &self.theme, self.notice.as_deref());
+
+        #[cfg(not(target_os = "windows"))]
+        let (intent, child_close_requested) = {
+            let bounds = self.picker.desktop_bounds();
+            (
+                paint::interact(
+                    ui,
+                    &mut self.picker,
+                    bounds.origin,
+                    &self.theme,
+                    self.notice.as_deref(),
+                ),
+                false,
+            )
+        };
+
+        if root_close_requested || child_close_requested {
+            self.finish(&ctx, Ok(Outcome::Cancelled));
+            return;
+        }
+
+        match intent {
+            paint::Intent::None => {}
+            paint::Intent::Cancel => self.finish(&ctx, Ok(Outcome::Cancelled)),
+            paint::Intent::Commit => self.commit(&ctx),
+        }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +755,33 @@ mod tests {
         let mut picker = fixtures::overlapping().into_picker();
         assert!(picker.point_at(at(300.0, 300.0)));
         assert_eq!(picker.focused_id(), Some(&WindowId("front".to_owned())));
+    }
+
+    #[test]
+    fn keyboard_focus_survives_until_the_pointer_actually_moves() {
+        let mut picker = fixtures::overlapping().into_picker();
+        let pointer = at(300.0, 300.0);
+        picker.point_at(pointer);
+        let pointer_window = picker.focused_id().cloned().expect("pointer hit");
+        picker.focus_next();
+        assert_ne!(picker.focused_id(), Some(&pointer_window));
+
+        assert!(
+            !picker.point_at(pointer),
+            "a stationary pointer is not input"
+        );
+        assert_ne!(
+            picker.focused_id(),
+            Some(&pointer_window),
+            "a frame with no mouse movement must not undo Tab selection"
+        );
+
+        picker.point_at(at(301.0, 300.0));
+        assert_eq!(
+            picker.focused_id(),
+            Some(&pointer_window),
+            "real pointer movement takes focus back"
+        );
     }
 
     #[test]
@@ -463,6 +808,19 @@ mod tests {
     }
 
     #[test]
+    fn application_identity_recognises_our_windows_without_matching_titles() {
+        let fixture = fixtures::with_our_overlay();
+        assert!(is_scrozz_window(&fixture.windows[0]));
+
+        let mut foreign = fixture.windows[1].clone();
+        foreign.title = Some("Scrozz — release notes".to_owned());
+        assert!(
+            !is_scrozz_window(&foreign),
+            "a foreign window title must not make it look like our overlay"
+        );
+    }
+
+    #[test]
     fn minimised_windows_are_listed_but_not_hoverable() {
         let picker = fixtures::with_minimised().into_picker();
         // The minimised window's bounds still cover this point.
@@ -480,6 +838,14 @@ mod tests {
             picker.window_at(at(499.0, 300.0)).map(|w| w.id.clone()),
             Some(WindowId("left".to_owned()))
         );
+    }
+
+    #[test]
+    fn a_display_viewport_targets_the_native_monitor_directly() {
+        let viewport = display_viewport(2);
+        assert_eq!(viewport.monitor, Some(2));
+        assert_eq!(viewport.position, None);
+        assert_eq!(viewport.inner_size, None);
     }
 
     #[test]

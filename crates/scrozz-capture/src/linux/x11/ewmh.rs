@@ -151,14 +151,28 @@ pub fn parse_wm_class(bytes: &[u8]) -> Option<(String, String)> {
 /// `WM_CLASS` is still listed rather than dropped.
 #[must_use]
 pub fn application_name(bytes: &[u8]) -> Option<String> {
-    let (instance, class) = parse_wm_class(bytes)?;
-    if !class.is_empty() {
+    application_metadata(bytes).0
+}
+
+/// Derives display and stable identity metadata from `WM_CLASS`.
+///
+/// The class half is both the conventional application label and the stable
+/// identity X11 clients expose. The instance is only a fallback for malformed
+/// one-field properties. Neither value is derived from `WM_NAME`: window titles
+/// are localised, mutable document labels and are not application identity.
+#[must_use]
+pub fn application_metadata(bytes: &[u8]) -> (Option<String>, Option<String>) {
+    let Some((instance, class)) = parse_wm_class(bytes) else {
+        return (None, None);
+    };
+    let identity = if !class.is_empty() {
         Some(class)
-    } else if instance.is_empty() {
-        None
-    } else {
+    } else if !instance.is_empty() {
         Some(instance)
-    }
+    } else {
+        None
+    };
+    (identity.clone(), identity)
 }
 
 /// Decoration insets from `_NET_FRAME_EXTENTS`, as `(left, right, top, bottom)`.
@@ -243,4 +257,29 @@ fn trim_trailing_nuls(bytes: &[u8]) -> &[u8] {
         .rposition(|&b| b != 0)
         .map_or(0, |index| index + 1);
     &bytes[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::application_metadata;
+
+    #[test]
+    fn wm_class_class_is_both_label_and_stable_identity() {
+        assert_eq!(
+            application_metadata(b"Navigator\0Firefox\0"),
+            (Some("Firefox".to_owned()), Some("Firefox".to_owned()))
+        );
+    }
+
+    #[test]
+    fn wm_class_identity_never_uses_a_window_title() {
+        assert_eq!(
+            application_metadata(b"org.gnome.Terminal\0Gnome-terminal\0"),
+            (
+                Some("Gnome-terminal".to_owned()),
+                Some("Gnome-terminal".to_owned())
+            )
+        );
+        assert_eq!(application_metadata(b"\0\0Document 1"), (None, None));
+    }
 }

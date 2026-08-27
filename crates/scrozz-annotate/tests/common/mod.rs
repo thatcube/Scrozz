@@ -71,11 +71,7 @@ pub fn capture_with(frame: Frame, provenance: Provenance) -> Capture {
         Provenance::AllDisplays | Provenance::Stitched => CaptureTarget::AllDisplays,
         Provenance::Display => CaptureTarget::Display(DisplayId("test-display".to_owned())),
     };
-    Capture {
-        frame,
-        provenance,
-        target,
-    }
+    Capture::new(frame, provenance, target)
 }
 
 /// A region capture — beautification is permitted.

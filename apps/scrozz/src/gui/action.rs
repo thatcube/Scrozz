@@ -131,7 +131,7 @@ impl Action {
     pub fn command_line(&self) -> String {
         match self {
             Self::Capture(CaptureKind::Region) => "scrozz capture --interactive".to_owned(),
-            Self::Capture(CaptureKind::Window) => "scrozz capture --interactive-window".to_owned(),
+            Self::Capture(CaptureKind::Window) => "scrozz capture --interactive window".to_owned(),
             Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active".to_owned(),
             Self::ToggleRecording => "scrozz record --toggle".to_owned(),
             Self::OpenHistory => "scrozz history list".to_owned(),
@@ -201,6 +201,14 @@ mod tests {
             let line = action.command_line();
             assert!(line.starts_with("scrozz "), "{line}");
         }
+    }
+
+    #[test]
+    fn window_capture_uses_the_cli_interactive_mode() {
+        assert_eq!(
+            Action::Capture(CaptureKind::Window).command_line(),
+            "scrozz capture --interactive window"
+        );
     }
 
     #[test]

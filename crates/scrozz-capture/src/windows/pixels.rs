@@ -18,9 +18,24 @@
 //! (cropping horizontally, compositing).
 
 use super::geom::DeviceRect;
+use scrozz_core::{ShadowSupport, WindowPickingCapability};
 
 /// Bytes per pixel for every format this backend produces.
 pub const BGRA_BYTES_PER_PIXEL: usize = 4;
+
+const SHADOW_UNAVAILABLE_REASON: &str =
+    "Windows window capture excludes the DWM shadow, and the GDI fallback cannot recover it";
+
+/// Interactive window fidelity for the active Windows capture path.
+#[must_use]
+pub fn window_picking_capability(wgc_available: bool) -> WindowPickingCapability {
+    WindowPickingCapability::in_process(
+        ShadowSupport::AlwaysExcluded {
+            why: SHADOW_UNAVAILABLE_REASON.into(),
+        },
+        wgc_available,
+    )
+}
 
 /// Bytes needed to hold `height` rows of `stride` bytes.
 #[must_use]
@@ -230,5 +245,53 @@ pub fn flip_vertical(buf: &mut [u8], stride: usize, height: u32) {
         let bottom = (rows - 1 - row) * stride;
         let (a, b) = buf.split_at_mut(bottom);
         a[top..top + stride].swap_with_slice(&mut b[..stride]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scrozz_core::{ShadowSupport, WindowSelection};
+
+    #[test]
+    fn picker_capability_tracks_wgc_alpha_without_inventing_a_shadow() {
+        let gdi = window_picking_capability(false);
+        let wgc = window_picking_capability(true);
+        assert_eq!(gdi.selection, WindowSelection::InProcess);
+        assert!(!gdi.native_alpha);
+        assert!(wgc.native_alpha);
+        assert!(matches!(gdi.shadow, ShadowSupport::AlwaysExcluded { .. }));
+        assert!(matches!(wgc.shadow, ShadowSupport::AlwaysExcluded { .. }));
+        assert!(!wgc.shadow.resolve(true));
+    }
+
+    #[test]
+    fn opaque_fixup_changes_only_alpha_and_not_stride_padding() {
+        let stride = 12;
+        let mut data = vec![
+            10, 20, 30, 0, 40, 50, 60, 1, 91, 92, 93, 94, //
+            70, 80, 90, 2, 11, 22, 33, 3, 95, 96, 97, 98,
+        ];
+        force_opaque_alpha(&mut data, stride, 2, 2);
+
+        assert_eq!(&data[0..8], &[10, 20, 30, 255, 40, 50, 60, 255]);
+        assert_eq!(&data[8..12], &[91, 92, 93, 94]);
+        assert_eq!(&data[12..20], &[70, 80, 90, 255, 11, 22, 33, 255]);
+        assert_eq!(&data[20..24], &[95, 96, 97, 98]);
+    }
+
+    #[test]
+    fn row_copy_preserves_bgra_alpha_and_driver_stride() {
+        let stride = 12;
+        let source = [
+            1, 2, 3, 4, 5, 6, 7, 8, 90, 91, 92, 93, //
+            11, 12, 13, 14, 15, 16, 17, 18, 94, 95, 96, 97,
+        ];
+        let copied = copy_rows_keeping_stride(&source, stride, 2);
+
+        assert_eq!(copied, source);
+        assert_eq!(copied.len(), buffer_len(stride, 2));
+        assert_eq!(&copied[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&copied[stride..stride + 4], &[11, 12, 13, 14]);
     }
 }

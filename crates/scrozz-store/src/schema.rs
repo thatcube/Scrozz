@@ -32,15 +32,14 @@ pub struct Migration {
 
 /// The schema, in order.
 ///
-/// Every statement is `IF NOT EXISTS`, so re-running a rung against a file that
-/// already has it is harmless. That matters more than it looks: the one way a
-/// `user_version` and a schema drift apart is an interrupted upgrade on a
-/// filesystem that lied about `fsync`, and idempotent rungs make that
-/// recoverable instead of fatal.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial history index",
-    sql: r"
+/// Creation statements use `IF NOT EXISTS`; later rungs are applied exactly once
+/// according to `user_version`, with each rung and its version update committed
+/// in the same transaction.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial history index",
+        sql: r"
         -- One row per capture. Rows are NEVER deleted by retention: decision
         -- D23 evicts `image_hash`, not the capture.
         CREATE TABLE IF NOT EXISTS captures (
@@ -94,8 +93,18 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             key   TEXT NOT NULL PRIMARY KEY,
             value TEXT NOT NULL
         ) STRICT;
-    ",
-}];
+        ",
+    },
+    Migration {
+        version: 2,
+        name: "capture source identity and window shadow",
+        sql: r"
+            ALTER TABLE captures ADD COLUMN app_identifier TEXT;
+            ALTER TABLE captures ADD COLUMN window_shadow INTEGER
+                CHECK (window_shadow IS NULL OR window_shadow IN (0, 1));
+        ",
+    },
+];
 
 /// The version a freshly-migrated file ends up at.
 #[must_use]
@@ -345,6 +354,30 @@ mod tests {
     }
 
     #[test]
+    fn the_real_v1_schema_upgrades_to_v2_without_losing_rows() {
+        let mut conn = memory();
+        migrate(&mut conn, &MIGRATIONS[..1]).expect("create v1");
+        conn.execute(
+            "INSERT INTO captures (
+                 id, created_at, stored_at, app_name, window_title, provenance,
+                 target_json, frame_json
+             ) VALUES ('old', 1, 2, 'Safari', 'Invoice', 'window', '{}', '{}')",
+            [],
+        )
+        .expect("insert v1 row");
+
+        assert_eq!(migrate(&mut conn, MIGRATIONS).expect("upgrade"), 2);
+        let row: (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT app_name, app_identifier, window_shadow FROM captures WHERE id = 'old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read upgraded row");
+        assert_eq!(row, ("Safari".to_owned(), None, None));
+    }
+
+    #[test]
     fn the_schema_rejects_a_pinned_value_that_is_not_a_flag() {
         let mut conn = memory();
         migrate(&mut conn, MIGRATIONS).expect("migrate");
@@ -354,5 +387,18 @@ mod tests {
             [],
         );
         assert!(bad.is_err(), "CHECK (pinned IN (0,1)) must hold");
+    }
+
+    #[test]
+    fn the_schema_rejects_a_window_shadow_value_that_is_not_a_flag() {
+        let mut conn = memory();
+        migrate(&mut conn, MIGRATIONS).expect("migrate");
+        let bad = conn.execute(
+            "INSERT INTO captures (
+                 id, created_at, stored_at, provenance, target_json, frame_json, window_shadow
+             ) VALUES ('x', 0, 0, 'window', '{}', '{}', 7)",
+            [],
+        );
+        assert!(bad.is_err(), "window_shadow must be NULL, 0, or 1");
     }
 }

@@ -668,13 +668,13 @@ fn menu_ids_are_unique_and_round_trip() {
 
 #[test]
 fn enabled_menu_items_are_never_clickable_no_ops() {
+    assert!(TrayAction::CaptureWindow.is_available());
     assert!(TrayAction::CaptureFullscreen.is_available());
     assert!(TrayAction::OpenSettings.is_available());
     assert!(TrayAction::Quit.is_available());
 
     for unfinished in [
         TrayAction::CaptureRegion,
-        TrayAction::CaptureWindow,
         TrayAction::ToggleRecording,
         TrayAction::OpenHistory,
     ] {

@@ -36,10 +36,25 @@ mod sut {
     pub mod pixels;
 }
 
-use scrozz_core::{LogicalRect, Point, ScaleFactor, Size};
+use scrozz_core::{LogicalRect, Point, ScaleFactor, ShadowSupport, Size, WindowSelection};
 use sut::filter::{self, Rejection, WindowFacts};
 use sut::geom::{self, DeviceRect};
 use sut::pixels::{self, PlaneRef};
+
+#[test]
+fn window_picker_capabilities_match_each_windows_capture_path() {
+    let gdi = pixels::window_picking_capability(false);
+    let wgc = pixels::window_picking_capability(true);
+
+    assert_eq!(gdi.selection, WindowSelection::InProcess);
+    assert_eq!(wgc.selection, WindowSelection::InProcess);
+    assert!(!gdi.native_alpha);
+    assert!(wgc.native_alpha);
+    assert!(matches!(gdi.shadow, ShadowSupport::AlwaysExcluded { .. }));
+    assert!(matches!(wgc.shadow, ShadowSupport::AlwaysExcluded { .. }));
+    assert!(!gdi.shadow.resolve(true));
+    assert!(!wgc.shadow.resolve(true));
+}
 
 // ---------------------------------------------------------------------------
 // Coordinate arithmetic

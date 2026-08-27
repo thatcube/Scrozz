@@ -24,7 +24,7 @@ use scrozz_export::{Encoder, FrameEncoder, ImageFormat, profile_for};
 const CASES: usize = 200;
 
 const FORMATS: [ImageFormat; 3] = [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::WebP];
-const PIXEL_FORMATS: [PixelFormat; 3] = [Rgba8, Bgra8, RgbaPremultiplied8];
+const PIXEL_FORMATS: [PixelFormat; 4] = [Rgba8, Bgra8, RgbaPremultiplied8, BgraPremultiplied8];
 const SPACES: [ColorSpace; 4] = [Srgb, DisplayP3, Rec2020, Unknown];
 
 /// The straight-alpha RGBA the encoders are expected to produce, computed the
@@ -82,7 +82,7 @@ fn arbitrary(rng: &mut Rng) -> Frame {
     let width = rng.range(1, 23);
     let height = rng.range(1, 23);
     let pad = rng.range(0, 3) as usize * 4;
-    let format = PIXEL_FORMATS[rng.range(0, 2) as usize];
+    let format = PIXEL_FORMATS[rng.range(0, 3) as usize];
     let space = SPACES[rng.range(0, 3) as usize];
 
     // Premultiplied buffers are generated in-gamut (c <= a) because that is what
@@ -90,7 +90,7 @@ fn arbitrary(rng: &mut Rng) -> Frame {
     let mut samples = Vec::with_capacity((width * height) as usize);
     for _ in 0..width * height {
         let a = rng.byte();
-        let cap = if format == RgbaPremultiplied8 { a } else { 255 };
+        let cap = if format.is_premultiplied() { a } else { 255 };
         samples.push([
             rng.byte().min(cap),
             rng.byte().min(cap),
@@ -147,11 +147,11 @@ fn padding_never_changes_the_result() {
     for case in 0..CASES {
         let width = rng.range(1, 17);
         let height = rng.range(1, 17);
-        let format = PIXEL_FORMATS[rng.range(0, 2) as usize];
+        let format = PIXEL_FORMATS[rng.range(0, 3) as usize];
         let mut samples = Vec::new();
         for _ in 0..width * height {
             let a = rng.byte();
-            let cap = if format == RgbaPremultiplied8 { a } else { 255 };
+            let cap = if format.is_premultiplied() { a } else { 255 };
             samples.push([
                 rng.byte().min(cap),
                 rng.byte().min(cap),

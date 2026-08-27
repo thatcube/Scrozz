@@ -388,6 +388,10 @@ impl eframe::App for Driver {
             self.settings.update(ctx, &mut self.app);
         }
 
+        if !self.stopped {
+            self.app.paint_window_picker(ctx);
+        }
+
         // An idle overlay must still be woken, or a hotkey pressed while
         // nothing is on screen would not be noticed until something else woke
         // the window — which, for a window that is empty at rest, may be never.

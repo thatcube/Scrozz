@@ -281,6 +281,8 @@ pub struct CaptureRequest {
     pub provenance: Provenance,
     /// The capture's own pixel dimensions, shown in the caption.
     pub source_px: (u32, u32),
+    /// Application label shown as a compact badge for window captures.
+    pub source_badge: Option<String>,
     /// A pre-scaled thumbnail. `None` shows a holding fill until one arrives.
     pub thumbnail: Option<egui::ColorImage>,
 }
@@ -293,6 +295,7 @@ impl CaptureRequest {
             name: name.into(),
             provenance,
             source_px,
+            source_badge: None,
             thumbnail: None,
         }
     }
@@ -314,8 +317,16 @@ impl CaptureRequest {
             name: name.into(),
             provenance,
             source_px,
+            source_badge: None,
             thumbnail: Some(thumbnail),
         })
+    }
+
+    /// Attach the application label associated with this capture.
+    #[must_use]
+    pub fn with_source_badge(mut self, badge: Option<String>) -> Self {
+        self.source_badge = badge;
+        self
     }
 
     /// Attach a thumbnail.
@@ -718,6 +729,7 @@ struct Entry {
     name: String,
     provenance: Provenance,
     source_px: (u32, u32),
+    source_badge: Option<String>,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
 }
@@ -865,6 +877,7 @@ impl OverlayApp {
                     name: request.name,
                     provenance: request.provenance,
                     source_px: request.source_px,
+                    source_badge: request.source_badge,
                     texture: None,
                     pending: thumb,
                 },
@@ -1080,7 +1093,8 @@ impl eframe::App for OverlayApp {
             let Some(entry) = self.content.get(&f.id) else {
                 continue;
             };
-            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
+            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance)
+                .with_source_badge(entry.source_badge.as_deref());
             if let Some(tex) = &entry.texture {
                 content.texture = Some(tex.id());
             }

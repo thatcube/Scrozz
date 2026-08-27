@@ -30,7 +30,8 @@ use objc2_screen_capture_kit::{
 };
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display, Error,
-    LogicalRect, Provenance, Result, ScaleFactor, TargetEnumerator, Window,
+    LogicalRect, Provenance, Result, ScaleFactor, ShadowSupport, SourceApp, TargetEnumerator,
+    Window, WindowPicking, WindowPickingCapability,
 };
 
 /// ScreenCaptureKit-backed still capture.
@@ -65,20 +66,43 @@ impl TargetEnumerator for ScreenCaptureKitBackend {
     }
 }
 
+impl WindowPicking for ScreenCaptureKitBackend {
+    fn window_picking(&self) -> WindowPickingCapability {
+        WindowPickingCapability::in_process(
+            ShadowSupport::AlwaysExcluded {
+                why: "ScreenCaptureKit's desktop-independent still capture exposes only the \
+                      window surface; its shadow-control flag does not add a separable shadow"
+                    .to_owned(),
+            },
+            true,
+        )
+    }
+}
+
 impl CaptureBackend for ScreenCaptureKitBackend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
-        let (frame, provenance) = match &request.target {
-            CaptureTarget::Display(id) => capture_display(id, request)?,
-            CaptureTarget::Window(id) => capture_window(id, request)?,
-            CaptureTarget::Region(rect) => capture_region(*rect, request)?,
-            CaptureTarget::AllDisplays => capture_all_displays(request)?,
-        };
-
-        Ok(Capture {
-            frame,
-            provenance,
-            target: request.target.clone(),
-        })
+        match &request.target {
+            CaptureTarget::Display(id) => {
+                let (frame, provenance) = capture_display(id, request)?;
+                Ok(Capture::new(frame, provenance, request.target.clone()))
+            }
+            CaptureTarget::Window(id) => {
+                let (frame, source_app, window_shadow) = capture_window(id, request)?;
+                Ok(
+                    Capture::new(frame, Provenance::Window, request.target.clone())
+                        .with_source_app(source_app)
+                        .with_window_shadow(window_shadow),
+                )
+            }
+            CaptureTarget::Region(rect) => {
+                let (frame, provenance) = capture_region(*rect, request)?;
+                Ok(Capture::new(frame, provenance, request.target.clone()))
+            }
+            CaptureTarget::AllDisplays => {
+                let (frame, provenance) = capture_all_displays(request)?;
+                Ok(Capture::new(frame, provenance, request.target.clone()))
+            }
+        }
     }
 
     fn name(&self) -> &str {
@@ -106,7 +130,7 @@ fn capture_display(
         )
     };
 
-    let config = configure(&filter, request, scale, None)?;
+    let (config, scale) = configure(&filter, request, scale, None, None)?;
     let image = sck::capture_image(&filter, &config)?;
     Ok((image::to_frame(&image, scale)?, Provenance::Display))
 }
@@ -114,11 +138,8 @@ fn capture_display(
 /// Captures one window, and nothing else.
 ///
 /// Decision D9 makes this the sacred path: whatever ScreenCaptureKit returns is
-/// the window's true shape, including its real shadow and its real corner
-/// radius. Nothing here pads, rounds, recolours or composites — the request's
-/// `include_window_shadow` is passed to the compositor, which knows how to
-/// render the shadow the window actually has, and the resulting image's own
-/// dimensions are taken as final.
+/// the window's true surface and corner alpha. Nothing here pads, rounds,
+/// recolours or composites, and the resulting image's own dimensions are final.
 ///
 /// # What the shadow flag actually does
 ///
@@ -129,16 +150,14 @@ fn capture_display(
 /// capture, where the window is composited onto a display-sized surface and the
 /// shadow has somewhere to fall.
 ///
-/// The flag is still passed through rather than dropped, because that is the
-/// request the caller made and the OS is entitled to honour it on other
-/// versions. What this function must never do is *manufacture* the difference
-/// by padding the image out and drawing a shadow itself; that is precisely the
-/// compositing D9 forbids, and it is why the returned image's own size is
-/// treated as authoritative rather than checked against `contentRect`.
+/// The supported still-capture path therefore resolves shadow to absent. It
+/// asks the API to ignore framing as well, but does not mistake that no-op flag
+/// for a toggle. Most importantly, it never manufactures a difference by
+/// padding, cropping, matting or drawing a shadow.
 fn capture_window(
     id: &scrozz_core::WindowId,
     request: &CaptureRequest,
-) -> Result<(scrozz_core::Frame, Provenance)> {
+) -> Result<(scrozz_core::Frame, SourceApp, bool)> {
     let content = sck::shareable_content()?;
     let target = window::find(&content, id).ok_or_else(|| {
         Error::TargetGone(format!(
@@ -157,9 +176,15 @@ fn capture_window(
     let filter =
         unsafe { SCContentFilter::initWithDesktopIndependentWindow(sck::alloc_filter(), &target) };
 
-    let config = configure(&filter, request, scale, None)?;
+    let source_app = window::source_app(&target);
+    let window_shadow = resolved_window_shadow(request.include_window_shadow);
+    let (config, scale) = configure(&filter, request, scale, None, Some(window_shadow))?;
     let image = sck::capture_image(&filter, &config)?;
-    Ok((image::to_frame(&image, scale)?, Provenance::Window))
+    Ok((
+        image::to_window_frame(&image, scale)?,
+        source_app,
+        window_shadow,
+    ))
 }
 
 /// Captures a rectangle of the global desktop.
@@ -215,9 +240,9 @@ fn capture_region(
         rect.size,
     );
 
-    let config = configure(&filter, request, home.scale, Some(local))?;
+    let (config, scale) = configure(&filter, request, home.scale, Some(local), None)?;
     let image = sck::capture_image(&filter, &config)?;
-    Ok((image::to_frame(&image, home.scale)?, Provenance::Region))
+    Ok((image::to_frame(&image, scale)?, Provenance::Region))
 }
 
 /// Captures every display as one image.
@@ -269,20 +294,18 @@ fn configure(
     request: &CaptureRequest,
     fallback_scale: ScaleFactor,
     source_rect: Option<LogicalRect>,
-) -> Result<Retained<SCStreamConfiguration>> {
+    window_shadow: Option<bool>,
+) -> Result<(Retained<SCStreamConfiguration>, ScaleFactor)> {
     let config = unsafe { SCStreamConfiguration::new() };
+    let pixel_scale = f64::from(unsafe { filter.pointPixelScale() });
+    let scale = if pixel_scale.is_finite() && pixel_scale > 0.0 {
+        display::scale_from_ratio(pixel_scale)
+    } else {
+        fallback_scale
+    };
 
     // SAFETY: all plain property reads and writes on a fresh configuration.
     unsafe {
-        // The filter knows its own pixel scale on macOS 14+; fall back to the
-        // display's when it reports something implausible.
-        let pixel_scale = f64::from(filter.pointPixelScale());
-        let scale = if pixel_scale.is_finite() && pixel_scale > 0.0 {
-            display::scale_from_ratio(pixel_scale)
-        } else {
-            fallback_scale
-        };
-
         let content = filter.contentRect();
         let region = source_rect.unwrap_or_else(|| display::from_cg_rect(content));
         let pixels = region.to_physical(scale);
@@ -308,17 +331,35 @@ fn configure(
 
         config.setShowsCursor(request.cursor == CursorMode::Visible);
 
-        // Decision D9 again: the shadow is the window's own, drawn by the
-        // compositor. This only chooses whether to ask for it.
-        config.setIgnoreShadowsSingleWindow(!request.include_window_shadow);
-
         // `colorSpaceName` is deliberately left untouched. Setting it would
         // convert the capture into that space; leaving it lets ScreenCaptureKit
         // deliver the display's own — Display P3 on most modern Macs — which
         // the frame then reports honestly.
     }
 
-    Ok(config)
+    if let Some(window_shadow) = window_shadow {
+        apply_window_fidelity(&config, window_shadow);
+    }
+
+    Ok((config, scale))
+}
+
+fn apply_window_fidelity(config: &SCStreamConfiguration, window_shadow: bool) {
+    // SAFETY: plain property writes on a live configuration.
+    unsafe {
+        // The still-image path currently resolves this to false. Keep the
+        // configuration tied to the resolved value, never the request.
+        config.setIgnoreShadowsSingleWindow(!window_shadow);
+        // Preserve the compositor's alpha at rounded corners.
+        config.setShouldBeOpaque(false);
+    }
+}
+
+fn resolved_window_shadow(requested: bool) -> bool {
+    ScreenCaptureKitBackend::new()
+        .window_picking()
+        .shadow
+        .resolve(requested)
 }
 
 fn find_display(
@@ -345,17 +386,28 @@ fn find_display(
 fn window_scale(window: &SCWindow) -> ScaleFactor {
     // SAFETY: a plain property read.
     let frame = display::from_cg_rect(unsafe { window.frame() });
-    let centre = (
-        frame.origin.x + frame.size.width / 2.0,
-        frame.origin.y + frame.size.height / 2.0,
-    );
-
     let displays = display::displays().unwrap_or_default();
+    predominant_scale(frame, &displays)
+}
+
+fn predominant_scale(bounds: LogicalRect, displays: &[Display]) -> ScaleFactor {
     displays
         .iter()
-        .find(|display| display::contains(display.bounds, centre))
-        .or_else(|| displays.iter().find(|display| display.is_primary))
-        .map_or(ScaleFactor::IDENTITY, |display| display.scale)
+        .filter_map(|display| {
+            let area = overlap_area(display.bounds, bounds);
+            (area > 0.0).then_some((area, display.scale))
+        })
+        .max_by(|(left, _), (right, _)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, scale)| scale)
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|display| display.is_primary)
+                .map(|display| display.scale)
+        })
+        .unwrap_or(ScaleFactor::IDENTITY)
 }
 
 /// The scale to record for a rectangle that may span displays.
@@ -400,10 +452,18 @@ fn overlaps(a: LogicalRect, b: LogicalRect) -> bool {
         && b.origin.y < a.origin.y + a.size.height
 }
 
+fn overlap_area(a: LogicalRect, b: LogicalRect) -> f64 {
+    let left = a.origin.x.max(b.origin.x);
+    let top = a.origin.y.max(b.origin.y);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let bottom = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    ((right - left).max(0.0)) * ((bottom - top).max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scrozz_core::{DisplayId, LogicalPoint, LogicalSize};
+    use scrozz_core::{DisplayId, LogicalPoint, LogicalSize, WindowSelection};
 
     fn display_at(id: &str, x: f64, width: f64, scale: f64) -> Display {
         let bounds = LogicalRect::new(LogicalPoint::new(x, 0.0), LogicalSize::new(width, 1000.0));
@@ -453,6 +513,25 @@ mod tests {
     }
 
     #[test]
+    fn window_scale_uses_overlap_area_in_an_irregular_layout() {
+        let mut primary = display_at("primary", 0.0, 1000.0, 2.0);
+        let mut external = display_at("external", 1000.0, 1600.0, 1.0);
+        external.bounds.origin.y = 700.0;
+        external.work_area = external.bounds;
+        primary.is_primary = true;
+
+        let window = LogicalRect::new(
+            LogicalPoint::new(900.0, 400.0),
+            LogicalSize::new(600.0, 500.0),
+        );
+        assert_eq!(
+            predominant_scale(window, &[primary, external]).get(),
+            1.0,
+            "most of the window is on the external display even though its centre is in the gap"
+        );
+    }
+
+    #[test]
     fn touching_edges_do_not_count_as_overlapping() {
         assert!(!overlaps(rect(0.0, 100.0), rect(100.0, 100.0)));
         assert!(overlaps(rect(0.0, 100.0), rect(99.0, 100.0)));
@@ -469,5 +548,34 @@ mod tests {
     #[test]
     fn the_backend_names_itself_for_bug_reports() {
         assert_eq!(ScreenCaptureKitBackend::new().name(), "ScreenCaptureKit");
+    }
+
+    #[test]
+    fn window_picking_reports_the_supported_fidelity_contract() {
+        let capability = ScreenCaptureKitBackend::new().window_picking();
+
+        assert_eq!(capability.selection, WindowSelection::InProcess);
+        assert!(matches!(
+            capability.shadow,
+            ShadowSupport::AlwaysExcluded { .. }
+        ));
+        assert!(capability.native_alpha);
+        assert!(!capability.shadow.resolve(true));
+        assert!(!capability.shadow.resolve(false));
+        assert!(!resolved_window_shadow(true));
+        assert!(!resolved_window_shadow(false));
+    }
+
+    #[test]
+    fn resolved_window_configuration_preserves_alpha_and_omits_shadow() {
+        // SAFETY: creates a standalone configuration with no stream attached.
+        let config = unsafe { SCStreamConfiguration::new() };
+        apply_window_fidelity(&config, resolved_window_shadow(true));
+
+        // SAFETY: plain property reads on a live configuration.
+        unsafe {
+            assert!(config.ignoreShadowsSingleWindow());
+            assert!(!config.shouldBeOpaque());
+        }
     }
 }

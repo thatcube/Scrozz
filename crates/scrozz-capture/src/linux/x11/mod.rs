@@ -12,12 +12,11 @@
 //!
 //! # MIT-SHM
 //!
-//! The shared-memory path is detected and reported but not used. It needs both
-//! `x11rb`'s `shm` feature and a way to call `shmget`/`shmat` or `memfd_create`
-//! — that is, `libc` or `rustix` — and this crate's manifest grants neither.
-//! `GetImage` is used instead, which is correct everywhere and slower on large
-//! captures. [`X11Backend::shm_available`] records what was found so the report
-//! is honest about which path ran.
+//! The shared-memory path is detected and reported but not used. The protocol
+//! feature is enabled, but the owned shared-segment mapping and cleanup path has
+//! not been implemented. `GetImage` is used instead, which is correct everywhere
+//! and slower on large captures. [`X11Backend::shm_available`] records what was
+//! found so the report is honest about which path ran.
 
 pub mod ewmh;
 pub mod layout;
@@ -28,8 +27,8 @@ pub mod wire;
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, ColorSpace, Display, DisplayId, Error,
-    Frame, LogicalRect, PhysicalSize, Provenance, Result, ScaleFactor, TargetEnumerator, Window,
-    WindowId,
+    Frame, LogicalRect, PhysicalSize, Provenance, Result, ScaleFactor, SourceApp, TargetEnumerator,
+    Window, WindowId, WindowPicking, WindowPickingCapability,
 };
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xproto::{
@@ -356,13 +355,24 @@ impl X11Backend {
             })
     }
 
-    fn window_application(&self, window: u32) -> Option<String> {
+    fn window_application(&self, window: u32) -> (Option<String>, Option<String>) {
         self.property(
             window,
             u32::from(AtomEnum::WM_CLASS),
             u32::from(AtomEnum::STRING),
         )
-        .and_then(|(_, bytes)| ewmh::application_name(&bytes))
+        .map_or((None, None), |(_, bytes)| {
+            ewmh::application_metadata(&bytes)
+        })
+    }
+
+    fn window_source_app(&self, window: u32) -> SourceApp {
+        let (name, identifier) = self.window_application(window);
+        SourceApp {
+            name,
+            identifier,
+            window_title: self.window_title(window),
+        }
     }
 
     fn is_mapped(&self, window: u32) -> bool {
@@ -596,10 +606,12 @@ impl TargetEnumerator for X11Backend {
                 let bounds = self.window_bounds(handle, true)?;
                 let display = layout::display_for_window(bounds, &displays)?;
 
+                let (application, application_id) = self.window_application(handle);
                 Some(Window {
                     id: WindowId(format!("x11:{handle:08x}")),
                     title: self.window_title(handle),
-                    application: self.window_application(handle),
+                    application,
+                    application_id,
                     bounds: bounds.to_logical(self.scale.get()),
                     display,
                     is_visible: mapped,
@@ -639,11 +651,15 @@ impl CaptureBackend for X11Backend {
             );
         }
 
-        let frame = match &request.target {
+        let (frame, source_app, window_shadow) = match &request.target {
             CaptureTarget::Display(id) => {
                 let display = self.display_by_id(id)?;
                 let region = physical_rect(display.bounds, display.scale);
-                self.grab(self.root, region, display.scale)?
+                (
+                    self.grab(self.root, region, display.scale)?,
+                    SourceApp::default(),
+                    None,
+                )
             }
 
             CaptureTarget::AllDisplays => {
@@ -654,7 +670,11 @@ impl CaptureBackend for X11Backend {
                     .collect();
                 let region = layout::bounding_box(&rects)
                     .ok_or_else(|| Error::Platform("no displays are connected".into()))?;
-                self.grab(self.root, region, self.scale)?
+                (
+                    self.grab(self.root, region, self.scale)?,
+                    SourceApp::default(),
+                    None,
+                )
             }
 
             CaptureTarget::Region(rect) => {
@@ -669,16 +689,23 @@ impl CaptureBackend for X11Backend {
                     .ok_or_else(|| {
                         Error::InvalidRequest("the selected region lies entirely off-screen".into())
                     })?;
-                self.grab(self.root, region, self.scale)?
+                (
+                    self.grab(self.root, region, self.scale)?,
+                    SourceApp::default(),
+                    None,
+                )
             }
 
             CaptureTarget::Window(id) => {
                 let client = self.window_handle(id)?;
-                let drawable = if request.include_window_shadow {
-                    self.frame_window(client)
-                } else {
-                    client
-                };
+                let source_app = self.window_source_app(client);
+                // A compositor paints X11 shadows as separate root-window
+                // pixels. They are not part of either the client drawable or
+                // the window-manager frame, so GetImage cannot include one
+                // without reading (and guessing a crop from) the root. Always
+                // capture the real frame: changing to the client when shadow
+                // is disabled would remove decorations, not a shadow.
+                let drawable = self.frame_window(client);
                 let bounds = self
                     .window_bounds(drawable, false)
                     .ok_or_else(|| Error::TargetGone(format!("window {} has closed", id.0)))?;
@@ -688,28 +715,43 @@ impl CaptureBackend for X11Backend {
                 // compositing manager is redirecting the window's contents.
                 // Without one, X has no stored pixels for obscured areas and
                 // the server returns whatever is on screen there.
-                self.grab(
-                    drawable,
-                    PixelRect::new(0, 0, bounds.width, bounds.height),
-                    self.scale,
-                )?
+                (
+                    self.grab(
+                        drawable,
+                        PixelRect::new(0, 0, bounds.width, bounds.height),
+                        self.scale,
+                    )?,
+                    source_app,
+                    Some(false),
+                )
             }
         };
 
-        Ok(Capture {
+        let capture = Capture::new(
             frame,
-            provenance: match &request.target {
+            match &request.target {
                 CaptureTarget::Display(_) => Provenance::Display,
                 CaptureTarget::Window(_) => Provenance::Window,
                 CaptureTarget::Region(_) => Provenance::Region,
                 CaptureTarget::AllDisplays => Provenance::AllDisplays,
             },
-            target: request.target.clone(),
+            request.target.clone(),
+        )
+        .with_source_app(source_app);
+        Ok(match window_shadow {
+            Some(present) => capture.with_window_shadow(present),
+            None => capture,
         })
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl WindowPicking for X11Backend {
+    fn window_picking(&self) -> WindowPickingCapability {
+        pixels::window_picking_capability()
     }
 }
 

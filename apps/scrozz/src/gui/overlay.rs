@@ -102,7 +102,8 @@ impl CardSurface for OverlayCards {
             // capture that happened should be visible even if thumbnailing
             // failed, because the file on disk is fine.
             None => CaptureRequest::new(name, provenance, card.source_px()),
-        };
+        }
+        .with_source_badge(card.source_badge().map(str::to_owned));
 
         self.pending.push_back(card.id);
         self.handle.push(request);

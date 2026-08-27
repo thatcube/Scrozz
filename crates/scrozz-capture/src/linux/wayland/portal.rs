@@ -1,17 +1,12 @@
-//! `xdg-desktop-portal` negotiation.
-//!
-//! Everything here that can be decided without D-Bus is decided here, as plain
-//! values, and tested. What remains — the calls themselves — is documented at
-//! [`acquire_frame`] and is not pretended to work.
+//! `xdg-desktop-portal` negotiation and still-image acquisition.
 //!
 //! # The two portal interfaces, and why both matter
 //!
 //! `org.freedesktop.portal.Screenshot` takes a picture and hands back a `file://`
-//! URI. It is one call, needs no PipeWire, and is what a "screenshot the whole
-//! screen" command should use. What it cannot do is let the application choose
-//! the region or the window: `interactive: true` delegates the entire selection
-//! to the desktop's own UI, which means Scrozz's editor, magnifier and
-//! measurement overlay never appear. It is a correct fallback, not the product.
+//! URI. Version 3 can constrain its trusted picker to windows, so it is the
+//! shortest correct path for a single still image: no PipeWire stream, no
+//! recording loop, and no opportunity to read another client's pixels without
+//! the user's explicit choice.
 //!
 //! `org.freedesktop.portal.ScreenCast` gives a PipeWire node the application
 //! reads frames from, with the selection made once and then restored silently on
@@ -21,10 +16,23 @@
 //! # Wire constants
 //!
 //! Transcribed from the portal specification and cross-checked against
-//! `ashpd`'s own definitions, which are compiled out of this build by feature
-//! gating (see [`super`]).
+//! `ashpd`'s own definitions.
 
-use scrozz_core::CaptureTarget;
+#[cfg(target_os = "linux")]
+use ashpd::{
+    PortalError,
+    desktop::{
+        ResponseError,
+        screenshot::{AvailableTargets, Screenshot, ScreenshotProxy},
+    },
+};
+#[cfg(target_os = "linux")]
+use image::ImageReader;
+
+use scrozz_core::{
+    Capture, CaptureRequest, CaptureTarget, Frame, Provenance, ShadowSupport,
+    WindowPickingCapability, WindowSelection,
+};
 
 use super::restore::TokenKey;
 
@@ -56,6 +64,78 @@ pub mod persist_mode {
     pub const APPLICATION: u32 = 1;
     /// The grant lasts until the user revokes it in system settings.
     pub const EXPLICITLY_REVOKED: u32 = 2;
+}
+
+/// Screenshot portal interface version which introduced `target`.
+#[cfg(target_os = "linux")]
+const SCREENSHOT_WINDOW_TARGET_VERSION: u32 = 3;
+
+/// A conservative capability used until portal support has been probed.
+#[must_use]
+pub fn unchecked_window_picking_capability(why: impl Into<String>) -> WindowPickingCapability {
+    WindowPickingCapability {
+        selection: WindowSelection::Unavailable { why: why.into() },
+        shadow: ShadowSupport::Unchecked {
+            why: "the Screenshot portal does not report whether the compositor included a \
+                  window shadow"
+                .to_owned(),
+        },
+        // The portal may return alpha, but the interface does not promise that
+        // compositors preserve a window's transparent corners.
+        native_alpha: false,
+    }
+}
+
+/// Probes whether the installed Screenshot portal can constrain its picker to windows.
+///
+/// A Screenshot v1/v2 implementation ignores the `target` option. Sending the
+/// request anyway would present an unconstrained picker while Scrozz claimed it
+/// was choosing a window, so support is checked before it is advertised.
+#[cfg(target_os = "linux")]
+pub fn window_picking_capability() -> scrozz_core::Result<WindowPickingCapability> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| scrozz_core::Error::Platform(format!("portal runtime: {err}")))?;
+    let selection = runtime.block_on(probe_window_selection())?;
+    Ok(capability_for_selection(selection))
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_window_selection() -> scrozz_core::Result<WindowSelection> {
+    let proxy = ScreenshotProxy::new().await.map_err(map_portal_error)?;
+    let version = proxy.version();
+    if version < SCREENSHOT_WINDOW_TARGET_VERSION {
+        return Ok(WindowSelection::Unavailable {
+            why: format!(
+                "the installed Screenshot portal implements interface version {version}; \
+                 choosing only windows requires version {SCREENSHOT_WINDOW_TARGET_VERSION}"
+            ),
+        });
+    }
+
+    let targets = proxy.available_targets().await.map_err(map_portal_error)?;
+    if !targets.contains(AvailableTargets::Window) {
+        return Ok(WindowSelection::Unavailable {
+            why: "the installed Screenshot portal does not advertise window targets".to_owned(),
+        });
+    }
+
+    Ok(WindowSelection::PortalPicker {
+        portal: "org.freedesktop.portal.Screenshot".to_owned(),
+    })
+}
+
+fn capability_for_selection(selection: WindowSelection) -> WindowPickingCapability {
+    WindowPickingCapability {
+        selection,
+        shadow: ShadowSupport::Unchecked {
+            why: "the Screenshot portal does not report whether the compositor included a \
+                  window shadow"
+                .to_owned(),
+        },
+        native_alpha: false,
+    }
 }
 
 /// The options for one `SelectSources` call.
@@ -207,40 +287,174 @@ impl StreamInfo {
     pub const fn is_placeable(&self) -> bool {
         self.position.is_some() && self.size.is_some()
     }
+
+    /// Attaches only metadata that the ScreenCast portal actually disclosed.
+    ///
+    /// The standard stream response has no owning-application identity. In
+    /// particular, the advisory [`scrozz_core::WindowId`] used to enter the portal
+    /// flow is not evidence about which window the user selected.
+    #[must_use]
+    pub fn capture_from_frame(frame: Frame, request: &CaptureRequest) -> Capture {
+        let provenance = match request.target {
+            CaptureTarget::Display(_) => Provenance::Display,
+            CaptureTarget::Window(_) => Provenance::Window,
+            CaptureTarget::Region(_) => Provenance::Region,
+            CaptureTarget::AllDisplays => Provenance::AllDisplays,
+        };
+        Capture::new(frame, provenance, request.target.clone())
+    }
 }
 
-/// Reads pixels from a PipeWire node.
+/// Opens the desktop's trusted window picker and decodes the selected still.
 ///
-/// # Not implemented, and why
+/// The advisory [`scrozz_core::WindowId`] in `request` is intentionally ignored:
+/// Wayland does not disclose a window list, and only the portal knows which
+/// surface the user selected.
 ///
-/// This is the honest boundary of the Wayland backend. Two independent things
-/// are missing, and neither can be worked around from inside this crate:
+/// # Errors
 ///
-/// 1. **The portal call itself.** `ashpd`'s `screencast` module is behind a
-///    Cargo feature this build does not enable, so `Screencast::new()` does not
-///    exist here. The negotiation above is therefore fully specified and
-///    unexecutable. Enabling `features = ["screencast", "screenshot"]` on the
-///    workspace's `ashpd` dependency is the entire fix.
-///
-/// 2. **PipeWire.** Even with the portal available, `Start` returns a node id
-///    rather than pixels. Turning that into a frame needs a PipeWire client —
-///    `pipewire-rs`, or GStreamer's `pipewiresrc` — which is a substantial
-///    dependency with its own event loop, buffer negotiation and DMA-BUF
-///    handling. That is a task in its own right, not a detail of this one.
-///
-/// Writing a plausible-looking implementation that returned a blank buffer would
-/// hide both facts behind something that appears to work, which is worse than a
-/// panic that names them.
-///
-/// # Panics
-///
-/// Always.
-#[allow(clippy::needless_pass_by_value)]
-pub fn acquire_frame(_stream: StreamInfo) -> ! {
-    todo!(
-        "PipeWire frame acquisition: connect to the node from Start, negotiate a \
-         BGRx/RGBx format, pull one buffer and copy it out. Needs a PipeWire client \
-         dependency (pipewire-rs) and ashpd's `screencast` feature, neither of which \
-         this crate's manifest currently grants."
-    )
+/// Returns [`scrozz_core::Error::Cancelled`] when the chooser is dismissed,
+/// [`scrozz_core::Error::Unsupported`] when no Screenshot portal is installed
+/// or its trusted picker cannot be restricted to windows, or a platform/codec
+/// error when the portal response cannot be read.
+#[cfg(target_os = "linux")]
+pub fn capture_window(request: &CaptureRequest) -> scrozz_core::Result<Capture> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| scrozz_core::Error::Platform(format!("portal runtime: {err}")))?;
+
+    let screenshot = runtime.block_on(async {
+        if let WindowSelection::Unavailable { why } = probe_window_selection().await? {
+            return Err(scrozz_core::Error::Unsupported {
+                what: "capturing a chosen window on Wayland".to_owned(),
+                why,
+            });
+        }
+
+        Screenshot::request()
+            .interactive(true)
+            .modal(false)
+            .target(AvailableTargets::Window)
+            .send()
+            .await
+            .map_err(map_portal_error)?
+            .response()
+            .map_err(map_portal_error)
+    })?;
+
+    let path = path_from_uri(screenshot.uri().as_str()).ok_or_else(|| {
+        scrozz_core::Error::Platform(format!(
+            "Screenshot portal returned a non-file URI: {}",
+            screenshot.uri().as_str()
+        ))
+    })?;
+    let reader = ImageReader::open(&path)
+        .map_err(scrozz_core::Error::Io)?
+        .with_guessed_format()
+        .map_err(|err| scrozz_core::Error::Codec(format!("portal image header: {err}")))?;
+    let image = reader
+        .decode()
+        .map_err(|err| scrozz_core::Error::Codec(format!("portal image decode: {err}")))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let frame = Frame {
+        data: image.into_raw(),
+        size: scrozz_core::PhysicalSize::new(f64::from(width), f64::from(height)),
+        stride: width as usize * 4,
+        format: scrozz_core::PixelFormat::Rgba8,
+        color_space: scrozz_core::ColorSpace::Unknown,
+        scale: scrozz_core::ScaleFactor::IDENTITY,
+    };
+
+    Ok(StreamInfo::capture_from_frame(frame, request))
+}
+
+#[cfg(target_os = "linux")]
+fn map_portal_error(err: ashpd::Error) -> scrozz_core::Error {
+    match err {
+        ashpd::Error::Response(ResponseError::Cancelled)
+        | ashpd::Error::Portal(PortalError::Cancelled(_)) => scrozz_core::Error::Cancelled,
+        ashpd::Error::PortalNotFound(interface) => scrozz_core::Error::Unsupported {
+            what: "capturing windows on Wayland".to_owned(),
+            why: format!("no desktop portal implements {interface}"),
+        },
+        other => scrozz_core::Error::Platform(format!("Screenshot portal: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SessionPlan, StreamInfo, capability_for_selection, source_type,
+        unchecked_window_picking_capability,
+    };
+    use scrozz_core::{
+        CaptureRequest, CaptureTarget, ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance,
+        ScaleFactor, ShadowSupport, WindowId, WindowSelection,
+    };
+
+    #[test]
+    fn portal_picker_names_the_real_interface_and_is_out_of_process() {
+        let capability = capability_for_selection(WindowSelection::PortalPicker {
+            portal: "org.freedesktop.portal.Screenshot".to_owned(),
+        });
+        assert_eq!(
+            capability.selection,
+            WindowSelection::PortalPicker {
+                portal: "org.freedesktop.portal.Screenshot".to_owned()
+            }
+        );
+        assert!(matches!(capability.shadow, ShadowSupport::Unchecked { .. }));
+        assert!(!capability.native_alpha);
+    }
+
+    #[test]
+    fn unprobed_portal_support_is_not_advertised() {
+        let capability = unchecked_window_picking_capability("probe failed");
+        assert_eq!(
+            capability.selection,
+            WindowSelection::Unavailable {
+                why: "probe failed".to_owned()
+            }
+        );
+        assert!(matches!(capability.shadow, ShadowSupport::Unchecked { .. }));
+    }
+
+    #[test]
+    fn interactive_window_flow_selects_only_a_window_source() {
+        let plan = SessionPlan::for_target(
+            &CaptureTarget::Window(WindowId("portal-picker".into())),
+            false,
+        );
+        assert_eq!(plan.types, source_type::WINDOW);
+        assert!(!plan.multiple);
+    }
+
+    #[test]
+    fn portal_window_metadata_does_not_fabricate_an_owner_or_double_composite() {
+        let frame = Frame {
+            data: vec![1, 2, 3, 0xff],
+            size: PhysicalSize::new(1.0, 1.0),
+            stride: 4,
+            format: PixelFormat::Bgra8,
+            color_space: ColorSpace::Unknown,
+            scale: ScaleFactor::IDENTITY,
+        };
+        let request = CaptureRequest::new(CaptureTarget::Window(WindowId(
+            "advisory-id-not-selected-owner".into(),
+        )));
+
+        let capture = StreamInfo::capture_from_frame(frame, &request);
+
+        assert!(!capture.source_app.is_known());
+        assert_eq!(
+            capture.window_shadow, None,
+            "the portal never disclosed whether a compositor shadow is present"
+        );
+        assert_eq!(capture.provenance, Provenance::Window);
+        assert!(capture.provenance.forbids_compositing());
+        assert_eq!(capture.frame.stride, 4);
+        assert_eq!(capture.frame.data, [1, 2, 3, 0xff]);
+    }
 }

@@ -2,7 +2,8 @@
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, Display, Error, Frame, LogicalRect,
-    Provenance, Result, ScaleFactor, Size, TargetEnumerator, Window,
+    Provenance, Result, ScaleFactor, Size, SourceApp, TargetEnumerator, Window, WindowPicking,
+    WindowPickingCapability,
 };
 
 use super::{
@@ -15,6 +16,12 @@ use super::{
 pub struct WindowsBackend {
     /// `None` when WGC is unavailable and every capture falls back to GDI.
     wgc: Option<wgc::WgcDevice>,
+}
+
+struct WindowCapture {
+    frame: Frame,
+    source_app: SourceApp,
+    window_shadow: bool,
 }
 
 impl WindowsBackend {
@@ -44,11 +51,7 @@ impl WindowsBackend {
     fn capture_display(&self, monitor: &MonitorRecord, request: &CaptureRequest) -> Result<Frame> {
         if let Some(device) = &self.wgc {
             let item = wgc::item_for_monitor(monitor.handle)?;
-            match wgc::capture_item(device, &item, request.cursor, monitor.scale) {
-                Ok(frame) => return Ok(frame),
-                Err(e @ Error::TargetGone(_)) => return Err(e),
-                Err(_) => {}
-            }
+            return wgc::capture_item(device, &item, request.cursor, monitor.scale);
         }
         gdi::capture_rect(monitor.bounds, monitor.scale)
     }
@@ -57,21 +60,30 @@ impl WindowsBackend {
         &self,
         id: &scrozz_core::WindowId,
         request: &CaptureRequest,
-    ) -> Result<Frame> {
+    ) -> Result<WindowCapture> {
         let (record, monitors) = enumerate::window_by_id(id)?;
         let scale = monitors
             .get(record.monitor)
             .map_or(ScaleFactor::IDENTITY, |m| m.scale);
 
-        if let Some(device) = &self.wgc {
+        let frame = if let Some(device) = &self.wgc {
             let item = wgc::item_for_window(record.handle)?;
-            match wgc::capture_item(device, &item, request.cursor, scale) {
-                Ok(frame) => return Ok(frame),
-                Err(e @ Error::TargetGone(_)) => return Err(e),
-                Err(_) => {}
-            }
-        }
-        gdi::capture_window(record.handle, record.bounds, scale)
+            // Once WGC is selected, its native-alpha guarantee is part of the
+            // advertised picker capability. Propagate capture failures instead
+            // of silently replacing those pixels with opaque PrintWindow output.
+            wgc::capture_item(device, &item, request.cursor, scale)?
+        } else {
+            gdi::capture_window(record.handle, record.bounds, scale)?
+        };
+
+        Ok(WindowCapture {
+            frame,
+            source_app: record.source_app(),
+            window_shadow: self
+                .window_picking()
+                .shadow
+                .resolve(request.include_window_shadow),
+        })
     }
 
     /// Captures a user-chosen rectangle.
@@ -149,12 +161,21 @@ impl WindowsBackend {
         let stride = pixels::min_stride(width);
         let mut data = vec![0u8; pixels::buffer_len(stride, height)];
         let origin = (canvas.origin.x, canvas.origin.y);
+        let mut captured = 0usize;
+        let mut last_error = None;
 
         for monitor in &monitors {
-            let Ok(frame) = self.capture_display(monitor, request) else {
-                // One unplugged monitor should not lose the other three.
-                continue;
+            let frame = match self.capture_display(monitor, request) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    // One unplugged monitor should not lose the other three,
+                    // but returning a transparent success when every capture
+                    // failed would be a lie.
+                    last_error = Some(error);
+                    continue;
+                }
             };
+            captured += 1;
             let placement =
                 geom::placement_in_composite(monitor.bounds, monitor.scale, origin, scale);
             pixels::blit_nearest(
@@ -172,6 +193,12 @@ impl WindowsBackend {
                     height: frame.height(),
                 },
             );
+        }
+
+        if captured == 0 {
+            return Err(last_error.unwrap_or_else(|| {
+                Error::Platform("all enumerated displays failed to capture".to_owned())
+            }));
         }
 
         Ok(Frame {
@@ -210,16 +237,41 @@ impl TargetEnumerator for WindowsBackend {
     }
 }
 
+impl WindowPicking for WindowsBackend {
+    fn window_picking(&self) -> WindowPickingCapability {
+        pixels::window_picking_capability(self.wgc.is_some())
+    }
+}
+
+fn finish_capture(
+    frame: Frame,
+    provenance: Provenance,
+    target: CaptureTarget,
+    window: Option<(SourceApp, bool)>,
+) -> Capture {
+    let capture = Capture::new(frame, provenance, target);
+    match window {
+        Some((source, shadow)) => capture.with_source_app(source).with_window_shadow(shadow),
+        None => capture,
+    }
+}
+
 impl CaptureBackend for WindowsBackend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
-        let frame = match &request.target {
+        let (frame, window) = match &request.target {
             CaptureTarget::Display(id) => {
                 let monitor = enumerate::monitor_by_id(id)?;
-                self.capture_display(&monitor, request)?
+                (self.capture_display(&monitor, request)?, None)
             }
-            CaptureTarget::Window(id) => self.capture_window(id, request)?,
-            CaptureTarget::Region(rect) => self.capture_region(*rect, request)?,
-            CaptureTarget::AllDisplays => self.capture_all(request)?,
+            CaptureTarget::Window(id) => {
+                let captured = self.capture_window(id, request)?;
+                (
+                    captured.frame,
+                    Some((captured.source_app, captured.window_shadow)),
+                )
+            }
+            CaptureTarget::Region(rect) => (self.capture_region(*rect, request)?, None),
+            CaptureTarget::AllDisplays => (self.capture_all(request)?, None),
         };
 
         // Decision D9: a window capture is returned exactly as the compositor
@@ -233,11 +285,12 @@ impl CaptureBackend for WindowsBackend {
             CaptureTarget::AllDisplays => Provenance::AllDisplays,
         };
 
-        Ok(Capture {
+        Ok(finish_capture(
             frame,
             provenance,
-            target: request.target.clone(),
-        })
+            request.target.clone(),
+            window,
+        ))
     }
 
     fn name(&self) -> &str {
@@ -257,4 +310,75 @@ impl CaptureBackend for WindowsBackend {
 /// station at all.
 pub fn backend() -> Result<Box<dyn CaptureBackend>> {
     Ok(Box::new(WindowsBackend::new()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use scrozz_core::{
+        ColorSpace, PixelFormat, ShadowSupport, SourceApp, WindowId, WindowPicking, WindowSelection,
+    };
+
+    use super::*;
+
+    fn sample_frame() -> Frame {
+        Frame {
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            size: Size::new(2.0, 1.0),
+            stride: 8,
+            format: PixelFormat::BgraPremultiplied8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn picker_reports_dynamic_alpha_and_fixed_shadow_capabilities() {
+        let gdi = WindowsBackend { wgc: None }.window_picking();
+        let wgc = pixels::window_picking_capability(true);
+
+        assert_eq!(gdi.selection, WindowSelection::InProcess);
+        assert!(!gdi.native_alpha);
+        assert!(wgc.native_alpha);
+        assert!(matches!(gdi.shadow, ShadowSupport::AlwaysExcluded { .. }));
+        assert!(matches!(wgc.shadow, ShadowSupport::AlwaysExcluded { .. }));
+        assert!(!gdi.shadow.resolve(true));
+        assert!(!gdi.shadow.resolve(false));
+        assert!(!wgc.shadow.resolve(true));
+    }
+
+    #[test]
+    fn window_completion_preserves_pixels_and_records_source() {
+        let frame = sample_frame();
+        let original = frame.data.clone();
+        let source = SourceApp {
+            name: Some("Browser".into()),
+            identifier: Some("browser.exe".into()),
+            window_title: Some("Document".into()),
+        };
+        let capture = finish_capture(
+            frame,
+            Provenance::Window,
+            CaptureTarget::Window(WindowId("42".into())),
+            Some((source.clone(), false)),
+        );
+
+        assert_eq!(capture.frame.data, original);
+        assert_eq!(capture.frame.stride, 8);
+        assert_eq!(capture.frame.format, PixelFormat::BgraPremultiplied8);
+        assert_eq!(capture.source_app, source);
+        assert_eq!(capture.window_shadow, Some(false));
+        assert!(capture.provenance.forbids_compositing());
+    }
+
+    #[test]
+    fn non_window_completion_has_no_source_or_shadow_question() {
+        let capture = finish_capture(
+            sample_frame(),
+            Provenance::AllDisplays,
+            CaptureTarget::AllDisplays,
+            None,
+        );
+        assert!(!capture.source_app.is_known());
+        assert_eq!(capture.window_shadow, None);
+    }
 }

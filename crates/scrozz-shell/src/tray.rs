@@ -109,7 +109,7 @@ impl TrayAction {
     pub const fn is_available(self) -> bool {
         matches!(
             self,
-            Self::CaptureFullscreen | Self::OpenSettings | Self::Quit
+            Self::CaptureWindow | Self::CaptureFullscreen | Self::OpenSettings | Self::Quit
         )
     }
 }
