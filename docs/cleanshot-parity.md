@@ -455,6 +455,13 @@ Parity alone gives no reason to switch. Candidates, none committed:
 
 - **True cross-platform** — no competitor does macOS + Windows + Linux well. This is the whole thesis.
 - **Genuinely free and OSI-licensed** — CleanShot $29, Cap $58, Shottr $8, Capso BSL.
+- **The capture dock** — swipe the capture list down and it collapses into a small
+  chevron'd bar at the screen corner; click or swipe up to bring it back. CleanShot
+  offers "temporarily hide overlays" as a settings toggle, not a spatial,
+  reversible, one-gesture affordance. See `decisions.md` D20.
+- **Annotations that are never permanent** — history persists the full editable
+  document, so any past capture reopens with its annotations live. No project
+  files to manage, which is strictly better than CleanShot's `.cleanshot` format.
 - **Scriptable/CLI-first** — a headless `scrozz capture --area ... --out ...` makes the app
   automatable and, critically, testable in CI.
 - **Sync across machines via BYO storage** — settings and history, no vendor account.

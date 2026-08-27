@@ -515,7 +515,56 @@ the test already exist.
 
 ---
 
-# Open questions
+## D20 — The capture dock
+
+**Decision.** Swiping the capture list **down** collapses it into a **dock**: a
+short, wide box at the **bottom-left of the screen**, the **same width as a
+capture card** but roughly **one-sixth the height**, carrying an **upward
+chevron**. **Clicking it or swiping up** brings the captures back.
+
+**Swiping down collapses — it never dismisses.** Nothing is lost; the captures
+are still there, just out of the way.
+
+**Motion.** Collapse and expand are headline animations. Cards must visibly
+travel *into* the dock and *out* of it — a fade would be wrong. The spatial
+relationship between the dock and the captures has to be legible.
+
+**Why.** Maintainer's design. It solves a real problem CleanShot doesn't: the
+overlay is in the way, but dealing with every capture individually just to clear
+the screen is friction. The dock gets the whole list out of the way in one
+gesture and costs nothing to bring back.
+
+This is a **beyond-parity differentiator** — CleanShot has "temporarily hide
+overlays" as a settings toggle, not a spatial, reversible, one-gesture affordance.
+
+---
+
+## D21 — The complete overlay animation set
+
+**Decision.** The overlay animates in exactly five places, and nowhere else:
+
+1. **Card enters** — slides in from the left, off-screen, spring settle. Captures
+   accumulate one after another, vertically, still without overlap (D12).
+2. **Existing cards make room** — spring settle with a slight stagger.
+3. **Card leaves** — via **close, copy, save, or swipe-left**. All four dismiss
+   the card and animate it away.
+4. **Neighbours close the gap** — spring settle.
+5. **Dock collapse and expand** (D20).
+
+**Button press animation is explicitly optional** and lowest priority.
+
+**The mental model is phone notifications:** a vertical list of discrete cards
+that accumulate, get swiped away individually, and can be collapsed out of the
+way.
+
+**Why copy and save also dismiss.** That is the actual workflow — capture, copy,
+gone. Leaving a card on screen after its action has been taken is clutter.
+
+**Why so few.** Maintainer: *"im realizing theres not that much animation… it
+might be nice to animate button presses for example, but that's not a hard
+requirement."* Motion budget concentrated on the handful of moments that carry
+the product's feel beats motion sprinkled everywhere — and per D19, easing
+controls actively makes an app feel slower.
 
 - **Q12 — UI stack (egui).** Provisional, pending the visual spike in
   `spikes/ui-spike/`. Decided on screenshots, not argument.
