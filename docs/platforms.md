@@ -88,7 +88,50 @@ behaviour the first three layers structurally cannot reach.
    compositor genuinely cannot do something. A gap that is documented is a
    limitation; a gap that is papered over is a bug report.
 
-## Known asymmetry, stated honestly
+## Platform gotchas discovered while building
+
+Recorded as they are found, because each one cost real time and every one of
+them is invisible until it bites.
+
+### Silent failures — APIs that lie about succeeding
+
+These are the dangerous class: the call returns success and nothing works.
+
+1. **macOS `RegisterEventHotKey` returns `noErr` for shortcuts the system already
+   owns** (`Cmd+Shift+4`, for instance). Registration "succeeds", the handler
+   never fires, and no API will tell you. **Never trust its return value** —
+   conflicts must be caught up-front against a table of reserved shortcuts.
+2. **`global-hotkey` is X11-only on Linux.** On Wayland it falls back to a no-op
+   that returns `Ok(())`. Taken at face value, Scrozz would report hotkeys as
+   working on every Wayland session while none of them fire. Detect the session
+   and return `Error::Unsupported` per D11 rather than believing the crate.
+3. **`tray-icon` and `muda` types are `Rc`-based and `!Send`**, and — along with
+   `GlobalHotKeyManager` — require the main thread with a live event loop.
+   Failure to satisfy that is also silent.
+
+### Process-global state
+
+4. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
+   Setting it once permanently starves the process-global receiver channel for
+   *every* other consumer in the process. Use `receiver()` instead; a library
+   crate must never claim the handler.
+
+### Coordinate systems
+
+5. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
+   `visibleFrame` and Vision's normalised text boxes all need flipping. This is
+   the classic "everything is upside down" bug and it is easy to get almost-right.
+6. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
+   or above the primary. Never assume the origin is `(0, 0)`.
+
+### Scale
+
+7. **There is no single app-wide scale factor on Windows or Wayland.** Windows
+   desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
+   Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+
+---
+
 
 macOS is where interactive verification happens today, so macOS code will be
 better tested than Windows or Linux code until layer 4 exists. That is a real
