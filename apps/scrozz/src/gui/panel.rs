@@ -28,11 +28,11 @@
 //! `detail` string rather than being a bool.
 
 use std::ffi::c_void;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::{cell::RefCell, rc::Rc};
 
 use raw_window_handle::HasWindowHandle;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use raw_window_handle::RawWindowHandle;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
 use scrozz_ui::PanelReport;
@@ -45,6 +45,10 @@ use scrozz_ui::PanelReport;
 pub struct BehaviorController {
     #[cfg(target_os = "macos")]
     overlay: Rc<RefCell<Option<NativeOverlay>>>,
+    #[cfg(target_os = "linux")]
+    x11_focus: Rc<RefCell<Option<scrozz_shell::X11FocusLease>>>,
+    #[cfg(test)]
+    behavior_log: Rc<RefCell<Vec<bool>>>,
 }
 
 impl BehaviorController {
@@ -57,13 +61,44 @@ impl BehaviorController {
             tracing::warn!(%error, "could not update native overlay behavior");
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        if let Some(focus) = self.x11_focus.borrow_mut().as_mut()
+            && let Err(error) = focus.set_wants_focus(behavior.accepts_key)
+        {
+            tracing::warn!(%error, "could not update X11 selector keyboard focus");
+        }
+
+        #[cfg(test)]
+        self.behavior_log.borrow_mut().push(behavior.accepts_key);
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
         let _ = behavior;
+    }
+
+    /// Retries native behavior that had to wait for queued window commands.
+    pub fn refresh(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(focus) = self.x11_focus.borrow_mut().as_mut()
+            && let Err(error) = focus.refresh()
+        {
+            tracing::warn!(%error, "could not acquire X11 selector keyboard focus");
+        }
     }
 
     #[cfg(target_os = "macos")]
     fn install(&self, overlay: NativeOverlay) {
         *self.overlay.borrow_mut() = Some(overlay);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_x11_focus(&self, focus: scrozz_shell::X11FocusLease) {
+        *self.x11_focus.borrow_mut() = Some(focus);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recording() -> (Self, Rc<RefCell<Vec<bool>>>) {
+        let controller = Self::default();
+        (controller.clone(), Rc::clone(&controller.behavior_log))
     }
 }
 
@@ -180,7 +215,20 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             report
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            let detail = match attach_x11_focus_handle(handle.as_raw(), &controller) {
+                Ok(()) => {
+                    "attached direct X11 selection focus; native capture-card input shaping is \
+                     still unavailable on this branch"
+                        .to_owned()
+                }
+                Err(error) => error,
+            };
+            PanelReport::unsupported(detail)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = handle;
             let _ = controller;
@@ -190,6 +238,55 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             )
         }
     })
+}
+
+/// Attaches direct keyboard-focus ownership to an eframe X11 window.
+///
+/// This is separate from panel conversion so the one-shot selector can retain
+/// X11 focus without attempting the macOS-only AppKit conversion.
+#[cfg(target_os = "linux")]
+pub fn attach_x11_focus(
+    cc: &eframe::CreationContext<'_>,
+    controller: &BehaviorController,
+) -> Result<(), String> {
+    let handle = cc
+        .window_handle()
+        .map_err(|error| format!("eframe reported no window handle for X11 focus: {error}"))?;
+    attach_x11_focus_handle(handle.as_raw(), controller)
+}
+
+#[cfg(target_os = "linux")]
+fn attach_x11_focus_handle(
+    handle: RawWindowHandle,
+    controller: &BehaviorController,
+) -> Result<(), String> {
+    let window = match handle {
+        RawWindowHandle::Xlib(xlib) => u32::try_from(xlib.window).map_err(|_| {
+            format!(
+                "the X11 window ID {} does not fit the protocol's 32-bit window field",
+                xlib.window
+            )
+        })?,
+        RawWindowHandle::Xcb(xcb) => xcb.window.get(),
+        RawWindowHandle::Wayland(_) => {
+            return Err(
+                "Wayland controls keyboard focus; direct X11 focus is unavailable".to_owned(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "the selector window is neither X11 nor Wayland ({other:?})"
+            ));
+        }
+    };
+
+    match scrozz_shell::X11FocusLease::adopt(window) {
+        Ok(focus) => {
+            controller.install_x11_focus(focus);
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[cfg(test)]

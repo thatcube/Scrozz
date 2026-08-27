@@ -920,8 +920,10 @@ pub fn native_drag_source() -> Result<NativeDragSource> {
 /// That is a real difference from macOS and Windows and is stated rather than
 /// papered over.
 ///
-/// **What blocks it:** `x11rb` is a workspace dependency but not a
-/// `scrozz-shell` one; only `ashpd` is declared for Linux here.
+/// **What still blocks it:** the XDND state machine, selection ownership and
+/// event-loop integration are not implemented. `x11rb` is available here for
+/// the independent selection-focus adapter, but adding a dependency never makes
+/// those protocol semantics exist.
 ///
 /// # Linux/Wayland
 ///
@@ -982,10 +984,10 @@ pub mod unimplemented_platform {
 
     /// Why this platform cannot drag yet, in the terms the module docs set out.
     #[cfg(target_os = "linux")]
-    const WHY: &str = "the X11 XDND backend needs the `x11rb` dependency, which \
-                       scrozz-shell does not declare, and the Wayland backend \
-                       additionally needs the input-event serial that authorised \
-                       the gesture, which DragOrigin does not yet carry";
+    const WHY: &str = "the X11 XDND state machine and selection-serving loop are \
+                       not implemented, and the Wayland backend additionally \
+                       needs the input-event serial that authorised the gesture, \
+                       which DragOrigin does not yet carry";
 
     /// Why this platform cannot drag yet, in the terms the module docs set out.
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]

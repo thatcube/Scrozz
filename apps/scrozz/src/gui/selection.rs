@@ -267,6 +267,12 @@ enum ControllerPhase {
         viewports: SelectorViewports,
         decision: Sender<Result<SelectionOutcome>>,
     },
+    ReleaseBeforeHide {
+        id: u64,
+        decision: Sender<Result<SelectionOutcome>>,
+        result: Result<SelectionOutcome>,
+        viewports: SelectorViewports,
+    },
     HideAfterDecision {
         id: u64,
         decision: Sender<Result<SelectionOutcome>>,
@@ -596,10 +602,11 @@ impl CaptureSelector for ClientOverlaySelector {
 impl ClientOverlayController {
     /// Advances lifecycle handshakes and applies viewport/native behavior.
     pub fn logic(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
-        self.advance(ctx);
+        self.advance(ctx, native);
         while let Ok(event) = self.events.try_recv() {
             self.handle_event(ctx, native, event);
         }
+        native.refresh();
     }
 
     /// Draws the selector when a prepared selection owns the window.
@@ -640,15 +647,19 @@ impl ClientOverlayController {
             SelectionDecision::Cancelled => Err(Error::Cancelled),
         };
 
-        if let ControllerPhase::Selecting { viewports, .. } = &self.phase {
-            viewports.hide(ui.ctx());
-        }
         let phase = std::mem::replace(&mut self.phase, ControllerPhase::Cards);
-        if let ControllerPhase::Selecting { id, decision, .. } = phase {
-            self.phase = ControllerPhase::HideAfterDecision {
+        if let ControllerPhase::Selecting {
+            id,
+            decision,
+            viewports,
+            ..
+        } = phase
+        {
+            self.phase = ControllerPhase::ReleaseBeforeHide {
                 id,
                 decision,
                 result,
+                viewports,
             };
         }
     }
@@ -659,7 +670,7 @@ impl ClientOverlayController {
         !matches!(self.phase, ControllerPhase::Cards)
     }
 
-    fn advance(&mut self, ctx: &egui::Context) {
+    fn advance(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
         let phase = std::mem::replace(&mut self.phase, ControllerPhase::Cards);
         self.phase = match phase {
             ControllerPhase::HideBeforeCapture { id, hidden } => {
@@ -669,6 +680,20 @@ impl ClientOverlayController {
             ControllerPhase::HideBeforePreparation { id, hidden } => {
                 let _ = hidden.send(());
                 ControllerPhase::WaitingForPreparation { id }
+            }
+            ControllerPhase::ReleaseBeforeHide {
+                id,
+                decision,
+                result,
+                viewports,
+            } => {
+                native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                viewports.hide(ctx);
+                ControllerPhase::HideAfterDecision {
+                    id,
+                    decision,
+                    result,
+                }
             }
             ControllerPhase::HideAfterDecision {
                 id,
@@ -748,6 +773,7 @@ impl ClientOverlayController {
                 ) =>
             {
                 if self.completion == Completion::CloseWindow {
+                    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     let _ = restored.send(());
                     self.phase = ControllerPhase::Cards;
@@ -764,10 +790,13 @@ impl ClientOverlayController {
                 let _ = restored.send(());
             }
             BridgeEvent::Cancel => {
-                if let ControllerPhase::Selecting { viewports, .. } = &self.phase {
-                    viewports.hide(ctx);
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                match &self.phase {
+                    ControllerPhase::Selecting { viewports, .. }
+                    | ControllerPhase::ReleaseBeforeHide { viewports, .. } => {
+                        viewports.hide(ctx);
+                    }
+                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
                 }
                 if self.completion == Completion::CloseWindow {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1433,7 +1462,7 @@ mod tests {
             let _ = owner_finished_tx.send(());
         });
         let ctx = egui::Context::default();
-        let native = crate::gui::panel::BehaviorController::default();
+        let (native, behavior_log) = crate::gui::panel::BehaviorController::recording();
 
         wait_until(|| {
             controller.logic(&ctx, &native);
@@ -1454,6 +1483,7 @@ mod tests {
             matches!(&controller.phase, ControllerPhase::Selecting { .. })
         });
         assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(*behavior_log.borrow(), vec![true]);
 
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -1469,8 +1499,27 @@ mod tests {
         output.textures_delta.clear();
         assert!(matches!(
             &controller.phase,
+            ControllerPhase::ReleaseBeforeHide { .. }
+        ));
+        assert_eq!(
+            *behavior_log.borrow(),
+            vec![true],
+            "focus must remain owned until the decision handshake advances"
+        );
+        controller.logic(&ctx, &native);
+        assert_eq!(
+            *behavior_log.borrow(),
+            vec![true, false],
+            "native focus must be released before the selector is hidden"
+        );
+        assert!(matches!(
+            &controller.phase,
             ControllerPhase::HideAfterDecision { .. }
         ));
+        assert!(
+            selected_rx.try_recv().is_err(),
+            "capture must wait until the hidden selector frame has elapsed"
+        );
         controller.logic(&ctx, &native);
         let selected = selected_rx
             .recv_timeout(Duration::from_secs(1))
