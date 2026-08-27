@@ -81,6 +81,7 @@
 #![forbid(unsafe_code)]
 
 pub mod card;
+pub mod editor;
 pub mod harness;
 pub mod icons;
 pub mod motion;

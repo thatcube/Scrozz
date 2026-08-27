@@ -3219,8 +3219,10 @@ dependencies = [
 name = "scrozz-annotate"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "image",
  "scrozz-core",
+ "scrozz-export",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3350,6 +3352,7 @@ dependencies = [
  "resvg",
  "scrozz-annotate",
  "scrozz-core",
+ "scrozz-export",
  "thiserror 2.0.20",
  "tracing",
 ]

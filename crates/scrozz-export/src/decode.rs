@@ -10,8 +10,14 @@
 //! annotation document outlived its pixels (D23), and importing an image to
 //! annotate.
 
-use image::ImageReader;
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use scrozz_core::{ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, ScaleFactor};
+
+use crate::profile_for;
+
+/// 8K-class inputs fit; dimensions large enough to threaten the process do not.
+const MAX_DECODED_PIXELS: u64 = 40_000_000;
+const MAX_DECODER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Decodes encoded image bytes into a frame.
 ///
@@ -21,12 +27,10 @@ use scrozz_core::{ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, S
 ///
 /// # Colour space
 ///
-/// Reported as [`ColorSpace::Unknown`] rather than assumed to be sRGB. The bytes
-/// may carry an ICC profile this decoder does not interpret, and claiming sRGB
-/// for a Display P3 image is precisely the mistake that makes wide-gamut
-/// screenshots look wrong — washed out in some viewers, oversaturated in others.
-/// `Unknown` lets an encoder decline to embed a profile instead of embedding a
-/// false one.
+/// ICC profiles emitted by Scrozz are recognised exactly. Other embedded
+/// profiles remain [`ColorSpace::Unknown`] rather than being guessed: claiming
+/// sRGB for a Display P3 image is precisely the mistake that makes wide-gamut
+/// screenshots look wrong.
 ///
 /// # Scale
 ///
@@ -40,12 +44,30 @@ use scrozz_core::{ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, S
 /// Returns [`Error::Codec`] if the bytes are not a supported image, or if the
 /// image is too large to address.
 pub fn decode(bytes: &[u8]) -> Result<Frame> {
-    let reader = ImageReader::new(std::io::Cursor::new(bytes))
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| Error::Codec(format!("could not read image header: {e}")))?;
+    reader.limits(decoder_limits());
 
-    let image = reader
-        .decode()
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| Error::Codec(format!("could not create image decoder: {e}")))?;
+    let (width, height) = decoder.dimensions();
+    let decoded_bytes = decoder.total_bytes();
+    validate_decoded_layout(width, height, decoded_bytes)?;
+    let mut remaining = decoder_limits();
+    remaining
+        .reserve(decoded_bytes)
+        .map_err(|e| Error::Codec(format!("decoded image exceeds memory limits: {e}")))?;
+    decoder
+        .set_limits(remaining)
+        .map_err(|e| Error::Codec(format!("decoder cannot enforce memory limits: {e}")))?;
+    let color_space = decoder
+        .icc_profile()
+        .map_err(|e| Error::Codec(format!("could not read image colour profile: {e}")))?
+        .as_deref()
+        .map_or(ColorSpace::Unknown, known_profile_space);
+    let image = DynamicImage::from_decoder(decoder)
         .map_err(|e| Error::Codec(format!("could not decode image: {e}")))?;
 
     let rgba = image.to_rgba8();
@@ -64,9 +86,45 @@ pub fn decode(bytes: &[u8]) -> Result<Frame> {
         size: PhysicalSize::new(f64::from(width), f64::from(height)),
         stride,
         format: PixelFormat::Rgba8,
-        color_space: ColorSpace::Unknown,
+        color_space,
         scale: ScaleFactor::IDENTITY,
     })
+}
+
+fn decoder_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_PIXELS as u32);
+    limits.max_image_height = Some(MAX_DECODED_PIXELS as u32);
+    limits.max_alloc = Some(MAX_DECODER_BYTES);
+    limits
+}
+
+fn validate_decoded_layout(width: u32, height: u32, decoded_bytes: u64) -> Result<()> {
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| Error::Codec(format!("image dimensions {width}x{height} overflow")))?;
+    if pixel_count > MAX_DECODED_PIXELS {
+        return Err(Error::Codec(format!(
+            "image {width}x{height} has {pixel_count} pixels; the limit is {MAX_DECODED_PIXELS}"
+        )));
+    }
+    if decoded_bytes > MAX_DECODER_BYTES {
+        return Err(Error::Codec(format!(
+            "decoded image needs {decoded_bytes} bytes; the limit is {MAX_DECODER_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn known_profile_space(profile: &[u8]) -> ColorSpace {
+    [ColorSpace::Srgb, ColorSpace::DisplayP3, ColorSpace::Rec2020]
+        .into_iter()
+        .find(|space| {
+            profile_for(*space)
+                .as_deref()
+                .is_some_and(|known| known == profile)
+        })
+        .unwrap_or(ColorSpace::Unknown)
 }
 
 /// Reads and decodes an image file.
@@ -84,7 +142,7 @@ pub fn decode_file(path: &std::path::Path) -> Result<Frame> {
 mod tests {
     use super::*;
     use crate::Encoder as _;
-    use crate::{ImageFormat, encode::FrameEncoder};
+    use crate::{EncodeOptions, ImageFormat, encode::FrameEncoder};
 
     fn solid_frame(w: u32, h: u32) -> Frame {
         let stride = w as usize * 4;
@@ -127,13 +185,33 @@ mod tests {
     }
 
     #[test]
-    fn colour_space_is_unknown_rather_than_assumed_srgb() {
-        // Claiming sRGB for what might be Display P3 is how wide-gamut captures
-        // come out wrong. Not knowing is the honest answer.
+    fn an_embedded_srgb_profile_is_restored() {
         let bytes = FrameEncoder::new()
             .encode(&solid_frame(4, 4), ImageFormat::Png)
             .expect("encode");
+        assert_eq!(decode(&bytes).unwrap().color_space, ColorSpace::Srgb);
+    }
+
+    #[test]
+    fn an_unprofiled_image_remains_unknown() {
+        let encoder = FrameEncoder::with_options(EncodeOptions {
+            embed_srgb_profile: false,
+            ..EncodeOptions::default()
+        });
+        let bytes = encoder
+            .encode(&solid_frame(4, 4), ImageFormat::Png)
+            .expect("encode");
         assert_eq!(decode(&bytes).unwrap().color_space, ColorSpace::Unknown);
+    }
+
+    #[test]
+    fn a_known_embedded_profile_is_restored() {
+        let mut frame = solid_frame(4, 4);
+        frame.color_space = ColorSpace::DisplayP3;
+        let bytes = FrameEncoder::new()
+            .encode(&frame, ImageFormat::Png)
+            .expect("encode");
+        assert_eq!(decode(&bytes).unwrap().color_space, ColorSpace::DisplayP3);
     }
 
     #[test]
@@ -154,5 +232,12 @@ mod tests {
     #[test]
     fn empty_input_is_a_codec_error() {
         assert!(matches!(decode(&[]).unwrap_err(), Error::Codec(_)));
+    }
+
+    #[test]
+    fn declared_dimensions_are_limited_before_pixel_allocation() {
+        let error = validate_decoded_layout(100_000, 100_000, 1)
+            .expect_err("ten billion pixels must be refused");
+        assert!(error.to_string().contains("pixels"));
     }
 }

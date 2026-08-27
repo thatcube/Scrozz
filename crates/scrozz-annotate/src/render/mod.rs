@@ -5,16 +5,20 @@ pub mod raster;
 pub mod redact;
 pub mod shapes;
 
-use scrozz_core::{Error, Frame, Result, ScaleFactor};
+use scrozz_core::{ColorSpace, Error, Frame, PixelFormat, Result, ScaleFactor};
+use scrozz_export::{RgbaImage, convert_to_srgb, to_straight_rgba8};
 use tiny_skia::{BlendMode, Pixmap, Transform};
 
 use crate::{
     annotation::{Annotation, AnnotationObject, RedactStyle},
-    document::Document,
+    document::{Beautification, Document, MAX_RASTER_PIXELS},
     style::Color,
 };
 
 use shapes::Scaled;
+
+const MAX_RENDER_WORKING_BYTES: u64 = 768 * 1024 * 1024;
+const BYTES_PER_PIXEL: u64 = 4;
 
 /// Renders a document to pixels.
 pub trait Renderer {
@@ -51,6 +55,15 @@ impl SkiaRenderer {
     /// the output would be zero-sized or unallocatable, or if the document
     /// carries beautification for a window capture — see decision D9.
     pub fn render_at(&self, document: &Document, scale: ScaleFactor) -> Result<Frame> {
+        self.render_at_with_width(document, scale, None)
+    }
+
+    fn render_at_with_width(
+        &self,
+        document: &Document,
+        scale: ScaleFactor,
+        target_width: Option<u32>,
+    ) -> Result<Frame> {
         // D9, second gate. `Document::set_beautification` refuses this too, but
         // a document can also arrive from persistence or from a future editing
         // path, and shipping a re-shadowed window capture must be impossible
@@ -61,10 +74,40 @@ impl SkiaRenderer {
             ));
         }
 
-        let source = raster::to_pixmap(&document.source.frame)?;
+        let edited = !document.annotations().is_empty()
+            || document
+                .beautification()
+                .is_some_and(|beautification| !beautification.is_noop());
         let logical = document.logical_size();
-        let width = (logical.width * scale.get()).round().max(1.0) as u32;
-        let height = (logical.height * scale.get()).round().max(1.0) as u32;
+        let width = checked_render_dimension(logical.width * scale.get(), "width")?;
+        let height = checked_render_dimension(logical.height * scale.get(), "height")?;
+        let converts_source = edited
+            && matches!(
+                document.source.frame.color_space,
+                ColorSpace::DisplayP3 | ColorSpace::Rec2020
+            );
+        let retained_background_bytes = match document.beautification() {
+            Some(beautification) => {
+                beautification.validate()?;
+                retained_background_bytes(beautification)?
+            }
+            None => 0,
+        };
+        preflight_render(
+            &document.source.frame,
+            width,
+            height,
+            converts_source,
+            retained_background_bytes,
+        )?;
+
+        let converted_source = if converts_source {
+            Some(frame_to_srgb(&document.source.frame)?)
+        } else {
+            None
+        };
+        let source_frame = converted_source.as_ref().unwrap_or(&document.source.frame);
+        let source = raster::to_pixmap(source_frame)?;
 
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
@@ -75,17 +118,51 @@ impl SkiaRenderer {
         for object in document.annotations() {
             draw_object(&mut canvas, object, xf);
         }
+        drop(source);
+        drop(converted_source);
 
+        let retained_source_bytes =
+            u64::try_from(document.source.frame.data.len()).map_err(|_| {
+                Error::InvalidRequest("source buffer size is not addressable".to_owned())
+            })?;
         let canvas = match document.beautification() {
-            Some(beautification) => beautify::apply(&canvas, beautification, scale.get())?,
-            None => canvas,
+            Some(beautification) if !beautification.is_noop() => {
+                beautify::apply_with_retained_bytes(
+                    &canvas,
+                    beautification,
+                    scale.get(),
+                    retained_source_bytes,
+                    target_width,
+                )?
+            }
+            Some(_) | None => canvas,
+        };
+        if let Some(target_width) = target_width
+            && canvas.width() != target_width
+        {
+            return Err(Error::InvalidRequest(format!(
+                "rendered width is {}, expected {target_width}",
+                canvas.width()
+            )));
+        }
+
+        let color_space = if !edited {
+            document.source.frame.color_space
+        } else if document.source.frame.color_space == ColorSpace::Unknown
+            || document.beautification().is_some_and(|beautification| {
+                matches!(
+                    &beautification.background,
+                    crate::Background::Image(image)
+                        if image.color_space() == ColorSpace::Unknown
+                )
+            })
+        {
+            ColorSpace::Unknown
+        } else {
+            ColorSpace::Srgb
         };
 
-        Ok(raster::from_pixmap(
-            canvas,
-            document.source.frame.color_space,
-            scale,
-        ))
+        Ok(raster::from_pixmap(canvas, color_space, scale))
     }
 
     /// Composites the document scaled so its output is `width` pixels wide.
@@ -100,13 +177,17 @@ impl SkiaRenderer {
                 "export width must be greater than zero".to_owned(),
             ));
         }
-        let logical = document.logical_size();
+        let logical = document.output_logical_size();
         if logical.width <= 0.0 {
             return Err(Error::InvalidRequest(
                 "cannot scale a source with no width".to_owned(),
             ));
         }
-        self.render_at(document, ScaleFactor::new(f64::from(width) / logical.width))
+        self.render_at_with_width(
+            document,
+            ScaleFactor::new(f64::from(width) / logical.width),
+            Some(width),
+        )
     }
 }
 
@@ -115,6 +196,89 @@ impl Renderer for SkiaRenderer {
     fn render(&self, document: &Document) -> Result<Frame> {
         self.render_at(document, document.source.frame.scale)
     }
+}
+
+fn checked_render_dimension(value: f64, name: &str) -> Result<u32> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return Err(Error::InvalidRequest(format!(
+            "rendered {name} {value} is not addressable"
+        )));
+    }
+    Ok(value.round().max(1.0) as u32)
+}
+
+fn preflight_render(
+    source: &Frame,
+    output_width: u32,
+    output_height: u32,
+    converts_source: bool,
+    retained_background_bytes: u64,
+) -> Result<()> {
+    let source_pixels = u64::from(source.width())
+        .checked_mul(u64::from(source.height()))
+        .ok_or_else(|| Error::InvalidRequest("source raster area overflowed".to_owned()))?;
+    let output_pixels = u64::from(output_width)
+        .checked_mul(u64::from(output_height))
+        .ok_or_else(|| Error::InvalidRequest("output raster area overflowed".to_owned()))?;
+    for (label, pixels) in [("source", source_pixels), ("output", output_pixels)] {
+        if pixels > MAX_RASTER_PIXELS {
+            return Err(Error::InvalidRequest(format!(
+                "{label} raster has {pixels} pixels; the limit is {MAX_RASTER_PIXELS}"
+            )));
+        }
+    }
+
+    let source_raster = source_pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| Error::InvalidRequest("source raster size overflowed".to_owned()))?;
+    let output_raster = output_pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| Error::InvalidRequest("output raster size overflowed".to_owned()))?;
+    let retained = u64::try_from(source.data.len())
+        .map_err(|_| Error::InvalidRequest("source buffer size is not addressable".to_owned()))?;
+    let source_copies = if converts_source { 2 } else { 1 };
+    let peak = source_raster
+        .checked_mul(source_copies)
+        .and_then(|bytes| bytes.checked_add(retained))
+        .and_then(|bytes| bytes.checked_add(retained_background_bytes))
+        .and_then(|bytes| bytes.checked_add(output_raster))
+        .ok_or_else(|| Error::InvalidRequest("render working set overflowed".to_owned()))?;
+    if peak > MAX_RENDER_WORKING_BYTES {
+        return Err(Error::InvalidRequest(format!(
+            "render needs about {} MiB of working memory; the limit is {} MiB",
+            peak.div_ceil(1024 * 1024),
+            MAX_RENDER_WORKING_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+fn retained_background_bytes(beautification: &Beautification) -> Result<u64> {
+    let crate::Background::Image(image) = &beautification.background else {
+        return Ok(0);
+    };
+    u64::from(image.width())
+        .checked_mul(u64::from(image.height()))
+        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        .and_then(|bytes| bytes.checked_add(image.encoded_len() as u64))
+        .ok_or_else(|| Error::InvalidRequest("background working set overflowed".to_owned()))
+}
+
+fn frame_to_srgb(frame: &Frame) -> Result<Frame> {
+    let source = to_straight_rgba8(frame)?;
+    let RgbaImage {
+        width,
+        height,
+        data,
+    } = convert_to_srgb(&source, frame.color_space)?;
+    Ok(Frame {
+        data,
+        size: scrozz_core::PhysicalSize::new(f64::from(width), f64::from(height)),
+        stride: width as usize * PixelFormat::Rgba8.bytes_per_pixel(),
+        format: PixelFormat::Rgba8,
+        color_space: ColorSpace::Srgb,
+        scale: frame.scale,
+    })
 }
 
 /// Draws the source image scaled to fill the canvas.

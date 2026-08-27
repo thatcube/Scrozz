@@ -508,6 +508,52 @@ fn a_dry_run_reports_the_plan_and_captures_nothing() {
 }
 
 #[test]
+fn a_dry_run_reports_the_resolved_beautification_plan() {
+    let out = scrozz([
+        "--json",
+        "capture",
+        "--region",
+        "0,0,300,200",
+        "--beautify",
+        "social",
+        "--background",
+        "#11223380",
+        "--aspect",
+        "wide",
+        "--alignment",
+        "bottom-right",
+        "--border",
+        "2",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(has_field(&text, "format", r#""automatic""#), "{text}");
+    assert!(has_field(&text, "auto_balance", "true"), "{text}");
+    assert!(has_field(&text, "aspect", r#""wide""#), "{text}");
+    assert!(has_field(&text, "alignment", r#""bottomright""#), "{text}");
+    assert!(has_field(&text, "background", r##""#11223380""##), "{text}");
+}
+
+#[test]
+fn d9_refuses_window_beautification_before_touching_a_backend() {
+    let out = scrozz([
+        "capture",
+        "--window",
+        "Safari",
+        "--beautify",
+        "clean",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 7, "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("window"), "{text}");
+    assert!(text.contains("D9"), "{text}");
+}
+
+#[test]
 fn generate_config_emits_something_a_compositor_will_accept() {
     let sway = stdout(&scrozz([
         "hotkey",

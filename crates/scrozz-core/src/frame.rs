@@ -112,6 +112,28 @@ impl Frame {
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         let min_stride = self.width() as usize * self.format.bytes_per_pixel();
-        self.stride >= min_stride && self.data.len() >= self.stride * self.height() as usize
+        self.stride >= min_stride
+            && self
+                .stride
+                .checked_mul(self.height() as usize)
+                .is_some_and(|needed| self.data.len() >= needed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostile_stride_overflow_is_malformed_not_a_panic() {
+        let frame = Frame {
+            data: Vec::new(),
+            size: PhysicalSize::new(1.0, 2.0),
+            stride: usize::MAX,
+            format: PixelFormat::Rgba8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::IDENTITY,
+        };
+        assert!(!frame.is_well_formed());
     }
 }

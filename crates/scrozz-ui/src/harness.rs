@@ -1870,7 +1870,11 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
+        me.register(
+            Scenario::EditorAnnotating,
+            Box::new(crate::editor::EditorPreviewScene::new()),
+        );
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));

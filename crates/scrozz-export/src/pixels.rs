@@ -243,7 +243,10 @@ pub fn to_straight_rgba8(frame: &Frame) -> Result<RgbaImage> {
         )));
     }
     if !frame.is_well_formed() {
-        let needed = frame.stride * height as usize;
+        let needed = frame.stride.checked_mul(height as usize).map_or_else(
+            || "an unaddressable number of bytes".to_owned(),
+            |n| n.to_string(),
+        );
         return Err(Error::InvalidRequest(format!(
             "frame buffer is {} bytes but {width}x{height} at stride {} needs {needed}",
             frame.data.len(),
@@ -311,6 +314,8 @@ fn unpremultiply(colour: [u8; 3], alpha: u8) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
+    use scrozz_core::{PhysicalSize, ScaleFactor};
+
     use super::*;
 
     #[test]
@@ -327,5 +332,18 @@ mod tests {
     #[test]
     fn half_alpha_white_round_trips_exactly() {
         assert_eq!(unpremultiply([128, 128, 128], 128), [255, 255, 255]);
+    }
+
+    #[test]
+    fn hostile_stride_overflow_returns_an_error() {
+        let frame = Frame {
+            data: Vec::new(),
+            size: PhysicalSize::new(1.0, 2.0),
+            stride: usize::MAX,
+            format: PixelFormat::Rgba8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::IDENTITY,
+        };
+        assert!(to_straight_rgba8(&frame).is_err());
     }
 }

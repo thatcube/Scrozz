@@ -1,15 +1,289 @@
 //! The document: a capture plus every edit ever made to it.
 
-use scrozz_core::{Capture, Error, LogicalPoint, LogicalRect, LogicalSize, Result};
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use scrozz_core::{
+    Capture, ColorSpace, Error, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
+    PixelFormat, Result, ScaleFactor,
+};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat, decode, to_straight_rgba8};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeStruct,
+};
 
 use crate::{
     annotation::{Annotation, AnnotationId, AnnotationObject},
     style::{Color, Style},
 };
 
+/// Rendered raster limit shared with the compositor.
+///
+/// Forty million pixels admits an 8K canvas while refusing dimensions
+/// large enough to make Rust's infallible allocator abort the process.
+pub(crate) const MAX_RASTER_PIXELS: u64 = 40_000_000;
+const MAX_BACKGROUND_PIXELS: u64 = 16_777_216;
+const MAX_BACKGROUND_BYTES: u64 = MAX_BACKGROUND_PIXELS * 4;
+const MAX_ENCODED_BACKGROUND_BYTES: u64 = MAX_BACKGROUND_BYTES + 1024 * 1024;
+
+/// A procedural background shipped with Scrozz.
+///
+/// These are values rather than asset paths so a document never depends on the
+/// current working directory, an install layout, or a file that can disappear.
+/// The renderer owns their exact deterministic appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInBackground {
+    /// Quiet cool-grey paper.
+    #[default]
+    Mist,
+    /// Periwinkle fading into violet, matching Scrozz's iris accent.
+    Iris,
+    /// Deep blue with a restrained cyan lift.
+    Midnight,
+    /// Soft peach and rose.
+    Sunrise,
+    /// Blue-green glass.
+    Lagoon,
+    /// Warm neutral studio paper.
+    Sand,
+}
+
+/// A self-contained custom background image.
+///
+/// Pixels stay as shared straight-alpha RGBA8 in memory. Persistence carries a
+/// bounded, base64-encoded PNG so a sidecar remains self-contained without
+/// materialising one JSON value per channel byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundImage {
+    /// Pixel width.
+    width: u32,
+    /// Pixel height.
+    height: u32,
+    /// Tightly packed straight-alpha RGBA8 samples.
+    pixels: Arc<[u8]>,
+    /// Interpretation of the colour samples.
+    color_space: ColorSpace,
+    encoded_png: Arc<[u8]>,
+}
+
+impl BackgroundImage {
+    /// Wraps a tightly packed RGBA8 image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for zero dimensions or a buffer whose
+    /// length does not exactly match `width × height × 4`.
+    pub fn new(width: u32, height: u32, pixels: Vec<u8>, color_space: ColorSpace) -> Result<Self> {
+        validate_background_pixels(width, height, &pixels)?;
+        let frame = Frame {
+            data: pixels,
+            size: PhysicalSize::new(f64::from(width), f64::from(height)),
+            stride: width as usize * PixelFormat::Rgba8.bytes_per_pixel(),
+            format: PixelFormat::Rgba8,
+            color_space,
+            scale: ScaleFactor::IDENTITY,
+        };
+        let encoded_png = FrameEncoder::new().encode(&frame, ImageFormat::Png)?;
+        Self::from_parts(width, height, frame.data, color_space, encoded_png)
+    }
+
+    fn from_parts(
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        color_space: ColorSpace,
+        encoded_png: Vec<u8>,
+    ) -> Result<Self> {
+        validate_background_pixels(width, height, &pixels)?;
+        if encoded_png.is_empty() || encoded_png.len() as u64 > MAX_ENCODED_BACKGROUND_BYTES {
+            return Err(Error::InvalidRequest(format!(
+                "encoded background is {} bytes; the limit is {MAX_ENCODED_BACKGROUND_BYTES}",
+                encoded_png.len()
+            )));
+        }
+        Ok(Self {
+            width,
+            height,
+            pixels: pixels.into(),
+            color_space,
+            encoded_png: encoded_png.into(),
+        })
+    }
+
+    /// Pixel width.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Pixel height.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Tightly packed straight-alpha RGBA8 samples.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Interpretation of the colour samples.
+    #[must_use]
+    pub const fn color_space(&self) -> ColorSpace {
+        self.color_space
+    }
+
+    /// Bytes in the compact persisted representation.
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.encoded_png.len()
+    }
+
+    /// Checks the pixel geometry without reading outside the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if the image is empty, too large to
+    /// address, or not tightly packed RGBA8.
+    pub fn validate(&self) -> Result<()> {
+        validate_background_pixels(self.width, self.height, &self.pixels)?;
+        if self.encoded_png.is_empty()
+            || self.encoded_png.len() as u64 > MAX_ENCODED_BACKGROUND_BYTES
+        {
+            return Err(Error::InvalidRequest(format!(
+                "encoded background is {} bytes; the limit is {MAX_ENCODED_BACKGROUND_BYTES}",
+                self.encoded_png.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BackgroundImage {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("BackgroundImage", 4)?;
+        state.serialize_field("width", &self.width)?;
+        state.serialize_field("height", &self.height)?;
+        state.serialize_field("pixels_png", &STANDARD.encode(&self.encoded_png))?;
+        state.serialize_field("color_space", &self.color_space)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BackgroundImage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct StoredBackgroundImage {
+            width: u32,
+            height: u32,
+            #[serde(default)]
+            pixels: Option<Vec<u8>>,
+            #[serde(default)]
+            pixels_png: Option<String>,
+            #[serde(default)]
+            color_space: ColorSpace,
+        }
+
+        let stored = StoredBackgroundImage::deserialize(deserializer)?;
+        validate_background_area(stored.width, stored.height).map_err(D::Error::custom)?;
+        match (stored.pixels, stored.pixels_png) {
+            (Some(pixels), None) => {
+                Self::new(stored.width, stored.height, pixels, stored.color_space)
+                    .map_err(D::Error::custom)
+            }
+            (None, Some(encoded)) => {
+                let max_base64 = MAX_ENCODED_BACKGROUND_BYTES.div_ceil(3) * 4;
+                if encoded.len() as u64 > max_base64 {
+                    return Err(D::Error::custom(format!(
+                        "encoded background text is {} bytes; the limit is {max_base64}",
+                        encoded.len()
+                    )));
+                }
+                let png = STANDARD.decode(encoded).map_err(D::Error::custom)?;
+                if png.len() as u64 > MAX_ENCODED_BACKGROUND_BYTES {
+                    return Err(D::Error::custom(format!(
+                        "encoded background is {} bytes; the limit is \
+                         {MAX_ENCODED_BACKGROUND_BYTES}",
+                        png.len()
+                    )));
+                }
+                let frame = decode(&png).map_err(D::Error::custom)?;
+                if frame.width() != stored.width || frame.height() != stored.height {
+                    return Err(D::Error::custom(format!(
+                        "encoded background is {}x{}, expected {}x{}",
+                        frame.width(),
+                        frame.height(),
+                        stored.width,
+                        stored.height
+                    )));
+                }
+                if frame.color_space != ColorSpace::Unknown
+                    && frame.color_space != stored.color_space
+                {
+                    return Err(D::Error::custom(format!(
+                        "encoded background profile is {:?}, metadata says {:?}",
+                        frame.color_space, stored.color_space
+                    )));
+                }
+                let pixels = to_straight_rgba8(&frame).map_err(D::Error::custom)?;
+                Self::from_parts(
+                    stored.width,
+                    stored.height,
+                    pixels.data,
+                    stored.color_space,
+                    png,
+                )
+                .map_err(D::Error::custom)
+            }
+            (Some(_), Some(_)) => Err(D::Error::custom(
+                "background image carries both legacy and compressed pixels",
+            )),
+            (None, None) => Err(D::Error::custom("background image has no pixels")),
+        }
+    }
+}
+
+fn validate_background_pixels(width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+    let pixel_count = validate_background_area(width, height)?;
+    let expected = usize::try_from(pixel_count)
+        .ok()
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!("background image {width}x{height} is too large"))
+        })?;
+    if width == 0 || height == 0 || pixels.len() != expected {
+        return Err(Error::InvalidRequest(format!(
+            "background image must be non-empty RGBA8: {} bytes for {width}x{height}",
+            pixels.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_background_area(width: u32, height: u32) -> Result<u64> {
+    let pixel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!("background image {width}x{height} is too large"))
+        })?;
+    if width == 0 || height == 0 || pixel_count > MAX_BACKGROUND_PIXELS {
+        return Err(Error::InvalidRequest(format!(
+            "background image {width}x{height} has {pixel_count} pixels; the limit is \
+             {MAX_BACKGROUND_PIXELS}"
+        )));
+    }
+    Ok(pixel_count)
+}
+
 /// The background painted behind a beautified capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Background {
     /// Nothing — the padding stays transparent.
@@ -24,6 +298,105 @@ pub enum Background {
         /// Colour at the bottom edge.
         end: Color,
     },
+    /// A procedural background bundled with Scrozz.
+    BuiltIn(BuiltInBackground),
+    /// A custom image, cropped to cover the canvas.
+    Image(BackgroundImage),
+}
+
+/// Where the capture sits when an aspect preset creates extra canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Alignment {
+    /// Top-left.
+    TopLeft,
+    /// Top edge, centred horizontally.
+    Top,
+    /// Top-right.
+    TopRight,
+    /// Left edge, centred vertically.
+    Left,
+    /// Centred on both axes.
+    #[default]
+    Center,
+    /// Right edge, centred vertically.
+    Right,
+    /// Bottom-left.
+    BottomLeft,
+    /// Bottom edge, centred horizontally.
+    Bottom,
+    /// Bottom-right.
+    BottomRight,
+}
+
+impl Alignment {
+    /// Horizontal alignment as a normalised 0–1 factor.
+    #[must_use]
+    pub const fn horizontal(self) -> f64 {
+        match self {
+            Self::TopLeft | Self::Left | Self::BottomLeft => 0.0,
+            Self::Top | Self::Center | Self::Bottom => 0.5,
+            Self::TopRight | Self::Right | Self::BottomRight => 1.0,
+        }
+    }
+
+    /// Vertical alignment as a normalised 0–1 factor.
+    #[must_use]
+    pub const fn vertical(self) -> f64 {
+        match self {
+            Self::TopLeft | Self::Top | Self::TopRight => 0.0,
+            Self::Left | Self::Center | Self::Right => 0.5,
+            Self::BottomLeft | Self::Bottom | Self::BottomRight => 1.0,
+        }
+    }
+}
+
+/// Output aspect ratios with names people recognise from their destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AspectPreset {
+    /// Keep the capture's natural aspect ratio.
+    #[default]
+    Original,
+    /// 1:1 social post.
+    Square,
+    /// 4:5 portrait post.
+    Portrait,
+    /// 9:16 story/reel.
+    Story,
+    /// 16:9 landscape post or thumbnail.
+    Landscape,
+    /// 3:1 social header.
+    Wide,
+}
+
+impl AspectPreset {
+    /// Width divided by height, or `None` for the source's natural ratio.
+    #[must_use]
+    pub const fn ratio(self) -> Option<f64> {
+        match self {
+            Self::Original => None,
+            Self::Square => Some(1.0),
+            Self::Portrait => Some(4.0 / 5.0),
+            Self::Story => Some(9.0 / 16.0),
+            Self::Landscape => Some(16.0 / 9.0),
+            Self::Wide => Some(3.0),
+        }
+    }
+}
+
+/// Named combinations available in the CLI and editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BeautificationPreset {
+    /// Neutral framing that works around any screenshot.
+    #[default]
+    Clean,
+    /// Square, colourful, and visually balanced for a social post.
+    Social,
+    /// Tall story/reel canvas.
+    Story,
+    /// Restrained warm paper with a fine border.
+    Editorial,
 }
 
 /// Padding, background and framing applied around a capture.
@@ -34,7 +407,8 @@ pub enum Background {
 /// enforcement point, [`Document::set_beautification`] is the gate, and the
 /// renderer refuses a second time so a document assembled by any other route
 /// still cannot slip through.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Beautification {
     /// Padding around the image, in logical points.
     pub padding: f64,
@@ -43,11 +417,42 @@ pub struct Beautification {
     /// Drop shadow depth.
     pub shadow: f64,
     /// What fills the padding.
-    #[serde(default)]
     pub background: Background,
+    /// Position within any extra canvas created by the aspect preset.
+    pub alignment: Alignment,
+    /// Shift the capture so its visual weight, not merely its bounds, is centred.
+    pub auto_balance: bool,
+    /// Output aspect ratio.
+    pub aspect: AspectPreset,
+    /// Border width drawn inside the rounded capture edge, in logical points.
+    pub border_width: f64,
+    /// Border colour.
+    pub border_color: Color,
+}
+
+impl Default for Beautification {
+    fn default() -> Self {
+        Self {
+            padding: 0.0,
+            corner_radius: 0.0,
+            shadow: 0.0,
+            background: Background::Transparent,
+            alignment: Alignment::Center,
+            auto_balance: false,
+            aspect: AspectPreset::Original,
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        }
+    }
 }
 
 impl Beautification {
+    /// Largest supported logical measurement.
+    ///
+    /// This is intentionally generous. The limit exists to turn corrupt
+    /// sidecars into a useful error before they request a multi-terabyte pixmap.
+    pub const MAX_MEASUREMENT: f64 = 16_384.0;
+
     /// A preset: generous padding on a flat neutral background, no shadow.
     #[must_use]
     pub fn padded(padding: f64, background: Background) -> Self {
@@ -56,6 +461,62 @@ impl Beautification {
             corner_radius: 0.0,
             shadow: 0.0,
             background,
+            alignment: Alignment::Center,
+            auto_balance: false,
+            aspect: AspectPreset::Original,
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        }
+    }
+
+    /// One of Scrozz's named starting points.
+    #[must_use]
+    pub const fn preset(preset: BeautificationPreset) -> Self {
+        match preset {
+            BeautificationPreset::Clean => Self {
+                padding: 40.0,
+                corner_radius: 16.0,
+                shadow: 18.0,
+                background: Background::BuiltIn(BuiltInBackground::Mist),
+                alignment: Alignment::Center,
+                auto_balance: false,
+                aspect: AspectPreset::Original,
+                border_width: 1.0,
+                border_color: Color::rgba(255, 255, 255, 90),
+            },
+            BeautificationPreset::Social => Self {
+                padding: 64.0,
+                corner_radius: 20.0,
+                shadow: 24.0,
+                background: Background::BuiltIn(BuiltInBackground::Iris),
+                alignment: Alignment::Center,
+                auto_balance: true,
+                aspect: AspectPreset::Square,
+                border_width: 1.0,
+                border_color: Color::rgba(255, 255, 255, 110),
+            },
+            BeautificationPreset::Story => Self {
+                padding: 72.0,
+                corner_radius: 24.0,
+                shadow: 28.0,
+                background: Background::BuiltIn(BuiltInBackground::Midnight),
+                alignment: Alignment::Center,
+                auto_balance: true,
+                aspect: AspectPreset::Story,
+                border_width: 1.0,
+                border_color: Color::rgba(255, 255, 255, 90),
+            },
+            BeautificationPreset::Editorial => Self {
+                padding: 56.0,
+                corner_radius: 10.0,
+                shadow: 14.0,
+                background: Background::BuiltIn(BuiltInBackground::Sand),
+                alignment: Alignment::Center,
+                auto_balance: false,
+                aspect: AspectPreset::Portrait,
+                border_width: 1.0,
+                border_color: Color::rgba(65, 53, 43, 65),
+            },
         }
     }
 
@@ -76,6 +537,51 @@ impl Beautification {
             && self.corner_radius <= 0.0
             && self.shadow <= 0.0
             && self.background == Background::Transparent
+            && self.aspect == AspectPreset::Original
+            && self.border_width <= 0.0
+    }
+
+    /// Validates values before they can reach allocation or rasterisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for a non-finite, negative, or
+    /// implausibly large measurement, or malformed custom background pixels.
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("padding", self.padding),
+            ("corner radius", self.corner_radius),
+            ("shadow", self.shadow),
+            ("border width", self.border_width),
+        ] {
+            if !value.is_finite() || !(0.0..=Self::MAX_MEASUREMENT).contains(&value) {
+                return Err(Error::InvalidRequest(format!(
+                    "beautification {name} must be between 0 and {}, got {value}",
+                    Self::MAX_MEASUREMENT
+                )));
+            }
+        }
+        if let Background::Image(image) = &self.background {
+            image.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Logical output size before rasterisation.
+    ///
+    /// Aspect presets only add canvas; they never crop or scale the capture.
+    #[must_use]
+    pub fn output_size(&self, content: LogicalSize) -> LogicalSize {
+        let base_width = content.width + self.padding * 2.0;
+        let base_height = content.height + self.padding * 2.0;
+        let Some(ratio) = self.aspect.ratio() else {
+            return LogicalSize::new(base_width, base_height);
+        };
+        if base_width / base_height < ratio {
+            LogicalSize::new(base_height * ratio, base_height)
+        } else {
+            LogicalSize::new(base_width, base_width / ratio)
+        }
     }
 }
 
@@ -103,7 +609,7 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 }
 
 impl Default for DocumentData {
@@ -169,6 +675,9 @@ impl Document {
                 "beautification is not permitted for window captures (decision D9)".to_owned(),
             ));
         }
+        if let Some(beautification) = &data.beautification {
+            beautification.validate()?;
+        }
         let highest = data
             .annotations
             .iter()
@@ -223,6 +732,15 @@ impl Document {
         LogicalSize::new(
             self.source.frame.size.width / scale,
             self.source.frame.size.height / scale,
+        )
+    }
+
+    /// Logical size after optional framing and aspect expansion.
+    #[must_use]
+    pub fn output_logical_size(&self) -> LogicalSize {
+        self.beautification.as_ref().map_or_else(
+            || self.logical_size(),
+            |beautification| beautification.output_size(self.logical_size()),
         )
     }
 
@@ -424,6 +942,9 @@ impl Document {
             return Err(Error::InvalidRequest(
                 "beautification is not permitted for window captures (decision D9)".to_owned(),
             ));
+        }
+        if let Some(beautification) = &beautification {
+            beautification.validate()?;
         }
         self.beautification = beautification;
         Ok(())

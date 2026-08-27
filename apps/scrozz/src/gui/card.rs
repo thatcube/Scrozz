@@ -30,6 +30,7 @@ use std::{
 
 use scrozz_core::Frame;
 use scrozz_store::CaptureId;
+use scrozz_ui::editor::{EditorEvent, EditorRequest, EditorStatus};
 
 use crate::gui::action::CaptureKind;
 
@@ -345,6 +346,40 @@ pub trait CardSurface {
     /// `scrozz-shell` polls `muda`: a registered handler is a global the first
     /// caller wins.
     fn poll(&mut self) -> Option<CardEvent>;
+
+    /// Opens or focuses the non-destructive editor for a capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scrozz_core::Error::Unsupported`] when this surface has no
+    /// native viewport host, such as the headless recording surface.
+    fn open_editor(&mut self, _request: EditorRequest) -> scrozz_core::Result<()> {
+        Err(scrozz_core::Error::Unsupported {
+            what: "the capture editor".to_owned(),
+            why: "this card surface has no native viewport host".to_owned(),
+        })
+    }
+
+    /// Focuses an editor that this surface already hosts.
+    fn focus_editor(&mut self, _id: CardId) {}
+
+    /// Delivers worker feedback to an open editor.
+    fn editor_status(&mut self, _id: CardId, _status: EditorStatus) {}
+
+    /// Delivers terminal export feedback and re-enables editor actions.
+    fn editor_export_status(&mut self, id: CardId, status: EditorStatus) {
+        self.editor_status(id, status);
+    }
+
+    /// Delivers autosave feedback without replacing export feedback.
+    fn editor_persist_status(&mut self, id: CardId, status: EditorStatus) {
+        self.editor_status(id, status);
+    }
+
+    /// Takes one pending editor interaction, if there is one. Never blocks.
+    fn poll_editor(&mut self) -> Option<EditorEvent> {
+        None
+    }
 
     /// How many cards are showing.
     fn len(&self) -> usize;

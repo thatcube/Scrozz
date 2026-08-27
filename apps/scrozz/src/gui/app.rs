@@ -23,12 +23,18 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
+use scrozz_export::Destination;
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
 };
+use scrozz_store::CaptureId;
+use scrozz_ui::editor::{EditorDestination, EditorEvent, EditorRequest, EditorStatus};
 
 use crate::{
     cli::Cli,
@@ -189,7 +195,19 @@ pub struct App {
     server: Option<Server>,
     started: Instant,
     captures: u64,
+    editors: HashMap<crate::gui::card::CardId, CaptureId>,
+    pending_editors: HashSet<crate::gui::card::CardId>,
+    pending_export: Option<crate::gui::card::CardId>,
+    pending_persists: HashMap<crate::gui::card::CardId, PendingPersist>,
+    export_failures: HashMap<crate::gui::card::CardId, String>,
+    next_persist_revision: u64,
     notes: Vec<String>,
+}
+
+struct PendingPersist {
+    revision: u64,
+    data: scrozz_annotate::DocumentData,
+    error: Option<String>,
 }
 
 impl App {
@@ -269,6 +287,12 @@ impl App {
             server,
             started: Instant::now(),
             captures: 0,
+            editors: HashMap::new(),
+            pending_editors: HashSet::new(),
+            pending_export: None,
+            pending_persists: HashMap::new(),
+            export_failures: HashMap::new(),
+            next_persist_revision: 1,
             notes,
         };
 
@@ -299,6 +323,7 @@ impl App {
         }
         self.drain_pipeline();
         self.drain_cards();
+        self.drain_editors();
 
         Tick::Continue
     }
@@ -392,13 +417,126 @@ impl App {
                         self.note(summary);
                     }
                 }
+                Outcome::EditorReady {
+                    card,
+                    capture,
+                    title,
+                    document,
+                } => {
+                    self.pending_editors.remove(&card);
+                    let document = *document;
+                    let document = match self.pending_persists.get(&card) {
+                        Some(pending) => scrozz_annotate::Document::from_data(
+                            document.source,
+                            pending.data.clone(),
+                        ),
+                        None => Ok(document),
+                    };
+                    match document {
+                        Err(error) => {
+                            self.note(format!(
+                                "{card} could not restore pending editor changes: {error}"
+                            ));
+                        }
+                        Ok(document) => {
+                            self.editors.insert(card, capture);
+                            if let Err(error) = self
+                                .surface
+                                .open_editor(EditorRequest::new(card.0, title, document))
+                            {
+                                self.editors.remove(&card);
+                                self.note(format!("{card} could not open the editor: {error}"));
+                            } else {
+                                if let Some(error) = self
+                                    .pending_persists
+                                    .get(&card)
+                                    .and_then(|pending| pending.error.as_ref())
+                                {
+                                    self.surface.editor_persist_status(
+                                        card,
+                                        EditorStatus::Failed(error.clone()),
+                                    );
+                                }
+                                if let Some(error) = self.export_failures.get(&card) {
+                                    self.surface.editor_export_status(
+                                        card,
+                                        EditorStatus::Failed(error.clone()),
+                                    );
+                                }
+                                self.note(format!("{card} opened for editing"));
+                            }
+                        }
+                    }
+                }
+                Outcome::EditorRefused { card, error } => {
+                    self.pending_editors.remove(&card);
+                    self.surface
+                        .editor_status(card, EditorStatus::Failed(error.to_string()));
+                    self.note(format!("{card} could not open the editor: {error}"));
+                }
+                Outcome::EditorExported { card, detail } => {
+                    if self.pending_export == Some(card) {
+                        self.pending_export = None;
+                    }
+                    self.export_failures.remove(&card);
+                    self.surface
+                        .editor_export_status(card, EditorStatus::Complete(detail.clone()));
+                    self.note(format!("{card} {detail}"));
+                }
+                Outcome::EditorExportRefused { card, error } => {
+                    if self.pending_export == Some(card) {
+                        self.pending_export = None;
+                    }
+                    let error = error.to_string();
+                    self.export_failures.insert(card, error.clone());
+                    self.surface
+                        .editor_export_status(card, EditorStatus::Failed(error.clone()));
+                    self.note(format!("{card} refused editor export: {error}"));
+                }
+                Outcome::EditorPersisted { card, revision } => {
+                    if self
+                        .pending_persists
+                        .get(&card)
+                        .is_none_or(|pending| pending.revision != revision)
+                    {
+                        continue;
+                    }
+                    self.pending_persists.remove(&card);
+                    self.surface.editor_persist_status(
+                        card,
+                        EditorStatus::Complete("saved changes".to_owned()),
+                    );
+                    self.note(format!("{card} saved changes"));
+                }
+                Outcome::EditorPersistRefused {
+                    card,
+                    revision,
+                    error,
+                } => {
+                    let error = error.to_string();
+                    let Some(pending) = self
+                        .pending_persists
+                        .get_mut(&card)
+                        .filter(|pending| pending.revision == revision)
+                    else {
+                        continue;
+                    };
+                    pending.error = Some(error.clone());
+                    self.surface
+                        .editor_persist_status(card, EditorStatus::Failed(error.clone()));
+                    self.note(format!("{card} could not save changes: {error}"));
+                }
                 Outcome::Failed { card, error } => {
                     self.note(format!("{card} failed: {error}"));
                 }
                 Outcome::Done { card, detail } => {
+                    self.surface
+                        .editor_status(card, EditorStatus::Complete(detail.clone()));
                     self.note(format!("{card} {detail}"));
                 }
                 Outcome::Refused { card, error } => {
+                    self.surface
+                        .editor_status(card, EditorStatus::Failed(error.to_string()));
                     self.note(format!("{card} refused: {error}"));
                 }
             }
@@ -419,6 +557,15 @@ impl App {
                 CardEvent::Save(id) => {
                     self.pipeline.post(Job::Save(id));
                 }
+                CardEvent::Open(id) => {
+                    if self.editors.contains_key(&id) {
+                        self.surface.focus_editor(id);
+                    } else if self.pending_editors.insert(id) && !self.pipeline.post(Job::Open(id))
+                    {
+                        self.pending_editors.remove(&id);
+                        self.note(format!("{id} could not queue the editor restore"));
+                    }
+                }
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
                     // The bytes are only worth holding while a card can still
@@ -430,11 +577,125 @@ impl App {
                 // `DragSource`, and collapsing into the dock is the capture
                 // stack's own animation — both belong to the surface that
                 // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
+                CardEvent::Drag(id) | CardEvent::Collapse(id) => {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
             }
         }
+    }
+
+    fn drain_editors(&mut self) {
+        let mut pending = Vec::new();
+        while let Some(event) = self.surface.poll_editor() {
+            pending.push(event);
+        }
+
+        for event in pending {
+            match event {
+                EditorEvent::Persist { id, data } => {
+                    let card = crate::gui::card::CardId(id);
+                    self.persist_editor_data(card, data);
+                }
+                EditorEvent::Export {
+                    id,
+                    destination,
+                    data,
+                } => {
+                    let card = crate::gui::card::CardId(id);
+                    if let Some(active) = self.pending_export {
+                        let error = format!("{active} is already exporting; wait for it to finish");
+                        self.export_failures.insert(card, error.clone());
+                        self.surface
+                            .editor_export_status(card, EditorStatus::Failed(error.clone()));
+                        self.note(format!("{card} could not export: {error}"));
+                        continue;
+                    }
+                    let Some(capture) = self.editors.get(&card).cloned() else {
+                        let error = "the capture history identity is no longer available";
+                        self.export_failures.insert(card, error.to_owned());
+                        self.surface
+                            .editor_export_status(card, EditorStatus::Failed(error.to_owned()));
+                        self.note(format!("{card} could not export: {error}"));
+                        continue;
+                    };
+                    let destination = match destination {
+                        EditorDestination::Clipboard => Destination::Clipboard,
+                        EditorDestination::DefaultFolder => {
+                            Destination::Folder(crate::output::default_directory())
+                        }
+                    };
+                    if self.pipeline.post(Job::Export {
+                        card,
+                        capture,
+                        destination,
+                        data,
+                    }) {
+                        self.export_failures.remove(&card);
+                        self.pending_export = Some(card);
+                    } else {
+                        let error = "the export worker is no longer available";
+                        self.export_failures.insert(card, error.to_owned());
+                        self.surface
+                            .editor_export_status(card, EditorStatus::Failed(error.to_owned()));
+                        self.note(format!("{card} could not export: {error}"));
+                    }
+                }
+                EditorEvent::Closed { id } => {
+                    let card = crate::gui::card::CardId(id);
+                    self.editors.remove(&card);
+                    self.note(format!("{card} editor closed"));
+                }
+            }
+        }
+    }
+
+    fn persist_editor_data(
+        &mut self,
+        card: crate::gui::card::CardId,
+        data: scrozz_annotate::DocumentData,
+    ) {
+        let revision = self.next_persist_revision;
+        self.next_persist_revision = self.next_persist_revision.saturating_add(1);
+        self.pending_persists.insert(
+            card,
+            PendingPersist {
+                revision,
+                data: data.clone(),
+                error: None,
+            },
+        );
+        let Some(capture) = self.editors.get(&card).cloned() else {
+            let error = "the capture history identity is no longer available".to_owned();
+            if let Some(pending) = self.pending_persists.get_mut(&card) {
+                pending.error = Some(error.clone());
+            }
+            self.surface
+                .editor_persist_status(card, EditorStatus::Failed(error.clone()));
+            self.note(format!("{card} could not save changes: {error}"));
+            return;
+        };
+        if !self.pipeline.post(Job::Persist {
+            card,
+            revision,
+            capture,
+            data,
+        }) {
+            let error = "the persistence worker is no longer available".to_owned();
+            if let Some(pending) = self.pending_persists.get_mut(&card) {
+                pending.error = Some(error.clone());
+            }
+            self.surface
+                .editor_persist_status(card, EditorStatus::Failed(error.clone()));
+            self.note(format!("{card} could not save changes: {error}"));
+        }
+    }
+
+    /// Routes editor events synchronously before the worker is stopped.
+    ///
+    /// Window hosts call this after flushing debounced panels so persistence
+    /// jobs enter the worker queue ahead of [`Job::Stop`].
+    pub(crate) fn flush_editor_events(&mut self) {
+        self.drain_editors();
     }
 
     /// Carries out one action.
@@ -542,12 +803,18 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.finish_pending_work();
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
         }
         self.server = None;
+    }
+
+    /// Finishes queued worker jobs and incorporates their outcomes in the report.
+    pub(crate) fn finish_pending_work(&mut self) {
         self.pipeline.stop();
+        self.drain_pipeline();
     }
 
     /// Every note recorded so far.
@@ -628,6 +895,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_persistence_enqueue_retains_the_latest_snapshot() {
+        let (mut app, _) = app();
+        let card = CardId(42);
+        app.editors
+            .insert(card, CaptureId("capture-fixture".to_owned()));
+        app.pipeline.stop();
+        let data = scrozz_annotate::DocumentData {
+            next_id: 17,
+            ..Default::default()
+        };
+
+        app.persist_editor_data(card, data.clone());
+
+        let pending = app.pending_persists.get(&card).expect("retained edits");
+        assert_eq!(pending.data, data);
+        assert!(
+            pending
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("worker"))
+        );
+    }
+
+    #[test]
     fn an_unwired_action_says_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
         for action in [
@@ -674,6 +965,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the copy never reached the worker: {:?}", app.notes());
+    }
+
+    #[test]
+    fn opening_a_card_reaches_the_document_worker() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Open(CardId(43)));
+        app.tick();
+
+        // As with copy, the absent card is useful here: only the worker can
+        // produce this refusal, proving Open is no longer swallowed by the
+        // coordinator.
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if app.notes().iter().any(|note| {
+                note.contains("card:43 could not open the editor")
+                    && note.contains("no capture to edit")
+            }) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("open never reached the worker: {:?}", app.notes());
+    }
+
+    #[test]
+    fn reopening_an_active_editor_never_queues_a_stale_store_read() {
+        let (mut app, surface) = app();
+        let card = CardId(44);
+        app.editors
+            .insert(card, CaptureId("active-editor".to_owned()));
+        surface.inject(CardEvent::Open(card));
+
+        app.tick();
+        std::thread::sleep(Duration::from_millis(25));
+        app.drain_pipeline();
+
+        assert!(!app.pending_editors.contains(&card));
+        assert!(
+            app.notes()
+                .iter()
+                .all(|note| !note.contains("no capture to edit")),
+            "focus-only reopen must not reach the worker: {:?}",
+            app.notes()
+        );
     }
 
     #[test]

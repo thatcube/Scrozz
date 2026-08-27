@@ -10,12 +10,13 @@ repository.workspace = true
 
 [dependencies]
 scrozz-core.workspace = true
+scrozz-export.workspace = true
+image.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-annotate.workspace = true
 egui.workspace = true
 eframe.workspace = true
-image.workspace = true
 resvg.workspace = true
 
 [lints]

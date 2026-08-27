@@ -8,8 +8,11 @@
 
 use std::path::{Path, PathBuf};
 
-use scrozz_core::Error as CoreError;
-use scrozz_export::{Destination, FileExporter, NameTemplate, NamingContext};
+use scrozz_core::{Error as CoreError, Frame};
+use scrozz_export::{
+    ContentKind, Destination, DestinationProfile, ExportOutcome, FileExporter, NameTemplate,
+    NamingContext,
+};
 
 use crate::fault::{CliError, CliResult};
 
@@ -21,6 +24,40 @@ use crate::fault::{CliError, CliResult};
 /// or I/O error when no safe path can be created.
 pub fn export_default(bytes: &[u8]) -> CliResult<PathBuf> {
     export_to_directory(bytes, &default_directory(), &NamingContext::now())
+}
+
+/// Encodes and exports a frame according to the destination's capabilities.
+///
+/// This is the shared automatic path for the CLI and editor. It preserves
+/// profiles for folders and the clipboard, chooses a transparency-safe format,
+/// and keeps Retina naming based on the rendered frame's logical scale.
+///
+/// # Errors
+///
+/// Returns an export error when the destination cannot accept the frame or the
+/// selected encoder/delivery mechanism fails.
+pub fn export_frame_auto(frame: &Frame, destination: &Destination) -> CliResult<ExportOutcome> {
+    let profile = match destination {
+        Destination::Clipboard => DestinationProfile::clipboard(),
+        Destination::Folder(_) => DestinationProfile::folder(),
+        Destination::S3 { .. } => {
+            return Err(CliError::Core(CoreError::Unsupported {
+                what: "automatic editor upload".to_owned(),
+                why: "the editor currently exposes clipboard and folder destinations".to_owned(),
+            }));
+        }
+    };
+    let context = NamingContext::now();
+    let template = NameTemplate::parse("Scrozz {date} at {time}")?;
+    Ok(FileExporter::new()
+        .with_template(template)
+        .export_frame_auto(
+            frame,
+            destination,
+            &profile,
+            ContentKind::Screenshot,
+            &context,
+        )?)
 }
 
 /// The fallback until the save-folder setting is wired into the settings UI.

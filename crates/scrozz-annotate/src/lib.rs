@@ -71,6 +71,9 @@ pub mod render;
 pub mod style;
 
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
-pub use document::{AnnotationMut, Background, Beautification, Document, DocumentData};
+pub use document::{
+    Alignment, AnnotationMut, AspectPreset, Background, BackgroundImage, Beautification,
+    BeautificationPreset, BuiltInBackground, Document, DocumentData,
+};
 pub use render::{Renderer, SkiaRenderer};
 pub use style::{Color, Style};

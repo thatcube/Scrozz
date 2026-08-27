@@ -24,7 +24,9 @@ use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
 use scrozz_ui::{
-    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
+    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle,
+    editor::{EditorEvent, EditorHandle, EditorRequest, EditorStatus},
+    overlay_app::THUMBNAIL_PX,
 };
 
 use crate::gui::{
@@ -50,6 +52,10 @@ pub struct OverlayCards {
     /// `drain_events` empties the overlay's outbox in one go, so a batch of
     /// five has to be held somewhere; without this, four would be dropped.
     queued: VecDeque<CardEvent>,
+    /// The ordinary viewport host shared with the window driver.
+    editor: Option<EditorHandle>,
+    /// Editor events beyond the one this poll returned.
+    editor_queued: VecDeque<EditorEvent>,
 }
 
 impl OverlayCards {
@@ -62,7 +68,16 @@ impl OverlayCards {
             mapped: HashMap::new(),
             reverse: HashMap::new(),
             queued: VecDeque::new(),
+            editor: None,
+            editor_queued: VecDeque::new(),
         }
+    }
+
+    /// Connects the card adapter to the editor viewports owned by the host.
+    #[must_use]
+    pub fn with_editor(mut self, editor: EditorHandle) -> Self {
+        self.editor = Some(editor);
+        self
     }
 
     /// A clone of the handle, for the window that draws it.
@@ -204,6 +219,52 @@ impl CardSurface for OverlayCards {
             self.queued.push_back(leftover);
         }
         first.or_else(|| self.queued.pop_front())
+    }
+
+    fn open_editor(&mut self, request: EditorRequest) -> scrozz_core::Result<()> {
+        let Some(editor) = &self.editor else {
+            return Err(scrozz_core::Error::Unsupported {
+                what: "the capture editor".to_owned(),
+                why: "the window host did not provide an editor handle".to_owned(),
+            });
+        };
+        editor.open(request);
+        Ok(())
+    }
+
+    fn focus_editor(&mut self, id: CardId) {
+        if let Some(editor) = &self.editor {
+            editor.focus(id.0);
+        }
+    }
+
+    fn editor_status(&mut self, id: CardId, status: EditorStatus) {
+        if let Some(editor) = &self.editor {
+            editor.status(id.0, status);
+        }
+    }
+
+    fn editor_export_status(&mut self, id: CardId, status: EditorStatus) {
+        if let Some(editor) = &self.editor {
+            editor.export_status(id.0, status);
+        }
+    }
+
+    fn editor_persist_status(&mut self, id: CardId, status: EditorStatus) {
+        if let Some(editor) = &self.editor {
+            editor.persist_status(id.0, status);
+        }
+    }
+
+    fn poll_editor(&mut self) -> Option<EditorEvent> {
+        if let Some(event) = self.editor_queued.pop_front() {
+            return Some(event);
+        }
+        let editor = self.editor.as_ref()?;
+        let mut batch = editor.drain_events().into_iter();
+        let first = batch.next();
+        self.editor_queued.extend(batch);
+        first.or_else(|| self.editor_queued.pop_front())
     }
 
     fn len(&self) -> usize {

@@ -19,6 +19,7 @@ use scrozz_ui::{
 };
 
 use scrozz_core::Error as CoreError;
+use scrozz_ui::editor::{EditorHandle, EditorWorkspace};
 
 use crate::{
     fault::{CliError, CliResult},
@@ -93,6 +94,7 @@ impl Host for Headless {
             std::thread::sleep(IDLE);
         }
 
+        app.finish_pending_work();
         let report = app.report();
         // Before the report is printed, not after: the menu-bar item should be
         // gone by the time the user sees any output about it.
@@ -164,6 +166,7 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
 /// happens there — capture and encoding are already on a worker.
 pub struct Windowed {
     handle: OverlayHandle,
+    editor: EditorHandle,
     emit: Emit,
 }
 
@@ -173,6 +176,7 @@ impl Windowed {
     pub fn new(emit: Emit) -> Self {
         Self {
             handle: OverlayHandle::new(),
+            editor: EditorHandle::default(),
             emit,
         }
     }
@@ -203,6 +207,8 @@ impl Host for Windowed {
         let sink = Arc::clone(&outcome);
         let handle = self.handle.clone();
         let reporting = self.handle.clone();
+        let editor_handle = self.editor.clone();
+        let editor_appearance = options.appearance;
         let emit = self.emit;
 
         eframe::run_native(
@@ -210,13 +216,16 @@ impl Host for Windowed {
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
+                let editor = EditorWorkspace::new(&cc.egui_ctx, editor_handle, editor_appearance);
                 Ok(Box::new(Driver {
                     app,
                     overlay,
+                    editor,
                     sink,
                     handle: reporting,
                     emit: Some(emit),
                     announced: false,
+                    stopping: false,
                     stopped: false,
                 }))
             }),
@@ -250,7 +259,7 @@ impl Host for Windowed {
     fn surface(&self) -> Box<dyn CardSurface> {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
-        Box::new(OverlayCards::new(self.handle.clone()))
+        Box::new(OverlayCards::new(self.handle.clone()).with_editor(self.editor.clone()))
     }
 }
 
@@ -258,10 +267,12 @@ impl Host for Windowed {
 struct Driver {
     app: App,
     overlay: OverlayApp,
+    editor: EditorWorkspace,
     sink: Arc<Mutex<Option<Report>>>,
     handle: OverlayHandle,
     emit: Option<Emit>,
     announced: bool,
+    stopping: bool,
     stopped: bool,
 }
 
@@ -295,6 +306,31 @@ impl Driver {
         self.handle
             .panel_report()
             .is_some_and(|report| report.non_activating)
+    }
+
+    fn finish(&mut self, ctx: &egui::Context) {
+        self.stopping = false;
+        self.stopped = true;
+        self.editor.flush_all();
+        self.app.flush_editor_events();
+        self.app.finish_pending_work();
+        let report = self.app.report();
+        if let Ok(mut slot) = self.sink.lock() {
+            *slot = Some(report.clone());
+        }
+        // Before the window closes, so the menu-bar item never outlives what
+        // the user can see.
+        self.app.shut_down();
+
+        if self.converted() {
+            if let Some(emit) = self.emit.take() {
+                emit(&report);
+            }
+            tracing::debug!("leaving without dismantling the converted panel");
+            std::process::exit(0);
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
 
@@ -344,25 +380,27 @@ impl eframe::App for Driver {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
 
-        if !self.stopped && self.app.tick() == Tick::Stop {
-            self.stopped = true;
-            let report = self.app.report();
-            if let Ok(mut slot) = self.sink.lock() {
-                *slot = Some(report.clone());
-            }
-            // Before the window closes, so the menu-bar item never outlives
-            // what the user can see.
-            self.app.shut_down();
+        // Hidden menu-bar windows may receive a logic tick without a paint pass.
+        // If the prior tick requested shutdown and `ui` never ran, finish here;
+        // otherwise `ui` finishes at the end of the initiating frame.
+        if self.stopping && !self.stopped {
+            self.finish(ctx);
+            return;
+        }
 
-            if self.converted() {
-                if let Some(emit) = self.emit.take() {
-                    emit(&report);
-                }
-                tracing::debug!("leaving without dismantling the converted panel");
-                std::process::exit(0);
+        let native_close = ctx.input(|input| input.viewport().close_requested());
+        if !self.stopped {
+            if native_close {
+                // A logic-only tick has no `ui` pass and eframe otherwise exits
+                // immediately after this callback. Hold the native close until
+                // the editor and FIFO worker have been flushed.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.stopping = true;
+                ctx.request_repaint();
+            } else if self.app.tick() == Tick::Stop {
+                self.stopping = true;
+                ctx.request_repaint();
             }
-
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while
@@ -373,6 +411,11 @@ impl eframe::App for Driver {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.overlay.ui(ui, frame);
+        self.editor.ui(ui.ctx());
+        if self.stopping && !self.stopped {
+            let context = ui.ctx().clone();
+            self.finish(&context);
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

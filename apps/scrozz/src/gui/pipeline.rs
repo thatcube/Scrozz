@@ -29,9 +29,9 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_annotate::Document;
+use scrozz_annotate::{Document, DocumentData, Renderer, SkiaRenderer};
 use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
-use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
+use scrozz_export::{Destination, Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
@@ -58,6 +58,30 @@ pub enum Job {
     Copy(CardId),
     /// Write a card's capture to the configured folder.
     Save(CardId),
+    /// Restore a card's full document and open it in the editor.
+    Open(CardId),
+    /// Persist non-destructive editor metadata.
+    Persist {
+        /// Which editor/card initiated the write.
+        card: CardId,
+        /// Monotonic snapshot revision assigned by the application.
+        revision: u64,
+        /// Stable history identity, retained even if the card is dismissed.
+        capture: CaptureId,
+        /// Mutable document data only.
+        data: DocumentData,
+    },
+    /// Render and deliver an editor snapshot.
+    Export {
+        /// Which editor/card initiated the export.
+        card: CardId,
+        /// Stable history identity used to restore immutable source pixels.
+        capture: CaptureId,
+        /// Concrete destination selected by the application.
+        destination: Destination,
+        /// Compact snapshot of current edits.
+        data: DocumentData,
+    },
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Finish, so the thread can be joined.
@@ -69,6 +93,54 @@ pub enum Job {
 pub enum Outcome {
     /// A capture succeeded and is ready to show.
     Ready(Box<Card>),
+    /// A persisted document is ready for an ordinary editor viewport.
+    EditorReady {
+        /// Which card requested it.
+        card: CardId,
+        /// Stable history identity used for subsequent metadata saves.
+        capture: CaptureId,
+        /// Human-readable editor title.
+        title: String,
+        /// Full non-destructive document.
+        document: Box<Document>,
+    },
+    /// An editor restore failed before a viewport could open.
+    EditorRefused {
+        /// Which card requested the editor.
+        card: CardId,
+        /// Why its document could not be restored.
+        error: CliError,
+    },
+    /// An editor export completed.
+    EditorExported {
+        /// Which editor requested it.
+        card: CardId,
+        /// What was delivered.
+        detail: String,
+    },
+    /// An editor export failed.
+    EditorExportRefused {
+        /// Which editor requested it.
+        card: CardId,
+        /// Why.
+        error: CliError,
+    },
+    /// Editor metadata was persisted.
+    EditorPersisted {
+        /// Which editor initiated the write.
+        card: CardId,
+        /// Which snapshot finished.
+        revision: u64,
+    },
+    /// Editor metadata could not be persisted.
+    EditorPersistRefused {
+        /// Which editor initiated the write.
+        card: CardId,
+        /// Which snapshot failed.
+        revision: u64,
+        /// Why.
+        error: CliError,
+    },
     /// A capture failed. The main thread says why and shows nothing.
     Failed {
         /// Which card was expected.
@@ -168,6 +240,8 @@ impl Drop for Pipeline {
 /// What the worker remembers about a card it produced.
 struct Cached {
     bytes: Vec<u8>,
+    capture_id: Option<CaptureId>,
+    title: String,
 }
 
 struct Worker {
@@ -207,6 +281,19 @@ impl Worker {
                 Job::Capture { kind, card } => self.capture(kind, card),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
+                Job::Open(card) => self.open(card),
+                Job::Persist {
+                    card,
+                    revision,
+                    capture,
+                    data,
+                } => self.persist(card, revision, &capture, &data),
+                Job::Export {
+                    card,
+                    capture,
+                    destination,
+                    data,
+                } => self.export(card, &capture, destination, data),
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
@@ -260,11 +347,9 @@ impl Worker {
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
 
-        self.cache.insert(card, Cached { bytes });
-
-        Ok(Card {
+        let built = Card {
             id: card,
-            capture_id,
+            capture_id: capture_id.clone(),
             kind,
             source_width: capture.frame.width(),
             source_height: capture.frame.height(),
@@ -275,7 +360,17 @@ impl Worker {
             // one here made Save create a duplicate a few seconds later.
             written: Vec::new(),
             taken_at: SystemTime::now(),
-        })
+        };
+        self.cache.insert(
+            card,
+            Cached {
+                bytes,
+                capture_id,
+                title: built.file_name(),
+            },
+        );
+
+        Ok(built)
     }
 
     /// Persists a capture, or explains in the log why it was not.
@@ -313,6 +408,136 @@ impl Worker {
         self.answer(card, result);
     }
 
+    fn open(&mut self, card: CardId) {
+        let result = self.open_document(card);
+        let message = match result {
+            Ok((capture, title, document)) => Outcome::EditorReady {
+                card,
+                capture,
+                title,
+                document: Box::new(document),
+            },
+            Err(error) => Outcome::EditorRefused { card, error },
+        };
+        let _ = self.outcomes.send(message);
+    }
+
+    fn open_document(&mut self, card: CardId) -> CliResult<(CaptureId, String, Document)> {
+        let cached = self.cached(card, "edit")?;
+        let capture = cached.capture_id.clone().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "this capture was shown but could not be added to history, so its editable \
+                 document is unavailable"
+                    .to_owned(),
+            ))
+        })?;
+        let title = cached.title.clone();
+        let store = self.store.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "capture history is unavailable, so the editable document cannot be restored"
+                    .to_owned(),
+            ))
+        })?;
+        let state = store.document(&capture)?.ok_or_else(|| {
+            CliError::Core(CoreError::Storage(format!(
+                "capture {} is no longer in history",
+                capture.0
+            )))
+        })?;
+        let document = state.complete().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "the source pixels were evicted from history; its edit metadata remains, but it \
+                 can no longer be rendered"
+                    .to_owned(),
+            ))
+        })?;
+        Ok((capture, title, document))
+    }
+
+    fn persist(&mut self, card: CardId, revision: u64, capture: &CaptureId, data: &DocumentData) {
+        let result = self
+            .store
+            .as_mut()
+            .ok_or_else(|| {
+                CliError::Core(CoreError::Storage(
+                    "capture history is unavailable; changes were not saved".to_owned(),
+                ))
+            })
+            .and_then(|store| {
+                store.save_edits(capture, data)?;
+                Ok("saved changes".to_owned())
+            });
+        let outcome = match result {
+            Ok(_) => Outcome::EditorPersisted { card, revision },
+            Err(error) => Outcome::EditorPersistRefused {
+                card,
+                revision,
+                error,
+            },
+        };
+        let _ = self.outcomes.send(outcome);
+    }
+
+    fn export(
+        &mut self,
+        card: CardId,
+        capture: &CaptureId,
+        destination: Destination,
+        data: DocumentData,
+    ) {
+        let result = self
+            .document_for_export(capture, data)
+            .and_then(|document| Ok(SkiaRenderer.render(&document)?))
+            .and_then(|frame| {
+                let outcome = crate::output::export_frame_auto(&frame, &destination)?;
+                match destination {
+                    Destination::Clipboard => {
+                        Ok("copied the edited image to the clipboard".to_owned())
+                    }
+                    Destination::Folder(_) => {
+                        let path = outcome.path.ok_or_else(|| {
+                            CliError::Core(CoreError::Storage(
+                                "the folder exporter succeeded without returning a path".to_owned(),
+                            ))
+                        })?;
+                        Ok(format!("saved the edited image to {}", path.display()))
+                    }
+                    Destination::S3 { .. } => unreachable!("editor does not expose uploads"),
+                }
+            });
+        let outcome = match result {
+            Ok(detail) => Outcome::EditorExported { card, detail },
+            Err(error) => Outcome::EditorExportRefused { card, error },
+        };
+        let _ = self.outcomes.send(outcome);
+    }
+
+    fn document_for_export(
+        &mut self,
+        capture: &CaptureId,
+        data: DocumentData,
+    ) -> CliResult<Document> {
+        let store = self.store.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "capture history is unavailable, so the edited image cannot be exported".to_owned(),
+            ))
+        })?;
+        let state = store.document(capture)?.ok_or_else(|| {
+            CliError::Core(CoreError::Storage(format!(
+                "capture {} is no longer in history",
+                capture.0
+            )))
+        })?;
+        let document = state.complete().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "the source pixels were evicted from history; its edits remain, but it can no \
+                 longer be exported"
+                    .to_owned(),
+            ))
+        })?;
+        Ok(Document::from_data(document.source, data)?)
+    }
+
     fn cached(&self, card: CardId, verb: &str) -> CliResult<&Cached> {
         self.cache
             .get(&card)
@@ -325,6 +550,190 @@ impl Worker {
             Err(error) => Outcome::Refused { card, error },
         };
         let _ = self.outcomes.send(message);
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use scrozz_annotate::{Background, Beautification, BeautificationPreset};
+    use scrozz_core::{
+        ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, Provenance,
+        ScaleFactor,
+    };
+
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "scrozz-pipeline-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn capture() -> Capture {
+        let width = 80_u32;
+        let height = 48_u32;
+        Capture {
+            frame: Frame {
+                data: [74, 102, 213, 255]
+                    .into_iter()
+                    .cycle()
+                    .take(width as usize * height as usize * 4)
+                    .collect(),
+                size: PhysicalSize::new(f64::from(width), f64::from(height)),
+                stride: width as usize * 4,
+                format: scrozz_core::PixelFormat::Rgba8,
+                color_space: ColorSpace::DisplayP3,
+                scale: ScaleFactor::new(2.0),
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(40.0, 24.0),
+            )),
+        }
+    }
+
+    fn stored_worker(label: &str) -> (Worker, Receiver<Outcome>, CaptureId, PathBuf) {
+        let root = scratch(label);
+        let mut store = SqliteStore::open_ephemeral(&root).expect("ephemeral store");
+        let document = Document::new(capture());
+        let capture_id = store
+            .insert(NewCapture::new(&document))
+            .expect("insert capture");
+        let (outcome_tx, outcome_rx) = channel();
+        let card = CardId(7);
+        let mut cache = HashMap::new();
+        cache.insert(
+            card,
+            Cached {
+                bytes: Vec::new(),
+                capture_id: Some(capture_id.clone()),
+                title: "Scrozz fixture.png".to_owned(),
+            },
+        );
+        (
+            Worker {
+                outcomes: outcome_tx,
+                store: Some(store),
+                cache,
+            },
+            outcome_rx,
+            capture_id,
+            root,
+        )
+    }
+
+    #[test]
+    fn open_restores_the_full_non_destructive_document() {
+        let (mut worker, outcomes, capture_id, root) = stored_worker("open");
+        worker.open(CardId(7));
+
+        let Outcome::EditorReady {
+            card,
+            capture: restored_id,
+            title,
+            document,
+        } = outcomes.recv().expect("editor outcome")
+        else {
+            panic!("expected editor-ready outcome");
+        };
+        assert_eq!(card, CardId(7));
+        assert_eq!(restored_id, capture_id);
+        assert_eq!(title, "Scrozz fixture.png");
+        assert_eq!(document.source.frame.data, capture().frame.data);
+        fs::remove_dir_all(root).expect("remove scratch store");
+    }
+
+    #[test]
+    fn persist_writes_only_document_metadata_back_to_history() {
+        let (mut worker, outcomes, capture_id, root) = stored_worker("persist");
+        let source = capture().frame.data;
+        let mut data = Document::new(capture()).data();
+        data.beautification = Some(Beautification::preset(BeautificationPreset::Editorial));
+        worker.persist(CardId(7), 23, &capture_id, &data);
+        assert!(matches!(
+            outcomes.recv().expect("save outcome"),
+            Outcome::EditorPersisted {
+                card: CardId(7),
+                revision: 23
+            }
+        ));
+
+        let restored = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .document(&capture_id)
+            .expect("read document")
+            .expect("stored document")
+            .complete()
+            .expect("source retained");
+        assert_eq!(restored.source.frame.data, source);
+        assert_eq!(restored.beautification(), data.beautification.as_ref());
+        fs::remove_dir_all(root).expect("remove scratch store");
+    }
+
+    #[test]
+    fn editor_export_uses_destination_policy_profiles_and_retina_names() {
+        let (mut worker, outcome_rx, capture_id, root) = stored_worker("export");
+        let export_root = root.join("exports");
+        fs::create_dir_all(&export_root).expect("create export folder");
+        let mut data = Document::new(capture()).data();
+        let mut framing = Beautification::preset(BeautificationPreset::Clean);
+        framing.background = Background::Transparent;
+        data.beautification = Some(framing);
+
+        worker.export(
+            CardId(7),
+            &capture_id,
+            Destination::Folder(export_root.clone()),
+            data,
+        );
+        assert!(matches!(
+            outcome_rx.recv().expect("export outcome"),
+            Outcome::EditorExported {
+                card: CardId(7),
+                ..
+            }
+        ));
+        let paths: Vec<PathBuf> = fs::read_dir(&export_root)
+            .expect("list export")
+            .map(|entry| entry.expect("directory entry").path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert!(
+            path.file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .contains("@2x"),
+            "retina suffix: {}",
+            path.display()
+        );
+        let bytes = fs::read(path).expect("read export");
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(
+            bytes.windows(b"iCCP".len()).any(|window| window == b"iCCP"),
+            "the sRGB working space should carry an ICC profile chunk"
+        );
+        assert_eq!(
+            scrozz_export::decode(&bytes)
+                .expect("decode exported image")
+                .color_space,
+            ColorSpace::Srgb
+        );
+        fs::remove_dir_all(root).expect("remove export folder");
     }
 }
 

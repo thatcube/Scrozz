@@ -345,14 +345,12 @@ mod tests {
             "straight alpha, unchanged: the 128-alpha pixel is where premultiplication would show"
         );
 
-        // Both of these are deliberate, and both are the safe direction.
-        // Claiming sRGB for what might be Display P3 is what makes wide-gamut
-        // captures look wrong; claiming 1x for a 2x file only makes the OCR
-        // upscaler do slightly more work than it had to.
+        // Both of these are deliberate. The encoder's known profile is
+        // interpreted exactly; scale remains unknowable from an image file.
         assert_eq!(
             frame.color_space,
-            ColorSpace::Unknown,
-            "the decoder must not claim a colour space it did not interpret"
+            ColorSpace::Srgb,
+            "the decoder should restore a profile it knows exactly"
         );
         assert_eq!(
             frame.scale,
