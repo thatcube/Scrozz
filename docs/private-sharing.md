@@ -32,9 +32,10 @@ Optional values are `SCROZZ_S3_PREFIX` (default `captures`),
 `SCROZZ_S3_PUBLIC_BASE_URL`, `SCROZZ_SHARE_TITLE`,
 `SCROZZ_SHARE_ACCENT`, and comma-separated `SCROZZ_S3_TAGS=key=value,...`.
 An endpoint override is available for every preset.
-S3 API endpoints must use HTTPS. Plain HTTP is accepted only for loopback
-development servers so credentials, signatures, and unencrypted captures cannot
-cross a network in cleartext. The network transport ignores ambient proxy
+S3 API endpoints must use HTTPS. Plain HTTP is accepted only for development
+servers addressed by a literal loopback IP; path-style addressing preserves that
+destination. Hostnames such as `localhost` are rejected so DNS cannot route a
+cleartext upload elsewhere. The network transport ignores ambient proxy
 variables rather than forwarding a signed upload to another host.
 
 ## Credentials
@@ -54,7 +55,9 @@ Temporary `SCROZZ_S3_SESSION_TOKEN`/`AWS_SESSION_TOKEN` values are supported.
 Secrets have no value-taking CLI flag, are redacted from `Debug` and request
 diagnostics, and have no settings key. Non-secret settings may contain a
 credential-command path; its stdout is never persisted. Credential commands
-have a 30-second timeout.
+have a 30-second timeout. The HTTP client's wire-log targets remain disabled
+even when `RUST_LOG=trace`, preventing signed request headers from reaching
+diagnostic logs.
 
 For example, a platform credential store can supply the secret without exposing
 it in process arguments:

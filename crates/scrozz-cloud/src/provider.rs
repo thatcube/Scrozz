@@ -112,10 +112,10 @@ impl Endpoint {
         }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         let authority = normalise_authority(authority, scheme, label)?;
-        if scheme == "http" && !authority_is_loopback(&authority) {
+        if scheme == "http" && !authority_is_literal_loopback(&authority) {
             return Err(Error::Config(format!(
-                "{label} must use HTTPS; plain HTTP is allowed only for a loopback \
-                 development endpoint"
+                "{label} must use HTTPS; plain HTTP is allowed only for a literal \
+                 loopback IP development endpoint"
             )));
         }
         validate_base_path(path, label)?;
@@ -244,12 +244,13 @@ impl ProviderConfig {
         }
 
         let encoded_key = aws_uri_encode(key, false);
-        let addressing =
-            if self.addressing == AddressingStyle::VirtualHosted && bucket.contains('.') {
-                AddressingStyle::Path
-            } else {
-                self.addressing
-            };
+        let addressing = if self.endpoint.scheme == "http"
+            || (self.addressing == AddressingStyle::VirtualHosted && bucket.contains('.'))
+        {
+            AddressingStyle::Path
+        } else {
+            self.addressing
+        };
         let (host, canonical_uri) = match addressing {
             AddressingStyle::VirtualHosted => (
                 format!("{bucket}.{}", self.endpoint.authority),
@@ -390,7 +391,7 @@ fn validate_base_path(path: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn authority_is_loopback(authority: &str) -> bool {
+fn authority_is_literal_loopback(authority: &str) -> bool {
     let host = if let Some(inner) = authority.strip_prefix('[') {
         inner.split_once(']').map(|(host, _)| host)
     } else {
@@ -400,10 +401,8 @@ fn authority_is_loopback(authority: &str) -> bool {
             .map_or(Some(authority), |(host, _)| Some(host))
     };
     host.is_some_and(|host| {
-        host == "localhost"
-            || host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
+        host.parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
     })
 }
 
@@ -486,6 +485,17 @@ mod tests {
             .unwrap();
         assert_eq!(dotted.host, "s3.us-west-2.amazonaws.com");
         assert_eq!(dotted.canonical_uri, "/shots.example/capture.png");
+
+        let loopback = ProviderConfig::from_options(
+            ProviderKind::Aws,
+            Some("us-west-2"),
+            Some("http://127.0.0.1:9000"),
+            None,
+        )
+        .unwrap();
+        let target = loopback.object_target("shots", "capture.png").unwrap();
+        assert_eq!(target.host, "127.0.0.1:9000");
+        assert_eq!(target.url, "http://127.0.0.1:9000/shots/capture.png");
     }
 
     #[test]
@@ -570,11 +580,20 @@ mod tests {
         let normalised = ProviderConfig::from_options(
             ProviderKind::Minio,
             None,
-            Some("http://LOCALHOST:80/base"),
+            Some("http://127.0.0.1:80/base"),
             None,
         )
         .unwrap();
-        assert_eq!(normalised.endpoint(), "http://localhost/base");
+        assert_eq!(normalised.endpoint(), "http://127.0.0.1/base");
+        assert!(
+            ProviderConfig::from_options(
+                ProviderKind::Minio,
+                None,
+                Some("http://localhost:9000"),
+                None,
+            )
+            .is_err()
+        );
         assert!(
             ProviderConfig::from_options(
                 ProviderKind::Minio,

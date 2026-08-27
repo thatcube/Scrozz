@@ -308,7 +308,7 @@ mod tests {
             (
                 ProviderKind::Minio,
                 None,
-                Some("http://localhost:9000"),
+                Some("http://127.0.0.1:9000"),
                 None,
             ),
         ];
