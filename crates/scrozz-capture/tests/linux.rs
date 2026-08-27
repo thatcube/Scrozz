@@ -18,6 +18,8 @@
 //! The `#[path]` on each inline module block sets the directory its children
 //! resolve against, and is itself relative to `tests/`.
 
+const WAYLAND_PORTAL_PICKER_WINDOW_ID: &str = scrozz_capture::WAYLAND_PORTAL_PICKER_WINDOW_ID;
+
 #[path = "../src/linux/session.rs"]
 mod session;
 
@@ -2255,7 +2257,7 @@ mod format_negotiation {
         Negotiated, OBJECT_FORMAT, OBJECT_PARAM_BUFFERS, PREFERRED_FORMATS, PREFERRED_TRANSFERS,
         buffer_key, data_type, key, param, primaries, transfer, video_format,
     };
-    use super::wayland::pipewire::pod::{Object, ObjectRef, Property, Scalar, choice};
+    use super::wayland::pipewire::pod::{Choice, Object, ObjectRef, Property, Scalar, choice};
 
     fn format_object(properties: Vec<Property>) -> Vec<u8> {
         Object {
@@ -3746,8 +3748,9 @@ mod region_cropping {
                     width: 1,
                     height: 2,
                 },
-            ),
-            Err(CropError::UnusableFrame)
+            )
+            .err(),
+            Some(CropError::UnusableFrame)
         );
         assert!(matches!(
             CropError::UnusableFrame.into_error("GNOME"),
