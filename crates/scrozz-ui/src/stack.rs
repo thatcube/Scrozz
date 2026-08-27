@@ -106,7 +106,7 @@ impl Default for CardMetrics {
         Self {
             width: 232.0,
             height: 145.0,
-            gap: 12.0,
+            gap: 8.0,
             margin: 16.0,
             clearance: 24.0,
         }
@@ -206,7 +206,12 @@ impl StackLayout {
     /// Where a card sits before it has slid in — fully off the left edge.
     #[must_use]
     pub fn entry_rect(&self, slot: usize) -> Rect {
-        let rest = self.slot_rect(slot);
+        self.entry_rect_for(self.slot_rect(slot))
+    }
+
+    /// Where an arbitrary card rectangle sits before horizontal entry.
+    #[must_use]
+    pub fn entry_rect_for(&self, rest: Rect) -> Rect {
         let dx = self.work_area.left() - self.metrics.clearance - rest.right();
         rest.translate(vec2(dx, 0.0))
     }
@@ -588,8 +593,9 @@ pub enum CardState {
 pub struct Card {
     id: CardId,
     born_slot: usize,
+    size: Vec2,
     entry: Option<Timeline>,
-    fall: Option<(Timeline, f32)>,
+    fall: Option<(Timeline, Vec2)>,
     ret: Option<(Timeline, Vec2)>,
     drag: Option<Vec2>,
     hover_on: bool,
@@ -609,6 +615,12 @@ impl Card {
     #[must_use]
     pub fn born_slot(&self) -> usize {
         self.born_slot
+    }
+
+    /// The visible preview-container size used by stack spacing.
+    #[must_use]
+    pub fn size(&self) -> Vec2 {
+        self.size
     }
 
     /// Whether the pointer is over this card.
@@ -882,6 +894,15 @@ impl CaptureStack {
     /// user asked for the overlay to be out of the way, not to stop seeing what
     /// they captured.
     pub fn push(&mut self, m: &Motion) -> CardId {
+        let metrics = self.layout.metrics();
+        self.push_sized(vec2(metrics.width, metrics.height), m)
+    }
+
+    /// Adds a capture whose visible preview container has `size`.
+    ///
+    /// Heights participate directly in vertical layout, so visible cards remain
+    /// exactly one configured gap apart even when their aspect ratios differ.
+    pub fn push_sized(&mut self, size: Vec2, m: &Motion) -> CardId {
         if self.dock.is_stowing() {
             self.dock.expand(m);
         }
@@ -891,9 +912,15 @@ impl CaptureStack {
         let slot = self.cards.len();
         let id = CardId(self.next_id);
         self.next_id += 1;
+        let metrics = self.layout.metrics();
+        let size = vec2(
+            size.x.clamp(1.0, metrics.width),
+            size.y.clamp(1.0, metrics.height),
+        );
         self.cards.push(Card {
             id,
             born_slot: slot,
+            size,
             entry: Some(Timeline::starting(
                 m,
                 self.timing.enter,
@@ -955,8 +982,8 @@ impl CaptureStack {
         // Where each card above is *right now*, captured before the shift —
         // otherwise an interrupted fall restarts from the slot it is about to
         // land in and the card jumps.
-        let previous: Vec<f32> = (slot + 1..self.cards.len())
-            .map(|i| fractional_slot(&self.cards[i], i, m, &self.layout))
+        let previous: Vec<Rect> = (slot + 1..self.cards.len())
+            .map(|i| self.rect_of_resident(i, m))
             .collect();
 
         let card = self.cards.remove(slot);
@@ -994,8 +1021,11 @@ impl CaptureStack {
 
         // Everything that was above the departing card now falls one slot.
         let fall = Timeline::starting(m, self.timing.fall, self.timing.fall_ease);
-        for (above, was_at) in self.cards.iter_mut().skip(slot).zip(previous) {
-            above.fall = Some((fall, was_at));
+        for (index, was_at) in previous.into_iter().enumerate() {
+            let target_slot = slot + index;
+            self.cards[target_slot].fall = None;
+            let target = self.rect_of_resident(target_slot, m);
+            self.cards[target_slot].fall = Some((fall, was_at.min - target.min));
         }
     }
 
@@ -1229,15 +1259,13 @@ impl CaptureStack {
     /// Where a resident card is, chrome aside.
     fn rect_of_resident(&self, slot: usize, m: &Motion) -> Rect {
         let card = &self.cards[slot];
-        let mut rect = self
-            .layout
-            .slot_rect_f(fractional_slot(card, slot, m, &self.layout));
+        let mut rect = self.home_rect(slot);
 
         // Horizontal entry. Vertical position is untouched by design: entry
         // never carries a card upward.
         if let Some(t) = card.entry {
             let v = t.value(m);
-            let start = self.layout.entry_rect(slot).left();
+            let start = self.layout.entry_rect_for(rect).left();
             let target = rect.left();
             let x = start + (target - start) * v;
             rect = rect.translate(vec2(x - rect.left(), 0.0));
@@ -1248,7 +1276,26 @@ impl CaptureStack {
         if let Some(offset) = card.drag {
             rect = rect.translate(offset);
         }
-        self.dock.absorb(rect, m)
+        rect = self.dock.absorb(rect, m);
+        card.fall.map_or(rect, |(timeline, displacement)| {
+            rect.translate(displacement * (1.0 - timeline.value(m).clamp(0.0, 1.0)))
+        })
+    }
+
+    fn home_rect(&self, slot: usize) -> Rect {
+        let metrics = self.layout.metrics();
+        let stack_below = self.cards[..slot]
+            .iter()
+            .map(|card| card.size.y + metrics.gap)
+            .sum::<f32>();
+        let bottom = self.layout.work_area().bottom() - metrics.margin - stack_below;
+        Rect::from_min_size(
+            pos2(
+                self.layout.work_area().left() + metrics.margin,
+                bottom - self.cards[slot].size.y,
+            ),
+            self.cards[slot].size,
+        )
     }
 
     fn resident_frame(&self, slot: usize, m: &Motion) -> CardFrame {
@@ -1361,19 +1408,6 @@ pub const MAX_LEAN: f32 = 0.10;
 #[must_use]
 pub fn lean(dx: f32) -> f32 {
     (dx / 900.0).clamp(-1.0, 1.0) * MAX_LEAN
-}
-
-/// A card's slot as a fractional number, so an interrupted fall continues from
-/// where it actually is rather than snapping to where it was.
-#[must_use]
-pub fn fractional_slot(card: &Card, slot: usize, m: &Motion, _layout: &StackLayout) -> f32 {
-    match card.fall {
-        Some((t, from)) => {
-            let v = t.value(m).clamp(0.0, 1.0);
-            from + (slot as f32 - from) * v
-        }
-        None => slot as f32,
-    }
 }
 
 /// How far a card's hover chrome is revealed, unshaped.

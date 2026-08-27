@@ -272,6 +272,18 @@ impl OverlayBehavior {
         }
     }
 
+    /// The behavior of an overlay window while none of its UI is visible.
+    ///
+    /// Selection preparation and capture can leave the long-lived native window
+    /// alive for several frames. Hidden empty space must fail open: no invisible
+    /// Scrozz surface may intercept pointer input.
+    #[must_use]
+    pub const fn hidden_surface() -> Self {
+        let mut behavior = Self::capture_card();
+        behavior.click_through = true;
+        behavior
+    }
+
     /// The behaviour of the fullscreen selection overlay.
     ///
     /// Above the menu bar, because a selection must be able to cover it, and
@@ -327,8 +339,8 @@ impl Default for StackLayout {
     fn default() -> Self {
         Self {
             card: LogicalSize::new(232.0, 150.0),
-            margin: 20.0,
-            gap: 12.0,
+            margin: 16.0,
+            gap: 8.0,
             max_slots: 6,
         }
     }

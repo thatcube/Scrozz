@@ -10,12 +10,12 @@
 
 use std::{
     sync::{Arc, Mutex, mpsc::channel},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scrozz_core::{
-    Capture, CaptureRequest, CursorMode, Error as CoreError, RegionSelector, SelectionHost,
-    SelectionOptions, SelectionOutcome,
+    Capture, CaptureRequest, CursorMode, Display, DisplayId, Error as CoreError, RegionSelector,
+    SelectionHost, SelectionOptions, SelectionOutcome,
 };
 use scrozz_ui::{
     OverlayHandle,
@@ -46,6 +46,9 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 /// menu-bar app is not a busy loop — which matters, because this process is
 /// meant to sit there all day.
 const IDLE: Duration = Duration::from_millis(16);
+const WORK_AREA_REFRESH: Duration = Duration::from_millis(250);
+
+type SharedGeometry = Arc<Mutex<OverlayGeometry>>;
 
 /// Something that can drive an [`App`] to completion.
 /// Writes the final report the way `main` would have.
@@ -180,6 +183,8 @@ pub struct Windowed {
     handle: OverlayHandle,
     emit: Emit,
     geometry: OverlayGeometry,
+    display_id: Option<DisplayId>,
+    pointer_geometry: SharedGeometry,
     selector: Arc<dyn CaptureSelector>,
     selection: ClientOverlayController,
     native: BehaviorController,
@@ -189,7 +194,8 @@ impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
-        let geometry = work_area();
+        let (geometry, display_id) = work_area();
+        let pointer_geometry = Arc::new(Mutex::new(geometry));
         let native = BehaviorController::default();
         let (client, selection) = ClientOverlaySelector::managed(geometry);
         let client: Arc<dyn CaptureSelector> = client;
@@ -204,6 +210,8 @@ impl Windowed {
             handle: OverlayHandle::new(),
             emit,
             geometry,
+            display_id,
+            pointer_geometry,
             selector,
             selection,
             native,
@@ -223,6 +231,8 @@ impl Host for Windowed {
             handle,
             emit,
             geometry,
+            display_id,
+            pointer_geometry,
             selector: _,
             selection,
             native,
@@ -232,7 +242,7 @@ impl Host for Windowed {
         let options = OverlayOptions {
             geometry,
             panel: panel_hook(native.clone()),
-            probe: pointer_probe(),
+            probe: pointer_probe(Arc::clone(&pointer_geometry)),
             ..Default::default()
         };
 
@@ -256,6 +266,9 @@ impl Host for Windowed {
                     emit: Some(emit),
                     selection,
                     native,
+                    display_id,
+                    pointer_geometry,
+                    next_work_area_refresh: Instant::now(),
                     announced: false,
                     stopped: false,
                 }))
@@ -426,6 +439,9 @@ struct Driver {
     emit: Option<Emit>,
     selection: ClientOverlayController,
     native: BehaviorController,
+    display_id: Option<DisplayId>,
+    pointer_geometry: SharedGeometry,
+    next_work_area_refresh: Instant,
     announced: bool,
     stopped: bool,
 }
@@ -508,7 +524,25 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        let selector_owned_the_window = self.selection.owns_surface();
         self.selection.logic(ctx, &self.native);
+        if selector_owned_the_window || self.selection.owns_surface() {
+            self.overlay.invalidate_passthrough_cache();
+        } else if Instant::now() >= self.next_work_area_refresh {
+            self.next_work_area_refresh = Instant::now() + WORK_AREA_REFRESH;
+            let geometry = refreshed_work_area(self.overlay.geometry(), &mut self.display_id);
+            if geometry != self.overlay.geometry() {
+                self.overlay.set_geometry(
+                    geometry,
+                    ctx,
+                    &scrozz_ui::motion::Motion::from_context(ctx),
+                );
+                self.selection.set_cards_geometry(geometry);
+                if let Ok(mut current) = self.pointer_geometry.lock() {
+                    *current = geometry;
+                }
+            }
+        }
 
         if !self.stopped && self.app.tick() == Tick::Stop {
             self.stopped = true;
@@ -578,16 +612,13 @@ fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
 /// The work area, not the display bounds: anchoring a card to the bottom-left
 /// of the *bounds* puts it behind the Dock. Falls back to a sensible default
 /// rather than failing, because a card in a slightly wrong place beats no card.
-fn work_area() -> OverlayGeometry {
+fn work_area() -> (OverlayGeometry, Option<DisplayId>) {
     #[cfg(target_os = "macos")]
     {
         match scrozz_shell::macos::display::active_display() {
             Ok(display) => {
-                let area = display.work_area;
-                return OverlayGeometry::new(egui::Rect::from_min_size(
-                    egui::pos2(area.origin.x as f32, area.origin.y as f32),
-                    egui::vec2(area.size.width as f32, area.size.height as f32),
-                ));
+                let geometry = geometry_for_display(&display);
+                return (geometry, Some(display.id));
             }
             Err(err) => {
                 tracing::warn!(%err, "no work area; using the default overlay geometry");
@@ -595,29 +626,68 @@ fn work_area() -> OverlayGeometry {
         }
     }
 
-    OverlayGeometry::default()
+    (OverlayGeometry::default(), None)
 }
 
 /// An exact pointer source for the click-through logic, if one is available.
 ///
-/// Returns `None` today. See [`PROBE_GAP`] — the degradation is bounded and
-/// documented, and a probe that guessed would be worse than none.
-fn pointer_probe() -> Option<scrozz_ui::PointerProbe> {
-    tracing::debug!("{PROBE_GAP}");
-    None
+fn pointer_probe(geometry: SharedGeometry) -> Option<scrozz_ui::PointerProbe> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Arc::new(move || {
+            let current = *geometry.lock().ok()?;
+            scrozz_shell::macos::display::pointer_location()
+                .ok()
+                .map(|point| local_pointer(current, point))
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = geometry;
+        None
+    }
 }
 
-/// Why there is no pointer probe.
-pub const PROBE_GAP: &str = "no crate exposes the pointer as a point. \
-     scrozz-shell reads NSEvent::mouseLocation inside \
-     macos::display::active_display and returns the Display containing it, \
-     never the location, so the one correct implementation of the AppKit \
-     coordinate flip is not reachable from here. Exposing \
-     `pub fn pointer_location() -> Result<LogicalPoint>` next to \
-     active_display would be a three-line extraction and is the right fix; \
-     calling NSEvent::mouseLocation again from this crate would duplicate \
-     that flip and eventually disagree with it. Without a probe the overlay \
-     re-samples click-through every 350ms, which is imprecise but bounded";
+fn local_pointer(geometry: OverlayGeometry, point: scrozz_core::LogicalPoint) -> egui::Pos2 {
+    let origin = geometry.position();
+    egui::pos2(point.x as f32 - origin.x, point.y as f32 - origin.y)
+}
+
+fn refreshed_work_area(
+    current: OverlayGeometry,
+    display_id: &mut Option<DisplayId>,
+) -> OverlayGeometry {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(displays) = scrozz_shell::macos::display::displays()
+            && let Some(display) = display_id
+                .as_ref()
+                .and_then(|id| display_by_id(&displays, id))
+        {
+            return geometry_for_display(display);
+        }
+        if let Ok(display) = scrozz_shell::macos::display::active_display() {
+            let geometry = geometry_for_display(&display);
+            *display_id = Some(display.id);
+            return geometry;
+        }
+    }
+
+    current
+}
+
+fn display_by_id<'a>(displays: &'a [Display], id: &DisplayId) -> Option<&'a Display> {
+    displays.iter().find(|display| display.id == *id)
+}
+
+fn geometry_for_display(display: &Display) -> OverlayGeometry {
+    let area = display.work_area;
+    OverlayGeometry::new(egui::Rect::from_min_size(
+        egui::pos2(area.origin.x as f32, area.origin.y as f32),
+        egui::vec2(area.size.width as f32, area.size.height as f32),
+    ))
+}
 
 /// Whether the environment asked for a run without a window.
 #[must_use]
@@ -628,7 +698,7 @@ pub fn headless_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scrozz_core::{Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
+    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
 
     #[test]
     fn a_headless_run_ends_by_itself() {
@@ -698,9 +768,42 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_gap_names_the_fix_rather_than_apologising() {
-        assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
-        assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    fn pointer_probe_is_available_on_macos() {
+        let probe = pointer_probe(Arc::new(Mutex::new(OverlayGeometry::default())));
+        assert_eq!(probe.is_some(), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn pointer_coordinates_are_relative_to_the_live_work_area() {
+        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
+            egui::pos2(100.0, 40.0),
+            egui::vec2(800.0, 600.0),
+        ));
+        assert_eq!(
+            local_pointer(geometry, scrozz_core::LogicalPoint::new(132.0, 91.0)),
+            egui::pos2(32.0, 51.0)
+        );
+    }
+
+    #[test]
+    fn work_area_refresh_follows_display_identity_across_coordinate_rebases() {
+        let display = |id: &str, x: f64| Display {
+            id: DisplayId(id.to_owned()),
+            name: id.to_owned(),
+            bounds: LogicalRect::new(LogicalPoint::new(x, 0.0), LogicalSize::new(800.0, 600.0)),
+            work_area: LogicalRect::new(LogicalPoint::new(x, 24.0), LogicalSize::new(800.0, 540.0)),
+            scale: ScaleFactor::new(1.0),
+            is_primary: id == "right",
+        };
+        let rebased = [display("left", -800.0), display("right", 0.0)];
+        assert_eq!(
+            display_by_id(&rebased, &DisplayId("left".to_owned()))
+                .expect("the same display should survive the rebase")
+                .bounds
+                .origin
+                .x,
+            -800.0
+        );
     }
 
     #[test]

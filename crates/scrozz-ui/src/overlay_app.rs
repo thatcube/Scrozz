@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
 
-use crate::card::{self, CardAction, CardContent};
+use crate::card::{self, CardAction, CardChrome, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
@@ -734,8 +734,9 @@ pub struct OverlayApp {
     probe: Option<PointerProbe>,
     thumbnail_px: u32,
     /// The value most recently sent to the window, so the command is sent on
-    /// change rather than every frame.
-    passthrough_now: bool,
+    /// change rather than every frame. `None` means native code changed the
+    /// window behind this renderer and the next frame must reassert its choice.
+    passthrough_now: Option<bool>,
     /// When the pointer was last actually known, for re-sampling.
     last_seen: f64,
     hovered: Option<CardId>,
@@ -792,7 +793,7 @@ impl OverlayApp {
             passthrough: options.passthrough,
             probe: options.probe,
             thumbnail_px: options.thumbnail_px.max(1),
-            passthrough_now: false,
+            passthrough_now: None,
             last_seen: 0.0,
             hovered: None,
             dock_collapsed: false,
@@ -829,6 +830,15 @@ impl OverlayApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
     }
 
+    /// Forces the next card frame to reassert native mouse passthrough.
+    ///
+    /// Selection temporarily takes exclusive input through the same native
+    /// window. Its behavior changes bypass this renderer, so the cached value is
+    /// no longer authoritative when the cards return.
+    pub fn invalidate_passthrough_cache(&mut self) {
+        self.passthrough_now = None;
+    }
+
     fn emit(&self, event: OverlayEvent) {
         if let Ok(mut q) = self.handle.shared.outbox.lock() {
             q.push(event);
@@ -855,7 +865,14 @@ impl OverlayApp {
 
     fn ingest(&mut self, m: &Motion) {
         for request in self.take_inbox() {
-            let id = self.stack.push(m);
+            let metrics = self.stack.layout().metrics();
+            let max_rect =
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(metrics.width, metrics.height));
+            let size = CardChrome::for_provenance(request.provenance)
+                .geometry(max_rect, request.source_px)
+                .container
+                .size();
+            let id = self.stack.push_sized(size, m);
             let thumb = request
                 .thumbnail
                 .map(|image| downscale(&image, self.thumbnail_px));
@@ -971,7 +988,7 @@ impl OverlayApp {
                     self.last_seen = now;
                     false
                 } else {
-                    self.passthrough_now
+                    self.passthrough_now.unwrap_or(false)
                 }
             }
         };
@@ -979,8 +996,8 @@ impl OverlayApp {
         if self.passthrough == Passthrough::Auto && self.probe.is_none() && desired && !empty {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(RESAMPLE_SECS));
         }
-        if desired != self.passthrough_now {
-            self.passthrough_now = desired;
+        if self.passthrough_now != Some(desired) {
+            self.passthrough_now = Some(desired);
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(desired));
         }
     }

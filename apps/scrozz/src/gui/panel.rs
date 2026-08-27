@@ -48,7 +48,7 @@ pub struct BehaviorController {
     #[cfg(target_os = "linux")]
     x11_focus: Rc<RefCell<Option<scrozz_shell::X11FocusLease>>>,
     #[cfg(test)]
-    behavior_log: Rc<RefCell<Vec<bool>>>,
+    behavior_log: Rc<RefCell<Vec<OverlayBehavior>>>,
 }
 
 impl BehaviorController {
@@ -69,7 +69,7 @@ impl BehaviorController {
         }
 
         #[cfg(test)]
-        self.behavior_log.borrow_mut().push(behavior.accepts_key);
+        self.behavior_log.borrow_mut().push(*behavior);
 
         #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
         let _ = behavior;
@@ -96,7 +96,7 @@ impl BehaviorController {
     }
 
     #[cfg(test)]
-    pub(crate) fn recording() -> (Self, Rc<RefCell<Vec<bool>>>) {
+    pub(crate) fn recording() -> (Self, Rc<RefCell<Vec<OverlayBehavior>>>) {
         let controller = Self::default();
         (controller.clone(), Rc::clone(&controller.behavior_log))
     }

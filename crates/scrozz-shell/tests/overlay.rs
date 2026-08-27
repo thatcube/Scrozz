@@ -132,6 +132,8 @@ fn the_stack_grows_upward() {
 #[test]
 fn adjacent_slots_are_separated_by_exactly_one_gap() {
     let layout = StackLayout::default();
+    assert_eq!(layout.gap, 8.0);
+    assert_eq!(layout.margin, 16.0);
     let area = work_area();
     let lower = layout.slot_frame(area, 0);
     let upper = layout.slot_frame(area, 1);
@@ -161,8 +163,8 @@ fn a_cards_position_never_moves_upward_as_the_stack_fills() {
 #[test]
 fn capacity_is_derived_from_work_area_height() {
     let layout = StackLayout::default();
-    // 1069 points of work area, 20 of margin either side, 162 per card:
-    // (1029 + 12) / 162 = 6.4 -> 6, which is also the cap.
+    // 1069 points of work area, 16 of margin either side, 158 per card:
+    // (1037 + 8) / 158 = 6.6 -> 6, which is also the cap.
     assert_eq!(layout.capacity(work_area()), 6);
 }
 
@@ -293,6 +295,16 @@ fn a_capture_card_floats_without_taking_focus() {
 }
 
 #[test]
+fn a_hidden_surface_cannot_intercept_pointer_input() {
+    let hidden = OverlayBehavior::hidden_surface();
+    assert!(hidden.click_through);
+    assert!(
+        !hidden.accepts_key,
+        "an invisible overlay must relinquish both pointer and keyboard input"
+    );
+}
+
+#[test]
 fn the_selection_overlay_sits_above_the_menu_bar() {
     let overlay = OverlayBehavior::selection_overlay();
     assert_eq!(overlay.level, OverlayLevel::Shielding);
@@ -412,6 +424,14 @@ mod off_main {
     #[test]
     fn the_active_display_is_refused_off_main() {
         assert!(matches!(display::active_display(), Err(Error::Platform(_))));
+    }
+
+    #[test]
+    fn the_pointer_location_is_refused_off_main() {
+        assert!(matches!(
+            display::pointer_location(),
+            Err(Error::Platform(_))
+        ));
     }
 
     #[test]

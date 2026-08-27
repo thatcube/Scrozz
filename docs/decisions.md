@@ -195,6 +195,13 @@ the acceptance criteria above and to golden-image tests — never an invitation 
 apply an adjustable radius. Radius, shadow and inset controls apply only to
 non-window captures.
 
+This governs capture and export pixels, not transient UI around a preview. The
+floating stack uses one aspect-hugging outer container for every provenance so
+cards share a coherent silhouette and hit target. The image fills that container
+edge to edge without cropping or letterboxing. A window thumbnail still keeps
+its native alpha, corners and shadow: it is not clipped, bordered, flattened or
+written back into the capture.
+
 **Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
 another, `inner_radius = outer_radius − padding`. Violating it makes corners look
 subtly wrong even when both shapes are "rounded". This belongs in the design
@@ -833,7 +840,13 @@ properties every transient surface must have:
 
 The selection overlay is the sole exception to "small": it is deliberately
 fullscreen, and it is also deliberately momentary — it exists between the hotkey
-and the click, and Escape always cancels it.
+and the click, and Escape always cancels it. Before that surface is hidden for
+capture it must first become mouse-pass-through, and the card renderer must
+reassert its own input region when it returns. An invisible fullscreen window
+that can still consume even one click violates this decision, regardless of
+whether a capture is still being processed. Keyboard ownership may remain only
+long enough to consume the key-up that committed or cancelled selection; pointer
+input is released independently and immediately.
 
 **Ordinary windows are genuinely ordinary.** Settings and the annotation editor
 are real, native, movable, resizable windows with normal chrome. They are opened

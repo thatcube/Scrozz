@@ -100,7 +100,10 @@ impl NoMoveUp {
 
 #[test]
 fn sixteen_inch_macbook_pro_gets_six_slots() {
-    assert_eq!(StackLayout::new(mbp16(), CardMetrics::default()).slots(), 6);
+    let metrics = CardMetrics::default();
+    assert_eq!(metrics.gap, 8.0);
+    assert_eq!(metrics.margin, 16.0);
+    assert_eq!(StackLayout::new(mbp16(), metrics).slots(), 6);
 }
 
 #[test]
@@ -179,6 +182,36 @@ fn slots_stack_upward_from_the_bottom_of_the_work_area() {
         assert!(
             (below.top() - here.top() - m.pitch()).abs() < 0.01,
             "slots are one pitch apart"
+        );
+    }
+}
+
+#[test]
+fn variable_preview_heights_keep_exact_visible_gaps_and_bottom_margin() {
+    let mut stack = stack();
+    let metrics = stack.layout().metrics();
+    stack.push_sized(vec2(232.0, 136.625), &at(0));
+    stack.push_sized(vec2(88.0, 145.0), &at(0));
+    stack.push_sized(vec2(232.0, 54.875), &at(0));
+    stack.advance(&at(SETTLED));
+
+    let frames = stack.frame(&at(SETTLED));
+    assert!(
+        (frames[0].rect.bottom() - (mbp16().bottom() - metrics.margin)).abs() < 0.01,
+        "the visible bottom card must sit exactly at the Dock margin"
+    );
+    for pair in frames.windows(2) {
+        let lower = pair[0].rect;
+        let upper = pair[1].rect;
+        assert!(
+            (lower.top() - upper.bottom() - metrics.gap).abs() < 0.01,
+            "visible cards are not exactly {}pt apart: {lower:?} {upper:?}",
+            metrics.gap
+        );
+        assert_eq!(
+            upper.left(),
+            mbp16().left() + metrics.margin,
+            "every aspect shares the same left edge"
         );
     }
 }
@@ -303,6 +336,74 @@ fn overflow_evicts_exactly_the_oldest() {
         s.slot_of(newcomer),
         Some(s.capacity() - 1),
         "the new capture arrives at the top"
+    );
+}
+
+#[test]
+fn a_fall_does_not_reapply_an_active_entry_transform() {
+    let mut stack = stack();
+    let ids: Vec<_> = (0..stack.capacity()).map(|_| stack.push(&at(0))).collect();
+    let instant = at(40);
+    let before: Vec<_> = ids[1..]
+        .iter()
+        .map(|id| (*id, stack.frame_of(*id, &instant).unwrap().rect))
+        .collect();
+
+    stack.push(&instant);
+
+    for (id, expected) in before {
+        assert_rect_eq(
+            stack.frame_of(id, &instant).unwrap().rect,
+            expected,
+            "overflow must not double-apply entry motion",
+        );
+    }
+}
+
+#[test]
+fn a_fall_does_not_reapply_an_active_drag_transform() {
+    let mut stack = stack();
+    let lower = stack.push(&at(0));
+    let upper = stack.push(&at(0));
+    stack.advance(&at(SETTLED));
+    let instant = at(SETTLED);
+    let origin = stack.frame_of(upper, &instant).unwrap().rect.center();
+    assert!(stack.begin_drag(upper, origin, &instant));
+    stack.drag_to(origin + vec2(70.0, 35.0), &instant);
+    let before = stack.frame_of(upper, &instant).unwrap().rect;
+
+    assert!(stack.dismiss(lower, &instant));
+
+    assert_rect_eq(
+        stack.frame_of(upper, &instant).unwrap().rect,
+        before,
+        "dismissal below a held card must not double its drag offset",
+    );
+
+    stack.drag_to(origin + vec2(90.0, 55.0), &instant);
+    let after = stack.frame_of(upper, &instant).unwrap().rect;
+    assert!(
+        (after.min - before.min - vec2(20.0, 20.0)).length() < 0.01,
+        "a falling held card stopped tracking 1:1: {before:?} -> {after:?}"
+    );
+}
+
+#[test]
+fn a_fall_does_not_reapply_an_active_dock_transform() {
+    let mut stack = stack();
+    let lower = stack.push(&at(0));
+    let upper = stack.push(&at(0));
+    stack.advance(&at(SETTLED));
+    stack.collapse(&at(SETTLED));
+    let instant = at(SETTLED + 160);
+    let before = stack.frame_of(upper, &instant).unwrap().rect;
+
+    assert!(stack.dismiss(lower, &instant));
+
+    assert_rect_eq(
+        stack.frame_of(upper, &instant).unwrap().rect,
+        before,
+        "dismissal during collapse must not absorb the card twice",
     );
 }
 

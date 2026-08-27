@@ -4,14 +4,10 @@
 //!
 //! 1. **The card paints, and hover changes it.** Baseline liveness: a card that
 //!    silently draws nothing would pass every logic test in the crate.
-//! 2. **Decision D9 holds in the pixels.** A window capture arrives with the
-//!    compositor's own corner radius and shadow already baked into it, so
-//!    Scrozz may not add its own. That is easy to assert on the *decision*
-//!    ([`CardChrome::composites`]) and easy to get wrong in the *drawing* — a
-//!    previous spike shipped a square scrim over a rounded thumbnail and
-//!    squared the bottom corners of every card. Nobody noticed until a human
-//!    looked at it. So the interesting assertions in this file are made on
-//!    pixels, at the corners, with the hover chrome fully revealed.
+//! 2. **Every provenance shares one preview silhouette.** Exported window pixels
+//!    remain sacred (D9), but the transient stack may frame their thumbnail.
+//!    The frame must hug the fitted aspect ratio, its padding must be uniform,
+//!    and every caption or hover wash must follow that same outer curve.
 //!
 //! Everything renders through [`scrozz_ui::harness`]: pure CPU, virtual clock,
 //! no window, no GPU, bit-identical on every machine. Nothing in this file
@@ -84,6 +80,7 @@ fn alpha_at(image: &Image, x: f32, y: f32) -> u8 {
 /// real thumbnail would get, which is the geometry the corner probes read.
 struct CardScene {
     provenance: Provenance,
+    source_px: (u32, u32),
     reveal: f32,
     lift: f32,
     angle: f32,
@@ -93,6 +90,7 @@ impl CardScene {
     const fn resting(provenance: Provenance) -> Self {
         Self {
             provenance,
+            source_px: (1600, 1000),
             reveal: 0.0,
             lift: 0.0,
             angle: 0.0,
@@ -102,6 +100,7 @@ impl CardScene {
     const fn hovered(provenance: Provenance) -> Self {
         Self {
             provenance,
+            source_px: (1600, 1000),
             reveal: 1.0,
             lift: 0.0,
             angle: 0.0,
@@ -138,7 +137,7 @@ impl Scene for CardScene {
             angle: self.angle,
             state: CardState::Resting,
         };
-        let content = CardContent::new("capture-01.png", (1600, 1000), self.provenance);
+        let content = CardContent::new("capture-01.png", self.source_px, self.provenance);
 
         card::draw_card(ui, &surface, &frame, &content);
     }
@@ -161,6 +160,12 @@ fn render(scene: CardScene) -> Image {
     spec.background = Background::Transparent;
 
     renderer.render(&spec).expect("render card")
+}
+
+fn preview_rect(provenance: Provenance, source_px: (u32, u32)) -> Rect {
+    CardChrome::for_provenance(provenance)
+        .geometry(card_rect(), source_px)
+        .container
 }
 
 // ---------------------------------------------------------------------------
@@ -224,44 +229,11 @@ fn the_probe_points_are_inside_the_rendered_image() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. D9: a window capture is never composited onto
+// 2. Shared, aspect-hugging card geometry
 // ---------------------------------------------------------------------------
 
-/// The decision, stated. Cheap, and it is the thing every pixel test below
-/// depends on.
 #[test]
-fn window_provenance_refuses_to_composite() {
-    let window = CardChrome::for_provenance(Provenance::Window);
-    assert!(!window.composites(), "D9: a window capture takes no chrome");
-    assert_eq!(window.thumb_radius, 0.0);
-    assert_eq!(window.padding, 0.0);
-    assert!(!window.plate);
-    assert!(!window.shadow);
-
-    for other in [
-        Provenance::Display,
-        Provenance::Region,
-        Provenance::AllDisplays,
-        Provenance::Stitched,
-    ] {
-        let chrome = CardChrome::for_provenance(other);
-        assert!(
-            chrome.composites(),
-            "{other:?} owns its geometry and should get a card"
-        );
-        assert!(
-            chrome.is_concentric(),
-            "{other:?}: the plate's radius minus its padding must equal the \
-             thumbnail's, or the corners are not concentric"
-        );
-    }
-}
-
-/// Every provenance, at every reveal: an overlay is drawn with the same
-/// rounding as the thing beneath it. This is the invariant the historical
-/// squared-corner defect broke.
-#[test]
-fn overlays_always_share_the_captures_rounding() {
+fn every_provenance_gets_the_same_outer_preview_container() {
     for provenance in [
         Provenance::Display,
         Provenance::Window,
@@ -270,57 +242,63 @@ fn overlays_always_share_the_captures_rounding() {
         Provenance::Stitched,
     ] {
         let chrome = CardChrome::for_provenance(provenance);
+        assert!(chrome.has_preview_container(), "{provenance:?}");
+        assert!(chrome.overlays_match_container(), "{provenance:?}");
+        assert_eq!(chrome.padding, CardChrome::PADDING, "{provenance:?}");
+    }
+
+    let window = CardChrome::for_provenance(Provenance::Window);
+    assert_eq!(
+        window.thumb_radius, 0.0,
+        "the shared preview must not clip native window pixels"
+    );
+    assert!(
+        !window.capture_border,
+        "the shared preview must not redraw the native window edge"
+    );
+}
+
+#[test]
+fn preview_geometry_hugs_multiple_capture_aspects() {
+    let chrome = CardChrome::for_provenance(Provenance::Display);
+    for source in [(1600, 1000), (1920, 1080), (1000, 1000), (900, 1600)] {
+        let geometry = chrome.geometry(card_rect(), source);
+        assert!(card_rect().contains_rect(geometry.container), "{source:?}");
         assert!(
-            chrome.overlays_match(),
-            "{provenance:?}: overlay radius {} != thumbnail radius {}; \
-             a scrim with the wrong rounding squares the card's corners",
-            chrome.overlay_radius,
-            chrome.thumb_radius,
+            (geometry.container.left() + chrome.padding - geometry.capture.left()).abs() < 0.01
+                && (geometry.container.top() + chrome.padding - geometry.capture.top()).abs()
+                    < 0.01
+                && (geometry.capture.right() + chrome.padding - geometry.container.right()).abs()
+                    < 0.01
+                && (geometry.capture.bottom() + chrome.padding - geometry.container.bottom()).abs()
+                    < 0.01,
+            "{source:?}: the fitted capture is not uniformly padded"
+        );
+        assert!(
+            chrome.is_concentric(),
+            "{source:?}: inner and outer radii must remain concentric"
         );
     }
 }
 
-/// A window capture's corner is *filled*, because Scrozz did not round it.
 #[test]
-fn a_window_card_keeps_its_square_corner() {
-    let image = render(CardScene::resting(Provenance::Window));
-    let rect = card_rect();
-
-    // One point in from the true corner: far enough to be unambiguous at 2x,
-    // far inside any radius Scrozz would have applied had it applied one.
-    let a = alpha_at(&image, rect.left() + 1.0, rect.top() + 1.0);
-    let b = alpha_at(&image, rect.right() - 1.0, rect.bottom() - 1.0);
-    assert!(
-        a > 128 && b > 128,
-        "D9 violation: a window capture's corners were rounded by Scrozz \
-         (top-left alpha {a}, bottom-right alpha {b}); the compositor already \
-         rounded them and its radius is in the pixels"
-    );
+fn window_and_display_cards_share_the_outer_curve() {
+    for provenance in [Provenance::Window, Provenance::Display] {
+        let image = render(CardScene::resting(provenance));
+        let rect = preview_rect(provenance, (1600, 1000));
+        let corner = alpha_at(&image, rect.left() + 1.0, rect.top() + 1.0);
+        assert!(
+            corner < 64,
+            "{provenance:?} preview has a filled outer corner (alpha {corner})"
+        );
+    }
 }
 
-/// The contrast case: a card Scrozz *does* own is rounded, so the same corner
-/// is cut away.
 #[test]
-fn a_display_card_is_rounded() {
-    let image = render(CardScene::resting(Provenance::Display));
-    let rect = card_rect();
-
-    let a = alpha_at(&image, rect.left() + 1.0, rect.top() + 1.0);
-    assert!(
-        a < 64,
-        "a display capture's card should be rounded, but its corner is filled \
-         (alpha {a})"
-    );
-}
-
-/// The defect that shipped: a scrim without the capture's rounding squares the
-/// bottom corners once the chrome is revealed. The corner must still be cut
-/// away at full reveal.
-#[test]
-fn the_hover_scrim_does_not_square_the_corners() {
+fn the_hover_scrim_does_not_square_the_container() {
     let rest = render(CardScene::resting(Provenance::Display));
     let hover = render(CardScene::hovered(Provenance::Display));
-    let rect = card_rect();
+    let rect = preview_rect(Provenance::Display, (1600, 1000));
 
     for (name, x, y) in [
         ("bottom-left", rect.left() + 1.0, rect.bottom() - 1.0),
@@ -330,71 +308,42 @@ fn the_hover_scrim_does_not_square_the_corners() {
     ] {
         let at_rest = alpha_at(&rest, x, y);
         let revealed = alpha_at(&hover, x, y);
-        assert!(
-            at_rest < 64,
-            "{name} corner is not rounded even at rest (alpha {at_rest})"
-        );
+        assert!(at_rest < 64, "{name} is filled at rest (alpha {at_rest})");
         assert!(
             revealed < 64,
-            "{name} corner was squared by the hover chrome (alpha {at_rest} at \
-             rest, {revealed} revealed) — this is the exact defect D9 exists to \
-             prevent: an overlay drawn without the capture's rounding"
+            "{name} was squared by hover (rest {at_rest}, hover {revealed})"
         );
     }
 }
 
-/// The caption scrim is the other overlay, and it sits on the bottom edge where
-/// the rounding actually matters. It is drawn at rest, so the resting corners
-/// above already cover it — this asserts the scrim is genuinely *there*, so
-/// that assertion is not vacuous.
 #[test]
-fn the_caption_scrim_is_drawn_and_still_rounded() {
+fn the_caption_scrim_uses_the_aspect_hugging_container() {
     let image = render(CardScene::resting(Provenance::Display));
-    let rect = card_rect();
-    let chrome = CardChrome::for_provenance(Provenance::Display);
-    let capture = chrome.capture_rect(rect);
+    let rect = preview_rect(Provenance::Display, (1600, 1000));
 
-    // Just inside the bottom edge, centred: squarely under the caption.
-    let scrimmed = image.pixel(px(capture.center().x), px(capture.bottom() - 6.0));
-    // Well above it, clear of the scrim's gradient.
-    let clear = image.pixel(px(capture.center().x), px(capture.top() + 20.0));
-
+    let scrimmed = image.pixel(px(rect.center().x), px(rect.bottom() - 6.0));
+    let clear = image.pixel(px(rect.center().x), px(rect.top() + 20.0));
     assert!(
         scrimmed[3] > 200 && clear[3] > 200,
-        "both probes should be inside the opaque capture"
+        "both probes should be inside the preview"
     );
-    let darker = i32::from(scrimmed[0]) < i32::from(clear[0]);
     assert!(
-        darker,
-        "the caption scrim should darken the bottom of the capture \
-         (bottom {scrimmed:?} vs middle {clear:?}); if it is absent, the \
-         rounding assertions elsewhere in this file are not testing anything"
+        i32::from(scrimmed[0]) < i32::from(clear[0]),
+        "caption scrim did not darken the preview bottom: {scrimmed:?} vs {clear:?}"
     );
 }
 
-/// A window capture gets no shadow either — a shadow is composited geometry
-/// just as much as a corner radius is.
 #[test]
-fn a_window_card_casts_no_shadow() {
-    let window = render(CardScene::resting(Provenance::Window));
-    let display = render(CardScene::resting(Provenance::Display));
-    let rect = card_rect();
-
-    // Below the card, where a soft shadow falls.
-    let (x, y) = (rect.center().x, rect.bottom() + 5.0);
-    let shadowed = alpha_at(&display, x, y);
-    let bare = alpha_at(&window, x, y);
-
-    assert!(
-        shadowed > 0,
-        "a display card should cast a shadow below it, but the pixel is empty; \
-         the comparison below would then be vacuous"
-    );
-    assert_eq!(
-        bare, 0,
-        "D9 violation: Scrozz drew a shadow under a window capture \
-         (alpha {bare}); the compositor's own shadow is already in the pixels"
-    );
+fn every_preview_container_casts_the_stack_shadow() {
+    for provenance in [Provenance::Window, Provenance::Display] {
+        let image = render(CardScene::resting(provenance));
+        let rect = preview_rect(provenance, (1600, 1000));
+        let shadow = alpha_at(&image, rect.center().x, rect.bottom() + 5.0);
+        assert!(
+            shadow > 0,
+            "{provenance:?} preview should cast the shared stack shadow"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -198,7 +198,18 @@ struct SelectorChildViewport {
 }
 
 impl SelectorViewports {
-    fn hide(&self, ctx: &egui::Context) {
+    fn release_pointer(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(true),
+        );
+        for child in &self.children {
+            ctx.send_viewport_cmd_to(child.id, egui::ViewportCommand::MousePassthrough(true));
+        }
+    }
+
+    fn hide_and_release_input(&self, ctx: &egui::Context) {
+        self.release_pointer(ctx);
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
             egui::ViewportCommand::Visible(false),
@@ -600,6 +611,11 @@ impl CaptureSelector for ClientOverlaySelector {
 }
 
 impl ClientOverlayController {
+    /// Updates the work area capture cards return to after selection.
+    pub fn set_cards_geometry(&mut self, geometry: OverlayGeometry) {
+        self.cards = geometry;
+    }
+
     /// Advances lifecycle handshakes and applies viewport/native behavior.
     pub fn logic(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
         self.advance(ctx, native);
@@ -625,9 +641,7 @@ impl ClientOverlayController {
                 if decision == SelectionDecision::Pending {
                     let ctx = ui.ctx().clone();
                     for child in &viewports.children {
-                        let builder = scrozz_ui::overlay_app::viewport(child.geometry)
-                            .with_title("Scrozz Selector")
-                            .with_app_id(format!("com.scrozz.selector.{}", child.display.0));
+                        let builder = child_viewport_builder(child);
                         decision =
                             ctx.show_viewport_immediate(child.id, builder, |child_ui, _class| {
                                 selector.update_display(child_ui, &child.display)
@@ -638,6 +652,10 @@ impl ClientOverlayController {
                     }
                 }
                 decision
+            }
+            ControllerPhase::ReleaseBeforeHide { viewports, .. } => {
+                keep_child_viewports_alive(ui.ctx(), viewports);
+                return;
             }
             _ => return,
         };
@@ -655,6 +673,10 @@ impl ClientOverlayController {
             ..
         } = phase
         {
+            // The committing key may still be down, so the viewports stay alive
+            // long enough to consume key-up. Pointer input is independent and
+            // must be released immediately once selection has ended.
+            viewports.release_pointer(ui.ctx());
             self.phase = ControllerPhase::ReleaseBeforeHide {
                 id,
                 decision,
@@ -687,7 +709,7 @@ impl ClientOverlayController {
                 result,
                 viewports,
             } => {
-                if !selector_input_is_quiescent(ctx) {
+                if !selector_input_is_quiescent(ctx, &viewports) {
                     ctx.request_repaint();
                     ControllerPhase::ReleaseBeforeHide {
                         id,
@@ -696,8 +718,8 @@ impl ClientOverlayController {
                         viewports,
                     }
                 } else {
-                    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
-                    viewports.hide(ctx);
+                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    viewports.hide_and_release_input(ctx);
                     ControllerPhase::HideAfterDecision {
                         id,
                         decision,
@@ -732,11 +754,15 @@ impl ClientOverlayController {
             BridgeEvent::BeginCapture { id, hidden }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforeCapture { id, hidden };
             }
             BridgeEvent::Begin { id, hidden } if matches!(self.phase, ControllerPhase::Cards) => {
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforePreparation { id, hidden };
@@ -783,13 +809,14 @@ impl ClientOverlayController {
                 ) =>
             {
                 if self.completion == Completion::CloseWindow {
-                    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     let _ = restored.send(());
                     self.phase = ControllerPhase::Cards;
                 } else {
                     configure_viewport(ctx, self.cards, false);
-                    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     ctx.request_repaint();
                     self.phase = ControllerPhase::RestoringCards { restored };
                 }
@@ -800,13 +827,16 @@ impl ClientOverlayController {
                 let _ = restored.send(());
             }
             BridgeEvent::Cancel => {
-                native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 match &self.phase {
                     ControllerPhase::Selecting { viewports, .. }
                     | ControllerPhase::ReleaseBeforeHide { viewports, .. } => {
-                        viewports.hide(ctx);
+                        viewports.hide_and_release_input(ctx);
                     }
-                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+                    _ => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
                 }
                 if self.completion == Completion::CloseWindow {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1090,8 +1120,33 @@ fn selector_viewports_for(
     })
 }
 
-fn selector_input_is_quiescent(ctx: &egui::Context) -> bool {
-    ctx.input(|input| {
+fn child_viewport_builder(child: &SelectorChildViewport) -> egui::ViewportBuilder {
+    scrozz_ui::overlay_app::viewport(child.geometry)
+        .with_title("Scrozz Selector")
+        .with_app_id(format!("com.scrozz.selector.{}", child.display.0))
+}
+
+fn keep_child_viewports_alive(ctx: &egui::Context, viewports: &SelectorViewports) -> usize {
+    for child in &viewports.children {
+        ctx.show_viewport_immediate(
+            child.id,
+            child_viewport_builder(child),
+            |_child_ui, _class| {},
+        );
+    }
+    viewports.children.len()
+}
+
+fn selector_input_is_quiescent(ctx: &egui::Context, viewports: &SelectorViewports) -> bool {
+    input_is_quiescent(ctx, egui::ViewportId::ROOT)
+        && viewports
+            .children
+            .iter()
+            .all(|child| input_is_quiescent(ctx, child.id))
+}
+
+fn input_is_quiescent(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
+    ctx.input_for(viewport, |input| {
         input.keys_down.is_empty()
             && !input.pointer.any_down()
             && !input.modifiers.alt
@@ -1106,7 +1161,7 @@ fn configure_viewport(ctx: &egui::Context, geometry: OverlayGeometry, selection:
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
-    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!selection));
     // The viewport starts always-on-top. Re-queueing that level here would run
     // after the native macOS adapter raises selection to shielding level and
     // silently lower it back to an ordinary floating window.
@@ -1505,7 +1560,14 @@ mod tests {
             matches!(&controller.phase, ControllerPhase::Selecting { .. })
         });
         assert_eq!(preparations.load(Ordering::SeqCst), 1);
-        assert_eq!(*behavior_log.borrow(), vec![true]);
+        assert_eq!(
+            *behavior_log.borrow(),
+            vec![
+                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
+            ],
+            "the hidden preparation window must release input before selection takes it"
+        );
 
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -1526,19 +1588,36 @@ mod tests {
             |ui| controller.ui(ui),
         );
         output.textures_delta.clear();
+        assert!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| {
+                    viewport.commands.iter().any(|command| {
+                        matches!(command, egui::ViewportCommand::MousePassthrough(true))
+                    })
+                }),
+            "selection completion must release pointer input in the same frame"
+        );
         assert!(matches!(
             &controller.phase,
             ControllerPhase::ReleaseBeforeHide { .. }
         ));
         assert_eq!(
             *behavior_log.borrow(),
-            vec![true],
+            vec![
+                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
+            ],
             "focus must remain owned until the decision handshake advances"
         );
         controller.logic(&ctx, &native);
         assert_eq!(
             *behavior_log.borrow(),
-            vec![true],
+            vec![
+                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
+            ],
             "focus must remain owned until the committing key is released"
         );
         assert!(matches!(
@@ -1572,8 +1651,12 @@ mod tests {
         controller.logic(&ctx, &native);
         assert_eq!(
             *behavior_log.borrow(),
-            vec![true, false],
-            "native focus may release after the committing key-up is consumed"
+            vec![
+                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
+                scrozz_shell::OverlayBehavior::hidden_surface(),
+            ],
+            "the invisible capture interval must release pointer and keyboard input"
         );
         assert!(matches!(
             &controller.phase,
@@ -1627,6 +1710,13 @@ mod tests {
             controller.logic(&ctx, &native);
             matches!(&controller.phase, ControllerPhase::RestoringCards { .. })
         });
+        assert!(
+            behavior_log
+                .borrow()
+                .last()
+                .is_some_and(|behavior| behavior.click_through),
+            "restoration must stay fail-open until the card renderer paints"
+        );
         controller.logic(&ctx, &native);
         owner_finished_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1658,7 +1748,7 @@ mod tests {
             );
             output.textures_delta.clear();
             assert!(
-                !selector_input_is_quiescent(&ctx),
+                !input_is_quiescent(&ctx, egui::ViewportId::ROOT),
                 "{key:?} press must retain selector focus"
             );
 
@@ -1672,10 +1762,79 @@ mod tests {
             );
             output.textures_delta.clear();
             assert!(
-                selector_input_is_quiescent(&ctx),
+                input_is_quiescent(&ctx, egui::ViewportId::ROOT),
                 "{key:?} release must unlock selector focus restoration"
             );
         }
+    }
+
+    #[test]
+    fn terminal_input_barrier_includes_secondary_viewports() {
+        let ctx = egui::Context::default();
+        let child_id = egui::ViewportId::from_hash_of("secondary");
+        let viewports = SelectorViewports {
+            root: SelectorRootViewport {
+                display: None,
+                geometry: OverlayGeometry::default(),
+            },
+            children: vec![SelectorChildViewport {
+                id: child_id,
+                display: DisplayId("secondary".to_owned()),
+                geometry: OverlayGeometry::default(),
+            }],
+        };
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let run_child = |ctx: &egui::Context, event| {
+            let mut input = egui::RawInput {
+                viewport_id: child_id,
+                events: vec![event],
+                ..Default::default()
+            };
+            input.viewports.insert(child_id, Default::default());
+            let mut output = ctx.run_ui(input, |_| {});
+            output.textures_delta.clear();
+        };
+
+        run_child(&ctx, key(true));
+        assert!(
+            !selector_input_is_quiescent(&ctx, &viewports),
+            "a held key in a child selector must retain input ownership"
+        );
+        run_child(&ctx, key(false));
+        assert!(
+            selector_input_is_quiescent(&ctx, &viewports),
+            "releasing the child selector key must unlock teardown"
+        );
+    }
+
+    #[test]
+    fn release_barrier_reissues_every_secondary_viewport() {
+        let child_id = egui::ViewportId::from_hash_of("secondary-release");
+        let viewports = SelectorViewports {
+            root: SelectorRootViewport {
+                display: None,
+                geometry: OverlayGeometry::default(),
+            },
+            children: vec![SelectorChildViewport {
+                id: child_id,
+                display: DisplayId("secondary".to_owned()),
+                geometry: OverlayGeometry::default(),
+            }],
+        };
+        let ctx = egui::Context::default();
+        let mut kept = 0;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            kept = keep_child_viewports_alive(&ctx, &viewports);
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(kept, 1);
     }
 
     #[test]

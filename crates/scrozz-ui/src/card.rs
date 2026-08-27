@@ -20,23 +20,18 @@
 //! and why this module never wraps one in a fade. Instant feedback reads as
 //! faster than an eased one, and a control is not an object.
 //!
-//! # D9: a window capture is never composited onto
+//! # D9: exported window pixels are never composited onto
 //!
 //! A window capture already carries the compositor's own corner radius, its
 //! shadow, and the transparency between the two. Painting a synthetic radius,
-//! shadow, padding or backing plate on top of that produces a double corner and
-//! a double shadow, and it bakes the host's idea of a window into a picture the
-//! user will paste somewhere else.
+//! shadow, padding or backing plate into those pixels produces a double corner
+//! and a double shadow.
 //!
-//! [`CardChrome::for_provenance`] is the single place that decision is made, and
-//! [`CardChrome::composites`] reports it so a test can assert it directly rather
-//! than inferring it from pixels. Every overlay this module draws — the hover
-//! scrim, the caption scrim, the placeholder — takes its rounding from
-//! [`CardChrome::overlay_radius`], which is by construction the *same* value the
-//! capture is drawn with. That is not a stylistic preference: a scrim drawn with
-//! square corners over a rounded thumbnail squares the bottom of the card, which
-//! is exactly the defect that shipped once before and which nobody caught until
-//! a human looked at it.
+//! The floating stack is presentation, not export. Every thumbnail therefore
+//! fills the same removable, aspect-hugging preview container edge to edge,
+//! while a window thumbnail keeps its native alpha and receives no synthetic
+//! clipping or border. Hover and caption washes follow the outer container,
+//! never an unrelated fixed slot.
 
 use egui::epaint::{Mesh, Vertex};
 use egui::{Align2, Color32, Id, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
@@ -60,6 +55,12 @@ const HOVER_SCRIM: f32 = 132.0;
 const CAPTION_SCRIM: f32 = 205.0;
 /// Height of the caption scrim, matching [`paint::caption_strip`].
 const CAPTION_H: f32 = 58.0;
+/// Width below which primary actions collapse to icon-only controls.
+const COMPACT_CHROME_W: f32 = 154.0;
+/// Height below which the two-row chrome collapses to icon-only controls.
+const COMPACT_CHROME_H: f32 = 72.0;
+/// Smallest outer dimension that can still carry one 28pt compact control.
+const MIN_INTERACTIVE_SIDE: f32 = ICON_BTN + CHROME_INSET * 2.0;
 
 // ---------------------------------------------------------------------------
 // Chrome
@@ -75,11 +76,7 @@ pub struct CardChrome {
     /// Corner radius applied to the capture, in points. Zero when the capture
     /// carries its own corners.
     pub thumb_radius: f32,
-    /// Radius for *anything* drawn over the capture — scrims, placeholders,
-    /// hover washes.
-    ///
-    /// Always equal to [`Self::thumb_radius`]. It is a separate field so the
-    /// invariant is nameable and testable rather than implicit in a call site.
+    /// Radius for anything drawn over the shared preview container.
     pub overlay_radius: f32,
     /// Inset of the capture inside the card rectangle, in points.
     pub padding: f32,
@@ -87,6 +84,10 @@ pub struct CardChrome {
     pub plate: bool,
     /// Whether a synthetic drop shadow is drawn under the card.
     pub shadow: bool,
+    /// Whether the preview draws a hairline around the thumbnail.
+    ///
+    /// Window captures keep the platform-provided edge and alpha untouched.
+    pub capture_border: bool,
 }
 
 impl CardChrome {
@@ -95,52 +96,46 @@ impl CardChrome {
 
     /// Padding between the card edge and the capture.
     ///
-    /// Chosen so the concentric-radius rule holds exactly:
-    /// `inner = outer − padding`, i.e. [`Radius::THUMB`] sits inside
-    /// [`Radius::CARD`] with no optical pinch at the corners.
-    pub const PADDING: f32 = Radius::CARD - Radius::THUMB;
+    /// Zero by design: the image is the thumbnail surface and fills it edge to
+    /// edge. Aspect-hugging avoids both cropping and letterboxing.
+    pub const PADDING: f32 = 0.0;
 
     /// The chrome permitted for a capture of this provenance.
     #[must_use]
     pub fn for_provenance(provenance: Provenance) -> Self {
         if provenance.forbids_compositing() {
-            // A window capture is delivered with its own radius, its own shadow
-            // and the alpha between them. Everything here is off, and stays off
-            // in every interaction state including drag (D9).
+            // The shared container lives outside the thumbnail. The thumbnail
+            // itself keeps the native window pixels, alpha and edge untouched.
             Self {
                 thumb_radius: 0.0,
-                overlay_radius: 0.0,
-                padding: 0.0,
-                plate: false,
-                shadow: false,
-            }
-        } else {
-            Self {
-                thumb_radius: Radius::THUMB,
-                overlay_radius: Radius::THUMB,
+                overlay_radius: Self::OUTER_RADIUS,
                 padding: Self::PADDING,
                 plate: true,
                 shadow: true,
+                capture_border: false,
+            }
+        } else {
+            Self {
+                thumb_radius: Self::OUTER_RADIUS,
+                overlay_radius: Self::OUTER_RADIUS,
+                padding: Self::PADDING,
+                plate: true,
+                shadow: true,
+                capture_border: true,
             }
         }
     }
 
-    /// Whether this chrome adds any synthetic geometry to the capture at all.
-    ///
-    /// The one assertion a D9 test needs.
+    /// Whether this chrome supplies the shared floating preview container.
     #[must_use]
-    pub fn composites(self) -> bool {
-        self.plate || self.shadow || self.padding > 0.0 || self.thumb_radius > 0.0
+    pub fn has_preview_container(self) -> bool {
+        self.plate && self.shadow
     }
 
-    /// Whether the overlay rounding matches the capture's rounding.
-    ///
-    /// Must always be true. A scrim, wash or placeholder drawn at a different
-    /// radius from the thing beneath it changes the silhouette of the card,
-    /// which is the D9 defect in its original form.
+    /// Whether overlays use the preview container's own rounding.
     #[must_use]
-    pub fn overlays_match(self) -> bool {
-        (self.overlay_radius - self.thumb_radius).abs() < f32::EPSILON
+    pub fn overlays_match_container(self) -> bool {
+        (self.overlay_radius - Self::OUTER_RADIUS).abs() < f32::EPSILON
     }
 
     /// Whether `inner = outer − padding` holds.
@@ -149,11 +144,32 @@ impl CardChrome {
         (Self::OUTER_RADIUS - self.padding - self.thumb_radius).abs() < 0.001
     }
 
-    /// Where the capture is drawn inside a card rectangle.
+    /// Derives the aspect-hugging container and capture rectangles for a slot.
     #[must_use]
-    pub fn capture_rect(self, card: Rect) -> Rect {
-        card.shrink(self.padding)
+    pub fn geometry(self, slot: Rect, source_px: (u32, u32)) -> CardGeometry {
+        let capture = fit(slot.shrink(self.padding), source_px);
+        let hugging = capture.expand(self.padding);
+        let size = vec2(
+            hugging.width().max(MIN_INTERACTIVE_SIDE).min(slot.width()),
+            hugging
+                .height()
+                .max(MIN_INTERACTIVE_SIDE)
+                .min(slot.height()),
+        );
+        CardGeometry {
+            container: Rect::from_center_size(hugging.center(), size),
+            capture,
+        }
     }
+}
+
+/// The visible geometry derived from one fixed stack slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardGeometry {
+    /// Shared outer plate, shadow, hover surface and interaction hitbox.
+    pub container: Rect,
+    /// Aspect-preserving thumbnail rectangle inside the container.
+    pub capture: Rect,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +328,8 @@ pub fn draw_card(
     content: &CardContent<'_>,
 ) -> CardResponse {
     let chrome = CardChrome::for_provenance(content.provenance);
-    let rect = frame.rect;
+    let geometry = chrome.geometry(frame.rect, content.source_px);
+    let rect = geometry.container;
     let alpha = frame.alpha.clamp(0.0, 1.0);
     let palette = surface.palette();
 
@@ -365,7 +382,7 @@ pub fn draw_card(
         }
     }
 
-    let capture = chrome.capture_rect(rect);
+    let capture = geometry.capture;
     draw_capture(ui, surface, content, chrome, capture, angle, alpha);
 
     // The caption belongs to the resting card; the hover chrome replaces it, so
@@ -376,7 +393,7 @@ pub fn draw_card(
         draw_caption(
             ui,
             surface,
-            capture,
+            rect,
             chrome,
             content,
             caption_alpha,
@@ -385,7 +402,7 @@ pub fn draw_card(
         );
     }
 
-    let action = draw_chrome(ui, surface, frame, chrome, capture, alpha * reveal);
+    let action = draw_chrome(ui, surface, frame, chrome, rect, alpha * reveal);
 
     CardResponse {
         body,
@@ -409,22 +426,20 @@ fn draw_capture(
     let palette = surface.palette();
 
     let Some(texture) = content.texture else {
-        // No pixels yet, so there is nothing to composite *onto*: a neutral
-        // holding fill is not a violation. It still takes the capture's own
-        // rounding, so the card's silhouette never changes when the thumbnail
-        // arrives.
+        // No pixels yet, so use the shared container silhouette. A window's
+        // native alpha is not available to preserve until its texture arrives.
         let fill = fade(palette.card_fill, alpha * 0.9);
         if angle.abs() > f32::EPSILON {
             paint::fill_rot_round_rect(
                 painter,
                 capture,
-                chrome.overlay_radius,
+                CardChrome::OUTER_RADIUS,
                 capture.center(),
                 angle,
                 fill,
             );
         } else {
-            painter.rect_filled(capture, corner(chrome.overlay_radius), fill);
+            painter.rect_filled(capture, corner(CardChrome::OUTER_RADIUS), fill);
         }
         return;
     };
@@ -435,9 +450,9 @@ fn draw_capture(
     let tint = Color32::WHITE.gamma_multiply(alpha);
     textured_round_rect(painter, texture, fitted, chrome.thumb_radius, angle, tint);
 
-    if chrome.plate {
-        // A hairline only where we already own the geometry. Never around a
-        // window capture, whose edge is its own (D9).
+    if chrome.capture_border {
+        // A hairline only where we own the thumbnail geometry. Never around a
+        // window capture, whose edge is platform-provided (D9).
         painter.rect_stroke(
             fitted,
             corner(chrome.thumb_radius),
@@ -447,13 +462,12 @@ fn draw_capture(
     }
 }
 
-/// Name on the left, dimensions on the right, over a scrim that takes the
-/// capture's rounding.
+/// Name on the left, dimensions on the right, over the shared card container.
 #[allow(clippy::too_many_arguments)]
 fn draw_caption(
     ui: &mut Ui,
     surface: &Surface<'_>,
-    capture: Rect,
+    container: Rect,
     chrome: CardChrome,
     content: &CardContent<'_>,
     alpha: f32,
@@ -468,29 +482,40 @@ fn draw_caption(
     }
     let painter = ui.painter();
 
-    // `bottom_scrim` rounds its *bottom* corners to the radius it is given, so
-    // passing the capture's radius is what keeps the card's silhouette intact.
+    if container.width() < 132.0 {
+        return;
+    }
+
+    // `bottom_scrim` rounds its bottom corners to the container radius.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let peak = (CAPTION_SCRIM * alpha).round().clamp(0.0, 255.0) as u8;
     if peak > 0 {
-        paint::bottom_scrim(painter, capture, CAPTION_H, chrome.overlay_radius, peak);
+        paint::bottom_scrim(
+            painter,
+            container,
+            CAPTION_H.min(container.height()),
+            chrome.overlay_radius,
+            peak,
+        );
     }
 
-    let cy = capture.bottom() - 15.0;
+    let cy = container.bottom() - 15.0;
     painter.text(
-        pos2(capture.left() + 13.0, cy),
+        pos2(container.left() + 13.0, cy),
         Align2::LEFT_CENTER,
         content.name,
         surface.font(Text::Label),
         fade(Color32::from_rgb(255, 255, 255), alpha * 0.925),
     );
-    painter.text(
-        pos2(capture.right() - 13.0, cy),
-        Align2::RIGHT_CENTER,
-        content.dimensions(),
-        surface.font(Text::Caption),
-        fade(Color32::from_rgb(255, 255, 255), alpha * 0.59),
-    );
+    if container.width() >= 190.0 {
+        painter.text(
+            pos2(container.right() - 13.0, cy),
+            Align2::RIGHT_CENTER,
+            content.dimensions(),
+            surface.font(Text::Caption),
+            fade(Color32::from_rgb(255, 255, 255), alpha * 0.59),
+        );
+    }
 }
 
 /// The hover chrome: a scrim, two primary pills, four quiet corner icons.
@@ -503,7 +528,7 @@ fn draw_chrome(
     surface: &Surface<'_>,
     frame: &CardFrame,
     chrome: CardChrome,
-    capture: Rect,
+    container: Rect,
     opacity: f32,
 ) -> Option<CardAction> {
     if opacity <= 0.004 {
@@ -516,20 +541,37 @@ fn draw_chrome(
         // Same rounding as the capture beneath it. This single argument is the
         // whole of D9 at this call site.
         ui.painter().rect_filled(
-            capture,
+            container,
             corner(chrome.overlay_radius),
             Color32::from_black_alpha(scrim),
         );
     }
 
-    let inner = capture.shrink(CHROME_INSET);
-    if inner.width() < ICON_BTN * 2.0 || inner.height() < ICON_BTN * 2.0 {
-        return None;
-    }
+    let inner = container.shrink(CHROME_INSET);
 
     let lift = Reveal::new(opacity, vec2(0.0, (1.0 - opacity) * 6.0));
     let settle = Reveal::new(opacity, vec2(0.0, (1.0 - opacity) * -3.0));
     let mut pressed = None;
+
+    if inner.width() < COMPACT_CHROME_W || inner.height() < COMPACT_CHROME_H {
+        let rects = compact_primary_rects(inner)?;
+        for (rect, action) in rects.into_iter().zip([CardAction::Copy, CardAction::Save]) {
+            let response = paint::icon_button(
+                ui,
+                surface,
+                rect,
+                control_id(frame.id, action),
+                action.icon(),
+                action.label(),
+                ControlState::new(),
+                lift,
+            );
+            if response.clicked() {
+                pressed = Some(action);
+            }
+        }
+        return pressed;
+    }
 
     // Primary: Copy and Save, side by side, centred.
     let gap = Space::SM;
@@ -597,6 +639,32 @@ fn draw_chrome(
 // ---------------------------------------------------------------------------
 // Geometry helpers
 // ---------------------------------------------------------------------------
+
+fn compact_primary_rects(inner: Rect) -> Option<[Rect; 2]> {
+    let gap = Space::SM;
+    let total = ICON_BTN.mul_add(2.0, gap);
+    if inner.width() >= total && inner.height() >= ICON_BTN {
+        let first = Rect::from_min_size(
+            pos2(
+                inner.center().x - total * 0.5,
+                inner.center().y - ICON_BTN * 0.5,
+            ),
+            vec2(ICON_BTN, ICON_BTN),
+        );
+        return Some([first, first.translate(vec2(ICON_BTN + gap, 0.0))]);
+    }
+    if inner.height() >= total && inner.width() >= ICON_BTN {
+        let first = Rect::from_min_size(
+            pos2(
+                inner.center().x - ICON_BTN * 0.5,
+                inner.center().y - total * 0.5,
+            ),
+            vec2(ICON_BTN, ICON_BTN),
+        );
+        return Some([first, first.translate(vec2(0.0, ICON_BTN + gap))]);
+    }
+    None
+}
 
 /// Fit `source_px` inside `bounds`, preserving aspect and centring.
 ///
@@ -685,14 +753,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_provenance_adds_nothing() {
+    fn window_provenance_keeps_native_thumbnail_geometry_inside_shared_chrome() {
         let c = CardChrome::for_provenance(Provenance::Window);
-        assert!(!c.composites());
-        assert!(!c.plate);
-        assert!(!c.shadow);
-        assert_eq!(c.padding, 0.0);
+        assert!(c.has_preview_container());
+        assert!(c.plate);
+        assert!(c.shadow);
+        assert_eq!(c.padding, CardChrome::PADDING);
         assert_eq!(c.thumb_radius, 0.0);
-        assert!(c.overlays_match());
+        assert!(!c.capture_border);
+        assert!(c.overlays_match_container());
     }
 
     #[test]
@@ -704,9 +773,55 @@ mod tests {
             Provenance::Stitched,
         ] {
             let c = CardChrome::for_provenance(p);
-            assert!(c.composites(), "{p:?} should get chrome");
+            assert!(c.has_preview_container(), "{p:?} should get chrome");
             assert!(c.is_concentric(), "{p:?} radius must be concentric");
-            assert!(c.overlays_match());
+            assert!(c.capture_border);
+            assert!(c.overlays_match_container());
+        }
+    }
+
+    #[test]
+    fn preview_geometry_is_edge_to_edge_for_normal_aspects() {
+        let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(232.0, 145.0));
+        for source in [(100, 100), (1600, 1000), (1920, 1080), (900, 1600)] {
+            let chrome = CardChrome::for_provenance(Provenance::Display);
+            let geometry = chrome.geometry(slot, source);
+            assert!(slot.contains_rect(geometry.container), "{source:?}");
+            assert_eq!(geometry.container, geometry.capture, "{source:?}");
+            assert!(
+                (geometry.capture.left() - geometry.container.left() - chrome.padding).abs()
+                    < 0.001
+            );
+            assert!(
+                (geometry.capture.top() - geometry.container.top() - chrome.padding).abs() < 0.001
+            );
+            assert!(
+                (geometry.container.right() - geometry.capture.right() - chrome.padding).abs()
+                    < 0.001
+            );
+            assert!(
+                (geometry.container.bottom() - geometry.capture.bottom() - chrome.padding).abs()
+                    < 0.001
+            );
+        }
+    }
+
+    #[test]
+    fn compact_primary_actions_fit_panorama_and_portrait_previews() {
+        let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(232.0, 145.0));
+        let chrome = CardChrome::for_provenance(Provenance::Display);
+        for source in [
+            (5760, 1080),
+            (900, 1600),
+            (1179, 2556),
+            (3000, 300),
+            (300, 3000),
+        ] {
+            let inner = chrome.geometry(slot, source).container.shrink(CHROME_INSET);
+            let controls = compact_primary_rects(inner)
+                .unwrap_or_else(|| panic!("{source:?} lost Copy and Save controls"));
+            assert!(inner.contains_rect(controls[0]), "{source:?}");
+            assert!(inner.contains_rect(controls[1]), "{source:?}");
         }
     }
 
