@@ -195,8 +195,15 @@ fn new_capture_animates_in_then_the_app_goes_idle() {
     );
     assert!(n < 120, "the entry animation never finished inside 2s — it would never idle");
 
-    // The card really arrived.
-    assert_eq!(frames[n.saturating_sub(1)].len, at_rest.len + 1, "no card was added");
+    // The card really arrived. The list is capped at `MAX_VISIBLE`, so a spawn
+    // onto an already-full list holds the count rather than growing it — the
+    // oldest capture is pushed off the end and reaped.
+    let after = frames[n.saturating_sub(1)].len;
+    assert!(
+        after == at_rest.len + 1 || after == stack::MAX_VISIBLE,
+        "no card was added (len went {} -> {after})",
+        at_rest.len
+    );
 
     // And the animated values genuinely changed frame to frame — this is the
     // assertion the previous spike would have failed.
@@ -311,8 +318,34 @@ fn replay_restarts_the_animation_without_leaking() {
 /// The front card's horizontal offset from its home position this frame.
 /// `pose()` lays each card out as [depth, x, y, angle, alpha, entry], and the
 /// deck's front card is always first.
+/// The x-offset of the card that is furthest from home.
+///
+/// Was `pose[1]`, the *first* deck entry. That read the newest capture only
+/// while new cards were inserted at the front. They now arrive at the **top** of
+/// the pile (D28: bottom-anchored, growing upward, oldest at index 0), so the
+/// first entry is the oldest card and reading it found a settled card rather
+/// than the arriving one.
 fn front_x(f: &Frame) -> f32 {
-    f.pose.get(1).copied().unwrap_or(0.0)
+    card_x(f, entering_index(f))
+}
+
+/// The pose index of the card furthest from home — the one currently flying.
+fn entering_index(f: &Frame) -> usize {
+    f.pose
+        .chunks(6)
+        .enumerate()
+        .filter_map(|(i, c)| c.get(1).map(|x| (i, *x)))
+        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+        .map_or(0, |(i, _)| i)
+}
+
+/// One card's x-offset, by pose index.
+///
+/// Tracking a *fixed* index matters once a spawn can also evict: the departing
+/// card accelerates away and would otherwise steal "furthest from home" from the
+/// arriving card partway through, truncating the measured flight.
+fn card_x(f: &Frame, index: usize) -> f32 {
+    f.pose.chunks(6).nth(index).and_then(|c| c.get(1)).copied().unwrap_or(0.0)
 }
 
 /// The headline of the whole spike: a new capture must arrive as a *slide from
@@ -340,13 +373,17 @@ fn entry_slides_in_from_the_anchored_edge() {
     // is on the order of ten frames, not thirty.)
     let mut travel = vec![first.clone()];
     travel.extend(sim.run(90));
+    // Follow the card that was entering on the first frame, for its whole
+    // flight. Re-deciding per frame would hand the measurement to a departing
+    // card as soon as that one overtook it.
+    let entering = entering_index(&first);
     let inward: f32 = travel
         .windows(2)
-        .map(|w| (front_x(&w[1]) - front_x(&w[0])).max(0.0))
+        .map(|w| (card_x(&w[1], entering) - card_x(&w[0], entering)).max(0.0))
         .sum();
     let frames = travel
         .windows(2)
-        .filter(|w| front_x(&w[1]) - front_x(&w[0]) > 0.5)
+        .filter(|w| card_x(&w[1], entering) - card_x(&w[0], entering) > 0.5)
         .count();
     assert!(
         inward > 280.0 && frames >= 4,
@@ -356,7 +393,10 @@ fn entry_slides_in_from_the_anchored_edge() {
     // A spring settle, not an ease-out: the card must carry past its home
     // position and come back. If this ever reads 0 the motion has quietly
     // degraded into a plain tween.
-    let overshoot = travel.iter().map(|f| front_x(f)).fold(f32::MIN, f32::max);
+    let overshoot = travel
+        .iter()
+        .map(|f| card_x(f, entering))
+        .fold(f32::MIN, f32::max);
     assert!(
         overshoot > 2.0,
         "the entry should overshoot and settle back, peak was {overshoot:.1}px"
@@ -424,5 +464,64 @@ fn dismissal_travels_toward_the_anchored_edge() {
         sim.step().len,
         before - 1,
         "the dismissed card should have left the deck"
+    );
+}
+
+/// **The layout correction, locked in.**
+///
+/// The overlay is a *vertical list*, not a card stack. An earlier revision drew
+/// cards overlapping with progressive offset, scale and opacity falloff — only
+/// the top one fully visible. That was a misreading of the CleanShot reference,
+/// which shows two fully-separate cards with a clear gap between them.
+///
+/// This asserts the properties that distinguish a list from a stack, so the
+/// stack metaphor cannot creep back in:
+///   * every visible slot is the **same size** (no scale falloff)
+///   * no two slots **overlap**, and there is a real gap
+///   * slots differ only on **y** (no horizontal peek)
+///   * every visible slot is at **full opacity** (no depth dimming)
+#[test]
+fn the_list_is_vertical_and_never_overlaps() {
+    let home = egui::Rect::from_min_size(
+        egui::pos2(40.0, 600.0),
+        egui::vec2(stack::CARD_W, stack::CARD_H),
+    );
+    let rects: Vec<egui::Rect> =
+        (0..stack::MAX_VISIBLE).map(|i| stack::Stack::geom(home, i as f32)).collect();
+
+    for (i, r) in rects.iter().enumerate() {
+        assert_eq!(
+            r.size(),
+            home.size(),
+            "slot {i} is not the same size as slot 0 — that is stack scale falloff"
+        );
+        assert!(
+            (r.left() - home.left()).abs() < 0.01,
+            "slot {i} is offset horizontally by {} — a list has no sideways peek",
+            r.left() - home.left()
+        );
+        assert!(
+            (stack::Stack::slot_alpha(i as f32) - 1.0).abs() < 0.001,
+            "slot {i} is dimmed — every capture in the list is fully visible"
+        );
+    }
+
+    for w in rects.windows(2) {
+        let gap = w[0].top() - w[1].bottom();
+        assert!(
+            gap > 0.5,
+            "consecutive cards overlap (gap {gap}) — this is the stack metaphor, not a list"
+        );
+        assert!(
+            gap < stack::CARD_H,
+            "consecutive cards are further apart than a whole card ({gap}) — that is not a list"
+        );
+    }
+
+    // And the card immediately past the end of the list has faded out, which is
+    // how the cap is enforced without anything blinking off screen.
+    assert!(
+        stack::Stack::slot_alpha(stack::MAX_VISIBLE as f32) < 0.01,
+        "the card pushed past the end of the list should be gone"
     );
 }

@@ -1,3 +1,9 @@
+# Stand alone. The repo root grew a `crates/*` workspace while this spike was
+# being written, which would otherwise pull the spike in as a member and break
+# its build whenever a sibling crate is mid-edit. An empty table makes this
+# directory its own workspace root.
+[workspace]
+
 # THROWAWAY visual spike — see README.md. Not part of the Scrozz app build.
 # This crate is deliberately NOT a workspace member; it stands alone.
 [package]
