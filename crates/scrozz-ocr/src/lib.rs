@@ -46,6 +46,12 @@
 
 use scrozz_core::{Frame, LogicalRect, Result};
 
+/// Windows COM-apartment error mapping.
+///
+/// Compiled everywhere so its tests run on the machine this project is
+/// actually developed on; it names no `windows` type and does nothing on
+/// other platforms.
+pub mod apartment;
 pub mod layout;
 pub mod prepare;
 

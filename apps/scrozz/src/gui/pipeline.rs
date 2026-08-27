@@ -101,6 +101,51 @@ pub struct Pipeline {
     next_card: u64,
 }
 
+/// Puts the capture worker in a COM apartment, on the platforms that have one.
+///
+/// Windows only, and not optional there. `Windows.Graphics.Capture` and
+/// `Windows.Media.Ocr` are both WinRT, and every WinRT call from a thread that
+/// never entered an apartment fails with `CO_E_NOTINITIALIZED`. That failure is
+/// the dangerous kind: the capability probes read it as "this machine cannot do
+/// WGC", so Scrozz would quietly take the GDI path — no cursor control, no
+/// per-window capture, no alpha — on hardware that supports all three, and say
+/// nothing about it.
+///
+/// A worker gets its own apartment because apartments are per thread. The event
+/// loop's does not carry over; winit's `OleInitialize` covers only winit's
+/// thread.
+///
+/// The returned guard must be held for the worker's whole life, hence
+/// `let _apartment = …` rather than a bare call: `let _ = …` would drop it
+/// immediately and leave the thread exactly as uninitialised as before.
+#[cfg(target_os = "windows")]
+fn enter_apartment() -> Option<scrozz_shell::windows::apartment::Apartment> {
+    match scrozz_shell::windows::apartment::Apartment::enter_multithreaded() {
+        Ok(apartment) => {
+            tracing::debug!(
+                owned = apartment.owns(),
+                "capture worker entered a COM apartment"
+            );
+            Some(apartment)
+        }
+        Err(err) => {
+            // Not fatal: GDI capture needs no apartment, so the worker can
+            // still take screenshots. It is loud because the user is about to
+            // get a visibly worse product than their machine can deliver.
+            tracing::error!(
+                %err,
+                "the capture worker has no COM apartment, so Windows.Graphics.Capture \
+                 and text recognition are both unavailable; falling back to GDI"
+            );
+            None
+        }
+    }
+}
+
+/// No apartment concept on this platform; nothing to enter.
+#[cfg(not(target_os = "windows"))]
+const fn enter_apartment() {}
+
 impl Pipeline {
     /// Starts the worker.
     ///
@@ -116,7 +161,10 @@ impl Pipeline {
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx).run(&job_rx))
+            .spawn(move || {
+                let _apartment = enter_apartment();
+                Worker::new(outcome_tx).run(&job_rx);
+            })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"

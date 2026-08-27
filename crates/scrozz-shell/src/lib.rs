@@ -16,6 +16,11 @@ pub mod macos;
 pub mod overlay;
 pub mod permissions;
 pub mod tray;
+pub mod main_thread;
+pub mod win32;
+pub mod win32_drag;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use drag::{
     ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,

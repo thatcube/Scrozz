@@ -206,6 +206,14 @@ impl App {
         let pipeline = Pipeline::start()?;
         let mut notes = Vec::new();
 
+        // The check the module docs above describe. Everything built below this
+        // line — tray, menu, hotkeys — succeeds on a worker thread and then
+        // does nothing at all, so the one moment it can be caught is now.
+        if let Some(warning) = scrozz_shell::main_thread::check("the tray and global hotkeys") {
+            tracing::error!("{warning}");
+            notes.push(warning);
+        }
+
         let server = if config.ipc {
             // The one failure worth stopping for: another instance is live,
             // and a second menu-bar item is exactly what single-instance exists

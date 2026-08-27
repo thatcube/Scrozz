@@ -978,7 +978,10 @@ pub mod unimplemented_platform {
     const WHY: &str = "the Windows IDataObject/DoDragDrop backend needs the \
                        Win32_System_Com, Win32_System_Ole and Win32_UI_Shell \
                        features of the `windows` crate, which scrozz-shell does \
-                       not declare";
+                       not declare. The FILEGROUPDESCRIPTORW byte layout the \
+                       backend will need is already written and tested in \
+                       scrozz_shell::win32_drag; what remains is the COM \
+                       plumbing, which cannot be exercised anywhere but Windows";
 
     /// Why this platform cannot drag yet, in the terms the module docs set out.
     #[cfg(target_os = "linux")]

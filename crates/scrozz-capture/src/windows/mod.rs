@@ -16,6 +16,7 @@
 //! kept as thin as possible over them, because they can only ever be
 //! type-checked here.
 
+mod availability;
 mod backend;
 mod dpi;
 mod enumerate;

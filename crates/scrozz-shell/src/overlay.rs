@@ -62,10 +62,10 @@
 //! *behind the Dock*, which is the single most common way a bottom-anchored
 //! overlay goes wrong.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::ffi::c_void;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use scrozz_core::{Error, Result};
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 
@@ -416,17 +416,20 @@ pub struct OverlayReport {
 #[cfg(target_os = "macos")]
 pub use crate::macos::overlay::MacOverlay as NativeOverlay;
 
+#[cfg(target_os = "windows")]
+pub use crate::windows::overlay::WindowsOverlay as NativeOverlay;
+
 /// A native overlay window on a platform Scrozz does not yet retrofit.
 ///
 /// Present so that call sites compile everywhere; every method reports
 /// [`Error::Unsupported`] rather than silently doing nothing.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 pub struct NativeOverlay {
     _private: (),
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl NativeOverlay {
     /// Adopts a native window handle.
     ///
@@ -453,7 +456,7 @@ impl NativeOverlay {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl crate::OverlayWindow for NativeOverlay {
     fn set_frame(&mut self, frame: LogicalRect) -> Result<()> {
         let _ = frame;
@@ -467,10 +470,10 @@ impl crate::OverlayWindow for NativeOverlay {
 }
 
 /// The error every not-yet-implemented platform returns.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn unsupported() -> Error {
     Error::Unsupported {
         what: "native overlay window".into(),
-        why: "only the macOS overlay backend is implemented so far".into(),
+        why: "only the macOS and Windows overlay backends are implemented so far".into(),
     }
 }

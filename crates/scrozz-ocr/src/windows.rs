@@ -32,6 +32,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::apartment;
 use scrozz_core::{Error, Frame, Result};
 use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
@@ -185,16 +186,13 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
 /// machine has no OCR packs at all.
 fn engine_for(languages: &[String]) -> Result<OcrEngine> {
     if languages.is_empty() {
-        // A missing engine is a configuration gap the user can close, not a bug,
-        // so it gets an Unsupported with the remedy rather than an opaque HRESULT.
-        return OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| Error::Unsupported {
-            what: "text recognition".to_string(),
-            why: format!(
-                "Windows has no OCR language pack for your display languages. \
-                 Add one in Settings > Time & language > Language & region > \
-                 Add a language, choosing a language whose optional features \
-                 include Optical character recognition ({e})"
-            ),
+        // A missing engine is usually a configuration gap the user can close,
+        // so it gets an Unsupported with the remedy rather than an opaque
+        // HRESULT. Usually — but not when the thread never entered a COM
+        // apartment, in which case that remedy is advice to install a language
+        // pack the user already has, for a fault that is entirely ours.
+        return OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| {
+            apartment::engine_failure(e.code().0, "text recognition", &e.message())
         });
     }
 
@@ -216,6 +214,20 @@ fn engine_for(languages: &[String]) -> Result<OcrEngine> {
         if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&language) {
             return Ok(engine);
         }
+    }
+
+    // Every candidate was rejected by `IsLanguageSupported`, which answers
+    // `Err(CO_E_NOTINITIALIZED)` on an uninitialised thread and is read here as
+    // a plain "no". Ask once, directly, so that case is named rather than
+    // reported as a machine-wide absence of language packs.
+    if let Err(e) = OcrEngine::AvailableRecognizerLanguages()
+        && apartment::is_uninitialised_apartment(e.code().0)
+    {
+        return Err(apartment::engine_failure(
+            e.code().0,
+            "text recognition",
+            &e.message(),
+        ));
     }
 
     Err(Error::Unsupported {

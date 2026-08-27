@@ -43,6 +43,18 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
+    with_platform_apartment(|| dispatch_in_apartment(command))
+}
+
+/// Runs a command after the calling thread has entered every apartment model
+/// its platform APIs require.
+///
+/// Kept separate from [`dispatch`] so the guard visibly encloses the complete
+/// command: backend construction, capture, encoding, clipboard delivery and
+/// OCR. Initialising immediately before one WinRT call and dropping immediately
+/// after it is not equivalent; objects returned by that call may keep using the
+/// apartment for the rest of the operation.
+fn dispatch_in_apartment(command: &Command) -> CliResult<Report> {
     match command {
         Command::Capture(args) => capture(args),
         Command::Record(args) => record(args),
@@ -53,6 +65,35 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
         Command::Hotkey(args) => hotkey(&args.command),
         Command::Gui => gui(),
     }
+}
+
+/// Runs one CLI/IPC command in a COM apartment on Windows.
+///
+/// The GUI capture worker enters its own apartment in `gui::pipeline`; this is
+/// the other calling thread: a direct `scrozz capture` or `scrozz ocr`, plus a
+/// command forwarded into the GUI event loop. In the first case this call owns
+/// an MTA and balances it when the command returns. In the second, winit has
+/// already put the thread in an STA, so `Apartment` records
+/// `RPC_E_CHANGED_MODE` as usable but not owned and deliberately does not call
+/// `RoUninitialize`.
+#[cfg(target_os = "windows")]
+fn with_platform_apartment<T>(body: impl FnOnce() -> CliResult<T>) -> CliResult<T> {
+    let apartment =
+        scrozz_shell::windows::apartment::Apartment::enter_multithreaded()
+            .map_err(CliError::Core)?;
+    tracing::debug!(
+        owned = apartment.owns(),
+        "command thread has a COM apartment"
+    );
+    let result = body();
+    drop(apartment);
+    result
+}
+
+/// Platforms without COM need no calling-thread guard.
+#[cfg(not(target_os = "windows"))]
+fn with_platform_apartment<T>(body: impl FnOnce() -> CliResult<T>) -> CliResult<T> {
+    body()
 }
 
 // ---------------------------------------------------------------------------

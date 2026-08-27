@@ -409,6 +409,25 @@ fn panel_hook() -> Option<scrozz_ui::PanelHook> {
 /// of the *bounds* puts it behind the Dock. Falls back to a sensible default
 /// rather than failing, because a card in a slightly wrong place beats no card.
 fn work_area() -> OverlayGeometry {
+    #[cfg(target_os = "windows")]
+    {
+        // Windows reports the work area of the monitor under the pointer, which
+        // is the display the user is looking at. Its origin is often negative
+        // (a monitor placed left of the primary one) and must survive intact,
+        // or the card lands on the wrong screen.
+        match scrozz_shell::windows::overlay::work_area_under_pointer() {
+            Ok(area) => {
+                return OverlayGeometry::new(egui::Rect::from_min_size(
+                    egui::pos2(area.origin.x as f32, area.origin.y as f32),
+                    egui::vec2(area.size.width as f32, area.size.height as f32),
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(%err, "no work area; using the default overlay geometry");
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         match scrozz_shell::macos::display::active_display() {
@@ -433,11 +452,32 @@ fn work_area() -> OverlayGeometry {
 /// Returns `None` today. See [`PROBE_GAP`] — the degradation is bounded and
 /// documented, and a probe that guessed would be worse than none.
 fn pointer_probe() -> Option<scrozz_ui::PointerProbe> {
-    tracing::debug!("{PROBE_GAP}");
-    None
+    #[cfg(target_os = "windows")]
+    {
+        // The probe is asked for a point every frame from the UI thread, but it
+        // is stored behind `Arc<dyn Fn() + Send + Sync>`, so it cannot close
+        // over an `HWND` (a raw pointer, and therefore neither `Send` nor
+        // `Sync`). It closes over the handle as an integer instead; every call
+        // it makes is a read-only query that Windows documents as usable from
+        // any thread, and a stale handle is caught by `IsWindow`.
+        return Some(std::sync::Arc::new(|| {
+            let hwnd = crate::gui::panel::overlay_hwnd();
+            let (x, y) = scrozz_shell::windows::overlay::pointer_in_hwnd(hwnd)?;
+            Some(egui::pos2(x as f32, y as f32))
+        }));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        tracing::debug!("{PROBE_GAP}");
+        None
+    }
 }
 
-/// Why there is no pointer probe.
+/// Why there is no pointer probe on macOS.
+///
+/// Windows has one — see [`pointer_probe`] — because `GetCursorPos` needs no
+/// coordinate flip and no window ownership. This gap is macOS-specific.
 pub const PROBE_GAP: &str = "no crate exposes the pointer as a point. \
      scrozz-shell reads NSEvent::mouseLocation inside \
      macos::display::active_display and returns the Display containing it, \
@@ -525,5 +565,50 @@ mod tests {
     fn the_probe_gap_names_the_fix_rather_than_apologising() {
         assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
         assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    }
+
+    /// This binary cannot be type-checked for Windows on this machine —
+    /// `libsqlite3-sys` compiles `sqlite3.c` for the target and there is no
+    /// MSVC toolchain here, so `cargo check --target x86_64-pc-windows-msvc`
+    /// dies in a build script before rustc ever sees this file.
+    ///
+    /// The Windows arm of [`pointer_probe`] therefore gets no cross-target
+    /// checking. Its one genuinely uncertain part is not the Win32 call, which
+    /// *is* checked over in `scrozz-shell`; it is whether a closure over an
+    /// integer handle satisfies `PointerProbe`'s `Send + Sync` bound. That
+    /// question has no Windows in it, so it can be settled here, today.
+    #[test]
+    fn a_probe_may_close_over_a_window_handle_as_an_integer() {
+        // Exactly the shape the Windows arm builds: an integer read from a
+        // shared place, a fallible lookup, an egui point out. If `HWND` had
+        // been captured directly this would not compile, which is the point.
+        static HANDLE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+        fn lookup(handle: isize) -> Option<(f64, f64)> {
+            (handle != 0).then_some((3.0, 4.0))
+        }
+
+        let probe: scrozz_ui::PointerProbe = std::sync::Arc::new(|| {
+            let handle = HANDLE.load(std::sync::atomic::Ordering::Relaxed);
+            let (x, y) = lookup(handle)?;
+            Some(egui::pos2(x as f32, y as f32))
+        });
+
+        assert_eq!(probe(), None, "no window yet means no pointer of ours");
+        HANDLE.store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(probe(), Some(egui::pos2(3.0, 4.0)));
+
+        // The bound that makes the whole arrangement necessary.
+        fn assert_shareable<T: Send + Sync>(_: &T) {}
+        assert_shareable(&probe);
+    }
+
+    #[test]
+    fn a_probe_that_knows_nothing_returns_none_rather_than_a_guess() {
+        // `apply_passthrough` reads `None` as "nothing of ours is under the
+        // mouse" and lets the click through. A probe that invented a point
+        // would make empty overlay regions swallow clicks — worse than the
+        // 350ms resampling it replaces.
+        let probe: scrozz_ui::PointerProbe = std::sync::Arc::new(|| None);
+        assert_eq!(probe(), None);
     }
 }

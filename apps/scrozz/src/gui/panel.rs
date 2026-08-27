@@ -23,6 +23,13 @@
 //! `NSPanel` subclass and then sets the mask, guarding the swizzle on the two
 //! classes having identical instance sizes and refusing when they do not.
 //!
+//! Windows *does* have a switch — `WS_EX_NOACTIVATE` — but winit rewrites the
+//! whole extended-style word whenever any of the flags it models changes, and
+//! it does not model that bit. `scrozz-shell` therefore treats the style as a
+//! specification and re-asserts it from a `WM_STYLECHANGING` hook rather than
+//! writing it once. Both platforms end up in the same place by very different
+//! routes, which is exactly why the seam is a hook and not a flag.
+//!
 //! Refusal is not breakage: the overlay still draws and still works, it just
 //! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
 //! `detail` string rather than being a bool.
@@ -30,7 +37,7 @@
 use std::ffi::c_void;
 
 use raw_window_handle::HasWindowHandle;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use raw_window_handle::RawWindowHandle;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
 use scrozz_ui::PanelReport;
@@ -57,17 +64,75 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
     }
 
     // The entry point is named differently per platform: macOS adopts a view or
-    // a window, and the stub backends adopt an opaque handle. Both refuse
-    // safely, so the non-macOS arm is a real path rather than a `todo!`.
+    // a window, and the other backends adopt an opaque handle. All of them
+    // refuse safely, so the non-macOS arm is a real path rather than a `todo!`.
     #[cfg(target_os = "macos")]
     // SAFETY: forwarded from this function's own contract — a live `NSView *`
     // on the main thread.
     let adopted = unsafe { NativeOverlay::from_ns_view(ns_view) };
 
     #[cfg(not(target_os = "macos"))]
-    // SAFETY: as above; the stub backends do not dereference the handle.
+    // SAFETY: as above. The stub backends do not dereference the handle; the
+    // Windows backend validates it with `IsWindow` before doing anything else.
     let adopted = unsafe { NativeOverlay::adopt(ns_view) };
 
+    finish(adopted)
+}
+
+/// Configures the overlay window identified by `hwnd` as a Windows overlay.
+///
+/// `hwnd` is the `hwnd` field of a `RawWindowHandle::Win32`, which is what
+/// `eframe::CreationContext` reports on Windows. Unlike AppKit, the handle
+/// *is* the window: there is no view to ask for its window.
+///
+/// Never panics and never fails, for the same reason [`convert_ns_view`] does
+/// not: a hook that could fail is a hook that can take down the window it was
+/// called to configure.
+///
+/// # Safety
+///
+/// `hwnd` must be a live `HWND` whose `WindowHandle` borrow is still alive, and
+/// this must be called on the thread that owns it. Both hold inside the
+/// `eframe` app creator, which is the only caller.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub unsafe fn convert_hwnd(hwnd: *mut c_void) -> PanelReport {
+    if hwnd.is_null() {
+        return PanelReport::unsupported("the window handle carried a null HWND");
+    }
+    // Published before the conversion is attempted, because the pointer probe
+    // is useful whether or not the style rewrite succeeded: a card that pulls
+    // focus should still know where the mouse is.
+    OVERLAY_HWND.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: forwarded from this function's own contract.
+    finish(unsafe { NativeOverlay::adopt(hwnd) })
+}
+
+/// The overlay window's `HWND`, as an integer, or `0` before it exists.
+///
+/// An integer rather than an `HWND` because the one consumer — the pointer
+/// probe in [`crate::gui::host`] — lives behind `Arc<dyn Fn() + Send + Sync>`,
+/// and `HWND` is a raw pointer, so it is neither `Send` nor `Sync`. Storing the
+/// bits keeps that boundary honest instead of forcing an `unsafe impl`.
+///
+/// Reading it can race with the window closing. That is not a soundness
+/// problem: every consumer passes the value straight to `IsWindow`, which
+/// exists precisely to be asked about handles that may already be dead.
+#[cfg(target_os = "windows")]
+static OVERLAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// The overlay window's `HWND` as an integer, or `0` if there is not one yet.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn overlay_hwnd() -> isize {
+    OVERLAY_HWND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Applies the capture-card behaviour to a freshly adopted overlay.
+///
+/// Shared by both entry points because the interesting half — what counts as
+/// success — must not be allowed to drift between platforms.
+fn finish(adopted: scrozz_core::Result<NativeOverlay>) -> PanelReport {
     let mut overlay = match adopted {
         Ok(overlay) => overlay,
         Err(err) => return PanelReport::unsupported(err.to_string()),
@@ -118,12 +183,26 @@ pub fn hook() -> scrozz_ui::PanelHook {
         #[cfg(target_os = "macos")]
         return unsafe { convert_ns_view(appkit.ns_view.as_ptr()) };
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return PanelReport::unsupported(
+                "the overlay window is not a Win32 window, so it has no HWND to configure",
+            );
+        };
+
+        // SAFETY: `handle` borrows the window for this scope, so the HWND is
+        // alive, and `raw-window-handle` documents it as belonging to the
+        // calling thread — which is the event-loop thread, as the adapter
+        // requires.
+        #[cfg(target_os = "windows")]
+        return unsafe { convert_hwnd(win32.hwnd.get() as *mut c_void) };
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = handle;
             PanelReport::unsupported(
-                "only the macOS overlay backend is implemented so far, so the \
-                 window keeps its native activation behaviour",
+                "only the macOS and Windows overlay backends are implemented so \
+                 far, so the window keeps its native activation behaviour",
             )
         }
     })

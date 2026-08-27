@@ -66,6 +66,13 @@ use crate::{
 };
 
 fn main() -> ExitCode {
+    // Claimed here, before anything can be spawned, so that later set-up knows
+    // which thread it is on. The tray, the menu and the global hotkeys all need
+    // this one and all fail silently on any other; see
+    // `scrozz_shell::main_thread` for why a latch is the only portable way to
+    // ask the question.
+    scrozz_shell::main_thread::claim();
+
     // `try_parse` rather than `parse`, because `parse` exits the process itself
     // and would bypass the exit-code contract. `--help` and `--version` are
     // "errors" in clap's model, which is why the display path below is separate

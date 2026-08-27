@@ -34,11 +34,15 @@ mod sut {
 
     #[path = "../src/windows/pixels.rs"]
     pub mod pixels;
+
+    #[path = "../src/windows/availability.rs"]
+    pub mod availability;
 }
 
 use scrozz_core::{LogicalRect, Point, ScaleFactor, Size};
 use sut::filter::{self, Rejection, WindowFacts};
 use sut::geom::{self, DeviceRect};
+use sut::availability::{self, WgcAvailability};
 use sut::pixels::{self, PlaneRef};
 
 // ---------------------------------------------------------------------------
@@ -983,3 +987,85 @@ mod live {
 //   for a suspended UWP app is not.
 // - **The GDI fallback's fidelity**, including whether `PW_RENDERFULLCONTENT`
 //   rescues a given application.
+
+// ---------------------------------------------------------------------------
+// WGC availability
+//
+// The bug these guard against is not a wrong picture, it is a *quietly wrong
+// code path*: WGC reporting itself unavailable because nobody put the calling
+// thread in a COM apartment, and Scrozz reading that as "this machine is old".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_supported_machine_is_available() {
+    assert_eq!(availability::classify(Ok(true)), WgcAvailability::Available);
+    assert!(availability::classify(Ok(true)).is_available());
+    assert!(
+        availability::explanation(WgcAvailability::Available).is_none(),
+        "there is nothing to explain when the answer is yes"
+    );
+}
+
+#[test]
+fn a_genuinely_old_machine_is_unsupported_not_a_bug() {
+    let outcome = availability::classify(Ok(false));
+    assert_eq!(outcome, WgcAvailability::Unsupported);
+    assert!(!outcome.is_available());
+    assert!(
+        outcome.fallback_is_legitimate(),
+        "pre-1803 Windows really cannot do WGC; GDI is the right answer"
+    );
+    assert!(!outcome.is_our_fault());
+}
+
+#[test]
+fn an_uninitialised_thread_is_our_fault_not_the_machines() {
+    // The whole point of the module. `IsSupported()` answers
+    // `Err(CO_E_NOTINITIALIZED)` on a bare std::thread, and the tempting
+    // `.unwrap_or(false)` would make that indistinguishable from the test
+    // above — losing cursor control and per-window capture on hardware that
+    // supports both.
+    let outcome = availability::classify(Err(availability::CO_E_NOTINITIALIZED));
+    assert_eq!(outcome, WgcAvailability::ApartmentMissing);
+    assert!(!outcome.is_available());
+    assert!(
+        !outcome.fallback_is_legitimate(),
+        "falling back here hides a fixable mistake"
+    );
+    assert!(outcome.is_our_fault());
+}
+
+#[test]
+fn an_unexpected_refusal_keeps_the_code() {
+    let outcome = availability::classify(Err(0x8007_000E_u32 as i32));
+    assert_eq!(outcome, WgcAvailability::Refused(0x8007_000E_u32 as i32));
+    let text = availability::explanation(outcome).expect("a refusal must explain itself");
+    assert!(
+        text.contains("8007000E"),
+        "a bug report needs the actual code: {text}"
+    );
+}
+
+#[test]
+fn every_unavailable_outcome_explains_itself() {
+    // A downgrade nobody can see is a downgrade nobody can fix, so "silently
+    // returned false" must not be reachable.
+    for outcome in [
+        WgcAvailability::Unsupported,
+        WgcAvailability::ApartmentMissing,
+        WgcAvailability::Refused(-1),
+    ] {
+        let text = availability::explanation(outcome)
+            .unwrap_or_else(|| panic!("{outcome:?} degraded the user's capture without saying so"));
+        assert!(!text.is_empty(), "{outcome:?}");
+    }
+}
+
+#[test]
+fn the_apartment_explanation_names_the_fix_not_just_the_symptom() {
+    // Per D15: an error the reader cannot act on is noise. This one is aimed
+    // at a developer, and the action is "enter an apartment on that thread".
+    let text = availability::explanation(WgcAvailability::ApartmentMissing).expect("explained");
+    assert!(text.contains("apartment"), "{text}");
+    assert!(text.contains("Scrozz bug"), "{text}");
+}

@@ -154,10 +154,40 @@ fn create_d3d11_device() -> Result<ID3D11Device> {
     })
 }
 
+pub use super::availability::WgcAvailability;
+use super::availability::{self, CO_E_NOTINITIALIZED};
+
+// A mistyped digit here would silently restore the exact bug this module was
+// written to remove, so it is a compile error instead.
+const _: () = assert!(CO_E_NOTINITIALIZED == windows::Win32::Foundation::CO_E_NOTINITIALIZED.0);
+
+/// Whether this machine — and this thread — can run the WGC path.
+///
+/// Deliberately not a `bool`. `GraphicsCaptureSession::IsSupported()` returns
+/// `Err(CO_E_NOTINITIALIZED)` on a thread with no apartment, and the obvious
+/// `.unwrap_or(false)` turns "you forgot to initialise WinRT" into "this
+/// machine cannot capture", which is both wrong and invisible.
+#[must_use]
+pub fn wgc_availability() -> WgcAvailability {
+    availability::classify(GraphicsCaptureSession::IsSupported().map_err(|e| e.code().0))
+}
+
 /// Whether this machine can run the WGC path at all.
+///
+/// Logs the reason when the answer is no, because every `false` here costs the
+/// user cursor control, per-window capture and alpha, and a downgrade nobody
+/// can see is a downgrade nobody can fix.
 #[must_use]
 pub fn is_supported() -> bool {
-    GraphicsCaptureSession::IsSupported().unwrap_or(false)
+    let availability = wgc_availability();
+    if let Some(explanation) = availability::explanation(availability) {
+        if availability.is_our_fault() {
+            tracing::error!("{explanation}");
+        } else {
+            tracing::info!("{explanation}");
+        }
+    }
+    availability.is_available()
 }
 
 /// The interop factory that turns an `HWND` or `HMONITOR` into a capture item.
