@@ -7,29 +7,47 @@
 
 use std::collections::HashMap;
 
-use objc2_core_graphics::{CGWindowID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID};
+use objc2_core_foundation::{CGRect, CGSize};
+use objc2_core_graphics::{
+    CGWindowID, CGWindowImageOption, CGWindowListCreate, CGWindowListOption, kCGNullWindowID,
+};
 use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
-use scrozz_core::{Display, DisplayId, Error, LogicalRect, Result, SourceApp, Window, WindowId};
+use scrozz_core::{
+    Display, DisplayId, Error, Frame, LogicalRect, Result, ScaleFactor, SourceApp, Window,
+    WindowCornerRadius, WindowId,
+};
+
+const DOCK_BUNDLE_ID: &str = "com.apple.dock";
+const DOCK_WINDOW_TITLE: &str = "Dock";
+/// Enough of a logical corner to cover current macOS window radii without
+/// reading the contents of the whole window.
+const CORNER_SAMPLE_POINTS: f64 = 48.0;
+const OPAQUE_ALPHA_THRESHOLD: u8 = 128;
 
 /// Windows the user could plausibly pick, in front-to-back order.
 ///
-/// Only the normal window layer is listed. Everything above it — menu bar
-/// extras, tooltips, the Dock, screen-saver windows — is furniture rather than
-/// content, and offering it in a window picker is noise. Windows that are
-/// currently off-screen (minimised, or on another Space) are kept and reported
-/// as not visible, because "capture that minimised window" is a real request.
+/// Normal application windows and the complete Dock surface are listed.
+/// Transient menu-bar extras, tooltips, and screen-saver windows remain excluded.
+/// Windows that are currently off-screen (minimised, or on another Space) are
+/// kept and reported as not visible, because "capture that minimised window" is
+/// a real request.
 pub(crate) fn windows(content: &SCShareableContent, displays: &[Display]) -> Result<Vec<Window>> {
     // SAFETY: reading properties of the shareable content snapshot.
     let list = unsafe { content.windows() };
 
     let mut windows: Vec<_> = list
         .iter()
-        .filter(|window| {
+        .filter_map(|window| {
             // SAFETY: `windowLayer` is a plain property read.
             let layer = unsafe { window.windowLayer() };
-            layer == 0
+            let metadata = WindowMetadata::from_window(&window);
+            let is_dock = metadata.is_dock();
+            if layer == 0 || is_dock {
+                to_window(&window, displays, metadata, is_dock)
+            } else {
+                None
+            }
         })
-        .map(|window| to_window(&window, displays))
         .collect();
 
     order_front_to_back(&mut windows, &core_graphics_z_order()?);
@@ -91,23 +109,135 @@ pub(crate) fn find(
     }
 }
 
-fn to_window(window: &SCWindow, displays: &[Display]) -> Window {
+fn to_window(
+    window: &SCWindow,
+    displays: &[Display],
+    metadata: WindowMetadata,
+    is_dock: bool,
+) -> Option<Window> {
     // SAFETY: all plain property reads on a live `SCWindow`.
     let (id, frame, is_visible) =
         unsafe { (window.windowID(), window.frame(), window.isOnScreen()) };
-    let metadata = WindowMetadata::from_window(window);
 
     let bounds = super::display::from_cg_rect(frame);
+    let (picker_bounds, corner_radius) = if is_dock {
+        (Some(native_visible_bounds(id, frame)?), None)
+    } else {
+        (
+            None,
+            is_visible
+                .then(|| native_corner_radius(id, frame))
+                .flatten()
+                .map(WindowCornerRadius::Measured),
+        )
+    };
 
-    Window {
+    Some(Window {
         id: WindowId(id.to_string()),
         title: metadata.title,
         application: metadata.application,
         application_id: metadata.application_id,
         bounds,
-        display: containing_display(bounds, displays),
+        picker_bounds,
+        corner_radius,
+        display: containing_display(picker_bounds.unwrap_or(bounds), displays),
         is_visible,
+    })
+}
+
+/// Resolves the sparse visible region of a system surface whose native window
+/// spans the display.
+#[allow(deprecated)]
+fn native_visible_bounds(id: CGWindowID, frame: CGRect) -> Option<LogicalRect> {
+    let pixels = native_window_pixels(id, frame)?;
+    let alpha = super::image::alpha_bounds(&pixels, 0)?;
+    let scale = pixels.scale.get();
+    let visible = CGRect::new(
+        objc2_core_foundation::CGPoint::new(
+            frame.origin.x + alpha.x as f64 / scale,
+            frame.origin.y + alpha.y as f64 / scale,
+        ),
+        CGSize::new(alpha.width as f64 / scale, alpha.height as f64 / scale),
+    );
+    let bounds = super::display::from_cg_rect(visible);
+
+    // A failure to obtain meaningful transparency would make the Dock's
+    // display-sized native window swallow every normal window in picker hit
+    // testing. Refuse that unsafe approximation.
+    let sparse =
+        bounds.size.width < frame.size.width * 0.9 || bounds.size.height < frame.size.height * 0.9;
+    sparse.then_some(bounds)
+}
+
+/// Measures one window's top-left native alpha edge in logical points.
+///
+/// CoreGraphics is used only for this tiny picker-style sample. The actual
+/// capture still uses ScreenCaptureKit, and no guessed geometry ever touches
+/// output pixels.
+#[allow(deprecated)]
+fn native_corner_radius(id: CGWindowID, frame: CGRect) -> Option<f64> {
+    let width = frame.size.width.min(CORNER_SAMPLE_POINTS);
+    let height = frame.size.height.min(CORNER_SAMPLE_POINTS);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
     }
+
+    let sample = CGRect::new(frame.origin, CGSize::new(width, height));
+    radius_from_alpha(&native_window_pixels(id, sample)?)
+}
+
+#[allow(deprecated)]
+fn native_window_pixels(id: CGWindowID, frame: CGRect) -> Option<Frame> {
+    let image = objc2_core_graphics::CGWindowListCreateImage(
+        frame,
+        CGWindowListOption::OptionIncludingWindow,
+        id,
+        CGWindowImageOption::BoundsIgnoreFraming | CGWindowImageOption::BestResolution,
+    )?;
+    let pixel_width = objc2_core_graphics::CGImage::width(Some(&image));
+    let pixel_height = objc2_core_graphics::CGImage::height(Some(&image));
+    if pixel_width == 0 || pixel_height == 0 {
+        return None;
+    }
+
+    let x_scale = pixel_width as f64 / frame.size.width;
+    let y_scale = pixel_height as f64 / frame.size.height;
+    if !x_scale.is_finite()
+        || !y_scale.is_finite()
+        || x_scale <= 0.0
+        || y_scale <= 0.0
+        || (x_scale - y_scale).abs() > 0.1
+    {
+        return None;
+    }
+
+    let scale = ScaleFactor::new((x_scale + y_scale) / 2.0);
+    super::image::to_window_frame(&image, scale).ok()
+}
+
+fn radius_from_alpha(frame: &Frame) -> Option<f64> {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    if width == 0 || height == 0 || frame.stride < width * 4 {
+        return None;
+    }
+
+    let alpha_at = |x: usize, y: usize| {
+        frame
+            .data
+            .get(y * frame.stride + x * 4 + 3)
+            .copied()
+            .unwrap_or(0)
+    };
+    let horizontal = (0..width).find(|&x| alpha_at(x, 0) >= OPAQUE_ALPHA_THRESHOLD)?;
+    let vertical = (0..height).find(|&y| alpha_at(0, y) >= OPAQUE_ALPHA_THRESHOLD)?;
+    let physical = (horizontal as f64 + vertical as f64) / 2.0;
+    let logical = physical / frame.scale.get();
+
+    logical
+        .is_finite()
+        .then(|| (logical * 2.0).round() / 2.0)
+        .filter(|radius| (0.0..=CORNER_SAMPLE_POINTS).contains(radius))
 }
 
 /// Captures owner metadata from the same current `SCWindow` used for capture.
@@ -157,6 +287,11 @@ impl WindowMetadata {
             window_title: self.title,
         }
     }
+
+    fn is_dock(&self) -> bool {
+        self.application_id.as_deref() == Some(DOCK_BUNDLE_ID)
+            && self.title.as_deref() == Some(DOCK_WINDOW_TITLE)
+    }
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -196,7 +331,9 @@ fn overlap_area(a: LogicalRect, b: LogicalRect) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scrozz_core::{LogicalPoint, LogicalSize, ScaleFactor};
+    use scrozz_core::{
+        ColorSpace, LogicalPoint, LogicalSize, PhysicalSize, PixelFormat, ScaleFactor,
+    };
 
     fn display(id: &str, x: f64, is_primary: bool) -> Display {
         display_rect(id, x, 0.0, 1000.0, 1000.0, is_primary)
@@ -232,9 +369,47 @@ mod tests {
             application: Some("Test".to_owned()),
             application_id: Some("com.thatcube.test".to_owned()),
             bounds: window_at(100.0, 500.0),
+            picker_bounds: None,
+            corner_radius: None,
             display: DisplayId("main".to_owned()),
             is_visible: true,
         }
+    }
+
+    fn alpha_frame(width: usize, height: usize, scale: f64) -> Frame {
+        Frame {
+            data: vec![0; width * height * 4],
+            size: PhysicalSize::new(width as f64, height as f64),
+            stride: width * 4,
+            format: PixelFormat::BgraPremultiplied8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::new(scale),
+        }
+    }
+
+    #[test]
+    fn native_alpha_axes_measure_a_logical_corner_radius() {
+        let mut frame = alpha_frame(64, 64, 2.0);
+        for x in 24..64 {
+            frame.data[x * 4 + 3] = u8::MAX;
+        }
+        for y in 24..64 {
+            frame.data[y * frame.stride + 3] = u8::MAX;
+        }
+
+        assert_eq!(radius_from_alpha(&frame), Some(12.0));
+    }
+
+    #[test]
+    fn square_native_alpha_reports_a_zero_radius() {
+        let mut frame = alpha_frame(16, 16, 2.0);
+        frame.data.fill(u8::MAX);
+        assert_eq!(radius_from_alpha(&frame), Some(0.0));
+    }
+
+    #[test]
+    fn an_empty_alpha_sample_falls_back_instead_of_inventing_a_radius() {
+        assert_eq!(radius_from_alpha(&alpha_frame(16, 16, 2.0)), None);
     }
 
     #[test]
@@ -332,6 +507,23 @@ mod tests {
         assert_eq!(source.name.as_deref(), Some("Safari"));
         assert_eq!(source.identifier.as_deref(), Some("com.apple.Safari"));
         assert_eq!(source.window_title.as_deref(), Some("Roadmap"));
+    }
+
+    #[test]
+    fn only_the_complete_dock_surface_is_treated_as_system_ui() {
+        let dock = WindowMetadata::new(
+            Some("Dock".to_owned()),
+            Some("Dock".to_owned()),
+            Some("com.apple.dock".to_owned()),
+        );
+        let dock_menu = WindowMetadata::new(
+            Some("Dock menu".to_owned()),
+            Some("Dock".to_owned()),
+            Some("com.apple.dock".to_owned()),
+        );
+
+        assert!(dock.is_dock());
+        assert!(!dock_menu.is_dock());
     }
 
     #[test]

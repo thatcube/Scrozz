@@ -59,13 +59,14 @@
 //! - `isFloatingPanel` → **YES**. Keeps the panel above its app's ordinary
 //!   windows and out of the standard window ordering.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, NSObjectProtocol, Sel};
 use objc2::{ClassType, sel};
 use objc2_app_kit::{
-    NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
+    NSApplication, NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
     NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
     NSWindowStyleMask,
 };
@@ -83,6 +84,7 @@ use crate::overlay::{OverlayBehavior, OverlayLevel, OverlayReport, logical_to_ap
 /// because the Objective-C runtime has one flat global namespace shared with
 /// every framework in the process.
 const PANEL_CLASS_NAME: &std::ffi::CStr = c"ScrozzOverlayPanel";
+const MAX_WINDOW_DISCOVERY_ATTEMPTS: u16 = 120;
 
 extern "C" fn can_become_key(_this: &AnyObject, _sel: Sel) -> Bool {
     Bool::YES
@@ -393,6 +395,7 @@ impl MacOverlay {
                 "null NSView pointer passed to MacOverlay::from_ns_view".to_owned(),
             ));
         }
+
         // SAFETY: the caller guarantees a live `NSView *`, and the reference
         // does not outlive this function — `window()` retains its result.
         let view: &NSView = unsafe { &*ns_view.cast::<NSView>() };
@@ -480,6 +483,34 @@ impl MacOverlay {
             }
         };
 
+        Ok(self.apply_properties(behavior, detail))
+    }
+
+    /// Applies overlay properties without changing the toolkit window's class.
+    ///
+    /// Use this for short-lived toolkit windows such as a selection picker.
+    /// winit observes its own KVO-generated `NSWindow` subclass and expects that
+    /// class to remain intact during teardown; isa-swizzling such a window and
+    /// then closing it can make observer removal raise an Objective-C exception.
+    /// An ephemeral picker may activate Scrozz while it is open, but it remains
+    /// safely above system UI and receives every click itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] if called off the main thread.
+    pub fn apply_without_class_change(
+        &mut self,
+        behavior: &OverlayBehavior,
+    ) -> Result<OverlayReport> {
+        let _mtm = main_thread("configuring an ephemeral overlay window")?;
+        self.non_activating = false;
+        Ok(self.apply_properties(
+            behavior,
+            "kept the toolkit window class intact for safe teardown".to_owned(),
+        ))
+    }
+
+    fn apply_properties(&mut self, behavior: &OverlayBehavior, detail: String) -> OverlayReport {
         let window = &self.window;
         window.setLevel(level_value(behavior.level));
         window.setCollectionBehavior(collection_behavior(behavior));
@@ -500,10 +531,10 @@ impl MacOverlay {
             panel.setFloatingPanel(behavior.level >= OverlayLevel::Floating);
         }
 
-        Ok(OverlayReport {
+        OverlayReport {
             non_activating: self.non_activating,
             detail,
-        })
+        }
     }
 
     /// Sets just the stacking level.
@@ -546,6 +577,110 @@ impl MacOverlay {
             collection_behavior: self.window.collectionBehavior().0,
             is_visible: self.window.isVisible(),
         })
+    }
+}
+
+/// Attaches selection-overlay behavior to eframe's next immediate child window.
+///
+/// eframe exposes native handles for its root window but not for immediate child
+/// viewports. The menu-bar picker snapshots this process's AppKit windows before
+/// asking eframe to create its hidden child, then calls [`Self::maintain`] after
+/// creation. Exactly one new process-owned window is accepted; no title or
+/// geometry search is involved.
+#[derive(Debug)]
+pub struct MacSelectionOverlayLease {
+    existing: HashSet<usize>,
+    overlay: Option<MacOverlay>,
+    discovery_attempts: u16,
+}
+
+impl MacSelectionOverlayLease {
+    /// Snapshots the process's native windows before creating the picker child.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when called off the AppKit main thread.
+    pub fn for_next_process_window() -> Result<Self> {
+        let mtm = main_thread("preparing the selection overlay")?;
+        Ok(Self {
+            existing: process_windows(mtm)
+                .iter()
+                .map(|window| window_identity(&window))
+                .collect(),
+            overlay: None,
+            discovery_attempts: 0,
+        })
+    }
+
+    /// Applies shielding, non-click-through selection behavior once the child exists.
+    ///
+    /// Returns `false` while eframe has not created the native window yet and
+    /// `true` once the picker is safely above system UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error off the main thread, when multiple new AppKit
+    /// windows make attachment ambiguous, or when the expected child never
+    /// appears.
+    pub fn maintain(&mut self) -> Result<bool> {
+        if self.overlay.is_some() {
+            return Ok(true);
+        }
+
+        let mtm = main_thread("attaching the selection overlay")?;
+        let candidates = process_windows(mtm)
+            .iter()
+            .filter(|window| !self.existing.contains(&window_identity(window)))
+            .collect::<Vec<_>>();
+        let Some(window) = unique_process_window(candidates)? else {
+            self.discovery_attempts = self.discovery_attempts.saturating_add(1);
+            if self.discovery_attempts >= MAX_WINDOW_DISCOVERY_ATTEMPTS {
+                return Err(Error::Platform(
+                    "the macOS picker child viewport never became available for native shielding"
+                        .to_owned(),
+                ));
+            }
+            return Ok(false);
+        };
+
+        let mut overlay = MacOverlay {
+            window,
+            non_activating: false,
+        };
+        overlay.apply_without_class_change(&OverlayBehavior::selection_overlay())?;
+        self.overlay = Some(overlay);
+        Ok(true)
+    }
+
+    /// Whether the native child is safe to reveal above the Dock and menu bar.
+    #[must_use]
+    pub const fn is_attached(&self) -> bool {
+        self.overlay.is_some()
+    }
+}
+
+fn process_windows(
+    mtm: objc2_foundation::MainThreadMarker,
+) -> Retained<objc2_foundation::NSArray<NSWindow>> {
+    NSApplication::sharedApplication(mtm).windows()
+}
+
+fn window_identity(window: &NSWindow) -> usize {
+    std::ptr::from_ref(window).addr()
+}
+
+fn unique_process_window(windows: Vec<Retained<NSWindow>>) -> Result<Option<Retained<NSWindow>>> {
+    match windows.as_slice() {
+        [] => Ok(None),
+        [window] => Ok(Some(window.clone())),
+        _ => Err(Error::Platform(format!(
+            "multiple new AppKit windows appeared while attaching the picker: {}",
+            windows
+                .iter()
+                .map(|window| window.windowNumber().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 

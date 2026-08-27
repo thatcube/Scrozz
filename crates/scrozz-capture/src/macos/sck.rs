@@ -65,6 +65,21 @@ pub(crate) fn ensure_permission() -> Result<()> {
 /// list. Off-screen windows are kept, so minimised and hidden windows can still
 /// be listed and reported as not visible.
 pub(crate) fn shareable_content() -> Result<Retained<SCShareableContent>> {
+    shareable_content_excluding_desktop_windows(true)
+}
+
+/// Fetches shareable content including stable desktop-owned surfaces.
+///
+/// The window picker needs the complete Dock surface. Wallpaper and backing
+/// windows are still rejected by `window::windows`; asking ScreenCaptureKit to
+/// include them here is what makes the Dock available to classify at all.
+pub(crate) fn shareable_content_for_windows() -> Result<Retained<SCShareableContent>> {
+    shareable_content_excluding_desktop_windows(false)
+}
+
+fn shareable_content_excluding_desktop_windows(
+    excluding_desktop_windows: bool,
+) -> Result<Retained<SCShareableContent>> {
     ensure_permission()?;
 
     blocking("listing shareable content", ENUMERATE_TIMEOUT, |handler| {
@@ -72,7 +87,9 @@ pub(crate) fn shareable_content() -> Result<Retained<SCShareableContent>> {
         unsafe {
             SCShareableContent::
                 getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-                    true, false, handler,
+                    excluding_desktop_windows,
+                    false,
+                    handler,
                 );
         }
     })

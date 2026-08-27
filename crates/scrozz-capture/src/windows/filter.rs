@@ -74,8 +74,6 @@ const IGNORED_CLASSES: &[&str] = &[
     // The desktop itself and its wallpaper hosts.
     "Progman",
     "WorkerW",
-    "Shell_TrayWnd",
-    "Shell_SecondaryTrayWnd",
     "Windows.UI.Core.CoreWindow",
     // Task view, Alt-Tab and the window-switcher chrome.
     "MultitaskingViewFrame",
@@ -105,6 +103,15 @@ const IGNORED_CLASSES: &[&str] = &[
 #[must_use]
 pub fn is_ignored_class(class_name: &str) -> bool {
     IGNORED_CLASSES.contains(&class_name)
+}
+
+/// Whether this is a complete Windows taskbar surface.
+///
+/// Taskbars are shell UI, but unlike transient menus and tooltips they are a
+/// stable visual surface users reasonably expect a window picker to capture.
+#[must_use]
+pub fn is_taskbar_class(class_name: &str) -> bool {
+    matches!(class_name, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
 }
 
 /// Why a window was excluded, for `tracing` and for tests.
@@ -148,6 +155,13 @@ pub fn classify(facts: &WindowFacts) -> Result<(), Rejection> {
     }
     if facts.cloaked {
         return Err(Rejection::Cloaked);
+    }
+    if is_taskbar_class(&facts.class_name) {
+        return if facts.width < MIN_WINDOW_EDGE || facts.height < MIN_WINDOW_EDGE {
+            Err(Rejection::TooSmall)
+        } else {
+            Ok(())
+        };
     }
     if facts.is_shell_window {
         return Err(Rejection::ShellWindow);

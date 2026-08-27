@@ -3316,6 +3316,7 @@ dependencies = [
  "tracing",
  "tray-icon",
  "windows",
+ "x11rb 0.14.0",
 ]
 
 [[package]]
@@ -3349,9 +3350,11 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "raw-window-handle",
  "resvg",
  "scrozz-annotate",
  "scrozz-core",
+ "scrozz-shell",
  "thiserror 2.0.20",
  "tracing",
 ]

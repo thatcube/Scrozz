@@ -56,7 +56,7 @@ impl TargetEnumerator for ScreenCaptureKitBackend {
     }
 
     fn windows(&self) -> Result<Vec<Window>> {
-        let content = sck::shareable_content()?;
+        let content = sck::shareable_content_for_windows()?;
         let displays = display::displays()?;
         window::windows(&content, &displays)
     }
@@ -158,7 +158,7 @@ fn capture_window(
     id: &scrozz_core::WindowId,
     request: &CaptureRequest,
 ) -> Result<(scrozz_core::Frame, SourceApp, bool)> {
-    let content = sck::shareable_content()?;
+    let content = sck::shareable_content_for_windows()?;
     let target = window::find(&content, id).ok_or_else(|| {
         Error::TargetGone(format!(
             "window {} is no longer open; it may have been closed since the list was taken",

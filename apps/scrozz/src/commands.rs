@@ -204,7 +204,16 @@ fn interactive_window_target(backend: Arc<dyn CaptureBackend>) -> CliResult<Capt
             let displays = backend.displays()?;
             let refresh_backend = Arc::clone(&backend);
             let refresh = Arc::new(move || refresh_backend.windows());
-            match scrozz_ui::picker::pick_window(windows, displays, refresh)? {
+            #[cfg(target_os = "macos")]
+            let native_hook = Some(crate::gui::panel::selection_hook());
+            #[cfg(not(target_os = "macos"))]
+            let native_hook: Option<scrozz_ui::picker::NativePickerHook> = None;
+            match scrozz_ui::picker::pick_window_with_native_hook(
+                windows,
+                displays,
+                refresh,
+                native_hook,
+            )? {
                 scrozz_ui::picker::Outcome::Selected(id) => Ok(CaptureTarget::Window(id)),
                 scrozz_ui::picker::Outcome::Cancelled => Err(CliError::Core(CoreError::Cancelled)),
                 scrozz_ui::picker::Outcome::Vanished(id) => {

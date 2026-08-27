@@ -16,6 +16,8 @@ pub mod macos;
 pub mod overlay;
 pub mod permissions;
 pub mod tray;
+#[cfg(target_os = "linux")]
+mod x11_focus;
 
 pub use drag::{
     ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
@@ -26,12 +28,16 @@ pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,
 };
+#[cfg(target_os = "macos")]
+pub use macos::overlay::MacSelectionOverlayLease;
 pub use overlay::{
     AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
 pub use permissions::SystemPermissions;
 pub use tray::{Tray, TrayAction, TrayEntry};
+#[cfg(target_os = "linux")]
+pub use x11_focus::X11FocusLease;
 
 use scrozz_core::{LogicalRect, Result};
 

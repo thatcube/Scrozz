@@ -46,4 +46,6 @@ pub use geometry::{
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
 pub use selection::{ShadowSupport, SourceApp, WindowPickingCapability, WindowSelection};
-pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};
+pub use target::{
+    CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowCornerRadius, WindowId,
+};

@@ -40,13 +40,13 @@
 //! them too, because focusing something invisible leaves the user with a
 //! highlight they cannot see.
 //!
-//! # Why the highlight radius is platform-specific
+//! # Why the highlight radius may be platform-specific
 //!
-//! Public capture APIs do not expose the compositor's final radius for arbitrary
-//! windows. The picker therefore uses a platform-specific visual estimate while
-//! preserving the OS-reported rectangular bounds exactly. This approximation is
-//! selection chrome only: it never masks or composites the captured pixels, whose
-//! native alpha remains the source of truth under D9.
+//! Backends carry a per-window radius when native pixels or system preferences
+//! make one available. Otherwise the picker uses a platform-specific visual
+//! estimate while preserving the OS-reported rectangular bounds exactly. Both
+//! forms are selection chrome only: neither masks nor composites captured pixels,
+//! whose native alpha remains the source of truth under D9.
 //!
 //! # Keyboard operation
 //!
@@ -59,9 +59,14 @@
 pub mod paint;
 
 use scrozz_core::{
-    Display, DisplayId, LogicalPoint, LogicalRect, ScaleFactor, SourceApp, Window, WindowId,
+    Display, DisplayId, LogicalPoint, LogicalRect, ScaleFactor, SourceApp, Window,
+    WindowCornerRadius, WindowId,
 };
 use std::sync::{Arc, Mutex};
+
+/// Native window configuration run before a standalone picker begins painting.
+pub type NativePickerHook =
+    Box<dyn FnOnce(&eframe::CreationContext<'_>) -> scrozz_core::Result<()>>;
 
 /// The input method currently controlling the picker highlight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,11 +82,14 @@ pub enum FocusMethod {
 pub struct Highlight {
     /// The window this describes.
     pub id: WindowId,
-    /// The window's true frame in global logical desktop points.
+    /// The window's visible picker frame in global logical desktop points.
     ///
-    /// Exactly what the OS reported — never inset or expanded. Visual corner
-    /// rounding is selection chrome and does not alter this geometry.
+    /// Normally this is the native capture frame. Sparse system surfaces may
+    /// narrow it to their native-alpha content so transparent canvas does not
+    /// intercept unrelated windows.
     pub bounds: LogicalRect,
+    /// The native capture frame, which may be larger than [`Self::bounds`].
+    pub capture_bounds: LogicalRect,
     /// The scale the capture will be taken at.
     ///
     /// The scale of the display the window is predominantly on, which is the
@@ -96,6 +104,8 @@ pub struct Highlight {
     /// Which application owns it, for the label chip and for the eventual
     /// history badge.
     pub source_app: SourceApp,
+    /// Per-window visual radius when the backend could determine one.
+    pub corner_radius: Option<WindowCornerRadius>,
     /// Whether pointer or keyboard input owns the current focus.
     pub focus_method: FocusMethod,
 }
@@ -104,7 +114,7 @@ impl Highlight {
     /// The capture size in real pixels, for the dimension readout.
     #[must_use]
     pub fn pixel_size(&self) -> (u32, u32) {
-        let physical = self.bounds.to_physical(self.scale);
+        let physical = self.capture_bounds.to_physical(self.scale);
         (physical.pixel_width(), physical.pixel_height())
     }
 
@@ -194,7 +204,9 @@ impl WindowPicker {
     /// lists and none of which can be hovered.
     pub fn candidates(&self) -> impl Iterator<Item = &Window> {
         self.windows.iter().filter(move |window| {
-            window.is_visible && !window.bounds.is_empty() && !self.excluded.contains(&window.id)
+            window.is_visible
+                && !window.picker_bounds().is_empty()
+                && !self.excluded.contains(&window.id)
         })
     }
 
@@ -253,7 +265,7 @@ impl WindowPicker {
     #[must_use]
     pub fn window_at(&self, position: LogicalPoint) -> Option<&Window> {
         self.candidates()
-            .find(|window| contains(window.bounds, position))
+            .find(|window| contains(window.picker_bounds(), position))
     }
 
     /// The currently focused window's id.
@@ -291,10 +303,12 @@ impl WindowPicker {
         let (scale, spans) = self.scale_of(window);
         Highlight {
             id: window.id.clone(),
-            bounds: window.bounds,
+            bounds: window.picker_bounds(),
+            capture_bounds: window.bounds,
             scale,
             spans_displays: spans,
             source_app: SourceApp::from_window(window),
+            corner_radius: window.corner_radius,
             focus_method,
         }
     }
@@ -427,7 +441,7 @@ impl WindowPicker {
         let mut best: Option<(f64, ScaleFactor)> = None;
 
         for display in &self.displays {
-            let area = overlap_area(display.bounds, window.bounds);
+            let area = overlap_area(display.bounds, window.picker_bounds());
             if area <= 0.0 {
                 continue;
             }
@@ -654,10 +668,32 @@ pub fn is_scrozz_window(window: &Window) -> bool {
 /// Returns a platform error when the native selection window cannot open, or
 /// propagates a fresh-enumeration error encountered while committing.
 pub fn pick_window(
-    mut windows: Vec<Window>,
+    windows: Vec<Window>,
     displays: Vec<Display>,
     refresh: Arc<dyn Fn() -> scrozz_core::Result<Vec<Window>> + Send + Sync>,
 ) -> scrozz_core::Result<Outcome> {
+    pick_window_with_native_hook(windows, displays, refresh, None)
+}
+
+/// Runs a standalone picker after applying required native window behavior.
+///
+/// The application uses this form on macOS to raise the picker above the Dock
+/// and menu bar before accepting input. Other callers can use [`pick_window`]
+/// when eframe's native viewport behavior is sufficient.
+///
+/// # Errors
+///
+/// Returns an error from `native_hook`, the native picker, or live enumeration.
+pub fn pick_window_with_native_hook(
+    mut windows: Vec<Window>,
+    displays: Vec<Display>,
+    refresh: Arc<dyn Fn() -> scrozz_core::Result<Vec<Window>> + Send + Sync>,
+    native_hook: Option<NativePickerHook>,
+) -> scrozz_core::Result<Outcome> {
+    #[cfg(target_os = "linux")]
+    let mut native_focus = scrozz_shell::X11FocusLease::before_window()?;
+    #[cfg(target_os = "macos")]
+    let reveal_after_native_hook = native_hook.is_some();
     windows.retain(|window| !is_scrozz_window(window));
     let result: Arc<Mutex<Option<scrozz_core::Result<Outcome>>>> = Arc::new(Mutex::new(None));
     let sink = Arc::clone(&result);
@@ -665,8 +701,10 @@ pub fn pick_window(
     let host_viewport = base_viewport()
         .with_inner_size(egui::vec2(1.0, 1.0))
         .with_visible(false);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let host_viewport = viewport(desktop_bounds(&displays));
+    #[cfg(target_os = "macos")]
+    let host_viewport = viewport(desktop_bounds(&displays)).with_visible(!reveal_after_native_hook);
 
     eframe::run_native(
         "Choose a window",
@@ -676,15 +714,52 @@ pub fn pick_window(
             ..Default::default()
         },
         Box::new(move |cc| {
+            if let Some(hook) = native_hook {
+                hook(cc)?;
+                #[cfg(target_os = "macos")]
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
             crate::theme::install_fonts(&cc.egui_ctx);
             let theme = crate::theme::Theme::dark();
             crate::theme::install_style(&cc.egui_ctx, &theme);
+            #[cfg(target_os = "linux")]
+            let native_focus = {
+                use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+                let handle = cc.window_handle().map_err(|error| {
+                    scrozz_core::Error::Platform(format!(
+                        "could not read the X11 picker window handle: {error}"
+                    ))
+                })?;
+                let window = match handle.as_raw() {
+                    RawWindowHandle::Xlib(handle) => {
+                        u32::try_from(handle.window).map_err(|_| {
+                            scrozz_core::Error::Platform(format!(
+                                "X11 picker window id does not fit in 32 bits: {}",
+                                handle.window
+                            ))
+                        })?
+                    }
+                    RawWindowHandle::Xcb(handle) => handle.window.get(),
+                    other => {
+                        return Err(scrozz_core::Error::Platform(format!(
+                            "in-process Linux window picking requires X11, got {other:?}"
+                        ))
+                        .into());
+                    }
+                };
+                native_focus.attach_window(window)?;
+                native_focus
+            };
             Ok(Box::new(PickerApp {
                 picker: WindowPicker::new(windows, displays),
                 refresh,
                 result: sink,
                 theme,
                 notice: None,
+                #[cfg(target_os = "linux")]
+                native_focus,
             }))
         }),
     )
@@ -705,21 +780,27 @@ struct PickerApp {
     result: Arc<Mutex<Option<scrozz_core::Result<Outcome>>>>,
     theme: crate::theme::Theme,
     notice: Option<String>,
+    #[cfg(target_os = "linux")]
+    native_focus: scrozz_shell::X11FocusLease,
 }
 
 fn store_terminal_result(
     result: &Mutex<Option<scrozz_core::Result<Outcome>>>,
     outcome: scrozz_core::Result<Outcome>,
 ) {
-    if let Ok(mut slot) = result.lock() {
-        if slot.is_none() {
-            *slot = Some(outcome);
-        }
+    if let Ok(mut slot) = result.lock()
+        && slot.is_none()
+    {
+        *slot = Some(outcome);
     }
 }
 
 impl PickerApp {
-    fn finish(&self, ctx: &egui::Context, outcome: scrozz_core::Result<Outcome>) {
+    fn finish(&mut self, ctx: &egui::Context, outcome: scrozz_core::Result<Outcome>) {
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.native_focus.restore() {
+            tracing::warn!("could not restore X11 focus before closing the picker: {error}");
+        }
         store_terminal_result(self.result.as_ref(), outcome);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -753,6 +834,19 @@ impl PickerApp {
 impl eframe::App for PickerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(target_os = "linux")]
+        match self.native_focus.maintain() {
+            Ok(true) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Ok(false) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            Err(error) => {
+                self.finish(&ctx, Err(error));
+                return;
+            }
+        }
         let root_close_requested = ctx.input(|input| input.viewport().close_requested());
 
         #[cfg(target_os = "windows")]
@@ -799,6 +893,10 @@ mod tests {
 
     fn at(x: f64, y: f64) -> LogicalPoint {
         LogicalPoint::new(x, y)
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
+        LogicalRect::new(at(x, y), LogicalSize::new(width, height))
     }
 
     #[test]
@@ -1035,6 +1133,8 @@ mod tests {
                 LogicalPoint::new(-9000.0, -9000.0),
                 LogicalSize::new(100.0, 100.0),
             ),
+            picker_bounds: None,
+            corner_radius: None,
             display: DisplayId("retina".to_owned()),
             is_visible: true,
         };
@@ -1171,6 +1271,21 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_radius_reaches_the_highlight_without_changing_bounds() {
+        let mut fixture = fixtures::overlapping();
+        fixture.windows[0].corner_radius = Some(WindowCornerRadius::Measured(15.5));
+        let window = fixture.windows[0].clone();
+        let picker = fixture.into_picker();
+        let highlight = picker.describe(&window);
+
+        assert_eq!(
+            highlight.corner_radius,
+            Some(WindowCornerRadius::Measured(15.5))
+        );
+        assert_eq!(highlight.bounds, window.bounds);
+    }
+
+    #[test]
     fn a_window_with_no_metadata_still_gets_a_readable_label() {
         let picker = fixtures::overlapping().into_picker();
         let anonymous = Window {
@@ -1179,10 +1294,36 @@ mod tests {
             application: None,
             application_id: None,
             bounds: LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(10.0, 10.0)),
+            picker_bounds: None,
+            corner_radius: None,
             display: DisplayId("main".to_owned()),
             is_visible: true,
         };
         assert_eq!(picker.describe(&anonymous).label(), "Untitled window");
+    }
+
+    #[test]
+    fn sparse_system_surface_only_intercepts_its_visible_picker_bounds() {
+        let mut fixture = fixtures::overlapping();
+        let mut dock = fixture.windows[0].clone();
+        dock.id = WindowId("dock".to_owned());
+        dock.bounds = rect(0.0, 0.0, 1440.0, 900.0);
+        dock.picker_bounds = Some(rect(420.0, 820.0, 600.0, 80.0));
+        fixture.windows.insert(0, dock);
+        let picker = fixture.into_picker();
+
+        assert_eq!(
+            picker.window_at(at(300.0, 200.0)).map(|window| &window.id),
+            Some(&WindowId("front".to_owned())),
+            "transparent native canvas must not swallow an application window"
+        );
+        let dock = picker.window_at(at(500.0, 850.0)).expect("visible Dock");
+        assert_eq!(dock.id, WindowId("dock".to_owned()));
+
+        let highlight = picker.describe(dock);
+        assert_eq!(highlight.bounds, rect(420.0, 820.0, 600.0, 80.0));
+        assert_eq!(highlight.capture_bounds, rect(0.0, 0.0, 1440.0, 900.0));
+        assert_eq!(highlight.pixel_size(), (2880, 1800));
     }
 
     #[test]

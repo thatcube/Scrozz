@@ -1,9 +1,10 @@
 //! Painting the interactive window picker.
 //!
 //! The selected wash and outline use the exact logical bounds supplied by the
-//! backend and a platform-specific visual estimate for the compositor's corner
-//! radius. The estimate affects only picker chrome; capture output keeps the
-//! platform's native edge pixels and alpha untouched.
+//! backend and a per-window radius where the backend can observe one. A
+//! platform-specific estimate is used only as a fallback. Both affect picker
+//! chrome only; capture output keeps the platform's native edge pixels and alpha
+//! untouched.
 
 use egui::epaint::Mesh;
 use egui::{
@@ -27,11 +28,11 @@ const LABEL_PADDING_X: f32 = 11.0;
 const LABEL_PADDING_Y: f32 = 6.0;
 const CORNER_SEGMENTS: u32 = 12;
 
-// Public window APIs do not expose the compositor's final per-window radius.
-// These logical-point estimates follow each platform's current window language;
-// Wayland uses its portal picker and never reaches this paint path.
+// These logical-point estimates are only for windows whose backend cannot
+// measure native alpha or read a system style hint. Wayland uses its portal
+// picker and never reaches this paint path.
 #[cfg(target_os = "macos")]
-const PLATFORM_WINDOW_RADIUS: f32 = 16.0;
+const PLATFORM_WINDOW_RADIUS: f32 = 12.0;
 #[cfg(target_os = "windows")]
 const PLATFORM_WINDOW_RADIUS: f32 = 8.0;
 #[cfg(target_os = "linux")]
@@ -118,7 +119,15 @@ pub fn draw(
 
     let layout = Layout::new(viewport, desktop_origin, highlight.bounds);
     let style = SelectionStyle::for_focus(highlight.focus_method);
-    let outer_radius = corner(PLATFORM_WINDOW_RADIUS);
+    let radius = highlight
+        .corner_radius
+        .map_or(PLATFORM_WINDOW_RADIUS, |radius| {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                radius.points() as f32
+            }
+        });
+    let outer_radius = corner(radius);
     for rect in &layout.scrim {
         painter.rect_filled(
             *rect,
@@ -128,7 +137,7 @@ pub fn draw(
     }
     painter.add(Shape::mesh(rounded_hole_corner_mesh(
         layout.highlight,
-        PLATFORM_WINDOW_RADIUS,
+        radius,
         Color32::from_black_alpha(SCRIM_ALPHA),
     )));
 
@@ -152,7 +161,7 @@ pub fn draw(
     if let Some(inner_width) = style.inner_outline_width {
         painter.rect_stroke(
             layout.highlight.shrink(style.outline_width),
-            corner((PLATFORM_WINDOW_RADIUS - style.outline_width).max(0.0)),
+            corner((radius - style.outline_width).max(0.0)),
             Stroke::new(inner_width, Color32::WHITE),
             StrokeKind::Inside,
         );

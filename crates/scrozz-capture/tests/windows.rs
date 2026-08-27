@@ -450,7 +450,7 @@ fn every_rejection_has_a_case_that_triggers_it() {
         (
             Rejection::IgnoredClass,
             WindowFacts {
-                class_name: "Shell_TrayWnd".to_string(),
+                class_name: "WorkerW".to_string(),
                 ..good_window()
             },
         ),
@@ -508,11 +508,27 @@ fn ws_ex_appwindow_overrides_ws_ex_toolwindow() {
 
 #[test]
 fn shell_furniture_classes_are_recognised() {
-    assert!(filter::is_ignored_class("Shell_TrayWnd"));
     assert!(filter::is_ignored_class("Progman"));
     assert!(filter::is_ignored_class("WorkerW"));
+    assert!(!filter::is_ignored_class("Shell_TrayWnd"));
     assert!(!filter::is_ignored_class("Chrome_WidgetWin_1"));
     assert!(!filter::is_ignored_class(""));
+}
+
+#[test]
+fn complete_taskbars_are_capturable_even_without_a_title() {
+    for class_name in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+        let facts = WindowFacts {
+            class_name: class_name.to_owned(),
+            title: String::new(),
+            ex_style: filter::WS_EX_TOOLWINDOW,
+            is_root_owner: false,
+            ..good_window()
+        };
+
+        assert!(filter::is_taskbar_class(class_name));
+        assert_eq!(filter::classify(&facts), Ok(()));
+    }
 }
 
 #[test]

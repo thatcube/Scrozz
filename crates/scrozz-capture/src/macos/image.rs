@@ -41,6 +41,52 @@ pub(crate) fn to_window_frame(image: &CGImage, scale: ScaleFactor) -> Result<Fra
     to_frame_inner(image, scale, true)
 }
 
+/// Pixel-space bounds enclosing every meaningfully non-transparent sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AlphaBounds {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+/// Finds the visible content inside an alpha-bearing frame.
+///
+/// Every normalized four-channel format stores alpha in byte 3, even though
+/// colour order and premultiplication differ. Rows are walked with the declared
+/// stride so aligned CoreGraphics buffers cannot skew the result.
+pub(crate) fn alpha_bounds(frame: &Frame, threshold: u8) -> Option<AlphaBounds> {
+    if !frame.is_well_formed() {
+        return None;
+    }
+    let (width, height) = (frame.width() as usize, frame.height() as usize);
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for y in 0..height {
+        for x in 0..width {
+            if frame.data[y * frame.stride + x * 4 + 3] <= threshold {
+                continue;
+            }
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + 1);
+            max_y = max_y.max(y + 1);
+        }
+    }
+
+    found.then_some(AlphaBounds {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
 fn to_frame_inner(image: &CGImage, scale: ScaleFactor, require_alpha: bool) -> Result<Frame> {
     let width = CGImage::width(Some(image));
     let height = CGImage::height(Some(image));
@@ -548,6 +594,34 @@ mod tests {
         assert!(
             !short.is_well_formed(),
             "a width*4-sized buffer under a padded stride must be caught"
+        );
+    }
+
+    #[test]
+    fn alpha_bounds_respect_stride_and_include_faint_native_alpha() {
+        let (width, height, stride) = (5usize, 4usize, 28usize);
+        let mut data = vec![0u8; stride * height];
+        for (x, y, alpha) in [(1usize, 1usize, 1u8), (2, 1, 128), (3, 2, 255)] {
+            let at = y * stride + x * 4;
+            data[at..at + 4].copy_from_slice(&[10, 20, 30, alpha]);
+        }
+        let frame = Frame {
+            data,
+            size: PhysicalSize::new(width as f64, height as f64),
+            stride,
+            format: PixelFormat::BgraPremultiplied8,
+            color_space: ColorSpace::DisplayP3,
+            scale: ScaleFactor::new(2.0),
+        };
+
+        assert_eq!(
+            alpha_bounds(&frame, 0),
+            Some(AlphaBounds {
+                x: 1,
+                y: 1,
+                width: 3,
+                height: 2,
+            })
         );
     }
 }

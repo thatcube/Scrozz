@@ -28,9 +28,9 @@ pub mod wire;
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, ColorSpace, Display, DisplayId, Error,
     Frame, LogicalRect, PhysicalSize, Provenance, Result, ScaleFactor, SourceApp, TargetEnumerator,
-    Window, WindowId, WindowPicking, WindowPickingCapability,
+    Window, WindowCornerRadius, WindowId, WindowPicking, WindowPickingCapability,
 };
-use x11rb::connection::{Connection, RequestConnection};
+use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     self, AtomEnum, ImageFormat, ImageOrder, MapState, Screen, Visualtype,
 };
@@ -53,13 +53,15 @@ struct Atoms {
     net_current_desktop: u32,
     net_frame_extents: u32,
     net_active_window: u32,
+    net_wm_window_type: u32,
+    net_wm_window_type_dock: u32,
     wm_state: u32,
     utf8_string: u32,
 }
 
 impl Atoms {
     fn intern(conn: &RustConnection) -> Result<Self> {
-        let names: [&[u8]; 9] = [
+        let names: [&[u8]; 11] = [
             b"_NET_CLIENT_LIST",
             b"_NET_CLIENT_LIST_STACKING",
             b"_NET_WM_NAME",
@@ -67,6 +69,8 @@ impl Atoms {
             b"_NET_CURRENT_DESKTOP",
             b"_NET_FRAME_EXTENTS",
             b"_NET_ACTIVE_WINDOW",
+            b"_NET_WM_WINDOW_TYPE",
+            b"_NET_WM_WINDOW_TYPE_DOCK",
             b"WM_STATE",
             b"UTF8_STRING",
         ];
@@ -78,7 +82,7 @@ impl Atoms {
             .map(|name| xproto::intern_atom(conn, false, name).map_err(platform))
             .collect::<Result<Vec<_>>>()?;
 
-        let mut atoms = [0u32; 9];
+        let mut atoms = [0u32; 11];
         for (slot, cookie) in atoms.iter_mut().zip(cookies) {
             *slot = cookie.reply().map_err(platform)?.atom;
         }
@@ -91,8 +95,10 @@ impl Atoms {
             net_current_desktop: atoms[4],
             net_frame_extents: atoms[5],
             net_active_window: atoms[6],
-            wm_state: atoms[7],
-            utf8_string: atoms[8],
+            net_wm_window_type: atoms[7],
+            net_wm_window_type_dock: atoms[8],
+            wm_state: atoms[9],
+            utf8_string: atoms[10],
         })
     }
 }
@@ -375,6 +381,17 @@ impl X11Backend {
         }
     }
 
+    fn is_desktop_panel(&self, window: u32) -> bool {
+        self.property(
+            window,
+            self.atoms.net_wm_window_type,
+            u32::from(AtomEnum::ATOM),
+        )
+        .is_some_and(|(_, bytes)| {
+            ewmh::parse_u32_list(&bytes).contains(&self.atoms.net_wm_window_type_dock)
+        })
+    }
+
     fn is_mapped(&self, window: u32) -> bool {
         xproto::get_window_attributes(&self.conn, window)
             .ok()
@@ -607,12 +624,17 @@ impl TargetEnumerator for X11Backend {
                 let display = layout::display_for_window(bounds, &displays)?;
 
                 let (application, application_id) = self.window_application(handle);
+                let corner_radius = self
+                    .is_desktop_panel(handle)
+                    .then_some(WindowCornerRadius::SystemHint(0.0));
                 Some(Window {
                     id: WindowId(format!("x11:{handle:08x}")),
                     title: self.window_title(handle),
                     application,
                     application_id,
                     bounds: bounds.to_logical(self.scale.get()),
+                    picker_bounds: None,
+                    corner_radius,
                     display,
                     is_visible: mapped,
                 })

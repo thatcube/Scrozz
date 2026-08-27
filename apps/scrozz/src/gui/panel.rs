@@ -129,6 +129,35 @@ pub fn hook() -> scrozz_ui::PanelHook {
     })
 }
 
+/// Native configuration for the standalone macOS window picker.
+///
+/// Unlike capture cards, the picker must sit above the Dock and menu bar and
+/// must receive every click itself. Failure is fatal to selection: showing it
+/// at the ordinary floating level would let system UI receive an attempted
+/// screenshot click.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn selection_hook() -> scrozz_ui::picker::NativePickerHook {
+    Box::new(|cc: &eframe::CreationContext<'_>| {
+        let handle = cc.window_handle().map_err(|error| {
+            scrozz_core::Error::Platform(format!(
+                "eframe reported no macOS picker window handle: {error}"
+            ))
+        })?;
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return Err(scrozz_core::Error::Platform(
+                "the macOS picker has no AppKit NSView handle".to_owned(),
+            ));
+        };
+
+        // SAFETY: the handle borrows the live eframe window for this scope and
+        // the application creator runs on AppKit's main thread.
+        let mut overlay = unsafe { NativeOverlay::from_ns_view(appkit.ns_view.as_ptr())? };
+        overlay.apply_without_class_change(&OverlayBehavior::selection_overlay())?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +209,13 @@ mod tests {
         // Building the hook must not touch AppKit — it is constructed at
         // start-up, long before `eframe` has a window to hand it.
         let hook = hook();
+        drop(hook);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_selection_hook_can_be_built_without_a_window() {
+        let hook = selection_hook();
         drop(hook);
     }
 }

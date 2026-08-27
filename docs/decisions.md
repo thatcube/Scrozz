@@ -199,6 +199,20 @@ where either is unavailable, that is a **fidelity gap to be closed**, never an
 invitation to guess a radius or synthesize a shadow. Radius, shadow and inset
 controls apply only to non-window captures.
 
+Picker chrome is separate from capture output. Where a backend can cheaply sample
+the window's native alpha, the picker may measure that window's visual radius;
+an OS style hint or documented platform estimate is an honest fallback. The value
+may shape the picker wash, cutout, and focus ring only. It must never crop, mask,
+or composite the window capture itself.
+
+Stable system surfaces are valid window targets too: the complete macOS Dock,
+Windows taskbar, and an EWMH X11 desktop panel may be selected, while transient
+menus and tooltips remain furniture. The macOS Dock's native window is a sparse,
+display-sized transparent surface, so its native alpha may narrow picker hit
+testing and chrome; the captured frame still remains exactly what
+ScreenCaptureKit returns. Wayland's trusted portal decides whether compositor
+shell surfaces are offered and Scrozz does not claim that choice on its behalf.
+
 **Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
 another, `inner_radius = outer_radius − padding`. Violating it makes corners look
 subtly wrong even when both shapes are "rounded". This belongs in the design

@@ -372,6 +372,8 @@ mod tests {
             application: Some(String::new()),
             application_id: Some("org.gnome.Nautilus".to_owned()),
             bounds: crate::LogicalRect::default(),
+            picker_bounds: None,
+            corner_radius: None,
             display: crate::DisplayId("d".to_owned()),
             is_visible: true,
         };

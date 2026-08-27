@@ -12,6 +12,28 @@ pub struct DisplayId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WindowId(pub String);
 
+/// How a picker corner radius was obtained.
+///
+/// This is selection metadata only. It must never be used to mask or composite
+/// capture output, whose native alpha remains authoritative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowCornerRadius {
+    /// Measured from the window's native alpha edge.
+    Measured(f64),
+    /// Inferred from an OS-provided window-style preference.
+    SystemHint(f64),
+}
+
+impl WindowCornerRadius {
+    /// Radius in logical desktop points.
+    #[must_use]
+    pub const fn points(self) -> f64 {
+        match self {
+            Self::Measured(points) | Self::SystemHint(points) => points,
+        }
+    }
+}
+
 /// A connected display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Display {
@@ -56,10 +78,30 @@ pub struct Window {
     pub application_id: Option<String>,
     /// Frame in the global logical desktop.
     pub bounds: LogicalRect,
+    /// Optional visible bounds used only for picker hit testing and chrome.
+    ///
+    /// Most windows use [`Self::bounds`]. Sparse compositor-owned surfaces can
+    /// have a display-sized native frame with pixels on only one edge (the macOS
+    /// Dock is one); exposing that full transparent frame to hit testing would
+    /// make it swallow every application window beneath it.
+    pub picker_bounds: Option<LogicalRect>,
+    /// Native visual corner radius where the backend can determine it.
+    ///
+    /// `None` means the picker must use an honest platform-wide estimate. This
+    /// value affects selection chrome only, never captured pixels.
+    pub corner_radius: Option<WindowCornerRadius>,
     /// The display this window is predominantly on.
     pub display: DisplayId,
     /// Whether the window is on screen and not minimised.
     pub is_visible: bool,
+}
+
+impl Window {
+    /// Bounds that should respond to picker input and receive selection chrome.
+    #[must_use]
+    pub fn picker_bounds(&self) -> LogicalRect {
+        self.picker_bounds.unwrap_or(self.bounds)
+    }
 }
 
 /// What a capture is aimed at.

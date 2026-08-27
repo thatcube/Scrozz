@@ -3,9 +3,13 @@
 //! Shared by both capture paths so the target list a user sees never depends on
 //! which path ends up doing the work.
 
-use scrozz_core::{Display, DisplayId, Error, Result, ScaleFactor, SourceApp, Window, WindowId};
+use scrozz_core::{
+    Display, DisplayId, Error, Result, ScaleFactor, SourceApp, Window, WindowCornerRadius, WindowId,
+};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DWMWCP_ROUNDSMALL, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::MONITORINFOEXW;
 use windows::Win32::System::Threading::{
@@ -220,6 +224,8 @@ pub struct WindowRecord {
     pub application: Option<String>,
     /// Normalized owning executable name, absent when it could not be read.
     pub application_id: Option<String>,
+    /// DWM's explicit corner preference, converted to a logical-point hint.
+    pub corner_radius: Option<WindowCornerRadius>,
     /// Index into the [`monitors`] list.
     pub monitor: usize,
 }
@@ -268,15 +274,52 @@ unsafe fn inspect_window(hwnd: HWND, state: &EnumState) -> Option<WindowRecord> 
     let mut process_id = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
     let application = unsafe { window_application(process_id) };
+    let is_taskbar = filter::is_taskbar_class(&facts.class_name);
+    let title = if is_taskbar {
+        Some("Taskbar".to_owned())
+    } else {
+        (!facts.title.is_empty()).then(|| facts.title.clone())
+    };
     Some(WindowRecord {
         handle: hwnd,
         process_id,
         bounds,
-        title: (!facts.title.is_empty()).then(|| facts.title.clone()),
+        title,
         application: application.as_ref().map(|app| app.name.clone()),
         application_id: application.map(|app| app.identifier),
+        corner_radius: if is_taskbar {
+            Some(WindowCornerRadius::SystemHint(0.0))
+        } else {
+            unsafe { window_corner_radius(hwnd) }
+        },
         monitor,
     })
+}
+
+unsafe fn window_corner_radius(hwnd: HWND) -> Option<WindowCornerRadius> {
+    let mut preference = DWM_WINDOW_CORNER_PREFERENCE::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw mut preference).cast(),
+            u32::try_from(size_of::<DWM_WINDOW_CORNER_PREFERENCE>()).ok()?,
+        )
+    }
+    .ok()?;
+
+    let points = if preference == DWMWCP_DONOTROUND {
+        0.0
+    } else if preference == DWMWCP_ROUND {
+        8.0
+    } else if preference == DWMWCP_ROUNDSMALL {
+        4.0
+    } else if preference == DWMWCP_DEFAULT {
+        return None;
+    } else {
+        return None;
+    };
+    Some(WindowCornerRadius::SystemHint(points))
 }
 
 unsafe fn collect_facts(hwnd: HWND, shell: HWND) -> WindowFacts {
@@ -480,6 +523,8 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
         application: record.application.clone(),
         application_id: record.application_id.clone(),
         bounds: logical_from_device(record.bounds, scale),
+        picker_bounds: None,
+        corner_radius: record.corner_radius,
         display,
         is_visible: true,
     }
@@ -574,6 +619,7 @@ mod tests {
             title: Some("Release notes".into()),
             application: Some(identity.name),
             application_id: Some(identity.identifier),
+            corner_radius: None,
             monitor: 0,
         };
 

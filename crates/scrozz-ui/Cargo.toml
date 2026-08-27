@@ -18,5 +18,9 @@ eframe.workspace = true
 image.workspace = true
 resvg.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle.workspace = true
+scrozz-shell.workspace = true
+
 [lints]
 workspace = true

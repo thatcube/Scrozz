@@ -339,6 +339,8 @@ fn window(
         application: Some(application.to_owned()),
         application_id: Some(application_id.to_owned()),
         bounds: rect(x, y, width, height),
+        picker_bounds: None,
+        corner_radius: None,
         display: DisplayId(display.to_owned()),
         is_visible,
     }

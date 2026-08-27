@@ -201,6 +201,10 @@ struct WindowPickerSession {
     theme: scrozz_ui::Theme,
     notice: Option<String>,
     committing: bool,
+    #[cfg(target_os = "macos")]
+    native_overlay: scrozz_shell::MacSelectionOverlayLease,
+    #[cfg(target_os = "linux")]
+    native_focus: scrozz_shell::X11FocusLease,
 }
 
 impl App {
@@ -439,12 +443,50 @@ impl App {
                         continue;
                     }
                     if self.active_window_capture == Some(card) {
+                        if let Some(session) = self
+                            .window_picker
+                            .as_mut()
+                            .filter(|session| session.card == card)
+                        {
+                            session.picker =
+                                scrozz_ui::picker::WindowPicker::new(windows, displays);
+                            session.notice = notice;
+                            session.committing = false;
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        let native_focus =
+                            match scrozz_shell::X11FocusLease::for_next_process_window() {
+                                Ok(native_focus) => native_focus,
+                                Err(error) => {
+                                    self.note(format!("window picker failed: {error}"));
+                                    self.pipeline.cancel_window(card);
+                                    self.active_window_capture = None;
+                                    continue;
+                                }
+                            };
+                        #[cfg(target_os = "macos")]
+                        let native_overlay =
+                            match scrozz_shell::MacSelectionOverlayLease::for_next_process_window()
+                            {
+                                Ok(native_overlay) => native_overlay,
+                                Err(error) => {
+                                    self.note(format!("window picker failed: {error}"));
+                                    self.pipeline.cancel_window(card);
+                                    self.active_window_capture = None;
+                                    continue;
+                                }
+                            };
                         self.window_picker = Some(WindowPickerSession {
                             card,
                             picker: scrozz_ui::picker::WindowPicker::new(windows, displays),
                             theme: scrozz_ui::Theme::dark(),
                             notice,
                             committing: false,
+                            #[cfg(target_os = "macos")]
+                            native_overlay,
+                            #[cfg(target_os = "linux")]
+                            native_focus,
                         });
                     } else {
                         self.pipeline.cancel_window(card);
@@ -554,6 +596,29 @@ impl App {
     /// Wayland never reaches this method with a picker: its trusted portal owns
     /// selection and the worker returns the completed capture directly.
     pub fn paint_window_picker(&mut self, root: &egui::Context) {
+        #[cfg(target_os = "linux")]
+        let focus_error =
+            self.window_picker
+                .as_mut()
+                .and_then(|session| match session.native_focus.maintain() {
+                    Ok(true) => {
+                        root.request_repaint_after(Duration::from_millis(50));
+                        None
+                    }
+                    Ok(false) => {
+                        root.request_repaint_after(Duration::from_millis(16));
+                        None
+                    }
+                    Err(error) => Some(error),
+                });
+        #[cfg(not(target_os = "linux"))]
+        let focus_error: Option<CoreError> = None;
+        if let Some(error) = focus_error {
+            self.note(format!("window picker failed: {error}"));
+            self.cancel_window_picker(root);
+            return;
+        }
+
         let Some(session) = self.window_picker.as_mut() else {
             return;
         };
@@ -571,9 +636,16 @@ impl App {
             let bounds = session.picker.desktop_bounds();
             let mut intent = scrozz_ui::picker::paint::Intent::None;
             let mut close_requested = false;
+            #[cfg(target_os = "macos")]
+            let picker_was_visible = session.native_overlay.is_attached();
+            #[cfg(target_os = "macos")]
+            let native_viewport =
+                scrozz_ui::picker::viewport(bounds).with_visible(picker_was_visible);
+            #[cfg(not(target_os = "macos"))]
+            let native_viewport = scrozz_ui::picker::viewport(bounds);
             root.show_viewport_immediate(
                 scrozz_ui::picker::viewport_id(),
-                scrozz_ui::picker::viewport(bounds),
+                native_viewport,
                 |ctx, _class| {
                     close_requested = ctx.input(|input| input.viewport().close_requested());
                     egui::CentralPanel::default()
@@ -589,6 +661,17 @@ impl App {
                         });
                 },
             );
+            #[cfg(target_os = "macos")]
+            match session.native_overlay.maintain() {
+                Ok(true) if !picker_was_visible => root.request_repaint(),
+                Ok(true) => {}
+                Ok(false) => root.request_repaint_after(Duration::from_millis(16)),
+                Err(error) => {
+                    self.note(format!("window picker failed: {error}"));
+                    self.cancel_window_picker(root);
+                    return;
+                }
+            }
             (intent, close_requested)
         };
 
