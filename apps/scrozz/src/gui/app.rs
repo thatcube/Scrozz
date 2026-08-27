@@ -1360,7 +1360,7 @@ mod tests {
         assert!(notes.contains("history window"), "{notes}");
         assert!(notes.contains("settings window"), "{notes}");
         assert!(
-            notes.contains("screen recording unavailable")
+            notes.contains("screen recording is unavailable")
                 || notes.contains("recording countdown started"),
             "{notes}"
         );
