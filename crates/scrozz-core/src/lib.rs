@@ -22,6 +22,10 @@
 //! - [`Error::PermissionDenied`] and [`Error::Unsupported`] make D15's
 //!   permission-on-first-use and D8's documented platform gaps ordinary,
 //!   handled outcomes rather than crashes.
+//! - [`identity`] holds the handful of strings — bundle identifier, URL scheme,
+//!   autostart label — that the OS keys permission grants, scheme handlers and
+//!   login items by. Every one of them fails silently when two subsystems
+//!   spell it differently, so there is exactly one spelling.
 
 #![forbid(unsafe_code)]
 
@@ -29,6 +33,7 @@ pub mod capture;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod identity;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
