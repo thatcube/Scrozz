@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 uap10 desktop rescap">
+  <Identity
+    Name="@PACKAGE_IDENTITY_NAME@"
+    Publisher="@PACKAGE_PUBLISHER@"
+    Version="@PACKAGE_VERSION@"
+    ProcessorArchitecture="@PACKAGE_ARCHITECTURE@" />
+  <Properties>
+    <DisplayName>Scrozz</DisplayName>
+    <PublisherDisplayName>@PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
+    <Description>Screenshots and screen recording</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily
+      Name="Windows.Desktop"
+      MinVersion="10.0.19041.0"
+      MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Applications>
+    <Application
+      Id="Scrozz"
+      Executable="scrozz.exe"
+      uap10:RuntimeBehavior="packagedClassicApp"
+      uap10:TrustLevel="mediumIL">
+      <uap:VisualElements
+        DisplayName="Scrozz"
+        Description="Screenshots and screen recording"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="default" />
+      <Extensions>
+        <uap:Extension
+          Category="windows.protocol"
+          uap10:Parameters="url handle">
+          <uap:Protocol Name="scrozz">
+            <uap:DisplayName>Scrozz URL automation</uap:DisplayName>
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+          </uap:Protocol>
+        </uap:Extension>
+        <desktop:Extension
+          Category="windows.startupTask"
+          Executable="scrozz.exe"
+          uap10:RuntimeBehavior="packagedClassicApp"
+          uap10:TrustLevel="mediumIL"
+          uap10:Parameters="gui">
+          <desktop:StartupTask
+            TaskId="ScrozzStartup"
+            Enabled="false"
+            DisplayName="Scrozz" />
+        </desktop:Extension>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="scrozz.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
