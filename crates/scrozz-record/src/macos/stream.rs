@@ -14,11 +14,12 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
 use objc2_av_foundation::{
     AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureConnection, AVCaptureOutput,
 };
+use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::{CMSampleBuffer, CMTime};
-use objc2_foundation::{NSError, NSObject};
+use objc2_foundation::{NSDictionary, NSError, NSNumber, NSObject, NSString};
 use objc2_screen_capture_kit::{
-    SCCaptureResolutionType, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput,
-    SCStreamOutputType,
+    SCCaptureResolutionType, SCFrameStatus, SCStream, SCStreamConfiguration, SCStreamDelegate,
+    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
 use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 
@@ -28,7 +29,8 @@ use crate::{
 };
 
 use super::audio::MicrophoneCapture;
-use super::content::CaptureContent;
+use super::compositor::Compositor;
+use super::content::{CaptureContent, CaptureSource};
 use super::plan::{CapturePixelFormat, RecordingPlan};
 use super::timeline::SessionTimeline;
 use super::writer::{AudioTrack, Writer};
@@ -52,22 +54,12 @@ pub(crate) fn start(
         content.native_width,
         content.native_height,
         content.scale,
-        has_overlays,
+        has_overlays || content.requires_composition(),
     );
     if plan.size.width < 2.0 || plan.size.height < 2.0 {
         return Err(Error::InvalidRequest(
             "recording resolution must be at least 2 by 2 pixels".to_owned(),
         ));
-    }
-
-    let configuration = configure(&content, &plan, request);
-    let native_microphone =
-        request.microphone && configuration.respondsToSelector(sel!(setCaptureMicrophone:));
-    if native_microphone {
-        // SAFETY: selector availability was checked on this exact object.
-        unsafe {
-            configuration.setCaptureMicrophone(true);
-        }
     }
 
     let writer = Writer::new(
@@ -77,72 +69,115 @@ pub(crate) fn start(
         request.system_audio,
         request.microphone,
     )?;
+    let output_width = plan.size.width.round() as u32;
+    let output_height = plan.size.height.round() as u32;
+    let compositor = if content.requires_composition() {
+        Some(Compositor::new(
+            output_width,
+            output_height,
+            (0..content.sources.len())
+                .map(|index| content.output_rect(index, output_width, output_height))
+                .collect(),
+            request.fps,
+        )?)
+    } else {
+        None
+    };
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
+        compositor: Mutex::new(compositor),
         clock: Mutex::new(SessionTimeline::new(Duration::ZERO)),
         overlays: Mutex::new(overlays),
         failure: Mutex::new(None),
         accepting: AtomicBool::new(false),
         epoch: std::time::Instant::now(),
         size: plan.size,
-        window_target: matches!(request.target, CaptureTarget::Window(_)),
     });
-    let delegate = StreamDelegate::new(Arc::clone(&shared));
-    let delegate_protocol: &ProtocolObject<dyn SCStreamDelegate> =
-        ProtocolObject::from_ref(&*delegate);
-    // SAFETY: designated initializer with live filter, configuration and delegate.
-    let stream = unsafe {
-        SCStream::initWithFilter_configuration_delegate(
-            SCStream::alloc(),
-            &content.filter,
-            &configuration,
-            Some(delegate_protocol),
-        )
-    };
     let queue = DispatchQueue::new("com.thatcube.scrozz.recording", None);
-    let output_protocol: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*delegate);
-
-    add_output(&stream, output_protocol, SCStreamOutputType::Screen, &queue)?;
-    if request.system_audio {
-        add_output(&stream, output_protocol, SCStreamOutputType::Audio, &queue)?;
-    }
-    if native_microphone {
-        add_output(
-            &stream,
-            output_protocol,
-            SCStreamOutputType::Microphone,
-            &queue,
-        )?;
-    }
-
-    wait_operation("starting screen capture", |handler| {
-        // SAFETY: the completion block is retained by ScreenCaptureKit for the
-        // asynchronous operation.
-        unsafe {
-            stream.startCaptureWithCompletionHandler(Some(handler));
+    let mut streams = Vec::with_capacity(content.sources.len());
+    let mut delegates = Vec::with_capacity(content.sources.len());
+    let mut native_microphone = false;
+    for (source_index, source) in content.sources.iter().enumerate() {
+        let configuration = configure(&content, source, source_index, &plan, request);
+        let source_microphone = source_index == 0
+            && request.microphone
+            && configuration.respondsToSelector(sel!(setCaptureMicrophone:));
+        if source_microphone {
+            // SAFETY: selector availability was checked on this exact object.
+            unsafe {
+                configuration.setCaptureMicrophone(true);
+            }
         }
-    })?;
-    {
-        let failure = lock(&shared.failure);
-        if let Some(reason) = failure.as_ref() {
-            return Err(Error::Platform(reason.clone()));
+        native_microphone |= source_microphone;
+
+        let delegate = StreamDelegate::new(
+            Arc::clone(&shared),
+            source_index,
+            source.label.clone(),
+            source.terminal_inactivity,
+        );
+        let delegate_protocol: &ProtocolObject<dyn SCStreamDelegate> =
+            ProtocolObject::from_ref(&*delegate);
+        // SAFETY: designated initializer with live filter, configuration and
+        // delegate; retained stream owns its configuration.
+        let stream = unsafe {
+            SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                &source.filter,
+                &configuration,
+                Some(delegate_protocol),
+            )
+        };
+        let output_protocol: &ProtocolObject<dyn SCStreamOutput> =
+            ProtocolObject::from_ref(&*delegate);
+        add_output(&stream, output_protocol, SCStreamOutputType::Screen, &queue)?;
+        if source_index == 0 && request.system_audio {
+            add_output(&stream, output_protocol, SCStreamOutputType::Audio, &queue)?;
         }
-        *lock(&shared.clock) = SessionTimeline::new(shared.now());
+        if source_microphone {
+            add_output(
+                &stream,
+                output_protocol,
+                SCStreamOutputType::Microphone,
+                &queue,
+            )?;
+        }
+        streams.push(stream);
+        delegates.push(delegate);
     }
+
+    *lock(&shared.clock) = SessionTimeline::new(shared.now());
     shared.accepting.store(true, Ordering::Release);
+    let mut started_streams = 0;
+    for stream in &streams {
+        if let Err(failure) = wait_operation("starting screen capture", |handler| {
+            // SAFETY: the completion block is retained by ScreenCaptureKit for
+            // the asynchronous operation.
+            unsafe {
+                stream.startCaptureWithCompletionHandler(Some(handler));
+            }
+        }) {
+            shared.accepting.store(false, Ordering::Release);
+            stop_started(&streams[..started_streams]);
+            return Err(failure);
+        }
+        started_streams += 1;
+    }
+    let startup_failure = lock(&shared.failure).clone();
+    if let Some(reason) = startup_failure {
+        shared.accepting.store(false, Ordering::Release);
+        stop_started(&streams);
+        return Err(Error::Platform(reason));
+    }
 
     let microphone = if request.microphone && !native_microphone {
         let audio_delegate: &ProtocolObject<dyn AVCaptureAudioDataOutputSampleBufferDelegate> =
-            ProtocolObject::from_ref(&*delegate);
+            ProtocolObject::from_ref(&*delegates[0]);
         match MicrophoneCapture::start(audio_delegate, &queue) {
             Ok(capture) => Some(capture),
             Err(failure) => {
-                let _ = wait_operation("stopping screen capture", |handler| {
-                    // SAFETY: valid stream and completion block.
-                    unsafe {
-                        stream.stopCaptureWithCompletionHandler(Some(handler));
-                    }
-                });
+                shared.accepting.store(false, Ordering::Release);
+                stop_started(&streams);
                 return Err(failure);
             }
         }
@@ -151,14 +186,14 @@ pub(crate) fn start(
     };
 
     Ok(Box::new(MacRecordingSession {
-        stream,
+        streams,
         microphone,
         shared,
         target: request.target.clone(),
         quality: request.quality,
         resolution: request.resolution,
         video_codec: plan.codec,
-        _delegate: delegate,
+        _delegates: delegates,
         _queue: queue,
         finalized: false,
     }))
@@ -166,13 +201,13 @@ pub(crate) fn start(
 
 struct Shared {
     writer: Mutex<Writer>,
+    compositor: Mutex<Option<Compositor>>,
     clock: Mutex<SessionTimeline>,
     overlays: Mutex<Option<Box<dyn OverlaySource>>>,
     failure: Mutex<Option<String>>,
     accepting: AtomicBool,
     epoch: std::time::Instant,
     size: PhysicalSize,
-    window_target: bool,
 }
 
 impl Shared {
@@ -188,7 +223,12 @@ impl Shared {
         lock(&self.clock).elapsed(self.now())
     }
 
-    fn append(&self, sample: &CMSampleBuffer, output_type: SCStreamOutputType) -> Result<()> {
+    fn append(
+        &self,
+        source_index: usize,
+        sample: &CMSampleBuffer,
+        output_type: SCStreamOutputType,
+    ) -> Result<()> {
         if !self.accepting.load(Ordering::Acquire) || self.state() != RecordingState::Recording {
             return Ok(());
         }
@@ -198,17 +238,13 @@ impl Shared {
         }
 
         if output_type == SCStreamOutputType::Screen {
-            let elapsed = self.elapsed();
-            let layers = {
-                let mut overlays = lock(&self.overlays);
-                overlays
-                    .as_mut()
-                    .map_or_else(Vec::new, |source| source.layers(elapsed, self.size))
-            };
-            if !layers.is_empty() {
-                super::overlay::composite(sample, &layers)?;
+            match screen_frame_status(sample) {
+                Some(SCFrameStatus::Complete | SCFrameStatus::Started) => {
+                    self.append_screen(source_index, sample, true)
+                }
+                Some(SCFrameStatus::Idle) => self.append_screen(source_index, sample, false),
+                _ => Ok(()),
             }
-            lock(&self.writer).append_video(sample)
         } else if output_type == SCStreamOutputType::Audio {
             lock(&self.writer).append_audio(AudioTrack::System, sample)
         } else if output_type == SCStreamOutputType::Microphone {
@@ -216,6 +252,55 @@ impl Shared {
         } else {
             Ok(())
         }
+    }
+
+    fn append_screen(
+        &self,
+        source_index: usize,
+        sample: &CMSampleBuffer,
+        has_new_pixels: bool,
+    ) -> Result<()> {
+        let composite = {
+            let mut compositor = lock(&self.compositor);
+            let Some(compositor) = compositor.as_mut() else {
+                if !has_new_pixels {
+                    return Ok(());
+                }
+                if source_index != 0 {
+                    return Err(Error::Codec(format!(
+                        "single-source recording received unexpected source {source_index}"
+                    )));
+                }
+                return self.append_video_with_overlays(sample);
+            };
+            let all_sources_ready = if has_new_pixels {
+                compositor.update(source_index, sample)?
+            } else {
+                compositor.sources_ready()
+            };
+            if !all_sources_ready
+                || !lock(&self.writer).video_ready()
+                || !compositor.ready_to_emit(sample)?
+            {
+                return Ok(());
+            }
+            compositor.compose(sample)?
+        };
+        self.append_video_with_overlays(&composite)
+    }
+
+    fn append_video_with_overlays(&self, sample: &CMSampleBuffer) -> Result<()> {
+        let elapsed = self.elapsed();
+        let layers = {
+            let mut overlays = lock(&self.overlays);
+            overlays
+                .as_mut()
+                .map_or_else(Vec::new, |source| source.layers(elapsed, self.size))
+        };
+        if !layers.is_empty() {
+            super::overlay::composite(sample, &layers)?;
+        }
+        lock(&self.writer).append_video(sample)
     }
 
     fn fail(&self, reason: String) {
@@ -238,9 +323,32 @@ impl Shared {
     }
 }
 
+fn screen_frame_status(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
+    // SAFETY: SCK owns the immutable attachment array for the duration of this
+    // callback; its first element is the documented frame-info dictionary.
+    let Some(attachments) = (unsafe { sample.sample_attachments_array(false) }) else {
+        return None;
+    };
+    if attachments.count() < 1 {
+        return None;
+    }
+    // SAFETY: the array is nonempty and SCK documents this value as an
+    // NSDictionary whose status value is an NSNumber.
+    let dictionary = unsafe {
+        &*attachments
+            .value_at_index(0)
+            .cast::<NSDictionary<NSString, NSNumber>>()
+    };
+    // SAFETY: immutable weak-linked SCK frame-info key.
+    let key = unsafe { SCStreamFrameInfoStatus };
+    dictionary
+        .objectForKey(key)
+        .map(|status| SCFrameStatus(status.integerValue()))
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
-    #[ivars = Arc<Shared>]
+    #[ivars = StreamDelegateIvars]
     struct StreamDelegate;
 
     unsafe impl NSObjectProtocol for StreamDelegate {}
@@ -253,8 +361,13 @@ define_class!(
             sample_buffer: &CMSampleBuffer,
             output_type: SCStreamOutputType,
         ) {
-            if let Err(failure) = self.ivars().append(sample_buffer, output_type) {
-                self.ivars().fail(failure.to_string());
+            let ivars = self.ivars();
+            if let Err(failure) =
+                ivars
+                    .shared
+                    .append(ivars.source_index, sample_buffer, output_type)
+            {
+                ivars.shared.fail(failure.to_string());
                 // SAFETY: called on the stream's serial callback queue; stopping
                 // asynchronously is valid and avoids blocking that queue.
                 unsafe {
@@ -268,19 +381,18 @@ define_class!(
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn stream_didStopWithError(&self, _stream: &SCStream, failure: &NSError) {
             self.ivars()
+                .shared
                 .fail(super::error::from_sck(failure, "screen capture stopped").to_string());
         }
 
         #[unsafe(method(streamDidBecomeInactive:))]
-        unsafe fn streamDidBecomeInactive(&self, stream: &SCStream) {
-            if self.ivars().window_target {
-                self.ivars().fail(
-                    "recording target disappeared before the session was stopped".to_owned(),
-                );
-                // SAFETY: see the sample callback's stop path.
-                unsafe {
-                    stream.stopCaptureWithCompletionHandler(None);
-                }
+        unsafe fn streamDidBecomeInactive(&self, _stream: &SCStream) {
+            let ivars = self.ivars();
+            if ivars.terminal_inactivity {
+                ivars.shared.fail(format!(
+                    "recording target {} disappeared before the session was stopped",
+                    ivars.source_label
+                ));
             }
         }
     }
@@ -293,19 +405,37 @@ define_class!(
             sample_buffer: &CMSampleBuffer,
             _connection: &AVCaptureConnection,
         ) {
-            if let Err(failure) = self
-                .ivars()
-                .append(sample_buffer, SCStreamOutputType::Microphone)
+            if let Err(failure) =
+                self.ivars()
+                    .shared
+                    .append(0, sample_buffer, SCStreamOutputType::Microphone)
             {
-                self.ivars().fail(failure.to_string());
+                self.ivars().shared.fail(failure.to_string());
             }
         }
     }
 );
 
+struct StreamDelegateIvars {
+    shared: Arc<Shared>,
+    source_index: usize,
+    source_label: String,
+    terminal_inactivity: bool,
+}
+
 impl StreamDelegate {
-    fn new(shared: Arc<Shared>) -> Retained<Self> {
-        let allocated = Self::alloc().set_ivars(shared);
+    fn new(
+        shared: Arc<Shared>,
+        source_index: usize,
+        source_label: String,
+        terminal_inactivity: bool,
+    ) -> Retained<Self> {
+        let allocated = Self::alloc().set_ivars(StreamDelegateIvars {
+            shared,
+            source_index,
+            source_label,
+            terminal_inactivity,
+        });
         // SAFETY: NSObject's initializer is valid for this direct subclass and
         // the Rust ivars were initialized above.
         unsafe { msg_send![super(allocated), init] }
@@ -313,14 +443,14 @@ impl StreamDelegate {
 }
 
 struct MacRecordingSession {
-    stream: Retained<SCStream>,
+    streams: Vec<Retained<SCStream>>,
     microphone: Option<MicrophoneCapture>,
     shared: Arc<Shared>,
     target: CaptureTarget,
     quality: Quality,
     resolution: RecordingResolution,
     video_codec: VideoCodec,
-    _delegate: Retained<StreamDelegate>,
+    _delegates: Vec<Retained<StreamDelegate>>,
     _queue: DispatchRetained<DispatchQueue>,
     finalized: bool,
 }
@@ -363,20 +493,23 @@ impl RecordingSession for MacRecordingSession {
 
     fn stop(mut self: Box<Self>) -> Result<Recording> {
         self.shared.accepting.store(false, Ordering::Release);
-        if let Err(failure) = wait_operation("stopping screen capture", |handler| {
-            // SAFETY: valid stream and completion block.
-            unsafe {
-                self.stream.stopCaptureWithCompletionHandler(Some(handler));
+        for stream in &self.streams {
+            if let Err(failure) = wait_operation("stopping screen capture", |handler| {
+                // SAFETY: valid stream and completion block.
+                unsafe {
+                    stream.stopCaptureWithCompletionHandler(Some(handler));
+                }
+            }) {
+                self.shared.add_failure(failure.to_string());
             }
-        }) {
-            self.shared.add_failure(failure.to_string());
         }
         if let Some(microphone) = &self.microphone {
             microphone.stop();
         }
         lock(&self.shared.clock).stop(self.shared.now());
+        let elapsed = self.shared.elapsed();
         let interrupted = lock(&self.shared.failure).take();
-        let summary = lock(&self.shared.writer).finish(interrupted)?;
+        let summary = lock(&self.shared.writer).finish(interrupted, elapsed)?;
         self.finalized = true;
 
         let metadata = RecordingMetadata {
@@ -410,8 +543,10 @@ impl Drop for MacRecordingSession {
         }
         self.shared.accepting.store(false, Ordering::Release);
         // SAFETY: best-effort asynchronous shutdown during an abandoned session.
-        unsafe {
-            self.stream.stopCaptureWithCompletionHandler(None);
+        for stream in &self.streams {
+            unsafe {
+                stream.stopCaptureWithCompletionHandler(None);
+            }
         }
         if let Some(microphone) = &self.microphone {
             microphone.stop();
@@ -421,13 +556,15 @@ impl Drop for MacRecordingSession {
         if interrupted.is_none() {
             interrupted = Some("recording session was dropped without an explicit stop".to_owned());
         }
-        let _ = lock(&self.shared.writer).finish(interrupted);
+        let _ = lock(&self.shared.writer).finish(interrupted, self.shared.elapsed());
         self.finalized = true;
     }
 }
 
 fn configure(
     content: &CaptureContent,
+    source: &CaptureSource,
+    source_index: usize,
     plan: &RecordingPlan,
     request: &RecordingRequest,
 ) -> Retained<SCStreamConfiguration> {
@@ -436,8 +573,13 @@ fn configure(
     // SAFETY: all values are validated and written before the configuration is
     // attached to a stream.
     unsafe {
-        configuration.setWidth(plan.size.width.round() as usize);
-        configuration.setHeight(plan.size.height.round() as usize);
+        let output = content.output_rect(
+            source_index,
+            plan.size.width.round() as u32,
+            plan.size.height.round() as u32,
+        );
+        configuration.setWidth(output.width as usize);
+        configuration.setHeight(output.height as usize);
         configuration.setMinimumFrameInterval(CMTime::new(1, request.fps as i32));
         configuration.setPixelFormat(match plan.pixel_format {
             CapturePixelFormat::VideoRange420 => PIXEL_FORMAT_420_VIDEO_RANGE,
@@ -446,15 +588,19 @@ fn configure(
         configuration.setShowsCursor(request.show_cursor);
         configuration.setQueueDepth(5);
         configuration.setScalesToFit(
-            plan.size.width.round() as u32 != content.native_width
+            content.requires_composition()
+                || plan.size.width.round() as u32 != content.native_width
                 || plan.size.height.round() as u32 != content.native_height,
         );
-        configuration.setPreservesAspectRatio(true);
+        configuration.setPreservesAspectRatio(!content.requires_composition());
         configuration.setCaptureResolution(SCCaptureResolutionType::Best);
-        if let Some(source_rect) = content.source_rect {
+        if plan.pixel_format == CapturePixelFormat::Bgra {
+            configuration.setColorSpaceName(kCGColorSpaceSRGB);
+        }
+        if let Some(source_rect) = source.source_rect {
             configuration.setSourceRect(source_rect);
         }
-        if request.system_audio {
+        if source_index == 0 && request.system_audio {
             configuration.setCapturesAudio(true);
             configuration.setSampleRate(48_000);
             configuration.setChannelCount(2);
@@ -462,6 +608,20 @@ fn configure(
         }
     }
     configuration
+}
+
+fn stop_started(streams: &[Retained<SCStream>]) {
+    for stream in streams {
+        let _ = wait_operation(
+            "stopping screen capture after a startup failure",
+            |handler| {
+                // SAFETY: valid stream and completion block.
+                unsafe {
+                    stream.stopCaptureWithCompletionHandler(Some(handler));
+                }
+            },
+        );
+    }
 }
 
 fn add_output(

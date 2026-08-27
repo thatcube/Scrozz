@@ -120,6 +120,17 @@ Screen Recording**, and the grant sticks across rebuilds.
 Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.
 
+Native recording probes are explicitly opt-in. The window-disappearance probe
+uses a disposable window; the microphone probe builds a signed helper app with
+`NSMicrophoneUsageDescription` and may show privacy prompts. Ordinary tests
+never run either probe:
+
+```bash
+SCROZZ_RECORD_WINDOW_SMOKE=1 tools/run-macos-recording-smoke.sh window-disappearance
+tools/run-macos-recording-smoke.sh microphone-package # build/sign only; no prompt
+SCROZZ_RECORD_MIC_SMOKE=1 tools/run-macos-recording-smoke.sh microphone
+```
+
 ### From the command line
 
 The CLI is not a wrapper around the app; it is the same capability, headless, and

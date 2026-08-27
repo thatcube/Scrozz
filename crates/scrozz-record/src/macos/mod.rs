@@ -1,6 +1,7 @@
 //! macOS ScreenCaptureKit recording.
 
 mod audio;
+mod compositor;
 mod content;
 mod error;
 mod mix;
