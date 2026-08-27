@@ -25,6 +25,7 @@
 
 pub mod portal;
 pub mod restore;
+pub(crate) mod scroll;
 
 use std::sync::Mutex;
 

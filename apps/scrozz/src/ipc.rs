@@ -148,6 +148,11 @@ pub fn policy(command: &Command) -> Forwarding {
         // process.
         Command::Record(args) if args.stop => Forwarding::Require,
 
+        // A scrolling capture is a long-lived interactive session. Running it
+        // inside the menu process would block that process's event loop and make
+        // its tray, hotkeys and Quit action unresponsive until stitching ends.
+        Command::Capture(args) if args.scrolling.is_some() => Forwarding::Never,
+
         // These write to the store or put an overlay on screen. Two processes
         // doing either concurrently is the bug this whole module exists to
         // prevent.
@@ -460,6 +465,14 @@ mod tests {
         assert_eq!(
             policy(&command_of(&["scrozz", "capture", "--region", "0,0,10,10"])),
             Forwarding::Prefer
+        );
+    }
+
+    #[test]
+    fn scrolling_capture_stays_local_so_it_cannot_block_the_gui_loop() {
+        assert_eq!(
+            policy(&command_of(&["scrozz", "capture", "--scrolling"])),
+            Forwarding::Never
         );
     }
 

@@ -233,6 +233,7 @@ const fn provenance_of(kind: CaptureKind) -> Provenance {
         CaptureKind::Region => Provenance::Region,
         CaptureKind::Window => Provenance::Window,
         CaptureKind::Fullscreen => Provenance::Display,
+        CaptureKind::Scrolling => Provenance::Stitched,
     }
 }
 
@@ -308,6 +309,7 @@ mod tests {
         assert_eq!(provenance_of(CaptureKind::Region), Provenance::Region);
         assert_eq!(provenance_of(CaptureKind::Window), Provenance::Window);
         assert_eq!(provenance_of(CaptureKind::Fullscreen), Provenance::Display);
+        assert_eq!(provenance_of(CaptureKind::Scrolling), Provenance::Stitched);
     }
 
     #[test]

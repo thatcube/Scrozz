@@ -24,7 +24,7 @@
 //! signatures means the compiler tells us the day a signature drifts, rather
 //! than the integration doing it months later.
 
-use scrozz_core::{CaptureBackend, TargetEnumerator};
+use scrozz_core::{CaptureBackend, ScrollDriver, TargetEnumerator};
 
 use crate::fault::{CliError, CliResult};
 
@@ -96,6 +96,18 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
     // window id starts meaning two different things. `CaptureBackend` has
     // `TargetEnumerator` as a supertrait, so this is a trait upcast.
     Ok(scrozz_capture::backend()?)
+}
+
+/// The input driver used by scrolling capture on this desktop.
+///
+/// # Errors
+///
+/// Returns a platform or permission error when automatic synthesis was selected
+/// but cannot be prepared. Desktops without a synthesis protocol return the
+/// manual driver instead.
+pub fn scroll_driver() -> CliResult<Box<dyn ScrollDriver>> {
+    capture_guard("starting a scrolling capture", "scrozz-capture")?;
+    Ok(scrozz_capture::scroll_driver()?)
 }
 
 /// Starts a screen recording.

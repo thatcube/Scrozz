@@ -23,6 +23,7 @@ mod filter;
 mod gdi;
 mod geom;
 mod pixels;
+pub(crate) mod scroll;
 mod wgc;
 
 pub use backend::backend;

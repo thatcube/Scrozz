@@ -155,6 +155,7 @@ impl Config {
                 "0" | "false" | "no" | "" => None,
                 "region" => Some(CaptureKind::Region),
                 "window" => Some(CaptureKind::Window),
+                "scrolling" => Some(CaptureKind::Scrolling),
                 _ => Some(CaptureKind::Fullscreen),
             };
         }
@@ -461,6 +462,9 @@ impl App {
             match outcome {
                 Outcome::Ready(card) if self.pipeline.is_window_cancelled(card.id) => {
                     self.pipeline.post(Job::Release(card.id));
+                }
+                Outcome::Progress { card, progress } => {
+                    self.note(format!("{card} {}", describe_scroll_progress(&progress)));
                 }
                 Outcome::Ready(card) => {
                     if self.active_window_capture == Some(card.id) {
@@ -817,6 +821,47 @@ impl App {
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
+    }
+}
+
+fn describe_scroll_progress(progress: &scrozz_stitch::Progress) -> String {
+    use scrozz_stitch::Progress;
+
+    match progress {
+        Progress::Prepared {
+            driver,
+            automatic,
+            manual_reason,
+        } => {
+            if *automatic {
+                format!("started scrolling with {driver}")
+            } else {
+                format!(
+                    "is ready in manual mode ({driver}); scroll the page to continue: {}",
+                    manual_reason
+                        .as_deref()
+                        .unwrap_or("automatic scrolling is unavailable")
+                )
+            }
+        }
+        Progress::FrameCaptured { frame } => format!("captured scrolling frame {frame}"),
+        Progress::WaitingForManualScroll => "is waiting for the page to scroll".to_owned(),
+        Progress::Advanced {
+            frame,
+            delta,
+            output_height,
+            ..
+        } => {
+            format!("stitched frame {frame} ({delta} px advanced, {output_height} px tall)")
+        }
+        Progress::Stalled { count } => format!("saw no movement ({count})"),
+        Progress::Finished {
+            reason,
+            frames,
+            output_height,
+        } => format!(
+            "finished scrolling capture ({reason:?}, {frames} frames, {output_height} px tall)"
+        ),
     }
 }
 

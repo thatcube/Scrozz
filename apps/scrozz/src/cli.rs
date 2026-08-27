@@ -305,6 +305,8 @@ pub enum TargetSpec {
     Display(DisplaySelector),
     /// Every display.
     AllDisplays,
+    /// Repeated frames from one display, assembled while its content scrolls.
+    Scrolling(DisplaySelector),
     /// Chosen on screen.
     Interactive(InteractiveMode),
 }
@@ -512,6 +514,19 @@ pub struct CaptureArgs {
     #[command(flatten)]
     pub target: TargetArgs,
 
+    /// Capture a scrolling page on a display.
+    ///
+    /// With no value, uses the display under the pointer. A selector may be an
+    /// id, `primary`, or `active`.
+    #[arg(
+        long,
+        value_name = "ID|primary|active",
+        num_args = 0..=1,
+        default_missing_value = "active",
+        conflicts_with = "target"
+    )]
+    pub scrolling: Option<String>,
+
     /// Composite the pointer into the capture.
     #[arg(long)]
     pub cursor: bool,
@@ -565,6 +580,14 @@ pub struct CaptureArgs {
 }
 
 impl CaptureArgs {
+    /// Resolves the ordinary target flags or the scrolling-capture selector.
+    pub fn target_spec(&self) -> CliResult<TargetSpec> {
+        self.scrolling.as_ref().map_or_else(
+            || self.target.resolve(),
+            |selector| Ok(TargetSpec::Scrolling(parse_display_selector(selector)?)),
+        )
+    }
+
     /// Every destination this invocation asked for.
     ///
     /// With none specified the capture is saved to the configured folder, which
@@ -613,7 +636,7 @@ impl CaptureArgs {
                  use --format jpeg or --format webp",
             ));
         }
-        self.target.resolve()?;
+        self.target_spec()?;
         Ok(())
     }
 }
@@ -1399,6 +1422,29 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_defaults_to_the_active_display_and_accepts_an_id() {
+        for (args, want) in [
+            (
+                vec!["scrozz", "capture", "--scrolling"],
+                DisplaySelector::Active,
+            ),
+            (
+                vec!["scrozz", "capture", "--scrolling=primary"],
+                DisplaySelector::Primary,
+            ),
+            (
+                vec!["scrozz", "capture", "--scrolling=DP-1"],
+                DisplaySelector::Id("DP-1".to_owned()),
+            ),
+        ] {
+            let Some(Command::Capture(parsed)) = parse(&args).command else {
+                panic!("expected capture")
+            };
+            assert_eq!(parsed.target_spec().unwrap(), TargetSpec::Scrolling(want));
+        }
+    }
+
+    #[test]
     fn an_empty_selector_is_a_usage_error_not_a_silent_default() {
         for args in [
             vec!["scrozz", "capture", "--display", ""],
@@ -1443,6 +1489,7 @@ mod tests {
             vec!["--display", "primary"],
             vec!["--all-displays"],
             vec!["--interactive"],
+            vec!["--scrolling=active"],
         ];
         for (i, first) in targets.iter().enumerate() {
             for second in targets.iter().skip(i + 1) {

@@ -130,3 +130,24 @@ impl WindowPicking for LinuxBackend {
         }
     }
 }
+
+/// Chooses and constructs the scroll-input driver for this Linux session.
+pub fn scroll_driver() -> Result<Box<dyn scrozz_core::ScrollDriver>> {
+    let env = SessionEnv::from_env();
+    match session::detect_session(&env) {
+        SessionKind::X11 => match x11::scroll::X11ScrollDriver::connect() {
+            Ok(driver) => Ok(Box::new(driver)),
+            Err(Error::Unsupported { why, .. }) => {
+                Ok(Box::new(scrozz_core::ManualScrollDriver::new(why)))
+            }
+            Err(error) => Err(error),
+        },
+        SessionKind::Wayland | SessionKind::XWayland => {
+            Ok(wayland::scroll::driver_for_session(&env))
+        }
+        SessionKind::Headless => Err(Error::Unsupported {
+            what: "scroll input".into(),
+            why: "no display server was found: neither WAYLAND_DISPLAY nor DISPLAY is set".into(),
+        }),
+    }
+}

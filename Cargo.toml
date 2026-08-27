@@ -62,7 +62,7 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "webp",
 ] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -103,13 +103,14 @@ x11rb = { version = "0.14", features = [
     "shm",            # MIT-SHM protocol
     "libc",           # the syscalls MIT-SHM actually needs; "shm" alone is not enough
     "xfixes",         # cursor capture
+    "xtest",          # synthetic wheel input for scrolling capture
     "allow-unsafe-code",
 ] }
 ashpd = { version = "0.13", features = [
     "screencast",     # without these the portal cannot be called at all
     "screenshot",
+    "remote_desktop", # pointer-axis input on GNOME and KDE Wayland sessions
 ] }
-
 [workspace.lints.rust]
 # An unimplemented contract must still compile. Phase 0 is deliberately a tree
 # of `todo!()` bodies, so these cannot be denied yet.

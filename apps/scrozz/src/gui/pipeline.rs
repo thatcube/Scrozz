@@ -38,6 +38,7 @@ use scrozz_core::{
     Error as CoreError, Window, WindowId, WindowSelection,
 };
 use scrozz_export::{Encoder, NamingContext, SystemClipboard};
+use scrozz_stitch::{AtomicCancellation, CancelAction, Progress};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
@@ -83,6 +84,13 @@ pub enum Job {
 /// What the capture thread produced.
 #[derive(Debug)]
 pub enum Outcome {
+    /// A scrolling capture reached a meaningful frame boundary.
+    Progress {
+        /// Which in-flight card the update belongs to.
+        card: CardId,
+        /// Session status suitable for the HUD and diagnostics.
+        progress: Progress,
+    },
     /// A capture succeeded and is ready to show.
     Ready(Box<Card>),
     /// The worker prepared an in-process picker snapshot.
@@ -127,6 +135,7 @@ pub struct Pipeline {
     stopped: Receiver<()>,
     worker: Option<JoinHandle<()>>,
     next_card: u64,
+    cancellation: AtomicCancellation,
 }
 
 impl Pipeline {
@@ -144,11 +153,13 @@ impl Pipeline {
         let (stopped_tx, stopped) = channel();
         let cancellations = Arc::new(Mutex::new(HashSet::new()));
         let worker_cancellations = Arc::clone(&cancellations);
+        let cancellation = AtomicCancellation::default();
+        let worker_cancellation = cancellation.clone();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
-                Worker::new(outcome_tx, worker_cancellations).run(&job_rx);
+                Worker::new(outcome_tx, worker_cancellations, worker_cancellation).run(&job_rx);
                 let _ = stopped_tx.send(());
             })
             .map_err(|err| {
@@ -164,6 +175,7 @@ impl Pipeline {
             stopped,
             worker: Some(worker),
             next_card: 1,
+            cancellation,
         })
     }
 
@@ -176,6 +188,9 @@ impl Pipeline {
 
     /// Posts a job. Returns `false` if the worker has gone.
     pub fn post(&self, job: Job) -> bool {
+        if matches!(&job, Job::Capture { .. }) {
+            self.cancellation.reset();
+        }
         self.jobs.send(job).is_ok()
     }
 
@@ -208,6 +223,7 @@ impl Pipeline {
     /// Called from `Drop`, but exposed so a host can shut down deterministically
     /// rather than at an unspecified point during teardown.
     pub fn stop(&mut self) {
+        self.cancellation.cancel(CancelAction::Abort);
         let _ = self.jobs.send(Job::Stop);
         if let Some(worker) = self.worker.take() {
             match self.stopped.recv_timeout(Duration::from_millis(250)) {
@@ -246,10 +262,15 @@ struct Worker {
     cache: HashMap<CardId, Cached>,
     window_pickers: HashMap<CardId, Box<dyn CaptureBackend>>,
     cancellations: Arc<Mutex<HashSet<CardId>>>,
+    cancellation: AtomicCancellation,
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>, cancellations: Arc<Mutex<HashSet<CardId>>>) -> Self {
+    fn new(
+        outcomes: Sender<Outcome>,
+        cancellations: Arc<Mutex<HashSet<CardId>>>,
+        cancellation: AtomicCancellation,
+    ) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -272,6 +293,7 @@ impl Worker {
             cache: HashMap::new(),
             window_pickers: HashMap::new(),
             cancellations,
+            cancellation,
         }
     }
 
@@ -319,7 +341,9 @@ impl Worker {
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
-            CaptureKind::Fullscreen => CaptureTarget::Display(backend.active_display()?.id),
+            CaptureKind::Fullscreen | CaptureKind::Scrolling => {
+                CaptureTarget::Display(backend.active_display()?.id)
+            }
             // Choosing a region or a window is the selection overlay's job, and
             // per D8 a missing capability is explained rather than approximated.
             // Silently capturing the whole display instead would be worse than
@@ -344,7 +368,19 @@ impl Worker {
             include_window_shadow: output.include_window_shadow(),
         };
 
-        let capture = backend.capture(&request)?;
+        let capture = if kind == CaptureKind::Scrolling {
+            let outcomes = self.outcomes.clone();
+            crate::commands::scrolling_capture_with(
+                backend.as_ref(),
+                request,
+                &mut self.cancellation,
+                move |progress| {
+                    let _ = outcomes.send(Outcome::Progress { card, progress });
+                },
+            )?
+        } else {
+            backend.capture(&request)?
+        };
         self.build_card(kind, card, capture, output)
     }
 
@@ -746,6 +782,7 @@ mod tests {
             cache: HashMap::new(),
             window_pickers: HashMap::new(),
             cancellations: Arc::new(Mutex::new(HashSet::new())),
+            cancellation: AtomicCancellation::default(),
         };
         let stride = 21;
         let mut data = vec![0xAB; stride * 2];
@@ -797,6 +834,7 @@ mod tests {
             cache: HashMap::new(),
             window_pickers: HashMap::new(),
             cancellations,
+            cancellation: AtomicCancellation::default(),
         };
         let capture = Capture::new(
             Frame {
