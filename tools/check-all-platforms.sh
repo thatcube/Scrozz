@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Type-check every crate against all three platforms from one machine.
 #
-# `cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-# That makes Windows and Linux platform code genuinely verifiable from a Mac:
-# the compiler checks it against the real `windows`, `x11rb` and `ashpd`
-# bindings, so a misused API is a compile error here rather than a surprise in
-# CI. It proves nothing about runtime behaviour — see docs/platforms.md.
+# `cargo check` does not link, so pure-Rust platform bindings need no foreign
+# SDK. Native library build scripts are the exception: GTK/ATK-backed Linux
+# crates still need target pkg-config metadata when checked from another OS.
+# See docs/platforms.md for the exact boundary.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -53,9 +52,9 @@ HOST_TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host: / { print $2 }')"
 #
 # That is a toolchain limitation, not a defect in Scrozz. Setting
 # SCROZZ_XCHECK_EXCLUDE lets the cross targets skip those crates while the host
-# target still checks everything. Nothing is lost for layer 1's actual purpose:
-# per docs/platforms.md only scrozz-capture, scrozz-record, scrozz-ocr and
-# scrozz-shell may contain `cfg(target_os)`, and all four remain fully checked.
+# target still checks everything. The Windows bindings and non-GTK Linux
+# platform crates remain cross-checkable; scrozz-shell's complete Linux path is
+# checked by native Linux CI.
 #
 # Drop the exclusion the day `rusqlite` stops bundling its own sqlite.
 EXCLUDES=()
@@ -99,6 +98,12 @@ for target in "${TARGETS[@]}"; do
       echo "  It means a missing cross toolchain, NOT a bug in your Rust code."
       echo "  Re-run with the offending crate excluded, for example:"
       echo "    SCROZZ_XCHECK_EXCLUDE='scrozz-store scrozz' $0 $target"
+    elif grep -q "pkg-config has not been configured to support cross-compilation" "$log" 2>/dev/null; then
+      echo
+      echo "  This target needs native-library pkg-config metadata (GTK/ATK for scrozz-shell)."
+      echo "  A foreign host cannot check that crate without a target sysroot."
+      echo "  Check the Rust-only Linux paths here, then rely on native Linux CI for scrozz-shell:"
+      echo "    cargo check --target $target -p scrozz-core -p scrozz-capture -p scrozz-record -p scrozz-ocr -p scrozz-ui --all-targets"
     elif grep -q "may not be installed" "$log" 2>/dev/null; then
       echo
       echo "  The target's standard library is missing. Install it with:"

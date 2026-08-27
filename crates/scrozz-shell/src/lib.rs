@@ -20,6 +20,7 @@ pub mod overlay;
 pub mod package;
 pub mod permissions;
 pub mod picker;
+pub mod selection;
 pub mod tray;
 pub mod url_scheme;
 
@@ -41,6 +42,7 @@ pub use overlay::{
 pub use package::{PackageKind, package_kind};
 pub use permissions::SystemPermissions;
 pub use picker::{NativeFolderPicker, StubFolderPicker, native_folder_picker};
+pub use selection::{SelectionIntegration, SelectionPlan, resolve_selection};
 pub use tray::{Tray, TrayAction, TrayEntry};
 
 use std::{

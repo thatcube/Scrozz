@@ -163,6 +163,7 @@ fn a_bad_invocation_exits_two_and_writes_to_stderr() {
         vec!["capture", "--region", "not-a-region"],
         vec!["capture", "--region", "0,0,100,100", "--display", "1"],
         vec!["capture", "--quality", "0"],
+        vec!["--no-ipc", "capture", "--delay", "1e300", "--dry-run"],
         vec!["list"],
         vec!["settings", "set", "only-a-key"],
         vec!["-v", "-q", "list", "displays"],
@@ -311,7 +312,7 @@ fn an_unsupported_operation_gives_the_why_and_the_alternative() {
     let text = stderr(&out);
     assert!(text.contains("Wayland"), "the why is missing: {text}");
     assert!(
-        text.contains("--interactive window"),
+        text.contains("Capture a display instead"),
         "the alternative is missing, which is the whole point: {text}"
     );
     assert!(
@@ -572,6 +573,57 @@ fn a_dry_run_reports_the_plan_and_captures_nothing() {
     assert!(has_field(&text, "cursor", "true"), "{text}");
     assert!(has_field(&text, "format", r#""jpeg""#), "{text}");
     assert!(has_field(&text, "width", "300.0"), "{text}");
+}
+
+#[test]
+fn all_in_one_selector_controls_survive_the_real_cli_boundary() {
+    let out = scrozz([
+        "--json",
+        "capture",
+        "--interactive",
+        "all-in-one",
+        "--fixed-size",
+        "1200x630",
+        "--aspect",
+        "40:21",
+        "--freeze=false",
+        "--magnifier=false",
+        "--crosshair=false",
+        "--retake",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let text = stdout(&out);
+    assert!(has_field(&text, "kind", r#""interactive""#), "{text}");
+    assert!(has_field(&text, "mode", r#""all-in-one""#), "{text}");
+    assert!(has_field(&text, "freeze", "false"), "{text}");
+    assert!(has_field(&text, "magnifier", "false"), "{text}");
+    assert!(has_field(&text, "crosshair", "false"), "{text}");
+    assert!(has_field(&text, "retake", "true"), "{text}");
+    assert!(
+        text.contains(r#""fixed_size":{"width":1200.0,"height":630.0}"#),
+        "{text}"
+    );
+}
+
+#[test]
+fn interactive_window_is_two_arguments_not_a_private_flag() {
+    let out = scrozz([
+        "--json",
+        "capture",
+        "--interactive",
+        "window",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(has_field(&text, "mode", r#""window""#), "{text}");
+
+    let obsolete = scrozz(["capture", "--interactive-window", "--dry-run"]);
+    assert_eq!(code(&obsolete), 2);
 }
 
 #[test]

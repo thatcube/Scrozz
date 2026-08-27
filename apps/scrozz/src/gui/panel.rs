@@ -27,6 +27,8 @@
 //! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
 //! `detail` string rather than being a bool.
 
+#[cfg(target_os = "macos")]
+use std::{cell::RefCell, rc::Rc};
 use std::{
     ffi::c_void,
     sync::{Arc, Mutex},
@@ -85,6 +87,47 @@ impl NativeSurfaceSlot {
     }
 }
 
+/// Main-thread control of the native window behavior after the creation hook.
+///
+/// The handle is intentionally `Rc`, not `Arc`: native window mutation belongs
+/// to the one eframe thread and must never become callable from a capture worker.
+#[derive(Clone, Default)]
+pub struct BehaviorController {
+    surface: NativeSurfaceSlot,
+    #[cfg(target_os = "macos")]
+    overlay: Rc<RefCell<Option<NativeOverlay>>>,
+}
+
+impl BehaviorController {
+    /// Uses `surface` for native drag and visibility consumers.
+    #[must_use]
+    pub fn with_surface(surface: NativeSurfaceSlot) -> Self {
+        Self {
+            surface,
+            #[cfg(target_os = "macos")]
+            overlay: Rc::default(),
+        }
+    }
+
+    /// Applies a card or selection behavior when a native adapter is retained.
+    pub fn apply(&self, behavior: &OverlayBehavior) {
+        #[cfg(target_os = "macos")]
+        if let Some(overlay) = self.overlay.borrow_mut().as_mut()
+            && let Err(error) = overlay.apply(behavior)
+        {
+            tracing::warn!(%error, "could not update native overlay behavior");
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = behavior;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn install(&self, overlay: NativeOverlay) {
+        *self.overlay.borrow_mut() = Some(overlay);
+    }
+}
+
 /// Converts the window hosting `ns_view` into a non-activating overlay panel.
 ///
 /// `ns_view` is the `ns_view` field of a `RawWindowHandle::AppKit`, which is
@@ -102,35 +145,51 @@ impl NativeSurfaceSlot {
 /// `eframe` app creator, which is the only caller.
 #[must_use]
 pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { convert_and_retain_ns_view(ns_view) }.0
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
     if ns_view.is_null() {
-        return PanelReport::unsupported("the window handle carried a null NSView");
+        return (
+            PanelReport::unsupported("the window handle carried a null NSView"),
+            None,
+        );
     }
 
-    // The entry point is named differently per platform: macOS adopts a view or
-    // a window, and the stub backends adopt an opaque handle. Both refuse
-    // safely, so the non-macOS arm is a real path rather than a `todo!`.
-    #[cfg(target_os = "macos")]
     // SAFETY: forwarded from this function's own contract — a live `NSView *`
     // on the main thread.
     let adopted = unsafe { NativeOverlay::from_ns_view(ns_view) };
 
-    #[cfg(not(target_os = "macos"))]
-    // SAFETY: as above; the stub backends do not dereference the handle.
-    let adopted = unsafe { NativeOverlay::adopt(ns_view) };
-
     let mut overlay = match adopted {
         Ok(overlay) => overlay,
-        Err(err) => return PanelReport::unsupported(err.to_string()),
+        Err(err) => return (PanelReport::unsupported(err.to_string()), None),
     };
 
-    match overlay.apply(&OverlayBehavior::capture_card()) {
+    let report = match overlay.apply(&OverlayBehavior::capture_card()) {
         // `non_activating` is the only part of the behaviour D27 depends on.
         // Everything else — level, collection behaviour — can be applied and
         // the card still behaves; this cannot.
         Ok(report) if report.non_activating => PanelReport::converted(report.detail),
         Ok(report) => PanelReport::unsupported(report.detail),
         Err(err) => PanelReport::unsupported(err.to_string()),
+    };
+    (report, Some(overlay))
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
+    if ns_view.is_null() {
+        return (
+            PanelReport::unsupported("the window handle carried a null native view"),
+            None,
+        );
     }
+    (
+        PanelReport::unsupported("only the macOS native overlay adapter is retained by this hook"),
+        None,
+    )
 }
 
 /// The hook `scrozz-ui` runs while the overlay window is being created.
@@ -146,25 +205,28 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
 /// pins the arm this reaches for.
 #[must_use]
 pub fn hook() -> scrozz_ui::PanelHook {
-    hook_with_surface(NativeSurfaceSlot::default())
+    hook_with_controller(BehaviorController::default())
 }
 
 /// The panel hook while retaining the view for native drag-out.
 #[must_use]
 pub fn hook_with_surface(surface: NativeSurfaceSlot) -> scrozz_ui::PanelHook {
-    hook_configured(surface, true)
+    hook_with_controller(BehaviorController::with_surface(surface))
+}
+
+/// The creation hook plus a handle for later card/selector behavior changes.
+#[must_use]
+pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelHook {
+    hook_configured(controller, true)
 }
 
 /// Retains the native view without converting its window into a panel.
-///
-/// This keeps native drag-out available when panel conversion is disabled for
-/// diagnostics.
 #[must_use]
-pub fn hook_without_conversion(surface: NativeSurfaceSlot) -> scrozz_ui::PanelHook {
-    hook_configured(surface, false)
+pub fn hook_without_conversion(controller: BehaviorController) -> scrozz_ui::PanelHook {
+    hook_configured(controller, false)
 }
 
-fn hook_configured(surface: NativeSurfaceSlot, convert: bool) -> scrozz_ui::PanelHook {
+fn hook_configured(controller: BehaviorController, convert: bool) -> scrozz_ui::PanelHook {
     Box::new(move |cc: &eframe::CreationContext<'_>| {
         let handle = match cc.window_handle() {
             Ok(handle) => handle,
@@ -187,17 +249,24 @@ fn hook_configured(surface: NativeSurfaceSlot, convert: bool) -> scrozz_ui::Pane
         #[cfg(target_os = "macos")]
         {
             let view = appkit.ns_view.as_ptr();
-            surface.remember(view);
-            if convert {
-                unsafe { convert_ns_view(view) }
-            } else {
+            controller.surface.remember(view);
+            if !convert {
                 PanelReport::unsupported("the panel conversion is disabled")
+            } else {
+                let (report, overlay) =
+                    // SAFETY: the handle borrow keeps the NSView alive for adoption.
+                    unsafe { convert_and_retain_ns_view(view) };
+                if let Some(overlay) = overlay {
+                    controller.install(overlay);
+                }
+                report
             }
         }
 
         #[cfg(not(target_os = "macos"))]
         {
             let _ = handle;
+            let _ = controller;
             PanelReport::unsupported(
                 "only the macOS overlay backend is implemented so far, so the \
                  window keeps its native activation behaviour",

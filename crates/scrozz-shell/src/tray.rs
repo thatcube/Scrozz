@@ -19,9 +19,14 @@
 //! A shipped `.app` should *also* set `LSUIElement` in its `Info.plist`; the
 //! runtime call covers `cargo run`, the CLI and tests, where there is no bundle.
 
-use scrozz_core::{Error, Result};
+use scrozz_core::{Error, Result, SelectionMode};
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+use crate::{
+    hotkey::{DisplayServer, Session},
+    selection::{SelectionIntegration, resolve_selection},
+};
 
 // ---------------------------------------------------------------------------
 // The menu model
@@ -33,12 +38,16 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 /// reachable only by hotkey or CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrayAction {
+    /// Open the selector with every still-capture mode available.
+    CaptureAllInOne,
     /// Drag out a region and capture it.
     CaptureRegion,
     /// Pick a window and capture it.
     CaptureWindow,
     /// Capture the display under the pointer.
     CaptureFullscreen,
+    /// Capture every connected display.
+    CaptureAllDisplays,
     /// Capture a scrolling page on the display under the pointer.
     CaptureScrolling,
     /// Start recording; becomes "Stop Recording" while recording runs.
@@ -57,10 +66,12 @@ pub enum TrayAction {
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
+        Self::CaptureAllInOne,
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
+        Self::CaptureAllDisplays,
         Self::CaptureScrolling,
         Self::ToggleRecording,
         Self::RestoreRecent,
@@ -78,9 +89,11 @@ impl TrayAction {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::CaptureAllInOne => "capture.all-in-one",
             Self::CaptureRegion => "capture.region",
             Self::CaptureWindow => "capture.window",
             Self::CaptureFullscreen => "capture.fullscreen",
+            Self::CaptureAllDisplays => "capture.all-displays",
             Self::CaptureScrolling => "capture.scrolling",
             Self::ToggleRecording => "record.toggle",
             Self::RestoreRecent => "capture.restore-recent",
@@ -95,9 +108,11 @@ impl TrayAction {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::CaptureAllInOne => "All-in-One Capture…",
             Self::CaptureRegion => "Capture Region",
             Self::CaptureWindow => "Capture Window",
             Self::CaptureFullscreen => "Capture Fullscreen",
+            Self::CaptureAllDisplays => "Capture All Displays",
             Self::CaptureScrolling => "Capture Scrolling Page",
             Self::ToggleRecording => "Start Recording",
             Self::RestoreRecent => "Restore Last Capture",
@@ -124,8 +139,11 @@ impl TrayAction {
     pub const fn is_available(self) -> bool {
         matches!(
             self,
-            Self::CaptureWindow
+            Self::CaptureAllInOne
+                | Self::CaptureRegion
+                | Self::CaptureWindow
                 | Self::CaptureFullscreen
+                | Self::CaptureAllDisplays
                 | Self::CaptureScrolling
                 | Self::RestoreRecent
                 | Self::ToggleOverlay
@@ -133,6 +151,37 @@ impl TrayAction {
                 | Self::OpenSettings
                 | Self::Quit
         )
+    }
+
+    /// Whether this row can complete in the measured desktop session.
+    #[must_use]
+    pub fn is_available_for(self, session: &Session) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        match self {
+            Self::CaptureAllInOne | Self::CaptureRegion | Self::CaptureWindow => {
+                let plan = resolve_selection(SelectionIntegration::for_session(session));
+                match self {
+                    Self::CaptureAllInOne => plan.is_available(),
+                    Self::CaptureRegion => plan.capabilities.supports(SelectionMode::Region),
+                    Self::CaptureWindow => plan.capabilities.supports(SelectionMode::Window),
+                    _ => unreachable!(),
+                }
+            }
+            Self::CaptureFullscreen => session.server != DisplayServer::Headless,
+            Self::CaptureAllDisplays => !matches!(
+                session.server,
+                DisplayServer::Wayland | DisplayServer::Headless
+            ),
+            Self::CaptureScrolling => session.server != DisplayServer::Headless,
+            Self::RestoreRecent
+            | Self::ToggleOverlay
+            | Self::OpenHistory
+            | Self::OpenSettings
+            | Self::Quit => true,
+            Self::ToggleRecording => false,
+        }
     }
 }
 
@@ -153,9 +202,11 @@ pub enum TrayEntry {
 #[must_use]
 pub const fn menu_model() -> &'static [TrayEntry] {
     &[
+        TrayEntry::Item(TrayAction::CaptureAllInOne),
         TrayEntry::Item(TrayAction::CaptureRegion),
         TrayEntry::Item(TrayAction::CaptureWindow),
         TrayEntry::Item(TrayAction::CaptureFullscreen),
+        TrayEntry::Item(TrayAction::CaptureAllDisplays),
         TrayEntry::Item(TrayAction::CaptureScrolling),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::ToggleRecording),
@@ -288,6 +339,23 @@ impl Tray {
     ///
     /// As [`Tray::new`].
     pub fn with_tooltip(tooltip: &str) -> Result<Self> {
+        let session = Session::detect();
+        Self::with_tooltip_and_availability(tooltip, |action| action.is_available_for(&session))
+    }
+
+    /// Creates the tray item using application-measured action readiness.
+    ///
+    /// This lets the app combine the shell's session facts with backend and
+    /// selector readiness, so a visible row is never enabled merely because the
+    /// desktop protocol could support it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tray::new`].
+    pub fn with_tooltip_and_availability(
+        tooltip: &str,
+        mut is_available: impl FnMut(TrayAction) -> bool,
+    ) -> Result<Self> {
         let menu = Menu::new();
         let mut record_item = None;
 
@@ -298,8 +366,12 @@ impl Tray {
                     append(&menu, &separator)?;
                 }
                 TrayEntry::Item(action) => {
-                    let item =
-                        MenuItem::with_id(action.id(), action.label(), action.is_available(), None);
+                    let item = MenuItem::with_id(
+                        action.id(),
+                        action.label(),
+                        action.is_available() && is_available(action),
+                        None,
+                    );
                     append(&menu, &item)?;
                     if action == TrayAction::ToggleRecording {
                         record_item = Some(item);

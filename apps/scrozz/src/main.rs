@@ -51,6 +51,7 @@ mod onboarding;
 mod output;
 mod platform;
 mod report;
+mod selection_store;
 mod settings;
 mod settings_hotkeys;
 mod settings_runtime;

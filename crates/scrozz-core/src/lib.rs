@@ -58,5 +58,10 @@ pub use scroll::{
     ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
     ScrollSynthesis,
 };
-pub use selection::{ShadowSupport, SourceApp, WindowPickingCapability, WindowSelection};
+pub use selection::{
+    AspectLock, DEFAULT_MAGNIFIER_ZOOM, MIN_SELECTION, RegionSelector, SelectionCapabilities,
+    SelectionHost, SelectionMode, SelectionOptions, SelectionOutcome, SelectionSource,
+    SessionFacts, ShadowSupport, SizeConstraint, SourceApp, WindowPickingCapability,
+    WindowSelection, host_for,
+};
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};

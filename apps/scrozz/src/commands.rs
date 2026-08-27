@@ -23,8 +23,8 @@ use clap::Parser as _;
 use scrozz_annotate::{Renderer as _, SkiaRenderer};
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display,
-    Error as CoreError, Provenance, ScrollGesture, SourceApp, TargetEnumerator, WindowId,
-    WindowSelection,
+    Error as CoreError, Provenance, ScrollGesture, SelectionOptions, SelectionOutcome, SourceApp,
+    TargetEnumerator,
 };
 use scrozz_export::{Clipboard, Encoder, FrameEncoder, ImageFormat, NamingContext};
 use scrozz_ocr::Ocr as _;
@@ -51,6 +51,7 @@ use crate::{
         SystemCommand, TargetSpec, UpdateCommand, UrlCommand,
     },
     fault::{CliError, CliResult},
+    gui::selection::CaptureSelector,
     hotkey_config, ipc,
     json::Json,
     output::CaptureOutput,
@@ -69,8 +70,24 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
+    dispatch_inner(command, None)
+}
+
+/// Runs a command with an existing-loop selector supplied by the GUI.
+///
+/// Forwarded interactive captures use this entry point from a worker thread, so
+/// the synchronous selector contract can wait while the main eframe loop paints
+/// and handles input.
+pub fn dispatch_with_selector(
+    command: &Command,
+    selector: &dyn CaptureSelector,
+) -> CliResult<Report> {
+    dispatch_inner(command, Some(selector))
+}
+
+fn dispatch_inner(command: &Command, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args),
+        Command::Capture(args) => capture(args, selector),
         Command::Record(args) => record(args),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -89,14 +106,18 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 // capture
 // ---------------------------------------------------------------------------
 
-fn capture(args: &CaptureArgs) -> CliResult<Report> {
+fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
     let output = CaptureOutput::load()?;
-    capture_with_output(args, &output)
+    capture_with_output(args, &output, selector)
 }
 
-fn capture_with_output(args: &CaptureArgs, output: &CaptureOutput) -> CliResult<Report> {
+fn capture_with_output(
+    args: &CaptureArgs,
+    output: &CaptureOutput,
+    selector: Option<&dyn CaptureSelector>,
+) -> CliResult<Report> {
     args.validate()?;
-    let target = args.target_spec()?;
+    let requested_target = args.target_spec()?;
     let mut sinks = args.sinks();
     if output.copy_to_clipboard() && !sinks.contains(&Sink::Clipboard) {
         sinks.push(Sink::Clipboard);
@@ -107,12 +128,19 @@ fn capture_with_output(args: &CaptureArgs, output: &CaptureOutput) -> CliResult<
     let quality = args.quality.unwrap_or(output.quality());
     let cursor = args.cursor || output.include_cursor();
     let window_shadow = !args.no_window_shadow && output.include_window_shadow();
+    let selection = args.selection_options(None)?;
 
     let plan = Json::obj([
-        ("target", target_json(&target)),
+        ("target", target_json(&requested_target)),
         (
             "interactive",
-            Json::Bool(matches!(target, TargetSpec::Interactive(_))),
+            Json::Bool(matches!(requested_target, TargetSpec::Interactive(_))),
+        ),
+        (
+            "selection",
+            Json::opt(selection.as_ref(), |options| {
+                selection_json(options, args.retake)
+            }),
         ),
         ("cursor", Json::Bool(cursor)),
         ("window_shadow", Json::Bool(window_shadow)),
@@ -130,16 +158,51 @@ fn capture_with_output(args: &CaptureArgs, output: &CaptureOutput) -> CliResult<
     if args.dry_run {
         return Ok(Report::new(
             Json::obj([("dry_run", Json::Bool(true)), ("plan", plan)]),
-            describe_plan("Would capture", &target, &sinks),
+            describe_plan("Would capture", &requested_target, &sinks),
         ));
     }
+
+    // Check before interactive preparation: freezing or magnifying the desktop
+    // reaches the capture backend too, and must obey the same unstable-backend
+    // policy as the final frame.
+    platform::ensure_capture_backend_ready()?;
 
     // The delay is deliberately *not* honoured before the backend check. Making
     // a user wait five seconds to be told the feature is unimplemented is a
     // small cruelty that costs nothing to avoid.
     let backend: Arc<dyn CaptureBackend> = Arc::from(platform::capture_backend()?);
+    let mut lifecycle = SelectorLifecycle::new(selector);
+    let scrolling = matches!(requested_target, TargetSpec::Scrolling(_));
+    let (target, selection_outcome, frozen_capture) = match requested_target {
+        TargetSpec::Interactive(_) => {
+            let remembered = if args.retake {
+                let remembered = crate::selection_store::RememberedRegionStore::default_location()?
+                    .load()?
+                    .ok_or_else(|| {
+                        CliError::usage(
+                            "--retake needs a previous region, but no region has been captured yet",
+                        )
+                    })?;
+                let displays = backend.displays()?;
+                Some((remembered.rect, remembered.display_for(&displays)))
+            } else {
+                None
+            };
+            let options = args
+                .selection_options(remembered)?
+                .expect("an interactive target has selection options");
+            let (outcome, frozen) = select_target(&options, args, selector)?;
+            (outcome.target.clone(), Some(outcome), frozen)
+        }
+        concrete => (
+            concrete_capture_target(&concrete, backend.as_ref())?,
+            None,
+            None,
+        ),
+    };
+
     let request = CaptureRequest {
-        target: capture_target(&target, Arc::clone(&backend))?,
+        target,
         cursor: if cursor {
             CursorMode::Visible
         } else {
@@ -148,15 +211,33 @@ fn capture_with_output(args: &CaptureArgs, output: &CaptureOutput) -> CliResult<
         include_window_shadow: window_shadow,
     };
 
-    if let Some(secs) = args.delay {
+    if selection_outcome.is_none()
+        && let Some(secs) = args.delay
+    {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     }
+    if selection_outcome.is_none()
+        && let Some(selector) = selector
+    {
+        selector.begin_capture()?;
+    }
 
-    let capture = if matches!(target, TargetSpec::Scrolling(_)) {
+    let capture = if scrolling {
         scrolling_capture(backend.as_ref(), request)?
     } else {
-        backend.capture(&request)?
+        match frozen_capture {
+            Some(capture) => capture,
+            None => crate::gui::selection::capture_selected(
+                backend.as_ref(),
+                &request,
+                selection_outcome.as_ref(),
+            )?,
+        }
     };
+    lifecycle.finish();
+    if let Some(outcome) = selection_outcome.as_ref() {
+        remember_selection(outcome, backend.as_ref());
+    }
     let frame = &capture.frame;
 
     let bytes = output
@@ -197,6 +278,10 @@ fn capture_with_output(args: &CaptureArgs, output: &CaptureOutput) -> CliResult<
 
     let data = Json::obj([
         ("plan", plan),
+        (
+            "selection_result",
+            Json::opt(selection_outcome.as_ref(), selection_outcome_json),
+        ),
         ("width", Json::Int(i64::from(frame.width()))),
         ("height", Json::Int(i64::from(frame.height()))),
         ("scale", Json::Float(frame.scale.get())),
@@ -244,54 +329,135 @@ const fn format_slug(format: ImageFormat) -> &'static str {
     }
 }
 
-/// Turns a resolved [`TargetSpec`] into the core request type.
-///
-/// The interactive modes have no representation here on purpose: choosing a
-/// target on screen is the overlay's job, and it hands back a concrete target.
-/// Modelling "the user has not chosen yet" as a [`CaptureTarget`] would push
-/// that uncertainty into every backend.
-fn capture_target(spec: &TargetSpec, backend: Arc<dyn CaptureBackend>) -> CliResult<CaptureTarget> {
-    match spec {
-        TargetSpec::Interactive(InteractiveMode::Window) => interactive_window_target(backend),
-        TargetSpec::Interactive(InteractiveMode::Region) => Err(CliError::not_implemented(
-            "choosing a region on screen",
-            "scrozz-ui (the region selection overlay)",
-        )),
-        TargetSpec::Interactive(InteractiveMode::Display) => Err(CliError::not_implemented(
-            "choosing a display on screen",
-            "scrozz-ui (the display selection overlay)",
-        )),
-        _ => concrete_capture_target(spec, backend.as_ref()),
+struct SelectorLifecycle<'a> {
+    selector: Option<&'a dyn CaptureSelector>,
+    active: bool,
+}
+
+impl<'a> SelectorLifecycle<'a> {
+    fn new(selector: Option<&'a dyn CaptureSelector>) -> Self {
+        Self {
+            selector,
+            active: selector.is_some(),
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.active {
+            if let Some(selector) = self.selector {
+                selector.capture_finished();
+            }
+            self.active = false;
+        }
     }
 }
 
-fn interactive_window_target(backend: Arc<dyn CaptureBackend>) -> CliResult<CaptureTarget> {
-    match backend.window_selection() {
-        WindowSelection::InProcess => {
-            let windows = backend.windows()?;
-            let displays = backend.displays()?;
-            let refresh_backend = Arc::clone(&backend);
-            let refresh = Arc::new(move || refresh_backend.windows());
-            match scrozz_ui::picker::pick_window(windows, displays, refresh)? {
-                scrozz_ui::picker::Outcome::Selected(id) => Ok(CaptureTarget::Window(id)),
-                scrozz_ui::picker::Outcome::Cancelled => Err(CliError::Core(CoreError::Cancelled)),
-                scrozz_ui::picker::Outcome::Vanished(id) => {
-                    Err(CliError::Core(CoreError::TargetGone(id.0)))
-                }
-            }
-        }
-        WindowSelection::PortalPicker { .. } => {
-            // The identifier is intentionally advisory. Wayland cannot disclose
-            // one; the portal asks the user and returns only the selected pixels.
-            Ok(CaptureTarget::Window(WindowId(
-                "xdg-desktop-portal-picker".to_owned(),
-            )))
-        }
-        WindowSelection::Unavailable { why } => Err(CliError::Core(CoreError::Unsupported {
-            what: "choosing a window".to_owned(),
-            why,
-        })),
+impl Drop for SelectorLifecycle<'_> {
+    fn drop(&mut self) {
+        self.finish();
     }
+}
+
+fn select_target(
+    options: &SelectionOptions,
+    args: &CaptureArgs,
+    selector: Option<&dyn CaptureSelector>,
+) -> CliResult<(SelectionOutcome, Option<Capture>)> {
+    let cursor = if args.cursor {
+        CursorMode::Visible
+    } else {
+        CursorMode::Hidden
+    };
+    if let Some(selector) = selector {
+        let capabilities = selector.capabilities();
+        let downgrades = capabilities.downgrades(options);
+        if (args.fixed_size.is_some() && !capabilities.exact_size)
+            || (args.aspect.is_some() && !capabilities.aspect_lock)
+            || (args.retake && !capabilities.remembered_region)
+        {
+            return Err(CliError::Core(CoreError::Unsupported {
+                what: "the requested interactive selection controls".to_owned(),
+                why: format!(
+                    "the {} selector cannot provide {}",
+                    selector.name(),
+                    downgrades.join(", ")
+                ),
+            }));
+        }
+        if !downgrades.is_empty() {
+            tracing::warn!(
+                selector = selector.name(),
+                unavailable = %downgrades.join(", "),
+                "the platform selector cannot draw every requested aid"
+            );
+        }
+        let outcome = selector.select_for_capture(&capabilities.honour(options), cursor)?;
+        let request = CaptureRequest {
+            target: outcome.target.clone(),
+            cursor,
+            include_window_shadow: !args.no_window_shadow,
+        };
+        let frozen = selector.take_frozen_capture(&request);
+        return Ok((outcome, frozen));
+    }
+
+    Ok(crate::gui::select_once(
+        options,
+        cursor,
+        !args.no_window_shadow,
+    )?)
+}
+
+fn remember_selection(outcome: &SelectionOutcome, backend: &dyn scrozz_core::CaptureBackend) {
+    if outcome.mode != scrozz_core::SelectionMode::Region {
+        return;
+    }
+    let Some(rect) = outcome.rect else {
+        tracing::warn!("a region selector returned no rectangle, so it cannot be remembered");
+        return;
+    };
+    let displays = match backend.displays() {
+        Ok(displays) => displays,
+        Err(error) => {
+            tracing::warn!("could not fingerprint the selected display: {error}");
+            Vec::new()
+        }
+    };
+    let display = outcome
+        .display
+        .as_ref()
+        .and_then(|id| displays.iter().find(|display| display.id == *id));
+    let remembered = crate::selection_store::RememberedRegion::new(rect, display);
+    if let Err(error) = crate::selection_store::RememberedRegionStore::default_location()
+        .and_then(|store| store.save(remembered))
+    {
+        tracing::warn!("the capture succeeded but its region could not be remembered: {error}");
+    }
+}
+
+fn selection_outcome_json(outcome: &SelectionOutcome) -> Json {
+    Json::obj([
+        ("mode", Json::str(outcome.mode.slug())),
+        ("source", Json::str(outcome.source.slug())),
+        (
+            "rect",
+            Json::opt(outcome.rect, |rect| {
+                Json::obj([
+                    ("x", Json::Float(rect.origin.x)),
+                    ("y", Json::Float(rect.origin.y)),
+                    ("width", Json::Float(rect.size.width)),
+                    ("height", Json::Float(rect.size.height)),
+                ])
+            }),
+        ),
+        (
+            "display",
+            Json::opt(outcome.display.as_ref(), |display| {
+                Json::str(display.0.as_str())
+            }),
+        ),
+        ("scale", Json::Float(outcome.scale.get())),
+    ])
 }
 
 fn concrete_capture_target(
@@ -514,16 +680,17 @@ fn list(what: ListWhat) -> CliResult<Report> {
         }
         ListWhat::Windows => {
             // D8: on Wayland this is not a missing feature, it is a missing
-            // protocol. Saying so precisely — and naming the alternative that
-            // does work — is the difference between a documented boundary and an
-            // app that looks broken.
+            // protocol. Do not claim that the RegionSelector path can stand in
+            // for the portal-owned capture picker: the portal does not return a
+            // window id or desktop geometry.
             if is_wayland() {
                 return Err(CliError::Core(CoreError::Unsupported {
                     what: "listing windows".to_string(),
                     why: "Wayland has no window enumeration protocol: a client \
-                          cannot see other clients' windows, by design. Use \
-                          `scrozz capture --interactive window`, which asks the \
-                          compositor's own picker to choose one."
+                          cannot see other clients' windows, by design. Capture \
+                          a display instead; portal-owned window capture and \
+                          positioned all-display composition are not yet connected \
+                          to this command."
                         .to_string(),
                 }));
             }
@@ -1759,7 +1926,32 @@ pub const fn interactive_slug(mode: InteractiveMode) -> &'static str {
         InteractiveMode::Region => "region",
         InteractiveMode::Window => "window",
         InteractiveMode::Display => "display",
+        InteractiveMode::AllInOne => "all-in-one",
     }
+}
+
+fn selection_json(options: &SelectionOptions, retake: bool) -> Json {
+    Json::obj([
+        ("initial_mode", Json::str(options.mode.slug())),
+        ("hud", Json::Bool(options.hud)),
+        (
+            "fixed_size",
+            Json::opt(options.constraint.exact, |size| {
+                Json::obj([
+                    ("width", Json::Float(size.width)),
+                    ("height", Json::Float(size.height)),
+                ])
+            }),
+        ),
+        (
+            "aspect",
+            Json::opt(options.constraint.aspect.value(), Json::Float),
+        ),
+        ("freeze", Json::Bool(options.freeze)),
+        ("retake", Json::Bool(retake)),
+        ("magnifier", Json::Bool(options.magnifier)),
+        ("crosshair", Json::Bool(options.crosshair)),
+    ])
 }
 
 fn sink_json(sink: &Sink) -> Json {
@@ -1861,7 +2053,7 @@ mod tests {
         cli.validate()?;
         let command = cli.command.clone().expect("should have a command");
         match &command {
-            Command::Capture(args) => capture_with_output(args, &default_capture_output()),
+            Command::Capture(args) => capture_with_output(args, &default_capture_output(), None),
             _ => dispatch(&command),
         }
     }
@@ -2230,7 +2422,7 @@ mod tests {
             },
             window_shadow: Some(false),
             provenance: scrozz_core::Provenance::Window,
-            target: CaptureTarget::Window(WindowId("7".into())),
+            target: CaptureTarget::Window(scrozz_core::WindowId("7".into())),
             frame: scrozz_store::FrameHeader {
                 size: scrozz_core::PhysicalSize::new(1200.0, 800.0),
                 stride: 4800,
@@ -2527,8 +2719,10 @@ mod tests {
         assert_eq!(err.exit(), Exit::Unsupported);
         let text = err.to_human();
         assert!(text.contains("no window enumeration protocol"), "{text}");
-        // D8 requires the alternative, not just the refusal.
-        assert!(text.contains("--interactive window"), "{text}");
+        // D8 requires a real alternative, not a route that would need to invent
+        // a window id for the portal's opaque choice.
+        assert!(text.contains("Capture a display instead"), "{text}");
+        assert!(!text.contains("--interactive window"), "{text}");
     }
 
     #[test]

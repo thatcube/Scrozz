@@ -631,10 +631,17 @@ fn the_capture_actions_come_first_and_quit_comes_last() {
         })
         .collect();
 
-    assert_eq!(items[0], TrayAction::CaptureRegion);
-    assert_eq!(items[1], TrayAction::CaptureWindow);
-    assert_eq!(items[2], TrayAction::CaptureFullscreen);
-    assert_eq!(items[3], TrayAction::CaptureScrolling);
+    assert_eq!(
+        &items[..6],
+        &[
+            TrayAction::CaptureAllInOne,
+            TrayAction::CaptureRegion,
+            TrayAction::CaptureWindow,
+            TrayAction::CaptureFullscreen,
+            TrayAction::CaptureAllDisplays,
+            TrayAction::CaptureScrolling,
+        ]
+    );
     assert_eq!(*items.last().expect("non-empty"), TrayAction::Quit);
 }
 
@@ -669,22 +676,71 @@ fn menu_ids_are_unique_and_round_trip() {
 
 #[test]
 fn enabled_menu_items_are_never_clickable_no_ops() {
-    assert!(TrayAction::CaptureWindow.is_available());
-    assert!(TrayAction::CaptureFullscreen.is_available());
-    assert!(TrayAction::OpenSettings.is_available());
-    assert!(TrayAction::CaptureScrolling.is_available());
-    assert!(TrayAction::Quit.is_available());
-
-    for unfinished in [
+    for finished in [
+        TrayAction::CaptureAllInOne,
         TrayAction::CaptureRegion,
-        TrayAction::ToggleRecording,
+        TrayAction::CaptureWindow,
+        TrayAction::CaptureFullscreen,
+        TrayAction::CaptureAllDisplays,
+        TrayAction::CaptureScrolling,
+        TrayAction::RestoreRecent,
+        TrayAction::ToggleOverlay,
         TrayAction::OpenHistory,
+        TrayAction::OpenSettings,
+        TrayAction::Quit,
     ] {
+        assert!(
+            finished.is_available(),
+            "{finished:?} is wired end to end and must be clickable"
+        );
+    }
+
+    for unfinished in [TrayAction::ToggleRecording] {
         assert!(
             !unfinished.is_available(),
             "{unfinished:?} has no end-to-end implementation and must look \
              disabled rather than accept a click that appears to do nothing"
         );
+    }
+}
+
+#[test]
+fn wayland_menu_disables_unimplemented_selectors_and_composition() {
+    for compositor in [Compositor::Gnome, Compositor::Kde, Compositor::Sway] {
+        let session = Session {
+            server: DisplayServer::Wayland,
+            compositor,
+            desktop: String::new(),
+        };
+        for unavailable in [
+            TrayAction::CaptureAllInOne,
+            TrayAction::CaptureRegion,
+            TrayAction::CaptureWindow,
+            TrayAction::CaptureAllDisplays,
+        ] {
+            assert!(!unavailable.is_available_for(&session));
+        }
+        assert!(TrayAction::CaptureFullscreen.is_available_for(&session));
+        assert!(TrayAction::Quit.is_available_for(&session));
+    }
+}
+
+#[test]
+fn native_menu_keeps_every_implemented_capture_action_enabled() {
+    let session = Session {
+        server: DisplayServer::Windows,
+        compositor: Compositor::Other,
+        desktop: String::new(),
+    };
+    for available in [
+        TrayAction::CaptureAllInOne,
+        TrayAction::CaptureRegion,
+        TrayAction::CaptureWindow,
+        TrayAction::CaptureFullscreen,
+        TrayAction::CaptureAllDisplays,
+        TrayAction::Quit,
+    ] {
+        assert!(available.is_available_for(&session));
     }
 }
 

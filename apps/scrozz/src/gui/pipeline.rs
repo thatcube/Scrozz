@@ -28,10 +28,10 @@
 //! back when the clipboard asks.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     thread::JoinHandle,
@@ -40,9 +40,8 @@ use std::{
 
 use scrozz_annotate::{Document, Renderer, SkiaRenderer};
 use scrozz_core::{
-    Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display,
-    Error as CoreError, LogicalPoint, LogicalRect, Provenance, ScaleFactor, Window, WindowId,
-    WindowSelection,
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, LogicalPoint,
+    LogicalRect, Provenance, ScaleFactor, SelectionMode, SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, NamingContext, SystemClipboard};
 use scrozz_shell::{ByteSource, DragPayload, DragPreview, byte_source};
@@ -58,6 +57,7 @@ use crate::{
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
+        selection::CaptureSelector,
     },
     output::CaptureOutput,
     platform,
@@ -133,15 +133,6 @@ pub enum Job {
         /// main thread can correlate the answer with the request.
         card: CardId,
     },
-    /// Re-enumerate and capture the window focused in the in-process picker.
-    CommitWindow {
-        /// Picker session.
-        card: CardId,
-        /// Window focused when the user committed.
-        window: WindowId,
-    },
-    /// Close an in-process picker and release its backend.
-    CancelWindow(CardId),
     /// Put a card's capture on the clipboard.
     Copy(CardId),
     /// Write a card's capture to the configured folder.
@@ -222,17 +213,6 @@ pub enum Outcome {
     },
     /// A capture succeeded and is ready to show.
     Ready(Box<Card>),
-    /// The worker prepared an in-process picker snapshot.
-    PickWindow {
-        /// Picker session.
-        card: CardId,
-        /// Front-most-first selectable windows.
-        windows: Vec<Window>,
-        /// Display layout used for highlighting and mixed-DPI scale resolution.
-        displays: Vec<Display>,
-        /// Why this is a refreshed snapshot, if the previous target vanished.
-        notice: Option<String>,
-    },
     /// A stored capture was rebuilt as a live card.
     Restored(Box<Card>),
     /// A capture failed. The main thread says why and shows nothing.
@@ -326,7 +306,6 @@ pub struct Pipeline {
     jobs: Sender<Job>,
     history_queries: Sender<HistoryQuery>,
     outcomes: Receiver<Outcome>,
-    cancellations: Arc<Mutex<HashSet<CardId>>>,
     stopped: Receiver<()>,
     worker: Option<JoinHandle<()>>,
     history_worker: Option<JoinHandle<()>>,
@@ -349,8 +328,8 @@ impl Pipeline {
     /// that will not open is *not* an error here: it is a degradation the worker
     /// reports and continues past, because a capture the user can see and copy
     /// is worth more than a capture refused because history was unavailable.
-    pub fn start() -> CliResult<Self> {
-        Self::start_with_retention(RetentionPolicy::default())
+    pub fn start(selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
+        Self::start_with_retention(selector, RetentionPolicy::default())
     }
 
     /// Starts the worker with the source-image policy loaded from settings.
@@ -358,13 +337,14 @@ impl Pipeline {
     /// # Errors
     ///
     /// Returns [`CliError::Core`] under the same conditions as [`Self::start`].
-    pub fn start_with_retention(retention_policy: RetentionPolicy) -> CliResult<Self> {
+    pub fn start_with_retention(
+        selector: Arc<dyn CaptureSelector>,
+        retention_policy: RetentionPolicy,
+    ) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (history_queries, history_rx) = channel();
         let (outcome_tx, outcomes) = channel();
         let (stopped_tx, stopped) = channel();
-        let cancellations = Arc::new(Mutex::new(HashSet::new()));
-        let worker_cancellations = Arc::clone(&cancellations);
         let cancellation = AtomicCancellation::default();
         let worker_cancellation = cancellation.clone();
         let history_outcomes = outcome_tx.clone();
@@ -372,13 +352,8 @@ impl Pipeline {
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
-                Worker::new(
-                    outcome_tx,
-                    worker_cancellations,
-                    worker_cancellation,
-                    retention_policy,
-                )
-                .run(&job_rx);
+                Worker::new(outcome_tx, selector, worker_cancellation, retention_policy)
+                    .run(&job_rx);
                 let _ = stopped_tx.send(());
             })
             .map_err(|err| {
@@ -404,7 +379,6 @@ impl Pipeline {
             jobs,
             history_queries,
             outcomes,
-            cancellations,
             stopped,
             worker: Some(worker),
             history_worker: Some(history_worker),
@@ -426,25 +400,6 @@ impl Pipeline {
             self.cancellation.reset();
         }
         self.jobs.send(job).is_ok()
-    }
-
-    /// Cancels a window-selection card immediately, even if its portal call is
-    /// currently blocking the worker.
-    pub fn cancel_window(&self, card: CardId) -> bool {
-        let Ok(mut cancellations) = self.cancellations.lock() else {
-            return false;
-        };
-        cancellations.insert(card);
-        drop(cancellations);
-        self.jobs.send(Job::CancelWindow(card)).is_ok()
-    }
-
-    /// Whether a window-selection card was cancelled by the UI.
-    #[must_use]
-    pub fn is_window_cancelled(&self, card: CardId) -> bool {
-        self.cancellations
-            .lock()
-            .map_or(true, |cancellations| cancellations.contains(&card))
     }
 
     /// Replaces the live policy and asks the worker to enforce it immediately.
@@ -550,20 +505,46 @@ struct Cached {
 
 struct Worker {
     outcomes: Sender<Outcome>,
+    selector: Arc<dyn CaptureSelector>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
-    window_pickers: HashMap<CardId, Box<dyn CaptureBackend>>,
-    cancellations: Arc<Mutex<HashSet<CardId>>>,
     cancellation: AtomicCancellation,
     retention_policy: RetentionPolicy,
     history_ids: HashMap<CardId, CaptureId>,
     saved: HashMap<CardId, PathBuf>,
 }
 
+struct CaptureLifecycle {
+    selector: Arc<dyn CaptureSelector>,
+    active: bool,
+}
+
+impl CaptureLifecycle {
+    fn new(selector: Arc<dyn CaptureSelector>) -> Self {
+        Self {
+            selector,
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.active {
+            self.selector.capture_finished();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for CaptureLifecycle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl Worker {
     fn new(
         outcomes: Sender<Outcome>,
-        cancellations: Arc<Mutex<HashSet<CardId>>>,
+        selector: Arc<dyn CaptureSelector>,
         cancellation: AtomicCancellation,
         retention_policy: RetentionPolicy,
     ) -> Self {
@@ -585,10 +566,9 @@ impl Worker {
 
         Self {
             outcomes,
+            selector,
             store,
             cache: HashMap::new(),
-            window_pickers: HashMap::new(),
-            cancellations,
             cancellation,
             retention_policy,
             history_ids: HashMap::new(),
@@ -603,11 +583,6 @@ impl Worker {
         while let Ok(job) = jobs.recv() {
             match job {
                 Job::Capture { kind, card } => self.capture(kind, card),
-                Job::CommitWindow { card, window } => self.commit_window(card, window),
-                Job::CancelWindow(card) => {
-                    self.window_pickers.remove(&card);
-                    self.discard_cancelled(card);
-                }
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
                 Job::Drag { card, geometry } => self.drag_card(card, geometry),
@@ -638,12 +613,19 @@ impl Worker {
     }
 
     fn capture(&mut self, kind: CaptureKind, card: CardId) {
-        if kind == CaptureKind::Window {
-            self.begin_window_capture(card);
-            return;
-        }
-
-        match self.take(kind, card) {
+        let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
+        let result = if matches!(
+            kind,
+            CaptureKind::Fullscreen | CaptureKind::AllDisplays | CaptureKind::Scrolling
+        ) {
+            self.selector
+                .begin_capture()
+                .map_err(CliError::Core)
+                .and_then(|()| self.take(kind, card, &mut lifecycle))
+        } else {
+            self.take(kind, card, &mut lifecycle)
+        };
+        match result {
             Ok(built) => {
                 let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
             }
@@ -654,38 +636,60 @@ impl Worker {
         }
     }
 
-    fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
+    fn take(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        lifecycle: &mut CaptureLifecycle,
+    ) -> CliResult<Card> {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
+        let mut selection_outcome = None;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
             CaptureKind::Fullscreen | CaptureKind::Scrolling => {
                 CaptureTarget::Display(backend.active_display()?.id)
             }
+            CaptureKind::AllDisplays => CaptureTarget::AllDisplays,
             // Choosing a region or a window is the selection overlay's job, and
             // per D8 a missing capability is explained rather than approximated.
             // Silently capturing the whole display instead would be worse than
             // refusing: the user would get a file they did not ask for.
-            CaptureKind::Region | CaptureKind::Window => {
-                return Err(CliError::not_implemented(
-                    format!("choosing a {} on screen", kind.label()),
-                    "scrozz-ui (the selection overlay); \
-                     `scrozz capture --region X,Y,W,H` takes one without it",
-                ));
+            CaptureKind::AllInOne | CaptureKind::Region | CaptureKind::Window => {
+                let options = Self::options_for(kind);
+                let capabilities = self.selector.capabilities();
+                if !capabilities.supports(options.mode) {
+                    return Err(CliError::Core(CoreError::Unsupported {
+                        what: format!("choosing a {} on screen", kind.label()),
+                        why: format!(
+                            "the {} selector does not support {} mode",
+                            self.selector.name(),
+                            options.mode.label()
+                        ),
+                    }));
+                }
+                let outcome = self
+                    .selector
+                    .select_for_capture(&capabilities.honour(&options), CursorMode::Hidden)?;
+                selection_outcome = Some(outcome.clone());
+                outcome.target
             }
         };
         let output = CaptureOutput::load()?;
 
+        let include_window_shadow = target.is_window();
         let request = CaptureRequest {
             target,
-            cursor: if output.include_cursor() {
+            cursor: if selection_outcome.is_some() {
+                CursorMode::Hidden
+            } else if output.include_cursor() {
                 CursorMode::Visible
             } else {
                 CursorMode::Hidden
             },
-            include_window_shadow: output.include_window_shadow(),
+            include_window_shadow: include_window_shadow && output.include_window_shadow(),
         };
 
         let capture = if kind == CaptureKind::Scrolling {
@@ -699,169 +703,24 @@ impl Worker {
                 },
             )?
         } else {
-            backend.capture(&request)?
+            match self.selector.take_frozen_capture(&request) {
+                Some(capture) => capture,
+                None => crate::gui::selection::capture_selected(
+                    backend.as_ref(),
+                    &request,
+                    selection_outcome.as_ref(),
+                )?,
+            }
         };
-        self.build_card(kind, card, capture, output)
-    }
-
-    fn begin_window_capture(&mut self, card: CardId) {
-        if self.is_cancelled(card) {
-            return;
-        }
-        let result = (|| -> CliResult<()> {
-            let backend = platform::capture_backend()?;
-            match backend.window_selection() {
-                WindowSelection::InProcess => {
-                    let displays = backend.displays()?;
-                    let windows = selectable_windows(backend.as_ref())?;
-                    if self.is_cancelled(card) {
-                        return Ok(());
-                    }
-                    self.window_pickers.insert(card, backend);
-                    let _ = self.outcomes.send(Outcome::PickWindow {
-                        card,
-                        windows,
-                        displays,
-                        notice: None,
-                    });
-                    Ok(())
-                }
-                WindowSelection::PortalPicker { .. } => {
-                    let output = CaptureOutput::load()?;
-                    let request = CaptureRequest {
-                        target: CaptureTarget::Window(WindowId(
-                            "xdg-desktop-portal-picker".to_owned(),
-                        )),
-                        cursor: if output.include_cursor() {
-                            CursorMode::Visible
-                        } else {
-                            CursorMode::Hidden
-                        },
-                        include_window_shadow: output.include_window_shadow(),
-                    };
-                    let capture = backend.capture(&request)?;
-                    if self.is_cancelled(card) {
-                        return Ok(());
-                    }
-                    let built = self.build_card(CaptureKind::Window, card, capture, output)?;
-                    if self.is_cancelled(card) {
-                        return Ok(());
-                    }
-                    let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
-                    Ok(())
-                }
-                WindowSelection::Unavailable { why } => {
-                    Err(CliError::Core(CoreError::Unsupported {
-                        what: "choosing a window".to_owned(),
-                        why,
-                    }))
-                }
-            }
-        })();
-
-        if let Err(error) = result
-            && !self.is_cancelled(card)
+        lifecycle.finish();
+        if let Some(outcome) = selection_outcome.as_ref()
+            && outcome.mode == SelectionMode::Region
+            && let Some(rect) = outcome.rect
+            && let Err(error) = remember_region(backend.as_ref(), rect, outcome)
         {
-            tracing::warn!(%card, "window capture failed: {error}");
-            let _ = self.outcomes.send(Outcome::Failed { card, error });
+            tracing::warn!("the capture succeeded but its region could not be remembered: {error}");
         }
-    }
-
-    fn commit_window(&mut self, card: CardId, window: WindowId) {
-        if self.is_cancelled(card) {
-            self.window_pickers.remove(&card);
-            return;
-        }
-        let result = (|| -> CliResult<(Capture, CaptureOutput)> {
-            let backend = self.window_pickers.get(&card).ok_or_else(|| {
-                CliError::Core(CoreError::InvalidRequest(format!(
-                    "{card} has no active window picker"
-                )))
-            })?;
-            let live = selectable_windows(backend.as_ref())?;
-            if !live.iter().any(|candidate| candidate.id == window) {
-                return Err(CliError::Core(CoreError::TargetGone(window.0.clone())));
-            }
-            let output = CaptureOutput::load()?;
-            let capture = backend
-                .capture(&CaptureRequest {
-                    target: CaptureTarget::Window(window.clone()),
-                    cursor: if output.include_cursor() {
-                        CursorMode::Visible
-                    } else {
-                        CursorMode::Hidden
-                    },
-                    include_window_shadow: output.include_window_shadow(),
-                })
-                .map_err(CliError::Core)?;
-            Ok((capture, output))
-        })();
-
-        if self.is_cancelled(card) {
-            self.window_pickers.remove(&card);
-            return;
-        }
-
-        match result {
-            Ok((capture, output)) => {
-                self.window_pickers.remove(&card);
-                match self.build_card(CaptureKind::Window, card, capture, output) {
-                    Ok(built) => {
-                        if !self.is_cancelled(card) {
-                            let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
-                        }
-                    }
-                    Err(error) => {
-                        if !self.is_cancelled(card) {
-                            let _ = self.outcomes.send(Outcome::Failed { card, error });
-                        }
-                    }
-                }
-            }
-            Err(CliError::Core(CoreError::TargetGone(_))) => {
-                if !self.is_cancelled(card) {
-                    self.refresh_window_picker(
-                        card,
-                        format!("That window closed. Choose another window. ({})", window.0),
-                    );
-                }
-            }
-            Err(error) => {
-                self.window_pickers.remove(&card);
-                if !self.is_cancelled(card) {
-                    let _ = self.outcomes.send(Outcome::Failed { card, error });
-                }
-            }
-        }
-    }
-
-    fn refresh_window_picker(&mut self, card: CardId, notice: String) {
-        if self.is_cancelled(card) {
-            return;
-        }
-        let result = (|| -> CliResult<(Vec<Window>, Vec<Display>)> {
-            let backend = self.window_pickers.get(&card).ok_or_else(|| {
-                CliError::Core(CoreError::InvalidRequest(format!(
-                    "{card} has no active window picker"
-                )))
-            })?;
-            Ok((selectable_windows(backend.as_ref())?, backend.displays()?))
-        })();
-
-        match result {
-            Ok((windows, displays)) => {
-                let _ = self.outcomes.send(Outcome::PickWindow {
-                    card,
-                    windows,
-                    displays,
-                    notice: Some(notice),
-                });
-            }
-            Err(error) => {
-                self.window_pickers.remove(&card);
-                let _ = self.outcomes.send(Outcome::Failed { card, error });
-            }
-        }
+        self.build_card(kind, card, capture, output)
     }
 
     fn build_card(
@@ -871,18 +730,11 @@ impl Worker {
         capture: Capture,
         output: CaptureOutput,
     ) -> CliResult<Card> {
-        if self.is_cancelled(card) {
-            return Err(CliError::Core(CoreError::Cancelled));
-        }
         let bytes = output
             .encoder(None)
             .encode(&capture.frame, output.format())?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
-        if self.is_cancelled(card) {
-            self.discard_capture(capture_id.as_ref(), card);
-            return Err(CliError::Core(CoreError::Cancelled));
-        }
         if output.copy_to_clipboard()
             && let Err(error) = SystemClipboard::new().write_image_reporting(&capture.frame)
         {
@@ -905,6 +757,7 @@ impl Worker {
             id: card,
             capture_id,
             kind,
+            provenance: capture.provenance,
             source_width: capture.frame.width(),
             source_height: capture.frame.height(),
             scale: capture.frame.scale.get(),
@@ -934,6 +787,23 @@ impl Worker {
         Ok(built)
     }
 
+    fn options_for(kind: CaptureKind) -> SelectionOptions {
+        match kind {
+            CaptureKind::AllInOne => SelectionOptions::default(),
+            CaptureKind::Region => SelectionOptions {
+                hud: false,
+                ..SelectionOptions::for_mode(SelectionMode::Region)
+            },
+            CaptureKind::Window => SelectionOptions {
+                hud: false,
+                ..SelectionOptions::for_mode(SelectionMode::Window)
+            },
+            CaptureKind::Fullscreen | CaptureKind::AllDisplays | CaptureKind::Scrolling => {
+                unreachable!("fixed targets never ask for selector options")
+            }
+        }
+    }
+
     /// Persists a capture, or explains in the log why it was not.
     fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
         let policy = self.retention_policy.clone();
@@ -954,33 +824,6 @@ impl Worker {
                 None
             }
         }
-    }
-
-    fn discard_cancelled(&mut self, card: CardId) {
-        let Some(cached) = self.cache.remove(&card) else {
-            return;
-        };
-        let Some(capture_id) = cached.capture_id else {
-            return;
-        };
-        self.discard_capture(Some(&capture_id), card);
-    }
-
-    fn discard_capture(&mut self, capture_id: Option<&CaptureId>, card: CardId) {
-        let Some(capture_id) = capture_id else {
-            return;
-        };
-        if let Some(store) = self.store.as_mut()
-            && let Err(error) = store.delete(capture_id)
-        {
-            tracing::warn!(%card, "could not discard cancelled capture from history: {error}");
-        }
-    }
-
-    fn is_cancelled(&self, card: CardId) -> bool {
-        self.cancellations
-            .lock()
-            .map_or(true, |cancellations| cancellations.contains(&card))
     }
 
     fn copy(&mut self, card: CardId) {
@@ -1081,6 +924,7 @@ impl Worker {
                 id: card,
                 capture_id: Some(capture.clone()),
                 kind,
+                provenance: rendered.record.provenance,
                 source_width: rendered.frame.width(),
                 source_height: rendered.frame.height(),
                 scale: rendered.frame.scale.get(),
@@ -1402,12 +1246,6 @@ impl Worker {
     }
 }
 
-fn selectable_windows(backend: &dyn CaptureBackend) -> CliResult<Vec<Window>> {
-    let mut windows = backend.windows()?;
-    windows.retain(|window| !scrozz_ui::picker::is_scrozz_window(window));
-    Ok(windows)
-}
-
 struct HistoryReader {
     outcomes: Sender<Outcome>,
     store: Option<SqliteStore>,
@@ -1630,6 +1468,20 @@ fn history_image_evicted(capture: &CaptureId) -> CliError {
     )))
 }
 
+fn remember_region(
+    backend: &dyn scrozz_core::CaptureBackend,
+    rect: scrozz_core::LogicalRect,
+    outcome: &scrozz_core::SelectionOutcome,
+) -> scrozz_core::Result<()> {
+    let displays = backend.displays()?;
+    let display = outcome
+        .display
+        .as_ref()
+        .and_then(|id| displays.iter().find(|display| display.id == *id));
+    crate::selection_store::RememberedRegionStore::default_location()?
+        .save(crate::selection_store::RememberedRegion::new(rect, display))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1644,8 +1496,35 @@ mod tests {
 
     use super::*;
     use scrozz_core::{
-        ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor, SourceApp,
+        ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Provenance, RegionSelector,
+        Result as CoreResult, ScaleFactor, SelectionCapabilities, SelectionOutcome, SourceApp,
+        WindowId,
     };
+
+    struct RefusingSelector;
+
+    impl RegionSelector for RefusingSelector {
+        fn name(&self) -> &'static str {
+            "test-refusal"
+        }
+
+        fn capabilities(&self) -> SelectionCapabilities {
+            SelectionCapabilities::NONE
+        }
+
+        fn select(&self, _options: &SelectionOptions) -> CoreResult<SelectionOutcome> {
+            Err(Error::Unsupported {
+                what: "selection in a pipeline unit test".to_owned(),
+                why: "the unit test did not provide a selection".to_owned(),
+            })
+        }
+    }
+
+    impl CaptureSelector for RefusingSelector {}
+
+    fn test_selector() -> Arc<dyn CaptureSelector> {
+        Arc::new(RefusingSelector)
+    }
 
     fn test_output() -> CaptureOutput {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1671,10 +1550,9 @@ mod tests {
             dir,
             Worker {
                 outcomes,
+                selector: test_selector(),
                 store: Some(store),
                 cache: HashMap::new(),
-                window_pickers: HashMap::new(),
-                cancellations: Arc::new(Mutex::new(HashSet::new())),
                 cancellation: AtomicCancellation::default(),
                 retention_policy: RetentionPolicy::default(),
                 history_ids: HashMap::new(),
@@ -1691,10 +1569,13 @@ mod tests {
     }
 
     fn test_pipeline() -> Pipeline {
-        Pipeline::start_with_retention(RetentionPolicy {
-            max_image_bytes: u64::MAX,
-            max_image_age: scrozz_store::RetentionWindow::Forever,
-        })
+        Pipeline::start_with_retention(
+            test_selector(),
+            RetentionPolicy {
+                max_image_bytes: u64::MAX,
+                max_image_age: scrozz_store::RetentionWindow::Forever,
+            },
+        )
         .expect("the worker should start")
     }
 
@@ -1703,10 +1584,9 @@ mod tests {
         (
             Worker {
                 outcomes,
+                selector: test_selector(),
                 store,
                 cache: HashMap::new(),
-                window_pickers: HashMap::new(),
-                cancellations: Arc::new(Mutex::new(HashSet::new())),
                 cancellation: AtomicCancellation::default(),
                 retention_policy: RetentionPolicy::default(),
                 history_ids: HashMap::new(),
@@ -1848,15 +1728,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_window_card_is_visible_before_the_worker_receives_it() {
-        let mut pipeline = Pipeline::start().expect("the worker should start");
-        let card = pipeline.allocate();
-
-        assert!(pipeline.cancel_window(card));
-        assert!(pipeline.is_window_cancelled(card));
-    }
-
-    #[test]
     fn copying_a_card_that_was_never_captured_is_refused_not_ignored() {
         let pipeline = test_pipeline();
         assert!(pipeline.post(Job::Copy(CardId(404))));
@@ -1893,10 +1764,9 @@ mod tests {
         let (outcomes, _outcome_rx) = std::sync::mpsc::channel();
         let mut worker = Worker {
             outcomes,
+            selector: test_selector(),
             store: None,
             cache: HashMap::new(),
-            window_pickers: HashMap::new(),
-            cancellations: Arc::new(Mutex::new(HashSet::new())),
             cancellation: AtomicCancellation::default(),
             retention_policy: RetentionPolicy::default(),
             history_ids: HashMap::new(),
@@ -1940,41 +1810,6 @@ mod tests {
             vec![0, 0, 0, 0, 255, 0, 0, 128, 0, 0, 255, 128, 0, 255, 0, 255],
             "native transparent and partially transparent edges must survive unchanged"
         );
-    }
-
-    #[test]
-    fn a_cancelled_window_card_is_not_encoded_or_cached() {
-        let (outcomes, _outcome_rx) = std::sync::mpsc::channel();
-        let cancellations = Arc::new(Mutex::new(HashSet::from([CardId(9)])));
-        let mut worker = Worker {
-            outcomes,
-            store: None,
-            cache: HashMap::new(),
-            window_pickers: HashMap::new(),
-            cancellations,
-            cancellation: AtomicCancellation::default(),
-            retention_policy: RetentionPolicy::default(),
-            history_ids: HashMap::new(),
-            saved: HashMap::new(),
-        };
-        let capture = Capture::new(
-            Frame {
-                data: vec![0, 0, 0, 0],
-                size: PhysicalSize::new(1.0, 1.0),
-                stride: 4,
-                format: PixelFormat::BgraPremultiplied8,
-                color_space: ColorSpace::Srgb,
-                scale: ScaleFactor::new(1.0),
-            },
-            Provenance::Window,
-            CaptureTarget::Window(WindowId("42".into())),
-        );
-
-        assert!(matches!(
-            worker.build_card(CaptureKind::Window, CardId(9), capture, test_output()),
-            Err(CliError::Core(CoreError::Cancelled))
-        ));
-        assert!(!worker.cache.contains_key(&CardId(9)));
     }
 
     #[test]
@@ -2234,10 +2069,9 @@ mod tests {
         let (outcomes, _receiver) = channel();
         let mut worker = Worker {
             outcomes,
+            selector: test_selector(),
             store: Some(store),
             cache: HashMap::new(),
-            window_pickers: HashMap::new(),
-            cancellations: Arc::new(Mutex::new(HashSet::new())),
             cancellation: AtomicCancellation::default(),
             retention_policy: RetentionPolicy::default(),
             history_ids: HashMap::new(),
@@ -2277,7 +2111,8 @@ mod tests {
 
     #[test]
     fn byte_source_reaches_the_worker_and_reports_a_missing_card() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline =
+            Pipeline::start(Arc::new(RefusingSelector)).expect("the worker should start");
         let error =
             pipeline.byte_source(CardId(404))().expect_err("an unknown card has no PNG bytes");
         assert!(error.to_string().contains("404"), "{error}");

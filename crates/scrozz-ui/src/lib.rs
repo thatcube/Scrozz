@@ -111,6 +111,7 @@ pub mod onboarding_view;
 pub mod overlay_app;
 pub mod paint;
 pub mod picker;
+pub mod select;
 pub mod settings_view;
 pub mod stack;
 pub mod theme;
@@ -132,5 +133,10 @@ pub use overlay_app::{
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
 };
 pub use picker::{Highlight as WindowHighlight, Outcome as WindowPickerOutcome, WindowPicker};
+pub use select::{
+    AxisDirection, DisplayLayout, FrozenDesktop, FrozenDisplayFrame, FrozenPixel, HudEntry,
+    HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,
+    SelectionAnnouncement, SelectionDecision, SelectionScene, SelectionState, SelectionUi,
+};
 pub use settings_view::{SettingsAction, SettingsResponse};
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

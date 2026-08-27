@@ -12,27 +12,34 @@
 //! subcommand, and that the three agree. This module is where that promise is
 //! kept.
 
-use scrozz_shell::TrayAction;
+use scrozz_core::{SelectionCapabilities, SelectionMode};
+use scrozz_shell::{DisplayServer, Session, TrayAction};
 
 /// What kind of still capture was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CaptureKind {
+    /// Open the mode HUD and choose after the overlay appears.
+    AllInOne,
     /// Drag out a rectangle. Needs the selection overlay.
     Region,
     /// Pick a window. Needs the selection overlay.
     Window,
     /// The whole display under the pointer. Needs nothing.
     Fullscreen,
+    /// Every connected display. Needs nothing.
+    AllDisplays,
     /// A long image assembled while the active display scrolls.
     Scrolling,
 }
 
 impl CaptureKind {
     /// Every kind, in menu order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
+        Self::AllInOne,
         Self::Region,
         Self::Window,
         Self::Fullscreen,
+        Self::AllDisplays,
         Self::Scrolling,
     ];
 
@@ -40,9 +47,11 @@ impl CaptureKind {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::AllInOne => "capture.all-in-one",
             Self::Region => "capture.region",
             Self::Window => "capture.window",
             Self::Fullscreen => "capture.fullscreen",
+            Self::AllDisplays => "capture.all-displays",
             Self::Scrolling => "capture.scrolling",
         }
     }
@@ -54,16 +63,42 @@ impl CaptureKind {
     /// moment the capture backend exists.
     #[must_use]
     pub const fn needs_selection(self) -> bool {
-        matches!(self, Self::Region | Self::Window)
+        matches!(self, Self::AllInOne | Self::Region | Self::Window)
+    }
+
+    /// Whether this capture can complete with the measured backend and selector.
+    #[must_use]
+    pub fn is_available(
+        self,
+        capabilities: SelectionCapabilities,
+        session: &Session,
+        capture_backend_ready: bool,
+    ) -> bool {
+        if !capture_backend_ready || session.server == DisplayServer::Headless {
+            return false;
+        }
+        match self {
+            Self::AllInOne => capabilities != SelectionCapabilities::NONE,
+            Self::Region => capabilities.supports(SelectionMode::Region),
+            Self::Window => capabilities.supports(SelectionMode::Window),
+            Self::Fullscreen => true,
+            Self::AllDisplays => !matches!(
+                session.server,
+                DisplayServer::Wayland | DisplayServer::Headless
+            ),
+            Self::Scrolling => true,
+        }
     }
 
     /// A short phrase for logs and card labels.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::AllInOne => "all-in-one",
             Self::Region => "region",
             Self::Window => "window",
             Self::Fullscreen => "display",
+            Self::AllDisplays => "all displays",
             Self::Scrolling => "scrolling page",
         }
     }
@@ -99,9 +134,11 @@ impl Action {
     #[must_use]
     pub const fn from_tray(action: TrayAction) -> Self {
         match action {
+            TrayAction::CaptureAllInOne => Self::Capture(CaptureKind::AllInOne),
             TrayAction::CaptureRegion => Self::Capture(CaptureKind::Region),
             TrayAction::CaptureWindow => Self::Capture(CaptureKind::Window),
             TrayAction::CaptureFullscreen => Self::Capture(CaptureKind::Fullscreen),
+            TrayAction::CaptureAllDisplays => Self::Capture(CaptureKind::AllDisplays),
             TrayAction::CaptureScrolling => Self::Capture(CaptureKind::Scrolling),
             TrayAction::ToggleRecording => Self::ToggleRecording,
             TrayAction::RestoreRecent => Self::RestoreRecent,
@@ -148,9 +185,13 @@ impl Action {
     #[must_use]
     pub fn command_line(&self) -> String {
         match self {
+            Self::Capture(CaptureKind::AllInOne) => {
+                "scrozz capture --interactive all-in-one".to_owned()
+            }
             Self::Capture(CaptureKind::Region) => "scrozz capture --interactive".to_owned(),
             Self::Capture(CaptureKind::Window) => "scrozz capture --interactive window".to_owned(),
             Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active".to_owned(),
+            Self::Capture(CaptureKind::AllDisplays) => "scrozz capture --all-displays".to_owned(),
             Self::Capture(CaptureKind::Scrolling) => "scrozz capture --scrolling".to_owned(),
             Self::ToggleRecording => "scrozz record --toggle".to_owned(),
             Self::RestoreRecent | Self::ToggleOverlay => "scrozz gui".to_owned(),
@@ -164,6 +205,25 @@ impl Action {
     #[must_use]
     pub const fn is_quit(&self) -> bool {
         matches!(self, Self::Quit)
+    }
+
+    /// Whether this action has an end-to-end implementation in the live app.
+    #[must_use]
+    pub fn is_available(
+        self,
+        capabilities: SelectionCapabilities,
+        session: &Session,
+        capture_backend_ready: bool,
+    ) -> bool {
+        match self {
+            Self::Capture(kind) => kind.is_available(capabilities, session, capture_backend_ready),
+            Self::RestoreRecent
+            | Self::ToggleOverlay
+            | Self::OpenHistory
+            | Self::OpenSettings
+            | Self::Quit => true,
+            Self::ToggleRecording => false,
+        }
     }
 }
 
@@ -212,8 +272,40 @@ mod tests {
     fn only_the_pointing_captures_need_the_overlay() {
         assert!(CaptureKind::Region.needs_selection());
         assert!(CaptureKind::Window.needs_selection());
+        assert!(CaptureKind::AllInOne.needs_selection());
         assert!(!CaptureKind::Fullscreen.needs_selection());
+        assert!(!CaptureKind::AllDisplays.needs_selection());
         assert!(!CaptureKind::Scrolling.needs_selection());
+    }
+
+    #[test]
+    fn capture_actions_require_both_backend_and_selector_capabilities() {
+        let desktop = Session::from_env(None, None, None, Some(":0"));
+        assert!(!Action::Capture(CaptureKind::Region).is_available(
+            SelectionCapabilities::CLIENT_OVERLAY,
+            &desktop,
+            false,
+        ));
+        assert!(!Action::Capture(CaptureKind::Region).is_available(
+            SelectionCapabilities::NONE,
+            &desktop,
+            true,
+        ));
+        assert!(Action::Capture(CaptureKind::Region).is_available(
+            SelectionCapabilities::CLIENT_OVERLAY,
+            &desktop,
+            true,
+        ));
+    }
+
+    #[test]
+    fn wayland_never_advertises_unimplemented_all_display_composition() {
+        let wayland = Session::from_env(Some("GNOME"), Some("wayland-0"), None, Some(":0"));
+        assert!(!Action::Capture(CaptureKind::AllDisplays).is_available(
+            SelectionCapabilities::CLIENT_OVERLAY,
+            &wayland,
+            true,
+        ));
     }
 
     #[test]

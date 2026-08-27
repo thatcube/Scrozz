@@ -34,7 +34,7 @@ use scrozz_core::Error as CoreError;
 use scrozz_annotate::Document;
 use scrozz_shell::{
     Accelerator, Capability, DragOutcome, DragPayload, GlobalHotkeys, Hotkey, HotkeyManager,
-    KeyState, Permissions, SystemPermissions, Tray, TrayAction,
+    KeyState, Permissions, Session, SystemPermissions, Tray, TrayAction,
 };
 use scrozz_store::{CaptureId, RetentionPolicy, Timestamp};
 use scrozz_ui::history::{HistoryAction, HistoryViewModel};
@@ -46,7 +46,8 @@ use crate::{
         action::{Action, CaptureKind},
         card::{CardEvent, CardSurface},
         pipeline::{DragGeometry, DragSubject, HistoryOperation, Job, Outcome, Pipeline},
-        server::Server,
+        selection::CaptureSelector,
+        server::{Forwarder, Server},
     },
     json::Json,
     report::Report,
@@ -213,13 +214,7 @@ impl Config {
             config.deadline = Some(Duration::from_millis(ms));
         }
         if let Ok(raw) = std::env::var(AUTOCAPTURE_ENV) {
-            config.capture_on_start = match raw.as_str() {
-                "0" | "false" | "no" | "" => None,
-                "region" => Some(CaptureKind::Region),
-                "window" => Some(CaptureKind::Window),
-                "scrolling" => Some(CaptureKind::Scrolling),
-                _ => Some(CaptureKind::Fullscreen),
-            };
+            config.capture_on_start = Self::capture_on_start(&raw);
         }
         if let Ok(raw) = std::env::var(CARD_SCALE_ENV)
             && let Ok(scale) = raw.parse::<f32>()
@@ -284,6 +279,19 @@ impl Config {
         })
     }
 
+    fn capture_on_start(raw: &str) -> Option<CaptureKind> {
+        match raw {
+            "0" | "false" | "no" | "" => None,
+            "all-in-one" => Some(CaptureKind::AllInOne),
+            "region" => Some(CaptureKind::Region),
+            "window" => Some(CaptureKind::Window),
+            "1" | "fullscreen" => Some(CaptureKind::Fullscreen),
+            "all-displays" => Some(CaptureKind::AllDisplays),
+            "scrolling" => Some(CaptureKind::Scrolling),
+            _ => None,
+        }
+    }
+
     /// A configuration that touches nothing outside this process.
     ///
     /// No menu-bar item, no keyboard registration, no socket. What tests use,
@@ -335,13 +343,13 @@ pub struct App {
     tray: Option<Tray>,
     hotkeys: GlobalHotkeys,
     server: Option<Server>,
+    forwarder: Option<Forwarder>,
+    selector: Arc<dyn CaptureSelector>,
     started: Instant,
     captures: u64,
     notes: Vec<String>,
     settings_requested: bool,
     settings_revision: u64,
-    active_window_capture: Option<crate::gui::card::CardId>,
-    window_picker: Option<WindowPickerSession>,
     history: Arc<Mutex<HistoryViewModel>>,
     pending_drags: VecDeque<PendingDrag>,
     pending_editors: VecDeque<(CaptureId, Document)>,
@@ -349,14 +357,6 @@ pub struct App {
     escape_retry_at: Option<Instant>,
     overlay_hidden: bool,
     native_drag_active: bool,
-}
-
-struct WindowPickerSession {
-    card: crate::gui::card::CardId,
-    picker: scrozz_ui::picker::WindowPicker,
-    theme: scrozz_ui::Theme,
-    notice: Option<String>,
-    committing: bool,
 }
 
 /// A worker-built drag waiting for the window host to enter the native loop.
@@ -379,9 +379,20 @@ impl App {
     /// already holds. A tray that will not appear, or a hotkey the system
     /// refuses, are *recorded* and the app runs on — per D8 a missing capability
     /// is explained, not fatal.
-    pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
-        let pipeline = Pipeline::start_with_retention(config.retention_policy.clone())?;
+    pub fn new(
+        config: Config,
+        surface: Box<dyn CardSurface>,
+        selector: Arc<dyn CaptureSelector>,
+    ) -> CliResult<Self> {
+        let pipeline =
+            Pipeline::start_with_retention(Arc::clone(&selector), config.retention_policy.clone())?;
         let mut notes = Vec::new();
+        let session = Session::detect();
+        let selection_capabilities = selector.capabilities();
+        let capture_backend_ready = crate::platform::capture_backend_is_ready();
+        let action_available = |action: Action| {
+            action.is_available(selection_capabilities, &session, capture_backend_ready)
+        };
 
         let server = if config.ipc {
             // The one failure worth stopping for: another instance is live,
@@ -393,9 +404,15 @@ impl App {
         } else {
             None
         };
+        let forwarder = server
+            .as_ref()
+            .map(|_| Forwarder::start(Arc::clone(&selector)))
+            .transpose()?;
 
         let tray = if config.tray {
-            match Tray::with_tooltip("Scrozz") {
+            match Tray::with_tooltip_and_availability("Scrozz", |entry| {
+                action_available(Action::from_tray(entry))
+            }) {
                 Ok(tray) => {
                     notes.push("menu-bar item shown".to_owned());
                     Some(tray)
@@ -409,7 +426,23 @@ impl App {
             None
         };
 
-        let mut hotkeys = if config.bindings.is_empty() {
+        let available_bindings: Vec<_> = config
+            .bindings
+            .iter()
+            .filter(|(_, action)| action_available(*action))
+            .collect();
+        for (accelerator, action) in config
+            .bindings
+            .iter()
+            .filter(|(_, action)| !action_available(*action))
+        {
+            notes.push(format!(
+                "{accelerator} not bound: {} is unavailable in this session",
+                action.id()
+            ));
+        }
+
+        let mut hotkeys = if available_bindings.is_empty() {
             // Nothing to bind means nothing should touch the keyboard. The
             // detached backend does the bookkeeping without an OS registration.
             GlobalHotkeys::detached()
@@ -424,7 +457,7 @@ impl App {
         };
         hotkeys.set_command("scrozz");
 
-        for (accelerator, action) in &config.bindings {
+        for (accelerator, action) in available_bindings {
             let hotkey = Hotkey {
                 accelerator: accelerator.clone(),
             };
@@ -444,13 +477,13 @@ impl App {
             tray,
             hotkeys,
             server,
+            forwarder,
+            selector,
             started: Instant::now(),
             captures: 0,
             notes,
             settings_requested: false,
             settings_revision: 0,
-            active_window_capture: None,
-            window_picker: None,
             history: Arc::new(Mutex::new(HistoryViewModel::new(Timestamp::now()))),
             pending_drags: VecDeque::new(),
             pending_editors: VecDeque::new(),
@@ -553,33 +586,43 @@ impl App {
 
         for request in pending {
             tracing::debug!(?request, "a forwarded command arrived");
-            // The command runs to completion here, on the main thread, because
-            // it must produce byte-identical output to a local run and the
-            // command layer is synchronous. A capture is tens of milliseconds;
-            // a recording returns as soon as it has started.
-            if let Some(command) = request.serve() {
-                let settings_changed = matches!(
-                    &command,
-                    Command::Settings(args)
-                        if matches!(
-                            args.command,
-                            SettingsCommand::Set { .. } | SettingsCommand::Reset { .. }
-                        )
-                );
-                self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
-                if matches!(command, crate::cli::Command::Gui) {
-                    // A second `scrozz gui` means "show yourself", not "start
-                    // again". There is nothing to show yet, so it is a no-op
-                    // that has at least been answered rather than ignored.
-                    self.note("a second launch was answered by this instance");
-                } else {
-                    self.with_history(|history| history.refresh_from_start(Timestamp::now()));
-                }
-                if settings_changed && let Err(error) = self.reload_settings() {
-                    self.note(format!(
-                        "settings changed but could not be reloaded: {error}"
-                    ));
-                }
+            let submitted = self
+                .forwarder
+                .as_ref()
+                .is_some_and(|forwarder| forwarder.submit(request));
+            if !submitted {
+                self.note("the forwarded-command worker has gone");
+            }
+        }
+
+        let mut completed = Vec::new();
+        if let Some(forwarder) = &self.forwarder {
+            while let Some(command) = forwarder.poll() {
+                completed.push(command);
+            }
+        }
+        for command in completed.into_iter().flatten() {
+            let settings_changed = matches!(
+                &command,
+                Command::Settings(args)
+                    if matches!(
+                        args.command,
+                        SettingsCommand::Set { .. } | SettingsCommand::Reset { .. }
+                    )
+            );
+            self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+            if matches!(command, crate::cli::Command::Gui) {
+                // A second `scrozz gui` means "show yourself", not "start
+                // again". There is nothing to show yet, so it is a no-op
+                // that has at least been answered rather than ignored.
+                self.note("a second launch was answered by this instance");
+            } else {
+                self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+            }
+            if settings_changed && let Err(error) = self.reload_settings() {
+                self.note(format!(
+                    "settings changed but could not be reloaded: {error}"
+                ));
             }
         }
 
@@ -604,17 +647,10 @@ impl App {
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
-                Outcome::Ready(card) if self.pipeline.is_window_cancelled(card.id) => {
-                    self.pipeline.post(Job::Release(card.id));
-                }
                 Outcome::Progress { card, progress } => {
                     self.note(format!("{card} {}", describe_scroll_progress(&progress)));
                 }
                 Outcome::Ready(card) => {
-                    if self.active_window_capture == Some(card.id) {
-                        self.active_window_capture = None;
-                        self.window_picker = None;
-                    }
                     self.captures += 1;
                     let history_changed = card.capture_id.is_some();
                     let summary = card.summary();
@@ -641,43 +677,12 @@ impl App {
                         self.note(format!("restored {summary}"));
                     }
                 }
-                Outcome::Failed { card, .. } if self.pipeline.is_window_cancelled(card) => {}
                 Outcome::Failed {
-                    card,
+                    card: _,
                     error: CliError::Core(CoreError::Cancelled),
-                } => {
-                    if self.active_window_capture == Some(card) {
-                        self.active_window_capture = None;
-                        self.window_picker = None;
-                    }
-                }
+                } => {}
                 Outcome::Failed { card, error } => {
-                    if self.active_window_capture == Some(card) {
-                        self.active_window_capture = None;
-                        self.window_picker = None;
-                    }
                     self.note(format!("{card} failed: {error}"));
-                }
-                Outcome::PickWindow {
-                    card,
-                    windows,
-                    displays,
-                    notice,
-                } => {
-                    if self.pipeline.is_window_cancelled(card) {
-                        continue;
-                    }
-                    if self.active_window_capture == Some(card) {
-                        self.window_picker = Some(WindowPickerSession {
-                            card,
-                            picker: scrozz_ui::picker::WindowPicker::new(windows, displays),
-                            theme: scrozz_ui::Theme::dark(),
-                            notice,
-                            committing: false,
-                        });
-                    } else {
-                        self.pipeline.cancel_window(card);
-                    }
                 }
                 Outcome::Done {
                     card,
@@ -987,11 +992,6 @@ impl App {
     }
 
     fn begin_capture(&mut self, kind: CaptureKind) {
-        if kind == CaptureKind::Window && self.active_window_capture.is_some() {
-            self.note("a window picker is already open");
-            return;
-        }
-
         // D15: ask at first use, not at launch. This must happen on the main
         // thread before the capture job is posted: the missing piece that made
         // Scrozz report PermissionDenied in an invisible log without ever
@@ -1008,84 +1008,7 @@ impl App {
         let card = self.pipeline.allocate();
         if !self.pipeline.post(Job::Capture { kind, card }) {
             self.note("the capture worker has gone");
-        } else if kind == CaptureKind::Window {
-            self.active_window_capture = Some(card);
         }
-    }
-
-    /// Draws the in-process picker as a child of the GUI's existing event loop.
-    ///
-    /// Wayland never reaches this method with a picker: its trusted portal owns
-    /// selection and the worker returns the completed capture directly.
-    pub fn paint_window_picker(&mut self, root: &egui::Context) {
-        let Some(session) = self.window_picker.as_mut() else {
-            return;
-        };
-
-        #[cfg(target_os = "windows")]
-        let (intent, close_requested) = scrozz_ui::picker::interact_display_viewports(
-            root,
-            &mut session.picker,
-            &session.theme,
-            session.notice.as_deref(),
-        );
-
-        #[cfg(not(target_os = "windows"))]
-        let (intent, close_requested) = {
-            let bounds = session.picker.desktop_bounds();
-            let mut intent = scrozz_ui::picker::paint::Intent::None;
-            let mut close_requested = false;
-            root.show_viewport_immediate(
-                scrozz_ui::picker::viewport_id(),
-                scrozz_ui::picker::viewport(bounds),
-                |ctx, _class| {
-                    close_requested = ctx.input(|input| input.viewport().close_requested());
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
-                        .show(ctx, |ui| {
-                            intent = scrozz_ui::picker::paint::interact(
-                                ui,
-                                &mut session.picker,
-                                bounds.origin,
-                                &session.theme,
-                                session.notice.as_deref(),
-                            );
-                        });
-                },
-            );
-            (intent, close_requested)
-        };
-
-        if close_requested || intent == scrozz_ui::picker::paint::Intent::Cancel {
-            self.cancel_window_picker(root);
-            return;
-        }
-        if intent != scrozz_ui::picker::paint::Intent::Commit || session.committing {
-            return;
-        }
-
-        let Some(window) = session.picker.focused_id().cloned() else {
-            self.cancel_window_picker(root);
-            return;
-        };
-        session.committing = true;
-        session.notice = Some("Checking that window…".to_owned());
-        if !self.pipeline.post(Job::CommitWindow {
-            card: session.card,
-            window,
-        }) {
-            self.note("the capture worker has gone");
-            self.cancel_window_picker(root);
-        }
-    }
-
-    fn cancel_window_picker(&mut self, root: &egui::Context) {
-        if let Some(session) = self.window_picker.take() {
-            self.pipeline.cancel_window(session.card);
-            scrozz_ui::picker::close_viewports(root, session.picker.displays());
-        }
-        self.active_window_capture = None;
-        self.note("window capture cancelled");
     }
 
     fn note(&mut self, what: impl Into<String>) {
@@ -1187,10 +1110,23 @@ impl App {
     pub fn reload_settings(&mut self) -> CliResult<()> {
         let store = SettingsStore::load()?;
         let desired = Config::from_settings(&store)?;
+        let session = Session::detect();
+        let selection_capabilities = self.selector.capabilities();
+        let capture_backend_ready = crate::platform::capture_backend_is_ready();
+        let action_available = |action: Action| {
+            action.is_available(selection_capabilities, &session, capture_backend_ready)
+        };
 
         if std::env::var_os(HOTKEYS_ENV).is_none() && desired.bindings != self.config.bindings {
             self.hotkeys.unregister_all();
             for (accelerator, action) in &desired.bindings {
+                if !action_available(*action) {
+                    self.notes.push(format!(
+                        "{accelerator} not rebound: {} is unavailable in this session",
+                        action.id()
+                    ));
+                    continue;
+                }
                 let hotkey = Hotkey {
                     accelerator: accelerator.clone(),
                 };
@@ -1206,7 +1142,9 @@ impl App {
 
         if std::env::var_os(TRAY_ENV).is_none() && desired.tray != self.config.tray {
             if desired.tray {
-                match Tray::with_tooltip("Scrozz") {
+                match Tray::with_tooltip_and_availability("Scrozz", |entry| {
+                    action_available(Action::from_tray(entry))
+                }) {
                     Ok(tray) => {
                         self.notes.push("menu-bar item shown".to_owned());
                         self.tray = Some(tray);
@@ -1281,10 +1219,10 @@ impl App {
             tray.close();
         }
         self.server = None;
-        if let Some(card) = self.active_window_capture.take() {
-            self.pipeline.cancel_window(card);
+        self.selector.cancel();
+        if let Some(mut forwarder) = self.forwarder.take() {
+            forwarder.stop();
         }
-        self.window_picker = None;
         self.pipeline.stop();
     }
 
@@ -1377,11 +1315,17 @@ mod tests {
 
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
+    use crate::gui::selection::UnsupportedSelector;
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
         let handle = surface.handle();
-        let app = App::new(Config::sealed(), Box::new(surface)).expect("a sealed app must start");
+        let app = App::new(
+            Config::sealed(),
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+        )
+        .expect("a sealed app must start");
         (app, handle)
     }
 
@@ -1682,6 +1626,11 @@ mod tests {
         assert_eq!(parsed[0].0, "Ctrl+Alt+P");
         assert_eq!(parsed[0].1, Action::Capture(CaptureKind::Fullscreen));
         assert_eq!(parsed[1].1, Action::Capture(CaptureKind::Region));
+    }
+
+    #[test]
+    fn documented_startup_capture_value_means_fullscreen() {
+        assert_eq!(Config::capture_on_start("1"), Some(CaptureKind::Fullscreen));
     }
 
     #[test]
