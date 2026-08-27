@@ -271,6 +271,102 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
+  # LAYER 2b — run the artifact, then keep it.
+  #
+  # `cargo test` proves the units behave; it never runs the shipped binary. Some
+  # things only exist in a real process: resolving a per-user data directory,
+  # opening the SQLite file, binding an IPC socket, driving the GUI's event loop
+  # to a deadline. Every one of those works on the author's Mac and can be
+  # broken on Windows by a path separator, so this job runs the actual release
+  # executable on each runner before packaging it.
+  #
+  # tools/smoke.sh asserts the *documented* status for the platform rather than
+  # demanding exit 0 everywhere — Phase 0 is a tree of contracts and most
+  # commands correctly refuse to work. Anything needing a desktop session or a
+  # TCC grant skips by name and is never counted as a pass.
+  #
+  # The artifact is what makes "CI is green" testable rather than merely
+  # asserted: every commit that gets here leaves behind something installable,
+  # named for the commit that produced it. Smoke runs first, so an executable
+  # that cannot even print its own help is never published as one that can.
+  #
+  # This is not release.yml. That workflow packages at a tag, signs, notarises
+  # and opens a draft release. Nothing here reads a secret or signs anything.
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package — ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # As with `test`: one platform's packaging failure must not conceal
+      # another's.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (arm64)
+            slug: macos-arm64
+          - os: ubuntu-latest
+            name: Linux (x86_64)
+            slug: linux-x86_64
+          - os: windows-latest
+            name: Windows (x86_64)
+            slug: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-${{ matrix.os }}
+
+      # The commit actually being built. Not `github.sha`, which on a
+      # pull_request event is the ephemeral merge commit and names something
+      # that exists nowhere in the branch's history.
+      - name: Identify the commit
+        id: commit
+        run: echo "short=$(git rev-parse --short HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: |
+          if ! cargo build --release --locked -p scrozz; then
+            echo "::error title=Release build failed on ${{ matrix.name }}::The debug build in 'Test' passed, so this is release-profile specific — an optimisation-dependent overflow, or a --locked dependency resolution the lockfile does not permit."
+            exit 1
+          fi
+
+      # Before packaging, so an executable that cannot run is never published.
+      - name: Native smoke checks
+        run: |
+          if ! tools/smoke.sh; then
+            echo "::error title=Smoke checks failed on ${{ matrix.name }}::The binary built but misbehaved when run. Reproduce with 'cargo build --release -p scrozz && tools/smoke.sh'. Skips are platform boundaries and never count as failures, so this is a real defect."
+            exit 1
+          fi
+
+      - name: Package
+        run: tools/package.sh dist
+        env:
+          SCROZZ_STAMP: ${{ steps.commit.outputs.short }}
+
+      - name: Upload ${{ matrix.slug }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrozz-${{ steps.commit.outputs.short }}-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+          # Matches the golden-image artefacts: long enough to survive a
+          # weekend, short enough not to accumulate.
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # One status check to require in branch protection.
   #
   # Matrix job names contain the platform, so they change whenever the matrix
@@ -280,20 +376,22 @@ jobs:
   ci-ok:
     name: CI passed
     if: always()
-    needs: [gate, test, golden]
+    needs: [gate, test, golden, package]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Verify the required jobs succeeded
         run: |
-          echo "gate:   ${{ needs.gate.result }}"
-          echo "test:   ${{ needs.test.result }}"
-          echo "golden: ${{ needs.golden.result }}"
+          echo "gate:    ${{ needs.gate.result }}"
+          echo "test:    ${{ needs.test.result }}"
+          echo "golden:  ${{ needs.golden.result }}"
+          echo "package: ${{ needs.package.result }}"
 
           failed=0
           for pair in "gate:${{ needs.gate.result }}" \
                       "test:${{ needs.test.result }}" \
-                      "golden:${{ needs.golden.result }}"; do
+                      "golden:${{ needs.golden.result }}" \
+                      "package:${{ needs.package.result }}"; do
             name="${pair%%:*}"
             result="${pair#*:}"
             # 'skipped' is a real outcome when an upstream job failed; treat it

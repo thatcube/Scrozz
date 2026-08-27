@@ -30,3 +30,9 @@
 # Competitor UI reference lives outside the repository by design (D17).
 # This entry exists so an accidental copy is never committed.
 /reference/
+
+# Packaged artifacts. tools/package.sh and .github/workflows/release.yml both
+# assemble here; the results are large, per-commit, and reproducible from the
+# scripts, so they belong in CI artifacts rather than in history.
+/dist/
+Scrozz.app/

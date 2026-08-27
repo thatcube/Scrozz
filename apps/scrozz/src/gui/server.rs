@@ -29,10 +29,19 @@
 
 use std::path::{Path, PathBuf};
 
+// Every construction of a `CliError` in this module happens inside a
+// `cfg(unix)` body — the Windows half of each pair is an infallible stub,
+// because there is no named-pipe listener to fail yet. An unconditional import
+// is therefore an `unused_imports` error on Windows only, which `cargo check`
+// cannot catch here either: layer 1 excludes this crate from the cross targets
+// over rusqlite's bundled C. Gate the import with the code that uses it and the
+// Windows runner stays quiet without anybody silencing a lint.
+#[cfg(unix)]
+use crate::fault::CliError;
 use crate::{
     cli::{Cli, Command},
     commands,
-    fault::{CliError, CliResult},
+    fault::CliResult,
     ipc::{self, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };
@@ -207,9 +216,12 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// Returns [`CliError::Ipc`] if another instance already holds the endpoint
-    /// — not a fault but a fact the caller must act on, by forwarding rather
-    /// than starting a second menu-bar app.
+    /// Returns [`crate::fault::CliError::Ipc`] if another instance already holds
+    /// the endpoint — not a fault but a fact the caller must act on, by
+    /// forwarding rather than starting a second menu-bar app.
+    ///
+    /// Spelled by full path rather than by the short name because the `CliError`
+    /// import above is `cfg(unix)`, and this doc comment is not.
     pub fn bind() -> CliResult<Self> {
         Self::bind_at(ipc::endpoint())
     }

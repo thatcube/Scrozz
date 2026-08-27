@@ -16,9 +16,20 @@
 # when he wants signed builds, are listed in each step's comment and summarised
 # in the `checksums-and-draft` job's final output.
 #
-# Until then this workflow produces working *unsigned* binaries, which macOS
+# Until then this workflow produces working *unsigned* artefacts, which macOS
 # Gatekeeper and Windows SmartScreen will both complain about. That is the
 # correct state for a project that has not yet decided to pay for certificates.
+#
+# ---------------------------------------------------------------------------
+# macOS ships a bundle, not a binary
+# ---------------------------------------------------------------------------
+# The macOS artefact is Scrozz.app. That is a functional requirement, not a
+# packaging taste: macOS attaches a Screen Recording grant to a code identity,
+# and a bare executable has none, so the grant lands on whatever launched it
+# and never follows the binary. A screenshot tool shipped as a loose executable
+# is a screenshot tool that can never be given permission to take a screenshot.
+# The bundle is assembled by tools/make-app-bundle.sh, signed and notarised as
+# a bundle, and stapled — which is only possible for a bundle.
 name: Release
 
 on:
@@ -78,7 +89,12 @@ jobs:
           - os: macos-latest
             name: macOS (universal)
             slug: macos-universal
-            archive: tar.gz
+            # zip, not tar.gz: the macOS artefact is an .app bundle, and `ditto
+            # -c -k` is the archiver that preserves the code signature, the
+            # stapled notarisation ticket and the extended attributes a bundle
+            # carries. tar drops enough of that to make Gatekeeper reject the
+            # result on the far side.
+            archive: zip
           - os: ubuntu-latest
             name: Linux (x86_64)
             slug: linux-x86_64
@@ -140,6 +156,38 @@ jobs:
             target/x86_64-apple-darwin/release/scrozz
           lipo -info dist/scrozz
 
+      # --- macOS: the shipped artefact is a bundle, not a binary --------------
+      #
+      # This is not packaging preference, it is the difference between an app
+      # that can take a screenshot and one that cannot. macOS attaches a Screen
+      # Recording grant to a code identity; a bare executable has none, so the
+      # grant lands on whatever launched it (Terminal, usually) and does not
+      # follow the binary. Shipping `scrozz` on its own produces a download
+      # that can never be given the permission it exists to use.
+      #
+      # tools/make-app-bundle.sh is the one implementation of what a Scrozz
+      # bundle looks like — Info.plist, bundle id, usage strings, icon. It is
+      # reused here rather than reimplemented, with SCROZZ_PREBUILT_BIN so it
+      # adopts the universal binary built above instead of rebuilding host-only,
+      # and SCROZZ_SKIP_SIGN because the next step signs with a real identity.
+      - name: Assemble Scrozz.app (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          SCROZZ_PREBUILT_BIN="$PWD/dist/scrozz" \
+          SCROZZ_APP_VERSION="${{ steps.version.outputs.version }}" \
+          SCROZZ_SKIP_SIGN=1 \
+            tools/make-app-bundle.sh "$PWD/dist/Scrozz.app"
+
+          # The loose binary would otherwise ship beside the bundle as a second,
+          # capture-incapable copy of the same program. One artefact, one
+          # answer to "what do I run": the CLI is inside the bundle at
+          # Scrozz.app/Contents/MacOS/Scrozz and works exactly as before.
+          rm -f dist/scrozz
+
+          "dist/Scrozz.app/Contents/MacOS/Scrozz" --version
+          lipo -info "dist/Scrozz.app/Contents/MacOS/Scrozz"
+
       - name: Build (single target)
         if: matrix.os != 'macos-latest'
         run: |
@@ -184,15 +232,20 @@ jobs:
 
           # --options runtime is the hardened runtime; notarisation rejects
           # anything without it. --timestamp is likewise mandatory.
+          #
+          # No --deep: Apple deprecated it, and it is the wrong tool anyway.
+          # The correct order is nested code first, then the bundle. Scrozz.app
+          # has no nested code — one executable, some resources — so signing the
+          # bundle once is complete. If a helper or framework is ever added it
+          # must be signed here before this line, not by reaching for --deep.
           codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGN_IDENTITY" dist/scrozz
-          codesign --verify --strict --verbose=2 dist/scrozz
+            --sign "$MACOS_SIGN_IDENTITY" dist/Scrozz.app
+          codesign --verify --strict --verbose=2 dist/Scrozz.app
 
-          # Notarisation needs a container; a zip of the binary is enough for a
-          # bare executable. When Scrozz grows a .app bundle this should submit
-          # the bundle (or a .dmg) instead.
+          # Notarisation needs a container. ditto -c -k --keepParent is the
+          # supported way to hand a bundle to notarytool.
           echo "$MACOS_NOTARY_KEY" | base64 --decode >"$RUNNER_TEMP/notary.p8"
-          ditto -c -k --keepParent dist/scrozz "$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --keepParent dist/Scrozz.app "$RUNNER_TEMP/notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$MACOS_NOTARY_KEY_ID" \
@@ -200,14 +253,30 @@ jobs:
             --wait
           rm -f "$RUNNER_TEMP/notary.p8"
 
-          # `stapler staple` only works on bundles and disk images, not bare
-          # executables, so it is intentionally not called here. Gatekeeper
-          # verifies a bare signed binary online instead.
+          # Stapling attaches the notarisation ticket to the bundle itself, so
+          # first launch works on a machine that is offline or behind a network
+          # that blocks Apple's OCSP. This step is only possible because the
+          # artefact is a bundle; `stapler` refuses bare executables, which is
+          # why the previous shape of this workflow could not do it.
+          xcrun stapler staple dist/Scrozz.app
+          xcrun stapler validate dist/Scrozz.app
+
+          # The end-to-end assertion: would Gatekeeper actually let a stranger
+          # open this? Failing here is worth failing the release for.
+          spctl --assess --type exec --verbose=4 dist/Scrozz.app
 
       - name: Note unsigned macOS build
         if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 == ''
         run: |
-          echo "::notice title=macOS binary is unsigned::No MACOS_CERTIFICATE_P12 secret is set, so signing and notarisation were skipped. Gatekeeper will block this binary on other people's machines until a Developer ID certificate is configured."
+          set -euo pipefail
+          # The bundle was assembled with SCROZZ_SKIP_SIGN because a real
+          # identity was expected. There is none, so give it the development
+          # signature instead — an unsigned bundle is worse than an ad-hoc one:
+          # macOS has nothing at all to hang a TCC grant on, so the app cannot
+          # be granted Screen Recording even by the person who downloaded it.
+          codesign --force --sign - --identifier com.thatcube.Scrozz dist/Scrozz.app
+          codesign --verify --strict dist/Scrozz.app
+          echo "::notice title=macOS app is ad-hoc signed only::No MACOS_CERTIFICATE_P12 secret is set, so Developer ID signing and notarisation were skipped and Scrozz.app carries a development (ad-hoc) signature. Gatekeeper will block it on other people's machines, and because an ad-hoc identity is effectively the cdhash, a Screen Recording grant will not survive a rebuild. Configure the signing secrets for a release anyone else can install."
 
       # --- Windows signing (skipped unless secrets exist) ---------------------
       #
@@ -250,26 +319,84 @@ jobs:
           echo "::notice title=Windows binary is unsigned::No WINDOWS_CERTIFICATE_PFX secret is set, so signing was skipped. SmartScreen will warn on download until a code-signing certificate is configured."
 
       # --- Package ------------------------------------------------------------
+      #
+      # Capture is gated per platform, and a build from a gated platform runs
+      # but cannot take a screenshot. Publishing that under the same name as a
+      # working build is the one thing in this pipeline that could actually
+      # mislead somebody, so it is labelled — and the label is probed from the
+      # binary by tools/preview-check.sh rather than hardcoded here, so it stops
+      # applying by itself on the day a platform's gate opens.
+      - name: Label preview builds
+        id: preview
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            macOS)   PROBE="dist/Scrozz.app/Contents/MacOS/Scrozz" ;;
+            Windows) PROBE="dist/scrozz.exe" ;;
+            *)       PROBE="dist/scrozz" ;;
+          esac
+          PREVIEW="$(tools/preview-check.sh probe "$PROBE")"
+          echo "preview=$PREVIEW" >>"$GITHUB_OUTPUT"
+          if [[ "$PREVIEW" == "1" ]]; then
+            SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+            SCROZZ_STAMP="${{ inputs.tag || github.ref_name }}" \
+            SCROZZ_PLATFORM="${{ matrix.slug }}" \
+              tools/preview-check.sh notice dist
+            echo "::warning title=${{ matrix.name }} is a preview build::Capture is gated off on this platform, so this artefact runs but cannot take a screenshot. It is named -preview and ships a PREVIEW.txt saying so."
+          else
+            echo "Capture gate is open on ${{ matrix.slug }}; not a preview."
+          fi
+
       - name: Package
         id: package
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           NAME="scrozz-${VERSION}-${{ matrix.slug }}"
+          if [[ "${{ steps.preview.outputs.preview }}" == "1" ]]; then
+            NAME="${NAME}-preview"
+          fi
 
           # GPL-3.0 obliges us to ship the licence with the binary (D2), and
           # the trademark terms travel with it.
           cp LICENSE TRADEMARK.md README.md dist/
 
-          cd dist
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            # ditto, not zip or tar: it is the only archiver that round-trips a
+            # signed, stapled bundle intact. --keepParent over a staging
+            # directory gives an archive that expands to one folder holding the
+            # app and its licence, rather than scattering files into whatever
+            # the user had selected in Finder.
+            STAGE="$RUNNER_TEMP/$NAME"
+            rm -rf "$STAGE"
+            mkdir -p "$STAGE"
+            ditto dist/Scrozz.app "$STAGE/Scrozz.app"
+            for f in LICENSE TRADEMARK.md README.md PREVIEW.txt; do
+              [[ -f "dist/$f" ]] && cp "dist/$f" "$STAGE/"
+            done
+            ditto -c -k --sequesterRsrc --keepParent "$STAGE" "${NAME}.zip"
+            ASSET="${NAME}.zip"
+
+            # Prove the archive survived the round trip. A signature that only
+            # verifies before packaging is worth nothing to the person
+            # downloading it.
+            VERIFY="$RUNNER_TEMP/verify"
+            rm -rf "$VERIFY"
+            mkdir -p "$VERIFY"
+            ditto -x -k "${NAME}.zip" "$VERIFY"
+            codesign --verify --strict --verbose=2 "$VERIFY/$NAME/Scrozz.app"
+            "$VERIFY/$NAME/Scrozz.app/Contents/MacOS/Scrozz" --version
+          elif [[ "${{ matrix.archive }}" == "zip" ]]; then
+            cd dist
             7z a "../${NAME}.zip" ./* >/dev/null
             ASSET="${NAME}.zip"
+            cd ..
           else
+            cd dist
             tar -czf "../${NAME}.tar.gz" ./*
             ASSET="${NAME}.tar.gz"
+            cd ..
           fi
-          cd ..
 
           # Checksum per artefact now; the release job concatenates them into a
           # single SHA256SUMS file people can actually verify against.
@@ -373,14 +500,20 @@ jobs:
             echo
             echo "| Platform | Signed | Secret that enables it |"
             echo "|---|---|---|"
-            echo "| macOS | ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'yes' || 'no' }} | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
+            echo "| macOS (Scrozz.app) | ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'Developer ID, notarised, stapled' || 'ad-hoc only' }} | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
             echo "| Windows | ${{ secrets.WINDOWS_CERTIFICATE_PFX != '' && 'yes' || 'no' }} | \`WINDOWS_CERTIFICATE_PFX\` (+ password) |"
             echo "| Checksums (GPG) | ${{ secrets.GPG_PRIVATE_KEY != '' && 'yes' || 'no' }} | \`GPG_PRIVATE_KEY\` (+ passphrase) |"
             echo
-            echo "Unsigned binaries work, but Gatekeeper and SmartScreen will"
-            echo "warn users. Configure the secrets above in"
+            echo "Unsigned artefacts work locally, but Gatekeeper and SmartScreen"
+            echo "will warn users. On macOS specifically, an ad-hoc signature is a"
+            echo "development identity: it is effectively the cdhash, so a Screen"
+            echo "Recording grant does not survive a rebuild. Developer ID is what"
+            echo "gives a release a stable identity. Configure the secrets above in"
             echo "**Settings → Secrets and variables → Actions** when signing"
             echo "certificates exist. None are required for a draft release."
+            echo
+            echo "Any artefact named \`-preview\` runs but cannot take a screenshot:"
+            echo "its platform's capture gate is still closed. See its PREVIEW.txt."
             echo
             echo "This release is a **draft**. Publishing it is a human decision (D5)."
           } >>"$GITHUB_STEP_SUMMARY"
