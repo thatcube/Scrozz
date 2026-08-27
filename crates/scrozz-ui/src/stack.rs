@@ -139,6 +139,26 @@ impl CardMetrics {
             fits as usize
         }
     }
+
+    /// Scales card and spacing tokens together.
+    ///
+    /// The clamp keeps the resulting controls usable and prevents a malformed
+    /// configuration from producing zero-sized or display-sized cards.
+    #[must_use]
+    pub fn scaled(self, scale: f32) -> Self {
+        let scale = if scale.is_finite() {
+            scale.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        Self {
+            width: self.width * scale,
+            height: self.height * scale,
+            gap: self.gap * scale,
+            margin: self.margin * scale,
+            clearance: self.clearance * scale,
+        }
+    }
 }
 
 /// Where the slots are, and how many there are.
@@ -595,6 +615,7 @@ pub struct Card {
     hover_on: bool,
     hover_since: f64,
     lifted: bool,
+    close_at: Option<f64>,
 }
 
 impl Card {
@@ -708,10 +729,34 @@ pub struct DragRelease {
     pub direction: Option<Dir>,
     /// Where the card was when it was let go.
     pub rect: Rect,
-    /// Where the pointer was when the card was let go.
+    /// Where the pointer was released, in window-local coordinates.
     pub pointer: Pos2,
     /// Release speed, in points per second.
     pub velocity: Vec2,
+}
+
+/// What happened when a capture was offered to the bounded pile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushResult {
+    /// The identity allocated for the new capture.
+    pub id: CardId,
+    /// Residents retired to make room, oldest first.
+    pub retired: Vec<CardId>,
+    /// Whether the new capture became resident.
+    ///
+    /// False means every resident was protected by the owning feature model.
+    /// The caller can still keep the capture in history/recently-closed without
+    /// duplicating that model inside the stack.
+    pub resident: bool,
+}
+
+/// What happened while restoring a rejected native drag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreResult {
+    /// Whether a pending drag-out with that identity existed.
+    pub restored: bool,
+    /// Unprotected residents retired to make room, oldest first.
+    pub retired: Vec<CardId>,
 }
 
 /// The card currently under the pointer.
@@ -766,6 +811,7 @@ pub struct CaptureStack {
     dock: Dock,
     drag: Option<ActiveDrag>,
     next_id: u64,
+    auto_close_secs: Option<f64>,
 }
 
 impl CaptureStack {
@@ -782,6 +828,7 @@ impl CaptureStack {
             dock,
             drag: None,
             next_id: 0,
+            auto_close_secs: None,
         }
     }
 
@@ -884,15 +931,51 @@ impl CaptureStack {
     /// user asked for the overlay to be out of the way, not to stop seeing what
     /// they captured.
     pub fn push(&mut self, m: &Motion) -> CardId {
+        self.push_with_protection(m, |_| false).id
+    }
+
+    /// Adds a capture while respecting protection owned by the caller.
+    ///
+    /// The stack does not own pin state. Instead, callers provide the one
+    /// predicate used only at the overflow decision point.
+    pub fn push_with_protection(
+        &mut self,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> PushResult {
         if self.dock.is_stowing() {
             self.dock.expand(m);
         }
-        if self.cards.len() >= self.capacity() {
-            self.retire_slot(0, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
-        }
-        let slot = self.cards.len();
         let id = CardId(self.next_id);
         self.next_id += 1;
+        let required = self
+            .cards
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.capacity());
+        let candidates: Vec<CardId> = self
+            .cards
+            .iter()
+            .filter(|card| !protected(card.id))
+            .take(required)
+            .map(|card| card.id)
+            .collect();
+        if candidates.len() < required {
+            return PushResult {
+                id,
+                retired: Vec::new(),
+                resident: false,
+            };
+        }
+        let mut retired = Vec::with_capacity(required);
+        for candidate in candidates {
+            let slot = self
+                .slot_of(candidate)
+                .expect("a selected overflow candidate must still be resident");
+            retired.push(candidate);
+            self.retire_slot(slot, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+        }
+        let slot = self.cards.len();
         self.cards.push(Card {
             id,
             born_slot: slot,
@@ -907,8 +990,36 @@ impl CaptureStack {
             hover_on: false,
             hover_since: m.now(),
             lifted: false,
+            close_at: self.auto_close_secs.map(|secs| m.now() + secs),
         });
-        id
+        PushResult {
+            id,
+            retired,
+            resident: true,
+        }
+    }
+
+    /// Configures inactivity-based retirement using the Motion clock.
+    ///
+    /// Existing cards get a fresh full interval. `None` disables auto-close.
+    pub fn set_auto_close(&mut self, secs: Option<f64>, m: &Motion) {
+        self.auto_close_secs = secs.filter(|secs| secs.is_finite() && *secs > 0.0);
+        for card in &mut self.cards {
+            card.close_at = self.auto_close_secs.map(|span| m.now() + span);
+        }
+    }
+
+    /// Pauses or resumes one card's auto-close deadline.
+    ///
+    /// Used by the external pin model; no pin bit is stored in the stack.
+    pub fn set_auto_close_paused(&mut self, id: CardId, paused: bool, m: &Motion) {
+        if let Some(card) = self.cards.iter_mut().find(|card| card.id == id) {
+            card.close_at = if paused {
+                None
+            } else {
+                self.auto_close_secs.map(|span| m.now() + span)
+            };
+        }
     }
 
     /// Retires a capture. Cards **above** it fall one slot; cards below it do
@@ -1009,11 +1120,58 @@ impl CaptureStack {
     /// Shrinking retires from the bottom, oldest first, exactly as overflow
     /// does, so the invariant survives a display change.
     pub fn resize(&mut self, work_area: Rect, m: &Motion) {
+        self.resize_with_protection(work_area, m, |_| false);
+    }
+
+    /// Re-derives layout while retaining externally protected residents.
+    ///
+    /// Returns the cards retired by the resize. If every excess resident is
+    /// protected, the stack temporarily exceeds its visual capacity rather than
+    /// silently discarding pinned captures.
+    pub fn resize_with_protection(
+        &mut self,
+        work_area: Rect,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> Vec<CardId> {
         self.layout = StackLayout::new(work_area, self.layout.metrics);
         self.dock.set_rect(self.layout.dock_rect());
+        self.enforce_capacity_with_protection(m, protected)
+    }
+
+    /// Applies new card-size tokens while retaining protected residents.
+    ///
+    /// Returns any unprotected cards that no longer fit.
+    pub fn set_metrics_with_protection(
+        &mut self,
+        metrics: CardMetrics,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> Vec<CardId> {
+        self.layout = StackLayout::new(self.layout.work_area, metrics);
+        self.dock.set_rect(self.layout.dock_rect());
+        self.enforce_capacity_with_protection(m, protected)
+    }
+
+    /// Retires excess unprotected residents after external protection changes.
+    ///
+    /// Pin ownership intentionally lives outside this state machine. An owner
+    /// calls this after unpinning so temporary protected overcapacity is resolved
+    /// immediately without duplicating pin state here.
+    pub fn enforce_capacity_with_protection(
+        &mut self,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> Vec<CardId> {
+        let mut retired = Vec::new();
         while self.cards.len() > self.capacity() {
-            self.retire_slot(0, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+            let Some(slot) = self.cards.iter().position(|card| !protected(card.id)) else {
+                break;
+            };
+            retired.push(self.cards[slot].id);
+            self.retire_slot(slot, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
         }
+        retired
     }
 
     // -- pointer ------------------------------------------------------------
@@ -1034,6 +1192,9 @@ impl CaptureStack {
             let done = if want { shown } else { 1.0 - shown };
             card.hover_on = want;
             card.hover_since = now - f64::from(span * done.clamp(0.0, 1.0));
+            if !want {
+                card.close_at = self.auto_close_secs.map(|secs| now + secs);
+            }
         }
     }
 
@@ -1054,6 +1215,7 @@ impl CaptureStack {
         card.drag = Some(Vec2::ZERO);
         card.ret = None;
         card.lifted = true;
+        card.close_at = self.auto_close_secs.map(|secs| m.now() + secs);
         true
     }
 
@@ -1074,6 +1236,19 @@ impl CaptureStack {
         }
     }
 
+    /// The intent already committed by the active gesture.
+    ///
+    /// A native drag source uses this while the mouse button is still held so
+    /// AppKit receives the live event that initiated the drag. `SpringBack`
+    /// means no directional threshold has been crossed yet.
+    #[must_use]
+    pub fn active_drag_intent(&self, m: &Motion) -> Option<Intent> {
+        let drag = self.drag.as_ref()?;
+        let travel = drag.latest - drag.origin;
+        let velocity = drag.velocity.velocity(m);
+        Some(classify(travel, velocity, &self.gestures).0)
+    }
+
     /// Lets go, and acts on what the gesture meant.
     ///
     /// Returns `None` if nothing was held.
@@ -1086,14 +1261,10 @@ impl CaptureStack {
         let rect = self.rect_of_resident(slot, m);
 
         match intent {
-            Intent::Dismiss => {
+            Intent::Dismiss | Intent::DragOut => {
                 let dir = direction.unwrap_or(Dir::Left);
                 self.retire_slot(slot, intent, dir, velocity, m);
             }
-            // Keep the original resident until the native drag reports an
-            // accepted drop. A cancellation can then return to this exact slot
-            // instead of reconstructing the card at the top of the pile.
-            Intent::DragOut => self.spring_back(slot, m),
             Intent::Collapse => {
                 self.spring_back(slot, m);
                 self.dock.collapse(m);
@@ -1137,6 +1308,88 @@ impl CaptureStack {
                 offset,
             ))
         };
+        card.close_at = self.auto_close_secs.map(|secs| m.now() + secs);
+    }
+
+    /// Restores a drag-out that no receiving application accepted.
+    ///
+    /// The card returns as the newest resident, which preserves the structural
+    /// no-upward-motion invariant even if another capture arrived during the
+    /// native drag session.
+    pub fn restore_drag_out(
+        &mut self,
+        id: CardId,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> RestoreResult {
+        let Some(index) = self
+            .departing
+            .iter()
+            .position(|departing| departing.id == id && departing.intent == Intent::DragOut)
+        else {
+            return RestoreResult {
+                restored: false,
+                retired: Vec::new(),
+            };
+        };
+        let departing = self.departing.remove(index);
+        let required = self
+            .cards
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.capacity());
+        let candidates: Vec<CardId> = self
+            .cards
+            .iter()
+            .filter(|card| !protected(card.id))
+            .take(required)
+            .map(|card| card.id)
+            .collect();
+        let mut retired = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let slot = self
+                .slot_of(candidate)
+                .expect("a selected restore candidate must still be resident");
+            retired.push(candidate);
+            self.retire_slot(slot, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+        }
+        let slot = self.cards.len();
+        let target = self.layout.slot_rect(slot);
+        let offset = departing.from.min - target.min;
+        self.cards.push(Card {
+            id,
+            born_slot: slot,
+            entry: None,
+            fall: None,
+            ret: (offset != Vec2::ZERO).then(|| {
+                (
+                    Timeline::starting(m, self.timing.spring_back, self.timing.spring_back_ease),
+                    offset,
+                )
+            }),
+            drag: None,
+            hover_on: false,
+            hover_since: m.now(),
+            lifted: false,
+            close_at: self.auto_close_secs.map(|secs| m.now() + secs),
+        });
+        RestoreResult {
+            restored: true,
+            retired,
+        }
+    }
+
+    /// Removes the retained departure after a native drag was accepted.
+    pub fn finalize_drag_out(&mut self, id: CardId) -> bool {
+        let Some(index) = self
+            .departing
+            .iter()
+            .position(|departing| departing.id == id && departing.intent == Intent::DragOut)
+        else {
+            return false;
+        };
+        self.departing.remove(index);
+        true
     }
 
     // -- dock ---------------------------------------------------------------
@@ -1164,6 +1417,18 @@ impl CaptureStack {
     /// harness that only ever renders never has to call this; a live app calls
     /// it once a frame.
     pub fn advance(&mut self, m: &Motion) {
+        let _ = self.advance_with_protection(m, |_| false);
+    }
+
+    /// Advances motion and retires cards whose Motion-clock deadlines elapsed.
+    ///
+    /// Returns the timed-out cards so the owning application can release their
+    /// cached bytes and update its recently-closed ring.
+    pub fn advance_with_protection(
+        &mut self,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> Vec<CardId> {
         self.dock.advance(m);
         for card in &mut self.cards {
             if card.entry.is_some_and(|t| !t.is_active(m)) {
@@ -1176,7 +1441,26 @@ impl CaptureStack {
                 card.ret = None;
             }
         }
-        self.departing.retain(|d| d.timeline.is_active(m));
+        self.departing
+            .retain(|d| d.intent == Intent::DragOut || d.timeline.is_active(m));
+
+        let expired: Vec<CardId> = self
+            .cards
+            .iter()
+            .filter(|card| {
+                !card.hover_on
+                    && !card.is_dragging()
+                    && !protected(card.id)
+                    && card.close_at.is_some_and(|at| at <= m.now())
+            })
+            .map(|card| card.id)
+            .collect();
+        for id in &expired {
+            if let Some(slot) = self.slot_of(*id) {
+                self.retire_slot(slot, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+            }
+        }
+        expired
     }
 
     /// What the stack contributes to the frame schedule.
@@ -1185,6 +1469,19 @@ impl CaptureStack {
     /// watch every animation freeze halfway.
     #[must_use]
     pub fn activity(&self, m: &Motion) -> Activity {
+        self.activity_with_protection(m, |_| false)
+    }
+
+    /// Frame activity while ignoring auto-close deadlines for protected cards.
+    ///
+    /// Protection remains caller-owned; this hook only prevents a stale
+    /// deadline on a pinned card from scheduling an immediate repaint forever.
+    #[must_use]
+    pub fn activity_with_protection(
+        &self,
+        m: &Motion,
+        protected: impl Fn(CardId) -> bool,
+    ) -> Activity {
         let mut a = self.dock.activity(m);
         if self.drag.is_some() {
             a |= Activity::animating();
@@ -1196,6 +1493,15 @@ impl CaptureStack {
                     || card.ret.is_some_and(|(t, _)| t.is_active(m))
                     || m.progress(card.hover_since, self.timing.reveal) < 1.0,
             );
+            if !card.hover_on
+                && !card.is_dragging()
+                && !protected(card.id)
+                && let Some(close_at) = card.close_at
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                let wait = (close_at - m.now()).max(0.0) as f32;
+                a |= Activity::waiting(wait);
+            }
         }
         for d in &self.departing {
             a |= d.timeline.activity(m);

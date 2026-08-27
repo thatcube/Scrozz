@@ -1163,18 +1163,19 @@ impl HotkeyManager for GlobalHotkeys {
     fn unregister(&mut self, hotkey: &Hotkey) -> Result<()> {
         let accelerator = Accelerator::parse(&hotkey.accelerator)?;
 
-        if self.bindings.remove(&accelerator).is_none() {
+        if !self.bindings.contains_key(&accelerator) {
             return Err(Error::InvalidRequest(format!(
                 "hotkey {accelerator} is not bound"
             )));
         }
-        self.by_id.remove(&accelerator.id());
 
         if let Backend::Os(manager) = &self.backend {
             manager.unregister(accelerator.to_hotkey()).map_err(|err| {
                 Error::Platform(format!("could not release {accelerator}: {err}"))
             })?;
         }
+        self.bindings.remove(&accelerator);
+        self.by_id.remove(&accelerator.id());
         Ok(())
     }
 }

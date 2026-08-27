@@ -43,6 +43,10 @@ pub enum TrayAction {
     CaptureScrolling,
     /// Start recording; becomes "Stop Recording" while recording runs.
     ToggleRecording,
+    /// Bring back the most recently closed capture card.
+    RestoreRecent,
+    /// Temporarily hide or show the capture overlay.
+    ToggleOverlay,
     /// Show previous captures.
     OpenHistory,
     /// Open settings — an ordinary, movable window, per D27.
@@ -53,12 +57,14 @@ pub enum TrayAction {
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
         Self::CaptureScrolling,
         Self::ToggleRecording,
+        Self::RestoreRecent,
+        Self::ToggleOverlay,
         Self::OpenHistory,
         Self::OpenSettings,
         Self::Quit,
@@ -77,6 +83,8 @@ impl TrayAction {
             Self::CaptureFullscreen => "capture.fullscreen",
             Self::CaptureScrolling => "capture.scrolling",
             Self::ToggleRecording => "record.toggle",
+            Self::RestoreRecent => "capture.restore-recent",
+            Self::ToggleOverlay => "overlay.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
             Self::Quit => "app.quit",
@@ -92,6 +100,8 @@ impl TrayAction {
             Self::CaptureFullscreen => "Capture Fullscreen",
             Self::CaptureScrolling => "Capture Scrolling Page",
             Self::ToggleRecording => "Start Recording",
+            Self::RestoreRecent => "Restore Last Capture",
+            Self::ToggleOverlay => "Hide/Show Capture Stack",
             Self::OpenHistory => "History…",
             Self::OpenSettings => "Settings…",
             Self::Quit => "Quit Scrozz",
@@ -117,6 +127,9 @@ impl TrayAction {
             Self::CaptureWindow
                 | Self::CaptureFullscreen
                 | Self::CaptureScrolling
+                | Self::RestoreRecent
+                | Self::ToggleOverlay
+                | Self::OpenHistory
                 | Self::OpenSettings
                 | Self::Quit
         )
@@ -146,6 +159,8 @@ pub const fn menu_model() -> &'static [TrayEntry] {
         TrayEntry::Item(TrayAction::CaptureScrolling),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::ToggleRecording),
+        TrayEntry::Item(TrayAction::RestoreRecent),
+        TrayEntry::Item(TrayAction::ToggleOverlay),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::OpenHistory),
         TrayEntry::Item(TrayAction::OpenSettings),

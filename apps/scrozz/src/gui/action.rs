@@ -76,6 +76,10 @@ pub enum Action {
     Capture(CaptureKind),
     /// Start or stop recording.
     ToggleRecording,
+    /// Restore the most recently closed capture card.
+    RestoreRecent,
+    /// Temporarily hide or show the capture stack.
+    ToggleOverlay,
     /// Show previous captures.
     OpenHistory,
     /// Open settings.
@@ -100,6 +104,8 @@ impl Action {
             TrayAction::CaptureFullscreen => Self::Capture(CaptureKind::Fullscreen),
             TrayAction::CaptureScrolling => Self::Capture(CaptureKind::Scrolling),
             TrayAction::ToggleRecording => Self::ToggleRecording,
+            TrayAction::RestoreRecent => Self::RestoreRecent,
+            TrayAction::ToggleOverlay => Self::ToggleOverlay,
             TrayAction::OpenHistory => Self::OpenHistory,
             TrayAction::OpenSettings => Self::OpenSettings,
             TrayAction::Quit => Self::Quit,
@@ -112,6 +118,8 @@ impl Action {
         match self {
             Self::Capture(kind) => kind.id(),
             Self::ToggleRecording => "record.toggle",
+            Self::RestoreRecent => "capture.restore-recent",
+            Self::ToggleOverlay => "overlay.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
             Self::Quit => "app.quit",
@@ -145,6 +153,7 @@ impl Action {
             Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active".to_owned(),
             Self::Capture(CaptureKind::Scrolling) => "scrozz capture --scrolling".to_owned(),
             Self::ToggleRecording => "scrozz record --toggle".to_owned(),
+            Self::RestoreRecent | Self::ToggleOverlay => "scrozz gui".to_owned(),
             Self::OpenHistory => "scrozz history list".to_owned(),
             Self::OpenSettings => "scrozz settings show".to_owned(),
             Self::Quit => "scrozz quit".to_owned(),

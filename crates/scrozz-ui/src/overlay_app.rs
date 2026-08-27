@@ -56,18 +56,18 @@
 //! [`Activity::apply`](crate::motion::Activity::apply) turns it into the right
 //! call — including a timed wake when something is merely waiting.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
 
 use crate::card::{self, CardAction, CardContent};
-use crate::icons::{Icon, IconStore};
-use crate::motion::{Motion, fade};
-use crate::paint::{self, Surface};
-use crate::stack::{CaptureStack, CardId, Intent, dock};
-use crate::theme::{Appearance, Radius, Theme, corner};
+use crate::icons::IconStore;
+use crate::motion::Motion;
+use crate::paint::Surface;
+use crate::stack::{CaptureStack, CardId, CardMetrics, Intent, StackLayout, Timing, dock};
+use crate::theme::{Appearance, Theme};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
 /// single frame to re-sample the pointer, when no [`PointerProbe`] is supplied.
@@ -78,6 +78,9 @@ pub const RESAMPLE_SECS: f32 = 0.35;
 /// A 6-card stack of full-resolution 5K captures is well over a gigabyte of
 /// texture. Cards are 232 pt wide, so 512 px is already generous at 2×.
 pub const THUMBNAIL_PX: u32 = 512;
+
+/// Number of dismissed cards that can be restored during this app session.
+pub const RECENTLY_CLOSED_LIMIT: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Native hook
@@ -161,6 +164,13 @@ impl PanelReport {
 /// works, it just takes focus when clicked.
 pub type PanelHook = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> PanelReport>;
 
+/// Shows or hides the native overlay without changing keyboard focus.
+///
+/// macOS needs this because winit implements `Visible(true)` with
+/// `makeKeyAndOrderFront`, which would divert typing into a non-activating
+/// panel. Other platforms can omit the hook and use the viewport command.
+pub type VisibilityHook = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// Reports the pointer position in the overlay window's own logical
 /// coordinates, whether or not the window is currently accepting mouse events.
 ///
@@ -238,8 +248,16 @@ pub struct OverlayOptions {
     pub probe: Option<PointerProbe>,
     /// Optional native conversion; see [`PanelHook`].
     pub panel: Option<PanelHook>,
+    /// Optional focus-preserving native visibility control.
+    pub visibility: Option<VisibilityHook>,
     /// Longest thumbnail edge in pixels.
     pub thumbnail_px: u32,
+    /// Card size and spacing tokens.
+    pub card_metrics: CardMetrics,
+    /// Seconds of inactivity before an unpinned card closes.
+    ///
+    /// `None` keeps cards open until the user acts.
+    pub auto_close_secs: Option<f64>,
 }
 
 impl Default for OverlayOptions {
@@ -250,7 +268,10 @@ impl Default for OverlayOptions {
             passthrough: Passthrough::default(),
             probe: None,
             panel: None,
+            visibility: None,
             thumbnail_px: THUMBNAIL_PX,
+            card_metrics: CardMetrics::default(),
+            auto_close_secs: None,
         }
     }
 }
@@ -264,6 +285,8 @@ impl std::fmt::Debug for OverlayOptions {
             .field("probe", &self.probe.is_some())
             .field("panel", &self.panel.is_some())
             .field("thumbnail_px", &self.thumbnail_px)
+            .field("card_metrics", &self.card_metrics)
+            .field("auto_close_secs", &self.auto_close_secs)
             .finish()
     }
 }
@@ -285,6 +308,8 @@ pub struct CaptureRequest {
     pub source_badge: Option<String>,
     /// A pre-scaled thumbnail. `None` shows a holding fill until one arrives.
     pub thumbnail: Option<egui::ColorImage>,
+    /// Whether the capture can be rehydrated after its live bytes are released.
+    pub restorable: bool,
 }
 
 impl CaptureRequest {
@@ -297,6 +322,7 @@ impl CaptureRequest {
             source_px,
             source_badge: None,
             thumbnail: None,
+            restorable: true,
         }
     }
 
@@ -319,6 +345,7 @@ impl CaptureRequest {
             source_px,
             source_badge: None,
             thumbnail: Some(thumbnail),
+            restorable: true,
         })
     }
 
@@ -333,6 +360,13 @@ impl CaptureRequest {
     #[must_use]
     pub fn with_thumbnail(mut self, image: egui::ColorImage) -> Self {
         self.thumbnail = Some(image);
+        self
+    }
+
+    /// Controls whether dismissal adds this capture to recently closed.
+    #[must_use]
+    pub const fn with_restorable(mut self, restorable: bool) -> Self {
+        self.restorable = restorable;
         self
     }
 }
@@ -353,6 +387,8 @@ pub enum DismissReason {
     Overflow,
     /// The application asked.
     Programmatic,
+    /// The configured inactivity interval elapsed.
+    TimedOut,
 }
 
 /// Something the user did to the overlay.
@@ -395,6 +431,8 @@ pub enum OverlayEvent {
     PinRequested {
         /// The card.
         id: CardId,
+        /// The new persistent pin state.
+        pinned: bool,
     },
     /// A drag began on a card. The host starts the platform drag here.
     DragStarted {
@@ -407,9 +445,9 @@ pub enum OverlayEvent {
     DragOut {
         /// The card.
         id: CardId,
-        /// Where it was released, in window coordinates.
+        /// Where the gesture crossed the drag-out threshold, in window coordinates.
         at: Pos2,
-        /// Card geometry at release, in window coordinates.
+        /// The card rectangle at the commitment instant.
         rect: Rect,
     },
     /// The pile collapsed into the dock (D20).
@@ -418,17 +456,36 @@ pub enum OverlayEvent {
     DockExpanded,
     /// The last card left; the overlay can be hidden.
     Emptied,
+    /// A recently closed capture re-entered with a new overlay identity.
+    Restored {
+        /// The new card identity.
+        id: CardId,
+    },
+    /// Temporary overlay visibility changed.
+    VisibilityChanged {
+        /// Whether the overlay is intentionally hidden.
+        hidden: bool,
+    },
 }
 
 /// Something the application asks the overlay to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Command {
     Dismiss(CardId),
+    DismissAfterAction(CardId),
     DismissAll,
-    FinishDrag(CardId, bool),
     Collapse,
     Expand,
     ToggleDock,
+    RestoreRecent,
+    UploadLatest,
+    FinishDrag { id: CardId, accepted: bool },
+    SetPinned { id: CardId, pinned: bool },
+    SetGeometry(OverlayGeometry),
+    SetMetrics(CardMetrics),
+    SetAutoClose(Option<f64>),
+    SetHidden(bool),
+    ToggleHidden,
     Close,
 }
 
@@ -481,14 +538,14 @@ impl OverlayHandle {
         self.command(Command::Dismiss(id));
     }
 
+    /// Retire one card after Copy or Save succeeds.
+    pub fn dismiss_after_action(&self, id: CardId) {
+        self.command(Command::DismissAfterAction(id));
+    }
+
     /// Retire every card.
     pub fn dismiss_all(&self) {
         self.command(Command::DismissAll);
-    }
-
-    /// Completes a native drag, removing its source only after acceptance.
-    pub fn finish_drag(&self, id: CardId, accepted: bool) {
-        self.command(Command::FinishDrag(id, accepted));
     }
 
     /// Collapse the pile into the dock (D20).
@@ -504,6 +561,51 @@ impl OverlayHandle {
     /// Collapse or expand, whichever is not current.
     pub fn toggle_dock(&self) {
         self.command(Command::ToggleDock);
+    }
+
+    /// Bring back the most recently closed capture.
+    pub fn restore_recent(&self) {
+        self.command(Command::RestoreRecent);
+    }
+
+    /// Upload the newest resident capture.
+    pub fn upload_latest(&self) {
+        self.command(Command::UploadLatest);
+    }
+
+    /// Complete a native drag, restoring rejected drops.
+    pub fn finish_drag(&self, id: CardId, accepted: bool) {
+        self.command(Command::FinishDrag { id, accepted });
+    }
+
+    /// Apply a pin state after the owning history store has persisted it.
+    pub fn set_pinned(&self, id: CardId, pinned: bool) {
+        self.command(Command::SetPinned { id, pinned });
+    }
+
+    /// Move and resize the overlay to another display work area.
+    pub fn set_geometry(&self, geometry: OverlayGeometry) {
+        self.command(Command::SetGeometry(geometry));
+    }
+
+    /// Change card size and stack density.
+    pub fn set_card_metrics(&self, metrics: CardMetrics) {
+        self.command(Command::SetMetrics(metrics));
+    }
+
+    /// Change inactivity-based auto-close.
+    pub fn set_auto_close(&self, secs: Option<f64>) {
+        self.command(Command::SetAutoClose(secs));
+    }
+
+    /// Temporarily hide or show the overlay without dropping captures.
+    pub fn set_hidden(&self, hidden: bool) {
+        self.command(Command::SetHidden(hidden));
+    }
+
+    /// Toggle temporary overlay visibility.
+    pub fn toggle_hidden(&self) {
+        self.command(Command::ToggleHidden);
     }
 
     /// Ask the overlay window to close.
@@ -733,6 +835,7 @@ pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> egui::ColorImage {
 // The application
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Entry {
     name: String,
     provenance: Provenance,
@@ -740,18 +843,30 @@ struct Entry {
     source_badge: Option<String>,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
+    pinned: bool,
+    restorable: bool,
+}
+
+#[derive(Clone)]
+struct RecentEntry {
+    id: CardId,
+    entry: Entry,
 }
 
 /// The `eframe` application that hosts the capture stack.
 pub struct OverlayApp {
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
+    recent: VecDeque<RecentEntry>,
+    restored_aliases: VecDeque<(CardId, CardId)>,
+    announced_closed: HashSet<CardId>,
     handle: OverlayHandle,
     theme: Theme,
     icons: IconStore,
     geometry: OverlayGeometry,
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
+    visibility: Option<VisibilityHook>,
     thumbnail_px: u32,
     /// The value most recently sent to the window, so the command is sent on
     /// change rather than every frame.
@@ -764,6 +879,10 @@ pub struct OverlayApp {
     pending_native_drag: Option<CardId>,
     native_drag_just_finished: bool,
     deferred_commands: VecDeque<Command>,
+    hidden: bool,
+    hidden_at_motion: Option<f64>,
+    refresh_deadlines_after: Option<f64>,
+    reported_empty: bool,
 }
 
 impl OverlayApp {
@@ -777,7 +896,19 @@ impl OverlayApp {
         handle: OverlayHandle,
         mut options: OverlayOptions,
     ) -> Self {
-        let ctx = &cc.egui_ctx;
+        let report = options.panel.take().map_or_else(
+            || PanelReport::unsupported("no native panel hook supplied"),
+            |hook| hook(cc),
+        );
+        Self::from_context(&cc.egui_ctx, handle, options, report)
+    }
+
+    fn from_context(
+        ctx: &egui::Context,
+        handle: OverlayHandle,
+        options: OverlayOptions,
+        report: PanelReport,
+    ) -> Self {
         let theme = Theme::for_appearance(options.appearance);
         crate::theme::install_fonts(ctx);
         crate::theme::install_style(ctx, &theme);
@@ -786,10 +917,6 @@ impl OverlayApp {
             *slot = Some(ctx.clone());
         }
 
-        let report = options.panel.take().map_or_else(
-            || PanelReport::unsupported("no native panel hook supplied"),
-            |hook| hook(cc),
-        );
         if !report.non_activating {
             tracing::warn!(detail = %report.detail, "overlay window is not non-activating");
         }
@@ -805,15 +932,25 @@ impl OverlayApp {
             );
         }
 
+        let mut stack = CaptureStack::new(
+            StackLayout::new(options.geometry.local(), options.card_metrics),
+            Timing::default(),
+        );
+        stack.set_auto_close(options.auto_close_secs, &Motion::from_context(ctx));
+
         Self {
-            stack: CaptureStack::for_work_area(options.geometry.local()),
+            stack,
             content: HashMap::new(),
+            recent: VecDeque::with_capacity(RECENTLY_CLOSED_LIMIT),
+            restored_aliases: VecDeque::with_capacity(RECENTLY_CLOSED_LIMIT),
+            announced_closed: HashSet::new(),
             handle,
             theme,
             icons: IconStore::new(ctx),
             geometry: options.geometry,
             passthrough: options.passthrough,
             probe: options.probe,
+            visibility: options.visibility,
             thumbnail_px: options.thumbnail_px.max(1),
             passthrough_now: false,
             last_seen: 0.0,
@@ -823,6 +960,10 @@ impl OverlayApp {
             pending_native_drag: None,
             native_drag_just_finished: false,
             deferred_commands: VecDeque::new(),
+            hidden: false,
+            hidden_at_motion: None,
+            refresh_deadlines_after: None,
+            reported_empty: true,
         }
     }
 
@@ -850,9 +991,132 @@ impl OverlayApp {
             return;
         }
         self.geometry = geometry;
-        self.stack.resize(geometry.local(), m);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+        let protected = self.protected_ids();
+        let retired = self
+            .stack
+            .resize_with_protection(geometry.local(), m, |id| protected.contains(&id));
+        for id in retired {
+            self.announce_closed(id, DismissReason::Overflow);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+    }
+
+    fn protected_ids(&self) -> HashSet<CardId> {
+        self.content
+            .iter()
+            .filter_map(|(id, entry)| entry.pinned.then_some(*id))
+            .collect()
+    }
+
+    fn remember(&mut self, id: CardId) {
+        let Some(entry) = self.content.get(&id).cloned() else {
+            return;
+        };
+        if !entry.restorable {
+            return;
+        }
+        self.recent.push_back(RecentEntry { id, entry });
+        if self.recent.len() > RECENTLY_CLOSED_LIMIT {
+            self.recent.pop_front();
+        }
+    }
+
+    fn apply_pinned(&mut self, id: CardId, pinned: bool, m: &Motion) {
+        let mut resident_id = id;
+        for _ in 0..RECENTLY_CLOSED_LIMIT {
+            let Some((_, next)) = self
+                .restored_aliases
+                .iter()
+                .rev()
+                .find(|(previous, _)| *previous == resident_id)
+            else {
+                break;
+            };
+            resident_id = *next;
+        }
+
+        let resident = if let Some(entry) = self.content.get_mut(&resident_id) {
+            entry.pinned = pinned;
+            true
+        } else {
+            false
+        };
+        for recent in self
+            .recent
+            .iter_mut()
+            .filter(|recent| recent.id == id || recent.id == resident_id)
+        {
+            recent.entry.pinned = pinned;
+        }
+
+        if !resident {
+            return;
+        }
+        self.stack
+            .set_auto_close_paused(resident_id, self.hidden || pinned, m);
+        if !pinned {
+            let protected = self.protected_ids();
+            let retired = self
+                .stack
+                .enforce_capacity_with_protection(m, |candidate| protected.contains(&candidate));
+            for retired in retired {
+                self.announce_closed(retired, DismissReason::Overflow);
+            }
+        }
+    }
+
+    fn announce_closed(&mut self, id: CardId, reason: DismissReason) {
+        if self.announced_closed.insert(id) {
+            self.remember(id);
+            self.emit(OverlayEvent::Dismissed { id, reason });
+        }
+    }
+
+    fn dismiss_all(&mut self, reason: DismissReason, m: &Motion) {
+        let ids: Vec<CardId> = self.stack.cards().iter().map(|card| card.id()).collect();
+        self.stack.dismiss_all(m);
+        for id in ids {
+            self.announce_closed(id, reason);
+        }
+    }
+
+    fn set_hidden(&mut self, hidden: bool, ctx: &egui::Context, m: &Motion) {
+        if self.hidden != hidden {
+            self.hidden = hidden;
+            if hidden {
+                self.hidden_at_motion = Some(m.now());
+                self.refresh_deadlines_after = None;
+                self.reconcile_auto_close_pauses(m);
+            } else {
+                self.refresh_deadlines_after =
+                    Some(self.hidden_at_motion.take().unwrap_or_else(|| m.now()));
+            }
+            if let Some(visibility) = &self.visibility {
+                visibility(!hidden);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!hidden));
+            }
+            self.emit(OverlayEvent::VisibilityChanged { hidden });
+        }
+    }
+
+    fn reconcile_auto_close_pauses(&mut self, m: &Motion) {
+        let paused: Vec<(CardId, bool)> = self
+            .stack
+            .cards()
+            .iter()
+            .map(|card| {
+                let pinned = self
+                    .content
+                    .get(&card.id())
+                    .is_some_and(|entry| entry.pinned);
+                (card.id(), self.hidden || pinned)
+            })
+            .collect();
+        for (id, paused) in paused {
+            self.stack.set_auto_close_paused(id, paused, m);
+        }
     }
 
     fn emit(&self, event: OverlayEvent) {
@@ -879,7 +1143,7 @@ impl OverlayApp {
             .unwrap_or_default()
     }
 
-    fn ingest(&mut self, m: &Motion) {
+    fn ingest(&mut self, ctx: &egui::Context, m: &Motion) {
         if self.pending_native_drag.is_some() {
             return;
         }
@@ -888,7 +1152,12 @@ impl OverlayApp {
             return;
         }
         for request in self.take_inbox() {
-            let id = self.stack.push(m);
+            self.set_hidden(false, ctx, m);
+            let protected = self.protected_ids();
+            let pushed = self
+                .stack
+                .push_with_protection(m, |id| protected.contains(&id));
+            let id = pushed.id;
             let thumb = request
                 .thumbnail
                 .map(|image| downscale(&image, self.thumbnail_px));
@@ -901,9 +1170,17 @@ impl OverlayApp {
                     source_badge: request.source_badge,
                     texture: None,
                     pending: thumb,
+                    pinned: false,
+                    restorable: request.restorable,
                 },
             );
             self.emit(OverlayEvent::Pushed { id });
+            for retired in pushed.retired {
+                self.announce_closed(retired, DismissReason::Overflow);
+            }
+            if !pushed.resident {
+                self.announce_closed(id, DismissReason::Overflow);
+            }
         }
     }
 
@@ -913,14 +1190,17 @@ impl OverlayApp {
         if let Some(pending) = self.pending_native_drag
             && let Some(index) = commands
                 .iter()
-                .position(|cmd| matches!(cmd, Command::FinishDrag(id, _) if *id == pending))
+                .position(|cmd| matches!(cmd, Command::FinishDrag { id, .. } if *id == pending))
             && let Some(finish) = commands.remove(index)
         {
             commands.push_front(finish);
         }
         for cmd in commands {
             if (self.pending_native_drag.is_some() || self.native_drag_just_finished)
-                && !matches!(cmd, Command::FinishDrag(id, _) if Some(id) == self.pending_native_drag)
+                && !matches!(
+                    cmd,
+                    Command::FinishDrag { id, .. } if Some(id) == self.pending_native_drag
+                )
             {
                 self.deferred_commands.push_back(cmd);
                 continue;
@@ -928,37 +1208,91 @@ impl OverlayApp {
             match cmd {
                 Command::Dismiss(id) => {
                     if self.stack.dismiss(id, m) {
-                        self.emit(OverlayEvent::Dismissed {
-                            id,
-                            reason: DismissReason::Programmatic,
-                        });
+                        self.announce_closed(id, DismissReason::Programmatic);
                     }
                 }
-                Command::DismissAll => {
-                    let ids: Vec<CardId> = self.stack.cards().iter().map(|c| c.id()).collect();
-                    self.stack.dismiss_all(m);
-                    for id in ids {
-                        self.emit(OverlayEvent::Dismissed {
-                            id,
-                            reason: DismissReason::Programmatic,
-                        });
+                Command::DismissAfterAction(id) => {
+                    if self.stack.dismiss(id, m) {
+                        self.announce_closed(id, DismissReason::Acted);
                     }
                 }
-                Command::FinishDrag(id, accepted) => {
-                    if self.pending_native_drag == Some(id) {
-                        self.pending_native_drag = None;
-                        self.native_drag_just_finished = true;
-                        if accepted && self.stack.dismiss(id, m) {
-                            self.emit(OverlayEvent::Dismissed {
-                                id,
-                                reason: DismissReason::DragOut,
-                            });
-                        }
-                    }
-                }
+                Command::DismissAll => self.dismiss_all(DismissReason::Programmatic, m),
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
+                Command::RestoreRecent => {
+                    if let Some(recent) = self.recent.pop_back() {
+                        let protected = self.protected_ids();
+                        let pushed = self
+                            .stack
+                            .push_with_protection(m, |id| protected.contains(&id));
+                        if pushed.resident {
+                            let id = pushed.id;
+                            self.restored_aliases.push_back((recent.id, id));
+                            if self.restored_aliases.len() > RECENTLY_CLOSED_LIMIT {
+                                self.restored_aliases.pop_front();
+                            }
+                            let pinned = recent.entry.pinned;
+                            self.content.insert(id, recent.entry);
+                            if pinned {
+                                self.stack.set_auto_close_paused(id, true, m);
+                            }
+                            self.emit(OverlayEvent::Restored { id });
+                            for retired in pushed.retired {
+                                self.announce_closed(retired, DismissReason::Overflow);
+                            }
+                            self.set_hidden(false, ctx, m);
+                        } else {
+                            self.recent.push_back(recent);
+                        }
+                    }
+                }
+                Command::UploadLatest => {
+                    if let Some(id) = self.stack.cards().last().map(|card| card.id()) {
+                        self.emit(OverlayEvent::UploadRequested { id });
+                    }
+                }
+                Command::FinishDrag { id, accepted } => {
+                    if self.pending_native_drag == Some(id) {
+                        self.pending_native_drag = None;
+                        self.native_drag_just_finished = true;
+                        if accepted {
+                            if self.stack.finalize_drag_out(id) {
+                                self.announce_closed(id, DismissReason::DragOut);
+                            }
+                        } else {
+                            let protected = self.protected_ids();
+                            let restored = self.stack.restore_drag_out(id, m, |candidate| {
+                                protected.contains(&candidate)
+                            });
+                            for retired in restored.retired {
+                                self.announce_closed(retired, DismissReason::Overflow);
+                            }
+                            if restored.restored
+                                && self.content.get(&id).is_some_and(|entry| entry.pinned)
+                            {
+                                self.stack.set_auto_close_paused(id, true, m);
+                            }
+                        }
+                    }
+                }
+                Command::SetPinned { id, pinned } => self.apply_pinned(id, pinned, m),
+                Command::SetGeometry(geometry) => self.set_geometry(geometry, ctx, m),
+                Command::SetMetrics(metrics) => {
+                    let protected = self.protected_ids();
+                    let retired = self
+                        .stack
+                        .set_metrics_with_protection(metrics, m, |id| protected.contains(&id));
+                    for id in retired {
+                        self.announce_closed(id, DismissReason::Overflow);
+                    }
+                }
+                Command::SetAutoClose(secs) => {
+                    self.stack.set_auto_close(secs, m);
+                    self.reconcile_auto_close_pauses(m);
+                }
+                Command::SetHidden(hidden) => self.set_hidden(hidden, ctx, m),
+                Command::ToggleHidden => self.set_hidden(!self.hidden, ctx, m),
                 Command::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -983,11 +1317,9 @@ impl OverlayApp {
             .collect();
         gone.sort_unstable_by_key(|id| id.0);
         for id in gone {
+            self.announce_closed(id, DismissReason::Overflow);
             self.content.remove(&id);
-            self.emit(OverlayEvent::Dismissed {
-                id,
-                reason: DismissReason::Overflow,
-            });
+            self.announced_closed.remove(&id);
         }
 
         for (id, entry) in &mut self.content {
@@ -1047,27 +1379,55 @@ impl OverlayApp {
         }
     }
 
+    fn finish_drag_gesture(&mut self, m: &Motion) {
+        if let Some(release) = self.stack.release_drag(m) {
+            match release.intent {
+                Intent::Dismiss => {
+                    self.announce_closed(release.id, DismissReason::Swipe);
+                }
+                Intent::DragOut => {
+                    self.pending_native_drag = Some(release.id);
+                    self.emit(OverlayEvent::DragOut {
+                        id: release.id,
+                        at: release.pointer,
+                        rect: release.rect,
+                    });
+                }
+                Intent::Collapse | Intent::SpringBack => {}
+            }
+        }
+        self.dragging = None;
+    }
+
     fn handle_action(&mut self, id: CardId, action: CardAction, m: &Motion) {
+        if action == CardAction::Pin {
+            let Some(entry) = self.content.get(&id) else {
+                return;
+            };
+            let pinned = !entry.pinned;
+            self.emit(OverlayEvent::PinRequested { id, pinned });
+            return;
+        }
         let (event, dismiss) = match action {
-            CardAction::Copy => (Some(OverlayEvent::CopyRequested { id }), true),
-            CardAction::Save => (Some(OverlayEvent::SaveRequested { id }), true),
+            CardAction::Copy => (Some(OverlayEvent::CopyRequested { id }), false),
+            CardAction::Save => (Some(OverlayEvent::SaveRequested { id }), false),
             CardAction::Annotate => (Some(OverlayEvent::AnnotateRequested { id }), false),
             CardAction::Upload => (Some(OverlayEvent::UploadRequested { id }), false),
-            CardAction::Pin => (Some(OverlayEvent::PinRequested { id }), false),
+            CardAction::Pin => unreachable!("pin is handled before the action table"),
             CardAction::Close => (None, true),
         };
         if let Some(event) = event {
             self.emit(event);
         }
         if dismiss && self.stack.dismiss(id, m) {
-            self.emit(OverlayEvent::Dismissed {
+            self.announce_closed(
                 id,
-                reason: if action == CardAction::Close {
+                if action == CardAction::Close {
                     DismissReason::Closed
                 } else {
                     DismissReason::Acted
                 },
-            });
+            );
         }
     }
 
@@ -1078,58 +1438,100 @@ impl OverlayApp {
         surface: &Surface<'_>,
         m: &Motion,
     ) -> (Option<Rect>, bool) {
-        let d = self.stack.dock();
-        if !d.is_visible(m) {
+        if self.stack.is_empty() && self.stack.departing().is_empty() {
             return (None, false);
         }
-        let rect = d.rect();
-        let alpha = d.alpha(m);
-        if alpha <= 0.004 || rect.width() <= 0.0 {
-            return (None, false);
-        }
-        let palette = surface.palette();
-        let painter = ui.painter();
-        paint::soft_shadow(painter, rect, Radius::BAR, palette, 0.6 * alpha);
-        painter.rect_filled(
-            rect,
-            corner(Radius::BAR),
-            fade(palette.card_fill_raised, alpha),
-        );
-        surface.icons.draw_faded(
-            painter,
-            Icon::ChevronRight,
-            d.chevron_rect().center(),
-            crate::icons::SIZE,
-            palette.text_muted,
-            alpha,
-        );
+        dock::draw(ui, surface, self.stack.dock(), m)
+    }
 
-        let response = ui.interact(rect, egui::Id::new("scrozz.dock"), egui::Sense::click());
-        (Some(rect), response.clicked())
+    fn update_state(&mut self, ctx: &egui::Context, m: &Motion, painted: bool) {
+        self.run_commands(ctx, m);
+        self.ingest(ctx, m);
+        if painted && let Some(hidden_clock) = self.refresh_deadlines_after {
+            self.reconcile_auto_close_pauses(m);
+            if m.now() > hidden_clock {
+                self.refresh_deadlines_after = None;
+            }
+        }
+        self.reconcile(ctx);
+        let protected = self.protected_ids();
+        let expired = self
+            .stack
+            .advance_with_protection(m, |id| protected.contains(&id));
+        for id in expired {
+            self.announce_closed(id, DismissReason::TimedOut);
+        }
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.dismiss_all(DismissReason::Programmatic, m);
+        }
+    }
+
+    fn announce_stack_state(&mut self) {
+        let dock_now = self.stack.dock().is_collapsed();
+        if dock_now != self.dock_collapsed {
+            self.emit(if dock_now {
+                OverlayEvent::DockCollapsed
+            } else {
+                OverlayEvent::DockExpanded
+            });
+        }
+        self.dock_collapsed = dock_now;
+
+        let empty_now = self.stack.is_empty() && self.stack.departing().is_empty();
+        if empty_now && !self.reported_empty {
+            self.emit(OverlayEvent::Emptied);
+        }
+        self.reported_empty = empty_now;
+    }
+
+    /// Services model commands while the native panel is ordered out.
+    ///
+    /// Eframe continues calling its logic phase for hidden windows but skips
+    /// painting. Processing here is what lets a tray action, restoration, or new
+    /// capture make an ordered-out panel visible again.
+    pub fn service_hidden(&mut self, ctx: &egui::Context) {
+        if !self.hidden {
+            return;
+        }
+
+        let m = Motion::from_context(ctx);
+        self.update_state(ctx, &m, false);
+        self.announce_stack_state();
+        if self.hidden {
+            self.apply_passthrough(ctx, &[], None);
+            let protected = self.protected_ids();
+            self.stack
+                .activity_with_protection(&m, |id| protected.contains(&id))
+                .apply(ctx);
+        } else {
+            ctx.request_repaint();
+        }
     }
 }
 
-impl eframe::App for OverlayApp {
-    /// Fully transparent. eframe's default is a dark translucent wash, which on
-    /// an overlay is a grey sheet over the entire work area.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl OverlayApp {
+    fn draw_frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let m = Motion::from_context(&ctx);
 
-        self.run_commands(&ctx, &m);
-        self.ingest(&m);
-        self.reconcile(&ctx);
-        self.stack.advance(&m);
+        self.update_state(&ctx, &m, true);
 
-        let was_empty = self.stack.is_empty();
-        let dock_was = self.stack.dock().is_collapsed();
+        if self.hidden {
+            self.apply_passthrough(&ctx, &[], None);
+            let protected = self.protected_ids();
+            self.stack
+                .activity_with_protection(&m, |id| protected.contains(&id))
+                .apply(&ctx);
+            return;
+        }
 
         let surface = Surface::new(&self.theme, &self.icons, m);
-        let frames = self.stack.frame(&m);
+        let frames = if self.stack.dock().is_collapsed() {
+            Vec::new()
+        } else {
+            self.stack.frame(&m)
+        };
 
         let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
         let mut hovered = None;
@@ -1143,7 +1545,8 @@ impl eframe::App for OverlayApp {
                 continue;
             };
             let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance)
-                .with_source_badge(entry.source_badge.as_deref());
+                .with_source_badge(entry.source_badge.as_deref())
+                .with_pinned(entry.pinned);
             if let Some(tex) = &entry.texture {
                 content.texture = Some(tex.id());
             }
@@ -1155,9 +1558,14 @@ impl eframe::App for OverlayApp {
             }
             if let Some(a) = response.action {
                 action = Some((f.id, a));
+            } else if response.body.clicked() {
+                action = Some((f.id, CardAction::Annotate));
             }
             if response.body.drag_started() {
-                drag_start = response.body.interact_pointer_pos().map(|p| (f.id, p));
+                drag_start = response
+                    .body
+                    .interact_pointer_pos()
+                    .map(|p| (f.id, p - response.body.drag_delta()));
             }
             if response.body.dragged() {
                 drag_to = response.body.interact_pointer_pos();
@@ -1192,26 +1600,12 @@ impl eframe::App for OverlayApp {
             && let Some(p) = drag_to
         {
             self.stack.drag_to(p, &m);
-        }
-        if self.pending_native_drag.is_none() && drag_end {
-            if let Some(release) = self.stack.release_drag(&m) {
-                match release.intent {
-                    Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
-                        id: release.id,
-                        reason: DismissReason::Swipe,
-                    }),
-                    Intent::DragOut => {
-                        self.pending_native_drag = Some(release.id);
-                        self.emit(OverlayEvent::DragOut {
-                            id: release.id,
-                            at: release.pointer,
-                            rect: release.rect,
-                        });
-                    }
-                    Intent::Collapse | Intent::SpringBack => {}
-                }
+            if self.stack.active_drag_intent(&m) == Some(Intent::DragOut) {
+                self.finish_drag_gesture(&m);
             }
-            self.dragging = None;
+        }
+        if drag_end && self.dragging.is_some() {
+            self.finish_drag_gesture(&m);
         }
         if self.pending_native_drag.is_none()
             && let Some((id, a)) = action
@@ -1219,25 +1613,36 @@ impl eframe::App for OverlayApp {
             self.handle_action(id, a, &m);
         }
 
-        let dock_now = self.stack.dock().is_collapsed();
-        if dock_now != dock_was {
-            self.emit(if dock_now {
-                OverlayEvent::DockCollapsed
-            } else {
-                OverlayEvent::DockExpanded
-            });
-        }
-        self.dock_collapsed = dock_now;
-        if !was_empty && self.stack.is_empty() && self.stack.departing().is_empty() {
-            self.emit(OverlayEvent::Emptied);
-        }
+        self.announce_stack_state();
 
         let pointer = self.pointer(&ctx);
         self.apply_passthrough(&ctx, &hits, pointer);
 
         // The single place repainting is requested: idle costs nothing, an
         // animation gets a continuous repaint, and a pending wake gets a timer.
-        self.stack.activity(&m).apply(&ctx);
+        let protected = self.protected_ids();
+        self.stack
+            .activity_with_protection(&m, |id| protected.contains(&id))
+            .apply(&ctx);
+        if self.refresh_deadlines_after.is_some() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl eframe::App for OverlayApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.service_hidden(ctx);
+    }
+
+    /// Fully transparent. eframe's default is a dark translucent wash, which on
+    /// an overlay is a grey sheet over the entire work area.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw_frame(ui);
     }
 }
 
@@ -1259,33 +1664,70 @@ mod tests {
         Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
     }
 
-    fn test_overlay() -> (OverlayApp, egui::Context, OverlayHandle) {
+    fn test_overlay(
+        geometry: OverlayGeometry,
+        visibility: Option<VisibilityHook>,
+    ) -> (egui::Context, OverlayApp, OverlayHandle) {
         let ctx = egui::Context::default();
         let handle = OverlayHandle::new();
-        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 1_440.0, 900.0));
-        (
-            OverlayApp {
-                stack: CaptureStack::for_work_area(geometry.local()),
-                content: HashMap::new(),
-                handle: handle.clone(),
-                theme: Theme::for_appearance(Appearance::Dark),
-                icons: IconStore::new(&ctx),
-                geometry,
-                passthrough: Passthrough::Auto,
-                probe: None,
-                thumbnail_px: THUMBNAIL_PX,
-                passthrough_now: false,
-                last_seen: 0.0,
-                hovered: None,
-                dock_collapsed: false,
-                dragging: None,
-                pending_native_drag: None,
-                native_drag_just_finished: false,
-                deferred_commands: VecDeque::new(),
+        let options = OverlayOptions {
+            geometry,
+            visibility,
+            ..OverlayOptions::default()
+        };
+        let app = OverlayApp::from_context(
+            &ctx,
+            handle.clone(),
+            options,
+            PanelReport::converted("test panel"),
+        );
+        (ctx, app, handle)
+    }
+
+    fn run_frame(
+        ctx: &egui::Context,
+        app: &mut OverlayApp,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                screen_rect: Some(app.geometry.local()),
+                events,
+                ..Default::default()
             },
-            ctx,
-            handle,
-        )
+            |ui| app.draw_frame(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn push_and_settle(
+        ctx: &egui::Context,
+        app: &mut OverlayApp,
+        handle: &OverlayHandle,
+    ) -> CardId {
+        handle.push(CaptureRequest::new(
+            "Shot.png",
+            Provenance::Display,
+            (1920, 1080),
+        ));
+        run_frame(ctx, app, 0.0, Vec::new());
+        let id = app.stack.cards()[0].id();
+        run_frame(ctx, app, 4.0, Vec::new());
+        let _ = handle.drain_events();
+        id
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
     }
 
     #[test]
@@ -1321,6 +1763,334 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_collapsed_stack_does_not_leave_a_dock_hit_target() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        handle.collapse();
+
+        run_frame(&ctx, &mut app, 0.0, Vec::new());
+
+        assert!(app.stack.is_empty());
+        assert!(
+            app.passthrough_now,
+            "an empty dock must leave the desktop clickable"
+        );
+    }
+
+    #[test]
+    fn clicking_the_card_body_requests_annotation() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        let id = push_and_settle(&ctx, &mut app, &handle);
+        let card = app.stack.frame_of(id, &Motion::at_ms(4_000)).unwrap();
+        let pointer = Pos2::new(card.rect.left() + 24.0, card.rect.center().y);
+
+        run_frame(
+            &ctx,
+            &mut app,
+            4.1,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                pointer_button(pointer, true),
+            ],
+        );
+        run_frame(&ctx, &mut app, 4.2, vec![pointer_button(pointer, false)]);
+
+        assert!(
+            handle
+                .drain_events()
+                .contains(&OverlayEvent::AnnotateRequested { id })
+        );
+    }
+
+    #[test]
+    fn drag_out_is_emitted_while_the_mouse_is_still_held() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        let id = push_and_settle(&ctx, &mut app, &handle);
+        let card = app.stack.frame_of(id, &Motion::at_ms(4_000)).unwrap();
+        let origin = Pos2::new(card.rect.left() + 24.0, card.rect.center().y);
+        let committed = origin + Vec2::new(240.0, 0.0);
+
+        run_frame(
+            &ctx,
+            &mut app,
+            4.1,
+            vec![
+                egui::Event::PointerMoved(origin),
+                pointer_button(origin, true),
+            ],
+        );
+        run_frame(
+            &ctx,
+            &mut app,
+            4.2,
+            vec![egui::Event::PointerMoved(committed)],
+        );
+
+        let events = handle.drain_events();
+        assert!(events.iter().any(
+            |event| matches!(event, OverlayEvent::DragStarted { id: found, .. } if *found == id)
+        ));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, OverlayEvent::DragOut { id: found, .. } if *found == id)
+            ),
+            "native drag commitment must precede the pointer-up event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_every_resident_card() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        let id = push_and_settle(&ctx, &mut app, &handle);
+
+        run_frame(
+            &ctx,
+            &mut app,
+            4.1,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert!(app.stack.is_empty());
+        assert!(handle.drain_events().contains(&OverlayEvent::Dismissed {
+            id,
+            reason: DismissReason::Programmatic,
+        }));
+    }
+
+    #[test]
+    fn successful_action_dismissal_reports_acted() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        let id = push_and_settle(&ctx, &mut app, &handle);
+
+        handle.dismiss_after_action(id);
+        run_frame(&ctx, &mut app, 4.1, Vec::new());
+
+        assert!(handle.drain_events().contains(&OverlayEvent::Dismissed {
+            id,
+            reason: DismissReason::Acted,
+        }));
+    }
+
+    #[test]
+    fn unpinning_reconciles_over_capacity_only_after_persistence_acknowledges_it() {
+        let roomy = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 1_000.0));
+        let (ctx, mut app, handle) = test_overlay(roomy, None);
+        handle.push(CaptureRequest::new(
+            "One.png",
+            Provenance::Display,
+            (100, 100),
+        ));
+        handle.push(CaptureRequest::new(
+            "Two.png",
+            Provenance::Display,
+            (100, 100),
+        ));
+        run_frame(&ctx, &mut app, 0.0, Vec::new());
+        let ids: Vec<_> = app.stack.cards().iter().map(|card| card.id()).collect();
+        for id in &ids {
+            app.content.get_mut(id).unwrap().pinned = true;
+            app.stack
+                .set_auto_close_paused(*id, true, &Motion::at_ms(0));
+        }
+
+        app.set_geometry(
+            OverlayGeometry::new(rect(0.0, 0.0, 640.0, 300.0)),
+            &ctx,
+            &Motion::at_ms(4_000),
+        );
+        assert_eq!(app.stack.capacity(), 1);
+        assert_eq!(app.stack.len(), 2);
+        let _ = handle.drain_events();
+
+        app.handle_action(ids[1], CardAction::Pin, &Motion::at_ms(4_100));
+
+        assert_eq!(app.stack.len(), 2);
+        assert!(app.content.get(&ids[1]).unwrap().pinned);
+        let events = handle.drain_events();
+        assert!(events.contains(&OverlayEvent::PinRequested {
+            id: ids[1],
+            pinned: false,
+        }));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            OverlayEvent::Dismissed {
+                reason: DismissReason::Overflow,
+                ..
+            }
+        )));
+
+        handle.set_pinned(ids[1], false);
+        run_frame(&ctx, &mut app, 4.2, Vec::new());
+
+        assert_eq!(app.stack.len(), 1);
+        assert_eq!(app.stack.slot_of(ids[0]), Some(0));
+        let events = handle.drain_events();
+        assert!(events.contains(&OverlayEvent::Dismissed {
+            id: ids[1],
+            reason: DismissReason::Overflow,
+        }));
+    }
+
+    #[test]
+    fn pin_acknowledgement_updates_a_recent_card_before_restore() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        let id = push_and_settle(&ctx, &mut app, &handle);
+
+        handle.dismiss(id);
+        run_frame(&ctx, &mut app, 4.1, Vec::new());
+        let _ = handle.drain_events();
+
+        handle.restore_recent();
+        handle.set_pinned(id, true);
+        run_frame(&ctx, &mut app, 4.2, Vec::new());
+
+        let restored = handle
+            .drain_events()
+            .into_iter()
+            .find_map(|event| match event {
+                OverlayEvent::Restored { id } => Some(id),
+                _ => None,
+            })
+            .expect("the recent capture should restore");
+        assert!(app.content.get(&restored).unwrap().pinned);
+    }
+
+    #[test]
+    fn temporary_hide_preserves_cards_and_uses_the_visibility_hook() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let visibility: VisibilityHook = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |visible| calls.lock().unwrap().push(visible))
+        };
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, Some(visibility));
+        let id = push_and_settle(&ctx, &mut app, &handle);
+
+        handle.set_hidden(true);
+        run_frame(&ctx, &mut app, 4.1, Vec::new());
+        assert_eq!(app.stack.slot_of(id), Some(0));
+        handle.set_hidden(false);
+        run_frame(&ctx, &mut app, 4.2, Vec::new());
+
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+        assert_eq!(app.stack.slot_of(id), Some(0));
+    }
+
+    #[test]
+    fn recently_closed_capture_restores_with_a_fresh_overlay_identity() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        let original = push_and_settle(&ctx, &mut app, &handle);
+
+        handle.dismiss(original);
+        run_frame(&ctx, &mut app, 4.1, Vec::new());
+        assert!(app.stack.is_empty());
+        assert_eq!(app.recent.len(), 1);
+        let _ = handle.drain_events();
+
+        handle.restore_recent();
+        run_frame(&ctx, &mut app, 4.2, Vec::new());
+
+        let restored = app.stack.cards()[0].id();
+        assert_ne!(restored, original);
+        assert_eq!(app.content[&restored].name, "Shot.png");
+        assert!(
+            handle
+                .drain_events()
+                .contains(&OverlayEvent::Restored { id: restored })
+        );
+    }
+
+    #[test]
+    fn a_historyless_capture_is_not_offered_for_restoration_after_cache_release() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        handle.push(
+            CaptureRequest::new("Ephemeral.png", Provenance::Display, (100, 100))
+                .with_restorable(false),
+        );
+        run_frame(&ctx, &mut app, 0.0, Vec::new());
+        let id = app.stack.cards()[0].id();
+        run_frame(&ctx, &mut app, 4.0, Vec::new());
+
+        handle.dismiss(id);
+        run_frame(&ctx, &mut app, 4.1, Vec::new());
+        assert!(app.recent.is_empty());
+
+        handle.restore_recent();
+        run_frame(&ctx, &mut app, 4.2, Vec::new());
+        assert!(app.stack.is_empty());
+    }
+
+    #[test]
+    fn temporary_hide_pauses_auto_close_until_the_stack_is_shown_again() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        handle.set_auto_close(Some(1.0));
+        handle.push(CaptureRequest::new(
+            "Shot.png",
+            Provenance::Display,
+            (1920, 1080),
+        ));
+        run_frame(&ctx, &mut app, 0.0, Vec::new());
+        let id = app.stack.cards()[0].id();
+        run_frame(&ctx, &mut app, 0.4, Vec::new());
+
+        handle.set_hidden(true);
+        run_frame(&ctx, &mut app, 0.5, Vec::new());
+        assert_eq!(app.stack.slot_of(id), Some(0));
+
+        handle.set_hidden(false);
+        app.service_hidden(&ctx);
+        assert!(!app.hidden, "the logic-only path must show the panel");
+        run_frame(&ctx, &mut app, 20.0, Vec::new());
+        assert_eq!(
+            app.stack.slot_of(id),
+            Some(0),
+            "a stale hidden clock must not expire the card on first paint"
+        );
+        run_frame(&ctx, &mut app, 20.999, Vec::new());
+        assert_eq!(app.stack.slot_of(id), Some(0));
+        run_frame(&ctx, &mut app, 21.0, Vec::new());
+        assert!(app.stack.is_empty());
+    }
+
+    #[test]
+    fn geometry_resizes_before_repositioning_the_window() {
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 640.0, 480.0));
+        let (ctx, mut app, handle) = test_overlay(geometry, None);
+        handle.set_geometry(OverlayGeometry::new(rect(100.0, 50.0, 800.0, 600.0)));
+
+        let output = run_frame(&ctx, &mut app, 0.0, Vec::new());
+        let commands = &output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .commands;
+        let resize = commands
+            .iter()
+            .position(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))
+            .expect("resize command");
+        let reposition = commands
+            .iter()
+            .position(|command| matches!(command, egui::ViewportCommand::OuterPosition(_)))
+            .expect("position command");
+
+        assert!(resize < reposition);
+    }
+
+    #[test]
     fn handle_queues_before_a_window_exists() {
         let h = OverlayHandle::new();
         assert!(!h.is_attached());
@@ -1336,7 +2106,8 @@ mod tests {
 
     #[test]
     fn incoming_captures_cannot_move_a_pending_native_drag_source() {
-        let (mut overlay, ctx, handle) = test_overlay();
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 1_440.0, 900.0));
+        let (ctx, mut overlay, handle) = test_overlay(geometry, None);
         let motion = Motion::at_ms(1_000);
         for _ in 0..overlay.stack.capacity() {
             overlay.stack.push(&motion);
@@ -1349,13 +2120,13 @@ mod tests {
             (100, 50),
         ));
 
-        overlay.ingest(&motion);
+        overlay.ingest(&ctx, &motion);
         assert_eq!(overlay.stack.slot_of(source), Some(0));
         assert_eq!(handle.shared.inbox.lock().unwrap().len(), 1);
 
         handle.finish_drag(source, false);
         overlay.run_commands(&ctx, &motion);
-        overlay.ingest(&motion);
+        overlay.ingest(&ctx, &motion);
 
         assert_eq!(
             overlay.stack.slot_of(source),

@@ -84,6 +84,9 @@ pub const SETTING_BINDINGS: &[(&str, Action)] = &[
     ),
 ];
 
+const OVERLAY_ESCAPE_ACCELERATOR: &str = "Escape";
+const OVERLAY_ESCAPE_ACTION: &str = "overlay-dismiss-all";
+
 /// Overrides the whole binding table, as `accelerator=action-id` pairs.
 ///
 /// e.g. `SCROZZ_GUI_HOTKEYS="Ctrl+Alt+P=capture.fullscreen"`. Empty disables
@@ -106,6 +109,51 @@ pub const DEADLINE_ENV: &str = "SCROZZ_GUI_TIMEOUT_MS";
 /// The end-to-end path without touching the keyboard.
 pub const AUTOCAPTURE_ENV: &str = "SCROZZ_GUI_CAPTURE_ON_START";
 
+/// Card-size multiplier (`0.5..=2.0`).
+pub const CARD_SCALE_ENV: &str = "SCROZZ_GUI_CARD_SCALE";
+
+/// Stack inset from the selected display's work-area edges, in points.
+pub const STACK_MARGIN_ENV: &str = "SCROZZ_GUI_STACK_MARGIN";
+
+/// Inactivity interval in milliseconds. `0` disables auto-close.
+pub const AUTO_CLOSE_ENV: &str = "SCROZZ_GUI_AUTO_CLOSE_MS";
+
+/// Which display supplies the overlay work area: `active` or `primary`.
+pub const DISPLAY_ENV: &str = "SCROZZ_GUI_DISPLAY";
+
+/// How the capture stack is sized and placed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayConfig {
+    /// Multiplier for card size and spacing.
+    pub card_scale: f32,
+    /// Inset from the work-area edges.
+    pub stack_margin: f32,
+    /// Inactivity interval; `None` keeps unpinned cards open.
+    pub auto_close: Option<Duration>,
+    /// Display selection policy.
+    pub display: OverlayDisplay,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            card_scale: 1.0,
+            stack_margin: 16.0,
+            auto_close: Some(Duration::from_secs(8)),
+            display: OverlayDisplay::Active,
+        }
+    }
+}
+
+/// Which display hosts the transient capture stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayDisplay {
+    /// Follow the display containing the pointer.
+    Active,
+    /// Stay on the menu-bar/primary display.
+    Primary,
+}
+
 /// How the GUI was asked to run.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -121,6 +169,8 @@ pub struct Config {
     pub capture_on_start: Option<CaptureKind>,
     /// Source-image retention applied by the history worker.
     pub retention_policy: RetentionPolicy,
+    /// Capture-stack size, position, timeout, and display behavior.
+    pub overlay: OverlayConfig,
 }
 
 impl Default for Config {
@@ -135,6 +185,7 @@ impl Default for Config {
             deadline: None,
             capture_on_start: None,
             retention_policy: RetentionPolicy::default(),
+            overlay: OverlayConfig::default(),
         }
     }
 }
@@ -168,6 +219,30 @@ impl Config {
                 "window" => Some(CaptureKind::Window),
                 "scrolling" => Some(CaptureKind::Scrolling),
                 _ => Some(CaptureKind::Fullscreen),
+            };
+        }
+        if let Ok(raw) = std::env::var(CARD_SCALE_ENV)
+            && let Ok(scale) = raw.parse::<f32>()
+            && scale.is_finite()
+        {
+            config.overlay.card_scale = scale.clamp(0.5, 2.0);
+        }
+        if let Ok(raw) = std::env::var(STACK_MARGIN_ENV)
+            && let Ok(margin) = raw.parse::<f32>()
+            && margin.is_finite()
+        {
+            config.overlay.stack_margin = margin.clamp(0.0, 256.0);
+        }
+        if let Ok(raw) = std::env::var(AUTO_CLOSE_ENV)
+            && let Ok(ms) = raw.parse::<u64>()
+        {
+            config.overlay.auto_close = (ms > 0).then(|| Duration::from_millis(ms));
+        }
+        if let Ok(raw) = std::env::var(DISPLAY_ENV) {
+            config.overlay.display = if raw.eq_ignore_ascii_case("primary") {
+                OverlayDisplay::Primary
+            } else {
+                OverlayDisplay::Active
             };
         }
 
@@ -225,6 +300,7 @@ impl Config {
                 max_image_bytes: u64::MAX,
                 max_image_age: scrozz_store::RetentionWindow::Forever,
             },
+            overlay: OverlayConfig::default(),
         }
     }
 }
@@ -269,6 +345,10 @@ pub struct App {
     history: Arc<Mutex<HistoryViewModel>>,
     pending_drags: VecDeque<PendingDrag>,
     pending_editors: VecDeque<(CaptureId, Document)>,
+    escape_registered: bool,
+    escape_retry_at: Option<Instant>,
+    overlay_hidden: bool,
+    native_drag_active: bool,
 }
 
 struct WindowPickerSession {
@@ -374,6 +454,10 @@ impl App {
             history: Arc::new(Mutex::new(HistoryViewModel::new(Timestamp::now()))),
             pending_drags: VecDeque::new(),
             pending_editors: VecDeque::new(),
+            escape_registered: false,
+            escape_retry_at: None,
+            overlay_hidden: false,
+            native_drag_active: false,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -405,6 +489,7 @@ impl App {
         self.drain_pipeline();
         self.drain_cards();
         self.drain_history();
+        self.reconcile_escape_binding();
 
         Tick::Continue
     }
@@ -444,6 +529,10 @@ impl App {
         }
 
         for id in pending {
+            if id == OVERLAY_ESCAPE_ACTION {
+                self.surface.dismiss_all();
+                continue;
+            }
             if let Some(action) = Action::from_id(&id) {
                 self.perform(action);
             } else {
@@ -534,6 +623,7 @@ impl App {
                         self.pipeline.post(Job::Release(card_id));
                         self.note(format!("a card could not be shown: {err}"));
                     } else {
+                        self.ensure_escape_binding();
                         self.note(summary);
                     }
                     if history_changed {
@@ -547,6 +637,7 @@ impl App {
                         self.pipeline.post(Job::Release(card_id));
                         self.note(format!("a restored card could not be shown: {err}"));
                     } else {
+                        self.ensure_escape_binding();
                         self.note(format!("restored {summary}"));
                     }
                 }
@@ -588,7 +679,23 @@ impl App {
                         self.pipeline.cancel_window(card);
                     }
                 }
-                Outcome::Done { card, detail } => {
+                Outcome::Done {
+                    card,
+                    detail,
+                    dismiss,
+                } => {
+                    if dismiss {
+                        self.surface.dismiss_after_action(card);
+                        self.pipeline.post(Job::Release(card));
+                    }
+                    self.note(format!("{card} {detail}"));
+                }
+                Outcome::PinUpdated {
+                    card,
+                    pinned,
+                    detail,
+                } => {
+                    self.surface.set_pinned(card, pinned);
                     self.note(format!("{card} {detail}"));
                 }
                 Outcome::Refused { card, error } => {
@@ -692,20 +799,54 @@ impl App {
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
                 }
-                CardEvent::Drag { id, rect, pointer } => {
+                CardEvent::DragStarted(_) => {
+                    // Native drag-out starts only after directional intent commits.
+                }
+                CardEvent::DragOut { id, rect, pointer } => {
+                    if !self.release_escape_binding() {
+                        self.surface.finish_drag(id, false);
+                        self.note(format!(
+                            "{id} could not start drag-out while the Escape binding remained active"
+                        ));
+                        continue;
+                    }
                     if !self.pipeline.post(Job::Drag {
                         card: id,
                         geometry: DragGeometry { rect, pointer },
                     }) {
                         self.surface.finish_drag(id, false);
+                        self.ensure_escape_binding();
                         self.note("the capture worker has gone");
+                    } else {
+                        self.native_drag_active = true;
                     }
                 }
-                CardEvent::Collapse(id) => {
-                    self.note(format!("{id}: capture stack collapsed"));
+                CardEvent::Collapse(_) | CardEvent::DockCollapsed => {
+                    self.note("capture stack collapsed");
+                }
+                CardEvent::DockExpanded => {
+                    self.note("capture stack expanded");
+                }
+                CardEvent::Emptied => {
+                    self.release_escape_binding();
+                    self.note("capture stack emptied");
+                }
+                CardEvent::Restored(id) => {
+                    self.ensure_escape_binding();
+                    self.note(format!("{id} restored"));
+                }
+                CardEvent::VisibilityChanged { hidden } => {
+                    self.overlay_hidden = hidden;
+                    self.reconcile_escape_binding();
                 }
                 CardEvent::Open(id) => {
                     self.pipeline.post(Job::OpenCard(id));
+                }
+                CardEvent::Upload(id) => {
+                    self.pipeline.post(Job::Upload(id));
+                }
+                CardEvent::Pin { id, pinned } => {
+                    self.pipeline.post(Job::Pin { card: id, pinned });
                 }
             }
         }
@@ -741,6 +882,68 @@ impl App {
         }
     }
 
+    /// Drains interactions emitted while the overlay was drawing this frame.
+    pub(super) fn drain_overlay_events(&mut self) {
+        self.drain_cards();
+        self.reconcile_escape_binding();
+    }
+
+    fn reconcile_escape_binding(&mut self) {
+        if self.overlay_hidden || self.surface.is_empty() || self.native_drag_active {
+            let _ = self.release_escape_binding();
+        } else {
+            self.ensure_escape_binding();
+        }
+    }
+
+    fn ensure_escape_binding(&mut self) {
+        if self.escape_registered
+            || self.surface.is_empty()
+            || self.native_drag_active
+            || self.overlay_hidden
+            || self
+                .escape_retry_at
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+        let hotkey = Hotkey {
+            accelerator: OVERLAY_ESCAPE_ACCELERATOR.to_owned(),
+        };
+        match self.hotkeys.register(&hotkey, OVERLAY_ESCAPE_ACTION) {
+            Ok(()) => {
+                self.escape_registered = true;
+                self.escape_retry_at = None;
+            }
+            Err(error) => {
+                self.escape_retry_at = Some(Instant::now() + Duration::from_secs(5));
+                self.note(format!(
+                    "Escape could not dismiss the capture stack: {error}"
+                ));
+            }
+        }
+    }
+
+    fn release_escape_binding(&mut self) -> bool {
+        self.escape_retry_at = None;
+        if !self.escape_registered {
+            return true;
+        }
+        let hotkey = Hotkey {
+            accelerator: OVERLAY_ESCAPE_ACCELERATOR.to_owned(),
+        };
+        match self.hotkeys.unregister(&hotkey) {
+            Ok(()) => {
+                self.escape_registered = false;
+                true
+            }
+            Err(error) => {
+                self.note(format!("Escape binding could not be released: {error}"));
+                false
+            }
+        }
+    }
+
     /// Carries out one action.
     fn perform(&mut self, action: Action) -> Tick {
         tracing::debug!(action = action.id(), "performing");
@@ -754,6 +957,16 @@ impl App {
                 // and has no session to toggle yet. Saying so beats a menu item
                 // that does nothing.
                 self.note("recording is not wired up yet");
+                Tick::Continue
+            }
+            Action::RestoreRecent => {
+                self.surface.restore_recent();
+                self.note("restore-last requested");
+                Tick::Continue
+            }
+            Action::ToggleOverlay => {
+                self.surface.toggle_hidden();
+                self.note("capture stack visibility toggled");
                 Tick::Continue
             }
             Action::OpenHistory => {
@@ -928,6 +1141,7 @@ impl App {
 
     /// Records a native drag, retiring its source only after an accepted drop.
     pub fn drag_finished(&mut self, subject: &DragSubject, outcome: &DragOutcome) {
+        self.native_drag_active = false;
         let detail = match outcome {
             DragOutcome::Accepted(_) => "Capture dragged to another app".to_owned(),
             DragOutcome::Rejected => "The destination did not accept the capture".to_owned(),
@@ -944,6 +1158,7 @@ impl App {
         if let DragSubject::History(_) = subject {
             self.with_history(|history| history.completed(&detail));
         }
+        self.reconcile_escape_binding();
         self.note(detail);
     }
 
@@ -1271,7 +1486,11 @@ mod tests {
     #[test]
     fn copying_a_card_reaches_the_worker_and_comes_back() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Copy(CardId(42)));
+        let card = CardId(42);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        surface.inject(CardEvent::Copy(card));
         app.tick();
 
         // The worker has no bytes for a card it never captured, so the answer
@@ -1279,38 +1498,12 @@ mod tests {
         for _ in 0..200 {
             app.drain_pipeline();
             if app.notes().iter().any(|n| n.contains("card:42 refused")) {
+                assert_eq!(app.showing(), 1, "a failed copy must remain retryable");
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the copy never reached the worker: {:?}", app.notes());
-    }
-
-    #[test]
-    fn dragging_a_card_reaches_the_worker() {
-        let (mut app, surface) = app();
-        surface.inject(CardEvent::Drag {
-            id: CardId(5),
-            rect: scrozz_core::LogicalRect::new(
-                scrozz_core::LogicalPoint::new(10.0, 20.0),
-                scrozz_core::LogicalSize::new(240.0, 160.0),
-            ),
-            pointer: scrozz_core::LogicalPoint::new(100.0, 80.0),
-        });
-        app.tick();
-
-        for _ in 0..200 {
-            app.drain_pipeline();
-            if app
-                .notes()
-                .iter()
-                .any(|note| note.contains("card:5 has no capture to drag"))
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("the drag never reached the worker: {:?}", app.notes());
     }
 
     #[test]
@@ -1338,6 +1531,93 @@ mod tests {
         );
 
         assert_eq!(app.showing(), 0);
+    }
+
+    #[test]
+    fn stack_events_are_recorded_not_swallowed() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::DockCollapsed);
+        surface.inject(CardEvent::DockExpanded);
+        surface.inject(CardEvent::Emptied);
+        app.tick();
+        let notes = app.notes().join("\n");
+        assert!(notes.contains("stack collapsed"), "{notes}");
+        assert!(notes.contains("stack expanded"), "{notes}");
+        assert!(notes.contains("stack emptied"), "{notes}");
+    }
+
+    #[test]
+    fn escape_is_bound_only_while_the_stack_has_cards() {
+        let (mut app, surface) = app();
+        let card = CardId(9);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+
+        app.ensure_escape_binding();
+        let escape = Accelerator::parse(OVERLAY_ESCAPE_ACCELERATOR).expect("Escape parses");
+        assert!(app.escape_registered);
+        assert_eq!(app.hotkeys.action_for(&escape), Some(OVERLAY_ESCAPE_ACTION));
+
+        surface.inject(CardEvent::Dismiss(card));
+        surface.inject(CardEvent::Emptied);
+        app.drain_cards();
+
+        assert!(!app.escape_registered);
+        assert_eq!(app.hotkeys.action_for(&escape), None);
+    }
+
+    #[test]
+    fn an_escape_registration_retry_resets_after_the_stack_empties() {
+        let (mut app, surface) = app();
+        app.escape_retry_at = Some(Instant::now() + Duration::from_secs(5));
+
+        surface.inject(CardEvent::Emptied);
+        app.drain_cards();
+
+        assert!(app.escape_retry_at.is_none());
+    }
+
+    #[test]
+    fn restoring_after_emptying_the_stack_reinstates_escape() {
+        let (mut app, surface) = app();
+        let card = CardId(11);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        app.ensure_escape_binding();
+
+        surface.inject(CardEvent::Dismiss(card));
+        surface.inject(CardEvent::Emptied);
+        app.drain_cards();
+        assert!(!app.escape_registered);
+
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        surface.inject(CardEvent::Restored(card));
+        app.drain_cards();
+
+        assert!(app.escape_registered);
+    }
+
+    #[test]
+    fn hiding_the_stack_releases_escape_until_it_is_visible_again() {
+        let (mut app, surface) = app();
+        let card = CardId(12);
+        app.surface
+            .present(Card::placeholder(card, CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        app.ensure_escape_binding();
+        assert!(app.escape_registered);
+
+        surface.inject(CardEvent::VisibilityChanged { hidden: true });
+        app.drain_cards();
+        assert!(!app.escape_registered);
+
+        surface.inject(CardEvent::VisibilityChanged { hidden: false });
+        app.drain_cards();
+        assert!(app.escape_registered);
     }
 
     #[test]

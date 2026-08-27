@@ -68,6 +68,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use scrozz_core::{Error, Result};
 
@@ -2008,13 +2009,18 @@ impl SceneRegistry {
     #[must_use]
     pub fn production() -> Self {
         let mut me = Self::placeholders();
-        // WIRING POINT — as each surface lands, override its placeholder here:
-        //
-        //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
-        //   me.register(Scenario::DockCollapsed, Box::new(crate::dock::DockScene));
-        //
-        // Until then every scenario renders a watermarked stand-in, and
-        // `Profile::Store` refuses to render those at all.
+        for scenario in [
+            Scenario::StackSingle,
+            Scenario::StackEntering,
+            Scenario::StackFull,
+            Scenario::StackOverflowEvicting,
+            Scenario::StackDismissing,
+            Scenario::StackDragging,
+            Scenario::DockCollapsing,
+            Scenario::DockCollapsed,
+        ] {
+            me.register(scenario, Box::new(StackScene));
+        }
         me.register(
             Scenario::SettingsForm,
             Box::new(crate::settings_view::SettingsScene::new()),
@@ -2075,6 +2081,198 @@ impl SceneRegistry {
 impl Default for SceneRegistry {
     fn default() -> Self {
         Self::production()
+    }
+}
+
+// ===========================================================================
+// The production capture-stack scene
+// ===========================================================================
+
+/// The real capture stack, driven from a frozen [`Fixture`] and [`VirtualClock`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StackScene;
+
+impl StackScene {
+    fn motion(ctx: &SceneCtx<'_>, seconds: f64) -> crate::motion::Motion {
+        crate::motion::Motion::at(seconds).with_reduce_motion(ctx.reduce_motion)
+    }
+
+    fn metrics(area: egui::Rect, slots: usize) -> crate::stack::CardMetrics {
+        let base = crate::stack::CardMetrics::default();
+        let slots = slots.max(1) as f32;
+        let footprint = slots * base.height + (slots - 1.0) * base.gap + 2.0 * base.margin;
+        base.scaled((area.height() / footprint).min(1.0))
+    }
+
+    fn add(
+        stack: &mut crate::stack::CaptureStack,
+        content: &mut HashMap<crate::stack::CardId, CardState>,
+        state: &CardState,
+        motion: &crate::motion::Motion,
+    ) -> crate::stack::CardId {
+        let id = stack.push(motion);
+        content.insert(id, state.clone());
+        id
+    }
+
+    fn build(
+        ctx: &SceneCtx<'_>,
+        area: egui::Rect,
+    ) -> (
+        crate::stack::CaptureStack,
+        HashMap<crate::stack::CardId, CardState>,
+        crate::motion::Motion,
+    ) {
+        let fixture = ctx.fixture;
+        let now = Self::motion(ctx, ctx.clock.as_secs_f64());
+        let settled = Self::motion(ctx, -10.0);
+        let start = Self::motion(ctx, 0.0);
+        let layout = crate::stack::StackLayout::new(area, Self::metrics(area, fixture.slot_count));
+        let mut stack = crate::stack::CaptureStack::new(layout, crate::stack::Timing::default());
+        let mut content = HashMap::new();
+        let mut ids = Vec::with_capacity(fixture.cards.len());
+
+        match fixture.gesture {
+            Gesture::Entering { slot } => {
+                for state in &fixture.cards {
+                    let at = if state.slot == slot { &start } else { &settled };
+                    ids.push(Self::add(&mut stack, &mut content, state, at));
+                }
+            }
+            Gesture::Overflowing { .. } => {
+                for state in &fixture.cards {
+                    ids.push(Self::add(&mut stack, &mut content, state, &settled));
+                }
+                if let Some(newest) = fixture.cards.last() {
+                    let mut arriving = newest.clone();
+                    arriving.title = format!("Newest {}", newest.title);
+                    let id = stack.push(&start);
+                    content.insert(id, arriving);
+                }
+            }
+            _ => {
+                for state in &fixture.cards {
+                    ids.push(Self::add(&mut stack, &mut content, state, &settled));
+                }
+            }
+        }
+
+        match fixture.gesture {
+            Gesture::Dismissing { slot } => {
+                if let Some(id) = ids.get(slot) {
+                    stack.dismiss(*id, &start);
+                }
+            }
+            Gesture::Dragging { slot, offset } => {
+                if let Some(id) = ids.get(slot) {
+                    let origin = stack.layout().slot_rect(slot).center();
+                    if stack.begin_drag(*id, origin, &start) {
+                        let progress = if ctx.reduce_motion {
+                            1.0
+                        } else {
+                            (ctx.clock.as_secs_f32() / 0.32).clamp(0.0, 1.0)
+                        };
+                        stack.drag_to(
+                            origin + egui::vec2(offset.0 * progress, offset.1 * progress),
+                            &now,
+                        );
+                    }
+                }
+            }
+            Gesture::Collapsing => stack.collapse(&start),
+            Gesture::Expanding => {
+                stack.collapse(&settled);
+                stack.expand(&start);
+            }
+            _ => {}
+        }
+        if fixture.docked {
+            stack.collapse(&settled);
+        }
+        stack.advance(&now);
+        (stack, content, now)
+    }
+
+    fn thumbnail(seed: u64) -> egui::ColorImage {
+        const WIDTH: usize = 96;
+        const HEIGHT: usize = 60;
+        let a = [(seed >> 8) as u8, (seed >> 24) as u8, (seed >> 40) as u8];
+        let b = [(seed >> 16) as u8, (seed >> 32) as u8, (seed >> 48) as u8];
+        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let t = (x + y) as f32 / (WIDTH + HEIGHT - 2) as f32;
+                let mix = |left: u8, right: u8| {
+                    (f32::from(left) + (f32::from(right) - f32::from(left)) * t) as u8
+                };
+                pixels.push(egui::Color32::from_rgb(
+                    mix(a[0], b[0]),
+                    mix(a[1], b[1]),
+                    mix(a[2], b[2]),
+                ));
+            }
+        }
+        egui::ColorImage::new([WIDTH, HEIGHT], pixels)
+    }
+}
+
+impl Scene for StackScene {
+    fn name(&self) -> &str {
+        "capture-stack"
+    }
+
+    fn setup(&self, ctx: &egui::Context) {
+        crate::theme::install_fonts(ctx);
+    }
+
+    fn ui(&self, ui: &mut egui::Ui, ctx: &SceneCtx<'_>) {
+        let (stack, content, motion) = Self::build(ctx, ui.max_rect());
+        let appearance = match ctx.theme {
+            egui::Theme::Dark => crate::theme::Appearance::Dark,
+            egui::Theme::Light => crate::theme::Appearance::Light,
+        };
+        let theme = crate::theme::Theme::for_appearance(appearance);
+        let icons_id = egui::Id::new("harness.stack.icons");
+        let icons = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<Arc<crate::icons::IconStore>>(icons_id))
+            .unwrap_or_else(|| {
+                let icons = Arc::new(crate::icons::IconStore::new(ui.ctx()));
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(icons_id, Arc::clone(&icons)));
+                icons
+            });
+        let surface = crate::paint::Surface::still(&theme, &icons, motion);
+        let mut textures = Vec::with_capacity(content.len());
+
+        if !stack.dock().is_collapsed() {
+            for frame in stack.frame(&motion) {
+                let Some(state) = content.get(&frame.id) else {
+                    continue;
+                };
+                let texture = ui.ctx().load_texture(
+                    format!(
+                        "harness.stack.{}.{}.{}",
+                        frame.id.0, state.thumb_seed, ctx.seed
+                    ),
+                    Self::thumbnail(state.thumb_seed ^ ctx.seed),
+                    egui::TextureOptions::LINEAR,
+                );
+                let provenance = if state.slot % 3 == 1 {
+                    scrozz_core::Provenance::Window
+                } else {
+                    scrozz_core::Provenance::Display
+                };
+                let card = crate::card::CardContent::new(&state.title, state.source_px, provenance)
+                    .with_texture(texture.id());
+                crate::card::draw_card(ui, &surface, &frame, &card);
+                textures.push(texture);
+            }
+        }
+        crate::stack::dock::draw(ui, &surface, stack.dock(), &motion);
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("harness.stack.textures"), textures);
+        });
     }
 }
 

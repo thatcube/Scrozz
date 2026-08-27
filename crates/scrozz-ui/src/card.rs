@@ -39,7 +39,10 @@
 //! a human looked at it.
 
 use egui::epaint::{Mesh, Vertex};
-use egui::{Align2, Color32, Id, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{
+    Color32, Id, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType,
+    pos2, vec2,
+};
 use scrozz_core::Provenance;
 
 use crate::icons::Icon;
@@ -176,6 +179,8 @@ pub struct CardContent<'a> {
     pub source_badge: Option<&'a str>,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
+    /// Whether the owning history model currently protects this capture.
+    pub pinned: bool,
 }
 
 impl<'a> CardContent<'a> {
@@ -188,6 +193,7 @@ impl<'a> CardContent<'a> {
             provenance,
             source_badge: None,
             texture: None,
+            pinned: false,
         }
     }
 
@@ -202,6 +208,13 @@ impl<'a> CardContent<'a> {
     #[must_use]
     pub fn with_texture(mut self, texture: egui::TextureId) -> Self {
         self.texture = Some(texture);
+        self
+    }
+
+    /// Marks the capture as pinned for its control label.
+    #[must_use]
+    pub const fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
         self
     }
 
@@ -306,6 +319,14 @@ pub fn body_id(card: CardId) -> Id {
     Id::new(("scrozz.card.body", card))
 }
 
+fn accessible_name(content: &CardContent<'_>) -> String {
+    format!(
+        "Capture {}, {}. Activate to annotate. Drag right or up to share.",
+        content.name,
+        content.dimensions()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
@@ -330,6 +351,8 @@ pub fn draw_card(
     // to the chrome, and so the card sits *under* its own buttons in the layer
     // order rather than swallowing their clicks.
     let body = ui.interact(rect, body_id(frame.id), Sense::click_and_drag());
+    let accessible_name = accessible_name(content);
+    body.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible_name.clone()));
 
     if alpha <= 0.001 {
         return CardResponse {
@@ -395,7 +418,15 @@ pub fn draw_card(
         );
     }
 
-    let action = draw_chrome(ui, surface, frame, chrome, capture, alpha * reveal);
+    let action = draw_chrome(
+        ui,
+        surface,
+        frame,
+        chrome,
+        capture,
+        alpha * reveal,
+        content.pinned,
+    );
 
     CardResponse {
         body,
@@ -486,20 +517,20 @@ fn draw_caption(
         paint::bottom_scrim(painter, capture, CAPTION_H, chrome.overlay_radius, peak);
     }
 
+    const SIDE_INSET: f32 = 13.0;
+    const LABEL_GAP: f32 = 8.0;
+    const MIN_NAME_WIDTH: f32 = 56.0;
+
     let cy = capture.bottom() - 15.0;
-    painter.text(
-        pos2(capture.left() + 13.0, cy),
-        Align2::LEFT_CENTER,
-        content.name,
-        surface.font(Text::Label),
-        fade(Color32::from_rgb(255, 255, 255), alpha * 0.925),
-    );
-    painter.text(
-        pos2(capture.right() - 13.0, cy),
-        Align2::RIGHT_CENTER,
+    let left = capture.left() + SIDE_INSET;
+    let right = capture.right() - SIDE_INSET;
+    let available = (right - left).max(0.0);
+    let name_color = fade(Color32::from_rgb(255, 255, 255), alpha * 0.925);
+    let detail_color = fade(Color32::from_rgb(255, 255, 255), alpha * 0.59);
+    let detail = painter.layout_no_wrap(
         content.dimensions(),
         surface.font(Text::Caption),
-        fade(Color32::from_rgb(255, 255, 255), alpha * 0.59),
+        detail_color,
     );
     if let Some(badge) = content.source_badge {
         let font = surface.font(Text::Caption);
@@ -516,6 +547,32 @@ fn draw_caption(
         );
         painter.galley(badge_rect.min + vec2(6.0, 2.5), galley, color);
     }
+
+    let show_detail = available >= MIN_NAME_WIDTH + LABEL_GAP + detail.size().x;
+    let name_width = if show_detail {
+        available - LABEL_GAP - detail.size().x
+    } else {
+        available
+    };
+    let mut name_job = egui::text::LayoutJob::simple(
+        content.name.to_owned(),
+        surface.font(Text::Label),
+        name_color,
+        name_width,
+    );
+    name_job.wrap.max_rows = 1;
+    name_job.wrap.break_anywhere = true;
+    name_job.wrap.overflow_character = Some('…');
+    let name = painter.layout_job(name_job);
+    painter.galley(pos2(left, cy - name.size().y * 0.5), name, name_color);
+
+    if show_detail {
+        painter.galley(
+            pos2(right - detail.size().x, cy - detail.size().y * 0.5),
+            detail,
+            detail_color,
+        );
+    }
 }
 
 /// The hover chrome: a scrim, two primary pills, four quiet corner icons.
@@ -530,6 +587,7 @@ fn draw_chrome(
     chrome: CardChrome,
     capture: Rect,
     opacity: f32,
+    pinned: bool,
 ) -> Option<CardAction> {
     if opacity <= 0.004 {
         return None;
@@ -607,7 +665,11 @@ fn draw_chrome(
             r,
             control_id(frame.id, action),
             action.icon(),
-            action.label(),
+            if action == CardAction::Pin && pinned {
+                "Unpin"
+            } else {
+                action.label()
+            },
             ControlState::new(),
             settle,
         );
@@ -758,5 +820,15 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, control_id(CardId(8), CardAction::Copy));
         assert_ne!(a, control_id(CardId(7), CardAction::Save));
+    }
+
+    #[test]
+    fn the_card_body_accessible_name_identifies_content_and_drag_action() {
+        let content = CardContent::new("Shot.png", (1920, 1080), Provenance::Display);
+        let label = accessible_name(&content);
+        assert!(label.contains("Shot.png"), "{label}");
+        assert!(label.contains("1920 × 1080"), "{label}");
+        assert!(label.contains("Activate to annotate"), "{label}");
+        assert!(label.contains("Drag right or up"), "{label}");
     }
 }
