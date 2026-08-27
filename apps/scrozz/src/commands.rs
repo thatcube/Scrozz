@@ -257,13 +257,12 @@ fn record(args: &RecordArgs) -> CliResult<Report> {
         ));
     }
 
-    let request = scrozz_record::RecordingRequest {
-        target: capture_target(&target)?,
-        microphone: args.microphone,
-        system_audio: args.system_audio,
-        fps: args.fps,
-        show_cursor: args.cursor,
-    };
+    let mut request = scrozz_record::RecordingRequest::new(capture_target(&target)?);
+    request.destination = args.output.clone();
+    request.microphone = args.microphone;
+    request.system_audio = args.system_audio;
+    request.fps = args.fps;
+    request.show_cursor = args.cursor;
     let _session = platform::start_recording(&request)?;
 
     Err(CliError::not_implemented(

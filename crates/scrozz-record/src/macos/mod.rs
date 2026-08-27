@@ -1,0 +1,69 @@
+//! macOS ScreenCaptureKit recording.
+
+mod audio;
+mod content;
+mod error;
+mod mix;
+mod overlay;
+mod pcm;
+mod permission;
+mod plan;
+mod settings;
+mod stream;
+mod timeline;
+mod writer;
+
+use scrozz_core::Result;
+
+use crate::{
+    EngineCapabilities, OverlaySource, RecordingEngine, RecordingRequest, RecordingSession,
+};
+
+pub(crate) const ENGINE_NAME: &str = "macOS ScreenCaptureKit + VideoToolbox";
+
+pub(crate) struct MacEngine;
+
+impl RecordingEngine for MacEngine {
+    fn name(&self) -> &'static str {
+        ENGINE_NAME
+    }
+
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities {
+            video: true,
+            system_audio: true,
+            microphone: true,
+            pause_resume: true,
+            display: true,
+            window: true,
+            region: true,
+            all_displays: true,
+            cursor: true,
+            mp4: true,
+            h264: true,
+            hevc: true,
+            quality: true,
+            resolution: true,
+            ..EngineCapabilities::default()
+        }
+    }
+
+    fn start(&self, request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
+        start(request, None)
+    }
+
+    fn start_with_overlays(
+        &self,
+        request: &RecordingRequest,
+        overlays: Box<dyn OverlaySource>,
+    ) -> Result<Box<dyn RecordingSession>> {
+        start(request, Some(overlays))
+    }
+}
+
+pub(super) fn start(
+    request: &RecordingRequest,
+    overlays: Option<Box<dyn OverlaySource>>,
+) -> Result<Box<dyn RecordingSession>> {
+    stream::start(request, overlays)
+}

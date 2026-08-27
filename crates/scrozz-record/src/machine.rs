@@ -335,8 +335,16 @@ impl RecordingMachine {
             Some(SessionEvent::Warning(message)) => {
                 self.push_warning(message);
             }
+            Some(SessionEvent::Finished(output)) => {
+                self.session = None;
+                self.set_phase(RecordingPhase::Finalising);
+                self.finish_output(output);
+                return;
+            }
             Some(SessionEvent::Failed(error)) => {
-                self.recover_live_failure(error);
+                self.session = None;
+                self.set_phase(RecordingPhase::Finalising);
+                self.enter_failed_arc(error, None, None);
                 return;
             }
             None => {}
@@ -364,31 +372,6 @@ impl RecordingMachine {
                 ));
             }
         }
-    }
-
-    fn recover_live_failure(&mut self, error: Error) {
-        let message = error.to_string();
-        let (partial, recovery_error) = match self.session.take() {
-            Some(session) => match session.stop() {
-                Ok(output) => {
-                    let partial = if output.is_partial() {
-                        Ok(output)
-                    } else {
-                        output.into_partial(format!("capture failed: {message}"))
-                    };
-                    match partial {
-                        Ok(output) => (Some(output), None),
-                        Err(recovery) => (None, Some(recovery.to_string())),
-                    }
-                }
-                Err(recovery) => (None, Some(recovery.to_string())),
-            },
-            None => (
-                None,
-                Some("failed session was already unavailable".to_owned()),
-            ),
-        };
-        self.enter_failed(error, partial, recovery_error);
     }
 
     fn push_warning(&mut self, message: String) {
@@ -446,6 +429,16 @@ impl RecordingMachine {
     ///
     /// Returns [`Error::InvalidRequest`] unless recording or paused.
     pub fn stop(&mut self) -> Result<()> {
+        let session = self.begin_finalising()?;
+        let result = session.stop();
+        self.complete_finalising(result)
+    }
+
+    /// Moves the live native session into an external finalisation worker.
+    ///
+    /// GUI hosts use this to enter `Finalising` immediately without blocking the
+    /// UI thread while a native container flushes.
+    pub fn begin_finalising(&mut self) -> Result<Box<dyn RecordingSession>> {
         if !matches!(
             self.phase,
             RecordingPhase::Recording | RecordingPhase::Paused
@@ -454,38 +447,46 @@ impl RecordingMachine {
         }
         self.set_phase(RecordingPhase::Finalising);
         let Some(session) = self.session.take() else {
-            self.enter_failed(
-                Error::Platform("active recording session disappeared before stop".to_owned()),
-                None,
-                None,
-            );
-            return Ok(());
+            let message = "active recording session disappeared before stop".to_owned();
+            self.enter_failed(Error::Platform(message.clone()), None, None);
+            return Err(Error::Platform(message));
         };
-        match session.stop() {
-            Ok(output) => {
-                if let Err(error) = output.validate() {
-                    self.enter_failed(error, None, None);
-                } else if output.is_partial() {
-                    let reason = output
-                        .partial_reason()
-                        .unwrap_or("recording finalisation failed")
-                        .to_owned();
-                    self.enter_failed(
-                        Error::Codec(format!(
-                            "recording finalisation left partial output: {reason}"
-                        )),
-                        Some(output),
-                        None,
-                    );
-                } else {
-                    self.output = Some(output.clone());
-                    self.set_phase(RecordingPhase::Finished);
-                    self.events.push_back(MachineEvent::Finished(output));
-                }
-            }
+        Ok(session)
+    }
+
+    /// Applies a native finalisation result returned by an external worker.
+    pub fn complete_finalising(&mut self, result: Result<Recording>) -> Result<()> {
+        self.require_phase(
+            RecordingPhase::Finalising,
+            "complete recording finalisation",
+        )?;
+        match result {
+            Ok(output) => self.finish_output(output),
             Err(error) => self.enter_failed(error, None, None),
         }
         Ok(())
+    }
+
+    fn finish_output(&mut self, output: Recording) {
+        if let Err(error) = output.validate() {
+            self.enter_failed(error, None, None);
+        } else if output.is_partial() {
+            let reason = output
+                .partial_reason()
+                .unwrap_or("recording finalisation failed")
+                .to_owned();
+            self.enter_failed(
+                Error::Codec(format!(
+                    "recording finalisation left partial output: {reason}"
+                )),
+                Some(output),
+                None,
+            );
+        } else {
+            self.output = Some(output.clone());
+            self.set_phase(RecordingPhase::Finished);
+            self.events.push_back(MachineEvent::Finished(output));
+        }
     }
 
     fn enter_failed(
@@ -494,9 +495,18 @@ impl RecordingMachine {
         partial: Option<Recording>,
         recovery_error: Option<String>,
     ) {
+        self.enter_failed_arc(Arc::new(error), partial, recovery_error);
+    }
+
+    fn enter_failed_arc(
+        &mut self,
+        error: Arc<Error>,
+        partial: Option<Recording>,
+        recovery_error: Option<String>,
+    ) {
         self.session = None;
         let failure = MachineFailure {
-            error: Arc::new(error),
+            error,
             partial,
             recovery_error,
         };
@@ -699,7 +709,7 @@ mod tests {
 
     use scrozz_core::{DisplayId, Error};
 
-    use crate::engine::{MockEngine, MockPoll, MockSessionPlan};
+    use crate::engine::{MockEngine, MockPoll, MockSessionPlan, MockStop};
 
     use super::*;
 
@@ -860,21 +870,25 @@ mod tests {
     }
 
     #[test]
-    fn live_failure_transitions_immediately_and_attaches_partial_output() {
-        let plan = MockSessionPlan::partial("salvage.mp4", 2.0, "flush failed")
-            .unwrap()
-            .with_polls(vec![MockPoll::new(
-                Some(SessionEvent::Failed(Error::Platform(
-                    "capture device vanished".to_owned(),
-                ))),
+    fn terminal_partial_transitions_immediately_and_attaches_output() {
+        let output =
+            Recording::synthetic_partial("salvage.mp4", 2.0, "test", "capture device vanished")
+                .unwrap();
+        let plan = MockSessionPlan {
+            polls: vec![MockPoll::new(
+                Some(SessionEvent::Finished(output.clone())),
                 Some(2.0),
-            )]);
+            )],
+            stop: MockStop::Output(output),
+            pause_failure: None,
+            resume_failure: None,
+        };
         let mut machine = make_machine(plan);
         machine.begin(target()).unwrap();
         machine.tick(Duration::from_secs(2)).unwrap();
         assert_eq!(machine.phase(), RecordingPhase::Failed);
         let failure = machine.failure().unwrap();
-        assert!(failure.error.to_string().contains("device vanished"));
+        assert!(failure.error.to_string().contains("partial output"));
         assert!(failure.partial.as_ref().unwrap().is_partial());
         assert!(machine.drain_events().any(
             |event| matches!(event, MachineEvent::Failed(failure) if failure.partial.is_some())
@@ -882,26 +896,21 @@ mod tests {
     }
 
     #[test]
-    fn live_failure_reclassifies_complete_recovered_bytes_as_partial() {
+    fn terminal_failure_without_output_has_no_partial() {
         let plan = MockSessionPlan::complete("salvage.mp4", 2.0)
             .unwrap()
             .with_polls(vec![MockPoll::new(
-                Some(SessionEvent::Failed(Error::Platform(
+                Some(SessionEvent::Failed(Arc::new(Error::Platform(
                     "stream disconnected".to_owned(),
-                ))),
+                )))),
                 None,
             )]);
         let mut machine = make_machine(plan);
         machine.begin(target()).unwrap();
         machine.tick(Duration::ZERO).unwrap();
-        let partial = machine.failure().unwrap().partial.as_ref().unwrap();
-        assert!(partial.is_partial());
-        assert!(
-            partial
-                .partial_reason()
-                .unwrap()
-                .contains("stream disconnected")
-        );
+        let failure = machine.failure().unwrap();
+        assert!(failure.partial.is_none());
+        assert!(failure.error.to_string().contains("stream disconnected"));
     }
 
     #[test]
@@ -964,10 +973,7 @@ mod tests {
         let mut settings = settings_without_countdown();
         settings.audio.microphone = true;
         let engine = MockEngine::new(
-            EngineCapabilities {
-                video: true,
-                ..EngineCapabilities::default()
-            },
+            EngineCapabilities::VIDEO,
             MockSessionPlan::complete("unused.mp4", 1.0).unwrap(),
         );
         let mut machine = RecordingMachine::with_engine(Box::new(engine), settings).unwrap();
@@ -1007,10 +1013,7 @@ mod tests {
     #[test]
     fn unsupported_and_failed_pause_leave_recording_active() {
         let engine = MockEngine::new(
-            EngineCapabilities {
-                video: true,
-                ..EngineCapabilities::default()
-            },
+            EngineCapabilities::VIDEO,
             MockSessionPlan::complete("out.mp4", 1.0).unwrap(),
         );
         let mut machine =

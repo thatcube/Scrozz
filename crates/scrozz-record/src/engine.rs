@@ -4,12 +4,17 @@ use std::{collections::VecDeque, sync::Mutex};
 
 use scrozz_core::{Error, Result};
 
-use crate::{Recording, RecordingRequest, RecordingSession, RecordingSettings, SessionEvent};
+use crate::{
+    OverlaySource, Recording, RecordingRequest, RecordingSession, RecordingSettings, SessionEvent,
+    VideoCodec,
+};
 
-/// Features a concrete recording engine actually supports.
+/// Declarative features a concrete recording engine can potentially support.
 ///
-/// Callers query this value and validate every requested feature. A platform
-/// name is never treated as evidence that an API is present.
+/// These facts drive UI enablement and reject impossible requests, but they are
+/// not a live hardware/permission probe. Encoders, endpoints, capture targets,
+/// and permissions can disappear between query and use, so [`RecordingEngine::start`]
+/// remains authoritative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EngineCapabilities {
     /// Can encode video frames.
@@ -26,9 +31,53 @@ pub struct EngineCapabilities {
     pub key_capture: bool,
     /// Can pause and resume an active session.
     pub pause_resume: bool,
+    /// Can record one display.
+    pub display: bool,
+    /// Can record one window.
+    pub window: bool,
+    /// Can crop a rectangular area from a supported source.
+    pub region: bool,
+    /// Can composite every attached display into one output.
+    pub all_displays: bool,
+    /// Can include the pointer when requested.
+    pub cursor: bool,
+    /// Can write MP4 output.
+    pub mp4: bool,
+    /// Supports a hardware H.264 path.
+    pub h264: bool,
+    /// Supports a hardware HEVC path.
+    pub hevc: bool,
+    /// Supports an explicitly enabled AV1 path.
+    pub av1: bool,
+    /// Can apply the shared quality ladder.
+    pub quality: bool,
+    /// Can apply the shared resolution policies.
+    pub resolution: bool,
 }
 
 impl EngineCapabilities {
+    /// Core video capabilities without audio, input observation, or pause.
+    pub const VIDEO: Self = Self {
+        video: true,
+        system_audio: false,
+        microphone: false,
+        camera: false,
+        click_capture: false,
+        key_capture: false,
+        pause_resume: false,
+        display: true,
+        window: true,
+        region: true,
+        all_displays: true,
+        cursor: true,
+        mp4: true,
+        h264: true,
+        hevc: false,
+        av1: false,
+        quality: true,
+        resolution: true,
+    };
+
     /// Every modeled recording feature, useful for a deterministic mock.
     pub const ALL: Self = Self {
         video: true,
@@ -38,6 +87,17 @@ impl EngineCapabilities {
         click_capture: true,
         key_capture: true,
         pause_resume: true,
+        display: true,
+        window: true,
+        region: true,
+        all_displays: true,
+        cursor: true,
+        mp4: true,
+        h264: true,
+        hevc: true,
+        av1: true,
+        quality: true,
+        resolution: true,
     };
 }
 
@@ -55,15 +115,39 @@ pub trait RecordingEngine: Send + Sync {
     ///
     /// Returns an actionable platform, permission, request, or capability error.
     fn start(&self, request: &RecordingRequest) -> Result<Box<dyn RecordingSession>>;
+
+    /// Starts with native pull-based overlays when the engine supports them.
+    ///
+    /// The default is an explicit unsupported result rather than silently
+    /// dropping visible recording features.
+    fn start_with_overlays(
+        &self,
+        request: &RecordingRequest,
+        overlays: Box<dyn OverlaySource>,
+    ) -> Result<Box<dyn RecordingSession>> {
+        let _ = (request, overlays);
+        Err(Error::Unsupported {
+            what: "recording overlays".to_owned(),
+            why: "the selected recording engine does not composite pull-based overlays".to_owned(),
+        })
+    }
 }
 
 /// Detects the native recording engine for the current platform.
 ///
-/// Native branches intentionally have not landed yet. Returning `None` rather
-/// than a mock prevents synthetic output from being reported as a real capture.
+/// Returning `None` rather than a mock prevents synthetic output from being
+/// reported as a real capture.
 #[must_use]
 pub fn detect_native_engine() -> Option<Box<dyn RecordingEngine>> {
-    None
+    #[cfg(target_os = "macos")]
+    {
+        Some(Box::new(crate::macos::MacEngine))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Validates a request and optional rich settings against engine capabilities.
@@ -82,6 +166,36 @@ pub fn validate_capabilities(
         settings.validate()?;
     }
     require(capabilities.video, "video encoding")?;
+    match request.target {
+        scrozz_core::CaptureTarget::Display(_) => {
+            require(capabilities.display, "display recording")?;
+        }
+        scrozz_core::CaptureTarget::Window(_) => {
+            require(capabilities.window, "window recording")?;
+        }
+        scrozz_core::CaptureTarget::Region(_) => {
+            require(capabilities.region, "area recording")?;
+        }
+        scrozz_core::CaptureTarget::AllDisplays => {
+            require(capabilities.all_displays, "all-display recording")?;
+        }
+    }
+    require(
+        !request.show_cursor || capabilities.cursor,
+        "cursor capture",
+    )?;
+    require(capabilities.mp4, "MP4 output")?;
+    require(capabilities.quality, "recording quality")?;
+    require(capabilities.resolution, "recording resolution")?;
+    match request.video_codec {
+        VideoCodec::Auto => require(
+            capabilities.h264 || capabilities.hevc || capabilities.av1,
+            "video encoding",
+        )?,
+        VideoCodec::H264 => require(capabilities.h264, "H.264 encoding")?,
+        VideoCodec::Hevc => require(capabilities.hevc, "HEVC encoding")?,
+        VideoCodec::Av1 => require(capabilities.av1, "AV1 encoding")?,
+    }
     let microphone =
         request.microphone || settings.is_some_and(RecordingSettings::needs_microphone);
     let system_audio =
@@ -270,6 +384,14 @@ impl RecordingEngine for MockEngine {
             engine_elapsed_secs: None,
         }))
     }
+
+    fn start_with_overlays(
+        &self,
+        request: &RecordingRequest,
+        _overlays: Box<dyn OverlaySource>,
+    ) -> Result<Box<dyn RecordingSession>> {
+        self.start(request)
+    }
 }
 
 struct MockSession {
@@ -333,29 +455,18 @@ mod tests {
     use super::*;
 
     fn request() -> RecordingRequest {
-        RecordingRequest {
-            target: CaptureTarget::Display(DisplayId("d1".to_owned())),
-            microphone: false,
-            system_audio: false,
-            fps: 30,
-            show_cursor: true,
-        }
+        let mut request = RecordingRequest::new(CaptureTarget::Display(DisplayId("d1".to_owned())));
+        request.show_cursor = true;
+        request
     }
 
     #[test]
     fn settings_are_checked_against_advertised_capabilities() {
         let mut settings = RecordingSettings::shipped();
         settings.camera.enabled = true;
-        let error = validate_capabilities(
-            EngineCapabilities {
-                video: true,
-                ..EngineCapabilities::default()
-            },
-            &request(),
-            Some(&settings),
-        )
-        .unwrap_err()
-        .to_string();
+        let error = validate_capabilities(EngineCapabilities::VIDEO, &request(), Some(&settings))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("camera"), "{error}");
     }
 
