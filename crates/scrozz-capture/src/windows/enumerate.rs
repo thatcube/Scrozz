@@ -3,7 +3,7 @@
 //! Shared by both capture paths so the target list a user sees never depends on
 //! which path ends up doing the work.
 
-use scrozz_core::{Display, DisplayId, Error, Result, ScaleFactor, Window, WindowId};
+use scrozz_core::{Display, DisplayId, Error, Result, ScaleFactor, SourceApp, Window, WindowId};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
@@ -81,7 +81,11 @@ unsafe extern "system" fn monitor_proc(
     BOOL(1)
 }
 
-/// Every connected monitor, primary first.
+/// Every connected monitor, in Win32 enumeration order.
+///
+/// The order is intentionally left untouched because winit uses the same
+/// `EnumDisplayMonitors` order for `ViewportBuilder::with_monitor`; preserving
+/// it lets the mixed-DPI picker target the matching native monitor by index.
 ///
 /// # Errors
 ///
@@ -104,16 +108,12 @@ pub fn monitors() -> Result<Vec<MonitorRecord>> {
         return Err(Error::Platform("EnumDisplayMonitors failed".into()));
     }
 
-    let mut records: Vec<MonitorRecord> = handles.into_iter().filter_map(monitor_record).collect();
+    let records: Vec<MonitorRecord> = handles.into_iter().filter_map(monitor_record).collect();
 
     if records.is_empty() {
         return Err(Error::Platform("no monitors reported".into()));
     }
 
-    // Primary first, then left to right. Anything that reads "the first
-    // display" — a default target, a fallback for a stale id — should land on
-    // the one the user thinks of as their main screen.
-    records.sort_by_key(|m| (!m.is_primary, m.bounds.left, m.bounds.top));
     Ok(records)
 }
 
@@ -206,6 +206,11 @@ pub fn monitor_under_cursor() -> Result<MonitorRecord> {
 pub struct WindowRecord {
     /// Live handle.
     pub handle: HWND,
+    /// Owning process at enumeration time.
+    ///
+    /// Paired with the handle in the public id so a recycled `HWND` cannot
+    /// silently retarget a committed picker selection to another application.
+    pub process_id: u32,
     /// Bounds in virtual-desktop device pixels, from the DWM frame where
     /// available.
     pub bounds: DeviceRect,
@@ -213,8 +218,22 @@ pub struct WindowRecord {
     pub title: Option<String>,
     /// Owning executable's file stem, absent when it could not be read.
     pub application: Option<String>,
+    /// Normalized owning executable name, absent when it could not be read.
+    pub application_id: Option<String>,
     /// Index into the [`monitors`] list.
     pub monitor: usize,
+}
+
+impl WindowRecord {
+    /// Application metadata frozen at capture time.
+    #[must_use]
+    pub fn source_app(&self) -> SourceApp {
+        SourceApp {
+            name: self.application.clone(),
+            identifier: self.application_id.clone(),
+            window_title: self.title.clone(),
+        }
+    }
 }
 
 struct EnumState {
@@ -246,11 +265,16 @@ unsafe fn inspect_window(hwnd: HWND, state: &EnumState) -> Option<WindowRecord> 
     let monitor_rects: Vec<DeviceRect> = state.monitors.iter().map(|m| m.bounds).collect();
     let monitor = dominant_monitor(bounds, &monitor_rects).unwrap_or(0);
 
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    let application = unsafe { window_application(process_id) };
     Some(WindowRecord {
         handle: hwnd,
+        process_id,
         bounds,
         title: (!facts.title.is_empty()).then(|| facts.title.clone()),
-        application: unsafe { window_application(hwnd) },
+        application: application.as_ref().map(|app| app.name.clone()),
+        application_id: application.map(|app| app.identifier),
         monitor,
     })
 }
@@ -346,15 +370,40 @@ unsafe fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..written as usize])
 }
 
-/// The file stem of the owning executable, e.g. `firefox`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplicationIdentity {
+    name: String,
+    identifier: String,
+}
+
+/// Derives a display label and case-stable executable identity from an image path.
+fn application_identity(image_path: &str) -> Option<ApplicationIdentity> {
+    let executable = image_path
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())?;
+    let suffix_start = executable.len().checked_sub(4).filter(|&start| {
+        executable
+            .as_bytes()
+            .get(start..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".exe"))
+    });
+    // A matching ASCII ".exe" suffix necessarily starts on a UTF-8 boundary.
+    let name = suffix_start.map_or(executable, |start| &executable[..start]);
+
+    Some(ApplicationIdentity {
+        name: name.to_owned(),
+        identifier: executable.to_lowercase(),
+    })
+}
+
+/// The identity of the owning executable, e.g. `Firefox` / `firefox.exe`.
 ///
 /// Best-effort: reading another process's image name fails for protected
 /// processes and for anything running at a higher integrity level, and a
 /// missing application name is not a reason to hide a window the user can
 /// plainly see.
-unsafe fn window_application(hwnd: HWND) -> Option<String> {
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+unsafe fn window_application(pid: u32) -> Option<ApplicationIdentity> {
     if pid == 0 {
         return None;
     }
@@ -364,8 +413,9 @@ unsafe fn window_application(hwnd: HWND) -> Option<String> {
         return None;
     }
 
-    let mut buf = [0u16; 260];
-    let mut len = u32::try_from(buf.len()).unwrap_or(260);
+    // QueryFullProcessImageNameW is not limited to MAX_PATH.
+    let mut buf = vec![0u16; 32_768];
+    let mut len = u32::try_from(buf.len()).unwrap_or(32_768);
     let ok = unsafe {
         QueryFullProcessImageNameW(
             handle,
@@ -381,9 +431,7 @@ unsafe fn window_application(hwnd: HWND) -> Option<String> {
     }
 
     let path = String::from_utf16_lossy(&buf[..len as usize]);
-    std::path::Path::new(&path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
+    application_identity(&path)
 }
 
 unsafe fn close_handle(handle: HANDLE) {
@@ -427,13 +475,18 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
     );
 
     Window {
-        id: WindowId((record.handle.0 as isize).to_string()),
+        id: window_id(record.handle, record.process_id),
         title: record.title.clone(),
         application: record.application.clone(),
+        application_id: record.application_id.clone(),
         bounds: logical_from_device(record.bounds, scale),
         display,
         is_visible: true,
     }
+}
+
+fn window_id(handle: HWND, process_id: u32) -> WindowId {
+    WindowId(format!("{}:{process_id}", handle.0 as isize))
 }
 
 /// Parses a [`WindowId`] back to a handle.
@@ -442,7 +495,14 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
 ///
 /// Returns [`Error::TargetGone`] for an id this backend did not produce.
 pub fn handle_from_id(id: &WindowId) -> Result<HWND> {
-    id.0.parse::<isize>()
+    let (handle, process_id) = id.0.split_once(':').ok_or_else(|| {
+        Error::TargetGone(format!("not a window id this backend issued: {}", id.0))
+    })?;
+    process_id
+        .parse::<u32>()
+        .map_err(|_| Error::TargetGone(format!("not a window id this backend issued: {}", id.0)))?;
+    handle
+        .parse::<isize>()
         .map(|raw| HWND(raw as *mut core::ffi::c_void))
         .map_err(|_| Error::TargetGone(format!("not a window id this backend issued: {}", id.0)))
 }
@@ -456,7 +516,9 @@ pub fn handle_from_id(id: &WindowId) -> Result<HWND> {
 pub fn window_by_id(id: &WindowId) -> Result<(WindowRecord, Vec<MonitorRecord>)> {
     let handle = handle_from_id(id)?;
     let monitors = monitors()?;
-    let found = windows()?.into_iter().find(|w| w.handle == handle);
+    let found = windows()?.into_iter().find(|window| {
+        window.handle == handle && window_id(window.handle, window.process_id) == *id
+    });
     match found {
         Some(record) => Ok((record, monitors)),
         None => Err(Error::TargetGone(format!("window {} has closed", id.0))),
@@ -468,4 +530,71 @@ pub fn window_by_id(id: &WindowId) -> Result<(WindowRecord, Vec<MonitorRecord>)>
 pub fn monitor_for_window(hwnd: HWND, monitors: &[MonitorRecord]) -> Option<usize> {
     let handle = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     monitors.iter().position(|m| m.handle == handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::HWND;
+
+    use super::{ApplicationIdentity, DeviceRect, WindowRecord, application_identity, window_id};
+
+    #[test]
+    fn executable_identity_is_stable_and_display_name_remains_separate() {
+        let upper = application_identity(r"C:\Program Files\Firefox\FIREFOX.EXE").unwrap();
+        let lower = application_identity(r"c:\program files\firefox\firefox.exe").unwrap();
+
+        assert_eq!(upper.name, "FIREFOX");
+        assert_eq!(upper.identifier, "firefox.exe");
+        assert_eq!(upper.identifier, lower.identifier);
+        assert_eq!(lower.name, "firefox");
+    }
+
+    #[test]
+    fn executable_identity_handles_both_path_separators() {
+        let identity = application_identity("C:/Tools/Recorder.exe").unwrap();
+        assert_eq!(identity.name, "Recorder");
+        assert_eq!(identity.identifier, "recorder.exe");
+        let unicode = application_identity(r"C:\Tools\应用").unwrap();
+        assert_eq!(unicode.name, "应用");
+        assert_eq!(unicode.identifier, "应用");
+        assert!(application_identity("").is_none());
+        assert!(application_identity("C:\\Tools\\").is_none());
+    }
+
+    #[test]
+    fn source_mapping_keeps_display_identity_and_title_distinct() {
+        let identity = ApplicationIdentity {
+            name: "Firefox".into(),
+            identifier: "firefox.exe".into(),
+        };
+        let record = WindowRecord {
+            handle: HWND::default(),
+            process_id: 7,
+            bounds: DeviceRect::new(0, 0, 100, 100),
+            title: Some("Release notes".into()),
+            application: Some(identity.name),
+            application_id: Some(identity.identifier),
+            monitor: 0,
+        };
+
+        let source = record.source_app();
+        assert_eq!(source.name.as_deref(), Some("Firefox"));
+        assert_eq!(source.identifier.as_deref(), Some("firefox.exe"));
+        assert_eq!(source.window_title.as_deref(), Some("Release notes"));
+    }
+
+    #[test]
+    fn picker_ids_bind_a_handle_to_its_owning_process() {
+        let handle = HWND(0x1234usize as *mut core::ffi::c_void);
+        assert_eq!(window_id(handle, 7), window_id(handle, 7));
+        assert_ne!(
+            window_id(handle, 7),
+            window_id(handle, 8),
+            "a recycled HWND owned by another process is a different target"
+        );
+        assert_ne!(
+            window_id(handle, 7),
+            window_id(HWND(0x5678usize as *mut core::ffi::c_void), 7)
+        );
+    }
 }

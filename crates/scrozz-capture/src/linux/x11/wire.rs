@@ -2,13 +2,11 @@
 //!
 //! # Why this is hand-rolled
 //!
-//! `x11rb` generates bindings for every X extension, but gates each one behind a
-//! Cargo feature, and the workspace declares `x11rb = "0.14"` with no features —
-//! so `x11rb::protocol::randr` does not exist in this build. Enabling it is a
-//! one-word manifest change that this crate is not permitted to make (see the
-//! module docs on `super`), and RandR is not optional: without it a multi-monitor
-//! desktop looks like one enormous screen, every per-monitor bound is wrong, and
-//! there is no primary display.
+//! RandR is not optional: without it a multi-monitor desktop looks like one
+//! enormous screen, every per-monitor bound is wrong, and there is no primary
+//! display. Scrozz's implementation predates enabling `x11rb`'s generated RandR
+//! module and deliberately keeps only the two requests it needs in this small,
+//! host-testable parser.
 //!
 //! So the two requests that are actually needed are encoded here directly. This
 //! is not a workaround so much as a relocation of the same bytes: the layouts

@@ -52,7 +52,7 @@ impl CaptureRequest {
 pub enum Provenance {
     /// A whole display.
     Display,
-    /// A single window — the OS already supplied its true shape and shadow.
+    /// A single window — the OS supplied its true shape and any available shadow.
     Window,
     /// A user-drawn region.
     Region,
@@ -90,8 +90,9 @@ pub struct Capture {
     ///
     /// The *resolved* answer, not the request: a platform that cannot omit the
     /// shadow overrules [`CaptureRequest::include_window_shadow`], and recording
-    /// the request instead would label the capture wrongly. `None` for anything
-    /// that is not a window, where the question does not arise.
+    /// the request instead would label the capture wrongly. `None` either when
+    /// the target is not a window or when the capture source does not disclose
+    /// whether a shadow is present.
     pub window_shadow: Option<bool>,
 }
 
@@ -128,9 +129,10 @@ impl Capture {
 
 /// A backend's interactive window-capture capabilities.
 ///
-/// Split from [`CaptureBackend`] rather than folded into it because the answer
-/// is needed *before* a capture is requested — the picker flow branches on it,
-/// and on Wayland the branch it takes is "do not open a picker at all".
+/// Kept as its own trait because the answer is needed *before* a capture is
+/// requested — the picker flow branches on it, and on Wayland the branch it
+/// takes is "do not open a picker at all". Every [`CaptureBackend`] implements
+/// it, so a caller can ask the backend it will actually capture through.
 pub trait WindowPicking {
     /// How the user picks a window here, and what the resulting pixels contain.
     ///
@@ -150,7 +152,7 @@ pub trait WindowPicking {
 /// One implementation per platform. Every method may fail with
 /// [`crate::Error::PermissionDenied`]; per decision D15 permission is requested
 /// at first use rather than up front, so this is an ordinary early-life outcome.
-pub trait CaptureBackend: TargetEnumerator + Send + Sync {
+pub trait CaptureBackend: TargetEnumerator + WindowPicking + Send + Sync {
     /// Takes a single capture.
     ///
     /// # Errors

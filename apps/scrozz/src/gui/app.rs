@@ -25,6 +25,7 @@
 
 use std::time::{Duration, Instant};
 
+use scrozz_core::Error as CoreError;
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
@@ -190,6 +191,16 @@ pub struct App {
     started: Instant,
     captures: u64,
     notes: Vec<String>,
+    active_window_capture: Option<crate::gui::card::CardId>,
+    window_picker: Option<WindowPickerSession>,
+}
+
+struct WindowPickerSession {
+    card: crate::gui::card::CardId,
+    picker: scrozz_ui::picker::WindowPicker,
+    theme: scrozz_ui::Theme,
+    notice: Option<String>,
+    committing: bool,
 }
 
 impl App {
@@ -270,6 +281,8 @@ impl App {
             started: Instant::now(),
             captures: 0,
             notes,
+            active_window_capture: None,
+            window_picker: None,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -383,7 +396,14 @@ impl App {
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
+                Outcome::Ready(card) if self.pipeline.is_window_cancelled(card.id) => {
+                    self.pipeline.post(Job::Release(card.id));
+                }
                 Outcome::Ready(card) => {
+                    if self.active_window_capture == Some(card.id) {
+                        self.active_window_capture = None;
+                        self.window_picker = None;
+                    }
                     self.captures += 1;
                     let summary = card.summary();
                     if let Err(err) = self.surface.present(*card) {
@@ -392,8 +412,43 @@ impl App {
                         self.note(summary);
                     }
                 }
+                Outcome::Failed { card, .. } if self.pipeline.is_window_cancelled(card) => {}
+                Outcome::Failed {
+                    card,
+                    error: CliError::Core(CoreError::Cancelled),
+                } => {
+                    if self.active_window_capture == Some(card) {
+                        self.active_window_capture = None;
+                        self.window_picker = None;
+                    }
+                }
                 Outcome::Failed { card, error } => {
+                    if self.active_window_capture == Some(card) {
+                        self.active_window_capture = None;
+                        self.window_picker = None;
+                    }
                     self.note(format!("{card} failed: {error}"));
+                }
+                Outcome::PickWindow {
+                    card,
+                    windows,
+                    displays,
+                    notice,
+                } => {
+                    if self.pipeline.is_window_cancelled(card) {
+                        continue;
+                    }
+                    if self.active_window_capture == Some(card) {
+                        self.window_picker = Some(WindowPickerSession {
+                            card,
+                            picker: scrozz_ui::picker::WindowPicker::new(windows, displays),
+                            theme: scrozz_ui::Theme::dark(),
+                            notice,
+                            committing: false,
+                        });
+                    } else {
+                        self.pipeline.cancel_window(card);
+                    }
                 }
                 Outcome::Done { card, detail } => {
                     self.note(format!("{card} {detail}"));
@@ -468,6 +523,11 @@ impl App {
     }
 
     fn begin_capture(&mut self, kind: CaptureKind) {
+        if kind == CaptureKind::Window && self.active_window_capture.is_some() {
+            self.note("a window picker is already open");
+            return;
+        }
+
         // D15: ask at first use, not at launch. This must happen on the main
         // thread before the capture job is posted: the missing piece that made
         // Scrozz report PermissionDenied in an invisible log without ever
@@ -484,7 +544,84 @@ impl App {
         let card = self.pipeline.allocate();
         if !self.pipeline.post(Job::Capture { kind, card }) {
             self.note("the capture worker has gone");
+        } else if kind == CaptureKind::Window {
+            self.active_window_capture = Some(card);
         }
+    }
+
+    /// Draws the in-process picker as a child of the GUI's existing event loop.
+    ///
+    /// Wayland never reaches this method with a picker: its trusted portal owns
+    /// selection and the worker returns the completed capture directly.
+    pub fn paint_window_picker(&mut self, root: &egui::Context) {
+        let Some(session) = self.window_picker.as_mut() else {
+            return;
+        };
+
+        #[cfg(target_os = "windows")]
+        let (intent, close_requested) = scrozz_ui::picker::interact_display_viewports(
+            root,
+            &mut session.picker,
+            &session.theme,
+            session.notice.as_deref(),
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        let (intent, close_requested) = {
+            let bounds = session.picker.desktop_bounds();
+            let mut intent = scrozz_ui::picker::paint::Intent::None;
+            let mut close_requested = false;
+            root.show_viewport_immediate(
+                scrozz_ui::picker::viewport_id(),
+                scrozz_ui::picker::viewport(bounds),
+                |ctx, _class| {
+                    close_requested = ctx.input(|input| input.viewport().close_requested());
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
+                        .show(ctx, |ui| {
+                            intent = scrozz_ui::picker::paint::interact(
+                                ui,
+                                &mut session.picker,
+                                bounds.origin,
+                                &session.theme,
+                                session.notice.as_deref(),
+                            );
+                        });
+                },
+            );
+            (intent, close_requested)
+        };
+
+        if close_requested || intent == scrozz_ui::picker::paint::Intent::Cancel {
+            self.cancel_window_picker(root);
+            return;
+        }
+        if intent != scrozz_ui::picker::paint::Intent::Commit || session.committing {
+            return;
+        }
+
+        let Some(window) = session.picker.focused_id().cloned() else {
+            self.cancel_window_picker(root);
+            return;
+        };
+        session.committing = true;
+        session.notice = Some("Checking that window…".to_owned());
+        if !self.pipeline.post(Job::CommitWindow {
+            card: session.card,
+            window,
+        }) {
+            self.note("the capture worker has gone");
+            self.cancel_window_picker(root);
+        }
+    }
+
+    fn cancel_window_picker(&mut self, root: &egui::Context) {
+        if let Some(session) = self.window_picker.take() {
+            self.pipeline.cancel_window(session.card);
+            scrozz_ui::picker::close_viewports(root, session.picker.displays());
+        }
+        self.active_window_capture = None;
+        self.note("window capture cancelled");
     }
 
     fn note(&mut self, what: impl Into<String>) {
@@ -547,6 +684,10 @@ impl App {
             tray.close();
         }
         self.server = None;
+        if let Some(card) = self.active_window_capture.take() {
+            self.pipeline.cancel_window(card);
+        }
+        self.window_picker = None;
         self.pipeline.stop();
     }
 

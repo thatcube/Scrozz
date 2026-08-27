@@ -113,7 +113,10 @@ fn a_reader_sees_a_consistent_history_while_a_writer_is_busy() {
                 .record(&known)
                 .expect("read must not fail under write load")
                 .expect("the pre-existing capture cannot vanish");
-            assert_eq!(record.window_title.as_deref(), Some("already here"));
+            assert_eq!(
+                record.source_app.window_title.as_deref(),
+                Some("already here")
+            );
             assert!(store.count().expect("count") >= 1);
             let listed = store.list().expect("list");
             assert!(listed.contains(&known));

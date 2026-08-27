@@ -172,6 +172,8 @@ pub struct CardContent<'a> {
     pub source_px: (u32, u32),
     /// Where the pixels came from. Decides the chrome (D9).
     pub provenance: Provenance,
+    /// Application label shown as a compact badge for window captures.
+    pub source_badge: Option<&'a str>,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
 }
@@ -184,8 +186,16 @@ impl<'a> CardContent<'a> {
             name,
             source_px,
             provenance,
+            source_badge: None,
             texture: None,
         }
+    }
+
+    /// The same content with its source application label attached.
+    #[must_use]
+    pub fn with_source_badge(mut self, badge: Option<&'a str>) -> Self {
+        self.source_badge = badge;
+        self
     }
 
     /// The same content with a thumbnail attached.
@@ -491,6 +501,21 @@ fn draw_caption(
         surface.font(Text::Caption),
         fade(Color32::from_rgb(255, 255, 255), alpha * 0.59),
     );
+    if let Some(badge) = content.source_badge {
+        let font = surface.font(Text::Caption);
+        let color = fade(Color32::WHITE, alpha * 0.76);
+        let galley = painter.layout_no_wrap(badge.to_owned(), font, color);
+        let badge_rect = Rect::from_min_size(
+            pos2(capture.left() + 13.0, capture.bottom() - 49.0),
+            galley.size() + vec2(12.0, 5.0),
+        );
+        painter.rect_filled(
+            badge_rect,
+            corner(badge_rect.height() * 0.5),
+            fade(Color32::from_black_alpha(118), alpha),
+        );
+        painter.galley(badge_rect.min + vec2(6.0, 2.5), galley, color);
+    }
 }
 
 /// The hover chrome: a scrim, two primary pills, four quiet corner icons.

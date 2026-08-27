@@ -300,6 +300,42 @@ fn bgra_and_rgba_describing_the_same_picture_encode_identically() {
     );
 }
 
+#[test]
+fn padded_bgra_premultiplied_window_edges_reach_lossless_output_unchanged() {
+    // One fixture combines the three properties native window pixels need:
+    // driver stride, Windows/macOS BGRA order, and transparent/soft edges.
+    let source = frame(
+        2,
+        2,
+        13,
+        PixelFormat::BgraPremultiplied8,
+        ColorSpace::Srgb,
+        |x, y| match (x, y) {
+            (0, 0) => [0, 0, 0, 0],
+            (1, 0) => [0, 0, 128, 128],
+            (0, 1) => [128, 0, 0, 128],
+            (1, 1) => [0, 255, 0, 255],
+            _ => unreachable!(),
+        },
+    );
+
+    for format in LOSSLESS {
+        let bytes = FrameEncoder::new()
+            .encode(&source, format)
+            .expect("encodes");
+        let (width, height, data) = decode(&bytes);
+        assert_eq!((width, height), (2, 2), "{format:?} added window framing");
+        assert_eq!(pixel_at(&data, width, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&data, width, 1, 0), [255, 0, 0, 128]);
+        assert_eq!(pixel_at(&data, width, 0, 1), [0, 0, 255, 128]);
+        assert_eq!(pixel_at(&data, width, 1, 1), [0, 255, 0, 255]);
+        assert!(
+            !data.contains(&PADDING_SENTINEL),
+            "{format:?} leaked stride padding"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Colour management
 // ---------------------------------------------------------------------------

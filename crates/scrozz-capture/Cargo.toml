@@ -45,6 +45,8 @@ windows = { workspace = true, features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb.workspace = true
 ashpd.workspace = true
+image.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

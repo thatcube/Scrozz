@@ -11,12 +11,13 @@
 //!   `BitBlt`/DXGI as the fallback for older builds and odd GPU configurations.
 //! - **Linux/X11** — direct `XGetImage`/XShm. Full window enumeration, absolute
 //!   positioning, everything works.
-//! - **Linux/Wayland** — the `xdg-desktop-portal` `ScreenCast` interface, and
-//!   only that. Per decision D8 the gaps are real and documented rather than
-//!   papered over: **there is no window enumeration protocol at all**, so
+//! - **Linux/Wayland** — `xdg-desktop-portal`: `ScreenCast` for desktop sources
+//!   and Screenshot v3's window-restricted picker for window stills. Per
+//!   decision D8 the gaps are real and documented rather than papered over:
+//!   **there is no window enumeration protocol at all**, so
 //!   [`scrozz_core::TargetEnumerator::windows`] returns
-//!   [`scrozz_core::Error::Unsupported`] and callers fall back to the portal's
-//!   own out-of-process picker.
+//!   [`scrozz_core::Error::Unsupported`]. Interactive window capture instead
+//!   delegates selection to the portal's out-of-process picker.
 
 // Platform APIs are reached through objc2 / windows-rs / x11rb, all of which
 // require `unsafe`. It is confined to this crate: every crate above it in the

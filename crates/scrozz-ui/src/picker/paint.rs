@@ -5,18 +5,33 @@
 //! window corner radius would make the picker promise geometry the captured
 //! pixels may not have.
 
-use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2, pos2, vec2};
+use egui::{
+    Align2, Color32, CornerRadius, Key, Painter, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2, pos2,
+    vec2,
+};
 use scrozz_core::{LogicalPoint, LogicalRect};
 
 use crate::theme::{Radius, Space, Text, Theme, corner};
 
 use super::Highlight;
+use super::WindowPicker;
 
 const SCRIM_ALPHA: u8 = 116;
 const OUTLINE_WIDTH: f32 = 3.0;
 const LABEL_GAP: f32 = Space::SM;
 const LABEL_PADDING_X: f32 = 11.0;
 const LABEL_PADDING_Y: f32 = 6.0;
+
+/// What the picker UI asks its owner to do after one frame of input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Keep choosing.
+    None,
+    /// Close without a capture.
+    Cancel,
+    /// Re-enumerate and commit the focused window.
+    Commit,
+}
 
 /// Geometry derived for one picker frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +100,101 @@ pub fn draw(
     let (width, height) = highlight.pixel_size();
     let text = format!("{}  {width} x {height}", highlight.label());
     paint_label(painter, viewport, layout.highlight, &text, theme);
+}
+
+/// Applies pointer and keyboard input to a picker and paints the resulting frame.
+///
+/// Pointer positions are viewport-local; `desktop_origin` translates them into
+/// the global logical coordinate system used by platform window enumeration.
+pub fn interact(
+    ui: &mut Ui,
+    picker: &mut WindowPicker,
+    desktop_origin: LogicalPoint,
+    theme: &Theme,
+    notice: Option<&str>,
+) -> Intent {
+    interact_inner(ui, picker, desktop_origin, theme, notice, true)
+}
+
+/// Drives one monitor-sized picker viewport.
+///
+/// Unlike [`interact`], an absent pointer does not clear focus because another
+/// monitor viewport may currently own the pointer.
+pub fn interact_display(
+    ui: &mut Ui,
+    picker: &mut WindowPicker,
+    desktop_origin: LogicalPoint,
+    theme: &Theme,
+    notice: Option<&str>,
+) -> Intent {
+    interact_inner(ui, picker, desktop_origin, theme, notice, false)
+}
+
+fn interact_inner(
+    ui: &mut Ui,
+    picker: &mut WindowPicker,
+    desktop_origin: LogicalPoint,
+    theme: &Theme,
+    notice: Option<&str>,
+    clear_absent_pointer: bool,
+) -> Intent {
+    let viewport = ui.max_rect();
+    let input = ui.ctx().input(|input| {
+        (
+            input.pointer.hover_pos(),
+            input.pointer.primary_clicked(),
+            input.key_pressed(Key::Escape),
+            input.key_pressed(Key::Tab),
+            input.modifiers.shift,
+            input.key_pressed(Key::Enter) || input.key_pressed(Key::Space),
+        )
+    });
+
+    if let Some(position) = input.0 {
+        picker.point_at(LogicalPoint::new(
+            desktop_origin.x + f64::from(position.x),
+            desktop_origin.y + f64::from(position.y),
+        ));
+    } else if clear_absent_pointer {
+        picker.clear_pointer();
+    }
+
+    if input.3 {
+        if input.4 {
+            picker.focus_prev();
+        } else {
+            picker.focus_next();
+        }
+    }
+
+    let highlight = picker.highlight();
+    draw(
+        ui.painter(),
+        viewport,
+        desktop_origin,
+        highlight.as_ref(),
+        theme,
+    );
+
+    let message = notice.or_else(|| picker.is_empty().then_some("No visible windows"));
+    if let Some(message) = message {
+        ui.painter().text(
+            viewport.center(),
+            Align2::CENTER_CENTER,
+            message,
+            theme.font(Text::Body),
+            theme.palette.text,
+        );
+    }
+
+    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    if input.2 {
+        Intent::Cancel
+    } else if input.1 || input.5 {
+        Intent::Commit
+    } else {
+        Intent::None
+    }
 }
 
 fn paint_label(painter: &Painter, viewport: Rect, highlight: Rect, text: &str, theme: &Theme) {

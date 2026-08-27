@@ -17,11 +17,15 @@
 //! is reported as a mistake in the command line even now, and the resolution
 //! logic is exercised by tests that never touch a screen.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_core::{
+    CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, SourceApp,
+    TargetEnumerator, WindowId, WindowSelection,
+};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
+use scrozz_store::{CaptureRecord, History, ImageState, Page, SearchQuery};
 
 use crate::{
     cli::{
@@ -85,9 +89,9 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     // The delay is deliberately *not* honoured before the backend check. Making
     // a user wait five seconds to be told the feature is unimplemented is a
     // small cruelty that costs nothing to avoid.
-    let backend = platform::capture_backend()?;
+    let backend: Arc<dyn CaptureBackend> = Arc::from(platform::capture_backend()?);
     let request = CaptureRequest {
-        target: capture_target(&target)?,
+        target: capture_target(&target, Arc::clone(&backend))?,
         cursor: if args.cursor {
             CursorMode::Visible
         } else {
@@ -138,18 +142,28 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         ("scale", Json::Float(frame.scale.get())),
         ("bytes", Json::Int(bytes.len() as i64)),
         ("provenance", Json::str(format!("{:?}", capture.provenance))),
+        ("source_app", source_app_json(&capture.source_app)),
+        (
+            "window_shadow",
+            Json::opt(capture.window_shadow, Json::Bool),
+        ),
         (
             "written",
             Json::arr(written.iter().map(|w| Json::str(w.as_str()))),
         ),
     ]);
 
+    let source = capture
+        .source_app
+        .badge()
+        .map_or_else(String::new, |label| format!(" from {label}"));
     let human = format!(
-        "Captured {}×{} at {}× ({} KB){}",
+        "Captured {}×{} at {}× ({} KB){}{}",
         frame.width(),
         frame.height(),
         frame.scale.get(),
         bytes.len() / 1024,
+        source,
         if written.is_empty() {
             String::new()
         } else {
@@ -168,7 +182,54 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
 /// target on screen is the overlay's job, and it hands back a concrete target.
 /// Modelling "the user has not chosen yet" as a [`CaptureTarget`] would push
 /// that uncertainty into every backend.
-fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
+fn capture_target(spec: &TargetSpec, backend: Arc<dyn CaptureBackend>) -> CliResult<CaptureTarget> {
+    match spec {
+        TargetSpec::Interactive(InteractiveMode::Window) => interactive_window_target(backend),
+        TargetSpec::Interactive(InteractiveMode::Region) => Err(CliError::not_implemented(
+            "choosing a region on screen",
+            "scrozz-ui (the region selection overlay)",
+        )),
+        TargetSpec::Interactive(InteractiveMode::Display) => Err(CliError::not_implemented(
+            "choosing a display on screen",
+            "scrozz-ui (the display selection overlay)",
+        )),
+        _ => concrete_capture_target(spec, backend.as_ref()),
+    }
+}
+
+fn interactive_window_target(backend: Arc<dyn CaptureBackend>) -> CliResult<CaptureTarget> {
+    match backend.window_selection() {
+        WindowSelection::InProcess => {
+            let windows = backend.windows()?;
+            let displays = backend.displays()?;
+            let refresh_backend = Arc::clone(&backend);
+            let refresh = Arc::new(move || refresh_backend.windows());
+            match scrozz_ui::picker::pick_window(windows, displays, refresh)? {
+                scrozz_ui::picker::Outcome::Selected(id) => Ok(CaptureTarget::Window(id)),
+                scrozz_ui::picker::Outcome::Cancelled => Err(CliError::Core(CoreError::Cancelled)),
+                scrozz_ui::picker::Outcome::Vanished(id) => {
+                    Err(CliError::Core(CoreError::TargetGone(id.0)))
+                }
+            }
+        }
+        WindowSelection::PortalPicker { .. } => {
+            // The identifier is intentionally advisory. Wayland cannot disclose
+            // one; the portal asks the user and returns only the selected pixels.
+            Ok(CaptureTarget::Window(WindowId(
+                "xdg-desktop-portal-picker".to_owned(),
+            )))
+        }
+        WindowSelection::Unavailable { why } => Err(CliError::Core(CoreError::Unsupported {
+            what: "choosing a window".to_owned(),
+            why,
+        })),
+    }
+}
+
+fn concrete_capture_target(
+    spec: &TargetSpec,
+    enumerator: &dyn TargetEnumerator,
+) -> CliResult<CaptureTarget> {
     match spec {
         TargetSpec::Region(rect) => Ok(CaptureTarget::Region(*rect)),
         TargetSpec::AllDisplays => Ok(CaptureTarget::AllDisplays),
@@ -176,13 +237,13 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
         // backend the capture will use — an id resolved by a different object
         // is an id that can disagree.
         TargetSpec::Display(sel) => {
-            let displays = platform::target_enumerator()?.displays()?;
+            let displays = enumerator.displays()?;
             let found = match sel {
                 DisplaySelector::Primary => displays.iter().find(|d| d.is_primary),
                 // The pointer's display, which is where an overlay should appear.
-                DisplaySelector::Active => platform::target_enumerator()
+                DisplaySelector::Active => enumerator
+                    .active_display()
                     .ok()
-                    .and_then(|e| e.active_display().ok())
                     .and_then(|a| displays.iter().find(|d| d.id == a.id))
                     .or_else(|| displays.iter().find(|d| d.is_primary)),
                 DisplaySelector::Id(name) => displays
@@ -198,7 +259,7 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
                 })
         }
         TargetSpec::Window(name) => {
-            let windows = platform::target_enumerator()?.windows()?;
+            let windows = enumerator.windows()?;
             windows
                 .iter()
                 .find(|w| {
@@ -214,11 +275,23 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
                     )))
                 })
         }
-        TargetSpec::Interactive(_) => Err(CliError::not_implemented(
-            "choosing a target on screen",
-            "scrozz-ui (the selection overlay)",
-        )),
+        TargetSpec::Interactive(_) => unreachable!("interactive targets are resolved before this"),
     }
+}
+
+fn source_app_json(source: &SourceApp) -> Json {
+    Json::obj([
+        ("name", Json::opt(source.name.as_deref(), Json::str)),
+        (
+            "identifier",
+            Json::opt(source.identifier.as_deref(), Json::str),
+        ),
+        (
+            "window_title",
+            Json::opt(source.window_title.as_deref(), Json::str),
+        ),
+        ("badge", Json::opt(source.badge(), Json::str)),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +330,9 @@ fn record(args: &RecordArgs) -> CliResult<Report> {
         ));
     }
 
+    let enumerator = platform::target_enumerator()?;
     let request = scrozz_record::RecordingRequest {
-        target: capture_target(&target)?,
+        target: concrete_capture_target(&target, enumerator.as_ref())?,
         microphone: args.microphone,
         system_audio: args.system_audio,
         fps: args.fps,
@@ -332,6 +406,10 @@ fn list(what: ListWhat) -> CliResult<Report> {
                         "application",
                         Json::opt(w.application.as_deref(), Json::str),
                     ),
+                    (
+                        "application_id",
+                        Json::opt(w.application_id.as_deref(), Json::str),
+                    ),
                     ("width", Json::Float(w.bounds.size.width)),
                     ("height", Json::Float(w.bounds.size.height)),
                 ])
@@ -365,11 +443,31 @@ fn is_wayland() -> bool {
 
 fn history(command: &HistoryCommand) -> CliResult<Report> {
     match command {
-        HistoryCommand::List { .. } => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "listing the capture history",
-                "scrozz-store",
+        HistoryCommand::List { limit, pinned } => {
+            let store = platform::store()?;
+            let page = Page::new(
+                limit.map_or(Page::default().limit, |value| {
+                    u32::try_from(value).unwrap_or(u32::MAX)
+                }),
+                0,
+            );
+            let records = if *pinned {
+                store.search(&SearchQuery::all().pinned_only().paged(page))?
+            } else {
+                store.page(page)?
+            };
+            let human = if records.is_empty() {
+                "No captures in history.".to_owned()
+            } else {
+                records
+                    .iter()
+                    .map(history_row_human)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(Report::new(
+                Json::arr(records.iter().map(history_row_json)),
+                human,
             ))
         }
         HistoryCommand::Get { .. } => Err(CliError::not_implemented(
@@ -389,6 +487,58 @@ fn history(command: &HistoryCommand) -> CliResult<Report> {
             ))
         }
     }
+}
+
+fn history_row_json(record: &CaptureRecord) -> Json {
+    let image = match &record.image {
+        ImageState::Present { byte_len, .. } => Json::obj([
+            ("state", Json::str("present")),
+            (
+                "bytes",
+                Json::Int((*byte_len).try_into().unwrap_or(i64::MAX)),
+            ),
+        ]),
+        ImageState::Evicted { .. } => Json::obj([("state", Json::str("evicted"))]),
+        ImageState::Absent => Json::obj([("state", Json::str("absent"))]),
+    };
+    Json::obj([
+        ("id", Json::str(record.id.0.as_str())),
+        ("created_at_ms", Json::Int(record.created_at.as_millis())),
+        ("pinned", Json::Bool(record.pinned)),
+        ("provenance", Json::str(format!("{:?}", record.provenance))),
+        ("source_app", source_app_json(&record.source_app)),
+        ("window_shadow", Json::opt(record.window_shadow, Json::Bool)),
+        ("width", Json::Float(record.frame.size.width)),
+        ("height", Json::Float(record.frame.size.height)),
+        ("scale", Json::Float(record.frame.scale.get())),
+        ("image", image),
+        (
+            "annotations",
+            Json::Int(record.annotation_count.try_into().unwrap_or(i64::MAX)),
+        ),
+    ])
+}
+
+fn history_row_human(record: &CaptureRecord) -> String {
+    let badge = record
+        .source_app
+        .badge()
+        .map_or_else(String::new, |app| format!("[{app}] "));
+    let title = record
+        .source_app
+        .window_title
+        .as_deref()
+        .map_or_else(String::new, |title| format!("{title}  "));
+    format!(
+        "{}  {}{}{}×{}  {:?}{}",
+        record.id.0,
+        badge,
+        title,
+        record.frame.size.width.round(),
+        record.frame.size.height.round(),
+        record.provenance,
+        if record.pinned { "  pinned" } else { "" },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +827,17 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
     if no_ipc {
         return ipc::Forwarding::Never;
     }
+    if matches!(
+        command,
+        Command::Capture(args)
+            if args.target.interactive == Some(InteractiveMode::Window)
+    ) {
+        // A forwarded command is served synchronously on the existing eframe
+        // main thread. Starting a second native event loop there is invalid, so
+        // the one-shot CLI owns its picker. Tray and hotkey window captures use
+        // the GUI pipeline and its child viewport instead.
+        return ipc::Forwarding::Never;
+    }
     ipc::policy(command)
 }
 
@@ -851,7 +1012,6 @@ mod tests {
         let cases = [
             vec!["scrozz", "capture", "--region", "0,0,10,10"],
             vec!["scrozz", "record"],
-            vec!["scrozz", "history", "list"],
             vec!["scrozz", "history", "get", "abc"],
             vec!["scrozz", "history", "delete", "abc"],
             vec!["scrozz", "history", "pin", "abc"],
@@ -879,6 +1039,49 @@ mod tests {
 
         let err = run(&["scrozz", "history", "delete", "abc"]).unwrap_err();
         assert!(err.to_string().contains("no delete"), "{err}");
+    }
+
+    #[test]
+    fn history_rows_include_source_metadata_and_a_human_badge() {
+        let record = CaptureRecord {
+            id: scrozz_store::CaptureId("capture-1".into()),
+            created_at: scrozz_store::Timestamp(123),
+            pinned: true,
+            source_app: SourceApp {
+                name: Some("Safari".into()),
+                identifier: Some("com.apple.Safari".into()),
+                window_title: Some("Roadmap".into()),
+            },
+            window_shadow: Some(false),
+            provenance: scrozz_core::Provenance::Window,
+            target: CaptureTarget::Window(WindowId("7".into())),
+            frame: scrozz_store::FrameHeader {
+                size: scrozz_core::PhysicalSize::new(1200.0, 800.0),
+                stride: 4800,
+                format: scrozz_core::PixelFormat::BgraPremultiplied8,
+                color_space: scrozz_core::ColorSpace::DisplayP3,
+                scale: scrozz_core::ScaleFactor::new(2.0),
+            },
+            image: ImageState::Present {
+                hash: "hash".into(),
+                byte_len: 4096,
+            },
+            ocr_text: None,
+            annotation_count: 2,
+        };
+
+        let json = history_row_json(&record).to_compact_string();
+        assert!(json.contains(r#""name":"Safari""#), "{json}");
+        assert!(
+            json.contains(r#""identifier":"com.apple.Safari""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""window_shadow":false"#), "{json}");
+        assert!(json.contains(r#""badge":"Safari""#), "{json}");
+        assert_eq!(
+            history_row_human(&record),
+            "capture-1  [Safari] Roadmap  1200×800  Window  pinned"
+        );
     }
 
     #[test]

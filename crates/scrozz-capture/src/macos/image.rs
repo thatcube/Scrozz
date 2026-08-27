@@ -26,10 +26,22 @@ use scrozz_core::{ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, S
 /// Converts a captured image into a frame, at its true pixel dimensions.
 ///
 /// `scale` is the display's backing-scale factor, recorded so consumers can
-/// recover the logical size. The pixel dimensions come from the image itself:
-/// a window capture including its shadow is larger than the window's frame
-/// implies, and the image is the authority on how much larger.
+/// recover the logical size. Pixel dimensions come from the image itself rather
+/// than inferred geometry.
 pub(crate) fn to_frame(image: &CGImage, scale: ScaleFactor) -> Result<Frame> {
+    to_frame_inner(image, scale, false)
+}
+
+/// Converts a desktop-independent window image while requiring native alpha.
+///
+/// The backend advertises native window alpha, so an OS response whose layout
+/// has no alpha channel is rejected rather than returned behind a false
+/// capability claim or repaired with guessed corner geometry.
+pub(crate) fn to_window_frame(image: &CGImage, scale: ScaleFactor) -> Result<Frame> {
+    to_frame_inner(image, scale, true)
+}
+
+fn to_frame_inner(image: &CGImage, scale: ScaleFactor, require_alpha: bool) -> Result<Frame> {
     let width = CGImage::width(Some(image));
     let height = CGImage::height(Some(image));
     if width == 0 || height == 0 {
@@ -55,9 +67,14 @@ pub(crate) fn to_frame(image: &CGImage, scale: ScaleFactor) -> Result<Frame> {
         )));
     }
 
-    let mut data = pixel_bytes(image, stride, height)?;
-
     let alpha = CGImage::alpha_info(Some(image));
+    if require_alpha && !has_alpha_channel(alpha) {
+        return Err(Error::Unsupported {
+            what: "native window transparency".to_owned(),
+            why: "ScreenCaptureKit returned an opaque image layout".to_owned(),
+        });
+    }
+    let mut data = pixel_bytes(image, stride, height)?;
     let little_endian = matches!(
         CGImage::byte_order_info(Some(image)),
         CGImageByteOrderInfo::Order32Little
@@ -87,6 +104,16 @@ pub(crate) fn to_frame(image: &CGImage, scale: ScaleFactor) -> Result<Frame> {
             frame.data.len(),
         )))
     }
+}
+
+const fn has_alpha_channel(alpha: CGImageAlphaInfo) -> bool {
+    matches!(
+        alpha,
+        CGImageAlphaInfo::PremultipliedFirst
+            | CGImageAlphaInfo::PremultipliedLast
+            | CGImageAlphaInfo::First
+            | CGImageAlphaInfo::Last
+    )
 }
 
 /// Copies the image's backing bytes out of CoreFoundation's ownership.
@@ -484,6 +511,19 @@ mod tests {
         )
         .expect_err("alpha masks are not captures");
         assert!(matches!(error, Error::Unsupported { .. }));
+    }
+
+    #[test]
+    fn only_real_colour_plus_alpha_layouts_satisfy_native_alpha() {
+        assert!(has_alpha_channel(CGImageAlphaInfo::PremultipliedFirst));
+        assert!(has_alpha_channel(CGImageAlphaInfo::PremultipliedLast));
+        assert!(has_alpha_channel(CGImageAlphaInfo::First));
+        assert!(has_alpha_channel(CGImageAlphaInfo::Last));
+
+        assert!(!has_alpha_channel(CGImageAlphaInfo::None));
+        assert!(!has_alpha_channel(CGImageAlphaInfo::NoneSkipFirst));
+        assert!(!has_alpha_channel(CGImageAlphaInfo::NoneSkipLast));
+        assert!(!has_alpha_channel(CGImageAlphaInfo::Only));
     }
 
     /// The exact bug the stride rule exists to prevent: a frame whose buffer is

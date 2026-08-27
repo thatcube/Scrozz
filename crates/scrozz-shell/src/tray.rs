@@ -107,7 +107,10 @@ impl TrayAction {
     /// until they can actually fulfil the click.
     #[must_use]
     pub const fn is_available(self) -> bool {
-        matches!(self, Self::CaptureFullscreen | Self::Quit)
+        matches!(
+            self,
+            Self::CaptureWindow | Self::CaptureFullscreen | Self::Quit
+        )
     }
 }
 

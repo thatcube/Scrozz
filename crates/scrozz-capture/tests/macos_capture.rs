@@ -23,7 +23,8 @@
 use scrozz_capture::backend;
 use scrozz_core::{
     CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display, DisplayId, Error,
-    LogicalPoint, LogicalRect, LogicalSize, PixelFormat, Provenance, WindowId,
+    LogicalPoint, LogicalRect, LogicalSize, PixelFormat, Provenance, ShadowSupport, WindowId,
+    WindowSelection,
 };
 
 /// Whether an error means "this machine cannot do this", rather than a defect.
@@ -78,6 +79,20 @@ fn displays_or_skip(backend: &dyn CaptureBackend) -> Option<Vec<Display>> {
 fn the_backend_exists_and_identifies_itself() {
     let backend = backend().expect("macOS always has a capture backend");
     assert_eq!(backend.name(), "ScreenCaptureKit");
+}
+
+#[test]
+fn window_picker_capability_reports_native_alpha_and_the_shadow_no_op() {
+    let backend = backend().expect("backend");
+    let capability = backend.window_picking();
+    assert_eq!(capability.selection, WindowSelection::InProcess);
+    assert!(capability.native_alpha);
+    assert!(matches!(
+        capability.shadow,
+        ShadowSupport::AlwaysExcluded { .. }
+    ));
+    assert!(!capability.shadow.resolve(true));
+    assert!(!capability.shadow.resolve(false));
 }
 
 #[test]
@@ -192,6 +207,7 @@ fn enumerated_windows_are_internally_consistent() {
             "an absent title must be None, not an empty string"
         );
         assert_ne!(window.application.as_deref(), Some(""));
+        assert_ne!(window.application_id.as_deref(), Some(""));
     }
 
     println!("enumerated {} windows", windows.len());
@@ -317,6 +333,9 @@ fn capturing_a_window_is_marked_as_sacred() {
     assert!(capture.frame.is_well_formed());
     assert!(capture.frame.width() > 0 && capture.frame.height() > 0);
     assert!(capture.frame.stride >= capture.frame.width() as usize * 4);
+    assert_eq!(capture.source_app.name, window.application);
+    assert_eq!(capture.source_app.identifier, window.application_id);
+    assert_eq!(capture.window_shadow, Some(false));
 
     println!(
         "captured window {:?} at {}x{} px",
@@ -326,10 +345,10 @@ fn capturing_a_window_is_marked_as_sacred() {
     );
 }
 
-/// The shadow flag must change the image, not be silently ignored: a window
-/// with its shadow is strictly larger than the same window without it.
+/// ScreenCaptureKit exposes a shadow-looking flag, but it is a no-op for the
+/// desktop-independent still path. Both requests must report the honest result.
 #[test]
-fn asking_for_a_window_shadow_produces_a_larger_image_than_refusing_it() {
+fn the_window_shadow_request_is_reported_as_excluded_either_way() {
     let backend = backend().expect("backend");
     let windows = attempt!("windows", backend.windows());
 
@@ -360,18 +379,11 @@ fn asking_for_a_window_shadow_produces_a_larger_image_than_refusing_it() {
     );
 
     assert!(with.frame.is_well_formed() && without.frame.is_well_formed());
-    assert!(
-        with.frame.width() >= without.frame.width()
-            && with.frame.height() >= without.frame.height(),
-        "the shadowed capture ({}x{}) is smaller than the unshadowed one ({}x{})",
-        with.frame.width(),
-        with.frame.height(),
-        without.frame.width(),
-        without.frame.height()
-    );
+    assert_eq!(with.window_shadow, Some(false));
+    assert_eq!(without.window_shadow, Some(false));
 
     println!(
-        "shadow on: {}x{}; shadow off: {}x{}",
+        "shadow requested: {}x{}; shadow refused: {}x{}; both honestly excluded",
         with.frame.width(),
         with.frame.height(),
         without.frame.width(),

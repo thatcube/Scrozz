@@ -6,7 +6,7 @@
 //! up a second time and racing with the user closing it in between.
 
 use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
-use scrozz_core::{Display, DisplayId, LogicalRect, Result, Window, WindowId};
+use scrozz_core::{Display, DisplayId, LogicalRect, Result, SourceApp, Window, WindowId};
 
 /// Windows the user could plausibly pick, in front-to-back order.
 ///
@@ -50,51 +50,104 @@ pub(crate) fn find(
 
 fn to_window(window: &SCWindow, displays: &[Display]) -> Window {
     // SAFETY: all plain property reads on a live `SCWindow`.
-    let (id, frame, title, application, is_visible) = unsafe {
-        (
-            window.windowID(),
-            window.frame(),
-            window.title().map(|title| title.to_string()),
-            window
-                .owningApplication()
-                .map(|app| app.applicationName().to_string()),
-            window.isOnScreen(),
-        )
-    };
+    let (id, frame, is_visible) =
+        unsafe { (window.windowID(), window.frame(), window.isOnScreen()) };
+    let metadata = WindowMetadata::from_window(window);
 
     let bounds = super::display::from_cg_rect(frame);
 
     Window {
         id: WindowId(id.to_string()),
-        // An empty title is the OS saying it has none, so report `None`
-        // rather than a blank string a picker would render as a gap.
-        title: title.filter(|title| !title.is_empty()),
-        application: application.filter(|name| !name.is_empty()),
+        title: metadata.title,
+        application: metadata.application,
+        application_id: metadata.application_id,
         bounds,
         display: containing_display(bounds, displays),
         is_visible,
     }
 }
 
+/// Captures owner metadata from the same current `SCWindow` used for capture.
+pub(crate) fn source_app(window: &SCWindow) -> SourceApp {
+    WindowMetadata::from_window(window).into_source_app()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WindowMetadata {
+    title: Option<String>,
+    application: Option<String>,
+    application_id: Option<String>,
+}
+
+impl WindowMetadata {
+    fn from_window(window: &SCWindow) -> Self {
+        // SAFETY: all plain property reads on a live `SCWindow`. Keeping the
+        // owner retained while reading both fields makes them one snapshot.
+        let (title, application, application_id) = unsafe {
+            let owner = window.owningApplication();
+            (
+                window.title().map(|title| title.to_string()),
+                owner.as_ref().map(|app| app.applicationName().to_string()),
+                owner.as_ref().map(|app| app.bundleIdentifier().to_string()),
+            )
+        };
+
+        Self::new(title, application, application_id)
+    }
+
+    fn new(
+        title: Option<String>,
+        application: Option<String>,
+        application_id: Option<String>,
+    ) -> Self {
+        Self {
+            title: non_empty(title),
+            application: non_empty(application),
+            application_id: non_empty(application_id),
+        }
+    }
+
+    fn into_source_app(self) -> SourceApp {
+        SourceApp {
+            name: self.application,
+            identifier: self.application_id,
+            window_title: self.title,
+        }
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
 /// The display a window belongs to.
 ///
-/// Decided by the window's centre rather than its origin: a window dragged
-/// halfway across a boundary belongs to whichever display shows more of it, and
-/// its origin can easily sit on the other one — or, for a window pushed
-/// partly off the left edge, on no display at all.
+/// Decided by overlap area rather than origin or centre. Irregular monitor
+/// layouts can put the centre in a gap, and an asymmetrical window can have its
+/// centre on the display that contains less of it.
 fn containing_display(bounds: LogicalRect, displays: &[Display]) -> DisplayId {
-    let centre = (
-        bounds.origin.x + bounds.size.width / 2.0,
-        bounds.origin.y + bounds.size.height / 2.0,
-    );
-
     displays
         .iter()
-        .find(|display| super::display::contains(display.bounds, centre))
+        .filter_map(|display| {
+            let area = overlap_area(bounds, display.bounds);
+            (area > 0.0).then_some((area, display))
+        })
+        .max_by(|(left, _), (right, _)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, display)| display)
         .or_else(|| displays.iter().find(|display| display.is_primary))
         .or_else(|| displays.first())
         .map(|display| display.id.clone())
         .unwrap_or_else(|| DisplayId(String::new()))
+}
+
+fn overlap_area(a: LogicalRect, b: LogicalRect) -> f64 {
+    let left = a.origin.x.max(b.origin.x);
+    let top = a.origin.y.max(b.origin.y);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let bottom = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    ((right - left).max(0.0)) * ((bottom - top).max(0.0))
 }
 
 #[cfg(test)]
@@ -103,7 +156,18 @@ mod tests {
     use scrozz_core::{LogicalPoint, LogicalSize, ScaleFactor};
 
     fn display(id: &str, x: f64, is_primary: bool) -> Display {
-        let bounds = LogicalRect::new(LogicalPoint::new(x, 0.0), LogicalSize::new(1000.0, 1000.0));
+        display_rect(id, x, 0.0, 1000.0, 1000.0, is_primary)
+    }
+
+    fn display_rect(
+        id: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        is_primary: bool,
+    ) -> Display {
+        let bounds = LogicalRect::new(LogicalPoint::new(x, y), LogicalSize::new(width, height));
         Display {
             id: DisplayId(id.to_owned()),
             name: id.to_owned(),
@@ -141,10 +205,57 @@ mod tests {
     }
 
     #[test]
+    fn irregular_layout_uses_the_display_with_the_largest_overlap() {
+        let displays = [
+            display_rect("small", 0.0, 0.0, 1000.0, 1000.0, true),
+            display_rect("large", 1000.0, 700.0, 1600.0, 900.0, false),
+        ];
+        // The centre (1200, 650) is in neither display. The centre-point rule
+        // would fall back to primary even though most of the window is on large.
+        let window = LogicalRect::new(
+            LogicalPoint::new(900.0, 400.0),
+            LogicalSize::new(600.0, 500.0),
+        );
+
+        assert_eq!(
+            containing_display(window, &displays),
+            DisplayId("large".to_owned())
+        );
+    }
+
+    #[test]
     fn no_displays_yields_an_empty_id_rather_than_a_panic() {
         assert_eq!(
             containing_display(window_at(0.0, 100.0), &[]),
             DisplayId(String::new())
         );
+    }
+
+    #[test]
+    fn bundle_identifier_and_display_name_map_to_their_distinct_fields() {
+        let metadata = WindowMetadata::new(
+            Some("Roadmap".to_owned()),
+            Some("Safari".to_owned()),
+            Some("com.apple.Safari".to_owned()),
+        );
+
+        assert_eq!(metadata.application.as_deref(), Some("Safari"));
+        assert_eq!(metadata.application_id.as_deref(), Some("com.apple.Safari"));
+
+        let source = metadata.into_source_app();
+        assert_eq!(source.name.as_deref(), Some("Safari"));
+        assert_eq!(source.identifier.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(source.window_title.as_deref(), Some("Roadmap"));
+    }
+
+    #[test]
+    fn empty_screen_capture_kit_metadata_remains_unknown() {
+        let metadata = WindowMetadata::new(
+            Some(String::new()),
+            Some(String::new()),
+            Some(String::new()),
+        );
+        assert_eq!(metadata, WindowMetadata::default());
+        assert!(!metadata.into_source_app().is_known());
     }
 }

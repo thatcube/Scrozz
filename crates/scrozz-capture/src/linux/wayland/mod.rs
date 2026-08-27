@@ -19,17 +19,9 @@
 //! - Display geometry is recovered from XWayland where it exists, because
 //!   XWayland mirrors the compositor's outputs into RandR. That is a real answer
 //!   on the overwhelming majority of desktops, and an honest refusal on the rest.
-//! - The permission prompt must be suppressed with a restore token or the tool
-//!   is unusable. [`restore`] handles that, and it is treated as a requirement
-//!   rather than a nicety.
-//!
-//! # Current state
-//!
-//! The negotiation is complete and tested; the D-Bus calls are not compiled.
-//! `ashpd`'s `screencast` and `screenshot` modules are behind Cargo features
-//! that this workspace's dependency declaration does not enable, and this crate
-//! is not permitted to change that declaration. See [`portal::acquire_frame`]
-//! for the second, larger gap: PipeWire.
+//! - Window stills use the Screenshot portal's window-restricted trusted picker.
+//!   The compositor returns an encoded image only after the user chooses a
+//!   surface, so Scrozz never gains ambient window-enumeration access.
 
 pub mod portal;
 pub mod restore;
@@ -37,11 +29,10 @@ pub mod restore;
 use std::sync::Mutex;
 
 use scrozz_core::{
-    Capture, CaptureBackend, CaptureRequest, CursorMode, Display, Error, Result, TargetEnumerator,
-    Window,
+    Capture, CaptureBackend, CaptureRequest, Display, Error, Result, TargetEnumerator, Window,
+    WindowPicking, WindowPickingCapability,
 };
 
-use self::portal::SessionPlan;
 use self::restore::{TokenKey, TokenStore};
 use super::session::{self, Compositor, PortalCapabilities, SessionEnv, SessionKind};
 
@@ -59,6 +50,7 @@ pub struct WaylandBackend {
     /// through it is safe, because XWayland is configured by the compositor to
     /// mirror the real output layout.
     geometry: Option<super::x11::X11Backend>,
+    window_picking: WindowPickingCapability,
     name: String,
 }
 
@@ -69,6 +61,7 @@ impl std::fmt::Debug for WaylandBackend {
             .field("kind", &self.kind)
             .field("capabilities", &self.capabilities)
             .field("xwayland_geometry", &self.geometry.is_some())
+            .field("window_picking", &self.window_picking)
             .finish_non_exhaustive()
     }
 }
@@ -108,6 +101,18 @@ impl WaylandBackend {
                     None
                 }
             });
+        let window_picking = if kind == SessionKind::Wayland {
+            portal::window_picking_capability().unwrap_or_else(|error| {
+                tracing::debug!(%error, "Screenshot portal window-target probe failed");
+                portal::unchecked_window_picking_capability(format!(
+                    "the Screenshot portal could not be queried: {error}"
+                ))
+            })
+        } else {
+            portal::unchecked_window_picking_capability(
+                "portal window selection applies only to native Wayland sessions",
+            )
+        };
 
         let name = format!(
             "xdg-desktop-portal ScreenCast on {compositor}{}",
@@ -125,6 +130,7 @@ impl WaylandBackend {
             tokens: Mutex::new(tokens),
             token_path,
             geometry,
+            window_picking,
             name,
         })
     }
@@ -192,31 +198,6 @@ impl WaylandBackend {
             ),
         })
     }
-
-    /// Negotiates a ScreenCast session for a request.
-    ///
-    /// Fully specified and currently unreachable. The plan it builds is exactly
-    /// what the D-Bus call would carry, which is why it is worth computing and
-    /// testing even while the call itself cannot be made.
-    fn open_session(&self, plan: &SessionPlan) -> Result<portal::StreamInfo> {
-        let _restore = self
-            .capabilities
-            .restore_tokens
-            .then(|| self.stored_token(plan.restore_key))
-            .flatten();
-
-        Err(Error::Unsupported {
-            what: "capturing on Wayland".into(),
-            why: format!(
-                "the ScreenCast portal is the only route to pixels on {compositor}, and this \
-                 build cannot call it: the `ashpd` dependency is declared without its \
-                 `screencast` and `screenshot` features, so those modules are not compiled in. \
-                 Adding `features = [\"screencast\", \"screenshot\"]` to the workspace's ashpd \
-                 dependency, plus a PipeWire client for frame acquisition, is what remains",
-                compositor = self.compositor
-            ),
-        })
-    }
 }
 
 impl TargetEnumerator for WaylandBackend {
@@ -252,20 +233,33 @@ impl TargetEnumerator for WaylandBackend {
 
 impl CaptureBackend for WaylandBackend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
-        let plan = SessionPlan::for_target(&request.target, request.cursor == CursorMode::Visible);
-
-        if request.target.is_window() && self.kind == SessionKind::Wayland {
-            tracing::info!(
-                "window capture on Wayland is chosen in the portal's picker, not by window id; \
-                 the requested id is advisory only"
-            );
+        if request.target.is_window() {
+            if self.kind == SessionKind::Wayland {
+                tracing::info!(
+                    "window capture on Wayland is chosen in the portal's picker, not by window id; \
+                    the requested id is advisory only"
+                );
+            }
+            return portal::capture_window(request);
         }
 
-        let stream = self.open_session(&plan)?;
-        portal::acquire_frame(stream)
+        Err(Error::Unsupported {
+            what: "capturing this target on Wayland".into(),
+            why: format!(
+                "the {compositor} Screenshot portal path currently supports window stills; \
+                 display and region requests require a separately placeable ScreenCast stream",
+                compositor = self.compositor
+            ),
+        })
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl WindowPicking for WaylandBackend {
+    fn window_picking(&self) -> WindowPickingCapability {
+        self.window_picking.clone()
     }
 }

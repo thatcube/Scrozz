@@ -109,6 +109,16 @@ pub enum ShadowSupport {
     /// The compositor honours both answers. The control is enabled.
     Toggleable,
 
+    /// The capture source neither controls nor reports whether a shadow is present.
+    ///
+    /// The control is hidden and capture metadata remains unknown. This is
+    /// distinct from [`Self::AlwaysExcluded`]: claiming "off" would fabricate a
+    /// fact about pixels the backend cannot inspect independently.
+    Unchecked {
+        /// Why no reliable shadow state is available, in the user's terms.
+        why: String,
+    },
+
     /// Every capture arrives with the shadow, and it cannot be removed.
     ///
     /// The control is shown disabled and pinned on, with `why` as its
@@ -149,6 +159,7 @@ impl ShadowSupport {
     pub const fn resolve(&self, requested: bool) -> bool {
         match self {
             Self::Toggleable => requested,
+            Self::Unchecked { .. } => false,
             Self::AlwaysIncluded { .. } => true,
             Self::AlwaysExcluded { .. } => false,
         }
@@ -159,7 +170,9 @@ impl ShadowSupport {
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Toggleable => None,
-            Self::AlwaysIncluded { why } | Self::AlwaysExcluded { why } => Some(why),
+            Self::Unchecked { why }
+            | Self::AlwaysIncluded { why }
+            | Self::AlwaysExcluded { why } => Some(why),
         }
     }
 }
