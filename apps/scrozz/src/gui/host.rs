@@ -350,13 +350,24 @@ pub fn select_once(
         .with_visible(false)
         .with_active(false);
     let driver_selector = Arc::clone(&selector);
+    let native = BehaviorController::default();
+    let creation_native = native.clone();
     let run_result = eframe::run_native(
         "Scrozz Selector",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            #[cfg(target_os = "linux")]
+            {
+                match crate::gui::panel::attach_x11_focus(cc, &creation_native) {
+                    Ok(()) => tracing::info!("attached one-shot X11 selector focus"),
+                    Err(error) => {
+                        tracing::warn!(%error, "one-shot X11 selector focus unavailable");
+                    }
+                }
+            }
             Ok(Box::new(OneShotDriver {
                 selection,
-                native: BehaviorController::default(),
+                native: creation_native,
                 selector: driver_selector,
             }))
         }),
