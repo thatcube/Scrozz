@@ -331,6 +331,14 @@ struct MacRecordingSession {
 unsafe impl Send for MacRecordingSession {}
 
 impl RecordingSession for MacRecordingSession {
+    fn state(&self) -> RecordingState {
+        self.shared.state()
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.shared.elapsed()
+    }
+
     fn pause(&mut self) -> Result<()> {
         lock(&self.shared.clock)
             .pause(self.shared.now())

@@ -344,6 +344,9 @@ impl eframe::App for Driver {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
 
+        for action in self.handle.drain_recording_actions() {
+            self.app.handle_recording_surface_action(action);
+        }
         if !self.stopped && self.app.tick() == Tick::Stop {
             self.stopped = true;
             let report = self.app.report();
@@ -353,6 +356,7 @@ impl eframe::App for Driver {
             // Before the window closes, so the menu-bar item never outlives
             // what the user can see.
             self.app.shut_down();
+            self.handle.set_recording(None);
 
             if self.converted() {
                 if let Some(emit) = self.emit.take() {
@@ -363,6 +367,9 @@ impl eframe::App for Driver {
             }
 
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if !self.stopped {
+            self.handle.set_recording(self.app.recording_presentation());
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while

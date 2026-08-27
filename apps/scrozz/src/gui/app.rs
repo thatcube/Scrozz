@@ -23,27 +23,59 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    time::{Duration, Instant},
+};
 
-use scrozz_core::CaptureTarget;
-use scrozz_record::{MachineEvent, RecordingMachine, RecordingPhase, RecordingSettings};
+use scrozz_core::{CaptureTarget, Error as CoreError};
+use scrozz_record::{
+    MachineEvent, Recording, RecordingMachine, RecordingPhase, RecordingSettings,
+    edit::{EditPlan, SourceMetadata, VideoDocument},
+    transcode::TranscodeFailure,
+};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
 };
+use scrozz_ui::{
+    RecordingHudAction, RecordingHudSnapshot, RecordingPresentation, RecordingSurfaceAction,
+    VideoEditorAction, VideoEditorSnapshot,
+};
 
 use crate::{
-    cli::Cli,
+    cli::{Cli, Command, RecordControl},
+    commands,
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
         card::{CardEvent, CardSurface},
         pipeline::{Job, Outcome, Pipeline},
-        server::Server,
+        server::{Request, Server},
     },
     json::Json,
     report::Report,
 };
+
+struct FinalisedRecording {
+    result: scrozz_core::Result<Recording>,
+    reply: Option<Request>,
+}
+
+enum GuiRecordingCompletion {
+    Finished(Report),
+    Failed(String),
+}
+
+struct ActiveVideoEditor {
+    document: VideoDocument,
+    plan: EditPlan,
+    transcode_failure: Option<TranscodeFailure>,
+}
 
 /// What a hotkey is bound to unless the environment says otherwise.
 ///
@@ -196,6 +228,9 @@ pub struct App {
     recording_permission: fn() -> CliResult<()>,
     recording_target: fn() -> CliResult<CaptureTarget>,
     recording_tick: Instant,
+    recording_finalisation: Option<Receiver<FinalisedRecording>>,
+    recording_completion: Option<GuiRecordingCompletion>,
+    recording_editor: Option<ActiveVideoEditor>,
 }
 
 impl App {
@@ -296,6 +331,9 @@ impl App {
             recording_permission: Self::ensure_recording_permission,
             recording_target: Self::active_recording_target,
             recording_tick: Instant::now(),
+            recording_finalisation: None,
+            recording_completion: None,
+            recording_editor: None,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -385,11 +423,22 @@ impl App {
 
         for request in pending {
             tracing::debug!(?request, "a forwarded command arrived");
-            // The command runs to completion here, on the main thread, because
-            // it must produce byte-identical output to a local run and the
-            // command layer is synchronous. A capture is tens of milliseconds;
-            // a recording returns as soon as it has started.
-            if let Some(command) = request.serve() {
+            let parsed = request.command();
+            if matches!(
+                parsed,
+                Some(Command::Record(ref args))
+                    if args.control() == Some(RecordControl::Stop)
+            ) {
+                self.begin_recording_finalisation(Some(request));
+                continue;
+            }
+
+            let served = if matches!(parsed, Some(Command::Record(_))) {
+                request.serve_with(|command| self.dispatch_gui_recording(command))
+            } else {
+                request.serve()
+            };
+            if let Some(command) = served {
                 self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
@@ -540,12 +589,7 @@ impl App {
                 self.finish_recording_action(result, "recording countdown cancelled");
             }
             RecordingPhase::Recording | RecordingPhase::Paused => {
-                let result = self
-                    .recording
-                    .as_mut()
-                    .expect("recording phase came from this machine")
-                    .stop();
-                self.finish_recording_action(result, "recording stopped");
+                self.begin_recording_finalisation(None);
             }
             RecordingPhase::Finalising => self.note("recording is already finalising"),
         }
@@ -586,6 +630,8 @@ impl App {
         }
 
         self.recording_tick = Instant::now();
+        self.recording_completion = None;
+        self.recording_editor = None;
         let result = self
             .recording
             .as_mut()
@@ -604,10 +650,14 @@ impl App {
     }
 
     fn advance_recording(&mut self) {
+        self.finish_pending_recording();
         let now = Instant::now();
         let delta = now.saturating_duration_since(self.recording_tick);
         self.recording_tick = now;
 
+        if let Some(editor) = &mut self.recording_editor {
+            editor.document.tick(delta);
+        }
         let result = self.recording.as_mut().map(|machine| machine.tick(delta));
         if let Some(Err(error)) = result {
             self.note(format!("recording tick failed: {error}"));
@@ -616,7 +666,155 @@ impl App {
         self.refresh_recording_tray();
     }
 
+    fn dispatch_gui_recording(&mut self, command: &Command) -> CliResult<Report> {
+        let Command::Record(args) = command else {
+            return commands::dispatch(command);
+        };
+        if args.dry_run {
+            return commands::dispatch(command);
+        }
+
+        let machine = self.recording.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Unsupported {
+                what: "screen recording".into(),
+                why: "no native recording engine is linked for this platform".into(),
+            })
+        })?;
+        match args.control() {
+            Some(RecordControl::Pause) => {
+                machine.pause()?;
+                Ok(recording_machine_report(
+                    machine,
+                    "paused",
+                    "Recording paused.",
+                ))
+            }
+            Some(RecordControl::Resume) => {
+                machine.resume()?;
+                Ok(recording_machine_report(
+                    machine,
+                    "recording",
+                    "Recording resumed.",
+                ))
+            }
+            Some(RecordControl::Stop) => Err(CliError::Core(CoreError::InvalidRequest(
+                "recording stop must be finalised asynchronously".into(),
+            ))),
+            None => {
+                if let Err(error) = (self.recording_permission)() {
+                    return Err(CliError::Core(CoreError::PermissionDenied {
+                        capability: "screen recording".into(),
+                        remedy: error.to_string(),
+                    }));
+                }
+                if matches!(
+                    machine.phase(),
+                    RecordingPhase::Finished | RecordingPhase::Failed
+                ) {
+                    machine.reset()?;
+                }
+                let prepared = commands::prepare_recording_args(args)?;
+                let report = prepared.started_report();
+                self.recording_editor = None;
+                machine.begin_request(prepared.request)?;
+                self.recording_tick = Instant::now();
+                self.recording_completion = None;
+                self.drain_recording_events();
+                self.refresh_recording_tray();
+                Ok(report)
+            }
+        }
+    }
+
+    fn begin_recording_finalisation(&mut self, reply: Option<Request>) {
+        let result = self
+            .recording
+            .as_mut()
+            .ok_or_else(|| {
+                CoreError::InvalidRequest(
+                    "no recording is in progress, so there is nothing to stop".into(),
+                )
+            })
+            .and_then(RecordingMachine::begin_finalising);
+        let session = match result {
+            Ok(session) => session,
+            Err(error) => {
+                self.note(format!("recording action failed: {error}"));
+                if let Some(request) = reply {
+                    request.serve_with(|_| Err(CliError::Core(error)));
+                }
+                return;
+            }
+        };
+
+        let (send, receive) = mpsc::channel();
+        self.recording_finalisation = Some(receive);
+        self.note("recording finalisation started");
+        std::thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| session.stop())).unwrap_or_else(|_| {
+                Err(CoreError::Platform(
+                    "the native recording finaliser panicked".into(),
+                ))
+            });
+            let _ = send.send(FinalisedRecording { result, reply });
+        });
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn finish_pending_recording(&mut self) {
+        let received = self.recording_finalisation.as_ref().map(Receiver::try_recv);
+        let message = match received {
+            Some(Ok(message)) => message,
+            Some(Err(TryRecvError::Empty)) | None => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.recording_finalisation = None;
+                let result = self.recording.as_mut().map(|machine| {
+                    machine.complete_finalising(Err(CoreError::Platform(
+                        "the recording finaliser ended without returning a result".into(),
+                    )))
+                });
+                if let Some(Err(error)) = result {
+                    self.note(format!("could not finish recording state: {error}"));
+                }
+                self.drain_recording_events();
+                return;
+            }
+        };
+        self.recording_finalisation = None;
+        self.apply_finalised_recording(message);
+    }
+
+    fn apply_finalised_recording(&mut self, message: FinalisedRecording) {
+        let completed = self
+            .recording
+            .as_mut()
+            .expect("a finalisation receiver belongs to a recording machine")
+            .complete_finalising(message.result);
+        if let Err(error) = completed {
+            self.note(format!("could not finish recording state: {error}"));
+        }
+        self.drain_recording_events();
+        if let Some(request) = message.reply {
+            let completion = self.recording_completion.take();
+            request.serve_with(|_| match completion {
+                Some(GuiRecordingCompletion::Finished(report)) => Ok(report),
+                Some(GuiRecordingCompletion::Failed(message)) => {
+                    Err(CliError::Core(CoreError::Platform(message)))
+                }
+                None => Err(CliError::Core(CoreError::Platform(
+                    "recording ended without a completion report".into(),
+                ))),
+            });
+        }
+    }
+
     fn drain_recording_events(&mut self) {
+        let fallback_target = self
+            .recording
+            .as_ref()
+            .and_then(RecordingMachine::request)
+            .map(|request| request.target.clone());
         let events = self
             .recording
             .as_mut()
@@ -634,26 +832,58 @@ impl App {
                     "recording clock drift: engine is {:+.3}s from the authoritative clock",
                     drift.delta_secs
                 )),
-                MachineEvent::Finished(output) => match output.require_native() {
-                    Ok(output) => {
-                        self.note(format!("recording saved to {}", output.path().display()));
-                    }
-                    Err(error) => self.note(format!(
-                        "recording output was rejected at the real-output boundary: {error}"
-                    )),
-                },
+                MachineEvent::Finished(output) => {
+                    self.retain_recording_completion(output, fallback_target.as_ref());
+                }
                 MachineEvent::Failed(failure) => {
-                    let partial = failure.partial.as_ref().and_then(|output| {
-                        output.require_native().ok().map(|output| {
-                            format!("; partial output is at {}", output.path().display())
-                        })
+                    let partial = failure.partial.clone();
+                    let partial_note = partial.as_ref().map(|output| {
+                        format!("; partial output is at {}", output.path().display())
                     });
                     self.note(format!(
                         "recording failed: {}{}",
                         failure.error,
-                        partial.unwrap_or_default()
+                        partial_note.unwrap_or_default()
                     ));
+                    if let Some(output) = partial {
+                        self.retain_recording_completion(output, fallback_target.as_ref());
+                    } else {
+                        self.recording_completion =
+                            Some(GuiRecordingCompletion::Failed(failure.error.to_string()));
+                    }
                 }
+            }
+        }
+    }
+
+    fn retain_recording_completion(
+        &mut self,
+        output: Recording,
+        fallback_target: Option<&CaptureTarget>,
+    ) {
+        let path = output.path().to_path_buf();
+        let requested_fps = self
+            .recording
+            .as_ref()
+            .and_then(RecordingMachine::request)
+            .map(|request| request.fps);
+        self.recording_editor = None;
+        match active_video_editor(&output, requested_fps) {
+            Ok(editor) => self.recording_editor = editor,
+            Err(error) => self.note(format!(
+                "recording was saved but could not be opened in the video editor: {error}"
+            )),
+        }
+        match commands::finish_recording_report(output, fallback_target) {
+            Ok(report) => {
+                self.note(format!("recording saved to {}", path.display()));
+                self.recording_completion = Some(GuiRecordingCompletion::Finished(report));
+            }
+            Err(error) => {
+                self.note(format!(
+                    "recording output was rejected at the real-output boundary: {error}"
+                ));
+                self.recording_completion = Some(GuiRecordingCompletion::Failed(error.to_string()));
             }
         }
     }
@@ -688,6 +918,154 @@ impl App {
         let backend = scrozz_capture::backend()?;
         let display = backend.active_display()?;
         Ok(CaptureTarget::Display(display.id))
+    }
+
+    /// Recording state rendered by the shared overlay.
+    #[must_use]
+    pub fn recording_presentation(&self) -> Option<RecordingPresentation> {
+        let machine = self.recording.as_ref()?;
+        if machine.phase() == RecordingPhase::Idle && self.recording_editor.is_none() {
+            return None;
+        }
+        Some(RecordingPresentation {
+            hud: RecordingHudSnapshot::from_machine(machine),
+            countdown: machine.settings().countdown,
+            countdown_remaining: machine.countdown_remaining(),
+            editor: self
+                .recording_editor
+                .as_ref()
+                .map(|editor| VideoEditorSnapshot {
+                    document: editor.document.clone(),
+                    plan: editor.plan,
+                    transcode_failure: editor.transcode_failure.clone(),
+                }),
+        })
+    }
+
+    /// Applies one semantic action raised by the shared recording surface.
+    pub fn handle_recording_surface_action(&mut self, action: RecordingSurfaceAction) {
+        match action {
+            RecordingSurfaceAction::Hud(action) => self.handle_recording_hud_action(action),
+            RecordingSurfaceAction::Editor(action) => self.handle_video_editor_action(action),
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn handle_recording_hud_action(&mut self, action: RecordingHudAction) {
+        match action {
+            RecordingHudAction::Dismiss => {
+                self.recording_editor = None;
+                let result = self.recording.as_mut().ok_or_else(|| {
+                    CoreError::InvalidRequest("no recording state is available".into())
+                });
+                let result = result.and_then(RecordingMachine::reset);
+                self.finish_recording_action(result, "recording result dismissed");
+            }
+            RecordingHudAction::Pause | RecordingHudAction::Resume => {
+                let result = self.recording.as_mut().ok_or_else(|| {
+                    CoreError::InvalidRequest("no recording session is available".into())
+                });
+                let result = result.and_then(|machine| match action {
+                    RecordingHudAction::Pause => machine.pause(),
+                    RecordingHudAction::Resume => machine.resume(),
+                    _ => unreachable!("the outer match accepts only pause or resume"),
+                });
+                self.finish_recording_action(result, "recording state changed");
+            }
+            RecordingHudAction::Stop => self.begin_recording_finalisation(None),
+            RecordingHudAction::RevealOutput => {
+                let path = self
+                    .recording_editor
+                    .as_ref()
+                    .map(|editor| editor.document.recording().path().to_path_buf())
+                    .or_else(|| {
+                        self.recording
+                            .as_ref()
+                            .and_then(RecordingMachine::output)
+                            .map(|output| output.path().to_path_buf())
+                    });
+                self.reveal_recording_path(path);
+            }
+            RecordingHudAction::RevealPartialOutput => {
+                let path = self
+                    .recording
+                    .as_ref()
+                    .and_then(RecordingMachine::failure)
+                    .and_then(|failure| failure.partial.as_ref())
+                    .map(|output| output.path().to_path_buf());
+                self.reveal_recording_path(path);
+            }
+        }
+    }
+
+    fn handle_video_editor_action(&mut self, action: VideoEditorAction) {
+        if action == VideoEditorAction::Close {
+            self.recording_editor = None;
+            if let Some(machine) = self.recording.as_mut()
+                && matches!(
+                    machine.phase(),
+                    RecordingPhase::Finished | RecordingPhase::Failed
+                )
+                && let Err(error) = machine.reset()
+            {
+                self.note(format!("could not close the recording editor: {error}"));
+            }
+            return;
+        }
+        let Some(editor) = self.recording_editor.as_mut() else {
+            self.note("the video editor no longer has a recording");
+            return;
+        };
+        match action {
+            VideoEditorAction::Close => {
+                unreachable!("close is handled before borrowing the editor")
+            }
+            VideoEditorAction::Play => editor.document.play(),
+            VideoEditorAction::Pause => editor.document.pause(),
+            VideoEditorAction::Seek(position) => {
+                if let Err(error) = editor.document.seek(position) {
+                    self.note(format!("could not seek the recording: {error}"));
+                }
+            }
+            VideoEditorAction::PlanChanged(plan) => {
+                editor.plan = plan;
+                editor.transcode_failure = None;
+            }
+            VideoEditorAction::Export(plan) => {
+                editor.plan = plan;
+                let error = CoreError::Unsupported {
+                    what: "video export".into(),
+                    why: "this build has no native transcoder; the source recording was left unchanged"
+                        .into(),
+                };
+                editor.transcode_failure = Some(TranscodeFailure {
+                    error: Arc::new(error),
+                    partial: None,
+                });
+            }
+            VideoEditorAction::CancelExport => {
+                self.note("there is no native video export job to cancel");
+            }
+            VideoEditorAction::RevealOutput | VideoEditorAction::RevealPartialOutput => {
+                let path = Some(editor.document.recording().path().to_path_buf());
+                self.reveal_recording_path(path);
+            }
+        }
+    }
+
+    fn reveal_recording_path(&mut self, path: Option<std::path::PathBuf>) {
+        let Some(path) = path else {
+            self.note("there is no recording output to reveal");
+            return;
+        };
+        match reveal_file(&path) {
+            Ok(()) => self.note(format!("revealed recording at {}", path.display())),
+            Err(error) => self.note(format!(
+                "could not reveal recording at {}: {error}",
+                path.display()
+            )),
+        }
     }
 
     /// How many cards are on screen.
@@ -739,6 +1117,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.finalise_recording_before_shutdown();
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
@@ -747,11 +1126,156 @@ impl App {
         self.pipeline.stop();
     }
 
+    fn finalise_recording_before_shutdown(&mut self) {
+        if let Some(receiver) = self.recording_finalisation.take() {
+            match receiver.recv() {
+                Ok(message) => self.apply_finalised_recording(message),
+                Err(_) => {
+                    if let Some(machine) = self.recording.as_mut() {
+                        let _ = machine.complete_finalising(Err(CoreError::Platform(
+                            "the recording finaliser ended during shutdown".into(),
+                        )));
+                    }
+                    self.drain_recording_events();
+                }
+            }
+            return;
+        }
+
+        let phase = self.recording.as_ref().map(RecordingMachine::phase);
+        if matches!(
+            phase,
+            Some(RecordingPhase::Recording | RecordingPhase::Paused)
+        ) {
+            let session = self
+                .recording
+                .as_mut()
+                .expect("the phase came from this machine")
+                .begin_finalising();
+            match session {
+                Ok(session) => {
+                    let result =
+                        catch_unwind(AssertUnwindSafe(|| session.stop())).unwrap_or_else(|_| {
+                            Err(CoreError::Platform(
+                                "the native recording finaliser panicked during shutdown".into(),
+                            ))
+                        });
+                    let _ = self
+                        .recording
+                        .as_mut()
+                        .expect("the session came from this machine")
+                        .complete_finalising(result);
+                    self.drain_recording_events();
+                }
+                Err(error) => self.note(format!(
+                    "could not begin recording finalisation during shutdown: {error}"
+                )),
+            }
+        }
+    }
+
     /// Every note recorded so far.
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_file(path: &std::path::Path) -> scrozz_core::Result<()> {
+    reveal_with(
+        std::process::Command::new("open").arg("-R").arg(path),
+        "Finder",
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_file(path: &std::path::Path) -> scrozz_core::Result<()> {
+    reveal_with(
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(path),
+        "File Explorer",
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn reveal_file(path: &std::path::Path) -> scrozz_core::Result<()> {
+    let directory = path.parent().unwrap_or(path);
+    reveal_with(
+        std::process::Command::new("xdg-open").arg(directory),
+        "the platform file browser",
+    )
+}
+
+fn reveal_with(command: &mut std::process::Command, application: &str) -> scrozz_core::Result<()> {
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CoreError::Platform(format!(
+            "{application} exited with {status}"
+        )))
+    }
+}
+
+fn active_video_editor(
+    output: &Recording,
+    requested_fps: Option<u32>,
+) -> scrozz_core::Result<Option<ActiveVideoEditor>> {
+    output.require_native()?;
+    if !output.is_playable() {
+        return Ok(None);
+    }
+    let size = output.metadata.size.ok_or_else(|| {
+        CoreError::Codec("the native engine did not report encoded dimensions".into())
+    })?;
+    let fps = output
+        .metadata
+        .frames
+        .filter(|frames| *frames > 0 && output.duration_secs > 0.0)
+        .map(|frames| frames as f64 / output.duration_secs)
+        .or_else(|| requested_fps.map(f64::from))
+        .ok_or_else(|| {
+            CoreError::Codec("the native engine did not report a usable frame rate".into())
+        })?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let metadata = SourceMetadata {
+        width: size.width.round() as u32,
+        height: size.height.round() as u32,
+        fps,
+        audio_channels: output.metadata.audio_channels.unwrap_or(0),
+    };
+    let document = VideoDocument::open(output.clone(), metadata)?;
+    let plan = EditPlan::video(&document)?;
+    Ok(Some(ActiveVideoEditor {
+        document,
+        plan,
+        transcode_failure: None,
+    }))
+}
+
+fn recording_machine_report(
+    machine: &RecordingMachine,
+    state: &'static str,
+    human: &'static str,
+) -> Report {
+    Report::new(
+        Json::obj([
+            ("state", Json::str(state)),
+            (
+                "path",
+                Json::opt(
+                    machine
+                        .request()
+                        .and_then(|request| request.destination.as_deref()),
+                    |path| Json::str(path.to_string_lossy().into_owned()),
+                ),
+            ),
+            ("elapsed_secs", Json::Float(machine.elapsed().as_secs_f64())),
+        ]),
+        human,
+    )
 }
 
 impl Drop for App {
@@ -830,6 +1354,7 @@ mod tests {
         for action in [Action::OpenHistory, Action::OpenSettings] {
             assert_eq!(app.perform(action), Tick::Continue);
         }
+        app.recording = None;
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
         assert!(notes.contains("no native engine"), "{notes}");
@@ -867,6 +1392,14 @@ mod tests {
         );
 
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
+        for _ in 0..100 {
+            app.advance_recording();
+            if app.recording.as_ref().map(RecordingMachine::phase) == Some(RecordingPhase::Finished)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(
             app.recording.as_ref().map(RecordingMachine::phase),
             Some(RecordingPhase::Finished)
@@ -876,6 +1409,100 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("rejected at the real-output boundary"))
         );
+    }
+
+    #[test]
+    fn shared_hud_actions_drive_the_gui_owned_machine() {
+        let (mut app, _) = app();
+        let mut settings = RecordingSettings::shipped();
+        settings.countdown.enabled = false;
+        app.recording = Some(
+            RecordingMachine::with_engine(
+                Box::new(scrozz_record::engine::MockEngine::fully_capable(
+                    scrozz_record::engine::MockSessionPlan::complete("mock.mp4", 2.0).unwrap(),
+                )),
+                settings,
+            )
+            .unwrap(),
+        );
+        app.recording
+            .as_mut()
+            .unwrap()
+            .begin(CaptureTarget::AllDisplays)
+            .unwrap();
+
+        app.handle_recording_surface_action(RecordingSurfaceAction::Hud(RecordingHudAction::Pause));
+        assert_eq!(
+            app.recording_presentation().unwrap().hud.phase,
+            RecordingPhase::Paused
+        );
+        app.handle_recording_surface_action(RecordingSurfaceAction::Hud(
+            RecordingHudAction::Resume,
+        ));
+        assert_eq!(
+            app.recording_presentation().unwrap().hud.phase,
+            RecordingPhase::Recording
+        );
+    }
+
+    #[test]
+    fn native_playable_output_opens_an_editor_but_initialisation_only_does_not() {
+        let metadata = scrozz_record::RecordingMetadata {
+            size: Some(scrozz_core::PhysicalSize::new(1920.0, 1080.0)),
+            frames: Some(300),
+            audio_channels: Some(2),
+            ..Default::default()
+        };
+        let native = scrozz_record::Recording::native("real.mp4", 10.0, "native-test")
+            .unwrap()
+            .with_native_details(CaptureTarget::AllDisplays, metadata.clone())
+            .unwrap();
+        let editor = active_video_editor(&native, None).unwrap().unwrap();
+        assert_eq!(editor.document.metadata().fps, 30.0);
+        assert_eq!(editor.document.metadata().audio_channels, 2);
+
+        let partial = scrozz_record::Recording::native_partial_with_salvageability(
+            "header-only.mp4",
+            0.0,
+            "native-test",
+            scrozz_record::Salvageability::InitialisationOnly,
+            "capture ended before media",
+        )
+        .unwrap()
+        .with_native_details(CaptureTarget::AllDisplays, metadata)
+        .unwrap();
+        assert!(active_video_editor(&partial, Some(30)).unwrap().is_none());
+    }
+
+    #[test]
+    fn editor_reports_native_transcoder_unavailability_without_mocking_export() {
+        let (mut app, _) = app();
+        let native = scrozz_record::Recording::native("real.mp4", 4.0, "native-test")
+            .unwrap()
+            .with_native_details(
+                CaptureTarget::AllDisplays,
+                scrozz_record::RecordingMetadata {
+                    size: Some(scrozz_core::PhysicalSize::new(1280.0, 720.0)),
+                    frames: Some(120),
+                    audio_channels: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.recording_editor = active_video_editor(&native, None).unwrap();
+        let plan = app.recording_editor.as_ref().unwrap().plan;
+
+        app.handle_recording_surface_action(RecordingSurfaceAction::Editor(
+            VideoEditorAction::Export(plan),
+        ));
+
+        let failure = app
+            .recording_editor
+            .as_ref()
+            .and_then(|editor| editor.transcode_failure.as_ref())
+            .expect("export must report the missing native transcoder");
+        assert!(failure.error.to_string().contains("no native transcoder"));
+        assert!(failure.partial.is_none());
     }
 
     #[test]

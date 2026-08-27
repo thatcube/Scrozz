@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     cli::{Cli, Command},
-    commands,
+    commands::{self, RecordingManager},
     fault::{CliError, CliResult},
     ipc::{self, Response, StreamKind},
     report::{error_envelope, success_envelope},
@@ -46,6 +46,8 @@ pub struct Request {
     pub cwd: Option<PathBuf>,
     #[cfg(unix)]
     stream: std::os::unix::net::UnixStream,
+    #[cfg(target_os = "windows")]
+    stream: std::fs::File,
 }
 
 impl std::fmt::Debug for Request {
@@ -58,6 +60,18 @@ impl std::fmt::Debug for Request {
 }
 
 impl Request {
+    /// Parses enough of the forwarded invocation for the host to choose an
+    /// asynchronous stateful path before replying.
+    #[must_use]
+    pub fn command(&self) -> Option<Command> {
+        let mut with_argv0 = Vec::with_capacity(self.argv.len() + 1);
+        with_argv0.push("scrozz".to_owned());
+        with_argv0.extend_from_slice(&self.argv);
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(with_argv0).ok()?;
+        Some(cli.command.unwrap_or(Command::Gui))
+    }
+
     /// Runs the command and answers the caller.
     ///
     /// Consumes the request, because the socket must be closed either way: a
@@ -67,7 +81,20 @@ impl Request {
     /// Returns what the command was, so the app can decide whether it also has
     /// local work to do — showing a card for a forwarded capture, or quitting.
     pub fn serve(self) -> Option<Command> {
-        let (command, response) = run(&self.argv, self.cwd.as_deref());
+        self.serve_with(commands::dispatch)
+    }
+
+    /// Runs the command against the CLI recording session retained by the host.
+    pub fn serve_with_recording(self, recording: &mut RecordingManager) -> Option<Command> {
+        self.serve_with(|command| commands::dispatch_with_recording(command, recording))
+    }
+
+    /// Runs the command with a state-aware dispatcher retained by the host.
+    pub fn serve_with(
+        self,
+        dispatch: impl FnOnce(&Command) -> CliResult<crate::report::Report>,
+    ) -> Option<Command> {
+        let (command, response) = run_with(&self.argv, self.cwd.as_deref(), dispatch);
         self.reply(&response);
         command
     }
@@ -86,7 +113,19 @@ impl Request {
         let _ = stream.shutdown(Shutdown::Both);
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    fn reply(self, response: &Response) {
+        use std::io::Write;
+
+        let mut stream = self.stream;
+        let bytes = ipc::encode_response(response);
+        if let Err(error) = stream.write_all(&bytes) {
+            tracing::warn!("could not answer a forwarded command: {error}");
+        }
+        let _ = stream.flush();
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
     fn reply(self, _response: &Response) {}
 }
 
@@ -96,6 +135,13 @@ impl Request {
 /// socket, which is the part most likely to drift from
 /// [`crate::report::Reporter::emit`].
 fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+    run_with(argv, cwd, commands::dispatch)
+}
+
+fn run_with<F>(argv: &[String], cwd: Option<&Path>, dispatch: F) -> (Option<Command>, Response)
+where
+    F: FnOnce(&Command) -> CliResult<crate::report::Report>,
+{
     use clap::Parser as _;
 
     if argv.is_empty() {
@@ -132,7 +178,7 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     // every later capture would otherwise inherit whatever directory the last
     // forwarded command happened to run in.
     let restore = enter(cwd);
-    let result = cli.validate().and_then(|()| commands::dispatch(&command));
+    let result = cli.validate().and_then(|()| dispatch(&command));
     restore();
 
     let response = match result {
@@ -200,6 +246,14 @@ pub struct Server {
     path: PathBuf,
     #[cfg(unix)]
     listener: std::os::unix::net::UnixListener,
+    #[cfg(target_os = "windows")]
+    listener: std::sync::Mutex<WindowsListener>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsListener {
+    pipe: Option<std::fs::File>,
+    connected: bool,
 }
 
 impl Server {
@@ -247,18 +301,27 @@ impl Server {
         Ok(Self { path, listener })
     }
 
-    /// Named-pipe support is not built yet, so there is nothing to listen on.
-    ///
-    /// # Errors
-    ///
-    /// Never. The GUI runs without single-instance forwarding rather than
-    /// refusing to start over it.
-    #[cfg(not(unix))]
+    /// Binds a Windows named pipe without blocking the GUI tick.
+    #[cfg(target_os = "windows")]
     pub fn bind_at(path: PathBuf) -> CliResult<Self> {
-        tracing::warn!(
-            "this build has no named-pipe listener, so `scrozz capture` from a \
-             terminal will run in its own process"
-        );
+        let pipe = create_named_pipe(&path, true).map_err(|error| {
+            CliError::ipc(format!(
+                "could not listen at named pipe {}: {error}",
+                path.display()
+            ))
+        })?;
+        tracing::debug!(path = %path.display(), "listening for forwarded commands");
+        Ok(Self {
+            path,
+            listener: std::sync::Mutex::new(WindowsListener {
+                pipe: Some(pipe),
+                connected: false,
+            }),
+        })
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    pub fn bind_at(path: PathBuf) -> CliResult<Self> {
         Ok(Self { path })
     }
 
@@ -292,8 +355,98 @@ impl Server {
         Some(Request { argv, cwd, stream })
     }
 
-    /// Nothing arrives without a listener.
-    #[cfg(not(unix))]
+    /// Takes one pending Windows named-pipe request without blocking.
+    #[cfg(target_os = "windows")]
+    pub fn poll(&self) -> Option<Request> {
+        use std::io::{ErrorKind, Read};
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::{ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE},
+            System::Pipes::ConnectNamedPipe,
+        };
+
+        let mut listener = self.listener.lock().ok()?;
+        if listener.pipe.is_none() {
+            match create_named_pipe(&self.path, false) {
+                Ok(pipe) => listener.pipe = Some(pipe),
+                Err(error) => {
+                    tracing::warn!("could not recreate the instance named pipe: {error}");
+                    return None;
+                }
+            }
+        }
+
+        if !listener.connected {
+            let raw = listener
+                .pipe
+                .as_ref()
+                .expect("the named pipe was ensured above")
+                .as_raw_handle();
+            let connected = unsafe { ConnectNamedPipe(HANDLE(raw), None) };
+            match connected {
+                Ok(()) => listener.connected = true,
+                Err(error) => match win32_error_code(&error) {
+                    code if code == ERROR_PIPE_CONNECTED.0 => listener.connected = true,
+                    code if code == ERROR_PIPE_LISTENING.0 => return None,
+                    code if code == ERROR_NO_DATA.0 => {
+                        reset_windows_listener(&mut listener, &self.path);
+                        return None;
+                    }
+                    _ => {
+                        tracing::warn!("could not accept a forwarded command: {error}");
+                        reset_windows_listener(&mut listener, &self.path);
+                        return None;
+                    }
+                },
+            }
+        }
+
+        let mut raw = vec![0_u8; 64 * 1024];
+        let read = listener
+            .pipe
+            .as_mut()
+            .expect("a connected listener owns a pipe")
+            .read(&mut raw);
+        let count = match read {
+            Ok(0) => {
+                reset_windows_listener(&mut listener, &self.path);
+                return None;
+            }
+            Ok(count) => count,
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(ERROR_NO_DATA.0 as i32) =>
+            {
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!("could not read a forwarded command: {error}");
+                reset_windows_listener(&mut listener, &self.path);
+                return None;
+            }
+        };
+        raw.truncate(count);
+        let line = String::from_utf8_lossy(&raw);
+        let parsed = string_array(&line, "argv").map(|argv| {
+            let cwd = string_field(&line, "cwd").map(PathBuf::from);
+            (argv, cwd)
+        });
+
+        let stream = listener
+            .pipe
+            .take()
+            .expect("the connected named pipe still exists");
+        listener.connected = false;
+        listener.pipe = create_named_pipe(&self.path, false)
+            .inspect_err(|error| {
+                tracing::warn!("could not create the next instance named pipe: {error}");
+            })
+            .ok();
+        parsed.map(|(argv, cwd)| Request { argv, cwd, stream })
+    }
+
+    /// Nothing arrives without a local IPC transport.
+    #[cfg(not(any(unix, target_os = "windows")))]
     #[must_use]
     pub const fn poll(&self) -> Option<Request> {
         None
@@ -310,8 +463,71 @@ impl Drop for Server {
     fn drop(&mut self) {
         // Otherwise the next launch finds a socket file with nothing behind it
         // and has to decide whether it is stale — solvable, but this is free.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[cfg(target_os = "windows")]
+fn create_named_pipe(path: &Path, first: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{FromRawHandle, OwnedHandle},
+    };
+    use windows::{
+        Win32::{
+            Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
+            System::Pipes::{
+                CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+                PIPE_UNLIMITED_INSTANCES,
+            },
+        },
+        core::PCWSTR,
+    };
+
+    let mut open_mode = PIPE_ACCESS_DUPLEX;
+    if first {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
+    let mode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(wide.as_ptr()),
+            open_mode,
+            mode,
+            PIPE_UNLIMITED_INSTANCES,
+            64 * 1024,
+            64 * 1024,
+            0,
+            None,
+        )
+    };
+    if handle.is_invalid() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    Ok(std::fs::File::from(owned))
+}
+
+#[cfg(target_os = "windows")]
+fn reset_windows_listener(listener: &mut WindowsListener, path: &Path) {
+    listener.pipe = create_named_pipe(path, false)
+        .inspect_err(|error| {
+            tracing::warn!("could not reset the instance named pipe: {error}");
+        })
+        .ok();
+    listener.connected = false;
+}
+
+#[cfg(target_os = "windows")]
+fn win32_error_code(error: &windows::core::Error) -> u32 {
+    error.code().0.cast_unsigned() & 0xffff
 }
 
 /// Removes a socket file left behind by a crash.

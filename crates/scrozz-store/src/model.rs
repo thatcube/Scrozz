@@ -9,7 +9,10 @@
 //! a record can never fail because the image went away, because the record was
 //! never holding the image.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use scrozz_core::{
     CaptureTarget, ColorSpace, DisplayId, Error, LogicalRect, PhysicalSize, PixelFormat,
@@ -18,6 +21,128 @@ use scrozz_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::CaptureId;
+
+/// Durable media category for one history row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MediaKind {
+    /// A still capture with optional source pixels and annotations.
+    #[default]
+    Image,
+    /// An externally stored native recording.
+    Video,
+}
+
+impl MediaKind {
+    /// Stable SQLite token.
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+
+    /// Parses a stable SQLite token.
+    pub fn from_token(token: &str) -> Result<Self> {
+        match token {
+            "image" => Ok(Self::Image),
+            "video" => Ok(Self::Video),
+            other => Err(Error::Storage(format!(
+                "unknown history media kind {other:?}"
+            ))),
+        }
+    }
+}
+
+/// How much of a retained partial video can be consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VideoSalvageability {
+    /// Container initialization exists but no complete media fragment does.
+    InitialisationOnly,
+    /// At least one complete fragment is playable.
+    Playable,
+}
+
+/// Finalization state persisted for a video.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum VideoCompletion {
+    /// Encoder and container finalized normally.
+    Complete,
+    /// The native engine retained output after a finalization failure.
+    Partial {
+        /// Whether playback/editing can open it.
+        salvageability: VideoSalvageability,
+        /// Native finalization failure.
+        reason: String,
+    },
+}
+
+/// External recording path and native media summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoMetadata {
+    /// Native media file, kept outside the history sidecar directory.
+    pub path: PathBuf,
+    /// Pause-free media duration.
+    pub duration_secs: f64,
+    /// Native engine stack that wrote the file.
+    pub engine: String,
+    /// Complete or retained partial output.
+    pub completion: VideoCompletion,
+    /// Encoded pixel dimensions.
+    #[serde(default)]
+    pub size: Option<PhysicalSize>,
+    /// Submitted video frames.
+    #[serde(default)]
+    pub frames: Option<u64>,
+    /// Encoded audio channels.
+    #[serde(default)]
+    pub audio_channels: Option<u16>,
+    /// Last observed file size.
+    #[serde(default)]
+    pub file_size_bytes: Option<u64>,
+    /// Resolved codec slug.
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// Encoder quality slug.
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Applied resolution-policy slug.
+    #[serde(default)]
+    pub resolution: Option<String>,
+}
+
+impl VideoMetadata {
+    /// Validates persisted recording metadata without opening the media file.
+    pub fn validate(&self) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Err(Error::InvalidRequest(
+                "a history video path cannot be empty".into(),
+            ));
+        }
+        if !self.duration_secs.is_finite() || self.duration_secs < 0.0 {
+            return Err(Error::InvalidRequest(
+                "history video duration must be finite and non-negative".into(),
+            ));
+        }
+        if self.engine.trim().is_empty() {
+            return Err(Error::InvalidRequest(
+                "history video metadata must name its native engine".into(),
+            ));
+        }
+        if matches!(
+            &self.completion,
+            VideoCompletion::Partial { reason, .. } if reason.trim().is_empty()
+        ) {
+            return Err(Error::InvalidRequest(
+                "partial history video metadata must explain the failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// A point in time, as milliseconds since the Unix epoch.
 ///
@@ -161,6 +286,8 @@ pub struct CaptureRecord {
     pub created_at: Timestamp,
     /// Exempt from eviction. Decision D23: pinned captures are never evicted.
     pub pinned: bool,
+    /// Still image or video.
+    pub media_kind: MediaKind,
     /// Owning application, where the platform reported one.
     pub app_name: Option<String>,
     /// Window title, where the platform reported one.
@@ -170,7 +297,9 @@ pub struct CaptureRecord {
     /// What it was aimed at.
     pub target: CaptureTarget,
     /// Frame geometry, which outlives the frame.
-    pub frame: FrameHeader,
+    pub frame: Option<FrameHeader>,
+    /// External native video metadata for video rows.
+    pub video: Option<VideoMetadata>,
     /// Whether the pixels are still here.
     pub image: ImageState,
     /// Recognised text, if OCR has run.
@@ -235,6 +364,8 @@ pub struct SearchQuery {
     pub created_before: Option<Timestamp>,
     /// Only pinned captures.
     pub pinned_only: bool,
+    /// Restrict results to stills or recordings.
+    pub media_kind: Option<MediaKind>,
     /// Exclude captures whose pixels have been evicted.
     ///
     /// Defaults to `false`, because D23's promise is that an evicted capture
@@ -306,6 +437,13 @@ impl SearchQuery {
     #[must_use]
     pub const fn pinned_only(mut self) -> Self {
         self.pinned_only = true;
+        self
+    }
+
+    /// Restricts results to one media category.
+    #[must_use]
+    pub const fn media_kind(mut self, kind: MediaKind) -> Self {
+        self.media_kind = Some(kind);
         self
     }
 

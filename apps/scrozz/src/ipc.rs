@@ -140,12 +140,12 @@ pub enum Forwarding {
 #[must_use]
 pub fn policy(command: &Command) -> Forwarding {
     match command {
-        // A recording is a live process owned by whoever started it. Stopping it
+        // A recording is a live process owned by whoever started it. Controlling it
         // from a second process is not merely preferable, it is the only thing
         // that can work — which is exactly the hotkey case on wlroots, where
-        // `record --stop` is bound to a key and always arrives in a fresh
+        // a recording hotkey always arrives in a fresh
         // process.
-        Command::Record(args) if args.stop => Forwarding::Require,
+        Command::Record(args) if args.control().is_some() => Forwarding::Require,
 
         // These write to the store or put an overlay on screen. Two processes
         // doing either concurrently is the bug this whole module exists to
@@ -332,10 +332,23 @@ fn probe_at(path: &Path) -> Status {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn probe_at(path: &Path) -> Status {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(_) => Status::Running,
+        Err(error) if matches!(error.raw_os_error(), Some(2)) => Status::NotRunning,
+        // Every pipe instance being occupied is itself proof of a live server.
+        Err(error) if matches!(error.raw_os_error(), Some(231)) => Status::Running,
+        Err(error) => Status::Unusable(error.to_string()),
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn probe_at(_path: &Path) -> Status {
-    // Named pipes need platform calls this crate has no dependency for. Until
-    // the GUI ships a listener there is nothing to connect to anyway.
     Status::NotRunning
 }
 
@@ -384,12 +397,54 @@ fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
     parse_response(&buffer)
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
+    use std::{
+        io::{Read, Write},
+        time::{Duration, Instant},
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stream = loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(error.raw_os_error(), Some(2 | 231)) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(CliError::ipc(format!(
+                    "could not reach the running Scrozz at {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    };
+
+    let cwd = std::env::current_dir().ok();
+    let request = encode_request(argv, cwd.as_deref());
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| CliError::ipc(format!("could not send the request: {error}")))?;
+    stream
+        .flush()
+        .map_err(|error| CliError::ipc(format!("could not finish the request: {error}")))?;
+
+    let mut buffer = Vec::new();
+    stream
+        .read_to_end(&mut buffer)
+        .map_err(|error| CliError::ipc(format!("could not read the response: {error}")))?;
+    parse_response(&buffer)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn forward_to(_path: &Path, _argv: &[String]) -> CliResult<Response> {
-    Err(CliError::ipc(
-        "handing a command to a running instance needs named-pipe support, \
-         which this build does not have yet",
-    ))
+    Err(CliError::ipc("this platform has no local IPC transport"))
 }
 
 #[cfg(test)]

@@ -223,16 +223,29 @@ impl RecordingMachine {
         self.prepare_target(target)
     }
 
+    /// Starts an already configured request without applying interactive
+    /// settings or a countdown.
+    ///
+    /// This is the adapter used by a long-lived GUI when a CLI invocation
+    /// forwards explicit quality, resolution, codec, audio, and destination
+    /// flags into the GUI-owned machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transition, request, capability, or engine-start error.
+    pub fn begin_request(&mut self, request: RecordingRequest) -> Result<()> {
+        self.require_phase(RecordingPhase::Idle, "begin configured recording")?;
+        request.validate()?;
+        validate_capabilities(self.capabilities, &request, None)?;
+        self.clear_run();
+        self.stage_request(&request);
+        self.start_request(request)
+    }
+
     fn prepare_target(&mut self, target: CaptureTarget) -> Result<()> {
         let request = RecordingRequest::from_settings(target, &self.settings);
         validate_capabilities(self.capabilities, &request, Some(&self.settings))?;
-        self.request = Some(request.clone());
-        self.elapsed = Duration::ZERO;
-        self.first_frame = false;
-        self.latest_drift = None;
-        self.output = None;
-        self.failure = None;
-        self.warnings.clear();
+        self.stage_request(&request);
 
         let countdown = if self.settings.countdown.enabled {
             Duration::from_secs(u64::from(self.settings.countdown.seconds))
@@ -246,6 +259,16 @@ impl RecordingMachine {
             self.set_phase(RecordingPhase::Countdown);
             Ok(())
         }
+    }
+
+    fn stage_request(&mut self, request: &RecordingRequest) {
+        self.request = Some(request.clone());
+        self.elapsed = Duration::ZERO;
+        self.first_frame = false;
+        self.latest_drift = None;
+        self.output = None;
+        self.failure = None;
+        self.warnings.clear();
     }
 
     fn start_request(&mut self, request: RecordingRequest) -> Result<()> {
@@ -762,6 +785,32 @@ mod tests {
                 RecordingPhase::Recording
             ]
         );
+    }
+
+    #[test]
+    fn configured_request_starts_immediately_and_keeps_forwarded_values() {
+        let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
+        let mut settings = RecordingSettings::shipped();
+        settings.countdown.enabled = true;
+        settings.countdown.seconds = 5;
+        let mut machine =
+            RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
+                .unwrap();
+        let mut request = RecordingRequest::new(target());
+        request.destination = Some(PathBuf::from("forwarded.mp4"));
+        request.fps = 48;
+        request.microphone = true;
+        request.system_audio = true;
+        request.show_cursor = true;
+        request.quality = crate::settings::Quality::High;
+        request.resolution = crate::RecordingResolution::ScalePercent(75);
+        request.video_codec = crate::VideoCodec::H264;
+
+        machine.begin_request(request.clone()).unwrap();
+
+        assert_eq!(machine.phase(), RecordingPhase::Recording);
+        assert_eq!(machine.countdown_remaining(), Duration::ZERO);
+        assert_eq!(machine.request(), Some(&request));
     }
 
     #[test]

@@ -58,16 +58,25 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
+use scrozz_record::{
+    edit::{EditPlan, VideoDocument},
+    settings::CountdownSettings,
+    transcode::TranscodeFailure,
+};
 
 use crate::card::{self, CardAction, CardContent};
+use crate::countdown::Countdown;
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
+use crate::recording_hud::{RecordingHud, RecordingHudAction, RecordingHudSnapshot};
 use crate::stack::{CaptureStack, CardId, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
+use crate::video_editor::{TranscodeView, VideoEditor, VideoEditorAction, VideoEditorModel};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
 /// single frame to re-sample the pointer, when no [`PointerProbe`] is supplied.
@@ -418,11 +427,46 @@ enum Command {
     Close,
 }
 
+/// Editor state retained by the application and drawn in the shared overlay.
+#[derive(Debug, Clone)]
+pub struct VideoEditorSnapshot {
+    /// Native source plus deterministic playback cursor.
+    pub document: VideoDocument,
+    /// Current non-destructive edit plan.
+    pub plan: EditPlan,
+    /// Explicit export failure, including native-transcoder unavailability.
+    pub transcode_failure: Option<TranscodeFailure>,
+}
+
+/// Owned recording UI state sent from the product owner to the overlay.
+#[derive(Debug, Clone)]
+pub struct RecordingPresentation {
+    /// HUD state.
+    pub hud: RecordingHudSnapshot,
+    /// Countdown preference used for this run.
+    pub countdown: CountdownSettings,
+    /// Remaining virtual countdown time.
+    pub countdown_remaining: Duration,
+    /// Editor state once playable output exists.
+    pub editor: Option<VideoEditorSnapshot>,
+}
+
+/// Semantic recording action raised by the shared overlay.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordingSurfaceAction {
+    /// Action from the live recording HUD.
+    Hud(RecordingHudAction),
+    /// Action from the terminal video editor.
+    Editor(VideoEditorAction),
+}
+
 #[derive(Default)]
 struct Shared {
     inbox: Mutex<Vec<CaptureRequest>>,
     outbox: Mutex<Vec<OverlayEvent>>,
     commands: Mutex<Vec<Command>>,
+    recording: Mutex<Option<RecordingPresentation>>,
+    recording_actions: Mutex<Vec<RecordingSurfaceAction>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
 }
@@ -459,6 +503,24 @@ impl OverlayHandle {
             .outbox
             .lock()
             .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+
+    /// Replaces the recording HUD/countdown/editor state shown by the overlay.
+    pub fn set_recording(&self, presentation: Option<RecordingPresentation>) {
+        if let Ok(mut state) = self.shared.recording.lock() {
+            *state = presentation;
+        }
+        self.wake();
+    }
+
+    /// Takes recording actions raised since the previous call.
+    #[must_use]
+    pub fn drain_recording_actions(&self) -> Vec<RecordingSurfaceAction> {
+        self.shared
+            .recording_actions
+            .lock()
+            .map(|mut actions| std::mem::take(&mut *actions))
             .unwrap_or_default()
     }
 
@@ -835,6 +897,21 @@ impl OverlayApp {
         }
     }
 
+    fn emit_recording_action(&self, action: RecordingSurfaceAction) {
+        if let Ok(mut actions) = self.handle.shared.recording_actions.lock() {
+            actions.push(action);
+        }
+    }
+
+    fn recording_presentation(&self) -> Option<RecordingPresentation> {
+        self.handle
+            .shared
+            .recording
+            .lock()
+            .ok()
+            .and_then(|state| state.clone())
+    }
+
     fn take_inbox(&self) -> Vec<CaptureRequest> {
         self.handle
             .shared
@@ -1009,6 +1086,80 @@ impl OverlayApp {
         }
     }
 
+    fn draw_recording(
+        &self,
+        ui: &mut egui::Ui,
+        presentation: &RecordingPresentation,
+        hits: &mut Vec<Rect>,
+    ) {
+        if presentation.hud.phase == scrozz_record::machine::RecordingPhase::Countdown {
+            let response = Countdown::new(presentation.countdown, presentation.countdown_remaining)
+                .show(ui, &self.theme);
+            if let Some(response) = response.response {
+                hits.push(response.rect);
+            }
+            return;
+        }
+
+        let work = ui.max_rect();
+        if let Some(editor) = &presentation.editor {
+            let width = (work.width() - 48.0).clamp(420.0, 900.0);
+            let height = (work.height() - 48.0).clamp(420.0, 740.0);
+            let rect = Rect::from_center_size(work.center(), Vec2::new(width, height));
+            let shown = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| {
+                    VideoEditor::new(
+                        VideoEditorModel {
+                            document: &editor.document,
+                            plan: editor.plan,
+                            transcode: editor.transcode_failure.as_ref().map_or(
+                                TranscodeView::Idle,
+                                |failure| TranscodeView::Failed {
+                                    failure: Some(failure),
+                                },
+                            ),
+                        },
+                        &self.theme,
+                    )
+                    .show(ui)
+                },
+            );
+            hits.push(shown.inner.response.rect);
+            for action in shown.inner.actions {
+                self.emit_recording_action(RecordingSurfaceAction::Editor(action));
+            }
+            return;
+        }
+
+        if matches!(
+            presentation.hud.phase,
+            scrozz_record::machine::RecordingPhase::Recording
+                | scrozz_record::machine::RecordingPhase::Paused
+                | scrozz_record::machine::RecordingPhase::Finalising
+                | scrozz_record::machine::RecordingPhase::Finished
+                | scrozz_record::machine::RecordingPhase::Failed
+        ) {
+            let width = 360.0_f32.min(work.width() - 32.0);
+            let rect = Rect::from_min_size(
+                Pos2::new(work.right() - width - 24.0, work.top() + 24.0),
+                Vec2::new(width, 520.0_f32.min(work.height() - 48.0)),
+            );
+            let shown = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| RecordingHud::new(presentation.hud.model(), &self.theme).show(ui),
+            );
+            hits.push(shown.inner.response.rect);
+            if let Some(action) = shown.inner.action {
+                self.emit_recording_action(RecordingSurfaceAction::Hud(action));
+            }
+        }
+    }
+
     /// Draw the dock, and return its hit rectangle plus whether it was clicked.
     fn draw_dock(
         &self,
@@ -1069,7 +1220,7 @@ impl eframe::App for OverlayApp {
         let surface = Surface::new(&self.theme, &self.icons, m);
         let frames = self.stack.frame(&m);
 
-        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
+        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 2);
         let mut hovered = None;
         let mut action = None;
         let mut drag_start = None;
@@ -1107,6 +1258,9 @@ impl eframe::App for OverlayApp {
         let (dock_hit, dock_clicked) = self.draw_dock(ui, &surface, &m);
         if let Some(rect) = dock_hit {
             hits.push(rect);
+        }
+        if let Some(recording) = self.recording_presentation() {
+            self.draw_recording(ui, &recording, &mut hits);
         }
 
         // Gestures, applied after drawing so this frame's responses drive the

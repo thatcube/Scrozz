@@ -100,10 +100,12 @@ pub use countdown::{Countdown, CountdownResponse};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
-    OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+    OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe, RecordingPresentation,
+    RecordingSurfaceAction, VideoEditorSnapshot,
 };
 pub use recording_hud::{
-    RecordingHud, RecordingHudAction, RecordingHudControls, RecordingHudModel, RecordingHudResponse,
+    RecordingHud, RecordingHudAction, RecordingHudControls, RecordingHudModel,
+    RecordingHudResponse, RecordingHudSnapshot,
 };
 pub use recording_overlay::{
     RecordingOverlay, RecordingOverlayAction, RecordingOverlayControls, RecordingOverlayModel,

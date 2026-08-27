@@ -2,19 +2,19 @@
 //!
 //! # Why this file exists
 //!
-//! Every backend below this line is under construction. Several entry points are
-//! literally `todo!()`, which is not an error value — it is a panic, and a panic
-//! reaches the user as exit code 101 and a backtrace. For a tool whose entire
+//! Some platform entry points remain under construction. An unfinished backend
+//! may still contain `todo!()`, which is not an error value — it is a panic, and
+//! a panic reaches the user as exit code 101 and a backtrace. For a tool whose
 //! error philosophy (D8, D15) is *never show the user a crash for a thing we
 //! already know about*, that is the worst possible failure mode.
 //!
-//! So every call into an unfinished backend goes through this module, and this
-//! module refuses to make the call unless it has been told to. The default is a
-//! clean [`CliError::NotImplemented`], exit code 12, with a message naming the
-//! crate that owes the work.
+//! So unfinished calls go through this module and remain guarded. The default
+//! is a clean [`CliError::NotImplemented`], exit code 12, with a message naming
+//! the crate that owes the work. Verified paths, including native recording,
+//! enter their backend directly and surface its real runtime errors.
 //!
-//! Setting `SCROZZ_UNSTABLE_BACKENDS=1` lifts the guard. That exists so the
-//! wiring can be exercised the moment a backend lands, without editing code.
+//! Setting `SCROZZ_UNSTABLE_BACKENDS=1` lifts the remaining guards. That exists
+//! so unfinished wiring can be exercised without editing code.
 //!
 //! # Why the calls are written out at all
 //!
@@ -102,11 +102,11 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::NotImplemented`] unless [`UNSTABLE_ENV`] is set.
+/// Returns the native engine's runtime capability, permission, or encoder error.
+/// No synthetic or unstable-backend fallback is permitted here.
 pub fn start_recording(
     request: &scrozz_record::RecordingRequest,
 ) -> CliResult<Box<dyn scrozz_record::RecordingSession>> {
-    guard("recording the screen", "scrozz-record")?;
     Ok(scrozz_record::start(request)?)
 }
 

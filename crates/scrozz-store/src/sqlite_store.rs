@@ -6,15 +6,15 @@ use rusqlite::{
     Connection, OptionalExtension as _, Row, ToSql, TransactionBehavior, params, params_from_iter,
 };
 use scrozz_annotate::{AnnotationObject, Document, DocumentData};
-use scrozz_core::{Capture, Error, Frame, Result};
+use scrozz_core::{Capture, CaptureTarget, Error, Frame, Provenance, Result};
 
 use crate::{
     CaptureId, RetentionPolicy, Store, db, hash,
     id::capture_id_at,
     layout::StoreLayout,
     model::{
-        CaptureRecord, FrameHeader, ImageState, Page, ProvenanceRepr, RetentionReport, SearchQuery,
-        TargetRepr, Timestamp,
+        CaptureRecord, FrameHeader, ImageState, MediaKind, Page, ProvenanceRepr, RetentionReport,
+        SearchQuery, TargetRepr, Timestamp, VideoMetadata,
     },
     record::StoredRecord,
     schema,
@@ -23,7 +23,7 @@ use crate::{
 /// Columns every record query selects, in the order [`row_to_record`] reads.
 const RECORD_COLUMNS: &str = "id, created_at, pinned, app_name, window_title, provenance, \
      target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text, \
-     annotation_count";
+     annotation_count, media_kind, video_json";
 
 /// A capture on its way into history.
 ///
@@ -90,6 +90,49 @@ impl<'a> NewCapture<'a> {
     }
 
     /// Pins the capture on arrival.
+    #[must_use]
+    pub const fn pinned(mut self) -> Self {
+        self.pinned = true;
+        self
+    }
+}
+
+/// A native recording on its way into history.
+#[derive(Debug, Clone)]
+pub struct NewRecording {
+    /// When capture started.
+    pub created_at: Timestamp,
+    /// Resolved capture source.
+    pub target: CaptureTarget,
+    /// Target-derived history provenance.
+    pub provenance: Provenance,
+    /// External media path and native summary.
+    pub video: VideoMetadata,
+    /// Whether to exempt this row from user deletion workflows.
+    pub pinned: bool,
+}
+
+impl NewRecording {
+    /// A native recording taken now.
+    #[must_use]
+    pub fn new(target: CaptureTarget, provenance: Provenance, video: VideoMetadata) -> Self {
+        Self {
+            created_at: Timestamp::now(),
+            target,
+            provenance,
+            video,
+            pinned: false,
+        }
+    }
+
+    /// Overrides the capture time.
+    #[must_use]
+    pub const fn taken_at(mut self, at: Timestamp) -> Self {
+        self.created_at = at;
+        self
+    }
+
+    /// Pins the history row.
     #[must_use]
     pub const fn pinned(mut self) -> Self {
         self.pinned = true;
@@ -183,6 +226,12 @@ pub trait History: Store {
     /// Returns [`Error::InvalidRequest`] if the frame's geometry does not match
     /// its buffer, or [`Error::Storage`] if the write fails.
     fn insert(&mut self, capture: NewCapture<'_>) -> Result<CaptureId>;
+
+    /// Adds an externally stored native recording.
+    ///
+    /// The media file is not copied into the image blob store. Its path and
+    /// native metadata are persisted in the durable sidecar and query index.
+    fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId>;
 
     /// Everything known about one capture, without its pixels.
     ///
@@ -704,6 +753,33 @@ impl History for SqliteStore {
         Ok(id)
     }
 
+    fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId> {
+        recording.video.validate()?;
+        let id = capture_id_at(recording.created_at.0);
+        let now = Timestamp::now();
+        let record = StoredRecord::from_video(
+            &id,
+            recording.created_at,
+            now,
+            recording.pinned,
+            recording.provenance,
+            &recording.target,
+            recording.video,
+        )?;
+
+        // The sidecar remains authoritative. If the process dies before the
+        // index transaction, opening the store adopts this recording.
+        self.layout.write_record(&record)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin recording insert"))?;
+        upsert_record(&tx, &record)?;
+        tx.commit()
+            .map_err(store_err("cannot commit recording insert"))?;
+        Ok(id)
+    }
+
     fn record(&self, id: &CaptureId) -> Result<Option<CaptureRecord>> {
         self.conn
             .query_row(
@@ -720,6 +796,12 @@ impl History for SqliteStore {
         let Some(record) = self.stored_record(id)? else {
             return Ok(None);
         };
+        if record.media_kind == MediaKind::Video {
+            return Err(Error::InvalidRequest(format!(
+                "history item {} is a video; open it with the video editor",
+                id.0
+            )));
+        }
         let data = record.document_data()?;
 
         let pixels = match record.image_state() {
@@ -736,7 +818,9 @@ impl History for SqliteStore {
             })));
         };
 
-        let header = &record.frame;
+        let header = record.frame.as_ref().ok_or_else(|| {
+            Error::Storage(format!("image history item {} has no frame metadata", id.0))
+        })?;
         let capture = Capture {
             frame: Frame {
                 data: pixels,
@@ -1024,14 +1108,22 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
         .map_err(|e| Error::Storage(format!("cannot serialise target: {e}")))?;
     let frame_json = serde_json::to_string(&record.frame)
         .map_err(|e| Error::Storage(format!("cannot serialise frame: {e}")))?;
+    let video_json = record
+        .video
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| Error::Storage(format!("cannot serialise video metadata: {e}")))?;
 
     conn.execute(
         "INSERT INTO captures (
              id, created_at, stored_at, pinned, app_name, window_title, provenance,
              target_json, frame_json, image_hash, image_bytes, image_evicted_at,
-             ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold
+            ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold,
+            media_kind, video_json
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19, ?20
          )
          ON CONFLICT (id) DO UPDATE SET
              created_at = excluded.created_at,
@@ -1050,7 +1142,9 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
              search_fold = excluded.search_fold,
              app_fold = excluded.app_fold,
              title_fold = excluded.title_fold,
-             ocr_fold = excluded.ocr_fold",
+             ocr_fold = excluded.ocr_fold,
+             media_kind = excluded.media_kind,
+             video_json = excluded.video_json",
         params![
             record.id,
             record.created_at,
@@ -1070,6 +1164,8 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
             record.app_name.as_ref().map(|t| t.to_lowercase()),
             record.window_title.as_ref().map(|t| t.to_lowercase()),
             record.ocr_text.as_ref().map(|t| t.to_lowercase()),
+            record.media_kind.as_token(),
+            video_json,
         ],
     )
     .map_err(store_err("cannot write capture row"))?;
@@ -1165,6 +1261,10 @@ fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
     if query.pinned_only {
         sql.push_str(" AND pinned = 1");
     }
+    if let Some(kind) = query.media_kind {
+        args.push(Box::new(kind.as_token().to_owned()));
+        sql.push_str(&format!(" AND media_kind = ?{}", args.len()));
+    }
     if query.images_only {
         sql.push_str(" AND image_hash IS NOT NULL AND image_evicted_at IS NULL");
     }
@@ -1194,11 +1294,24 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let image_evicted_at: Option<i64> = get(row, 10)?;
     let ocr_text: Option<String> = get(row, 11)?;
     let annotation_count: i64 = get(row, 12)?;
+    let media_kind: String = get(row, 13)?;
+    let video_json: Option<String> = get(row, 14)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
-    let frame: FrameHeader = serde_json::from_str(&frame_json)
+    let frame: Option<FrameHeader> = serde_json::from_str(&frame_json)
         .map_err(|e| Error::Storage(format!("cannot read frame for {id}: {e}")))?;
+    let video = video_json
+        .as_deref()
+        .map(serde_json::from_str::<VideoMetadata>)
+        .transpose()
+        .map_err(|e| Error::Storage(format!("cannot read video metadata for {id}: {e}")))?;
+    let media_kind = MediaKind::from_token(&media_kind)?;
+    if media_kind == MediaKind::Video && video.is_none() {
+        return Err(Error::Storage(format!(
+            "video history item {id} has no video metadata"
+        )));
+    }
 
     let image = match (image_hash, image_evicted_at) {
         (Some(hash), None) => ImageState::Present {
@@ -1220,11 +1333,13 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         id: CaptureId(id),
         created_at: Timestamp(created_at),
         pinned: pinned != 0,
+        media_kind,
         app_name,
         window_title,
         provenance: ProvenanceRepr::from_token(&provenance)?.into(),
         target: target.into(),
         frame,
+        video,
         image,
         ocr_text,
         annotation_count: usize::try_from(annotation_count).unwrap_or(0),

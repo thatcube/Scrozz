@@ -229,8 +229,8 @@ impl Worker {
     }
 
     fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
-        // Through `platform`, not `scrozz_capture` directly, so the
-        // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
+        // Through `platform`, not `scrozz_capture` directly, so the capture
+        // backend's stability policy also applies to the GUI path.
         let backend = platform::capture_backend()?;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a

@@ -710,6 +710,23 @@ pub enum SessionEvent {
 
 /// A recording session in progress.
 pub trait RecordingSession: Send {
+    /// Current native session state.
+    ///
+    /// Engines predating live state reporting may use the default while active.
+    fn state(&self) -> RecordingState {
+        RecordingState::Recording
+    }
+
+    /// Pause-free native media elapsed time.
+    ///
+    /// Kept alongside [`Self::engine_elapsed_secs`] for native adapters and
+    /// diagnostics that use a duration value directly.
+    fn elapsed(&self) -> Duration {
+        self.engine_elapsed_secs()
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .unwrap_or(Duration::ZERO)
+    }
+
     /// Suspends capture, keeping the session open.
     fn pause(&mut self) -> Result<()>;
 

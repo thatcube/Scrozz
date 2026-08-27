@@ -159,7 +159,12 @@ fn an_evicted_capture_still_lists_with_its_edits_intact() {
         "D23: the document is kept forever"
     );
     assert_eq!(
-        record.frame.size.width, 16.0,
+        record
+            .frame
+            .expect("image capture should have frame metadata")
+            .size
+            .width,
+        16.0,
         "the geometry outlives the pixels, so the UI can still lay it out"
     );
     match record.image {

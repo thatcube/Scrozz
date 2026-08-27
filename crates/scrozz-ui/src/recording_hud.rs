@@ -39,6 +39,55 @@ pub struct RecordingHudModel<'a> {
     pub failure: Option<&'a MachineFailure>,
 }
 
+/// Owned HUD values suitable for crossing the application/overlay thread seam.
+#[derive(Debug, Clone)]
+pub struct RecordingHudSnapshot {
+    /// Exact lifecycle phase.
+    pub phase: RecordingPhase,
+    /// Authoritative pause-free elapsed time.
+    pub elapsed: Duration,
+    /// Native engine capabilities.
+    pub capabilities: EngineCapabilities,
+    /// Most recent warning.
+    pub warning: Option<String>,
+    /// Most recent clock comparison.
+    pub drift: Option<ClockDrift>,
+    /// Complete terminal output.
+    pub output: Option<Recording>,
+    /// Terminal failure and retained partial output.
+    pub failure: Option<MachineFailure>,
+}
+
+impl RecordingHudSnapshot {
+    /// Copies the small observable surface of a recording machine.
+    #[must_use]
+    pub fn from_machine(machine: &RecordingMachine) -> Self {
+        Self {
+            phase: machine.phase(),
+            elapsed: machine.elapsed(),
+            capabilities: machine.capabilities(),
+            warning: machine.warnings().last().cloned(),
+            drift: machine.latest_drift(),
+            output: machine.output().cloned(),
+            failure: machine.failure().cloned(),
+        }
+    }
+
+    /// Borrows this owned snapshot as the widget model.
+    #[must_use]
+    pub fn model(&self) -> RecordingHudModel<'_> {
+        RecordingHudModel {
+            phase: self.phase,
+            elapsed: self.elapsed,
+            capabilities: self.capabilities,
+            warning: self.warning.as_deref(),
+            drift: self.drift,
+            output: self.output.as_ref(),
+            failure: self.failure.as_ref(),
+        }
+    }
+}
+
 impl<'a> RecordingHudModel<'a> {
     /// Borrows every HUD value from a recording machine without owning it.
     #[must_use]
@@ -58,6 +107,8 @@ impl<'a> RecordingHudModel<'a> {
 /// A semantic action requested by the HUD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingHudAction {
+    /// Dismiss terminal recording state.
+    Dismiss,
     /// Pause an active recording.
     Pause,
     /// Resume a paused recording.
@@ -276,6 +327,13 @@ impl<'a> RecordingHud<'a> {
                         });
                     }
                     reveal_response = Some(response);
+                }
+                if matches!(
+                    self.model.phase,
+                    RecordingPhase::Finished | RecordingPhase::Failed
+                ) && button(ui, self.theme, "Done", false, true).clicked()
+                {
+                    action = Some(RecordingHudAction::Dismiss);
                 }
             });
         });

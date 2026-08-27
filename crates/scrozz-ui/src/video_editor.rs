@@ -82,6 +82,8 @@ pub struct VideoEditorModel<'a> {
 /// Semantic action requested by the video editor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VideoEditorAction {
+    /// Close the editor while leaving the source recording untouched.
+    Close,
     /// Start virtual playback.
     Play,
     /// Pause virtual playback.
@@ -199,6 +201,9 @@ impl<'a> VideoEditor<'a> {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, self.theme, "Done", false, true).clicked() {
+                        actions.push(VideoEditorAction::Close);
+                    }
                     ui.label(
                         RichText::new(format!(
                             "{} / {}",
@@ -478,7 +483,7 @@ impl<'a> VideoEditor<'a> {
         });
 
         if plan_changed {
-            actions.push(VideoEditorAction::PlanChanged(plan));
+            actions.insert(0, VideoEditorAction::PlanChanged(plan));
         }
         let validation_error = document
             .validate_plan(&plan)

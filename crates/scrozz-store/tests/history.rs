@@ -1,10 +1,10 @@
 //! History as the app actually uses it: insert, read back, page, search, delete.
 
 use scrozz_annotate::{Annotation, Style};
-use scrozz_core::LogicalPoint;
+use scrozz_core::{CaptureTarget, DisplayId, LogicalPoint, PhysicalSize, Provenance};
 use scrozz_store::{
-    DocumentState, History as _, ImageState, NewCapture, Page, SearchQuery, SqliteStore,
-    Store as _, Timestamp,
+    DocumentState, History as _, ImageState, MediaKind, NewCapture, NewRecording, Page,
+    SearchQuery, SqliteStore, Store as _, Timestamp, VideoCompletion, VideoMetadata,
     test_support::{ScratchDir, richly_annotated_document, sample_document, scratch_dir},
 };
 
@@ -46,6 +46,68 @@ fn a_capture_survives_a_round_trip_through_history() {
     );
     assert_eq!(back.annotations().len(), 3);
     assert!(back.beautification().is_some());
+}
+
+#[test]
+fn a_native_recording_round_trips_as_external_video_history() {
+    let (_dir, mut store) = store("video-round-trip");
+    let metadata = VideoMetadata {
+        path: "/tmp/scrozz-recordings/demo.mp4".into(),
+        duration_secs: 12.5,
+        engine: "ScreenCaptureKit + AVFoundation".into(),
+        completion: VideoCompletion::Complete,
+        size: Some(PhysicalSize::new(1920.0, 1080.0)),
+        frames: Some(375),
+        audio_channels: Some(2),
+        file_size_bytes: Some(4_096),
+        codec: Some("h264".into()),
+        quality: Some("balanced".into()),
+        resolution: Some("1080p".into()),
+    };
+    let target = CaptureTarget::Display(DisplayId("main".into()));
+
+    let id = store
+        .insert_recording(NewRecording::new(
+            target.clone(),
+            Provenance::Display,
+            metadata.clone(),
+        ))
+        .expect("insert recording");
+
+    let record = store.record(&id).expect("read").expect("present");
+    assert_eq!(record.media_kind, MediaKind::Video);
+    assert_eq!(record.target, target);
+    assert_eq!(record.video.as_ref(), Some(&metadata));
+    assert!(record.frame.is_none());
+    assert_eq!(record.image, ImageState::Absent);
+    assert!(store.image(&id).expect("image lookup").is_none());
+    assert!(
+        store
+            .document(&id)
+            .expect_err("videos have no image document")
+            .to_string()
+            .contains("video")
+    );
+
+    let videos = store
+        .search(&SearchQuery::all().media_kind(MediaKind::Video))
+        .expect("video search");
+    assert_eq!(videos.len(), 1);
+    assert_eq!(videos[0].id, id);
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().media_kind(MediaKind::Image))
+            .expect("image search")
+            .len(),
+        0
+    );
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().text("avfoundation"))
+            .expect("engine search")[0]
+            .id,
+        id
+    );
 }
 
 #[test]

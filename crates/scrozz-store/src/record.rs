@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CaptureId,
-    model::{CaptureRecord, FrameHeader, ImageState, ProvenanceRepr, TargetRepr, Timestamp},
+    model::{
+        CaptureRecord, FrameHeader, ImageState, MediaKind, ProvenanceRepr, TargetRepr, Timestamp,
+        VideoMetadata,
+    },
 };
 
 /// Current sidecar format. Bumped only when old files stop being readable,
@@ -50,6 +53,9 @@ pub struct StoredRecord {
     /// Exempt from eviction.
     #[serde(default)]
     pub pinned: bool,
+    /// Still image or video. Missing in legacy sidecars means image.
+    #[serde(default)]
+    pub media_kind: MediaKind,
     /// Owning application.
     #[serde(default)]
     pub app_name: Option<String>,
@@ -61,7 +67,10 @@ pub struct StoredRecord {
     /// What it was aimed at.
     pub target: TargetRepr,
     /// Frame geometry.
-    pub frame: FrameHeader,
+    pub frame: Option<FrameHeader>,
+    /// External recording metadata for video sidecars.
+    #[serde(default)]
+    pub video: Option<VideoMetadata>,
     /// Content address of the source pixels, if they were ever stored.
     #[serde(default)]
     pub image_hash: Option<String>,
@@ -118,17 +127,51 @@ impl StoredRecord {
             created_at: created_at.0,
             stored_at: stored_at.0,
             pinned,
+            media_kind: MediaKind::Image,
             app_name,
             window_title,
             provenance: provenance.into(),
             target: TargetRepr::from(target),
-            frame,
+            frame: Some(frame),
+            video: None,
             image_hash,
             image_bytes,
             image_evicted_at: None,
             ocr_text,
             document: serde_json::to_value(document)
                 .map_err(|e| Error::Storage(format!("cannot serialise document: {e}")))?,
+        })
+    }
+
+    /// Builds a durable sidecar for an externally stored native recording.
+    pub fn from_video(
+        id: &CaptureId,
+        created_at: Timestamp,
+        stored_at: Timestamp,
+        pinned: bool,
+        provenance: Provenance,
+        target: &CaptureTarget,
+        video: VideoMetadata,
+    ) -> Result<Self> {
+        video.validate()?;
+        Ok(Self {
+            format: RECORD_FORMAT,
+            id: id.0.clone(),
+            created_at: created_at.0,
+            stored_at: stored_at.0,
+            pinned,
+            media_kind: MediaKind::Video,
+            app_name: None,
+            window_title: None,
+            provenance: provenance.into(),
+            target: TargetRepr::from(target),
+            frame: None,
+            video: Some(video),
+            image_hash: None,
+            image_bytes: 0,
+            image_evicted_at: None,
+            ocr_text: None,
+            document: empty_document(),
         })
     }
 
@@ -200,11 +243,13 @@ impl StoredRecord {
             id: CaptureId(self.id.clone()),
             created_at: Timestamp(self.created_at),
             pinned: self.pinned,
+            media_kind: self.media_kind,
             app_name: self.app_name.clone(),
             window_title: self.window_title.clone(),
             provenance: self.provenance.into(),
             target: self.target.clone().into(),
             frame: self.frame.clone(),
+            video: self.video.clone(),
             image: self.image_state(),
             ocr_text: self.ocr_text.clone(),
             annotation_count: self.annotation_count(),
@@ -222,6 +267,8 @@ impl StoredRecord {
             self.app_name.as_deref(),
             self.window_title.as_deref(),
             self.ocr_text.as_deref(),
+            self.video.as_ref().and_then(|video| video.path.to_str()),
+            self.video.as_ref().map(|video| video.engine.as_str()),
         ]
         .into_iter()
         .flatten()

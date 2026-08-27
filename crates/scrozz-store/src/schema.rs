@@ -37,10 +37,11 @@ pub struct Migration {
 /// `user_version` and a schema drift apart is an interrupted upgrade on a
 /// filesystem that lied about `fsync`, and idempotent rungs make that
 /// recoverable instead of fatal.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial history index",
-    sql: r"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial history index",
+        sql: r"
         -- One row per capture. Rows are NEVER deleted by retention: decision
         -- D23 evicts `image_hash`, not the capture.
         CREATE TABLE IF NOT EXISTS captures (
@@ -95,7 +96,20 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             value TEXT NOT NULL
         ) STRICT;
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "recording history",
+        sql: r"
+        ALTER TABLE captures
+            ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'
+            CHECK (media_kind IN ('image', 'video'));
+        ALTER TABLE captures ADD COLUMN video_json TEXT;
+        CREATE INDEX IF NOT EXISTS captures_by_media_kind
+            ON captures (media_kind, created_at DESC, id DESC);
+    ",
+    },
+];
 
 /// The version a freshly-migrated file ends up at.
 #[must_use]
@@ -161,7 +175,7 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32> {
             continue;
         }
 
-        tx.execute_batch(migration.sql).map_err(|e| {
+        apply_migration(&tx, migration).map_err(|e| {
             Error::Storage(format!(
                 "migration {} ({}) failed: {e}",
                 migration.version, migration.name
@@ -180,6 +194,44 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32> {
     }
 
     schema_version(conn)
+}
+
+fn apply_migration(tx: &rusqlite::Transaction<'_>, migration: &Migration) -> rusqlite::Result<()> {
+    if migration.name != "recording history" {
+        return tx.execute_batch(migration.sql);
+    }
+
+    // SQLite has no portable `ADD COLUMN IF NOT EXISTS`. Inspecting first keeps
+    // the rung safe when a filesystem persisted DDL but lost `user_version`.
+    if !column_exists(tx, "captures", "media_kind")? {
+        tx.execute_batch(
+            "ALTER TABLE captures
+             ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'
+             CHECK (media_kind IN ('image', 'video'));",
+        )?;
+    }
+    if !column_exists(tx, "captures", "video_json")? {
+        tx.execute_batch("ALTER TABLE captures ADD COLUMN video_json TEXT;")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS captures_by_media_kind
+         ON captures (media_kind, created_at DESC, id DESC);",
+    )
+}
+
+fn column_exists(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut statement = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn ensure_ascending(migrations: &[Migration]) -> Result<()> {
