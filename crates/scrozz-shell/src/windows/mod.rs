@@ -6,6 +6,7 @@
 //! with no arithmetic in it to get wrong.
 
 pub mod apartment;
+pub mod identity;
 pub mod overlay;
 
 // ---------------------------------------------------------------------------

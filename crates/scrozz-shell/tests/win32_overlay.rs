@@ -26,11 +26,12 @@ use scrozz_core::{LogicalRect, Point, ScaleFactor, Size};
 use scrozz_shell::overlay::{OverlayBehavior, OverlayLevel};
 use scrozz_shell::win32::{
     ApartmentEntry, DeviceRect, HR_ACCESS_DENIED, HR_CO_E_NOTINITIALIZED, HR_E_HANDLE,
-    HR_E_OUTOFMEMORY, HR_INVALID_WINDOW_HANDLE, HR_RPC_E_CHANGED_MODE, WS_EX_APPWINDOW,
+    HR_E_OUTOFMEMORY, HR_INVALID_WINDOW_HANDLE, HR_RPC_E_CHANGED_MODE, PackageIdentityProbe,
+    WIN32_ERROR_INSUFFICIENT_BUFFER, WIN32_ERROR_NO_PACKAGE_IDENTITY, WS_EX_APPWINDOW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, ZOrder,
-    classify_apartment_entry, classify_hresult, device_from_logical, enforced_ex_style_spec,
-    ex_style_spec, hit_test_passes_through, logical_from_device, pointer_in_window, scale_from_dpi,
-    work_area_logical, z_order,
+    classify_apartment_entry, classify_hresult, classify_package_identity_probe,
+    device_from_logical, enforced_ex_style_spec, ex_style_spec, hit_test_passes_through,
+    logical_from_device, pointer_in_window, scale_from_dpi, work_area_logical, z_order,
 };
 
 /// The ex-style word winit hands over for a transparent, always-on-top,
@@ -398,6 +399,22 @@ fn only_a_successful_roinitialize_is_usable_and_owned() {
             "{entry:?}: successful initialization is exactly what takes a reference"
         );
     }
+}
+
+#[test]
+fn runtime_identity_does_not_confuse_a_portable_exe_with_a_failed_probe() {
+    assert_eq!(
+        classify_package_identity_probe(WIN32_ERROR_NO_PACKAGE_IDENTITY, 0),
+        PackageIdentityProbe::Unpackaged
+    );
+    assert_eq!(
+        classify_package_identity_probe(WIN32_ERROR_INSUFFICIENT_BUFFER, 64),
+        PackageIdentityProbe::Packaged { utf16_len: 64 }
+    );
+    assert_eq!(
+        classify_package_identity_probe(5, 0),
+        PackageIdentityProbe::Failed(5)
+    );
 }
 
 // ---------------------------------------------------------------------------

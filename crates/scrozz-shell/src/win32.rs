@@ -496,6 +496,42 @@ pub const HR_CO_E_NOTINITIALIZED: i32 = 0x8004_01F0_u32 as i32;
 /// `S_FALSE` — succeeded, but the thing was already done.
 pub const HR_S_FALSE: i32 = 1;
 
+/// `ERROR_SUCCESS`.
+pub const WIN32_ERROR_SUCCESS: u32 = 0;
+/// `ERROR_INSUFFICIENT_BUFFER`.
+pub const WIN32_ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+/// `APPMODEL_ERROR_NO_PACKAGE`.
+pub const WIN32_ERROR_NO_PACKAGE_IDENTITY: u32 = 15_700;
+
+/// The first `GetCurrentPackageFullName` probe result.
+///
+/// Kept free of Windows types so the decision made by the native identity
+/// adapter is exercised by every host test run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageIdentityProbe {
+    /// A package identity exists; allocate this many UTF-16 code units.
+    Packaged {
+        /// Buffer length reported by Windows, including the trailing NUL.
+        utf16_len: u32,
+    },
+    /// The process has no package identity.
+    Unpackaged,
+    /// Windows returned an unexpected status.
+    Failed(u32),
+}
+
+/// Classifies the sizing call to `GetCurrentPackageFullName`.
+#[must_use]
+pub const fn classify_package_identity_probe(status: u32, utf16_len: u32) -> PackageIdentityProbe {
+    match status {
+        WIN32_ERROR_INSUFFICIENT_BUFFER if utf16_len > 1 => {
+            PackageIdentityProbe::Packaged { utf16_len }
+        }
+        WIN32_ERROR_NO_PACKAGE_IDENTITY => PackageIdentityProbe::Unpackaged,
+        other => PackageIdentityProbe::Failed(other),
+    }
+}
+
 /// Whether an `HRESULT` indicates success.
 ///
 /// `S_FALSE` (1) and the `DRAGDROP_S_*` codes are all non-zero successes, so
@@ -957,6 +993,34 @@ mod tests {
         assert!(
             !entry.owes_uninitialise(),
             "a failed call took no reference"
+        );
+    }
+
+    #[test]
+    fn package_identity_probe_distinguishes_packaged_and_portable_processes() {
+        assert_eq!(
+            classify_package_identity_probe(WIN32_ERROR_INSUFFICIENT_BUFFER, 42),
+            PackageIdentityProbe::Packaged { utf16_len: 42 }
+        );
+        assert_eq!(
+            classify_package_identity_probe(WIN32_ERROR_NO_PACKAGE_IDENTITY, 0),
+            PackageIdentityProbe::Unpackaged
+        );
+    }
+
+    #[test]
+    fn package_identity_probe_rejects_inconsistent_or_unexpected_results() {
+        assert_eq!(
+            classify_package_identity_probe(WIN32_ERROR_INSUFFICIENT_BUFFER, 0),
+            PackageIdentityProbe::Failed(WIN32_ERROR_INSUFFICIENT_BUFFER)
+        );
+        assert_eq!(
+            classify_package_identity_probe(WIN32_ERROR_SUCCESS, 0),
+            PackageIdentityProbe::Failed(WIN32_ERROR_SUCCESS)
+        );
+        assert_eq!(
+            classify_package_identity_probe(5, 0),
+            PackageIdentityProbe::Failed(5)
         );
     }
 
