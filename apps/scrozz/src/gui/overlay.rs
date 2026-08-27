@@ -22,15 +22,12 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
+use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
 use scrozz_ui::{
     CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
 };
 
-use crate::gui::{
-    action::CaptureKind,
-    card::{Card, CardEvent, CardId, CardSurface},
-};
+use crate::gui::card::{Card, CardEvent, CardId, CardSurface};
 
 /// A [`CardSurface`] backed by a running `scrozz-ui` overlay.
 ///
@@ -81,7 +78,7 @@ impl OverlayCards {
 impl CardSurface for OverlayCards {
     fn present(&mut self, card: Card) -> scrozz_core::Result<()> {
         let name = card.file_name();
-        let provenance = provenance_of(card.kind);
+        let provenance = card.provenance;
 
         // The pixels handed to the overlay are the thumbnail, not the capture.
         // A 3456×2234 frame is about thirty megabytes; the card draws it at
@@ -223,18 +220,6 @@ impl CardSurface for OverlayCards {
     }
 }
 
-/// The chrome a capture kind should get.
-///
-/// Per D9 a window capture keeps the shape and shadow the OS gave it, and a
-/// region capture must never gain a synthetic one, so this is not cosmetic.
-const fn provenance_of(kind: CaptureKind) -> Provenance {
-    match kind {
-        CaptureKind::Region => Provenance::Region,
-        CaptureKind::Window => Provenance::Window,
-        CaptureKind::Fullscreen => Provenance::Display,
-    }
-}
-
 /// Reading a [`crate::gui::Thumbnail`] as a frame the UI can scale.
 trait Thumb {
     /// Wraps the thumbnail's pixels as a frame, without copying more than once.
@@ -262,7 +247,9 @@ impl Thumb for crate::gui::card::Thumbnail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::action::CaptureKind;
     use crate::gui::card::Thumbnail;
+    use scrozz_core::Provenance;
 
     fn card(id: u64) -> Card {
         Card::placeholder(CardId(id), CaptureKind::Fullscreen)
@@ -301,12 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn each_capture_kind_keeps_its_own_chrome() {
+    fn each_capture_keeps_its_actual_source_chrome() {
         // D9: a region capture that gained a window shadow would be a lie about
         // what was captured.
-        assert_eq!(provenance_of(CaptureKind::Region), Provenance::Region);
-        assert_eq!(provenance_of(CaptureKind::Window), Provenance::Window);
-        assert_eq!(provenance_of(CaptureKind::Fullscreen), Provenance::Display);
+        let mut card = card(1);
+        card.kind = CaptureKind::AllInOne;
+        card.provenance = Provenance::Window;
+        assert_eq!(card.provenance, Provenance::Window);
     }
 
     #[test]

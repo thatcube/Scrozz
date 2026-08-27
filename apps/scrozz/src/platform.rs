@@ -53,12 +53,35 @@ pub const fn capture_backend_is_stable() -> bool {
     cfg!(all(target_os = "macos", not(test)))
 }
 
+/// Whether still capture can be offered to a live UI in this process.
+///
+/// Unlike [`capture_backend_is_stable`], this includes the explicit unstable
+/// opt-in used for native integration work.
+#[must_use]
+pub fn capture_backend_is_ready() -> bool {
+    capture_backend_is_stable() || unstable_backends_enabled()
+}
+
 fn capture_guard(what: &str, provider: &'static str) -> CliResult<()> {
-    if capture_backend_is_stable() || unstable_backends_enabled() {
+    if capture_backend_is_ready() {
         Ok(())
     } else {
         Err(CliError::not_implemented(what, provider))
     }
+}
+
+/// Refuses still-capture work before it can enumerate or freeze the desktop.
+///
+/// Interactive selection reads the desktop before the final capture. Keeping
+/// that preparation behind the same opt-in guard prevents an unfinished backend
+/// from touching screen contents only to be rejected after the user commits.
+///
+/// # Errors
+///
+/// Returns [`CliError::NotImplemented`] when the capture backend has not been
+/// verified on this platform and [`UNSTABLE_ENV`] is not enabled.
+pub fn ensure_capture_backend_ready() -> CliResult<()> {
+    capture_guard("taking a capture", "scrozz-capture")
 }
 
 fn guard(what: &str, provider: &'static str) -> CliResult<()> {
@@ -78,7 +101,7 @@ fn guard(what: &str, provider: &'static str) -> CliResult<()> {
 /// whatever [`scrozz_capture::backend`] returns — including
 /// [`scrozz_core::Error::Unsupported`] on a compositor with no usable path.
 pub fn capture_backend() -> CliResult<Box<dyn CaptureBackend>> {
-    capture_guard("taking a capture", "scrozz-capture")?;
+    ensure_capture_backend_ready()?;
     Ok(scrozz_capture::backend()?)
 }
 

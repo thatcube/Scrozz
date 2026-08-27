@@ -30,6 +30,13 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(target_os = "linux")]
+pub use linux::session::{
+    Compositor as LinuxCompositor, PortalCapabilities, SessionEnv as LinuxSessionEnv,
+    SessionKind as LinuxSessionKind, capabilities as linux_portal_capabilities,
+    describe as describe_linux_session, detect_compositor as detect_linux_compositor,
+    detect_session as detect_linux_session,
+};
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCaptureKitBackend;
 

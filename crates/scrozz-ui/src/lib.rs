@@ -86,6 +86,7 @@ pub mod icons;
 pub mod motion;
 pub mod overlay_app;
 pub mod paint;
+pub mod select;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
@@ -95,5 +96,10 @@ pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+};
+pub use select::{
+    AxisDirection, DisplayLayout, FrozenDesktop, FrozenDisplayFrame, FrozenPixel, HudEntry,
+    HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,
+    SelectionAnnouncement, SelectionDecision, SelectionScene, SelectionState, SelectionUi,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

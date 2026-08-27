@@ -12,10 +12,11 @@ different class of defect, and each one cheaper than the layer below it.
 
 ## Layer 1 — Cross-target type checking (local, seconds, free)
 
-`cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-Both targets check cleanly from macOS today for **every crate that contains
-platform-specific code** — including the real platform bindings: the `windows`
-crate, `x11rb`, and `ashpd` with its zbus stack.
+`cargo check` does not link, so pure-Rust platform bindings need no foreign SDK.
+The Windows target and the non-GTK Linux crates check cleanly from macOS against
+the real `windows`, `x11rb`, and `ashpd`/zbus APIs. The complete Linux shell path
+still needs target GTK/ATK pkg-config metadata, so it is compiled and tested on
+the native Linux CI runner rather than being claimed as a macOS cross-check.
 
 ```bash
 tools/check-all-platforms.sh
@@ -28,7 +29,7 @@ error on this machine** rather than a surprise days later. It is the difference
 between writing platform code blind and writing it with the type checker
 watching.
 
-### The one exception, and why it does not matter
+### Native build-script boundaries
 
 **Crates whose dependencies compile C cannot be cross-checked without a cross C
 toolchain.** `cargo check` still runs build scripts, and `rusqlite`'s `bundled`
@@ -36,12 +37,17 @@ feature compiles `sqlite3.c` *for the target*, which fails on this machine with
 `fatal error: 'stdlib.h' file not found`. `scrozz-store` and the `scrozz` binary
 that depends on it are therefore excluded, via `SCROZZ_XCHECK_EXCLUDE`.
 
-This costs nothing real. Only four crates are permitted to contain
-`cfg(target_os)` at all — `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and
-`scrozz-shell` — and **all four are still fully checked on all three targets**.
 `scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
 almost nothing, and CI compiles it natively on all three runners anyway (layer
 2), which is a strictly stronger check.
+
+Linux desktop integration has a second build-script boundary. GTK/ATK discovery
+uses pkg-config, and a macOS host has no Linux target sysroot containing that
+metadata. `scrozz-capture`, `scrozz-record`, `scrozz-ocr`, `scrozz-ui`, and the
+shared core remain cross-checked for Linux; the GTK-backed `scrozz-shell` path is
+checked in full on native Linux CI. The helper identifies this failure mode and
+prints the narrower command instead of implying that missing metadata is a Rust
+compile error.
 
 Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
 dependency, which matters far more than local cross-check coverage of a crate
@@ -92,6 +98,78 @@ behaviour the first three layers structurally cannot reach.
 
 ---
 
+## Interactive capture selection
+
+The selector is one state machine with platform-specific hosting. Region,
+window, display and all-display modes share the same measured desktop geometry,
+HUD and outcome contract. The client-owned route supports drag creation,
+move/resize handles, arrow-key nudging, Alt+arrow resizing, Shift for 10-point
+steps, exact size, aspect lock, remembered regions, retake, Escape cancellation,
+crosshairs, a frozen backdrop and a pixel magnifier. All-in-One exposes the
+available modes in the same HUD rather than opening a second picker.
+
+Freeze applies to region and single-display choices, where the pre-overlay
+display frame can be returned exactly (and cropped for a region). Window mode
+stays live so the backend can preserve the window's native isolation, shape and
+shadow; all-display mode stays live so the backend owns mixed-scale composition.
+
+Mixed-DPI desktops stay in logical coordinates while the user selects. A region
+is owned and clamped by one measured display, and only that display's scale is
+used to round the final rectangle outward to physical pixels. Window outcomes
+use the enumerator's owning display rather than the primary display. This avoids
+both negative-origin errors and the common 1.0x/1.5x boundary mismatch.
+
+The app reuses its existing eframe loop instead of starting a nested event loop:
+the capture worker blocks on the synchronous selector trait while the main
+thread hides the capture cards, waits one frame, prepares any frozen pixels,
+shows the desktop-sized selector, hides it after commit, captures, then restores
+the cards. Only one selector may own that lifecycle at a time. CLI one-shot
+selection uses the same bridge in an ordinary temporary window. That one-shot
+window intentionally skips reversible AppKit panel conversion, so its shielding
+across Spaces and fullscreen apps still needs a native smoke run.
+
+Shortcut settings and runtime actions are separate names:
+`hotkey.capture-region` persists the accelerator, while `capture.region` is the
+action registered with the hotkey backend. Registration and tray visibility use
+the same live gate: the capture backend must be ready, the session must support
+the target, and the selector must report support for the requested mode. An
+unavailable selector therefore cannot leave a shortcut that fires an inert
+command.
+
+| Session | Planned host | Current selector result |
+|---|---|---|
+| macOS | Client overlay | Implemented; the long-running window switches between non-activating card and selection behavior |
+| Windows | Client overlay | Implemented and type-checked; native focus, z-order and mixed-DPI behavior still need a real Windows session |
+| Linux/X11 | Client overlay | Implemented and type-checked; native input/focus behavior still needs an X11 smoke run |
+| KDE/wlroots Wayland | Layer shell | Unavailable: layer-shell may be advertised, but Scrozz does not yet own a mapped layer-shell rendering surface |
+| GNOME/Mutter Wayland | Compositor-owned | Unavailable through `RegionSelector`: the Screenshot portal returns an image URI, not target geometry |
+| Headless | None | Refused with `Error::Unsupported` |
+
+Wayland has two intentionally separate boundaries:
+
+- ScreenCast/PipeWire owns capture permission and may let the compositor choose
+  a window, but it does not reveal a reusable `WindowId` or desktop rectangle.
+  That portal-owned capture cannot be represented by inventing a selector
+  outcome.
+- The Screenshot portal is not implemented in Scrozz. Even when its interactive
+  UI is present, its image URI is not selection geometry and is never treated as
+  such.
+
+Accordingly, `--interactive window` is not advertised as a Wayland workaround.
+Window enumeration and the selector both refuse truthfully until capture has a
+targetless portal-owned handoff. Wayland region cropping likewise requires real
+portal stream position and size; missing geometry is an error, never guessed.
+All-display composition remains separate capture-backend work.
+
+Selector geometry, state, input, accessibility labels, frozen-pixel sampling and
+deterministic harness scenes are covered headlessly. The remaining native gaps
+are one-shot macOS shielding across Spaces/fullscreen apps, mapped layer-shell
+rendering, compositor-owned result adaptation, Wayland all-display composition,
+portal-provided optional geometry, GNOME/KDE runtime smoke, and hands-on
+Windows/X11 focus, DPI and accessibility verification.
+
+---
+
 ## What this means for anyone writing platform code
 
 1. **Never guess an API.** Read the vendored bindings under
@@ -99,7 +177,8 @@ behaviour the first three layers structurally cannot reach.
    they move fast, and your memory of them is probably older than the pinned
    version.
 2. **Cross-check before committing.** `tools/check-all-platforms.sh` is fast, and
-   a Windows compile error found here costs a minute instead of a CI round trip.
+   a Windows or Rust-only Linux compile error found here costs a minute instead
+   of a CI round trip. Native Linux CI owns GTK/ATK-backed shell validation.
 3. **Keep `cfg(target_os)` out of the crates above the platform layer.** Only
    `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and `scrozz-shell` may contain
    it. Everything else is platform-agnostic by construction, which is what keeps

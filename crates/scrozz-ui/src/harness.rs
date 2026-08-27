@@ -259,6 +259,22 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// The selector overlay at rest before a drag begins.
+    SelectorIdle,
+    /// The selector overlay while a freehand region is being dragged.
+    SelectorDragging,
+    /// The selector overlay with a remembered region restored for adjustment.
+    SelectorRemembered,
+    /// The selector overlay positioning an exact-size region.
+    SelectorExact,
+    /// The selector overlay with an aspect-locked drag in progress.
+    SelectorAspect,
+    /// The selector overlay with the pixel loupe visible.
+    SelectorMagnifier,
+    /// The selector overlay with the All-in-One mode HUD visible.
+    SelectorAllInOne,
+    /// The selector overlay spanning mixed-DPI displays without crossing scales.
+    SelectorMixedDpi,
 }
 
 impl Scenario {
@@ -275,6 +291,14 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::SelectorIdle,
+            Self::SelectorDragging,
+            Self::SelectorRemembered,
+            Self::SelectorExact,
+            Self::SelectorAspect,
+            Self::SelectorMagnifier,
+            Self::SelectorAllInOne,
+            Self::SelectorMixedDpi,
         ]
     }
 
@@ -294,6 +318,14 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::SelectorIdle => "selector-idle",
+            Self::SelectorDragging => "selector-dragging",
+            Self::SelectorRemembered => "selector-remembered",
+            Self::SelectorExact => "selector-exact",
+            Self::SelectorAspect => "selector-aspect",
+            Self::SelectorMagnifier => "selector-magnifier",
+            Self::SelectorAllInOne => "selector-all-in-one",
+            Self::SelectorMixedDpi => "selector-mixed-dpi",
         }
     }
 
@@ -747,9 +779,100 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::SelectorIdle => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Choose a region",
+                    "The selector overlay at rest over a frozen display, ready for a new region drag.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorDragging => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Drag in any direction",
+                    "A region drag in progress, showing the scrim cutout, resize handles, and live pixel-size readout.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorRemembered => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Retake the last region",
+                    "A remembered selection restored for adjustment before the next capture.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorExact => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Place an exact size",
+                    "An exact-size region being positioned without resizing, preserving the requested physical output dimensions.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorAspect => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Lock the aspect ratio",
+                    "A live region drag constrained to a locked aspect ratio.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorMagnifier => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Inspect exact pixels",
+                    "The pixel loupe sampling the frozen desktop at the owning display's real scale.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorAllInOne => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "One shortcut, every mode",
+                    "The All-in-One selector HUD exposing region, window, display, and all-displays capture modes with capability gating.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SelectorMixedDpi => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Mixed-DPI without guessing",
+                    "A region held wholly within one measured display on a mixed-DPI desktop, rather than pretending a cross-display span has one scale.",
+                    instants::REST,
+                    None,
+                ),
             };
 
-        let size_pt = if annotating { (900.0, 620.0) } else { size_pt };
+        let size_pt = match scenario {
+            Scenario::EditorAnnotating => (900.0, 620.0),
+            Scenario::SelectorIdle
+            | Scenario::SelectorDragging
+            | Scenario::SelectorRemembered
+            | Scenario::SelectorExact
+            | Scenario::SelectorAspect
+            | Scenario::SelectorMagnifier
+            | Scenario::SelectorAllInOne => (720.0, 420.0),
+            Scenario::SelectorMixedDpi => (800.0, 320.0),
+            _ => size_pt,
+        };
 
         Self {
             scenario,
@@ -1870,7 +1993,7 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
@@ -1878,6 +2001,18 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        for scenario in [
+            Scenario::SelectorIdle,
+            Scenario::SelectorDragging,
+            Scenario::SelectorRemembered,
+            Scenario::SelectorExact,
+            Scenario::SelectorAspect,
+            Scenario::SelectorMagnifier,
+            Scenario::SelectorAllInOne,
+            Scenario::SelectorMixedDpi,
+        ] {
+            me.register(scenario, Box::new(crate::select::SelectionScene));
+        }
         me
     }
 
