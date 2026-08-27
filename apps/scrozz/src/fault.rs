@@ -35,6 +35,18 @@ use scrozz_core::Error as CoreError;
 
 use crate::{exit::Exit, json::Json};
 
+#[derive(Debug, Clone)]
+/// Boxed details kept out of the common command-error representation.
+pub struct PartialRecordingFailure {
+    error: CoreError,
+    path: String,
+    playable: bool,
+    salvageability: String,
+    duration_secs: f64,
+    history_id: Option<String>,
+    history_error: Option<String>,
+}
+
 /// Anything that can end a Scrozz invocation unsuccessfully.
 #[derive(Debug, Clone)]
 pub enum CliError {
@@ -45,22 +57,7 @@ pub enum CliError {
     SharedCore(Arc<CoreError>),
 
     /// Native recording failed but retained output was persisted separately.
-    PartialRecording {
-        /// Terminal native failure category.
-        error: CoreError,
-        /// Retained media path.
-        path: String,
-        /// Whether playback/editing can consume the retained media.
-        playable: bool,
-        /// Container recovery classification.
-        salvageability: String,
-        /// Pause-free retained duration.
-        duration_secs: f64,
-        /// Durable history id, when persistence succeeded.
-        history_id: Option<String>,
-        /// Persistence failure, when the media survived but history did not.
-        history_error: Option<String>,
-    },
+    PartialRecording(Box<PartialRecordingFailure>),
 
     /// The arguments were well-formed but semantically wrong.
     ///
@@ -113,7 +110,7 @@ impl CliError {
         history_id: Option<String>,
         history_error: Option<String>,
     ) -> Self {
-        Self::PartialRecording {
+        Self::PartialRecording(Box::new(PartialRecordingFailure {
             error,
             path: path.into(),
             playable,
@@ -121,7 +118,7 @@ impl CliError {
             duration_secs,
             history_id,
             history_error,
-        }
+        }))
     }
 
     pub(crate) fn shared_pair(self) -> (Self, Self) {
@@ -137,37 +134,10 @@ impl CliError {
                 Self::SharedCore(Arc::clone(&error)),
                 Self::SharedCore(error),
             ),
-            Self::PartialRecording {
-                error,
-                path,
-                playable,
-                salvageability,
-                duration_secs,
-                history_id,
-                history_error,
-            } => {
-                let clone = Self::PartialRecording {
-                    error: error.clone(),
-                    path: path.clone(),
-                    playable,
-                    salvageability: salvageability.clone(),
-                    duration_secs,
-                    history_id: history_id.clone(),
-                    history_error: history_error.clone(),
-                };
-                (
-                    clone,
-                    Self::PartialRecording {
-                        error,
-                        path,
-                        playable,
-                        salvageability,
-                        duration_secs,
-                        history_id,
-                        history_error,
-                    },
-                )
-            }
+            Self::PartialRecording(failure) => (
+                Self::PartialRecording(failure.clone()),
+                Self::PartialRecording(failure),
+            ),
             Self::Usage(message) => (Self::Usage(message.clone()), Self::Usage(message)),
             Self::NotImplemented { what, provider } => (
                 Self::NotImplemented {
@@ -205,7 +175,7 @@ impl CliError {
             Self::Usage(_) => Exit::Usage,
             Self::NotImplemented { .. } => Exit::NotImplemented,
             Self::Ipc(_) => Exit::IpcFailed,
-            Self::Core(_) | Self::SharedCore(_) | Self::PartialRecording { .. } => {
+            Self::Core(_) | Self::SharedCore(_) | Self::PartialRecording(_) => {
                 unreachable!("handled above")
             }
         }
@@ -214,7 +184,7 @@ impl CliError {
     /// The stable `kind` slug used in JSON output.
     #[must_use]
     pub fn kind(&self) -> &'static str {
-        if matches!(self, Self::PartialRecording { .. }) {
+        if matches!(self, Self::PartialRecording(_)) {
             return "recording-partial";
         }
         self.exit().slug()
@@ -240,25 +210,19 @@ impl CliError {
     /// unconditionally, and reaches into `details` only for a kind it knows.
     #[must_use]
     pub fn details(&self) -> Json {
-        if let Self::PartialRecording {
-            path,
-            playable,
-            salvageability,
-            duration_secs,
-            history_id,
-            history_error,
-            ..
-        } = self
-        {
+        if let Self::PartialRecording(failure) = self {
             return Json::obj([
-                ("path", Json::str(path)),
-                ("playable", Json::Bool(*playable)),
-                ("salvageability", Json::str(salvageability)),
-                ("duration_secs", Json::Float(*duration_secs)),
-                ("history_id", Json::opt(history_id.as_deref(), Json::str)),
+                ("path", Json::str(&failure.path)),
+                ("playable", Json::Bool(failure.playable)),
+                ("salvageability", Json::str(&failure.salvageability)),
+                ("duration_secs", Json::Float(failure.duration_secs)),
+                (
+                    "history_id",
+                    Json::opt(failure.history_id.as_deref(), Json::str),
+                ),
                 (
                     "history_error",
-                    Json::opt(history_error.as_deref(), Json::str),
+                    Json::opt(failure.history_error.as_deref(), Json::str),
                 ),
             ]);
         }
@@ -303,26 +267,21 @@ impl CliError {
     /// cancellation case and only the cancellation case.
     #[must_use]
     pub fn to_human(&self) -> String {
-        if let Self::PartialRecording {
-            error,
-            path,
-            playable,
-            salvageability,
-            history_id,
-            history_error,
-            ..
-        } = self
-        {
-            let history = history_id.as_ref().map_or_else(
+        if let Self::PartialRecording(failure) = self {
+            let history = failure.history_id.as_ref().map_or_else(
                 || {
-                    history_error.as_ref().map_or_else(String::new, |failure| {
-                        format!("\n  History persistence also failed: {failure}")
-                    })
+                    failure
+                        .history_error
+                        .as_ref()
+                        .map_or_else(String::new, |history_error| {
+                            format!("\n  History persistence also failed: {history_error}")
+                        })
                 },
                 |id| format!("\n  History id: {id}"),
             );
             return format!(
-                "scrozz: recording failed, but retained {salvageability} output.\n\n  Path: {path}\n  Playable: {playable}\n  Failure: {error}{history}\n"
+                "scrozz: recording failed, but retained {} output.\n\n  Path: {}\n  Playable: {}\n  Failure: {}{history}\n",
+                failure.salvageability, failure.path, failure.playable, failure.error
             );
         }
         if let Some(error) = self.core_error() {
@@ -371,7 +330,7 @@ impl CliError {
                  \x20 or tray and try again.\n"
             ),
 
-            Self::Core(_) | Self::SharedCore(_) | Self::PartialRecording { .. } => {
+            Self::Core(_) | Self::SharedCore(_) | Self::PartialRecording(_) => {
                 unreachable!("handled above")
             }
         }
@@ -381,7 +340,7 @@ impl CliError {
         match self {
             Self::Core(error) => Some(error),
             Self::SharedCore(error) => Some(error),
-            Self::PartialRecording { error, .. } => Some(error),
+            Self::PartialRecording(failure) => Some(&failure.error),
             Self::Usage(_) | Self::NotImplemented { .. } | Self::Ipc(_) => None,
         }
     }
@@ -392,8 +351,12 @@ impl fmt::Display for CliError {
         match self {
             Self::Core(err) => write!(f, "{err}"),
             Self::SharedCore(err) => write!(f, "{err}"),
-            Self::PartialRecording { error, path, .. } => {
-                write!(f, "{error}; retained recording at {path}")
+            Self::PartialRecording(failure) => {
+                write!(
+                    f,
+                    "{}; retained recording at {}",
+                    failure.error, failure.path
+                )
             }
             Self::Usage(message) => write!(f, "{message}"),
             Self::NotImplemented { what, provider } => {

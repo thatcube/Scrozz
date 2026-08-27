@@ -17,6 +17,9 @@ pub mod overlay;
 pub mod permissions;
 pub mod selection;
 pub mod tray;
+pub mod win32;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(target_os = "linux")]
 mod x11_focus;
 

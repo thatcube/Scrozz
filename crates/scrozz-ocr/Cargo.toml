@@ -20,6 +20,7 @@ objc2-vision.workspace = true
 objc2-core-graphics.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+scrozz-shell.workspace = true
 windows = { workspace = true, features = [
     "Media_Ocr",
     "Graphics_Imaging",

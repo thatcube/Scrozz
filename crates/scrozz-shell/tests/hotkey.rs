@@ -675,13 +675,12 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
     assert!(!TrayAction::ToggleRecording.is_available_with(false));
     assert!(TrayAction::ToggleRecording.is_available_with(true));
 
-    for unfinished in [TrayAction::OpenSettings] {
-        assert!(
-            !unfinished.is_available(),
-            "{unfinished:?} has no end-to-end implementation and must look \
-             disabled rather than accept a click that appears to do nothing"
-        );
-    }
+    let unfinished = TrayAction::OpenSettings;
+    assert!(
+        !unfinished.is_available(),
+        "{unfinished:?} has no end-to-end implementation and must look \
+         disabled rather than accept a click that appears to do nothing"
+    );
 }
 
 #[test]

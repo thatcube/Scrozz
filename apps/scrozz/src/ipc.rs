@@ -48,10 +48,13 @@
 //! [`Status::NotRunning`] and every caller falls through to doing the work
 //! locally. That is the correct behaviour today and stays correct afterwards.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::{
-    cli::Command,
+    cli::{Cli, Command},
     fault::{CliError, CliResult},
     json::Json,
 };
@@ -64,6 +67,14 @@ pub const REQUEST_SCHEMA: i64 = 1;
 
 /// Overrides the endpoint, for tests and for unusual sandboxes.
 pub const ENDPOINT_ENV: &str = "SCROZZ_IPC_SOCKET";
+
+/// Maximum execution time for ordinary forwarded commands.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Additional response-transfer grace after command cancellation.
+pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client window covering execution plus cancellation and response transfer.
+pub(crate) const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60 + 20);
+const MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How a payload should be written to stdout once relayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +388,12 @@ fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
             path.display()
         ))
     })?;
+    stream
+        .set_write_timeout(Some(TRANSFER_TIMEOUT))
+        .map_err(|error| CliError::ipc(format!("could not bound request writes: {error}")))?;
+    stream
+        .set_read_timeout(response_timeout(argv))
+        .map_err(|error| CliError::ipc(format!("could not bound response reads: {error}")))?;
 
     let cwd = std::env::current_dir().ok();
     let request = encode_request(argv, cwd.as_deref());
@@ -390,9 +407,15 @@ fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
         .map_err(|e| CliError::ipc(format!("could not finish the request: {e}")))?;
 
     let mut buffer = Vec::new();
-    stream
+    (&mut stream)
+        .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut buffer)
         .map_err(|e| CliError::ipc(format!("could not read the response: {e}")))?;
+    if buffer.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(CliError::ipc(format!(
+            "the running instance returned more than {MAX_RESPONSE_BYTES} response bytes"
+        )));
+    }
 
     parse_response(&buffer)
 }
@@ -436,10 +459,31 @@ fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
         .map_err(|error| CliError::ipc(format!("could not finish the request: {error}")))?;
 
     let mut buffer = Vec::new();
-    stream
+    (&mut stream)
+        .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut buffer)
         .map_err(|error| CliError::ipc(format!("could not read the response: {error}")))?;
+    if buffer.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(CliError::ipc(format!(
+            "the running instance returned more than {MAX_RESPONSE_BYTES} response bytes"
+        )));
+    }
     parse_response(&buffer)
+}
+
+fn response_timeout(argv: &[String]) -> Option<Duration> {
+    use clap::Parser as _;
+
+    let mut with_argv0 = Vec::with_capacity(argv.len() + 1);
+    with_argv0.push("scrozz".to_owned());
+    with_argv0.extend_from_slice(argv);
+    let long_recording = Cli::try_parse_from(with_argv0).ok().is_some_and(|cli| {
+        matches!(
+            cli.command,
+            Some(Command::Record(args)) if args.control().is_none() && !args.dry_run
+        )
+    });
+    (!long_recording).then_some(CLIENT_RESPONSE_TIMEOUT)
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -455,6 +499,20 @@ mod tests {
 
     fn command_of(argv: &[&str]) -> Command {
         Cli::try_parse_from(argv).unwrap().command.unwrap()
+    }
+
+    #[test]
+    fn client_response_window_outlives_command_cancellation_and_transfer() {
+        assert!(CLIENT_RESPONSE_TIMEOUT > COMMAND_TIMEOUT);
+        assert!(CLIENT_RESPONSE_TIMEOUT - COMMAND_TIMEOUT >= TRANSFER_TIMEOUT.saturating_mul(2));
+    }
+
+    #[test]
+    fn long_recording_starts_are_not_cut_off_by_the_ordinary_command_window() {
+        let args = argv(&["record", "--display", "active"]);
+        assert_eq!(response_timeout(&args), None);
+        let capture = argv(&["capture", "--dry-run"]);
+        assert_eq!(response_timeout(&capture), Some(CLIENT_RESPONSE_TIMEOUT));
     }
 
     fn argv(items: &[&str]) -> Vec<String> {

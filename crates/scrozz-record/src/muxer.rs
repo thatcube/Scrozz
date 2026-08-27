@@ -267,16 +267,15 @@ pub fn inspect_recovery(bytes: &[u8]) -> RecoveryReport {
                 }
                 pending_moof = Some((start, first_video_sample_is_sync(&bytes[start..cursor])));
             }
-            b"mdat" => match pending_moof.take() {
-                Some((_, sync)) => {
+            b"mdat" => {
+                if let Some((_, sync)) = pending_moof.take() {
                     if !sync && complete_fragments == 0 {
                         break;
                     }
                     complete_fragments = complete_fragments.saturating_add(1);
                     valid_prefix = cursor;
                 }
-                None => {}
-            },
+            }
             _ => {
                 if pending_moof.take().is_some() {
                     break;

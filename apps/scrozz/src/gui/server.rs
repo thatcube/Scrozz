@@ -31,9 +31,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        mpsc::{Receiver, Sender, channel},
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::JoinHandle,
+    time::Instant,
 };
 
 use crate::{
@@ -44,6 +46,86 @@ use crate::{
     ipc::{self, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };
+
+const FORWARD_QUEUE_DEPTH: usize = 16;
+const REQUEST_QUEUED: u8 = 0;
+const REQUEST_RUNNING: u8 = 1;
+const REQUEST_CANCELLED: u8 = 2;
+const REQUEST_COMPLETED: u8 = 3;
+
+#[derive(Debug)]
+struct RequestControl {
+    phase: AtomicU8,
+    cancelled: AtomicBool,
+}
+
+impl RequestControl {
+    fn queued() -> Self {
+        Self {
+            phase: AtomicU8::new(REQUEST_QUEUED),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn try_start(&self, deadline: Option<Instant>) -> bool {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.cancel();
+            return false;
+        }
+        if self
+            .phase
+            .compare_exchange(
+                REQUEST_QUEUED,
+                REQUEST_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if self.cancelled.load(Ordering::Acquire)
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.cancelled.store(true, Ordering::Release);
+            let _ = self.phase.compare_exchange(
+                REQUEST_RUNNING,
+                REQUEST_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.phase.compare_exchange(
+            REQUEST_QUEUED,
+            REQUEST_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn complete(&self) {
+        let _ = self.phase.compare_exchange(
+            REQUEST_RUNNING,
+            REQUEST_COMPLETED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn is_running(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == REQUEST_RUNNING
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// A request from another process, waiting for its answer.
 pub struct Request {
@@ -56,6 +138,9 @@ pub struct Request {
     stream: std::os::unix::net::UnixStream,
     #[cfg(target_os = "windows")]
     stream: std::fs::File,
+    deadline: Option<Instant>,
+    control: Arc<RequestControl>,
+    execution: commands::ExecutionControl,
 }
 
 impl std::fmt::Debug for Request {
@@ -63,6 +148,8 @@ impl std::fmt::Debug for Request {
         f.debug_struct("Request")
             .field("argv", &self.argv)
             .field("cwd", &self.cwd)
+            .field("deadline", &self.deadline)
+            .field("control", &self.control)
             .finish_non_exhaustive()
     }
 }
@@ -80,6 +167,32 @@ impl Request {
         Some(cli.command.unwrap_or(Command::Gui))
     }
 
+    fn request_controls(
+        argv: &[String],
+    ) -> (
+        Option<Instant>,
+        Arc<RequestControl>,
+        commands::ExecutionControl,
+    ) {
+        use clap::Parser as _;
+
+        let mut with_argv0 = Vec::with_capacity(argv.len() + 1);
+        with_argv0.push("scrozz".to_owned());
+        with_argv0.extend_from_slice(argv);
+        let long_recording = Cli::try_parse_from(with_argv0).ok().is_some_and(|cli| {
+            matches!(
+                cli.command,
+                Some(Command::Record(args)) if args.control().is_none() && !args.dry_run
+            )
+        });
+        let deadline = (!long_recording).then(|| Instant::now() + ipc::COMMAND_TIMEOUT);
+        (
+            deadline,
+            Arc::new(RequestControl::queued()),
+            commands::ExecutionControl::forwarded(deadline),
+        )
+    }
+
     /// Runs the command and answers the caller.
     ///
     /// Consumes the request, because the socket must be closed either way: a
@@ -89,12 +202,12 @@ impl Request {
     /// Returns what the command was, so the app can decide whether it also has
     /// local work to do — showing a card for a forwarded capture, or quitting.
     pub fn serve(self) -> Option<Command> {
-        self.serve_with(commands::dispatch)
+        self.serve_with(commands::dispatch_controlled)
     }
 
     /// Runs the command against the CLI recording session retained by the host.
     pub fn serve_with_recording(self, recording: &mut RecordingManager) -> Option<Command> {
-        self.serve_with(|command| commands::dispatch_with_recording(command, recording))
+        self.serve_with(|command, _execution| commands::dispatch_with_recording(command, recording))
     }
 
     /// Runs a stateful command in the caller's working directory without
@@ -106,6 +219,12 @@ impl Request {
         &self,
         dispatch: impl FnOnce(&Command) -> CliResult<crate::report::Report>,
     ) -> CliResult<crate::report::Report> {
+        if !self.claim() {
+            return Err(CliError::ipc(
+                "the forwarded command expired before it could start",
+            ));
+        }
+        self.execution.check()?;
         use clap::Parser as _;
 
         let mut with_argv0 = Vec::with_capacity(self.argv.len() + 1);
@@ -122,50 +241,91 @@ impl Request {
     }
 
     /// Runs the command with a state-aware dispatcher retained by the host.
-    pub fn serve_with(
-        self,
-        dispatch: impl FnOnce(&Command) -> CliResult<crate::report::Report>,
-    ) -> Option<Command> {
-        let (command, response) = run_with(&self.argv, self.cwd.as_deref(), dispatch);
-        self.reply(&response);
-        command
+    pub fn serve_with<F>(mut self, dispatch: F) -> Option<Command>
+    where
+        F: FnOnce(&Command, &commands::ExecutionControl) -> CliResult<crate::report::Report>,
+    {
+        if !self.claim() {
+            self.reject("the forwarded command expired before it could start");
+            return None;
+        }
+        let (command, response) =
+            run_with(&self.argv, self.cwd.as_deref(), &self.execution, dispatch);
+        if self.reply(&response) {
+            self.control.complete();
+            command
+        } else {
+            self.cancel();
+            None
+        }
     }
 
     fn serve_with_selector(self, selector: &dyn CaptureSelector) -> Option<Command> {
-        let (command, response) =
-            run_with_selector(&self.argv, self.cwd.as_deref(), Some(selector));
-        self.reply(&response);
-        command
+        self.serve_with(|command, execution| {
+            commands::dispatch_with_selector_control(command, selector, execution)
+        })
+    }
+
+    fn claim(&self) -> bool {
+        if self.control.is_running() {
+            return !self.control.is_cancelled() && self.execution.check().is_ok();
+        }
+        self.control.try_start(self.deadline)
+    }
+
+    fn cancel(&self) {
+        self.control.cancel();
+        self.execution.cancel();
+    }
+
+    fn reject(mut self, message: &str) {
+        self.cancel();
+        let response = text(crate::exit::Exit::IpcFailed.code(), message.to_owned());
+        let _ = self.reply(&response);
     }
 
     #[cfg(unix)]
-    fn reply(self, response: &Response) {
+    fn reply(&mut self, response: &Response) -> bool {
         use std::{io::Write, net::Shutdown};
 
-        let mut stream = self.stream;
         let bytes = ipc::encode_response(response);
-        if let Err(err) = stream.write_all(&bytes) {
+        if let Err(err) = self.stream.write_all(&bytes) {
             tracing::warn!("could not answer a forwarded command: {err}");
+            return false;
         }
-        let _ = stream.flush();
+        if let Err(error) = self.stream.flush() {
+            tracing::warn!("could not flush a forwarded command response: {error}");
+            return false;
+        }
         // The client reads to EOF, so it only sees the answer once we close.
-        let _ = stream.shutdown(Shutdown::Both);
+        if let Err(error) = self.stream.shutdown(Shutdown::Both) {
+            tracing::debug!(
+                "socket shutdown after a forwarded response was already closed: {error}"
+            );
+        }
+        true
     }
 
     #[cfg(target_os = "windows")]
-    fn reply(self, response: &Response) {
+    fn reply(&mut self, response: &Response) -> bool {
         use std::io::Write;
 
-        let mut stream = self.stream;
         let bytes = ipc::encode_response(response);
-        if let Err(error) = stream.write_all(&bytes) {
+        if let Err(error) = self.stream.write_all(&bytes) {
             tracing::warn!("could not answer a forwarded command: {error}");
+            return false;
         }
-        let _ = stream.flush();
+        if let Err(error) = self.stream.flush() {
+            tracing::warn!("could not flush a forwarded command response: {error}");
+            return false;
+        }
+        true
     }
 
     #[cfg(not(any(unix, target_os = "windows")))]
-    fn reply(self, _response: &Response) {}
+    fn reply(&mut self, _response: &Response) -> bool {
+        false
+    }
 }
 
 /// Executes a forwarded argument vector, exactly as a local run would.
@@ -174,7 +334,12 @@ impl Request {
 /// socket, which is the part most likely to drift from
 /// [`crate::report::Reporter::emit`].
 fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
-    run_with(argv, cwd, commands::dispatch)
+    run_with(
+        argv,
+        cwd,
+        &commands::ExecutionControl::local(),
+        commands::dispatch_controlled,
+    )
 }
 
 fn run_with_selector(
@@ -182,50 +347,58 @@ fn run_with_selector(
     cwd: Option<&Path>,
     selector: Option<&dyn CaptureSelector>,
 ) -> (Option<Command>, Response) {
-    run_with(argv, cwd, |command| match selector {
-        Some(selector) => commands::dispatch_with_selector(command, selector),
-        None => commands::dispatch(command),
-    })
+    run_with(
+        argv,
+        cwd,
+        &commands::ExecutionControl::local(),
+        |command, execution| match selector {
+            Some(selector) => {
+                commands::dispatch_with_selector_control(command, selector, execution)
+            }
+            None => commands::dispatch_controlled(command, execution),
+        },
+    )
 }
 
-fn run_with<F>(argv: &[String], cwd: Option<&Path>, dispatch: F) -> (Option<Command>, Response)
+fn run_with<F>(
+    argv: &[String],
+    cwd: Option<&Path>,
+    execution: &commands::ExecutionControl,
+    dispatch: F,
+) -> (Option<Command>, Response)
 where
-    F: FnOnce(&Command) -> CliResult<crate::report::Report>,
+    F: FnOnce(&Command, &commands::ExecutionControl) -> CliResult<crate::report::Report>,
 {
+    if let Err(error) = execution.check() {
+        return (None, text(error.exit().code(), error.to_string()));
+    }
     use clap::Parser as _;
 
     if argv.is_empty() {
-        // A forwarded invocation with nothing in it cannot be honoured, and
-        // clap would answer with the help text rather than saying so.
         return (
             None,
             text(2, "the forwarded command had no arguments".to_owned()),
         );
     }
 
-    // The wire carries the arguments *after* the program name — `ipc::forward`
-    // is handed `env::args().skip(1)`. clap always treats its first element as
-    // the program name and discards it, so without a placeholder the real
-    // subcommand is eaten and every forwarded command parses as a bare
-    // `scrozz`. That failure is invisible: the response comes back well-formed,
-    // for the wrong command.
     let mut with_argv0 = Vec::with_capacity(argv.len() + 1);
     with_argv0.push("scrozz".to_owned());
     with_argv0.extend_from_slice(argv);
-
     let mut cli = match Cli::try_parse_from(&with_argv0) {
         Ok(cli) => cli,
-        // clap's own rejection. There is no slug to report it under, because we
-        // never got as far as knowing which subcommand was meant.
         Err(err) => return (None, text(2, err.to_string())),
     };
     let aliases = cwd.map_or_else(Default::default, |cwd| cli.absolutize_paths(cwd));
-
     let command = cli.command.clone().unwrap_or(Command::Gui);
     let slug = command.slug();
-
-    let result = cli.validate().and_then(|()| dispatch(&command));
-
+    let result = cli
+        .validate()
+        .and_then(|()| execution.check())
+        .and_then(|()| dispatch(&command, execution))
+        .and_then(|report| {
+            execution.check()?;
+            Ok(report)
+        });
     let response = match result {
         Ok(mut report) => {
             aliases.restore_json(&mut report.data);
@@ -255,7 +428,6 @@ where
             }
         }
     };
-
     (Some(command), response)
 }
 
@@ -270,7 +442,7 @@ enum ForwardJob {
 /// worker wait on the selector while eframe's main thread continues polling the
 /// selector bridge and painting the overlay.
 pub struct Forwarder {
-    jobs: Sender<ForwardJob>,
+    jobs: SyncSender<ForwardJob>,
     completed: Receiver<Option<Command>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -282,8 +454,8 @@ impl Forwarder {
     ///
     /// Returns a platform error if the thread cannot be created.
     pub fn start(selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
-        let (jobs, requests) = channel();
-        let (finished, completed) = channel();
+        let (jobs, requests) = sync_channel(FORWARD_QUEUE_DEPTH);
+        let (finished, completed) = sync_channel(FORWARD_QUEUE_DEPTH);
         let worker = std::thread::Builder::new()
             .name("scrozz-forwarded-command".to_owned())
             .spawn(move || {
@@ -311,7 +483,22 @@ impl Forwarder {
 
     /// Queues an accepted request without blocking the caller.
     pub fn submit(&self, request: Request) -> bool {
-        self.jobs.send(ForwardJob::Serve(request)).is_ok()
+        match self.jobs.try_send(ForwardJob::Serve(request)) {
+            Ok(()) => true,
+            Err(TrySendError::Full(ForwardJob::Serve(request))) => {
+                request.reject("the running instance is busy");
+                false
+            }
+            Err(TrySendError::Disconnected(ForwardJob::Serve(request))) => {
+                request.reject("the running instance is shutting down");
+                false
+            }
+            Err(
+                TrySendError::Full(ForwardJob::Stop) | TrySendError::Disconnected(ForwardJob::Stop),
+            ) => {
+                unreachable!("submit only sends Serve jobs")
+            }
+        }
     }
 
     /// Takes one completed command, if any.
@@ -468,7 +655,15 @@ impl Server {
         let line = String::from_utf8_lossy(&raw);
         let argv = string_array(&line, "argv")?;
         let cwd = string_field(&line, "cwd").map(PathBuf::from);
-        Some(Request { argv, cwd, stream })
+        let (deadline, control, execution) = Request::request_controls(&argv);
+        Some(Request {
+            argv,
+            cwd,
+            stream,
+            deadline,
+            control,
+            execution,
+        })
     }
 
     /// Takes one pending Windows named-pipe request without blocking.
@@ -583,7 +778,17 @@ impl Server {
                 tracing::warn!("could not create the next instance named pipe: {error}");
             })
             .ok();
-        parsed.map(|(argv, cwd)| Request { argv, cwd, stream })
+        parsed.map(|(argv, cwd)| {
+            let (deadline, control, execution) = Request::request_controls(&argv);
+            Request {
+                argv,
+                cwd,
+                stream,
+                deadline,
+                control,
+                execution,
+            }
+        })
     }
 
     /// Nothing arrives without a local IPC transport.
@@ -836,6 +1041,46 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn cancellation_and_dispatch_claim_are_atomically_ordered() {
+        let cancelled_first = RequestControl::queued();
+        cancelled_first.cancel();
+        assert!(!cancelled_first.try_start(Some(Instant::now() + ipc::COMMAND_TIMEOUT)));
+        assert_eq!(
+            cancelled_first.phase.load(Ordering::Acquire),
+            REQUEST_CANCELLED
+        );
+
+        let dispatch_first = RequestControl::queued();
+        assert!(dispatch_first.try_start(Some(Instant::now() + ipc::COMMAND_TIMEOUT)));
+        dispatch_first.cancel();
+        assert_eq!(
+            dispatch_first.phase.load(Ordering::Acquire),
+            REQUEST_RUNNING
+        );
+        assert!(dispatch_first.is_cancelled());
+    }
+
+    #[test]
+    fn a_request_queued_past_its_deadline_can_never_start_later() {
+        let control = RequestControl::queued();
+        assert!(!control.try_start(Some(Instant::now() - std::time::Duration::from_millis(1))));
+        assert!(control.is_cancelled());
+        assert_eq!(control.phase.load(Ordering::Acquire), REQUEST_CANCELLED);
+    }
+
+    #[test]
+    fn unbounded_recording_claims_still_obey_explicit_cancellation() {
+        let control = RequestControl::queued();
+        assert!(control.try_start(None));
+        control.complete();
+        assert_eq!(control.phase.load(Ordering::Acquire), REQUEST_COMPLETED);
+
+        let cancelled = RequestControl::queued();
+        cancelled.cancel();
+        assert!(!cancelled.try_start(None));
     }
 
     #[test]

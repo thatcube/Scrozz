@@ -22,7 +22,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
@@ -54,6 +54,76 @@ use crate::{
     settings,
 };
 
+const CANCELLATION_POLL: Duration = Duration::from_millis(20);
+
+/// Deadline and cooperative cancellation shared with a forwarded command.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionControl {
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl ExecutionControl {
+    pub(crate) const fn local() -> Self {
+        Self {
+            deadline: None,
+            cancelled: None,
+        }
+    }
+
+    pub(crate) fn forwarded(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            cancelled: Some(Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        if let Some(cancelled) = &self.cancelled {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn check(&self) -> CliResult<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(CliError::ipc(
+                "the forwarded command expired before it could complete",
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait(&self, duration: Duration) -> CliResult<()> {
+        let wake = Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| CliError::usage("the capture delay is too large"))?;
+        if self.deadline.is_some_and(|deadline| wake >= deadline) {
+            return Err(CliError::ipc(
+                "the capture delay exceeds the forwarded-command deadline",
+            ));
+        }
+        if self.deadline.is_none() {
+            std::thread::sleep(duration);
+            return Ok(());
+        }
+        loop {
+            self.check()?;
+            let remaining = wake.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(CANCELLATION_POLL));
+        }
+    }
+}
+
 /// Runs a command locally.
 ///
 /// # Errors
@@ -61,8 +131,15 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
+    dispatch_controlled(command, &ExecutionControl::local())
+}
+
+pub(crate) fn dispatch_controlled(
+    command: &Command,
+    execution: &ExecutionControl,
+) -> CliResult<Report> {
     let mut recording = RecordingManager::default();
-    dispatch_inner(command, &mut recording, None)
+    dispatch_inner(command, &mut recording, None, execution)
 }
 
 /// Runs a command with access to the recording owned by this process.
@@ -70,7 +147,7 @@ pub fn dispatch_with_recording(
     command: &Command,
     recording: &mut RecordingManager,
 ) -> CliResult<Report> {
-    dispatch_inner(command, recording, None)
+    dispatch_inner(command, recording, None, &ExecutionControl::local())
 }
 
 /// Runs a command with an existing-loop selector supplied by the GUI.
@@ -83,24 +160,58 @@ pub fn dispatch_with_selector(
     selector: &dyn CaptureSelector,
 ) -> CliResult<Report> {
     let mut recording = RecordingManager::default();
-    dispatch_inner(command, &mut recording, Some(selector))
+    dispatch_inner(
+        command,
+        &mut recording,
+        Some(selector),
+        &ExecutionControl::local(),
+    )
+}
+
+pub(crate) fn dispatch_with_selector_control(
+    command: &Command,
+    selector: &dyn CaptureSelector,
+    execution: &ExecutionControl,
+) -> CliResult<Report> {
+    let mut recording = RecordingManager::default();
+    dispatch_inner(command, &mut recording, Some(selector), execution)
 }
 
 fn dispatch_inner(
     command: &Command,
     recording: &mut RecordingManager,
     selector: Option<&dyn CaptureSelector>,
+    execution: &ExecutionControl,
 ) -> CliResult<Report> {
-    match command {
-        Command::Capture(args) => capture(args, selector),
-        Command::Record(args) => record(args, recording, selector),
-        Command::List(args) => list(args.what),
-        Command::History(args) => history(&args.command),
-        Command::Ocr(args) => ocr(args),
-        Command::Settings(args) => settings_command(&args.command),
-        Command::Hotkey(args) => hotkey(&args.command),
-        Command::Gui => gui(),
-    }
+    with_platform_apartment(|| {
+        execution.check()?;
+        let report = match command {
+            Command::Capture(args) => capture(args, selector, execution),
+            Command::Record(args) => record(args, recording, selector, execution),
+            Command::List(args) => list(args.what),
+            Command::History(args) => history(&args.command),
+            Command::Ocr(args) => ocr(args),
+            Command::Settings(args) => settings_command(&args.command),
+            Command::Hotkey(args) => hotkey(&args.command),
+            Command::Gui => gui(),
+        }?;
+        execution.check()?;
+        Ok(report)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn with_platform_apartment<T>(body: impl FnOnce() -> CliResult<T>) -> CliResult<T> {
+    let apartment = scrozz_shell::windows::apartment::Apartment::enter_multithreaded()
+        .map_err(CliError::Core)?;
+    let result = body();
+    drop(apartment);
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn with_platform_apartment<T>(body: impl FnOnce() -> CliResult<T>) -> CliResult<T> {
+    body()
 }
 
 /// The native recording session owned by one Scrozz process.
@@ -371,7 +482,12 @@ pub fn run_owned_recording(command: &Command, ipc_enabled: bool) -> CliResult<Re
 // capture
 // ---------------------------------------------------------------------------
 
-fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
+fn capture(
+    args: &CaptureArgs,
+    selector: Option<&dyn CaptureSelector>,
+    execution: &ExecutionControl,
+) -> CliResult<Report> {
+    execution.check()?;
     args.validate()?;
     let requested_target = args.target.resolve()?;
     let sinks = args.sinks();
@@ -434,6 +550,7 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
         }
         concrete => (capture_target(&concrete)?, None, None),
     };
+    execution.check()?;
 
     let request = CaptureRequest {
         target,
@@ -448,7 +565,9 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
     if selection_outcome.is_none()
         && let Some(secs) = args.delay
     {
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        let delay = Duration::try_from_secs_f64(secs)
+            .map_err(|_| CliError::usage("the capture delay is too large"))?;
+        execution.wait(delay)?;
     }
     if selection_outcome.is_none()
         && let Some(selector) = selector
@@ -464,6 +583,7 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             selection_outcome.as_ref(),
         )?,
     };
+    execution.check()?;
     lifecycle.finish();
     if let Some(outcome) = selection_outcome.as_ref() {
         remember_selection(outcome, backend.as_ref());
@@ -473,10 +593,12 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
     let bytes = FrameEncoder::new()
         .encode(frame, args.format().to_export())
         .map_err(CliError::Core)?;
+    execution.check()?;
 
     let mut written = Vec::new();
     let mut raw = None;
     for sink in &sinks {
+        execution.check()?;
         match sink {
             Sink::File(path) => {
                 std::fs::write(path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
@@ -497,6 +619,7 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             }
         }
     }
+    execution.check()?;
 
     let data = Json::obj([
         ("plan", plan),
@@ -751,6 +874,7 @@ fn record(
     args: &RecordArgs,
     recording: &mut RecordingManager,
     selector: Option<&dyn CaptureSelector>,
+    execution: &ExecutionControl,
 ) -> CliResult<Report> {
     if let Some(control) = args.control() {
         return match control {
@@ -778,6 +902,7 @@ fn record(
         return Err(recording_already_active_error());
     }
     let target = resolve_recording_capture_target(&requested_target, selector)?;
+    execution.check()?;
     let resolved_plan = recording_plan_for_target(args, &target);
     let prepared = prepare_recording(args, target, resolved_plan)?;
     let session = platform::start_recording(&prepared.request)?;
@@ -2009,6 +2134,27 @@ mod tests {
         let cli = Cli::try_parse_from(argv).expect("should parse");
         cli.validate()?;
         dispatch(&cli.command.clone().expect("should have a command"))
+    }
+
+    #[test]
+    fn forwarded_execution_rejects_expiry_before_dispatch() {
+        let execution = ExecutionControl::forwarded(Some(Instant::now()));
+        let error = execution.check().unwrap_err();
+        assert_eq!(error.exit(), Exit::IpcFailed);
+        assert!(error.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn cancelling_a_forwarded_delay_wakes_it_promptly() {
+        let execution = ExecutionControl::forwarded(Some(Instant::now() + Duration::from_secs(5)));
+        let canceller = execution.clone();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || execution.wait(Duration::from_secs(4)));
+        std::thread::sleep(Duration::from_millis(30));
+        canceller.cancel();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.exit(), Exit::IpcFailed);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn json_of(argv: &[&str]) -> String {

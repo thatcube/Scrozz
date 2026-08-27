@@ -65,6 +65,24 @@ const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 /// the machine has no OCR language pack installed, [`Error::Platform`] for any
 /// other WinRT failure.
 pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    match scrozz_shell::windows::identity::current() {
+        scrozz_shell::windows::identity::PackageIdentity::Packaged { .. } => {}
+        scrozz_shell::windows::identity::PackageIdentity::Unpackaged => {
+            return Err(Error::Unsupported {
+                what: "text recognition in a portable Windows build".to_owned(),
+                why: "Windows.Media.Ocr requires package identity and this build does not yet \
+                      include the reviewed artifact-local Tesseract payload"
+                    .to_owned(),
+            });
+        }
+        scrozz_shell::windows::identity::PackageIdentity::Unknown { status, detail } => {
+            return Err(Error::Platform(format!(
+                "cannot select the Windows OCR backend because package identity is unknown \
+                 (Win32 status {status}): {detail}"
+            )));
+        }
+    }
+
     // Ask the engine for its ceiling first: the answer feeds the upscale
     // decision, so an image is never enlarged past what the engine will accept
     // and an already-oversized capture is shrunk rather than rejected.

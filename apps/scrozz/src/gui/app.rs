@@ -546,14 +546,14 @@ impl App {
                         self.reply_recording_waiters();
                     }
                     Err(error) => {
-                        request.serve_with(|_| Err(error));
+                        request.serve_with(|_, _| Err(error));
                     }
                 }
                 continue;
             }
 
             if matches!(parsed, Some(Command::Record(_))) {
-                let _ = request.serve_with(|command| self.dispatch_gui_recording(command));
+                let _ = request.serve_with(|command, _| self.dispatch_gui_recording(command));
             } else {
                 let submitted = self
                     .forwarder
@@ -1196,7 +1196,7 @@ impl App {
             Err(error) => {
                 self.note(format!("recording action failed: {error}"));
                 if let Some(request) = reply {
-                    request.serve_with(|_| Err(CliError::Core(error)));
+                    request.serve_with(|_, _| Err(CliError::Core(error)));
                 }
                 return;
             }
@@ -1314,7 +1314,7 @@ impl App {
         };
         for request in self.recording_replies.drain(..) {
             let completion = completion.clone();
-            request.serve_with(|_| match completion {
+            request.serve_with(|_, _| match completion {
                 GuiRecordingCompletion::Finished(report) => Ok(report),
                 GuiRecordingCompletion::Failed(error) => Err(error),
             });
