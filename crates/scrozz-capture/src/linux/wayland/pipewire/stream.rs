@@ -621,8 +621,14 @@ impl Drop for Session<'_> {
         unsafe {
             if !self.stream.is_null() {
                 (self.symbols.pw_thread_loop_lock)(self.thread_loop);
-                (self.symbols.pw_stream_disconnect)(self.stream);
+                let disconnected = (self.symbols.pw_stream_disconnect)(self.stream);
                 (self.symbols.pw_thread_loop_unlock)(self.thread_loop);
+                if disconnected < 0 {
+                    tracing::warn!(
+                        error = %errno_text(disconnected),
+                        "PipeWire stream disconnect failed during teardown"
+                    );
+                }
             }
             // Stop the loop before destroying anything it might be servicing;
             // this joins the loop thread, so no callback can be in flight after
@@ -634,7 +640,13 @@ impl Drop for Session<'_> {
                 (self.symbols.pw_stream_destroy)(self.stream);
             }
             if !self.core.is_null() {
-                (self.symbols.pw_core_disconnect)(self.core);
+                let disconnected = (self.symbols.pw_core_disconnect)(self.core);
+                if disconnected < 0 {
+                    tracing::warn!(
+                        error = %errno_text(disconnected),
+                        "PipeWire core disconnect failed during teardown"
+                    );
+                }
             }
             if !self.context.is_null() {
                 (self.symbols.pw_context_destroy)(self.context);
