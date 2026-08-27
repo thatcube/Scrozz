@@ -39,9 +39,10 @@ if ($Artifact -and -not (Test-Path -LiteralPath $Artifact -PathType Leaf)) {
     throw "Artifact is not a file: $Artifact"
 }
 
-$repoRoot = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null)
+$invocationDirectory = (Get-Location).ProviderPath
+$repoRoot = (& git -C $invocationDirectory rev-parse --show-toplevel 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not $repoRoot) {
-    throw 'native-evidence.ps1 must run from a Git worktree'
+    throw 'native-evidence.ps1 must be invoked from inside the source Git worktree'
 }
 $repoRoot = [IO.Path]::GetFullPath($repoRoot.Trim())
 $Output = [IO.Path]::GetFullPath($Output)
@@ -124,6 +125,7 @@ $manifest = [ordered]@{
     classification = 'unreviewed'
     label = $Label
     captured_utc = [DateTime]::UtcNow.ToString('o')
+    source_root = $repoRoot
     source_sha = $SourceSha.Trim()
     source_dirty = $sourceStatus.Count -gt 0
     host = [ordered]@{

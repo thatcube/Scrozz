@@ -22,6 +22,7 @@ Use the evidence wrappers to retain a command before interpreting it:
 
 ```bash
 export SCROZZ_LAB_ROOT="$HOME/ScrozzPlatformLab"
+# Run from the source checkout whose command is being exercised.
 tools/native-evidence.sh \
   --output "$SCROZZ_LAB_ROOT/runs/gnome-wayland-capture" \
   --label gnome-wayland-capture \
@@ -31,6 +32,7 @@ tools/native-evidence.sh \
 
 ```powershell
 $LabRoot = Join-Path $HOME 'ScrozzPlatformLab'
+# Run from the source checkout whose command is being exercised.
 .\tools\native-evidence.ps1 `
   -Output (Join-Path $LabRoot 'runs\windows-capture') `
   -Label windows-capture `
@@ -42,7 +44,9 @@ Both wrappers create a new, private directory outside the repository, retain
 stdout and stderr separately, hash an optional artifact, and record only an
 allowlist of session variables. They deliberately write
 `classification=unreviewed`. They never promote exit zero to `pass`, and warn
-when a skip marker appears.
+when a skip marker appears. Source revision and dirty status come from the
+current source worktree, even when the wrapper itself is invoked by absolute
+path from another checkout.
 
 Do not put passwords, tokens or VM encryption keys in command arguments. Store
 guest credentials in the host keychain or another machine-local credential

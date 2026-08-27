@@ -15,6 +15,8 @@ Usage:
 Runs COMMAND once and preserves its stdout, stderr, exit status, selected desktop
 session variables, host identity, source revision and optional artifact digest.
 The output directory must be outside the repository and must not already exist.
+Invoke this script from inside the source worktree being exercised; source
+revision and status are recorded from that worktree, not the wrapper's location.
 
 This script never calls an exit-zero command a pass. run.properties always says
 classification=unreviewed, and skip_marker=present warns that the command may
@@ -27,7 +29,6 @@ die() {
   exit 2
 }
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 OUTPUT=""
 LABEL=""
 SOURCE_SHA=""
@@ -77,15 +78,20 @@ done
 [[ "$#" -gt 0 ]] || die "a command is required after --"
 [[ ! -e "$OUTPUT" ]] || die "output already exists: $OUTPUT"
 
+SOURCE_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+[[ -n "$SOURCE_ROOT" ]] ||
+  die "run this script from inside the source Git worktree"
+SOURCE_ROOT="$(cd "$SOURCE_ROOT" && pwd -P)"
+
 OUTPUT_PARENT="$(dirname "$OUTPUT")"
 mkdir -p "$OUTPUT_PARENT" || die "cannot create output parent: $OUTPUT_PARENT"
 OUTPUT="$(cd "$OUTPUT_PARENT" && pwd -P)/$(basename "$OUTPUT")"
 case "$OUTPUT/" in
-  "$ROOT/"*) die "--output must be outside the repository" ;;
+  "$SOURCE_ROOT/"*) die "--output must be outside the source repository" ;;
 esac
 
 if [[ -z "$SOURCE_SHA" ]]; then
-  SOURCE_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  SOURCE_SHA="$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null || true)"
   [[ -n "$SOURCE_SHA" ]] || SOURCE_SHA="unknown"
 fi
 
@@ -106,6 +112,7 @@ umask 077
 mkdir "$OUTPUT" || die "cannot create output directory: $OUTPUT"
 
 printf '%s\n' "$LABEL" >"$OUTPUT/label.txt"
+printf '%s\n' "$SOURCE_ROOT" >"$OUTPUT/source-root.txt"
 printf '%s\n' "$SOURCE_SHA" >"$OUTPUT/source-sha.txt"
 printf '%q ' "$@" >"$OUTPUT/command.sh"
 printf '\n' >>"$OUTPUT/command.sh"
@@ -128,7 +135,8 @@ env |
   grep -E '^(DBUS_SESSION_BUS_ADDRESS|DESKTOP_SESSION|DISPLAY|PROCESSOR_ARCHITECTURE|SESSIONNAME|WAYLAND_DISPLAY|XDG_CURRENT_DESKTOP|XDG_RUNTIME_DIR|XDG_SESSION_TYPE)=' |
   sort >"$OUTPUT/session-environment.txt" || true
 
-git -C "$ROOT" status --porcelain=v1 >"$OUTPUT/source-status.txt" 2>/dev/null || true
+git -C "$SOURCE_ROOT" status --porcelain=v1 \
+  >"$OUTPUT/source-status.txt" 2>/dev/null || true
 
 if [[ -n "$ARTIFACT" ]]; then
   printf '%s\n' "$ARTIFACT" >"$OUTPUT/artifact.path"
