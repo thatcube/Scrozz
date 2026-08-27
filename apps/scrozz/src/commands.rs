@@ -19,14 +19,23 @@
 
 use std::path::Path;
 
+use clap::Parser as _;
 use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
+use scrozz_shell::{
+    Notification, RegistrationStatus, autostart::AutostartTarget, url_scheme::SchemeTarget,
+};
+use scrozz_update::{
+    CheckOutcome, InstallPlan, Phase, PinnedKeyRing, UpdateState, Updater, VerifiedUpdate,
+};
+use semver::Version;
 
 use crate::{
     cli::{
-        CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand, HotkeyCommand,
-        InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
+        AutostartCommand, CaptureArgs, Cli, Command, Compositor, DisplaySelector, HistoryCommand,
+        HotkeyCommand, InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink,
+        SystemCommand, TargetSpec, UpdateCommand, UrlCommand,
     },
     fault::{CliError, CliResult},
     hotkey_config, ipc,
@@ -34,6 +43,9 @@ use crate::{
     platform,
     report::Report,
     settings,
+    settings_store::SettingsStore,
+    system_integration::SystemContext,
+    url::UrlAction,
 };
 
 /// Runs a command locally.
@@ -51,6 +63,10 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
         Command::Ocr(args) => ocr(args),
         Command::Settings(args) => settings_command(&args.command),
         Command::Hotkey(args) => hotkey(&args.command),
+        Command::Autostart(args) => autostart(args.command),
+        Command::Url(args) => url_command(&args.command),
+        Command::Update(args) => update(&args.command),
+        Command::System(args) => system(&args.command),
         Command::Gui => gui(),
     }
 }
@@ -476,28 +492,34 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 // ---------------------------------------------------------------------------
 
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
+    let store = SettingsStore::open_default()?;
     match command {
-        SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json())]),
-            settings::all_human(),
-        )),
+        SettingsCommand::Get { key: None } => {
+            let values = store.all()?;
+            let human = values
+                .iter()
+                .map(|value| format!("{}  {}", value.setting().key, value.value()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Report::new(
+                Json::obj([(
+                    "settings",
+                    Json::arr(values.iter().map(|value| value.to_json())),
+                )]),
+                human,
+            ))
+        }
 
         SettingsCommand::Get { key: Some(key) } => {
             let setting = settings::lookup(key)?;
-            Ok(Report::new(setting.to_json(), setting.default.to_string()))
+            let value = store.get(setting)?;
+            Ok(Report::new(value.to_json(), value.value()))
         }
 
         SettingsCommand::Set { key, value } => {
-            // Validate first and completely. A rejected value must be rejected
-            // for the right reason: "that is not a format" is useful, "settings
-            // are not implemented" is not, and the user needs to hear the first
-            // one even while the second is true.
             let setting = settings::lookup(key)?;
-            setting.validate(value)?;
-            Err(CliError::not_implemented(
-                format!("saving {key}"),
-                "scrozz-store (settings persistence)",
-            ))
+            let value = store.set(setting, value)?;
+            Ok(Report::new(value.to_json(), value.value()))
         }
     }
 }
@@ -518,6 +540,590 @@ fn hotkey(command: &HotkeyCommand) -> CliResult<Report> {
     let config = hotkey_config::generate(compositor, exec, *action, accelerator.as_deref())?;
 
     Ok(Report::new(config.to_json(), config.to_text()))
+}
+
+// ---------------------------------------------------------------------------
+// system integration
+// ---------------------------------------------------------------------------
+
+fn autostart(command: AutostartCommand) -> CliResult<Report> {
+    let context = SystemContext::current()?;
+    let plan = context.autostart()?;
+    match command {
+        AutostartCommand::Status => {
+            let status = plan.status()?;
+            Ok(registration_report(
+                "autostart",
+                status,
+                autostart_target(plan.target()),
+            ))
+        }
+        AutostartCommand::Enable => {
+            plan.apply()?;
+            let status = plan.status()?;
+            Ok(registration_report(
+                "autostart",
+                status,
+                autostart_target(plan.target()),
+            ))
+        }
+        AutostartCommand::Disable => {
+            plan.remove()?;
+            let status = plan.status()?;
+            Ok(registration_report(
+                "autostart",
+                status,
+                autostart_target(plan.target()),
+            ))
+        }
+    }
+}
+
+fn url_command(command: &UrlCommand) -> CliResult<Report> {
+    const TOGGLE: &str = "system.url-scheme-enabled";
+
+    let store = SettingsStore::open_default()?;
+    match command {
+        UrlCommand::Status => {
+            let context = SystemContext::current()?;
+            let plan = context.url_scheme()?;
+            let status = plan.status()?;
+            let enabled = store.boolean(TOGGLE)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("registered", Json::str(registration_slug(status))),
+                    ("enabled", Json::Bool(enabled)),
+                    ("target", Json::str(scheme_target(plan.target()))),
+                ]),
+                format!(
+                    "URL registration: {}\nURL automation: {}\nTarget: {}",
+                    registration_slug(status),
+                    if enabled { "enabled" } else { "disabled" },
+                    scheme_target(plan.target())
+                ),
+            ))
+        }
+        UrlCommand::Register => {
+            let context = SystemContext::current()?;
+            let plan = context.url_scheme()?;
+            plan.apply()?;
+            let status = plan.status()?;
+            let enabled = store.boolean(TOGGLE)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("registered", Json::str(registration_slug(status))),
+                    ("enabled", Json::Bool(enabled)),
+                    ("target", Json::str(scheme_target(plan.target()))),
+                ]),
+                format!(
+                    "Registered {}. URL automation remains {}.",
+                    scheme_target(plan.target()),
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            ))
+        }
+        UrlCommand::Unregister => {
+            set_url_enabled(&store, false)?;
+            let context = SystemContext::current()?;
+            let plan = context.url_scheme()?;
+            plan.remove()?;
+            Ok(Report::new(
+                Json::obj([
+                    ("registered", Json::str("disabled")),
+                    ("enabled", Json::Bool(false)),
+                    ("target", Json::str(scheme_target(plan.target()))),
+                ]),
+                "URL automation disabled and handler unregistered.",
+            ))
+        }
+        UrlCommand::Enable => {
+            let value = set_url_enabled(&store, true)?;
+            Ok(Report::new(
+                Json::obj([("enabled", Json::Bool(true)), ("setting", value.to_json())]),
+                "URL automation enabled for allow-listed actions.",
+            ))
+        }
+        UrlCommand::Disable => {
+            let value = set_url_enabled(&store, false)?;
+            Ok(Report::new(
+                Json::obj([("enabled", Json::Bool(false)), ("setting", value.to_json())]),
+                "URL automation disabled.",
+            ))
+        }
+        UrlCommand::Handle { url } => {
+            let action = enabled_url_action(&store, url)?;
+            dispatch_url_action(action)
+        }
+    }
+}
+
+pub(crate) fn enabled_url_action(store: &SettingsStore, url: &str) -> CliResult<UrlAction> {
+    if !store.boolean("system.url-scheme-enabled")? {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "URL automation is disabled; run `scrozz url enable` to grant consent".to_owned(),
+        )));
+    }
+    UrlAction::parse(url)
+}
+
+fn dispatch_url_action(action: UrlAction) -> CliResult<Report> {
+    let command = command_for_url_action(action)?;
+    match ipc::probe() {
+        ipc::Status::Running => {
+            let response = ipc::forward_url(action)?;
+            if response.code != 0 {
+                return Err(CliError::ipc(format!(
+                    "the running Scrozz rejected {} (exit {}): {}",
+                    action.slug(),
+                    response.code,
+                    String::from_utf8_lossy(&response.payload).trim()
+                )));
+            }
+            Ok(Report::new(
+                Json::obj([
+                    ("action", Json::str(action.slug())),
+                    ("forwarded", Json::Bool(true)),
+                ]),
+                format!("Forwarded {} to the running Scrozz.", action.slug()),
+            ))
+        }
+        ipc::Status::NotRunning if ipc::policy(&command) == ipc::Forwarding::Require => {
+            Err(CliError::ipc(format!(
+                "{} requires a running Scrozz instance",
+                action.slug()
+            )))
+        }
+        ipc::Status::NotRunning => dispatch(&command),
+        ipc::Status::Unusable(reason) => Err(CliError::ipc(format!(
+            "refusing URL action because the Scrozz IPC endpoint is unusable: {reason}"
+        ))),
+    }
+}
+
+pub(crate) fn command_for_url_action(action: UrlAction) -> CliResult<Command> {
+    let mut argv = Vec::with_capacity(action.arguments().len() + 1);
+    argv.push("scrozz");
+    argv.extend(action.arguments().iter().copied());
+    Cli::try_parse_from(argv)
+        .map_err(|error| {
+            CliError::Core(CoreError::Platform(format!(
+                "allow-listed URL action {} maps to an invalid command: {error}",
+                action.slug()
+            )))
+        })?
+        .command
+        .ok_or_else(|| {
+            CliError::Core(CoreError::Platform(format!(
+                "allow-listed URL action {} maps to no command",
+                action.slug()
+            )))
+        })
+}
+
+fn set_url_enabled(
+    store: &SettingsStore,
+    enabled: bool,
+) -> CliResult<crate::settings_store::ResolvedSetting> {
+    let setting = settings::lookup("system.url-scheme-enabled")?;
+    store.set(setting, if enabled { "true" } else { "false" })
+}
+
+fn update(command: &UpdateCommand) -> CliResult<Report> {
+    let context = SystemContext::current()?;
+    let keys = PinnedKeyRing::production();
+
+    if matches!(command, UpdateCommand::Check { .. }) && keys.is_empty() {
+        return Err(CliError::not_implemented(
+            "checking release manifests until a human-controlled public key is pinned",
+            "the release signing process",
+        ));
+    }
+
+    let mut updater = Updater::open(context.update_state.clone(), keys).map_err(update_error)?;
+    match command {
+        UpdateCommand::Status => Ok(update_state_report(
+            updater.state(),
+            &context.update_state,
+            PinnedKeyRing::production().len(),
+        )),
+        UpdateCommand::Check {
+            manifest_url,
+            signature_url,
+        } => {
+            let installed = Version::parse(scrozz_core::identity::VERSION).map_err(|error| {
+                CliError::Core(CoreError::Platform(format!(
+                    "this build has an invalid semantic version: {error}"
+                )))
+            })?;
+            let outcome = updater
+                .check(manifest_url.clone(), signature_url.clone(), &installed)
+                .map_err(update_error)?;
+            Ok(check_outcome_report(&outcome))
+        }
+        UpdateCommand::Download { output } => {
+            let candidate = if updater.state().phase() == Phase::Failed {
+                updater.retry_available_update().map_err(update_error)?
+            } else {
+                updater.available_update().ok_or_else(|| {
+                    CliError::usage(
+                        "no verified update is available; run `scrozz update check` first",
+                    )
+                })?
+            };
+            let download = updater
+                .download(&candidate, output.clone())
+                .map_err(update_error)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("phase", Json::str("downloaded")),
+                    (
+                        "path",
+                        Json::str(download.path().to_string_lossy().into_owned()),
+                    ),
+                    ("candidate", candidate_json(&candidate)),
+                ]),
+                format!("Verified update artifact at {}.", download.path().display()),
+            ))
+        }
+        UpdateCommand::Stage { output } => {
+            let download = updater.downloaded_artifact().map_err(update_error)?;
+            let staged = updater
+                .stage(&download, output.clone())
+                .map_err(update_error)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("phase", Json::str("staged")),
+                    (
+                        "path",
+                        Json::str(staged.path().to_string_lossy().into_owned()),
+                    ),
+                ]),
+                format!(
+                    "Staged verified artifact at {}. It has not been installed.",
+                    staged.path().display()
+                ),
+            ))
+        }
+        UpdateCommand::Install {
+            installed,
+            previous,
+            failed_candidate,
+        } => {
+            let staged = updater.staged_artifact().map_err(update_error)?;
+            let plan = InstallPlan::new(
+                installed.clone(),
+                previous.clone(),
+                failed_candidate.clone(),
+            )
+            .map_err(update_error)?;
+            updater.install(&staged, plan).map_err(update_error)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("phase", Json::str("installed")),
+                    (
+                        "installed",
+                        Json::str(installed.to_string_lossy().into_owned()),
+                    ),
+                    (
+                        "previous",
+                        Json::str(previous.to_string_lossy().into_owned()),
+                    ),
+                ]),
+                format!(
+                    "Installed verified artifact at {} and retained {}.",
+                    installed.display(),
+                    previous.display()
+                ),
+            ))
+        }
+        UpdateCommand::Recover => {
+            updater.recover().map_err(update_error)?;
+            Ok(update_state_report(
+                updater.state(),
+                &context.update_state,
+                PinnedKeyRing::production().len(),
+            ))
+        }
+        UpdateCommand::Rollback => {
+            updater.rollback().map_err(update_error)?;
+            Ok(update_state_report(
+                updater.state(),
+                &context.update_state,
+                PinnedKeyRing::production().len(),
+            ))
+        }
+        UpdateCommand::Reset => {
+            updater.reset_to_idle().map_err(update_error)?;
+            Ok(update_state_report(
+                updater.state(),
+                &context.update_state,
+                PinnedKeyRing::production().len(),
+            ))
+        }
+    }
+}
+
+fn system(command: &SystemCommand) -> CliResult<Report> {
+    match command {
+        SystemCommand::Status => {
+            let context = SystemContext::current()?;
+            let autostart = context.autostart()?;
+            let scheme = context.url_scheme()?;
+            let autostart_status = autostart.status()?;
+            let scheme_status = scheme.status()?;
+            let url_enabled =
+                SettingsStore::open_default()?.boolean("system.url-scheme-enabled")?;
+            let updater = Updater::open_with_production_keys(context.update_state.clone())
+                .map_err(update_error)?;
+            let trusted_update_keys = PinnedKeyRing::production().len();
+            Ok(Report::new(
+                Json::obj([
+                    ("product", Json::str(scrozz_core::identity::PRODUCT_NAME)),
+                    ("version", Json::str(scrozz_core::identity::VERSION)),
+                    ("bundle_id", Json::str(scrozz_core::identity::BUNDLE_ID)),
+                    ("url_scheme", Json::str(scrozz_core::identity::URL_SCHEME)),
+                    ("platform", Json::str(context.platform.slug())),
+                    (
+                        "platform_key",
+                        Json::str(scrozz_core::identity::platform_key()),
+                    ),
+                    ("autostart", Json::str(registration_slug(autostart_status))),
+                    (
+                        "url_registration",
+                        Json::str(registration_slug(scheme_status)),
+                    ),
+                    ("url_enabled", Json::Bool(url_enabled)),
+                    (
+                        "update_phase",
+                        Json::str(phase_slug(updater.state().phase())),
+                    ),
+                    ("trusted_update_keys", Json::Int(trusted_update_keys as i64)),
+                ]),
+                format!(
+                    "{} {} ({})\nAutostart: {}\nURL registration: {}\nURL automation: {}\nUpdate state: {}\nTrusted update keys: {}",
+                    scrozz_core::identity::PRODUCT_NAME,
+                    scrozz_core::identity::VERSION,
+                    scrozz_core::identity::platform_key(),
+                    registration_slug(autostart_status),
+                    registration_slug(scheme_status),
+                    if url_enabled { "enabled" } else { "disabled" },
+                    phase_slug(updater.state().phase()),
+                    trusted_update_keys_summary(trusted_update_keys),
+                ),
+            ))
+        }
+        SystemCommand::Notify { title, body } => {
+            let platform = scrozz_shell::SystemPlatform::current()?;
+            let notification = Notification::new(title.clone(), body.clone())?;
+            notification.plan(platform).apply()?;
+            Ok(Report::new(
+                Json::obj([
+                    ("shown", Json::Bool(true)),
+                    ("platform", Json::str(platform.slug())),
+                ]),
+                "Notification shown.",
+            ))
+        }
+    }
+}
+
+fn registration_report(kind: &str, status: RegistrationStatus, target: String) -> Report {
+    Report::new(
+        Json::obj([
+            ("kind", Json::str(kind)),
+            ("status", Json::str(registration_slug(status))),
+            ("target", Json::str(target.clone())),
+        ]),
+        format!(
+            "{}: {}\nTarget: {target}",
+            if kind == "autostart" {
+                "Autostart"
+            } else {
+                "Registration"
+            },
+            registration_slug(status)
+        ),
+    )
+}
+
+const fn registration_slug(status: RegistrationStatus) -> &'static str {
+    match status {
+        RegistrationStatus::Disabled => "disabled",
+        RegistrationStatus::Enabled => "enabled",
+        RegistrationStatus::Drifted => "drifted",
+    }
+}
+
+fn autostart_target(target: &AutostartTarget) -> String {
+    match target {
+        AutostartTarget::File(path) => path.to_string_lossy().into_owned(),
+        AutostartTarget::RegistryValue { key, name } => format!("{key}\\{name}"),
+    }
+}
+
+fn scheme_target(target: &SchemeTarget) -> String {
+    match target {
+        SchemeTarget::ApplicationBundle(path) | SchemeTarget::DesktopFile(path) => {
+            path.to_string_lossy().into_owned()
+        }
+        SchemeTarget::RegistryClass(key) => key.clone(),
+    }
+}
+
+fn update_state_report(state: &UpdateState, state_path: &Path, trusted_keys: usize) -> Report {
+    let candidate = state.candidate().map(|candidate| {
+        Json::obj([
+            ("version", Json::str(candidate.version().to_string())),
+            ("generation", Json::str(candidate.generated().to_string())),
+        ])
+    });
+    let artifact = state.artifact().map(|artifact| {
+        Json::obj([
+            ("platform", Json::str(artifact.platform())),
+            ("url", Json::str(artifact.url().as_str())),
+            ("sha256", Json::str(artifact.sha256().as_hex())),
+            ("size", Json::str(artifact.size().to_string())),
+        ])
+    });
+    let plan = state.install_plan().map(|plan| {
+        Json::obj([
+            (
+                "installed",
+                Json::str(plan.installed().to_string_lossy().into_owned()),
+            ),
+            (
+                "previous",
+                Json::str(plan.previous().to_string_lossy().into_owned()),
+            ),
+            (
+                "failed_candidate",
+                Json::str(plan.failed_candidate().to_string_lossy().into_owned()),
+            ),
+        ])
+    });
+    let human = format!(
+        "Update state: {}\nGeneration watermark: {}\nState file: {}\nTrusted update keys: {}{}",
+        phase_slug(state.phase()),
+        state.highest_accepted_generation(),
+        state_path.display(),
+        trusted_keys,
+        state
+            .failure()
+            .map_or_else(String::new, |failure| format!("\nFailure: {failure}"))
+    );
+    Report::new(
+        Json::obj([
+            ("phase", Json::str(phase_slug(state.phase()))),
+            (
+                "highest_accepted_generation",
+                Json::str(state.highest_accepted_generation().to_string()),
+            ),
+            ("candidate", Json::opt(candidate, |value| value)),
+            ("artifact", Json::opt(artifact, |value| value)),
+            (
+                "downloaded_path",
+                Json::opt(state.downloaded_path(), |path| {
+                    Json::str(path.to_string_lossy().into_owned())
+                }),
+            ),
+            (
+                "staged_path",
+                Json::opt(state.staged_path(), |path| {
+                    Json::str(path.to_string_lossy().into_owned())
+                }),
+            ),
+            ("install_plan", Json::opt(plan, |value| value)),
+            ("rollback_requested", Json::Bool(state.rollback_requested())),
+            (
+                "failure",
+                Json::opt(state.failure(), |failure| Json::str(failure.to_owned())),
+            ),
+            (
+                "state_file",
+                Json::str(state_path.to_string_lossy().into_owned()),
+            ),
+            ("trusted_keys", Json::Int(trusted_keys as i64)),
+        ]),
+        human,
+    )
+}
+
+fn check_outcome_report(outcome: &CheckOutcome) -> Report {
+    match outcome {
+        CheckOutcome::Current { version, generated } => Report::new(
+            Json::obj([
+                ("outcome", Json::str("current")),
+                ("version", Json::str(version.to_string())),
+                ("generation", Json::str(generated.to_string())),
+            ]),
+            format!("Scrozz {version} is current."),
+        ),
+        CheckOutcome::PlatformUnavailable {
+            version,
+            generated,
+            platform,
+        } => Report::new(
+            Json::obj([
+                ("outcome", Json::str("platform-unavailable")),
+                ("version", Json::str(version.to_string())),
+                ("generation", Json::str(generated.to_string())),
+                ("platform", Json::str(platform)),
+            ]),
+            format!("Scrozz {version} is signed, but no {platform} artifact is published."),
+        ),
+        CheckOutcome::UpdateAvailable(candidate) => Report::new(
+            Json::obj([
+                ("outcome", Json::str("update-available")),
+                ("candidate", candidate_json(candidate)),
+                ("installed", Json::Bool(false)),
+            ]),
+            format!(
+                "Scrozz {} is available. No artifact was downloaded or installed.",
+                candidate.version()
+            ),
+        ),
+    }
+}
+
+fn candidate_json(candidate: &VerifiedUpdate) -> Json {
+    let artifact = candidate.artifact().metadata();
+    Json::obj([
+        ("version", Json::str(candidate.version().to_string())),
+        ("generation", Json::str(candidate.generated().to_string())),
+        ("platform", Json::str(artifact.platform())),
+        ("url", Json::str(artifact.url().as_str())),
+        ("sha256", Json::str(artifact.sha256().as_hex())),
+        ("size", Json::str(artifact.size().to_string())),
+    ])
+}
+
+const fn phase_slug(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Idle => "idle",
+        Phase::Checking => "checking",
+        Phase::UpdateAvailable => "update-available",
+        Phase::Downloading => "downloading",
+        Phase::Downloaded => "downloaded",
+        Phase::Staged => "staged",
+        Phase::AwaitingRestart => "awaiting-restart",
+        Phase::Installed => "installed",
+        Phase::Failed => "failed",
+        Phase::RolledBack => "rolled-back",
+    }
+}
+
+fn trusted_update_keys_summary(count: usize) -> String {
+    if count == 0 {
+        "0 (release signing gated)".to_owned()
+    } else {
+        count.to_string()
+    }
+}
+
+fn update_error(error: scrozz_update::Error) -> CliError {
+    CliError::Core(CoreError::Platform(format!(
+        "signed update failed: {error}"
+    )))
 }
 
 /// Picks the compositor to target.
@@ -682,6 +1288,8 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use clap::Parser;
 
     use super::*;
@@ -695,6 +1303,21 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    fn with_empty_settings<T>(run_test: impl FnOnce() -> T) -> T {
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+
+        let _env = crate::test_env::lock();
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-command-settings-{}-{}",
+            std::process::id(),
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::test_env::set("SCROZZ_CONFIG_DIR", directory.to_string_lossy().as_ref());
+        let result = run_test();
+        let _ = std::fs::remove_dir_all(directory);
+        result
     }
 
     // -- dry-run capture ---------------------------------------------------
@@ -892,7 +1515,7 @@ mod tests {
 
     #[test]
     fn listing_settings_works_today() {
-        let rendered = json_of(&["scrozz", "settings", "get"]);
+        let rendered = with_empty_settings(|| json_of(&["scrozz", "settings", "get"]));
         assert!(rendered.contains(r#""key":"capture.format""#), "{rendered}");
         assert!(
             rendered.contains(r#""key":"hotkey.record-stop""#),
@@ -902,7 +1525,8 @@ mod tests {
 
     #[test]
     fn reading_one_setting_returns_just_that_one() {
-        let report = run(&["scrozz", "settings", "get", "capture.quality"]).unwrap();
+        let report =
+            with_empty_settings(|| run(&["scrozz", "settings", "get", "capture.quality"]).unwrap());
         assert_eq!(report.human, "90");
         assert!(
             report
@@ -914,25 +1538,104 @@ mod tests {
 
     #[test]
     fn an_unknown_setting_is_a_usage_error_with_a_suggestion() {
-        let err = run(&["scrozz", "settings", "get", "capture.forrmat"]).unwrap_err();
+        let err = with_empty_settings(|| {
+            run(&["scrozz", "settings", "get", "capture.forrmat"]).unwrap_err()
+        });
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("capture.format"), "{err}");
     }
 
     #[test]
-    fn a_bad_value_is_rejected_for_being_bad_not_for_being_unimplemented() {
-        // The distinction that matters: the user must learn about their mistake
-        // even though persistence is missing.
-        let err = run(&["scrozz", "settings", "set", "capture.format", "gif"]).unwrap_err();
+    fn a_bad_setting_value_is_rejected_without_persisting_it() {
+        let err = with_empty_settings(|| {
+            run(&["scrozz", "settings", "set", "capture.format", "gif"]).unwrap_err()
+        });
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("png"), "{err}");
     }
 
     #[test]
-    fn a_good_value_reports_the_missing_persistence() {
-        let err = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap_err();
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("capture.format"), "{err}");
+    fn a_good_setting_value_is_persisted_and_read_back() {
+        with_empty_settings(|| {
+            let written = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap();
+            assert_eq!(written.human, "webp");
+            let read = run(&["scrozz", "settings", "get", "capture.format"]).unwrap();
+            assert_eq!(read.human, "webp");
+            assert!(read.data.to_compact_string().contains(r#""source":"user""#));
+        });
+    }
+
+    // -- URL automation and updates ---------------------------------------
+
+    #[test]
+    fn url_actions_are_inert_until_the_master_toggle_is_enabled() {
+        with_empty_settings(|| {
+            let err = run(&["scrozz", "url", "handle", "scrozz://capture/region"]).unwrap_err();
+            assert_eq!(err.exit(), Exit::InvalidRequest);
+            assert!(err.to_string().contains("disabled"), "{err}");
+        });
+    }
+
+    #[test]
+    fn enabled_url_automation_still_rejects_parameters_before_dispatch() {
+        with_empty_settings(|| {
+            run(&["scrozz", "url", "enable"]).unwrap();
+            let err = run(&[
+                "scrozz",
+                "url",
+                "handle",
+                "scrozz://capture/region?output=/tmp/untrusted",
+            ])
+            .unwrap_err();
+            assert_eq!(err.exit(), Exit::Usage);
+            assert!(err.to_string().contains("not an allowed"), "{err}");
+        });
+    }
+
+    #[test]
+    fn every_url_action_maps_to_capture_or_record_only() {
+        for action in [
+            UrlAction::CaptureRegion,
+            UrlAction::CaptureWindow,
+            UrlAction::CaptureDisplay,
+            UrlAction::CaptureAllDisplays,
+            UrlAction::RecordRegion,
+            UrlAction::RecordStop,
+        ] {
+            let command = command_for_url_action(action).unwrap();
+            assert!(
+                matches!(command, Command::Capture(_) | Command::Record(_)),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_status_is_persisted_but_has_no_release_key_yet() {
+        with_empty_settings(|| {
+            let report = run(&["scrozz", "update", "status"]).unwrap();
+            let rendered = report.data.to_compact_string();
+            assert!(rendered.contains(r#""phase":"idle""#), "{rendered}");
+            assert!(rendered.contains(r#""trusted_keys":0"#), "{rendered}");
+        });
+    }
+
+    #[test]
+    fn update_check_is_gated_before_any_network_request() {
+        with_empty_settings(|| {
+            let err = run(&[
+                "scrozz",
+                "update",
+                "check",
+                "--manifest-url",
+                "https://127.0.0.1/manifest.json",
+                "--signature-url",
+                "https://127.0.0.1/manifest.sig",
+            ])
+            .unwrap_err();
+            assert_eq!(err.exit(), Exit::NotImplemented);
+            assert!(err.to_string().contains("public key"), "{err}");
+        });
     }
 
     // -- hotkey ------------------------------------------------------------
@@ -1124,5 +1827,11 @@ mod tests {
         let command = cli.command.unwrap();
         assert_eq!(should_forward(&command, false), ipc::Forwarding::Require);
         assert_eq!(should_forward(&command, true), ipc::Forwarding::Never);
+    }
+
+    #[test]
+    fn trusted_key_status_only_reports_the_release_gate_while_empty() {
+        assert_eq!(trusted_update_keys_summary(0), "0 (release signing gated)");
+        assert_eq!(trusted_update_keys_summary(2), "2");
     }
 }

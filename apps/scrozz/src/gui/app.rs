@@ -380,6 +380,17 @@ impl App {
         Tick::Continue
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn handle_url(&mut self, url: &str) -> CliResult<()> {
+        let store = crate::settings_store::SettingsStore::open_default()?;
+        let action = crate::commands::enabled_url_action(&store, url)?;
+        let command = crate::commands::command_for_url_action(action)?;
+        crate::commands::dispatch(&command)?;
+        self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+        self.note(format!("handled {}", action.slug()));
+        Ok(())
+    }
+
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {

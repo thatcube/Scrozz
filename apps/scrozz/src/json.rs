@@ -1,12 +1,11 @@
 //! A small, dependency-free JSON writer.
 //!
-//! # Why this exists rather than `serde_json`
+//! # Why this exists alongside `serde_json`
 //!
-//! `serde_json` is not a declared dependency of this binary, and adding one is
-//! out of scope. That turns out to be a benefit rather than a workaround: per
-//! decision D11 the `--json` output is a **scripting contract**, so the schema
-//! deserves to be a literal, greppable thing rather than whatever a derive macro
-//! happened to emit from a struct that someone later reorders.
+//! Settings persistence uses `serde_json`, but command output stays explicit.
+//! Per decision D11 the `--json` output is a **scripting contract**, so the
+//! schema deserves to be a literal, greppable thing rather than whatever a
+//! derive macro happened to emit from a struct that someone later reorders.
 //!
 //! Two properties matter and both are enforced here:
 //!

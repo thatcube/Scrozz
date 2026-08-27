@@ -2,16 +2,9 @@
 //!
 //! # Why the schema lives here and not in the store
 //!
-//! Nothing persists settings yet. That could mean `scrozz settings` waits for a
-//! store, but it should not: the *schema* is the interesting part and the part
-//! everything else depends on. A key's name, type and default are what the GUI
-//! renders, what `--json` reports, and what a user's dotfiles refer to. Getting
-//! them wrong is expensive to undo; getting them right costs nothing today.
-//!
-//! So `settings get` works now, reporting defaults and saying so, and
-//! `settings set` validates fully before reporting that persistence is missing.
-//! A typo in a key or a value is caught immediately rather than being written
-//! somewhere and silently ignored later.
+//! The schema is independent from persistence. [`crate::settings_store`] is a
+//! deliberately small file-backed overlay that can be replaced by the full
+//! settings/onboarding implementation without moving these public keys.
 //!
 //! # Naming
 //!
@@ -77,15 +70,18 @@ impl Setting {
     /// The JSON representation, including the current (always default) value.
     #[must_use]
     pub fn to_json(self) -> Json {
+        self.to_json_with(self.default, "default")
+    }
+
+    /// The JSON representation with a resolved value and its source.
+    #[must_use]
+    pub fn to_json_with(self, value: &str, source: &str) -> Json {
         let mut fields = vec![
             ("key", Json::str(self.key)),
             ("type", Json::str(self.kind.slug())),
-            ("value", Json::str(self.default)),
+            ("value", Json::str(value)),
             ("default", Json::str(self.default)),
-            // Honest about where the value came from. When persistence lands
-            // this becomes "user" for anything overridden, and a script that
-            // already reads it keeps working.
-            ("source", Json::str("default")),
+            ("source", Json::str(source)),
             ("description", Json::str(self.description)),
         ];
         if let Kind::Choice(options) = self.kind {
@@ -227,6 +223,12 @@ pub const SETTINGS: &[Setting] = &[
         },
         default: "10737418240",
         description: "Disk budget for stored source images. Pinned captures are never evicted.",
+    },
+    Setting {
+        key: "system.url-scheme-enabled",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Allow registered scrozz:// links to trigger fixed, allow-listed actions.",
     },
     Setting {
         key: "hotkey.capture-region",

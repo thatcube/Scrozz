@@ -51,8 +51,11 @@ mod output;
 mod platform;
 mod report;
 mod settings;
+mod settings_store;
+mod system_integration;
 #[cfg(test)]
 mod test_env;
+mod url;
 
 use std::{io::Write, process::ExitCode};
 

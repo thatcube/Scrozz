@@ -54,6 +54,7 @@ use crate::{
     cli::Command,
     fault::{CliError, CliResult},
     json::Json,
+    url::UrlAction,
 };
 
 /// The protocol version token that opens every response.
@@ -154,13 +155,21 @@ pub fn policy(command: &Command) -> Forwarding {
         Command::History(_) => Forwarding::Prefer,
         Command::Ocr(_) => Forwarding::Prefer,
         Command::Settings(args) if args.is_write() => Forwarding::Prefer,
+        Command::Url(args) if args.writes_settings() => Forwarding::Prefer,
+        // Opening updater state can recover an interrupted operation, including
+        // completing an already-requested install. Keep every updater-backed
+        // operation serialized inside the running instance.
+        Command::Update(_) | Command::System(_) => Forwarding::Prefer,
 
         // Pure reads and pure functions. `list` asks the compositor, not Scrozz;
         // `hotkey generate-config` is string formatting; `gui` is the thing that
         // would be forwarded to.
-        Command::Settings(_) | Command::List(_) | Command::Hotkey(_) | Command::Gui => {
-            Forwarding::Never
-        }
+        Command::Settings(_)
+        | Command::List(_)
+        | Command::Hotkey(_)
+        | Command::Autostart(_)
+        | Command::Url(_)
+        | Command::Gui => Forwarding::Never,
     }
 }
 
@@ -350,6 +359,22 @@ pub fn forward(argv: &[String]) -> CliResult<Response> {
     forward_to(&endpoint(), argv)
 }
 
+/// Hands one allow-listed URL action to a running instance.
+///
+/// Only the action's compile-time argument vector crosses IPC. The external URL
+/// itself can never become a command, argument, option, or path.
+pub fn forward_url(action: UrlAction) -> CliResult<Response> {
+    forward(&url_arguments(action))
+}
+
+fn url_arguments(action: UrlAction) -> Vec<String> {
+    action
+        .arguments()
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect()
+}
+
 #[cfg(unix)]
 fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
     use std::{
@@ -465,6 +490,45 @@ mod tests {
             policy(&command_of(&["scrozz", "settings", "get"])),
             Forwarding::Never
         );
+    }
+
+    #[test]
+    fn url_consent_writes_forward_but_external_actions_do_not() {
+        assert_eq!(
+            policy(&command_of(&["scrozz", "url", "enable"])),
+            Forwarding::Prefer
+        );
+        assert_eq!(
+            policy(&command_of(&[
+                "scrozz",
+                "url",
+                "handle",
+                "scrozz://capture/region"
+            ])),
+            Forwarding::Never
+        );
+    }
+
+    #[test]
+    fn url_ipc_uses_only_the_actions_fixed_argument_vector() {
+        assert_eq!(
+            url_arguments(UrlAction::CaptureRegion),
+            argv(&["capture", "--interactive", "region"])
+        );
+        assert_eq!(
+            url_arguments(UrlAction::RecordStop),
+            argv(&["record", "--stop"])
+        );
+    }
+
+    #[test]
+    fn updater_backed_status_is_serialized_in_the_running_instance() {
+        for args in [
+            vec!["scrozz", "update", "status"],
+            vec!["scrozz", "system", "status"],
+        ] {
+            assert_eq!(policy(&command_of(&args)), Forwarding::Prefer, "{args:?}");
+        }
     }
 
     #[test]

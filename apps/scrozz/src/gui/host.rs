@@ -218,6 +218,8 @@ impl Host for Windowed {
                     emit: Some(emit),
                     announced: false,
                     stopped: false,
+                    #[cfg(target_os = "macos")]
+                    url_events: scrozz_shell::macos::url_event::UrlEventHandler::install()?,
                 }))
             }),
         )
@@ -263,6 +265,8 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
+    #[cfg(target_os = "macos")]
+    url_events: scrozz_shell::macos::url_event::UrlEventHandler,
 }
 
 impl Driver {
@@ -343,6 +347,18 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+
+        #[cfg(target_os = "macos")]
+        match self.url_events.drain() {
+            Ok(urls) => {
+                for url in urls {
+                    if let Err(error) = self.app.handle_url(&url) {
+                        tracing::warn!(%error, "an incoming URL was refused");
+                    }
+                }
+            }
+            Err(error) => tracing::error!(%error, "incoming URLs cannot be read"),
+        }
 
         if !self.stopped && self.app.tick() == Tick::Stop {
             self.stopped = true;
