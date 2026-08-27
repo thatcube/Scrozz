@@ -687,12 +687,22 @@ impl ClientOverlayController {
                 result,
                 viewports,
             } => {
-                native.apply(&scrozz_shell::OverlayBehavior::capture_card());
-                viewports.hide(ctx);
-                ControllerPhase::HideAfterDecision {
-                    id,
-                    decision,
-                    result,
+                if !selector_input_is_quiescent(ctx) {
+                    ctx.request_repaint();
+                    ControllerPhase::ReleaseBeforeHide {
+                        id,
+                        decision,
+                        result,
+                        viewports,
+                    }
+                } else {
+                    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                    viewports.hide(ctx);
+                    ControllerPhase::HideAfterDecision {
+                        id,
+                        decision,
+                        result,
+                    }
                 }
             }
             ControllerPhase::HideAfterDecision {
@@ -1077,6 +1087,18 @@ fn selector_viewports_for(
             geometry: display_geometry(root, launch_scale),
         },
         children,
+    })
+}
+
+fn selector_input_is_quiescent(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.keys_down.is_empty()
+            && !input.pointer.any_down()
+            && !input.modifiers.alt
+            && !input.modifiers.ctrl
+            && !input.modifiers.shift
+            && !input.modifiers.mac_cmd
+            && !input.modifiers.command
     })
 }
 
@@ -1492,6 +1514,13 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(320.0, 240.0),
                 )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
                 ..Default::default()
             },
             |ui| controller.ui(ui),
@@ -1509,8 +1538,42 @@ mod tests {
         controller.logic(&ctx, &native);
         assert_eq!(
             *behavior_log.borrow(),
+            vec![true],
+            "focus must remain owned until the committing key is released"
+        );
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::ReleaseBeforeHide { .. }
+        ));
+        assert!(
+            selected_rx.try_recv().is_err(),
+            "capture must not begin while a terminal key is still held"
+        );
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        controller.logic(&ctx, &native);
+        assert_eq!(
+            *behavior_log.borrow(),
             vec![true, false],
-            "native focus must be released before the selector is hidden"
+            "native focus may release after the committing key-up is consumed"
         );
         assert!(matches!(
             &controller.phase,
@@ -1572,6 +1635,47 @@ mod tests {
 
         selector.cancel();
         second_worker.join().expect("second selector worker");
+    }
+
+    #[test]
+    fn terminal_input_barrier_waits_for_escape_and_enter_release() {
+        for key in [egui::Key::Escape, egui::Key::Enter] {
+            let ctx = egui::Context::default();
+            let key_event = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![key_event(true)],
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            output.textures_delta.clear();
+            assert!(
+                !selector_input_is_quiescent(&ctx),
+                "{key:?} press must retain selector focus"
+            );
+
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![key_event(false)],
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            output.textures_delta.clear();
+            assert!(
+                selector_input_is_quiescent(&ctx),
+                "{key:?} release must unlock selector focus restoration"
+            );
+        }
     }
 
     #[test]

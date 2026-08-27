@@ -298,6 +298,10 @@ impl Host for Windowed {
     }
 }
 
+fn initialize_one_shot_context(ctx: &egui::Context) {
+    scrozz_ui::theme::install_fonts(ctx);
+}
+
 /// Runs one interactive selection in its own ordinary eframe window.
 ///
 /// The long-running app reuses its card window instead. This path deliberately
@@ -354,6 +358,7 @@ pub fn select_once(
         "Scrozz Selector",
         native_options,
         Box::new(move |cc| {
+            initialize_one_shot_context(&cc.egui_ctx);
             #[cfg(target_os = "linux")]
             {
                 match crate::gui::panel::attach_x11_focus(cc, &creation_native) {
@@ -623,6 +628,7 @@ pub fn headless_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrozz_core::{Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
 
     #[test]
     fn a_headless_run_ends_by_itself() {
@@ -695,5 +701,77 @@ mod tests {
     fn the_probe_gap_names_the_fix_rather_than_apologising() {
         assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
         assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    }
+
+    #[test]
+    fn one_shot_selector_binds_fonts_before_keyboard_confirmation_paints() {
+        let ctx = egui::Context::default();
+        initialize_one_shot_context(&ctx);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 240.0));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(360.0, 240.0));
+        let display = Display {
+            id: DisplayId("main".to_owned()),
+            name: "Main".to_owned(),
+            bounds,
+            work_area: bounds,
+            scale: ScaleFactor::new(1.0),
+            is_primary: true,
+        };
+        let mut selector = scrozz_ui::SelectionUi::new(
+            SelectionOptions {
+                remembered: Some(LogicalRect::new(
+                    LogicalPoint::new(40.0, 50.0),
+                    LogicalSize::new(160.0, 100.0),
+                )),
+                ..SelectionOptions::region()
+            },
+            vec![display],
+            Vec::new(),
+        );
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        let mut decision = scrozz_ui::SelectionDecision::Pending;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(screen_rect),
+                events: vec![key(egui::Key::Tab, true), key(egui::Key::Tab, false)],
+                ..Default::default()
+            },
+            |ui| decision = selector.update(ui),
+        );
+        output.textures_delta.clear();
+        assert_eq!(decision, scrozz_ui::SelectionDecision::Pending);
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(screen_rect),
+                events: vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)],
+                ..Default::default()
+            },
+            |ui| decision = selector.update(ui),
+        );
+        output.textures_delta.clear();
+        assert!(matches!(
+            decision,
+            scrozz_ui::SelectionDecision::Selected(_)
+        ));
     }
 }
