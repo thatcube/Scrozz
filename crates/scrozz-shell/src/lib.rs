@@ -11,6 +11,11 @@
 
 pub mod drag;
 pub mod hotkey;
+// The Linux module is compiled everywhere, not just on Linux. Most of what it
+// contains is arithmetic — which backend applies, where the anchor lands, which
+// rectangles stay clickable — and that reasoning is worth testing on every CI
+// host rather than only on the one machine that can run it.
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod overlay;
@@ -26,6 +31,12 @@ pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,
 };
+#[cfg(target_os = "linux")]
+pub use linux::LinuxWindowHandle;
+pub use linux::capability::{
+    LayerShellProbe, OverlayBackend, OverlayPlan, Placement, layer_shell_expectation,
+};
+pub use linux::{overlay_plan, probe_layer_shell};
 pub use overlay::{
     AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,

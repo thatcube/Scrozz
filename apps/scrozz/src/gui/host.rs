@@ -425,6 +425,27 @@ fn work_area() -> OverlayGeometry {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        // `_NET_WORKAREA` is the X11 analogue of the macOS work area: the screen
+        // minus whatever panels and docks have reserved space via
+        // `_NET_WM_STRUT_PARTIAL`. Anchoring to the screen instead would put the
+        // capture card underneath a KDE or XFCE panel, where D28's
+        // bottom-anchored stack is invisible for exactly the reason the whole
+        // feature exists to avoid.
+        //
+        // On Wayland this returns `None` — there is no equivalent query, and the
+        // compositor positions the window anyway — so the default applies and
+        // nothing pretends to have measured a panel it cannot see.
+        if let Some(area) = scrozz_shell::linux::work_area() {
+            return OverlayGeometry::new(egui::Rect::from_min_size(
+                egui::pos2(area.origin.x as f32, area.origin.y as f32),
+                egui::vec2(area.size.width as f32, area.size.height as f32),
+            ));
+        }
+        tracing::debug!("no _NET_WORKAREA; using the default overlay geometry");
+    }
+
     OverlayGeometry::default()
 }
 

@@ -3313,7 +3313,10 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tray-icon",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "windows",
+ "x11rb 0.14.0",
 ]
 
 [[package]]

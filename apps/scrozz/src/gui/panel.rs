@@ -30,10 +30,50 @@
 use std::ffi::c_void;
 
 use raw_window_handle::HasWindowHandle;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use raw_window_handle::RawWindowHandle;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
 use scrozz_ui::PanelReport;
+
+/// Converts an already-created Linux overlay window into a capture card.
+///
+/// The X11 and Wayland halves of this are not symmetric, and pretending they
+/// were is the mistake this function exists to avoid.
+///
+/// On X11 the window is real, addressable and repositionable, so the handle is
+/// a window ID and the backend can do everything the card needs: stack it above
+/// normal windows, keep it out of the taskbar and the alt-tab cycle, anchor it
+/// to `_NET_WORKAREA`, and shape its input region so clicks outside the card
+/// fall through.
+///
+/// On Wayland the handle is deliberately opaque, because there is nothing legal
+/// to do with it. winit's surface already carries the `xdg_toplevel` role, and a
+/// `wl_surface` holds exactly one role for its lifetime — asking
+/// `zwlr_layer_shell_v1` to promote it raises a protocol error, which on Wayland
+/// is fatal and kills the whole client connection. So the backend refuses, and
+/// the refusal says which of the two very different reasons applies: the
+/// compositor supports layer-shell and Scrozz cannot yet reach it, or the
+/// compositor refuses layer-shell outright.
+#[cfg(target_os = "linux")]
+#[must_use]
+fn convert_linux_window(handle: scrozz_shell::LinuxWindowHandle) -> PanelReport {
+    let session = scrozz_shell::Session::detect();
+
+    let mut overlay = match NativeOverlay::adopt(handle, &session) {
+        Ok(overlay) => overlay,
+        Err(err) => return PanelReport::unsupported(err.to_string()),
+    };
+
+    match overlay.apply(&OverlayBehavior::capture_card()) {
+        // Same rule as macOS: `non_activating` is the one part of the behaviour
+        // D27 depends on. On X11 an override-redirect or tool window satisfies
+        // it; under the GNOME fallback nothing does, and the report says so
+        // rather than claiming a success the window will not deliver.
+        Ok(report) if report.non_activating => PanelReport::converted(report.detail),
+        Ok(report) => PanelReport::unsupported(report.detail),
+        Err(err) => PanelReport::unsupported(err.to_string()),
+    }
+}
 
 /// Converts the window hosting `ns_view` into a non-activating overlay panel.
 ///
@@ -64,22 +104,34 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
     // on the main thread.
     let adopted = unsafe { NativeOverlay::from_ns_view(ns_view) };
 
-    #[cfg(not(target_os = "macos"))]
+    // Linux has a real backend, but it is not reachable through an NSView
+    // pointer — there is no such thing here. Rather than inventing a conversion,
+    // this says so; [`hook`] never routes Linux through this function.
+    #[cfg(target_os = "linux")]
+    return PanelReport::unsupported(
+        "an NSView pointer has no meaning on Linux; the X11 and Wayland backends \
+         are reached through the window handle instead",
+    );
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     // SAFETY: as above; the stub backends do not dereference the handle.
     let adopted = unsafe { NativeOverlay::adopt(ns_view) };
 
-    let mut overlay = match adopted {
-        Ok(overlay) => overlay,
-        Err(err) => return PanelReport::unsupported(err.to_string()),
-    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut overlay = match adopted {
+            Ok(overlay) => overlay,
+            Err(err) => return PanelReport::unsupported(err.to_string()),
+        };
 
-    match overlay.apply(&OverlayBehavior::capture_card()) {
-        // `non_activating` is the only part of the behaviour D27 depends on.
-        // Everything else — level, collection behaviour — can be applied and
-        // the card still behaves; this cannot.
-        Ok(report) if report.non_activating => PanelReport::converted(report.detail),
-        Ok(report) => PanelReport::unsupported(report.detail),
-        Err(err) => PanelReport::unsupported(err.to_string()),
+        match overlay.apply(&OverlayBehavior::capture_card()) {
+            // `non_activating` is the only part of the behaviour D27 depends on.
+            // Everything else — level, collection behaviour — can be applied and
+            // the card still behaves; this cannot.
+            Ok(report) if report.non_activating => PanelReport::converted(report.detail),
+            Ok(report) => PanelReport::unsupported(report.detail),
+            Err(err) => PanelReport::unsupported(err.to_string()),
+        }
     }
 }
 
@@ -118,14 +170,47 @@ pub fn hook() -> scrozz_ui::PanelHook {
         #[cfg(target_os = "macos")]
         return unsafe { convert_ns_view(appkit.ns_view.as_ptr()) };
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = handle;
             PanelReport::unsupported(
-                "only the macOS overlay backend is implemented so far, so the \
-                 window keeps its native activation behaviour",
+                "only the macOS and Linux overlay backends are implemented so far, so \
+                 the window keeps its native activation behaviour",
             )
         }
+
+        // Both X11 handle flavours carry the same thing — a server-side window
+        // ID — and which one winit reports depends on how it was built, not on
+        // anything Scrozz chose. Accepting both is not defensive coding; it is
+        // the difference between working and not on an ordinary X11 session.
+        #[cfg(target_os = "linux")]
+        return match handle.as_raw() {
+            RawWindowHandle::Xlib(xlib) => match u32::try_from(xlib.window) {
+                // An X11 window ID is 32 bits on the wire; Xlib widens it to
+                // `c_ulong` purely for historical reasons. A value that does not
+                // fit therefore is not a window, and passing a truncated ID to
+                // the server would configure some *other* window — so this
+                // refuses rather than guessing.
+                Ok(window) => convert_linux_window(scrozz_shell::LinuxWindowHandle::X11 { window }),
+                Err(_) => PanelReport::unsupported(format!(
+                    "the X11 window ID {} does not fit in 32 bits, so it cannot be a \
+                     valid window",
+                    xlib.window
+                )),
+            },
+            RawWindowHandle::Xcb(xcb) => {
+                convert_linux_window(scrozz_shell::LinuxWindowHandle::X11 {
+                    window: xcb.window.get(),
+                })
+            }
+            RawWindowHandle::Wayland(_) => {
+                convert_linux_window(scrozz_shell::LinuxWindowHandle::Wayland)
+            }
+            other => PanelReport::unsupported(format!(
+                "the overlay window is neither X11 nor Wayland ({other:?}), so Scrozz \
+                 has no way to configure it"
+            )),
+        };
     })
 }
 

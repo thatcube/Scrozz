@@ -240,7 +240,57 @@ pub fn readiness() -> Vec<(&'static str, bool)> {
         ("ocr", ocr_available()),
         ("decode", true),
         ("gui", crate::gui::available()),
+        ("overlay", overlay_is_ready()),
     ]
+}
+
+/// Whether the overlay window is genuinely under Scrozz's control here.
+///
+/// "Genuinely" is doing real work in that sentence. On GNOME/Wayland Scrozz
+/// still *shows* the capture stack — an ordinary compositor-placed toplevel is
+/// far better than nothing — but it does not choose where the window lands, so
+/// the D28 bottom-left anchor is a request the compositor is free to ignore.
+/// Reporting that as ready would make the diagnostics lie in precisely the case
+/// a user is most likely to be reading them.
+#[must_use]
+pub fn overlay_is_ready() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        scrozz_shell::overlay_plan(&scrozz_shell::Session::detect()).is_fully_controlled()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// A sentence naming the overlay mechanism in use, for `--json` diagnostics.
+///
+/// This is the half of capability detection that [`readiness`] cannot carry. A
+/// bool can say "not fully controlled"; only a sentence can distinguish "your
+/// compositor supports layer-shell but Scrozz cannot yet reach it" from "your
+/// compositor refuses layer-shell outright, and there is nothing to wait for".
+/// Those call for completely different actions from the person reading them.
+#[must_use]
+pub fn overlay_detail() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "AppKit NSPanel: Scrozz positions the overlay and it never takes focus".to_string()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        scrozz_shell::overlay_plan(&scrozz_shell::Session::detect())
+            .detail
+            .to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "no overlay backend on this platform; the window keeps its native behaviour".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -430,7 +480,8 @@ mod tests {
                 "store",
                 "ocr",
                 "decode",
-                "gui"
+                "gui",
+                "overlay"
             ]
         );
     }

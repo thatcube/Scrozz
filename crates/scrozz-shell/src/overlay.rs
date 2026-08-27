@@ -62,10 +62,10 @@
 //! *behind the Dock*, which is the single most common way a bottom-anchored
 //! overlay goes wrong.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use std::ffi::c_void;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use scrozz_core::{Error, Result};
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 
@@ -416,17 +416,25 @@ pub struct OverlayReport {
 #[cfg(target_os = "macos")]
 pub use crate::macos::overlay::MacOverlay as NativeOverlay;
 
+/// The Linux overlay: X11 retrofit, `wlr-layer-shell`, or an honest fallback.
+///
+/// Unlike the stub below this one is real, and unlike the macOS one it does not
+/// take a raw pointer — Linux window handles are IDs, not pointers. See
+/// [`crate::linux::LinuxOverlay`] for how it is adopted.
+#[cfg(target_os = "linux")]
+pub use crate::linux::LinuxOverlay as NativeOverlay;
+
 /// A native overlay window on a platform Scrozz does not yet retrofit.
 ///
 /// Present so that call sites compile everywhere; every method reports
 /// [`Error::Unsupported`] rather than silently doing nothing.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[derive(Debug)]
 pub struct NativeOverlay {
     _private: (),
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl NativeOverlay {
     /// Adopts a native window handle.
     ///
@@ -453,7 +461,7 @@ impl NativeOverlay {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl crate::OverlayWindow for NativeOverlay {
     fn set_frame(&mut self, frame: LogicalRect) -> Result<()> {
         let _ = frame;
@@ -467,7 +475,7 @@ impl crate::OverlayWindow for NativeOverlay {
 }
 
 /// The error every not-yet-implemented platform returns.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported() -> Error {
     Error::Unsupported {
         what: "native overlay window".into(),

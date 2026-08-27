@@ -101,6 +101,18 @@ use crate::{cli::Cli, fault::CliResult, report::Report};
 pub fn run(cli: &Cli) -> CliResult<Report> {
     crate::platform::become_accessory_app()?;
 
+    // Said before the window is opened, not after. On a compositor that refuses
+    // to position client windows the overlay may land somewhere surprising, and
+    // a line explaining why beats a user concluding the app is broken. It is
+    // also the only capability line that survives when the window never appears
+    // at all.
+    let overlay = crate::platform::overlay_detail();
+    if crate::platform::overlay_is_ready() {
+        tracing::info!(detail = %overlay, "overlay placement");
+    } else {
+        tracing::warn!(detail = %overlay, "overlay placement is not under Scrozz's control");
+    }
+
     let config = Config::from_cli(cli);
 
     // Handed to the host because a windowed run cannot always return to `main`

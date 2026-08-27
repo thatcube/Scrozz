@@ -1,0 +1,51 @@
+# A compiler for the Linux overlay code, on a machine that is not Linux.
+#
+# `cargo check -p scrozz-shell --target x86_64-unknown-linux-gnu` cannot run
+# from macOS: scrozz-shell depends on tray-icon, which depends on
+# libappindicator, which depends on GTK 3, whose `*-sys` build scripts shell out
+# to pkg-config and refuse to cross-compile without a Linux sysroot. That is a
+# real limitation and it has nothing to do with the overlay code — but it means
+# the x11rb and Wayland calls in `crates/scrozz-shell/src/linux/` would
+# otherwise reach a compiler only on CI, or on a Linux machine.
+#
+# This crate exists so they reach one here. It `#[path]`-includes the *real*
+# sources — no copies, nothing to drift — with only the dependencies they
+# actually need. It builds nothing, ships nothing, and is excluded from the
+# workspace so it never affects a normal build.
+#
+#     cargo check --manifest-path tools/linux-typecheck/Cargo.toml \
+#         --target x86_64-unknown-linux-gnu
+#
+# `tools/check-all-platforms.sh` runs exactly that.
+[package]
+name = "scrozz-linux-typecheck"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+scrozz-core = { path = "../../crates/scrozz-core" }
+thiserror = "2"
+tracing = "0.1"
+global-hotkey = "0.8"
+x11rb = { version = "0.14", features = [
+    "randr",
+    "shm",
+    "libc",
+    "xfixes",
+    "shape",
+    "allow-unsafe-code",
+] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[lints.rust]
+# The real crate warns on missing docs; this one only needs to type-check, and
+# the modules it includes are documented in their own crate anyway.
+missing_docs = "allow"
+unused_imports = "warn"

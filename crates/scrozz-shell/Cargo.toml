@@ -30,6 +30,9 @@ windows = { workspace = true, features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd.workspace = true
+x11rb.workspace = true
+wayland-client.workspace = true
+wayland-protocols-wlr.workspace = true
 
 [lints]
 workspace = true
