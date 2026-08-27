@@ -16,6 +16,9 @@
 # Usage:
 #   tools/wayland-smoke.sh              run it, or exit 77 with a reason
 #   tools/wayland-smoke.sh --require    turn every skip into a failure
+#   tools/wayland-smoke.sh --require --stale-token
+#                                        exercise invalidation and one retry;
+#                                        requires an isolated XDG_STATE_HOME
 #
 # CI, on a native Ubuntu runner with a Wayland session:
 #   tools/ci-linux-deps.sh
@@ -28,15 +31,21 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 
 EXIT_SKIP=77
 REQUIRE=0
-if [[ "${1:-}" == "--require" ]]; then
-  REQUIRE=1
-elif [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
-  exit 0
-elif [[ "$#" -gt 0 ]]; then
-  echo "wayland-smoke: unknown argument '$1'. Try --help." >&2
-  exit 2
-fi
+STALE_TOKEN=0
+for argument in "$@"; do
+  case "$argument" in
+    --require) REQUIRE=1 ;;
+    --stale-token) STALE_TOKEN=1 ;;
+    -h|--help)
+      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "wayland-smoke: unknown argument '$argument'. Try --help." >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Emits a skip, or a failure when --require was passed. Every skip path goes
 # through here so the two behaviours cannot drift apart.
@@ -104,6 +113,26 @@ echo "  compositor:  ${XDG_CURRENT_DESKTOP:-<unset>} / ${XDG_SESSION_TYPE:-<unse
 echo "  display:     ${WAYLAND_DISPLAY}"
 echo
 
+if [[ "$STALE_TOKEN" == "1" ]]; then
+  if [[ -z "${XDG_STATE_HOME:-}" || "${XDG_STATE_HOME}" != /* ]]; then
+    skip "--stale-token requires an absolute, isolated XDG_STATE_HOME so the
+  operator's real portal grants are never overwritten."
+  fi
+  token_dir="$XDG_STATE_HOME/scrozz"
+  if ! mkdir -p "$token_dir"; then
+    echo "wayland-smoke: could not create isolated token directory $token_dir" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' \
+    '# Intentionally invalid token for the Wayland stale-restore smoke path.' \
+    $'monitor\tscrozz-intentionally-stale-restore-token' \
+    >"$token_dir/portal-tokens"; then
+    echo "wayland-smoke: could not write the isolated stale token" >&2
+    exit 1
+  fi
+  echo "wayland-smoke: planted an intentionally stale monitor token in isolated state"
+fi
+
 # --- Run -------------------------------------------------------------------
 #
 # `--` separates cargo's arguments from the example's. The example repeats the
@@ -114,8 +143,31 @@ if [[ "$REQUIRE" == "1" ]]; then
   args+=("--require")
 fi
 
-cargo run --release --package scrozz-capture --example wayland-smoke -- ${args[@]+"${args[@]}"}
-status=$?
+trace_log=
+if [[ "$STALE_TOKEN" == "1" ]]; then
+  trace_log=$(mktemp "${TMPDIR:-/tmp}/scrozz-wayland-smoke.XXXXXX") || exit 1
+  trap 'rm -f "$trace_log"' EXIT
+  RUST_LOG="${RUST_LOG:-warn},scrozz_capture=debug" \
+    cargo run --release --package scrozz-capture --example wayland-smoke -- \
+      ${args[@]+"${args[@]}"} 2>&1 | tee "$trace_log"
+  status=${PIPESTATUS[0]}
+else
+  cargo run --release --package scrozz-capture --example wayland-smoke -- \
+    ${args[@]+"${args[@]}"}
+  status=$?
+fi
+
+if [[ "$STALE_TOKEN" == "1" && "$status" == "0" ]]; then
+  retry_count=$(grep -Fc \
+    'the stored portal restore token was not accepted; asking again without it' \
+    "$trace_log" || true)
+  if [[ "$retry_count" != "1" ]]; then
+    echo "wayland-smoke: stale-token run observed $retry_count classified retries; expected exactly 1." >&2
+    status=1
+  else
+    echo "wayland-smoke: stale restore token was rejected and retried exactly once"
+  fi
+fi
 
 case "$status" in
   0)

@@ -19,6 +19,10 @@
 //! - Display geometry is recovered from XWayland where it exists, because
 //!   XWayland mirrors the compositor's outputs into RandR. That is a real answer
 //!   on the overwhelming majority of desktops, and an honest refusal on the rest.
+//! - All-display capture is refused before the portal picker opens. ScreenCast
+//!   does not guarantee positions for every returned stream, so a correct virtual
+//!   desktop cannot be composed on every compositor and capturing only the first
+//!   display would misrepresent the result.
 //! - The permission prompt must be suppressed with a restore token or the tool
 //!   is unusable. [`restore`] handles that, and it is treated as a requirement
 //!   rather than a nicety.
@@ -43,7 +47,9 @@ pub mod region;
 pub mod restore;
 pub mod screencast;
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display, Error, Frame,
@@ -51,18 +57,57 @@ use scrozz_core::{
 };
 
 use self::portal::{PortalFailure, SessionPlan, StreamInfo};
-use self::restore::{TokenKey, TokenStore};
+use self::restore::TokenStore;
 use super::session::{self, Compositor, PortalCapabilities, SessionEnv, SessionKind};
+use crate::FrameSession;
+
+/// Process-wide restore-token state and negotiation gate.
+///
+/// Portal restore tokens can be single-use and rotated after every successful
+/// `Start`. Keeping the store behind the same lock that serialises negotiation
+/// prevents two independently constructed backends from presenting the same
+/// token or overwriting each other's rotation. The lock is released before the
+/// long-lived PipeWire stream is opened, so one scrolling session cannot block
+/// unrelated captures for its entire lifetime.
+#[derive(Debug, Default)]
+struct NegotiationState {
+    stores: HashMap<Option<PathBuf>, TokenStore>,
+}
+
+impl NegotiationState {
+    fn tokens(&mut self, path: &Option<PathBuf>) -> &mut TokenStore {
+        self.stores.entry(path.clone()).or_insert_with(|| {
+            path.as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map_or_else(TokenStore::new, |text| TokenStore::parse(&text))
+        })
+    }
+}
+
+static NEGOTIATION_STATE: OnceLock<Mutex<NegotiationState>> = OnceLock::new();
+
+fn negotiation_state() -> &'static Mutex<NegotiationState> {
+    NEGOTIATION_STATE.get_or_init(|| Mutex::new(NegotiationState::default()))
+}
+
+fn persist_tokens(path: Option<&Path>, store: &TokenStore) {
+    let Some(path) = path else {
+        return;
+    };
+    let write = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(path, store.serialise()));
+    if let Err(err) = write {
+        tracing::warn!(%err, path = %path.display(), "could not persist the portal restore token");
+    }
+}
 
 /// Still capture through `xdg-desktop-portal`.
 pub struct WaylandBackend {
     compositor: Compositor,
     capabilities: PortalCapabilities,
     kind: SessionKind,
-    /// Serialises captures so a single-use restore token is never presented by
-    /// two concurrent portal sessions.
-    capture_gate: Mutex<()>,
-    tokens: Mutex<TokenStore>,
     token_path: Option<std::path::PathBuf>,
     /// XWayland, used only to read output geometry — never to capture.
     ///
@@ -72,6 +117,54 @@ pub struct WaylandBackend {
     /// mirror the real output layout.
     geometry: Option<super::x11::X11Backend>,
     name: String,
+}
+
+/// A portal grant and PipeWire stream retained across viewport captures.
+///
+/// Field order is part of teardown: the PipeWire stream drops first, then the
+/// portal session closes.
+pub struct WaylandFrameSession {
+    pipewire: pipewire::FrameStream,
+    _negotiation: screencast::Negotiation,
+    stream: StreamInfo,
+    target: CaptureTarget,
+    fallback_scale: ScaleFactor,
+    compositor: String,
+    name: String,
+}
+
+impl std::fmt::Debug for WaylandFrameSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaylandFrameSession")
+            .field("stream", &self.stream)
+            .field("target", &self.target)
+            .field("compositor", &self.compositor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrameSession for WaylandFrameSession {
+    fn capture_frame(&mut self) -> Result<Frame> {
+        let mut frame = self.pipewire.capture_frame()?;
+        frame.scale = region::resolve_scale(
+            &self.stream,
+            (frame.width(), frame.height()),
+            self.fallback_scale,
+        );
+
+        if let CaptureTarget::Region(rect) = &self.target {
+            let crop = region::plan_crop(*rect, &self.stream, (frame.width(), frame.height()))
+                .map_err(|err| err.into_error(&self.compositor))?;
+            frame = region::crop(&frame, crop).map_err(|err| err.into_error(&self.compositor))?;
+        }
+
+        debug_assert!(frame.is_well_formed());
+        Ok(frame)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl std::fmt::Debug for WaylandBackend {
@@ -103,11 +196,6 @@ impl WaylandBackend {
             std::env::var("HOME").ok().as_deref(),
         );
 
-        let tokens = token_path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map_or_else(TokenStore::new, |text| TokenStore::parse(&text));
-
         // XWayland is present in essentially every GNOME and KDE session, but a
         // pure-Wayland sway session may genuinely lack it, and a failure here is
         // a missing capability rather than an error.
@@ -134,8 +222,6 @@ impl WaylandBackend {
             compositor,
             capabilities,
             kind,
-            capture_gate: Mutex::new(()),
-            tokens: Mutex::new(tokens),
             token_path,
             geometry,
             name,
@@ -152,46 +238,6 @@ impl WaylandBackend {
     #[must_use]
     pub const fn compositor(&self) -> &Compositor {
         &self.compositor
-    }
-
-    /// The restore token stored for a session kind, if any.
-    #[must_use]
-    pub fn stored_token(&self, key: TokenKey) -> Option<String> {
-        self.tokens
-            .lock()
-            .ok()?
-            .get(key)
-            .map(std::borrow::ToOwned::to_owned)
-    }
-
-    /// Records a token the portal issued and writes it out.
-    ///
-    /// Write failures are logged rather than propagated: losing persistence
-    /// costs a permission prompt next time, whereas failing the capture the user
-    /// just took loses their work.
-    pub fn remember_token(&self, key: TokenKey, token: &str) {
-        let Ok(mut store) = self.tokens.lock() else {
-            return;
-        };
-        store.set(key, token);
-
-        let Some(path) = &self.token_path else {
-            return;
-        };
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(path, store.serialise()));
-        if let Err(err) = write {
-            tracing::warn!(%err, path = %path.display(), "could not persist the portal restore token");
-        }
-    }
-
-    /// Forgets a token the portal rejected.
-    pub fn forget_token(&self, key: TokenKey) {
-        if let Ok(mut store) = self.tokens.lock() {
-            store.invalidate(key);
-        }
     }
 
     fn geometry_backend(&self) -> Result<&super::x11::X11Backend> {
@@ -218,11 +264,25 @@ impl WaylandBackend {
     /// Cancellation is never retried: the user said no, and asking again
     /// immediately is precisely the behaviour that makes a tool feel hostile.
     fn open_session(&self, plan: &SessionPlan) -> Result<screencast::Negotiation> {
+        tracing::debug!("waiting for the process-wide portal negotiation gate");
+        let mut state = negotiation_state().lock().map_err(|_| {
+            Error::Platform(
+                "the Wayland portal negotiation gate was poisoned by an earlier failed capture"
+                    .into(),
+            )
+        })?;
+        tracing::debug!("acquired the process-wide portal negotiation gate");
+        let tokens = state.tokens(&self.token_path);
         let stored = self
             .capabilities
             .restore_tokens
-            .then(|| self.stored_token(plan.restore_key))
+            .then(|| tokens.get(plan.restore_key).map(ToOwned::to_owned))
             .flatten();
+        tracing::debug!(
+            restore_key = plan.restore_key.as_str(),
+            stored_token = stored.is_some(),
+            "opening a desktop-portal ScreenCast session"
+        );
 
         let outcome = screencast::negotiate(plan, stored.as_deref());
 
@@ -234,8 +294,8 @@ impl WaylandBackend {
                     ?failure,
                     "the stored portal restore token was not accepted; asking again without it"
                 );
-                self.forget_token(plan.restore_key);
-                self.persist_tokens();
+                tokens.invalidate(plan.restore_key);
+                persist_tokens(self.token_path.as_deref(), tokens);
                 screencast::negotiate(plan, None)
                     .map_err(|err| err.into_error(&self.compositor.to_string()))?
             }
@@ -246,32 +306,30 @@ impl WaylandBackend {
         // entitled to rotate a token it accepted, and dropping the rotation is a
         // silent regression to a prompt on the capture after next.
         match &negotiation.restore_token {
-            Some(token) => self.remember_token(plan.restore_key, token),
+            Some(token) => {
+                tracing::debug!(
+                    restore_key = plan.restore_key.as_str(),
+                    replaced = stored.as_deref() != Some(token.as_str()),
+                    "the desktop portal issued a restore token"
+                );
+                tokens.set(plan.restore_key, token);
+                persist_tokens(self.token_path.as_deref(), tokens);
+            }
             // A successful restore consumes the old token. If the portal did
             // not issue a replacement, retaining the old value guarantees a
             // stale restore attempt on the next capture.
             None if stored.is_some() => {
-                self.forget_token(plan.restore_key);
-                self.persist_tokens();
+                tracing::debug!(
+                    restore_key = plan.restore_key.as_str(),
+                    "the desktop portal consumed the restore token without replacing it"
+                );
+                tokens.invalidate(plan.restore_key);
+                persist_tokens(self.token_path.as_deref(), tokens);
             }
             None => {}
         }
 
         Ok(negotiation)
-    }
-
-    /// Writes the token store out after an invalidation.
-    fn persist_tokens(&self) {
-        let (Ok(store), Some(path)) = (self.tokens.lock(), &self.token_path) else {
-            return;
-        };
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(path, store.serialise()));
-        if let Err(err) = write {
-            tracing::warn!(%err, path = %path.display(), "could not persist the portal restore token");
-        }
     }
 
     /// The scale to assume when the stream itself does not reveal one.
@@ -286,43 +344,53 @@ impl WaylandBackend {
             .map_or(ScaleFactor::IDENTITY, |display| display.scale)
     }
 
-    /// Reads one frame from the first stream the portal granted.
-    fn frame_from(&self, negotiation: &screencast::Negotiation) -> Result<(Frame, StreamInfo)> {
-        // The portal may grant several streams for an all-displays request. Only
-        // the first is read here: compositing them needs each stream's position,
-        // which the specification makes optional, and stitching frames on
-        // guessed geometry would produce a misaligned image rather than an
-        // honest refusal.
+    /// Opens one portal and PipeWire stream for repeated viewport captures.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported targets before opening the portal, then propagates
+    /// portal, token, remote, and PipeWire connection failures.
+    pub fn open_frame_session(&self, request: &CaptureRequest) -> Result<WaylandFrameSession> {
+        let plan = SessionPlan::for_target(&request.target, request.cursor == CursorMode::Visible)
+            .map_err(portal::PlanFailure::into_error)?;
+
+        if request.target.is_window() && self.kind == SessionKind::Wayland {
+            tracing::info!(
+                "window capture on Wayland is chosen in the portal's picker, not by window id; \
+                 the requested id is advisory only"
+            );
+        }
+
+        let negotiation = self.open_session(&plan)?;
         let stream = *negotiation
             .streams
             .first()
             .ok_or_else(|| PortalFailure::NoStreams.into_error(&self.compositor.to_string()))?;
 
-        if negotiation.streams.len() > 1 {
-            tracing::warn!(
-                granted = negotiation.streams.len(),
-                "the portal granted several streams; capturing the first, because compositing \
-                 them needs per-stream positions the portal does not guarantee"
-            );
+        if negotiation.streams.len() != 1 {
+            return Err(Error::Platform(format!(
+                "the desktop portal returned {} streams after Scrozz explicitly requested one",
+                negotiation.streams.len()
+            )));
         }
 
-        // `OwnedFd` is moved into PipeWire, which closes it on teardown, so the
-        // negotiation's fd is duplicated rather than consumed — the caller may
-        // still want to report on the session afterwards.
         let fd = negotiation.remote.try_clone().map_err(|err| {
             Error::Platform(format!(
                 "could not duplicate the PipeWire socket the portal returned: {err}"
             ))
         })?;
+        let fallback_scale = self.fallback_scale();
+        let pipewire = pipewire::FrameStream::connect(fd, stream.node_id, fallback_scale)?;
 
-        let mut frame = pipewire::acquire_frame(fd, stream.node_id, self.fallback_scale())?;
-        frame.scale = region::resolve_scale(
-            &stream,
-            (frame.width(), frame.height()),
-            self.fallback_scale(),
-        );
-
-        Ok((frame, stream))
+        Ok(WaylandFrameSession {
+            pipewire,
+            _negotiation: negotiation,
+            stream,
+            target: request.target.clone(),
+            fallback_scale,
+            compositor: self.compositor.to_string(),
+            name: self.name.clone(),
+        })
     }
 }
 
@@ -359,41 +427,8 @@ impl TargetEnumerator for WaylandBackend {
 
 impl CaptureBackend for WaylandBackend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
-        let _capture = self.capture_gate.lock().map_err(|_| {
-            Error::Platform(
-                "the Wayland capture gate was poisoned by an earlier failed capture".into(),
-            )
-        })?;
-        let plan = SessionPlan::for_target(&request.target, request.cursor == CursorMode::Visible);
-
-        if request.target.is_window() && self.kind == SessionKind::Wayland {
-            tracing::info!(
-                "window capture on Wayland is chosen in the portal's picker, not by window id; \
-                 the requested id is advisory only"
-            );
-        }
-
-        let negotiation = self.open_session(&plan)?;
-        let frame = self.frame_from(&negotiation);
-        if let Err(close_failure) = negotiation.close() {
-            tracing::warn!(
-                ?close_failure,
-                "could not close the desktop-portal ScreenCast session after capture"
-            );
-        }
-        let (frame, stream) = frame?;
-
-        let frame = match &request.target {
-            CaptureTarget::Region(rect) => {
-                let crop = region::plan_crop(*rect, &stream, (frame.width(), frame.height()))
-                    .map_err(|err| err.into_error(&self.compositor.to_string()))?;
-                region::crop(&frame, crop)
-                    .map_err(|err| err.into_error(&self.compositor.to_string()))?
-            }
-            _ => frame,
-        };
-
-        debug_assert!(frame.is_well_formed());
+        let mut session = self.open_frame_session(request)?;
+        let frame = session.capture_frame()?;
 
         Ok(Capture {
             frame,
@@ -404,7 +439,7 @@ impl CaptureBackend for WaylandBackend {
                 // that makes window pixels sacred everywhere else.
                 CaptureTarget::Window(_) => Provenance::Window,
                 CaptureTarget::Region(_) => Provenance::Region,
-                CaptureTarget::AllDisplays => Provenance::AllDisplays,
+                CaptureTarget::AllDisplays => unreachable!("the session plan rejects this target"),
             },
             target: request.target.clone(),
         })

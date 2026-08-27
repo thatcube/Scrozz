@@ -3357,6 +3357,7 @@ dependencies = [
  "scrozz-core",
  "thiserror 2.0.20",
  "tracing",
+ "tracing-subscriber",
  "windows",
  "x11rb 0.14.0",
 ]

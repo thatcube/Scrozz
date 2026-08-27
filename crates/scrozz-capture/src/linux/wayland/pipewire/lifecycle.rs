@@ -190,6 +190,26 @@ impl Lifecycle {
         }
     }
 
+    /// Resumes capture on a stream that has already reached `Streaming`.
+    ///
+    /// A new lifecycle is created for every requested frame, but stream history
+    /// must survive those instances: an `Unconnected` callback after the first
+    /// frame means the selected source disappeared, not that the portal handed
+    /// over a node that never existed.
+    #[must_use]
+    pub const fn resume(timeout_seconds: u32, format: Option<Negotiated>) -> Self {
+        Self {
+            phase: if format.is_some() {
+                Phase::Streaming
+            } else {
+                Phase::Connecting
+            },
+            format,
+            ever_streamed: true,
+            timeout_seconds,
+        }
+    }
+
     /// The current phase.
     #[must_use]
     pub const fn phase(&self) -> &Phase {

@@ -38,9 +38,10 @@ pub mod session;
 pub mod wayland;
 pub mod x11;
 
-use scrozz_core::{CaptureBackend, Error, Result};
+use scrozz_core::{CaptureBackend, CaptureRequest, Error, Result};
 
 use self::session::{SessionEnv, SessionKind};
+use crate::FrameSession;
 
 /// Chooses and constructs the backend for this session.
 ///
@@ -72,5 +73,25 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
                   runner. Set one of them, or run under Xvfb, to capture"
                 .into(),
         }),
+    }
+}
+
+/// Opens a repeated-frame source for the current Linux display server.
+///
+/// Wayland gets a native long-lived portal/PipeWire session. X11 uses the
+/// ordinary backend adapter because its direct capture has no permission session
+/// to preserve.
+pub fn frame_session(request: CaptureRequest) -> Result<Box<dyn FrameSession>> {
+    let env = SessionEnv::from_env();
+    let kind = session::detect_session(&env);
+
+    match kind {
+        SessionKind::Wayland | SessionKind::XWayland => {
+            let backend = wayland::WaylandBackend::new(&env)?;
+            Ok(Box::new(backend.open_frame_session(&request)?))
+        }
+        SessionKind::X11 | SessionKind::Headless => {
+            Ok(crate::backend_frame_session(backend()?, request))
+        }
     }
 }

@@ -1441,17 +1441,17 @@ window\t
 
 mod portal_negotiation {
     use super::wayland::portal::{
-        SessionPlan, StreamInfo, cursor_mode, path_from_uri, persist_mode, source_type,
+        PlanFailure, SessionPlan, StreamInfo, cursor_mode, path_from_uri, persist_mode, source_type,
     };
     use super::wayland::restore::TokenKey;
     use scrozz_core::{CaptureTarget, DisplayId, LogicalPoint, LogicalRect, LogicalSize, WindowId};
 
     #[test]
     fn a_display_capture_asks_for_a_monitor() {
-        let plan = SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false);
+        let plan =
+            SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false).unwrap();
         assert_eq!(plan.types, source_type::MONITOR);
         assert_eq!(plan.restore_key, TokenKey::Monitor);
-        assert!(!plan.multiple);
     }
 
     /// The portal has no concept of a sub-rectangle, and asking the user to
@@ -1462,33 +1462,42 @@ mod portal_negotiation {
             LogicalPoint::new(0.0, 0.0),
             LogicalSize::new(100.0, 100.0),
         ));
-        let plan = SessionPlan::for_target(&region, false);
+        let plan = SessionPlan::for_target(&region, false).unwrap();
         assert_eq!(plan.types, source_type::MONITOR);
         assert_eq!(plan.restore_key, TokenKey::Monitor);
     }
 
     #[test]
     fn a_window_capture_asks_for_a_window() {
-        let plan = SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false);
+        let plan =
+            SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false).unwrap();
         assert_eq!(plan.types, source_type::WINDOW);
         assert_eq!(plan.restore_key, TokenKey::Window);
     }
 
     #[test]
-    fn all_displays_offers_monitors_and_virtual_sources_and_allows_several() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, false);
-        assert_eq!(plan.types, source_type::MONITOR | source_type::VIRTUAL);
-        assert_eq!(plan.restore_key, TokenKey::AllDisplays);
-        assert!(plan.multiple);
+    fn all_displays_is_refused_before_portal_negotiation() {
+        assert_eq!(
+            SessionPlan::for_target(&CaptureTarget::AllDisplays, false),
+            Err(PlanFailure::AllDisplaysNeedsPositions)
+        );
+        let error = PlanFailure::AllDisplaysNeedsPositions.into_error();
+        let scrozz_core::Error::Unsupported { what, why } = error else {
+            panic!("all-display planning must return Unsupported");
+        };
+        assert!(what.contains("all displays"));
+        assert!(why.contains("before opening the portal picker"));
+        assert!(why.contains("Capture one display instead"));
     }
 
     /// A still capture cannot composite a pointer itself without getting the
     /// hotspot subtly wrong, so it asks the portal to embed one.
     #[test]
     fn the_pointer_is_requested_embedded_or_hidden() {
-        let with = SessionPlan::for_target(&CaptureTarget::AllDisplays, true);
+        let target = CaptureTarget::Display(DisplayId("1".into()));
+        let with = SessionPlan::for_target(&target, true).unwrap();
         assert_eq!(with.cursor, cursor_mode::EMBEDDED);
-        let without = SessionPlan::for_target(&CaptureTarget::AllDisplays, false);
+        let without = SessionPlan::for_target(&target, false).unwrap();
         assert_eq!(without.cursor, cursor_mode::HIDDEN);
     }
 
@@ -1497,7 +1506,8 @@ mod portal_negotiation {
     /// mechanism exists to prevent.
     #[test]
     fn persistence_outlives_the_process() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, false);
+        let plan =
+            SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false).unwrap();
         assert_eq!(plan.persist, persist_mode::EXPLICITLY_REVOKED);
         assert_ne!(plan.persist, persist_mode::APPLICATION);
     }
@@ -1506,7 +1516,8 @@ mod portal_negotiation {
     /// sources must be met with a narrowed request, not a rejected call.
     #[test]
     fn narrowing_drops_source_types_the_portal_lacks() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, false)
+        let plan = SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false)
+            .unwrap()
             .narrow(source_type::MONITOR, cursor_mode::HIDDEN)
             .expect("monitor survives");
         assert_eq!(plan.types, source_type::MONITOR);
@@ -1516,6 +1527,7 @@ mod portal_negotiation {
     fn narrowing_to_nothing_is_a_refusal() {
         assert_eq!(
             SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false)
+                .unwrap()
                 .narrow(source_type::MONITOR, cursor_mode::EMBEDDED),
             None,
             "a portal with no window source cannot serve a window capture"
@@ -1526,7 +1538,8 @@ mod portal_negotiation {
     /// losing the capture.
     #[test]
     fn an_unavailable_cursor_mode_degrades_to_hidden() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, true)
+        let plan = SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), true)
+            .unwrap()
             .narrow(source_type::MONITOR, cursor_mode::HIDDEN)
             .expect("monitor survives");
         assert_eq!(plan.cursor, cursor_mode::HIDDEN);
@@ -2421,6 +2434,23 @@ mod stream_lifecycle {
         );
 
         assert!(matches!(after.outcome(), Err(Error::TargetGone(_))));
+    }
+
+    #[test]
+    fn repeated_capture_retains_streaming_history_and_format() {
+        let mut resumed = Lifecycle::resume(10, Some(negotiated()));
+        assert_eq!(resumed.format(), Some(negotiated()));
+        assert_eq!(
+            resumed.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        let Phase::Failed(Failure::Gone(during)) = resumed.phase().clone() else {
+            panic!("a resumed stream disconnection is a failure");
+        };
+        assert!(
+            during.contains("disappeared"),
+            "a later lifecycle must remember that the stream previously ran: {during}"
+        );
     }
 
     /// Pixels whose layout is unknown are worse than no pixels: they would be

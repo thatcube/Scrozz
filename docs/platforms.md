@@ -127,6 +127,22 @@ interface hands back a *node id*, not pixels. The obvious way to consume that is
 the `pipewire` crate — and it is the wrong one here, for two reasons that are
 both about this document rather than about ergonomics:
 
+All-display capture is unavailable on Wayland for now. ScreenCast may return
+one stream per monitor, but stream positions are optional. Scrozz rejects the
+request before opening the portal picker rather than prompt and then compose
+guessed geometry—or quietly return only the first display. Single-display
+capture remains available.
+
+Still captures use the ordinary `CaptureBackend` API. Scrolling capture opens
+`scrozz_capture::frame_session` instead: its Wayland implementation retains one
+portal grant and one connected PipeWire stream across viewport frames, then
+tears the stream down before closing the portal session when dropped. Every
+`capture_frame` after the first discards pixels buffered before that call, so a
+scrolling stitch cannot consume the previous viewport. Restore-token negotiation
+is serialised process-wide, but the gate is released before the long-lived
+PipeWire stream opens; independent frame sessions therefore cannot reuse one
+single-use token or block each other for their full lifetime.
+
 1. **`pipewire-sys` needs `pkg-config` and `bindgen`.** Adding it would take
    `scrozz-capture` — one of the four crates that *must* stay cross-checkable —
    out of layer 1 entirely, in exchange for a Linux sysroot nobody has. The
@@ -175,6 +191,20 @@ non-blocking** step, run on a native Ubuntu runner:
 tools/ci-linux-deps.sh
 tools/wayland-smoke.sh
 ```
+
+For a destructive stale-token check, isolate the state first so no real desktop
+grant is overwritten:
+
+```bash
+XDG_STATE_HOME="$(mktemp -d)" \
+  RUST_LOG=scrozz_capture=debug \
+  tools/wayland-smoke.sh --require --stale-token
+```
+
+That mode fails unless the planted token is parsed, rejected by the portal, and
+retried exactly once. A successful run also retains one portal/PipeWire session
+for repeated frames and requires changed pixels after the second request; keep
+the invoking terminal visible on the monitor selected in the picker.
 
 `tools/wayland-smoke.sh` exits **77** — the automake "skipped" convention — with
 the specific missing piece on stderr when there is no `WAYLAND_DISPLAY`, no

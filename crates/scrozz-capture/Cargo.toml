@@ -48,5 +48,8 @@ ashpd.workspace = true
 libloading.workspace = true
 futures-lite.workspace = true
 
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

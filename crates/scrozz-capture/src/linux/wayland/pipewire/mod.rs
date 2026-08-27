@@ -61,6 +61,40 @@ use scrozz_core::{Error, Frame, PhysicalSize, Result, ScaleFactor};
 /// machine, and a too-eager timeout turns a slow capture into a failed one.
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A portal-provided PipeWire stream kept open across frame requests.
+#[derive(Debug)]
+pub struct FrameStream {
+    stream: stream::FrameStream,
+    scale: ScaleFactor,
+}
+
+impl FrameStream {
+    /// Connects once to a portal-provided PipeWire node.
+    ///
+    /// `fd` is consumed and closed when the stream is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if PipeWire is unavailable and
+    /// [`Error::Platform`] if its loop, context, remote, or stream cannot be
+    /// created.
+    pub fn connect(fd: OwnedFd, node_id: u32, scale: ScaleFactor) -> Result<Self> {
+        let library = sys::Library::open()?;
+        let stream = stream::FrameStream::connect(library, fd, node_id, FRAME_TIMEOUT)?;
+        Ok(Self { stream, scale })
+    }
+
+    /// Waits for the next usable frame without reconnecting the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TargetGone`] when the selected source disappears and
+    /// [`Error::Platform`] for stream, format, buffer, and timeout failures.
+    pub fn capture_frame(&mut self) -> Result<Frame> {
+        raw_to_frame(self.stream.capture_frame()?, self.scale)
+    }
+}
+
 /// Captures one frame from a portal-provided PipeWire node.
 ///
 /// `fd` is consumed — PipeWire closes it when the connection is torn down.
@@ -75,9 +109,10 @@ pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// the node disappears, and [`Error::Platform`] for compositor and stream
 /// failures — each with enough text for the user to know what to do next.
 pub fn acquire_frame(fd: OwnedFd, node_id: u32, scale: ScaleFactor) -> Result<Frame> {
-    let library = sys::Library::open()?;
-    let raw = stream::capture_one(library, fd, node_id, FRAME_TIMEOUT)?;
+    FrameStream::connect(fd, node_id, scale)?.capture_frame()
+}
 
+fn raw_to_frame(raw: stream::RawFrame, scale: ScaleFactor) -> Result<Frame> {
     let format = raw.format;
     let frame = Frame {
         data: raw.pixels,

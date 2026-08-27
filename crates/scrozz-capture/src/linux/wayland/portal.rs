@@ -27,7 +27,7 @@
 //! [`SessionPlan`] be tested on a machine with no portal, no D-Bus and no
 //! Linux.
 
-use scrozz_core::CaptureTarget;
+use scrozz_core::{CaptureTarget, Error};
 
 use super::restore::TokenKey;
 
@@ -72,12 +72,36 @@ pub struct SessionPlan {
     pub types: u32,
     /// The `CursorMode` to request.
     pub cursor: u32,
-    /// Whether the user may pick more than one source.
-    pub multiple: bool,
     /// The `PersistMode` to request.
     pub persist: u32,
     /// Which stored token, if any, to present for silent restore.
     pub restore_key: TokenKey,
+}
+
+/// A capture target the portal cannot serve without guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanFailure {
+    /// ScreenCast may return several streams but does not guarantee their
+    /// positions, so they cannot always be composed into one desktop.
+    AllDisplaysNeedsPositions,
+}
+
+impl PlanFailure {
+    /// Turns the planning refusal into the public platform error.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::AllDisplaysNeedsPositions => Error::Unsupported {
+                what: "capturing all displays on Wayland".into(),
+                why: "The ScreenCast portal may return one stream per monitor, but it does not \
+                      guarantee each stream's desktop position. Scrozz cannot compose a correct \
+                      virtual-desktop image without every position, so it refuses before opening \
+                      the portal picker instead of capturing only the first display. Capture one \
+                      display instead."
+                    .into(),
+            },
+        }
+    }
 }
 
 impl SessionPlan {
@@ -92,14 +116,19 @@ impl SessionPlan {
     /// - Persistence is always `EXPLICITLY_REVOKED`. `APPLICATION` sounds safer
     ///   but expires when the process does, so every launch costs a permission
     ///   dialog — which is the failure this whole mechanism exists to prevent.
-    #[must_use]
-    pub fn for_target(target: &CaptureTarget, want_cursor: bool) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Rejects all-display capture before any portal call. The portal makes
+    /// per-stream positions optional, so requesting several sources could prompt
+    /// the user and still leave no honest way to compose the result.
+    pub fn for_target(
+        target: &CaptureTarget,
+        want_cursor: bool,
+    ) -> std::result::Result<Self, PlanFailure> {
         let (types, restore_key) = match target {
             CaptureTarget::Window(_) => (source_type::WINDOW, TokenKey::Window),
-            CaptureTarget::AllDisplays => (
-                source_type::MONITOR | source_type::VIRTUAL,
-                TokenKey::AllDisplays,
-            ),
+            CaptureTarget::AllDisplays => return Err(PlanFailure::AllDisplaysNeedsPositions),
             // A region is cropped from a monitor capture after the fact.
             // The portal has no concept of a sub-rectangle, and asking the user
             // to pick a region in the portal's UI and then again in Scrozz's
@@ -109,17 +138,16 @@ impl SessionPlan {
             }
         };
 
-        Self {
+        Ok(Self {
             types,
             cursor: if want_cursor {
                 cursor_mode::EMBEDDED
             } else {
                 cursor_mode::HIDDEN
             },
-            multiple: matches!(target, CaptureTarget::AllDisplays),
             persist: persist_mode::EXPLICITLY_REVOKED,
             restore_key,
-        }
+        })
     }
 
     /// Narrows the plan to what the portal says it can actually do.

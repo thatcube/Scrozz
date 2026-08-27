@@ -70,7 +70,40 @@ pub struct RawFrame {
 struct Shared {
     events: Vec<Event>,
     negotiated: Option<Negotiated>,
-    pixels: Option<Vec<u8>>,
+    /// Latest state, retained after its queued callback event is drained.
+    state: Option<(StreamState, Option<String>)>,
+    /// Stream history must survive the lifecycle created for each frame.
+    ever_streamed: bool,
+    /// The newest complete frame not yet taken by the capture thread.
+    ///
+    /// Keeping its format beside its pixels makes renegotiation safe: a later
+    /// callback can replace both atomically rather than pair new pixels with an
+    /// earlier `FormatAgreed` event.
+    frame: Option<RawFrame>,
+}
+
+impl Shared {
+    fn invalidate_frame(&mut self) {
+        self.frame = None;
+        self.events
+            .retain(|event| !matches!(event, Event::FrameReady));
+    }
+
+    fn push(&mut self, event: Event) {
+        match &event {
+            Event::StateChanged(state, message) => {
+                self.state = Some((*state, message.clone()));
+                self.ever_streamed |= *state == StreamState::Streaming;
+            }
+            Event::FormatRejected(_) => {
+                self.negotiated = None;
+                self.invalidate_frame();
+            }
+            Event::BufferRejected(_) => self.invalidate_frame(),
+            Event::FormatAgreed(_) | Event::FrameReady | Event::EmptyBuffer | Event::TimedOut => {}
+        }
+        self.events.push(event);
+    }
 }
 
 /// The `user_data` every callback receives.
@@ -85,7 +118,7 @@ struct Listener {
 impl Listener {
     fn push(&self, event: Event) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.events.push(event);
+            shared.push(event);
         }
         // Wake the capturing thread. `false` means "do not wait for the other
         // side to acknowledge", which is right here: nothing the capturing
@@ -128,6 +161,7 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     if param.is_null() {
         if let Ok(mut shared) = listener.shared.lock() {
             shared.negotiated = None;
+            shared.invalidate_frame();
         }
         return;
     }
@@ -167,6 +201,14 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
             if let Ok(mut shared) = listener.shared.lock() {
                 shared.negotiated = Some(negotiated);
             }
+            tracing::debug!(
+                width = negotiated.width,
+                height = negotiated.height,
+                pixel_format = ?negotiated.pixel_format,
+                color_space = ?negotiated.color_space,
+                modifier = "none",
+                "PipeWire accepted the raw-video format offer"
+            );
             listener.push(Event::FormatAgreed(negotiated));
 
             // A modifier-less EnumFormat is only half of shared-memory
@@ -190,6 +232,11 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
                      requirement ({})",
                     errno_text(rc)
                 )));
+            } else {
+                tracing::debug!(
+                    data_types = "MemFd|MemPtr",
+                    "PipeWire accepted the shared-memory buffer parameters"
+                );
             }
         }
         Err(why) => listener.push(Event::FormatRejected(why.to_string())),
@@ -229,8 +276,8 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         return;
     }
 
-    let (negotiated, store_pixels) = match listener.shared.lock() {
-        Ok(shared) => (shared.negotiated, shared.pixels.is_none()),
+    let negotiated = match listener.shared.lock() {
+        Ok(shared) => shared.negotiated,
         Err(_) => return,
     };
 
@@ -238,8 +285,9 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     // deliver an empty priming buffer, and if several have piled up the newest
     // is the one the user actually asked for. Once a completed process callback
     // has published a frame, later callbacks must not overwrite it: a format
-    // renegotiation could otherwise pair the first FrameReady event with pixels
-    // copied under a later layout.
+    // renegotiation could otherwise pair pixels with the wrong layout. Pixels
+    // and format are stored together, so the newest valid frame may safely
+    // replace an earlier callback's frame until the capture thread takes it.
     let mut outcome: Option<Event> = None;
     loop {
         let buffer = unsafe { (symbols.pw_stream_dequeue_buffer)(stream) };
@@ -247,7 +295,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             break;
         }
 
-        let mut event = unsafe { read_buffer(buffer, negotiated.as_ref(), listener, store_pixels) };
+        let mut event = unsafe { read_buffer(buffer, negotiated.as_ref(), listener) };
         let queued = unsafe { (symbols.pw_stream_queue_buffer)(stream, buffer) };
         if queued < 0 {
             event = Event::BufferRejected(format!(
@@ -280,7 +328,6 @@ unsafe fn read_buffer(
     buffer: *mut sys::pw_buffer,
     negotiated: Option<&Negotiated>,
     listener: &Listener,
-    store_pixels: bool,
 ) -> Event {
     let Some(negotiated) = negotiated else {
         return Event::EmptyBuffer;
@@ -298,8 +345,9 @@ unsafe fn read_buffer(
 
     let plane = unsafe { &*(*spa).datas };
 
-    match plane.type_ {
-        format::data_type::MEM_PTR | format::data_type::MEM_FD => {}
+    let memory_type = match plane.type_ {
+        format::data_type::MEM_PTR => "MemPtr",
+        format::data_type::MEM_FD => "MemFd",
         format::data_type::DMA_BUF => {
             return Event::BufferRejected(
                 "the compositor delivered a DMA-BUF frame despite the negotiated shared-memory \
@@ -314,7 +362,7 @@ unsafe fn read_buffer(
                  MemPtr and MemFd"
             ));
         }
-    }
+    };
 
     if plane.chunk.is_null() {
         return Event::EmptyBuffer;
@@ -364,9 +412,18 @@ unsafe fn read_buffer(
     ) {
         Ok(pixels) => match listener.shared.lock() {
             Ok(mut shared) => {
-                if store_pixels {
-                    shared.pixels = Some(pixels);
-                }
+                tracing::debug!(
+                    memory_type,
+                    width = negotiated.width,
+                    height = negotiated.height,
+                    stride = chunk.stride,
+                    bytes = pixels.len(),
+                    "received a mapped shared-memory PipeWire frame"
+                );
+                shared.frame = Some(RawFrame {
+                    pixels,
+                    format: *negotiated,
+                });
                 Event::FrameReady
             }
             Err(_) => Event::BufferRejected(
@@ -409,6 +466,7 @@ struct Session<'lib> {
 
 impl Drop for Session<'_> {
     fn drop(&mut self) {
+        tracing::debug!("tearing down the PipeWire capture stream");
         unsafe {
             if !self.stream.is_null() {
                 (self.symbols.pw_thread_loop_lock)(self.thread_loop);
@@ -434,14 +492,134 @@ impl Drop for Session<'_> {
                 (self.symbols.pw_thread_loop_destroy)(self.thread_loop);
             }
         }
+        tracing::debug!("PipeWire capture stream teardown completed");
+    }
+}
+
+/// A connected PipeWire stream that can supply successive frames.
+///
+/// The field order is deliberate: Rust drops fields in declaration order, so
+/// the stream session is destroyed before the callback hook and listener whose
+/// addresses it retains.
+pub struct FrameStream {
+    session: Session<'static>,
+    _hook: Box<spa_hook>,
+    listener: Box<Listener>,
+    timeout: Duration,
+    captured_once: bool,
+}
+
+impl std::fmt::Debug for FrameStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameStream")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrameStream {
+    /// Connects to a portal-provided PipeWire node without consuming a frame.
+    ///
+    /// `fd` is the remote returned by `org.freedesktop.portal.ScreenCast.
+    /// OpenPipeWireRemote` and is consumed: PipeWire closes it when this stream
+    /// is torn down. `node_id` is the stream's `pipe_wire_node_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] if the loop, context, remote, or stream
+    /// cannot be created or connected.
+    pub fn connect(
+        library: &'static Library,
+        fd: OwnedFd,
+        node_id: u32,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        let symbols = &library.symbols;
+
+        // Declared before `session` so construction failures drop the session
+        // first. Once moved into `FrameStream`, field order provides the same
+        // guarantee.
+        let mut listener = Box::new(Listener {
+            symbols: ptr::from_ref(symbols),
+            thread_loop: ptr::null_mut(),
+            stream: Mutex::new(ptr::null_mut()),
+            shared: Mutex::new(Shared::default()),
+        });
+        let mut hook = Box::new(spa_hook::zeroed());
+
+        let name = CString::new("scrozz-capture").expect("literal has no interior NUL");
+        let thread_loop = unsafe { (symbols.pw_thread_loop_new)(name.as_ptr(), ptr::null()) };
+        if thread_loop.is_null() {
+            return Err(Error::Platform(
+                "PipeWire refused to create an event loop; the pipewire user service is probably \
+                 not running (try `systemctl --user status pipewire`)"
+                    .into(),
+            ));
+        }
+        listener.thread_loop = thread_loop;
+
+        let mut session = Session {
+            symbols,
+            thread_loop,
+            context: ptr::null_mut(),
+            core: ptr::null_mut(),
+            stream: ptr::null_mut(),
+            started: false,
+        };
+
+        let loop_ = unsafe { (symbols.pw_thread_loop_get_loop)(thread_loop) };
+        session.context = unsafe { (symbols.pw_context_new)(loop_, ptr::null_mut(), 0) };
+        if session.context.is_null() {
+            return Err(Error::Platform(
+                "PipeWire could not create a client context".into(),
+            ));
+        }
+
+        if unsafe { (symbols.pw_thread_loop_start)(thread_loop) } < 0 {
+            return Err(Error::Platform(
+                "PipeWire could not start its event loop thread".into(),
+            ));
+        }
+        session.started = true;
+
+        {
+            let _lock = LoopLock::new(symbols, thread_loop);
+            connect_locked(&mut session, &mut listener, &mut hook, fd, node_id)?;
+        }
+
+        tracing::debug!(node_id, "connected the reusable PipeWire capture stream");
+        Ok(Self {
+            session,
+            _hook: hook,
+            listener,
+            timeout,
+            captured_once: false,
+        })
+    }
+
+    /// Waits for and removes the newest complete frame.
+    ///
+    /// The stream remains connected after success, so callers can trigger a
+    /// repaint or scroll and request another frame without reopening the portal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lifecycle failure reported by the stream, including timeout,
+    /// target disappearance, malformed buffers, and format rejection.
+    pub fn capture_frame(&mut self) -> Result<RawFrame, Error> {
+        let _lock = LoopLock::new(self.session.symbols, self.session.thread_loop);
+        let frame = wait_for_frame(
+            &self.session,
+            &self.listener,
+            self.timeout,
+            self.captured_once,
+        )?;
+        self.captured_once = true;
+        Ok(frame)
     }
 }
 
 /// Captures a single frame from a portal-provided PipeWire node.
-///
-/// `fd` is the remote returned by `org.freedesktop.portal.ScreenCast.
-/// OpenPipeWireRemote` and is consumed: PipeWire closes it when the connection
-/// is torn down. `node_id` is the stream's `pipe_wire_node_id`.
 ///
 /// # Errors
 ///
@@ -450,63 +628,12 @@ impl Drop for Session<'_> {
 /// [`super::lifecycle::Failure`]. Never panics on a compositor's bad behaviour;
 /// the whole point of [`super::lifecycle`] is that misbehaviour is data.
 pub fn capture_one(
-    library: &Library,
+    library: &'static Library,
     fd: OwnedFd,
     node_id: u32,
     timeout: Duration,
 ) -> Result<RawFrame, Error> {
-    let symbols = &library.symbols;
-
-    // Declared before `session` so that it is dropped *after* it: the stream
-    // holds a pointer to the listener and must be destroyed first.
-    let listener = Box::new(Listener {
-        symbols: ptr::from_ref(symbols),
-        thread_loop: ptr::null_mut(),
-        stream: Mutex::new(ptr::null_mut()),
-        shared: Mutex::new(Shared::default()),
-    });
-    let mut listener = listener;
-    let mut hook = Box::new(spa_hook::zeroed());
-
-    let name = CString::new("scrozz-capture").expect("literal has no interior NUL");
-    let thread_loop = unsafe { (symbols.pw_thread_loop_new)(name.as_ptr(), ptr::null()) };
-    if thread_loop.is_null() {
-        return Err(Error::Platform(
-            "PipeWire refused to create an event loop; the pipewire user service is probably not \
-             running (try `systemctl --user status pipewire`)"
-                .into(),
-        ));
-    }
-    listener.thread_loop = thread_loop;
-
-    let mut session = Session {
-        symbols,
-        thread_loop,
-        context: ptr::null_mut(),
-        core: ptr::null_mut(),
-        stream: ptr::null_mut(),
-        started: false,
-    };
-
-    let loop_ = unsafe { (symbols.pw_thread_loop_get_loop)(thread_loop) };
-    session.context = unsafe { (symbols.pw_context_new)(loop_, ptr::null_mut(), 0) };
-    if session.context.is_null() {
-        return Err(Error::Platform(
-            "PipeWire could not create a client context".into(),
-        ));
-    }
-
-    if unsafe { (symbols.pw_thread_loop_start)(thread_loop) } < 0 {
-        return Err(Error::Platform(
-            "PipeWire could not start its event loop thread".into(),
-        ));
-    }
-    session.started = true;
-
-    {
-        let _lock = LoopLock::new(symbols, thread_loop);
-        run_locked(&mut session, &mut listener, &mut hook, fd, node_id, timeout)
-    }
+    FrameStream::connect(library, fd, node_id, timeout)?.capture_frame()
 }
 
 /// Releases the recursive thread-loop lock on every return and unwind path.
@@ -532,14 +659,13 @@ impl Drop for LoopLock<'_> {
 }
 
 /// The part that must happen with the loop lock held.
-fn run_locked(
+fn connect_locked(
     session: &mut Session<'_>,
     listener: &mut Listener,
     hook: &mut spa_hook,
     fd: OwnedFd,
     node_id: u32,
-    timeout: Duration,
-) -> Result<RawFrame, Error> {
+) -> Result<(), Error> {
     let symbols = session.symbols;
 
     // PipeWire takes the descriptor and closes it with the connection, so it
@@ -599,7 +725,7 @@ fn run_locked(
         )));
     }
 
-    wait_for_frame(session, listener, timeout)
+    Ok(())
 }
 
 /// Blocks on the loop until the lifecycle settles or the deadline passes.
@@ -607,10 +733,67 @@ fn wait_for_frame(
     session: &Session<'_>,
     listener: &Listener,
     timeout: Duration,
+    discard_buffered_frame: bool,
 ) -> Result<RawFrame, Error> {
     let symbols = session.symbols;
     let seconds = u32::try_from(timeout.as_secs().max(1)).unwrap_or(u32::MAX);
-    let mut lifecycle = Lifecycle::new(seconds);
+    let (pending, existing_format, state, ever_streamed) = {
+        let mut shared = listener
+            .shared
+            .lock()
+            .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))?;
+
+        if discard_buffered_frame {
+            // The caller may have scrolled only after the previous capture
+            // returned. A frame queued while it was preparing that input is
+            // older than this request and must never be stitched as the next
+            // viewport.
+            shared.invalidate_frame();
+        }
+
+        let has_frame = shared.frame.is_some();
+        let mut pending = std::mem::take(&mut shared.events);
+        pending.retain(|event| match event {
+            Event::FrameReady => !discard_buffered_frame && has_frame,
+            Event::FormatRejected(_) | Event::BufferRejected(_) => true,
+            Event::StateChanged(_, _)
+            | Event::FormatAgreed(_)
+            | Event::EmptyBuffer
+            | Event::TimedOut => false,
+        });
+
+        (
+            pending,
+            shared
+                .frame
+                .as_ref()
+                .map(|frame| frame.format)
+                .or(shared.negotiated),
+            shared.state.clone(),
+            shared.ever_streamed,
+        )
+    };
+
+    let mut lifecycle = if ever_streamed {
+        Lifecycle::resume(seconds, existing_format)
+    } else {
+        Lifecycle::new(seconds)
+    };
+    if !ever_streamed && let Some(format) = existing_format {
+        lifecycle.observe(Event::FormatAgreed(format));
+    }
+
+    for event in pending {
+        if lifecycle.observe(event) == Action::Stop {
+            break;
+        }
+    }
+    if !lifecycle.is_settled()
+        && let Some((state, message)) = state
+    {
+        lifecycle.observe(Event::StateChanged(state, message));
+    }
+
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| Error::Platform("the PipeWire frame deadline overflowed".into()))?;
@@ -620,8 +803,8 @@ fn wait_for_frame(
         let batch = listener
             .shared
             .lock()
-            .map(|mut shared| std::mem::take(&mut shared.events))
-            .unwrap_or_default();
+            .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))
+            .map(|mut shared| std::mem::take(&mut shared.events))?;
 
         let mut stop = false;
         for event in batch {
@@ -658,19 +841,20 @@ fn wait_for_frame(
         }
     }
 
-    let format = lifecycle.outcome()?;
-    let pixels = listener
+    lifecycle.outcome()?;
+    let frame = listener
         .shared
         .lock()
-        .ok()
-        .and_then(|mut shared| shared.pixels.take())
+        .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))?
+        .frame
+        .take()
         .ok_or_else(|| {
             Error::Platform(
                 "the PipeWire stream reported a complete frame but produced no pixels".into(),
             )
         })?;
 
-    Ok(RawFrame { pixels, format })
+    Ok(frame)
 }
 
 /// Builds the stream's properties.

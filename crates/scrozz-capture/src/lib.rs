@@ -33,7 +33,45 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCaptureKitBackend;
 
-use scrozz_core::{CaptureBackend, Result};
+use scrozz_core::{CaptureBackend, CaptureRequest, Frame, Result};
+
+/// Supplies viewport frames from one logical capture session.
+///
+/// A platform may keep native resources open between calls. On Wayland this is
+/// the difference between reusing one portal/PipeWire stream and reopening the
+/// permission flow for every scrolling viewport. Dropping the session releases
+/// every native resource it owns.
+pub trait FrameSession {
+    /// Captures the viewport in its current state.
+    fn capture_frame(&mut self) -> Result<Frame>;
+
+    /// Human-readable source name for diagnostics.
+    fn name(&self) -> &str;
+}
+
+/// Repeated-frame fallback for platforms whose ordinary backend is already
+/// efficient enough to reopen per frame.
+struct BackendFrameSession {
+    backend: Box<dyn CaptureBackend>,
+    request: CaptureRequest,
+}
+
+impl FrameSession for BackendFrameSession {
+    fn capture_frame(&mut self) -> Result<Frame> {
+        Ok(self.backend.capture(&self.request)?.frame)
+    }
+
+    fn name(&self) -> &str {
+        self.backend.name()
+    }
+}
+
+pub(crate) fn backend_frame_session(
+    backend: Box<dyn CaptureBackend>,
+    request: CaptureRequest,
+) -> Box<dyn FrameSession> {
+    Box::new(BackendFrameSession { backend, request })
+}
 
 /// Constructs the best capture backend for the running system.
 ///
@@ -60,5 +98,32 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         todo!("select and construct the platform capture backend")
+    }
+}
+
+/// Opens a frame source suitable for a scrolling capture.
+///
+/// Wayland keeps one portal grant and PipeWire stream alive across calls.
+/// Other platforms currently adapt their ordinary capture backend.
+///
+/// # Errors
+///
+/// Returns the same platform, permission, and target errors as [`backend`] and
+/// [`FrameSession::capture_frame`].
+pub fn frame_session(request: CaptureRequest) -> Result<Box<dyn FrameSession>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::frame_session(request)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Ok(backend_frame_session(backend()?, request))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = request;
+        todo!("select and construct the platform frame session")
     }
 }

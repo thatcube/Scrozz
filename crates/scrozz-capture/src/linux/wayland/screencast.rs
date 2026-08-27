@@ -66,7 +66,7 @@ pub struct Negotiation {
     /// Dropping ashpd's proxy does not call `org.freedesktop.portal.Session.Close`;
     /// without this handle, every capture would leak a compositor session until
     /// the D-Bus connection or process ended.
-    session: Session<Screencast>,
+    session: Option<Session<Screencast>>,
 }
 
 impl Negotiation {
@@ -76,8 +76,25 @@ impl Negotiation {
     ///
     /// Returns the classified D-Bus failure so the caller can report cleanup
     /// trouble without hiding the capture's primary result.
-    pub fn close(&self) -> Result<(), PortalFailure> {
-        futures_lite::future::block_on(self.session.close()).map_err(classify)
+    pub fn close(&mut self) -> Result<(), PortalFailure> {
+        let Some(session) = self.session.take() else {
+            return Ok(());
+        };
+        tracing::debug!("closing the desktop-portal ScreenCast session");
+        futures_lite::future::block_on(session.close()).map_err(classify)?;
+        tracing::debug!("desktop-portal ScreenCast session closed");
+        Ok(())
+    }
+}
+
+impl Drop for Negotiation {
+    fn drop(&mut self) {
+        if let Err(close_error) = self.close() {
+            tracing::warn!(
+                ?close_error,
+                "could not close the desktop-portal ScreenCast session during teardown"
+            );
+        }
     }
 }
 
@@ -132,7 +149,7 @@ async fn negotiate_async(
             streams,
             restore_token,
             remote,
-            session,
+            session: Some(session),
         }),
         Err(failure) => {
             if let Err(close_error) = session.close().await {
@@ -153,8 +170,14 @@ async fn complete_session(
     narrowed: SessionPlan,
     restore_token: Option<&str>,
 ) -> Result<(Vec<StreamInfo>, Option<String>, OwnedFd), PortalFailure> {
+    tracing::debug!(
+        sources = narrowed.types,
+        cursor = narrowed.cursor,
+        restore_token = restore_token.is_some(),
+        "selecting desktop-portal ScreenCast sources"
+    );
     let options = SelectSourcesOptions::default()
-        .set_multiple(narrowed.multiple)
+        .set_multiple(false)
         .set_cursor_mode(to_cursor_mode(narrowed.cursor))
         .set_sources(to_source_types(narrowed.types))
         .set_persist_mode(to_persist_mode(narrowed.persist))
@@ -190,6 +213,19 @@ async fn complete_session(
     if streams.is_empty() {
         return Err(PortalFailure::NoStreams);
     }
+    tracing::debug!(
+        streams = streams.len(),
+        positioned = streams
+            .iter()
+            .filter(|stream| stream.position.is_some())
+            .count(),
+        sized = streams
+            .iter()
+            .filter(|stream| stream.size.is_some())
+            .count(),
+        restore_token = response.restore_token().is_some(),
+        "desktop-portal ScreenCast session started"
+    );
 
     let remote = proxy
         .open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default())
@@ -233,6 +269,7 @@ fn classify(error: ashpd::Error) -> PortalFailure {
 
     match error {
         Ashpd::Response(ResponseError::Cancelled) | Ashpd::Portal(PortalError::Cancelled(_)) => {
+            tracing::debug!("desktop-portal ScreenCast picker was cancelled");
             PortalFailure::Cancelled
         }
         Ashpd::PortalNotFound(name) => {

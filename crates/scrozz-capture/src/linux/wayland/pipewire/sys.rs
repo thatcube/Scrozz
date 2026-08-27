@@ -300,6 +300,8 @@ macro_rules! symbols {
 
 symbols! {
     pw_init: unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char) = b"pw_init\0",
+    pw_get_library_version:
+        unsafe extern "C" fn() -> *const c_char = b"pw_get_library_version\0",
 
     pw_thread_loop_new:
         unsafe extern "C" fn(*const c_char, *const c_void) -> *mut c_void = b"pw_thread_loop_new\0",
@@ -415,6 +417,8 @@ impl Library {
                 Ok(library) => {
                     let symbols =
                         unsafe { Symbols::resolve(&library) }.map_err(LoadFailure::TooOld)?;
+                    let version = unsafe { optional_string((symbols.pw_get_library_version)()) }
+                        .unwrap_or_else(|| "<unknown>".into());
                     let loaded = Self {
                         symbols,
                         _library: library,
@@ -425,6 +429,31 @@ impl Library {
                     unsafe {
                         (loaded.symbols.pw_init)(std::ptr::null_mut(), std::ptr::null_mut());
                     }
+                    tracing::debug!(
+                        library = name,
+                        %version,
+                        pointer_width = usize::BITS,
+                        spa_hook_size = std::mem::size_of::<spa_hook>(),
+                        spa_data_size = std::mem::size_of::<spa_data>(),
+                        spa_buffer_size = std::mem::size_of::<spa_buffer>(),
+                        pw_buffer_prefix_size = std::mem::size_of::<pw_buffer>(),
+                        stream_events_size = std::mem::size_of::<pw_stream_events>(),
+                        "loaded and initialized the native PipeWire ABI"
+                    );
+                    tracing::debug!(
+                        spa_hook_callbacks_offset = std::mem::offset_of!(spa_hook, cb),
+                        spa_data_pointer_offset = std::mem::offset_of!(spa_data, data),
+                        spa_data_chunk_offset = std::mem::offset_of!(spa_data, chunk),
+                        spa_buffer_datas_offset = std::mem::offset_of!(spa_buffer, datas),
+                        pw_buffer_pointer_offset = std::mem::offset_of!(pw_buffer, buffer),
+                        stream_state_callback_offset =
+                            std::mem::offset_of!(pw_stream_events, state_changed),
+                        stream_format_callback_offset =
+                            std::mem::offset_of!(pw_stream_events, param_changed),
+                        stream_process_callback_offset =
+                            std::mem::offset_of!(pw_stream_events, process),
+                        "native PipeWire ABI layout guards are active"
+                    );
                     return Ok(loaded);
                 }
                 Err(err) => last = err.to_string(),
