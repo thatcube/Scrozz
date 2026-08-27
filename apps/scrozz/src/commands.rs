@@ -676,11 +676,16 @@ fn dispatch_url_action(action: UrlAction) -> CliResult<Report> {
         ipc::Status::Running => {
             let response = ipc::forward_url(action)?;
             if response.code != 0 {
+                let detail = if response.stderr.is_empty() {
+                    &response.stdout
+                } else {
+                    &response.stderr
+                };
                 return Err(CliError::ipc(format!(
                     "the running Scrozz rejected {} (exit {}): {}",
                     action.slug(),
                     response.code,
-                    String::from_utf8_lossy(&response.payload).trim()
+                    String::from_utf8_lossy(detail).trim()
                 )));
             }
             Ok(Report::new(

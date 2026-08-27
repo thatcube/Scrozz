@@ -162,8 +162,14 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
 /// not a failure.
 fn try_forward(command: &Command) -> CliResult<Option<u8>> {
     let _ = command;
-    if !matches!(ipc::probe(), ipc::Status::Running) {
-        return Ok(None);
+    match ipc::probe() {
+        ipc::Status::Running => {}
+        ipc::Status::NotRunning => return Ok(None),
+        ipc::Status::Unusable(error) => {
+            return Err(CliError::ipc(format!(
+                "the running-instance endpoint is present but unusable: {error}"
+            )));
+        }
     }
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -172,20 +178,21 @@ fn try_forward(command: &Command) -> CliResult<Option<u8>> {
     // Relayed byte for byte. The whole point of the single-instance design is
     // that `scrozz capture --json` produces the same document whether or not the
     // menu-bar app happens to be running; re-encoding here would break that.
-    let mut stdout = std::io::stdout().lock();
-    match stdout
-        .write_all(&response.payload)
-        .and_then(|()| stdout.flush())
-    {
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-        other => other.map_err(|e| CliError::ipc(format!("could not relay the response: {e}")))?,
-    }
+    relay(&mut std::io::stdout().lock(), &response.stdout, "stdout")?;
+    relay(&mut std::io::stderr().lock(), &response.stderr, "stderr")?;
     tracing::debug!(
-        stream = response.stream.token(),
-        bytes = response.payload.len(),
+        stdout_bytes = response.stdout.len(),
+        stderr_bytes = response.stderr.len(),
         "relayed from the running instance"
     );
     Ok(Some(response.code))
+}
+
+fn relay(output: &mut impl Write, bytes: &[u8], stream: &str) -> CliResult<()> {
+    match output.write_all(bytes).and_then(|()| output.flush()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map_err(|error| CliError::ipc(format!("could not relay {stream}: {error}"))),
+    }
 }
 
 /// Renders `--help`, `--version` and parse failures.

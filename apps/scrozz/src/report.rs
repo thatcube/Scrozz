@@ -100,6 +100,13 @@ pub struct Reporter {
     quiet: bool,
 }
 
+/// Fully rendered process output, before it is written locally or sent over IPC.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderedOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 impl Reporter {
     /// Builds a reporter from the parsed global options.
     #[must_use]
@@ -130,26 +137,41 @@ impl Reporter {
     /// downstream reader — `scrozz ... | head` — is not a failure and is
     /// swallowed, because the consumer got what it asked for.
     pub fn emit(&self, command: &str, report: &Report) -> io::Result<()> {
+        self.render(command, report).emit()
+    }
+
+    /// Renders a successful result without writing it.
+    #[must_use]
+    pub fn render(&self, command: &str, report: &Report) -> RenderedOutput {
         if let Some(bytes) = &report.raw {
             // Raw mode: stdout is the payload. Anything else we might have said
             // moves to stderr so the byte stream stays exactly the file the
             // caller is piping into something.
-            write_bytes(&mut io::stdout().lock(), bytes)?;
-            if !self.quiet && !report.human.is_empty() {
-                let _ = writeln!(io::stderr(), "{}", report.human.trim_end());
-            }
-            return Ok(());
+            return RenderedOutput {
+                stdout: bytes.clone(),
+                stderr: if self.quiet || report.human.is_empty() {
+                    Vec::new()
+                } else {
+                    line_bytes(&report.human)
+                },
+            };
         }
 
         if self.json {
             let document = success_envelope(command, report.data.clone());
-            return write_line(&mut io::stdout().lock(), &document.to_compact_string());
+            return RenderedOutput {
+                stdout: line_bytes(&document.to_compact_string()),
+                stderr: Vec::new(),
+            };
         }
 
         if self.quiet || report.human.is_empty() {
-            return Ok(());
+            return RenderedOutput::default();
         }
-        write_line(&mut io::stdout().lock(), report.human.trim_end())
+        RenderedOutput {
+            stdout: line_bytes(&report.human),
+            stderr: Vec::new(),
+        }
     }
 
     /// Writes a failure.
@@ -163,23 +185,30 @@ impl Reporter {
     ///
     /// Returns an I/O error if the diagnostic could not be written.
     pub fn emit_error(&self, command: &str, err: &CliError) -> io::Result<()> {
+        self.render_error(command, err).emit()
+    }
+
+    /// Renders a failure without writing it.
+    #[must_use]
+    pub fn render_error(&self, command: &str, err: &CliError) -> RenderedOutput {
         if self.json {
             let document = error_envelope(command, err);
-            return write_line(&mut io::stdout().lock(), &document.to_compact_string());
+            return RenderedOutput {
+                stdout: line_bytes(&document.to_compact_string()),
+                stderr: Vec::new(),
+            };
         }
 
         let text = err.to_human();
         if text.is_empty() {
-            return Ok(());
+            return RenderedOutput::default();
         }
         // Errors are essential output, so `--quiet` does not suppress them. It
         // suppresses the chatter around a *successful* command.
-        let mut stderr = io::stderr().lock();
-        match stderr.write_all(text.as_bytes()) {
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-            other => other,
-        }?;
-        flush(&mut stderr)
+        RenderedOutput {
+            stdout: Vec::new(),
+            stderr: text.into_bytes(),
+        }
     }
 
     /// Whether stdout is a terminal, for deciding on decoration.
@@ -190,6 +219,19 @@ impl Reporter {
     pub fn stdout_is_terminal(&self) -> bool {
         io::stdout().is_terminal()
     }
+}
+
+impl RenderedOutput {
+    fn emit(self) -> io::Result<()> {
+        write_bytes(&mut io::stdout().lock(), &self.stdout)?;
+        write_bytes(&mut io::stderr().lock(), &self.stderr)
+    }
+}
+
+fn line_bytes(text: &str) -> Vec<u8> {
+    let mut line = text.trim_end().as_bytes().to_vec();
+    line.push(b'\n');
+    line
 }
 
 fn write_line(out: &mut impl Write, line: &str) -> io::Result<()> {
@@ -366,5 +408,20 @@ mod tests {
     fn reporter_modes_are_readable() {
         assert!(Reporter::new(true, false).is_json());
         assert!(!Reporter::new(false, true).is_json());
+    }
+
+    #[test]
+    fn rendered_output_preserves_the_stream_contract() {
+        let report = Report::new(Json::obj([("ok", Json::Bool(true))]), "saved")
+            .with_raw(vec![0x89, b'P', b'N', b'G']);
+        let rendered = Reporter::new(false, false).render("capture", &report);
+        assert_eq!(rendered.stdout, vec![0x89, b'P', b'N', b'G']);
+        assert_eq!(rendered.stderr, b"saved\n");
+
+        let failure =
+            Reporter::new(false, false).render_error("capture", &CliError::usage("bad input"));
+        assert!(failure.stdout.is_empty());
+        assert!(failure.stderr.starts_with(b"scrozz: bad input\n"));
+        assert!(failure.stderr.ends_with(b"\n"));
     }
 }
