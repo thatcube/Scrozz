@@ -30,6 +30,7 @@ pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60 + 20);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
 const RETRY_DELAY: Duration = Duration::from_millis(2);
 const FRAME_PREFIX_BYTES: usize = size_of::<u32>();
@@ -566,7 +567,7 @@ fn exchange(stream: &mut (impl Read + Write), argv: &[String]) -> CliResult<Resp
         Instant::now() + TRANSFER_TIMEOUT,
         None,
     )?;
-    let response = read_response(stream, Instant::now() + COMMAND_TIMEOUT)?;
+    let response = read_response(stream, Instant::now() + CLIENT_RESPONSE_TIMEOUT)?;
     send_ack(stream, Instant::now() + TRANSFER_TIMEOUT)?;
     Ok(response)
 }
@@ -1116,6 +1117,12 @@ mod tests {
             url_arguments(UrlAction::RecordStop),
             argv(&["record", "--stop"])
         );
+    }
+
+    #[test]
+    fn client_response_window_outlives_the_server_command_deadline() {
+        assert!(CLIENT_RESPONSE_TIMEOUT > COMMAND_TIMEOUT);
+        assert!(CLIENT_RESPONSE_TIMEOUT - COMMAND_TIMEOUT >= TRANSFER_TIMEOUT * 2);
     }
 
     #[test]

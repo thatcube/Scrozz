@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
     thread::JoinHandle,
@@ -24,12 +24,86 @@ use crate::{
 
 const REQUEST_QUEUE_DEPTH: usize = 16;
 const WORKER_POLL: Duration = Duration::from_millis(10);
+const REQUEST_QUEUED: u8 = 0;
+const REQUEST_RUNNING: u8 = 1;
+const REQUEST_CANCELLED: u8 = 2;
+const REQUEST_COMPLETED: u8 = 3;
+
+#[derive(Debug)]
+struct RequestControl {
+    phase: AtomicU8,
+    cancelled: AtomicBool,
+}
+
+impl RequestControl {
+    fn queued() -> Self {
+        Self {
+            phase: AtomicU8::new(REQUEST_QUEUED),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn try_start(&self, deadline: Instant) -> bool {
+        if Instant::now() >= deadline {
+            self.cancel();
+            return false;
+        }
+        if self
+            .phase
+            .compare_exchange(
+                REQUEST_QUEUED,
+                REQUEST_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            self.cancelled.store(true, Ordering::Release);
+            let _ = self.phase.compare_exchange(
+                REQUEST_RUNNING,
+                REQUEST_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.phase.compare_exchange(
+            REQUEST_QUEUED,
+            REQUEST_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn complete(&self) {
+        let _ = self.phase.compare_exchange(
+            REQUEST_RUNNING,
+            REQUEST_COMPLETED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// A validated request from another process, waiting for its answer.
 pub struct Request {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     reply: SyncSender<Response>,
+    deadline: Instant,
+    control: Arc<RequestControl>,
 }
 
 impl std::fmt::Debug for Request {
@@ -38,6 +112,8 @@ impl std::fmt::Debug for Request {
             .debug_struct("Request")
             .field("argv", &self.argv)
             .field("cwd", &self.cwd)
+            .field("deadline", &self.deadline)
+            .field("control", &self.control)
             .finish_non_exhaustive()
     }
 }
@@ -45,9 +121,16 @@ impl std::fmt::Debug for Request {
 impl Request {
     /// Executes the request and hands both output streams back to the worker.
     pub fn serve(self) -> Option<Command> {
+        if !self.control.try_start(self.deadline) {
+            tracing::debug!("discarding a cancelled or expired forwarded command");
+            return None;
+        }
         let (command, response) = run(&self.argv, self.cwd.as_deref());
         if self.reply.send(response).is_err() {
+            self.control.cancel();
             tracing::debug!("forwarded command client disconnected before the reply");
+        } else {
+            self.control.complete();
         }
         command
     }
@@ -329,49 +412,67 @@ fn serve_connection(
                 return;
             }
         };
+    let deadline = Instant::now() + ipc::COMMAND_TIMEOUT;
+    let control = Arc::new(RequestControl::queued());
     let (reply, response) = sync_channel(1);
     let request = Request {
         argv: request.argv,
         cwd: request.cwd,
         reply,
+        deadline,
+        control: Arc::clone(&control),
     };
     if let Err(error) = requests.try_send(request) {
+        control.cancel();
         let response = match error {
             TrySendError::Full(_) => protocol_error("the running instance is busy"),
             TrySendError::Disconnected(_) => {
                 protocol_error("the running instance is shutting down")
             }
         };
-        answer(stream, &response, shutdown);
+        answer(stream, &response, shutdown, &control);
         return;
     }
 
-    let deadline = Instant::now() + ipc::COMMAND_TIMEOUT;
-    let response = loop {
+    let response = wait_for_response(&response, shutdown, deadline, &control);
+    answer(stream, &response, shutdown, &control);
+}
+
+fn wait_for_response(
+    response: &Receiver<Response>,
+    shutdown: &AtomicBool,
+    deadline: Instant,
+    control: &RequestControl,
+) -> Response {
+    loop {
         if shutdown.load(Ordering::Acquire) {
+            control.cancel();
             break protocol_error("the running instance is shutting down");
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            control.cancel();
             break protocol_error("the forwarded command timed out");
         }
         match response.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(response) => break response,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
+                control.cancel();
                 break protocol_error("the forwarded command did not produce a response");
             }
         }
-    };
-    answer(stream, &response, shutdown);
+    }
 }
 
 fn answer(
     stream: &mut (impl std::io::Read + std::io::Write),
     response: &Response,
     shutdown: &Arc<AtomicBool>,
+    control: &RequestControl,
 ) {
     if shutdown.load(Ordering::Acquire) {
+        control.cancel();
         return;
     }
     if let Err(error) = ipc::send_response(
@@ -380,10 +481,12 @@ fn answer(
         Instant::now() + ipc::TRANSFER_TIMEOUT,
         shutdown,
     ) {
+        control.cancel();
         tracing::debug!("could not answer a forwarded command: {error}");
         return;
     }
     if let Err(error) = ipc::receive_ack(stream, Instant::now() + ipc::TRANSFER_TIMEOUT, shutdown) {
+        control.cancel();
         tracing::debug!("forwarded command response was not acknowledged: {error}");
     }
 }
@@ -528,6 +631,113 @@ mod tests {
         let temporary = std::env::temp_dir();
         drop(WorkingDirectory::enter(Some(&temporary)).unwrap());
         assert_eq!(std::env::current_dir().unwrap(), before);
+    }
+
+    fn dry_run_request(
+        deadline: Instant,
+        control: Arc<RequestControl>,
+    ) -> (Request, Receiver<Response>) {
+        let (reply, response) = sync_channel(1);
+        (
+            Request {
+                argv: argv(&["capture", "--dry-run"]),
+                cwd: None,
+                reply,
+                deadline,
+                control,
+            },
+            response,
+        )
+    }
+
+    #[test]
+    fn cancelled_and_expired_requests_never_dispatch() {
+        let cancelled = Arc::new(RequestControl::queued());
+        cancelled.cancel();
+        let (request, response) = dry_run_request(
+            Instant::now() + ipc::COMMAND_TIMEOUT,
+            Arc::clone(&cancelled),
+        );
+        assert!(request.serve().is_none());
+        assert!(cancelled.is_cancelled());
+        assert!(matches!(
+            response.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+
+        let cancelled = Arc::new(RequestControl::queued());
+        let (request, response) = dry_run_request(
+            Instant::now() - Duration::from_millis(1),
+            Arc::clone(&cancelled),
+        );
+        assert!(request.serve().is_none());
+        assert!(cancelled.is_cancelled());
+        assert!(matches!(
+            response.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn cancellation_and_dispatch_claim_are_atomically_ordered() {
+        let cancelled_first = RequestControl::queued();
+        cancelled_first.cancel();
+        assert!(!cancelled_first.try_start(Instant::now() + ipc::COMMAND_TIMEOUT));
+        assert_eq!(
+            cancelled_first.phase.load(Ordering::Acquire),
+            REQUEST_CANCELLED
+        );
+
+        let dispatch_first = RequestControl::queued();
+        assert!(dispatch_first.try_start(Instant::now() + ipc::COMMAND_TIMEOUT));
+        dispatch_first.cancel();
+        assert_eq!(
+            dispatch_first.phase.load(Ordering::Acquire),
+            REQUEST_RUNNING
+        );
+        assert!(dispatch_first.is_cancelled());
+    }
+
+    #[test]
+    fn timeout_shutdown_and_reply_loss_cancel_the_queued_request() {
+        let shutdown = AtomicBool::new(false);
+        let cancelled = RequestControl::queued();
+        let (_reply, response) = sync_channel(1);
+        let timeout = wait_for_response(
+            &response,
+            &shutdown,
+            Instant::now() - Duration::from_millis(1),
+            &cancelled,
+        );
+        assert!(cancelled.is_cancelled());
+        assert!(String::from_utf8_lossy(&timeout.stderr).contains("timed out"));
+
+        let shutdown = AtomicBool::new(true);
+        let cancelled = RequestControl::queued();
+        let (_reply, response) = sync_channel(1);
+        let stopped = wait_for_response(
+            &response,
+            &shutdown,
+            Instant::now() + ipc::COMMAND_TIMEOUT,
+            &cancelled,
+        );
+        assert!(cancelled.is_cancelled());
+        assert!(String::from_utf8_lossy(&stopped.stderr).contains("shutting down"));
+
+        let shutdown = AtomicBool::new(false);
+        let cancelled = RequestControl::queued();
+        let (reply, response) = sync_channel(1);
+        drop(reply);
+        let disconnected = wait_for_response(
+            &response,
+            &shutdown,
+            Instant::now() + ipc::COMMAND_TIMEOUT,
+            &cancelled,
+        );
+        assert!(cancelled.is_cancelled());
+        assert!(
+            String::from_utf8_lossy(&disconnected.stderr).contains("did not produce a response")
+        );
     }
 
     #[cfg(unix)]
