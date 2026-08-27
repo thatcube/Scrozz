@@ -50,7 +50,7 @@
 //!         to: LogicalPoint::new(120.0, 90.0),
 //!     },
 //!     Style::stroked(),
-//! );
+//! ).expect("annotation id space available");
 //!
 //! // Persisted invisibly alongside the capture — no project file, D14.
 //! let saved = serde_json::to_string(&document.data()).unwrap();

@@ -602,20 +602,31 @@ impl SqliteStore {
             "source image is missing from disk; recording it as evicted"
         );
         let now = Timestamp::now();
-        self.conn
+        let layout = &self.layout;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin missing-image repair"))?;
+        let changed = tx
             .execute(
                 "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
                 params![id.0, now.0],
             )
             .map_err(store_err("cannot record missing image"))?;
-        self.conn
-            .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+        if changed == 0 {
+            tx.commit()
+                .map_err(store_err("cannot commit missing-image repair"))?;
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
             .map_err(store_err("cannot forget missing blob"))?;
 
-        if let Some(mut record) = self.stored_record(id)? {
+        if let Some(mut record) = layout.read_record(id)? {
             record.mark_evicted(now);
-            self.layout.write_record(&record)?;
+            layout.write_record(&record)?;
         }
+        tx.commit()
+            .map_err(store_err("cannot commit missing-image repair"))?;
         Ok(None)
     }
 
@@ -639,12 +650,16 @@ impl Store for SqliteStore {
     }
 
     fn set_pinned(&mut self, id: &CaptureId, pinned: bool) -> Result<()> {
-        let mut record = self.require_record(id)?;
-        record.pinned = pinned;
-        self.layout.write_record(&record)?;
-
-        let changed = self
+        let layout = &self.layout;
+        let tx = self
             .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin pin update"))?;
+        let mut record = layout
+            .read_record(id)?
+            .ok_or_else(|| Error::Storage(format!("no capture {} in history", id.0)))?;
+        record.pinned = pinned;
+        let changed = tx
             .execute(
                 "UPDATE captures SET pinned = ?2 WHERE id = ?1",
                 params![id.0, i64::from(pinned)],
@@ -653,6 +668,8 @@ impl Store for SqliteStore {
         if changed == 0 {
             return Err(Error::Storage(format!("no capture {} in history", id.0)));
         }
+        layout.write_record(&record)?;
+        tx.commit().map_err(store_err("cannot commit pin update"))?;
         Ok(())
     }
 
@@ -849,19 +866,20 @@ impl History for SqliteStore {
     }
 
     fn delete(&mut self, id: &CaptureId) -> Result<bool> {
-        let Some(record) = self.stored_record(id)? else {
-            // The record may be gone while a stale row survives; clear it too.
-            let removed = self
-                .conn
-                .execute("DELETE FROM captures WHERE id = ?1", params![id.0])
-                .map_err(store_err("cannot delete capture"))?;
-            return Ok(removed > 0);
-        };
-
+        let layout = &self.layout;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_err("cannot begin delete"))?;
+        let Some(record) = layout.read_record(id)? else {
+            // The record may be gone while a stale row survives; clear it too.
+            let removed = tx
+                .execute("DELETE FROM captures WHERE id = ?1", params![id.0])
+                .map_err(store_err("cannot delete capture"))?;
+            tx.commit().map_err(store_err("cannot commit delete"))?;
+            return Ok(removed > 0);
+        };
+
         tx.execute("DELETE FROM captures WHERE id = ?1", params![id.0])
             .map_err(store_err("cannot delete capture"))?;
 
@@ -870,11 +888,13 @@ impl History for SqliteStore {
         {
             tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
                 .map_err(store_err("cannot forget blob"))?;
-            self.layout.delete_blob(hash)?;
+            layout.delete_blob(hash)?;
         }
+        // Delete the durable source of truth while the SQLite writer lock is
+        // still held. A concurrent save can now only finish before this delete
+        // or observe the missing row afterwards; it cannot recreate the record.
+        layout.delete_record(id)?;
         tx.commit().map_err(store_err("cannot commit delete"))?;
-
-        self.layout.delete_record(id)?;
         Ok(true)
     }
 
@@ -883,14 +903,17 @@ impl History for SqliteStore {
     }
 
     fn save_edits(&mut self, id: &CaptureId, data: &DocumentData) -> Result<()> {
-        let mut record = self.require_record(id)?;
+        let layout = &self.layout;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin edit save"))?;
+        let mut record = layout
+            .read_record(id)?
+            .ok_or_else(|| Error::Storage(format!("no capture {} in history", id.0)))?;
         record.set_document(data)?;
 
-        // The durable record first, then the index. The index only caches the
-        // count, so the worst a crash between them can do is show a stale
-        // number until the next reconcile.
-        self.layout.write_record(&record)?;
-        self.conn
+        let changed = tx
             .execute(
                 "UPDATE captures SET annotation_count = ?2 WHERE id = ?1",
                 params![
@@ -899,15 +922,27 @@ impl History for SqliteStore {
                 ],
             )
             .map_err(store_err("cannot record edit count"))?;
+        if changed != 1 {
+            return Err(Error::Storage(format!("no capture {} in history", id.0)));
+        }
+        // The durable record precedes the transaction commit. A crash can leave
+        // only a stale cached count, which reconciliation repairs.
+        layout.write_record(&record)?;
+        tx.commit().map_err(store_err("cannot commit edit save"))?;
         Ok(())
     }
 
     fn set_ocr_text(&mut self, id: &CaptureId, text: Option<&str>) -> Result<()> {
-        let mut record = self.require_record(id)?;
+        let layout = &self.layout;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin recognised-text update"))?;
+        let mut record = layout
+            .read_record(id)?
+            .ok_or_else(|| Error::Storage(format!("no capture {} in history", id.0)))?;
         record.ocr_text = text.map(ToOwned::to_owned);
-        self.layout.write_record(&record)?;
-
-        self.conn
+        let changed = tx
             .execute(
                 "UPDATE captures SET ocr_text = ?2, ocr_fold = ?3, search_fold = ?4 WHERE id = ?1",
                 params![
@@ -918,6 +953,12 @@ impl History for SqliteStore {
                 ],
             )
             .map_err(store_err("cannot record recognised text"))?;
+        if changed != 1 {
+            return Err(Error::Storage(format!("no capture {} in history", id.0)));
+        }
+        layout.write_record(&record)?;
+        tx.commit()
+            .map_err(store_err("cannot commit recognised-text update"))?;
         Ok(())
     }
 
@@ -1017,17 +1058,17 @@ impl History for SqliteStore {
             return Ok(report);
         }
 
-        tx.commit().map_err(store_err("cannot commit retention"))?;
-
-        // Durable records last: if this is interrupted, the next open finds a
-        // record claiming pixels that are not there and marks it evicted, which
-        // is the same end state.
-        for id in rewritten {
-            if let Some(mut record) = self.stored_record(&id)? {
+        // Rewrite durable records before releasing the writer lock. This keeps
+        // retention from recreating a sidecar that a concurrent delete removed.
+        // If the transaction later fails, the record already describes the
+        // missing blob, which is the conservative recoverable state.
+        for id in &rewritten {
+            if let Some(mut record) = self.layout.read_record(id)? {
                 record.mark_evicted(now);
                 self.layout.write_record(&record)?;
             }
         }
+        tx.commit().map_err(store_err("cannot commit retention"))?;
 
         Ok(report)
     }

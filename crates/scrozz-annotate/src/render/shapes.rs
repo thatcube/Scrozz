@@ -14,10 +14,10 @@ use tiny_skia::{
 };
 
 use crate::{
-    annotation::AnnotationObject,
+    annotation::{AnnotationObject, ArrowShaft},
     document::CanvasGeometry,
     font, geom,
-    style::{ArrowStyle, Color, Style, TextPreset},
+    style::{Color, Style, TextPreset},
 };
 
 /// Converts logical annotation coordinates into physical canvas pixels.
@@ -174,87 +174,39 @@ pub fn arrow(
     to: LogicalPoint,
     xf: Scaled,
 ) -> Option<(Path, Vec<Path>)> {
-    let (x0, y0) = xf.point(from);
-    let (x1, y1) = xf.point(to);
-    let (dx, dy) = (x1 - x0, y1 - y0);
-    let length = dx.hypot(dy);
-    if length <= f32::EPSILON {
-        return None;
-    }
-    let (ux, uy) = (dx / length, dy / length);
-
-    // Never let the head eat the whole arrow: a very short arrow becomes mostly
-    // head, but must still read as an arrow rather than as a stray triangle.
-    let head_length = xf.length(object.arrow_head_length()).min(length * 0.6);
-    let half_width = xf.length(object.arrow_head_half_width());
-
-    let mut heads = Vec::with_capacity(2);
+    let geometry = object.arrow_geometry(from, to)?;
     let mut shaft = PathBuilder::new();
-
-    match object.style.arrow_style {
-        ArrowStyle::Curved => {
-            let control = geom::curved_arrow_control(from, to);
-            let (cx, cy) = xf.point(control);
-            let (tdx, tdy) = (x1 - cx, y1 - cy);
-            let tangent_length = tdx.hypot(tdy).max(f32::EPSILON);
-            let (tux, tuy) = (tdx / tangent_length, tdy / tangent_length);
-            let base_x = tux.mul_add(-head_length, x1);
-            let base_y = tuy.mul_add(-head_length, y1);
+    match geometry.shaft {
+        ArrowShaft::Line { from, to } => {
+            let (x0, y0) = xf.point(from);
+            let (x1, y1) = xf.point(to);
             shaft.move_to(x0, y0);
-            shaft.quad_to(
-                cx,
-                cy,
-                tux.mul_add(head_length * 0.35, base_x),
-                tuy.mul_add(head_length * 0.35, base_y),
-            );
-            heads.push(arrow_head(x1, y1, tux, tuy, head_length, half_width)?);
+            shaft.line_to(x1, y1);
         }
-        ArrowStyle::Straight | ArrowStyle::Dashed | ArrowStyle::DoubleEnded => {
-            let end_x = ux.mul_add(-head_length * 0.65, x1);
-            let end_y = uy.mul_add(-head_length * 0.65, y1);
-            let (start_x, start_y) = if object.style.arrow_style == ArrowStyle::DoubleEnded {
-                (
-                    ux.mul_add(head_length * 0.65, x0),
-                    uy.mul_add(head_length * 0.65, y0),
-                )
-            } else {
-                (x0, y0)
-            };
-            shaft.move_to(start_x, start_y);
-            shaft.line_to(end_x, end_y);
-            heads.push(arrow_head(x1, y1, ux, uy, head_length, half_width)?);
-            if object.style.arrow_style == ArrowStyle::DoubleEnded {
-                heads.push(arrow_head(x0, y0, -ux, -uy, head_length, half_width)?);
-            }
+        ArrowShaft::Quadratic { from, control, to } => {
+            let (x0, y0) = xf.point(from);
+            let (cx, cy) = xf.point(control);
+            let (x1, y1) = xf.point(to);
+            shaft.move_to(x0, y0);
+            shaft.quad_to(cx, cy, x1, y1);
         }
     }
-
+    let heads = geometry
+        .heads
+        .into_iter()
+        .filter_map(|head| {
+            let mut path = PathBuilder::new();
+            let (tip_x, tip_y) = xf.point(head[0]);
+            let (left_x, left_y) = xf.point(head[1]);
+            let (right_x, right_y) = xf.point(head[2]);
+            path.move_to(tip_x, tip_y);
+            path.line_to(left_x, left_y);
+            path.line_to(right_x, right_y);
+            path.close();
+            path.finish()
+        })
+        .collect();
     Some((shaft.finish()?, heads))
-}
-
-fn arrow_head(
-    tip_x: f32,
-    tip_y: f32,
-    ux: f32,
-    uy: f32,
-    length: f32,
-    half_width: f32,
-) -> Option<Path> {
-    let base_x = ux.mul_add(-length, tip_x);
-    let base_y = uy.mul_add(-length, tip_y);
-    let (px, py) = (-uy, ux);
-    let mut head = PathBuilder::new();
-    head.move_to(tip_x, tip_y);
-    head.line_to(
-        px.mul_add(half_width, base_x),
-        py.mul_add(half_width, base_y),
-    );
-    head.line_to(
-        px.mul_add(-half_width, base_x),
-        py.mul_add(-half_width, base_y),
-    );
-    head.close();
-    head.finish()
 }
 
 /// A straight line.

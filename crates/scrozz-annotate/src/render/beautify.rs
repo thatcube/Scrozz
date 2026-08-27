@@ -465,7 +465,11 @@ fn paint_image_background(canvas: &mut Pixmap, image: &BackgroundImage) -> Resul
             image.height()
         ))
     })?;
-    for (pixel, rgba) in source.pixels_mut().iter_mut().zip(pixels.chunks_exact(4)) {
+    for (pixel, rgba) in source
+        .pixels_mut()
+        .iter_mut()
+        .zip(pixels.as_chunks::<4>().0)
+    {
         *pixel = premultiply(rgba[0], rgba[1], rgba[2], rgba[3]);
     }
 

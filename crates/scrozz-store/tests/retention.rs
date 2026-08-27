@@ -113,17 +113,21 @@ fn an_evicted_capture_still_lists_with_its_edits_intact() {
     let base = 1_700_000_000_000;
 
     let mut document = sample_document(16, 16, 1, 0);
-    document.add(
-        Annotation::Text {
-            at: LogicalPoint::new(4.0, 4.0),
-            content: "the important bit".into(),
-        },
-        Style::stroked(),
-    );
-    document.add_default(Annotation::Arrow {
-        from: LogicalPoint::new(0.0, 0.0),
-        to: LogicalPoint::new(8.0, 8.0),
-    });
+    document
+        .add(
+            Annotation::Text {
+                at: LogicalPoint::new(4.0, 4.0),
+                content: "the important bit".into(),
+            },
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
+    document
+        .add_default(Annotation::Arrow {
+            from: LogicalPoint::new(0.0, 0.0),
+            to: LogicalPoint::new(8.0, 8.0),
+        })
+        .expect("annotation id space available");
 
     let old = store
         .insert(

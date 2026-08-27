@@ -14,7 +14,7 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 
 # Crates whose build scripts compile C, which cannot cross-compile without a
 # foreign toolchain. See tools/check-all-platforms.sh for the full explanation.
-XCHECK_EXCLUDE="scrozz-store scrozz"
+XCHECK_EXCLUDE="scrozz-store scrozz-ui scrozz"
 
 usage() {
   cat <<'USAGE'

@@ -68,6 +68,7 @@ tiny-skia = "0.12"
 ttf-parser = "0.25"
 rustybuzz = "0.20"
 unicode-bidi = "0.3"
+unicode-segmentation = "1"
 resvg = "0.48"
 arboard = "3.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }

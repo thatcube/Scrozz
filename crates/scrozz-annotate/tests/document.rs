@@ -4,29 +4,115 @@ mod common;
 
 use common::{document, every_annotation, rect};
 use scrozz_annotate::{
-    Annotation, AnnotationKind, Canvas, CanvasRotation, Color, Document, RedactStyle, Style,
-    UndoHistory,
+    Annotation, AnnotationId, AnnotationKind, AnnotationObject, Canvas, CanvasRotation, Color,
+    Document, DocumentData, RedactStyle, Style, UndoHistory,
 };
 use scrozz_core::LogicalPoint;
+
+fn persisted_data(ids: &[u64], next_id: u64) -> DocumentData {
+    DocumentData {
+        version: DocumentData::VERSION,
+        annotations: ids
+            .iter()
+            .map(|id| {
+                AnnotationObject::new(
+                    AnnotationId(*id),
+                    Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+                    Style::stroked(),
+                )
+            })
+            .collect(),
+        beautification: None,
+        canvas: Canvas::default(),
+        redaction_seed: 1,
+        next_id,
+    }
+}
+
+#[test]
+fn persisted_duplicate_ids_are_rejected() {
+    let result = Document::from_data(
+        document(200, 120).source.clone(),
+        persisted_data(&[7, 7], 8),
+    );
+    assert!(result.is_err(), "duplicate persisted ids must be rejected");
+}
+
+#[test]
+fn persisted_zero_and_max_ids_are_rejected() {
+    for id in [0, u64::MAX] {
+        let result = Document::from_data(
+            document(200, 120).source.clone(),
+            persisted_data(&[id], id.saturating_add(1)),
+        );
+        assert!(result.is_err(), "persisted id {id} must be rejected");
+    }
+}
+
+#[test]
+fn persisted_high_water_normalizes_allocator() {
+    let source = document(200, 120).source.clone();
+    let mut restored =
+        Document::from_data(source, persisted_data(&[7], 2)).expect("valid persisted document");
+
+    assert_eq!(restored.data().next_id, 8);
+    let id = restored
+        .add_default(Annotation::Rectangle(rect(20.0, 20.0, 10.0, 10.0)))
+        .expect("normalized allocator supplies the next id");
+    assert_eq!(id, AnnotationId(8));
+}
+
+#[test]
+fn exhausted_allocator_returns_error_without_adding_or_reusing_id() {
+    let source = document(200, 120).source.clone();
+    let mut restored = Document::from_data(source, persisted_data(&[u64::MAX - 1], u64::MAX))
+        .expect("valid exhausted state");
+    let result = restored.add_default(Annotation::Rectangle(rect(20.0, 20.0, 10.0, 10.0)));
+
+    assert!(
+        result.is_err(),
+        "an exhausted allocator must return an error"
+    );
+    assert_eq!(
+        restored.len(),
+        1,
+        "failed allocation must not add an annotation"
+    );
+    assert!(
+        restored.get(AnnotationId(u64::MAX - 1)).is_some(),
+        "failed allocation must not reuse an existing id"
+    );
+    assert_eq!(
+        restored.data().next_id,
+        u64::MAX,
+        "failed allocation must not rewind or reuse an id"
+    );
+}
 
 #[test]
 fn add_returns_stable_unique_ids() {
     let mut doc = document(200, 120);
-    let a = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
-        Style::stroked(),
-    );
-    let b = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
-        Style::stroked(),
-    );
+    let a = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
+    let b = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     assert_ne!(a, b);
 
     doc.remove(a);
-    let c = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
-        Style::stroked(),
-    );
+    let c = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     assert_ne!(
         c, a,
         "an id must never be reused: a stale reference would silently address a different object"
@@ -39,14 +125,18 @@ fn add_returns_stable_unique_ids() {
 #[test]
 fn hit_test_picks_the_topmost_annotation() {
     let mut doc = document(200, 200);
-    let under = doc.add(
-        Annotation::Rectangle(rect(10.0, 10.0, 100.0, 100.0)),
-        Style::stroked().with_fill(Some(Color::rgb(255, 0, 0))),
-    );
-    let over = doc.add(
-        Annotation::Rectangle(rect(30.0, 30.0, 60.0, 60.0)),
-        Style::stroked().with_fill(Some(Color::rgb(0, 255, 0))),
-    );
+    let under = doc
+        .add(
+            Annotation::Rectangle(rect(10.0, 10.0, 100.0, 100.0)),
+            Style::stroked().with_fill(Some(Color::rgb(255, 0, 0))),
+        )
+        .expect("annotation id space available");
+    let over = doc
+        .add(
+            Annotation::Rectangle(rect(30.0, 30.0, 60.0, 60.0)),
+            Style::stroked().with_fill(Some(Color::rgb(0, 255, 0))),
+        )
+        .expect("annotation id space available");
 
     let inside_both = LogicalPoint::new(50.0, 50.0);
     assert_eq!(doc.hit_test(inside_both), Some(over));
@@ -65,14 +155,18 @@ fn hit_test_picks_the_topmost_annotation() {
 #[test]
 fn line_and_spotlight_are_first_class_editable_objects() {
     let mut doc = document(200, 120);
-    let line = doc.add(
-        Annotation::Line {
-            from: LogicalPoint::new(10.0, 10.0),
-            to: LogicalPoint::new(100.0, 60.0),
-        },
-        Style::stroked(),
-    );
-    let spotlight = doc.add_default(Annotation::Spotlight(rect(25.0, 20.0, 70.0, 40.0)));
+    let line = doc
+        .add(
+            Annotation::Line {
+                from: LogicalPoint::new(10.0, 10.0),
+                to: LogicalPoint::new(100.0, 60.0),
+            },
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
+    let spotlight = doc
+        .add_default(Annotation::Spotlight(rect(25.0, 20.0, 70.0, 40.0)))
+        .expect("annotation id space available");
 
     assert_eq!(doc.get(line).unwrap().kind(), AnnotationKind::Line);
     assert_eq!(
@@ -143,7 +237,9 @@ fn undo_and_redo_restore_only_editable_snapshots() {
     let mut doc = document(120, 80);
     let source = doc.source.frame.data.clone();
     let mut history = UndoHistory::new(&doc);
-    let id = doc.add_default(Annotation::Rectangle(rect(10.0, 10.0, 30.0, 20.0)));
+    let id = doc
+        .add_default(Annotation::Rectangle(rect(10.0, 10.0, 30.0, 20.0)))
+        .expect("annotation id space available");
     history.checkpoint(&doc);
     doc.translate(id, 25.0, 0.0);
     history.checkpoint(&doc);
@@ -167,13 +263,19 @@ fn undo_and_redo_restore_only_editable_snapshots() {
 fn undo_never_reuses_an_exposed_annotation_id() {
     let mut doc = document(120, 80);
     let mut history = UndoHistory::new(&doc);
-    let first = doc.add_default(Annotation::Rectangle(rect(5.0, 5.0, 10.0, 10.0)));
+    let first = doc
+        .add_default(Annotation::Rectangle(rect(5.0, 5.0, 10.0, 10.0)))
+        .expect("annotation id space available");
     history.checkpoint(&doc);
-    let undone = doc.add_default(Annotation::Rectangle(rect(20.0, 5.0, 10.0, 10.0)));
+    let undone = doc
+        .add_default(Annotation::Rectangle(rect(20.0, 5.0, 10.0, 10.0)))
+        .expect("annotation id space available");
     history.checkpoint(&doc);
 
     assert!(history.undo(&mut doc).unwrap());
-    let replacement = doc.add_default(Annotation::Rectangle(rect(35.0, 5.0, 10.0, 10.0)));
+    let replacement = doc
+        .add_default(Annotation::Rectangle(rect(35.0, 5.0, 10.0, 10.0)))
+        .expect("annotation id space available");
 
     assert_ne!(replacement, first);
     assert_ne!(
@@ -185,14 +287,18 @@ fn undo_never_reuses_an_exposed_annotation_id() {
 #[test]
 fn hit_test_follows_z_order_changes() {
     let mut doc = document(200, 200);
-    let first = doc.add(
-        Annotation::Rectangle(rect(10.0, 10.0, 100.0, 100.0)),
-        Style::stroked().with_fill(Some(Color::rgb(255, 0, 0))),
-    );
-    let second = doc.add(
-        Annotation::Rectangle(rect(10.0, 10.0, 100.0, 100.0)),
-        Style::stroked().with_fill(Some(Color::rgb(0, 255, 0))),
-    );
+    let first = doc
+        .add(
+            Annotation::Rectangle(rect(10.0, 10.0, 100.0, 100.0)),
+            Style::stroked().with_fill(Some(Color::rgb(255, 0, 0))),
+        )
+        .expect("annotation id space available");
+    let second = doc
+        .add(
+            Annotation::Rectangle(rect(10.0, 10.0, 100.0, 100.0)),
+            Style::stroked().with_fill(Some(Color::rgb(0, 255, 0))),
+        )
+        .expect("annotation id space available");
     let probe = LogicalPoint::new(50.0, 50.0);
     assert_eq!(doc.hit_test(probe), Some(second));
 
@@ -217,7 +323,8 @@ fn hit_test_misses_outside_the_tolerance() {
     doc.add(
         Annotation::Rectangle(rect(50.0, 50.0, 40.0, 40.0)),
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     // An unfilled rectangle is hit on its outline, not its interior: clicking
     // the hollow middle of a frame should not select it.
     assert!(doc.hit_test(LogicalPoint::new(70.0, 70.0)).is_none());
@@ -231,7 +338,8 @@ fn filled_shapes_are_hit_in_their_interior() {
     doc.add(
         Annotation::Ellipse(rect(50.0, 50.0, 60.0, 60.0)),
         Style::stroked().with_fill(Some(Color::rgb(0, 0, 255))),
-    );
+    )
+    .expect("annotation id space available");
     assert!(doc.hit_test(LogicalPoint::new(80.0, 80.0)).is_some());
     // Still outside the ellipse even though it is inside the bounding box.
     assert!(doc.hit_test(LogicalPoint::new(52.0, 52.0)).is_none());
@@ -246,11 +354,35 @@ fn arrows_are_hit_along_the_line_not_the_bounding_box() {
             to: LogicalPoint::new(100.0, 100.0),
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     assert!(doc.hit_test(LogicalPoint::new(50.0, 50.0)).is_some());
     assert!(
         doc.hit_test(LogicalPoint::new(95.0, 5.0)).is_none(),
         "the far corner of an arrow's bounding box is empty space"
+    );
+}
+
+#[test]
+fn moving_a_curved_arrow_moves_its_control_point() {
+    let mut doc = document(200, 200);
+    let control = LogicalPoint::new(50.0, 10.0);
+    let id = doc
+        .add(
+            Annotation::Arrow {
+                from: LogicalPoint::new(10.0, 80.0),
+                to: LogicalPoint::new(120.0, 80.0),
+            },
+            Style::stroked()
+                .with_arrow_style(scrozz_annotate::ArrowStyle::Curved)
+                .with_curve_control(control),
+        )
+        .expect("annotation id space available");
+
+    assert!(doc.translate(id, 13.0, -7.0));
+    assert_eq!(
+        doc.get(id).unwrap().style.curve_control,
+        Some(LogicalPoint::new(63.0, 3.0))
     );
 }
 
@@ -266,6 +398,7 @@ fn counters_number_from_one_and_renumber_after_deletion() {
                 },
                 Style::stroked(),
             )
+            .expect("annotation id space available")
         })
         .collect();
 
@@ -295,7 +428,8 @@ fn counters_number_from_one_and_renumber_after_deletion() {
             index: 99,
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     assert_eq!(
         counter_indices(&doc),
         vec![1, 2, 3, 4],
@@ -306,20 +440,24 @@ fn counters_number_from_one_and_renumber_after_deletion() {
 #[test]
 fn counter_numbering_follows_creation_order_not_z_order() {
     let mut doc = document(300, 300);
-    let first = doc.add(
-        Annotation::Counter {
-            at: LogicalPoint::new(10.0, 10.0),
-            index: 0,
-        },
-        Style::stroked(),
-    );
-    let second = doc.add(
-        Annotation::Counter {
-            at: LogicalPoint::new(60.0, 10.0),
-            index: 0,
-        },
-        Style::stroked(),
-    );
+    let first = doc
+        .add(
+            Annotation::Counter {
+                at: LogicalPoint::new(10.0, 10.0),
+                index: 0,
+            },
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
+    let second = doc
+        .add(
+            Annotation::Counter {
+                at: LogicalPoint::new(60.0, 10.0),
+                index: 0,
+            },
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
 
     doc.bring_to_front(first);
 
@@ -338,18 +476,22 @@ fn counters_ignore_non_counter_annotations() {
             index: 0,
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
         Style::stroked(),
-    );
-    let third = doc.add(
-        Annotation::Counter {
-            at: LogicalPoint::new(60.0, 10.0),
-            index: 0,
-        },
-        Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
+    let third = doc
+        .add(
+            Annotation::Counter {
+                at: LogicalPoint::new(60.0, 10.0),
+                index: 0,
+            },
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     assert_eq!(index_of(&doc, third), Some(2));
     assert_eq!(doc.counter_count(), 2);
 }
@@ -360,7 +502,9 @@ fn resizing_to_the_current_bounds_is_a_no_op() {
     // `bounds()` reports must be exactly what `set_bounds` accepts back.
     let mut doc = document(300, 300);
     for (annotation, style) in every_annotation() {
-        let id = doc.add(annotation, style);
+        let id = doc
+            .add(annotation, style)
+            .expect("annotation id space available");
         let before = doc.get(id).unwrap().annotation.clone();
         let bounds = doc.get(id).unwrap().bounds();
         doc.set_bounds(id, bounds);
@@ -377,10 +521,12 @@ fn resizing_to_the_current_bounds_is_a_no_op() {
 #[test]
 fn visual_bounds_covers_the_stroke_and_geometric_bounds_does_not() {
     let mut doc = document(300, 300);
-    let id = doc.add(
-        Annotation::Rectangle(rect(50.0, 50.0, 40.0, 40.0)),
-        Style::stroked().with_stroke_width(10.0),
-    );
+    let id = doc
+        .add(
+            Annotation::Rectangle(rect(50.0, 50.0, 40.0, 40.0)),
+            Style::stroked().with_stroke_width(10.0),
+        )
+        .expect("annotation id space available");
     let object = doc.get(id).unwrap();
     assert!((object.bounds().size.width - 40.0).abs() < 1e-9);
     assert!(
@@ -394,13 +540,15 @@ fn curved_arrow_visual_bounds_include_bezier_extrema_for_auto_expand() {
     let mut doc = document(200, 70);
     let mut style = Style::stroked().with_stroke_width(4.0);
     style.arrow_style = scrozz_annotate::ArrowStyle::Curved;
-    let id = doc.add(
-        Annotation::Arrow {
-            from: LogicalPoint::new(20.0, 60.0),
-            to: LogicalPoint::new(180.0, 60.0),
-        },
-        style,
-    );
+    let id = doc
+        .add(
+            Annotation::Arrow {
+                from: LogicalPoint::new(20.0, 60.0),
+                to: LogicalPoint::new(180.0, 60.0),
+            },
+            style,
+        )
+        .expect("annotation id space available");
     doc.set_canvas(Canvas {
         auto_expand: true,
         ..Canvas::default()
@@ -421,10 +569,12 @@ fn curved_arrow_visual_bounds_include_bezier_extrema_for_auto_expand() {
 #[test]
 fn translate_and_set_bounds_move_and_resize() {
     let mut doc = document(300, 300);
-    let id = doc.add(
-        Annotation::Rectangle(rect(10.0, 10.0, 20.0, 20.0)),
-        Style::stroked(),
-    );
+    let id = doc
+        .add(
+            Annotation::Rectangle(rect(10.0, 10.0, 20.0, 20.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
 
     doc.translate(id, 15.0, -5.0);
     let moved = doc.get(id).unwrap().bounds();
@@ -441,14 +591,16 @@ fn translate_and_set_bounds_move_and_resize() {
 #[test]
 fn resizing_freehand_remaps_every_point_proportionally() {
     let mut doc = document(300, 300);
-    let id = doc.add(
-        Annotation::Freehand(vec![
-            LogicalPoint::new(0.0, 0.0),
-            LogicalPoint::new(10.0, 5.0),
-            LogicalPoint::new(20.0, 10.0),
-        ]),
-        Style::stroked(),
-    );
+    let id = doc
+        .add(
+            Annotation::Freehand(vec![
+                LogicalPoint::new(0.0, 0.0),
+                LogicalPoint::new(10.0, 5.0),
+                LogicalPoint::new(20.0, 10.0),
+            ]),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     doc.set_bounds(id, rect(100.0, 100.0, 40.0, 20.0));
 
     let Some(Annotation::Freehand(points)) = doc.get(id).map(|o| o.annotation.clone()) else {
@@ -469,13 +621,15 @@ fn resizing_a_degenerate_shape_does_not_produce_nan() {
     let mut doc = document(300, 300);
     // A perfectly horizontal freehand stroke has zero height; the remap must not
     // divide by it.
-    let id = doc.add(
-        Annotation::Freehand(vec![
-            LogicalPoint::new(0.0, 50.0),
-            LogicalPoint::new(40.0, 50.0),
-        ]),
-        Style::stroked(),
-    );
+    let id = doc
+        .add(
+            Annotation::Freehand(vec![
+                LogicalPoint::new(0.0, 50.0),
+                LogicalPoint::new(40.0, 50.0),
+            ]),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     doc.set_bounds(id, rect(10.0, 10.0, 80.0, 30.0));
     let Some(Annotation::Freehand(points)) = doc.get(id).map(|o| o.annotation.clone()) else {
         panic!("expected freehand");
@@ -486,20 +640,23 @@ fn resizing_a_degenerate_shape_does_not_produce_nan() {
 #[test]
 fn get_mut_renumbers_when_an_edit_changes_the_kind_balance() {
     let mut doc = document(300, 300);
-    let a = doc.add(
-        Annotation::Counter {
-            at: LogicalPoint::new(10.0, 10.0),
-            index: 0,
-        },
-        Style::stroked(),
-    );
+    let a = doc
+        .add(
+            Annotation::Counter {
+                at: LogicalPoint::new(10.0, 10.0),
+                index: 0,
+            },
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     doc.add(
         Annotation::Counter {
             at: LogicalPoint::new(40.0, 10.0),
             index: 0,
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
 
     // Turning the first marker into a rectangle must renumber the rest.
     {
@@ -512,10 +669,12 @@ fn get_mut_renumbers_when_an_edit_changes_the_kind_balance() {
 #[test]
 fn set_style_replaces_only_the_style() {
     let mut doc = document(300, 300);
-    let id = doc.add(
-        Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)),
-        Style::stroked(),
-    );
+    let id = doc
+        .add(
+            Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     doc.set_style(id, Style::stroked().with_stroke(Color::rgb(1, 2, 3)));
 
     let object = doc.get(id).unwrap();
@@ -527,16 +686,20 @@ fn set_style_replaces_only_the_style() {
 #[test]
 fn clear_removes_everything_but_keeps_ids_unique() {
     let mut doc = document(100, 100);
-    let a = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
-        Style::stroked(),
-    );
+    let a = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     doc.clear();
     assert!(doc.is_empty());
-    let b = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
-        Style::stroked(),
-    );
+    let b = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     assert_ne!(a, b);
 }
 
@@ -555,7 +718,9 @@ fn logical_bounds_covers_the_source() {
 fn every_variant_reports_a_kind_and_a_bounding_box() {
     let mut doc = document(200, 200);
     for (annotation, style) in every_annotation() {
-        let id = doc.add(annotation, style);
+        let id = doc
+            .add(annotation, style)
+            .expect("annotation id space available");
         let object = doc.get(id).unwrap();
         let bounds = object.bounds();
         assert!(

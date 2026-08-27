@@ -16,9 +16,9 @@
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_shell::drag::{
-    DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession,
-    FALLBACK_STEM, MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source,
-    card_rect_in_view, check_origin, sanitise_stem,
+    DragFormat, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, FALLBACK_STEM,
+    MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source, card_rect_in_view, check_origin,
+    point_in_view, sanitise_stem,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -443,6 +443,18 @@ fn a_card_at_the_top_of_an_unflipped_view_sits_at_the_top() {
     assert_eq!(placed.y, VIEW_HEIGHT - 60.0);
 }
 
+#[test]
+fn a_flipped_view_keeps_the_pointer_in_top_left_coordinates() {
+    let point = LogicalPoint::new(40.0, 120.0);
+    assert_eq!(point_in_view(point, VIEW_HEIGHT, true), point);
+}
+
+#[test]
+fn an_unflipped_view_flips_the_pointer_with_the_card() {
+    let point = point_in_view(LogicalPoint::new(40.0, 120.0), VIEW_HEIGHT, false);
+    assert_eq!(point, LogicalPoint::new(40.0, VIEW_HEIGHT - 120.0));
+}
+
 // ---------------------------------------------------------------------------
 // Origin validation
 // ---------------------------------------------------------------------------
@@ -513,53 +525,6 @@ fn the_first_outcome_wins() {
         Some(DragOutcome::Accepted(
             scrozz_shell::drag::DragOperation::Copy
         ))
-    );
-}
-
-#[test]
-fn an_accepted_lazy_drag_waits_for_delivery() {
-    let session = DragSession::awaiting_delivery();
-    session.finish(DragOutcome::Accepted(DragOperation::Copy));
-
-    assert!(session.is_active());
-    assert_eq!(session.outcome(), None);
-
-    session.delivery_succeeded();
-    assert_eq!(
-        session.outcome(),
-        Some(DragOutcome::Accepted(DragOperation::Copy))
-    );
-}
-
-#[test]
-fn delivery_failure_overrides_a_pending_acceptance() {
-    let session = DragSession::awaiting_delivery();
-    session.finish(DragOutcome::Accepted(DragOperation::Copy));
-    session.delivery_failed("disk full");
-    session.delivery_succeeded();
-
-    assert_eq!(
-        session.outcome(),
-        Some(DragOutcome::Failed("disk full".to_owned()))
-    );
-}
-
-#[test]
-fn lazy_delivery_and_platform_completion_can_arrive_in_either_order() {
-    let delivered_first = DragSession::awaiting_delivery();
-    delivered_first.delivery_succeeded();
-    delivered_first.finish(DragOutcome::Accepted(DragOperation::Copy));
-    assert_eq!(
-        delivered_first.outcome(),
-        Some(DragOutcome::Accepted(DragOperation::Copy))
-    );
-
-    let failed_first = DragSession::awaiting_delivery();
-    failed_first.delivery_failed("producer failed");
-    failed_first.finish(DragOutcome::Accepted(DragOperation::Copy));
-    assert_eq!(
-        failed_first.outcome(),
-        Some(DragOutcome::Failed("producer failed".to_owned()))
     );
 }
 
@@ -725,8 +690,27 @@ mod appkit {
     #[test]
     #[ignore = "needs the main thread and a running AppKit"]
     fn the_pasteboard_offers_png_and_tiff_lazily() {
-        let payload = DragPayload::png_capture("Flavours", byte_source(|| Ok(png_bytes())));
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let payload = DragPayload::png_capture(
+            "Flavours",
+            byte_source(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(png_bytes())
+            }),
+        );
         let harness = PromiseHarness::new(&payload);
+
+        assert!(harness.representation_is_promised("public.png"));
+        assert!(harness.representation_is_promised("public.tiff"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "probing promised image types materialized the payload"
+        );
 
         let png = harness
             .image_flavour("public.png")

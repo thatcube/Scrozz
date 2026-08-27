@@ -159,7 +159,13 @@ impl SkiaRenderer {
         document: &Document,
         scale: ScaleFactor,
     ) -> Result<RenderedFrame> {
-        self.render_resolved_at(document, document.canvas_geometry(), scale, None)
+        self.render_resolved_at(
+            document,
+            *document.canvas(),
+            document.canvas_geometry(),
+            scale,
+            None,
+        )
     }
 
     /// Composites through a temporary canvas without changing the document.
@@ -201,12 +207,13 @@ impl SkiaRenderer {
         scale: ScaleFactor,
     ) -> Result<RenderedFrame> {
         let geometry = document.canvas_geometry_for(canvas)?;
-        self.render_resolved_at(document, geometry, scale, None)
+        self.render_resolved_at(document, canvas, geometry, scale, None)
     }
 
     fn render_resolved_at(
         &self,
         document: &Document,
+        canvas: Canvas,
         canvas_geometry: crate::CanvasGeometry,
         scale: ScaleFactor,
         target_width: Option<u32>,
@@ -221,7 +228,7 @@ impl SkiaRenderer {
             ));
         }
         let edited = !document.annotations().is_empty()
-            || *document.canvas() != Canvas::default()
+            || canvas != Canvas::default()
             || document
                 .beautification()
                 .is_some_and(|beautification| !beautification.is_noop());
@@ -257,7 +264,12 @@ impl SkiaRenderer {
             None
         };
         let source_frame = converted_source.as_ref().unwrap_or(&document.source.frame);
-        let source = raster::to_pixmap(source_frame)?;
+        let mut source = raster::to_pixmap(source_frame)?;
+        sanitize_redacted_source(
+            &mut source,
+            document.annotations(),
+            document.source.frame.scale,
+        );
 
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
@@ -368,6 +380,7 @@ impl SkiaRenderer {
         }
         let rendered = self.render_resolved_at(
             document,
+            *document.canvas(),
             canvas,
             ScaleFactor::new(f64::from(width) / logical_width),
             Some(width),
@@ -494,6 +507,35 @@ fn output_color_space(document: &Document, edited: bool) -> ColorSpace {
     }
 }
 
+/// Removes every covered source sample before filtered canvas transforms.
+///
+/// Redactions are still rendered in z-order below. This first pass protects the
+/// edge of a redaction: bilinear scaling can otherwise move a covered source
+/// sample into an adjacent destination pixel that the later redaction does not
+/// quite cover.
+fn sanitize_redacted_source(
+    source: &mut Pixmap,
+    annotations: &[AnnotationObject],
+    source_scale: ScaleFactor,
+) {
+    let scale = source_scale.get() as f32;
+    for object in annotations {
+        let Annotation::Redact { area, style } = &object.annotation else {
+            continue;
+        };
+        if *style == RedactStyle::SmoothBlur {
+            continue;
+        }
+        let left = area.origin.x as f32 * scale;
+        let top = area.origin.y as f32 * scale;
+        let right = (area.origin.x + area.size.width) as f32 * scale;
+        let bottom = (area.origin.y + area.size.height) as f32 * scale;
+        if let Some(region) = redact::clip(source, left, top, right, bottom) {
+            redact::solid(source, region, Color::BLACK);
+        }
+    }
+}
+
 /// Draws source pixels through the reversible canvas transform and crop mask.
 fn draw_source(
     canvas: &mut Pixmap,
@@ -552,7 +594,7 @@ fn draw_source(
 /// stricter reading and the safer one: a redaction always erases what it covers.
 fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, redaction_seed: u64) {
     let opacity = object.style.effective_opacity();
-    if opacity <= 0.0 {
+    if opacity <= 0.0 && !object.annotation.is_destructive() {
         return;
     }
     let width = xf.length(object.style.effective_stroke_width());
@@ -615,15 +657,16 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, redac
             shapes::stroke_path(canvas, &path, &paint, width);
         }
         Annotation::Text { at, content } => {
-            let Some(path) = shapes::text(content, *at, &object.style, xf) else {
-                return;
-            };
+            let path = shapes::text(content, *at, &object.style, xf);
             let boxed = text_box(object, xf);
+            if path.is_none() && boxed.is_none() {
+                return;
+            }
             if object.style.shadow {
                 if let Some(boxed) = &boxed {
                     draw_path_shadow(canvas, boxed, None, true, xf);
-                } else {
-                    draw_path_shadow(canvas, &path, None, true, xf);
+                } else if let Some(path) = &path {
+                    draw_path_shadow(canvas, path, None, true, xf);
                 }
             }
 
@@ -634,6 +677,9 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, redac
                 background.contrasting()
             } else {
                 object.style.stroke
+            };
+            let Some(path) = path else {
+                return;
             };
             let paint = shapes::paint(ink, opacity, BlendMode::SourceOver);
             if object.style.text_preset == TextPreset::Outlined {
@@ -706,7 +752,15 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, redac
             };
             let strength = object.style.effective_redact_strength();
             match style {
-                RedactStyle::Blur => redact::blur_with_strength(canvas, region, strength),
+                RedactStyle::Blur => redact::blur_with_strength_and_seed(
+                    canvas,
+                    region,
+                    strength,
+                    mix_redaction_seed(redaction_seed, object.id.0),
+                ),
+                RedactStyle::SmoothBlur => {
+                    redact::smooth_blur_with_strength(canvas, region, strength);
+                }
                 RedactStyle::Pixelate => {
                     redact::pixelate_with_strength_and_seed(
                         canvas,

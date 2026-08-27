@@ -345,14 +345,13 @@ mod tests {
             "straight alpha, unchanged: the 128-alpha pixel is where premultiplication would show"
         );
 
-        // Both of these are deliberate, and both are the safe direction.
-        // Claiming sRGB for what might be Display P3 is what makes wide-gamut
-        // captures look wrong; claiming 1x for a 2x file only makes the OCR
-        // upscaler do slightly more work than it had to.
+        // The decoder recognises the exact profiles emitted by Scrozz without
+        // guessing about arbitrary third-party ICC data. A file still carries no
+        // notion of the display scale it came from.
         assert_eq!(
             frame.color_space,
-            ColorSpace::Unknown,
-            "the decoder must not claim a colour space it did not interpret"
+            ColorSpace::Srgb,
+            "the decoder should restore Scrozz's embedded sRGB profile"
         );
         assert_eq!(
             frame.scale,

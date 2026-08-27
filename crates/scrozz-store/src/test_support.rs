@@ -139,13 +139,15 @@ pub fn sample_display_capture(width: u32, height: u32, seed: u8) -> Capture {
 pub fn sample_document(width: u32, height: u32, seed: u8, annotations: usize) -> Document {
     let mut document = Document::new(sample_capture(width, height, seed));
     for i in 0..annotations {
-        document.add(
-            Annotation::Arrow {
-                from: LogicalPoint::new(i as f64, 0.0),
-                to: LogicalPoint::new(i as f64 + 10.0, 10.0),
-            },
-            Style::stroked(),
-        );
+        document
+            .add(
+                Annotation::Arrow {
+                    from: LogicalPoint::new(i as f64, 0.0),
+                    to: LogicalPoint::new(i as f64 + 10.0, 10.0),
+                },
+                Style::stroked(),
+            )
+            .expect("annotation id space available");
     }
     document
 }
@@ -157,21 +159,27 @@ pub fn sample_document(width: u32, height: u32, seed: u8, annotations: usize) ->
 #[must_use]
 pub fn richly_annotated_document(seed: u8) -> Document {
     let mut document = Document::new(sample_display_capture(32, 16, seed));
-    document.add(
-        Annotation::Rectangle(LogicalRect::new(
-            LogicalPoint::new(1.0, 2.0),
-            LogicalSize::new(3.0, 4.0),
-        )),
-        Style::stroked(),
-    );
-    document.add_default(Annotation::Text {
-        at: LogicalPoint::new(5.0, 6.0),
-        content: "look here".into(),
-    });
-    document.add_default(Annotation::Counter {
-        at: LogicalPoint::new(7.0, 8.0),
-        index: 1,
-    });
+    document
+        .add(
+            Annotation::Rectangle(LogicalRect::new(
+                LogicalPoint::new(1.0, 2.0),
+                LogicalSize::new(3.0, 4.0),
+            )),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
+    document
+        .add_default(Annotation::Text {
+            at: LogicalPoint::new(5.0, 6.0),
+            content: "look here".into(),
+        })
+        .expect("annotation id space available");
+    document
+        .add_default(Annotation::Counter {
+            at: LogicalPoint::new(7.0, 8.0),
+            index: 1,
+        })
+        .expect("annotation id space available");
     document
         .set_beautification(Some(Beautification::padded(24.0, Background::default())))
         .expect("display captures may be beautified");

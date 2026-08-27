@@ -19,8 +19,9 @@ pub mod tray;
 
 pub use drag::{
     ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
-    DragPreview, DragSession, DragSource, NativeDragSource, NativeSurface, PromisedFile,
-    byte_source, current_native_drag_surface, native_drag_source, native_surface_for_window,
+    DragPreview, DragSession, DragSource, NativeDragEvent, NativeDragSource, NativeSurface,
+    PromisedFile, byte_source, current_native_drag_event, current_native_drag_surface,
+    native_drag_source, native_surface_for_window,
 };
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,

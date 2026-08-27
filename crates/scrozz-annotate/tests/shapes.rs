@@ -3,7 +3,10 @@
 mod common;
 
 use common::{capture_with, flat, near, pixel, rect};
-use scrozz_annotate::{Annotation, Color, Document, Renderer, SkiaRenderer, Style, font};
+use scrozz_annotate::{
+    Annotation, AnnotationId, ArrowStyle, Color, Document, Renderer, SkiaRenderer, Style,
+    TextPreset, font,
+};
 use scrozz_core::{Frame, LogicalPoint, Provenance, ScaleFactor};
 
 /// A white canvas to draw black ink onto.
@@ -50,6 +53,37 @@ fn ink_bounds(frame: &Frame) -> Option<(u32, u32, u32, u32)> {
     found.then_some((l, t, r, b))
 }
 
+fn assert_rendered_ink_fits_visual_bounds(doc: &Document, id: AnnotationId) {
+    let visual = doc
+        .get(id)
+        .expect("annotation remains present")
+        .visual_bounds();
+    let rendered = SkiaRenderer::new()
+        .render_at_with_geometry(doc, ScaleFactor::new(2.0))
+        .expect("annotation renders with geometry");
+    let (left, top, right, bottom) =
+        ink_bounds(&rendered.frame).expect("annotation produces visible pixels");
+    let visual_left = rendered.geometry.source_to_output(visual.origin);
+    let visual_right = rendered.geometry.source_to_output(LogicalPoint::new(
+        visual.origin.x + visual.size.width,
+        visual.origin.y + visual.size.height,
+    ));
+    let tolerance = 1.0;
+
+    assert!(
+        f64::from(left) + tolerance >= visual_left.x.floor()
+            && f64::from(top) + tolerance >= visual_left.y.floor()
+            && f64::from(right) <= visual_right.x.ceil() + tolerance
+            && f64::from(bottom) <= visual_right.y.ceil() + tolerance,
+        "rendered ink ({left}, {top})..({right}, {bottom}) escaped visual bounds \
+         ({:.2}, {:.2})..({:.2}, {:.2})",
+        visual_left.x,
+        visual_left.y,
+        visual_right.x,
+        visual_right.y
+    );
+}
+
 #[test]
 fn an_arrow_has_a_head_that_is_wider_than_its_shaft() {
     let mut doc = white(120, 60);
@@ -59,7 +93,8 @@ fn an_arrow_has_a_head_that_is_wider_than_its_shaft() {
             to: LogicalPoint::new(100.0, 30.0),
         },
         ink(Style::stroked().with_stroke_width(4.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     let at_tail = column_thickness(&out, 20);
@@ -83,7 +118,8 @@ fn the_arrowhead_scales_with_stroke_width() {
                 to: LogicalPoint::new(170.0, 50.0),
             },
             ink(Style::stroked().with_stroke_width(width)),
-        );
+        )
+        .expect("annotation id space available");
         let out = SkiaRenderer::new().render(&doc).unwrap();
         column_thickness(&out, 160)
     };
@@ -106,12 +142,31 @@ fn an_arrow_points_at_its_destination() {
             to: LogicalPoint::new(80.0, 80.0),
         },
         ink(Style::stroked().with_stroke_width(3.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     let (l, t, r, b) = ink_bounds(&out).expect("something was drawn");
 
     assert!(l <= 12 && t <= 12, "the tail starts near (10,10): {l},{t}");
     assert!(r >= 78 && b >= 78, "the head reaches (80,80): {r},{b}");
+}
+
+#[test]
+fn curved_arrow_pixels_fit_the_shared_visual_geometry() {
+    let mut doc = white(320, 220);
+    let mut style = ink(Style::stroked().with_stroke_width(9.0));
+    style.arrow_style = ArrowStyle::Curved;
+    let id = doc
+        .add(
+            Annotation::Arrow {
+                from: LogicalPoint::new(35.0, 155.0),
+                to: LogicalPoint::new(275.0, 125.0),
+            },
+            style,
+        )
+        .expect("annotation id space available");
+
+    assert_rendered_ink_fits_visual_bounds(&doc, id);
 }
 
 #[test]
@@ -124,7 +179,8 @@ fn a_zero_length_arrow_draws_nothing_rather_than_a_singularity() {
             to: LogicalPoint::new(30.0, 30.0),
         },
         ink(Style::stroked()),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert_eq!(plain.data, out.data);
 }
@@ -135,7 +191,8 @@ fn a_rectangle_can_be_stroked_filled_or_both() {
     doc.add(
         Annotation::Rectangle(rect(20.0, 20.0, 40.0, 40.0)),
         ink(Style::stroked().with_stroke_width(2.0)),
-    );
+    )
+    .expect("annotation id space available");
     let stroked = SkiaRenderer::new().render(&doc).unwrap();
     assert!(
         near(pixel(&stroked, 40, 40), [255, 255, 255, 255], 2),
@@ -149,7 +206,8 @@ fn a_rectangle_can_be_stroked_filled_or_both() {
         ink(Style::stroked()
             .with_stroke_width(2.0)
             .with_fill(Some(Color::rgb(0, 200, 0)))),
-    );
+    )
+    .expect("annotation id space available");
     let filled = SkiaRenderer::new().render(&doc).unwrap();
     assert!(near(pixel(&filled, 40, 40), [0, 200, 0, 255], 2), "filled");
     assert!(
@@ -166,7 +224,8 @@ fn an_ellipse_is_round_not_rectangular() {
         ink(Style::stroked()
             .with_stroke_width(1.0)
             .with_fill(Some(Color::rgb(0, 0, 0)))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     assert!(pixel(&out, 50, 50)[0] < 128, "the centre is filled");
@@ -194,7 +253,8 @@ fn freehand_is_smoothed_rather_than_drawn_as_raw_segments() {
     doc.add(
         Annotation::Freehand(points.clone()),
         ink(Style::stroked().with_stroke_width(2.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     // The corner is rounded away rather than drawn as a spike.
@@ -245,7 +305,8 @@ fn freehand_with_two_points_is_a_straight_line() {
             LogicalPoint::new(70.0, 40.0),
         ]),
         ink(Style::stroked().with_stroke_width(2.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     let (l, t, r, b) = ink_bounds(&out).unwrap();
     assert!(l <= 11 && r >= 69);
@@ -266,7 +327,8 @@ fn freehand_ignores_duplicate_samples() {
             LogicalPoint::new(50.0, 30.0),
         ]),
         ink(Style::stroked().with_stroke_width(2.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert!(ink_count(&out) > 0, "the stroke should still be drawn");
     let (l, _, r, _) = ink_bounds(&out).unwrap();
@@ -282,7 +344,8 @@ fn text_draws_visible_glyphs() {
             content: "SCROZZ 123".to_owned(),
         },
         ink(Style::stroked().with_font_size(24.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert!(
         ink_count(&out) > 50,
@@ -309,7 +372,8 @@ fn text_measurement_matches_what_is_drawn() {
             content: content.to_owned(),
         },
         ink(Style::stroked().with_font_size(size)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     let (l, t, r, b) = ink_bounds(&out).unwrap();
 
@@ -330,6 +394,36 @@ fn text_measurement_matches_what_is_drawn() {
 }
 
 #[test]
+fn shaped_text_pixels_fit_visual_bounds_for_every_preset() {
+    for preset in [
+        TextPreset::Standard,
+        TextPreset::Monospaced,
+        TextPreset::Outlined,
+        TextPreset::Rounded,
+        TextPreset::Boxed,
+        TextPreset::RoundedBoxed,
+        TextPreset::MonospacedBoxed,
+    ] {
+        let mut doc = white(520, 160);
+        let mut style = ink(Style::stroked()
+            .with_font_size(34.0)
+            .with_fill(Some(Color::rgb(0, 0, 0))));
+        style.text_preset = preset;
+        let id = doc
+            .add(
+                Annotation::Text {
+                    at: LogicalPoint::new(35.0, 45.0),
+                    content: "A\u{301} ffi مرحبا שלום 42".to_owned(),
+                },
+                style,
+            )
+            .expect("annotation id space available");
+
+        assert_rendered_ink_fits_visual_bounds(&doc, id);
+    }
+}
+
+#[test]
 fn text_scales_with_font_size() {
     let measure_at = |size: f64| {
         let mut doc = white(400, 200);
@@ -339,7 +433,8 @@ fn text_scales_with_font_size() {
                 content: "AB".to_owned(),
             },
             ink(Style::stroked().with_font_size(size)),
-        );
+        )
+        .expect("annotation id space available");
         let out = SkiaRenderer::new().render(&doc).unwrap();
         let (l, t, r, b) = ink_bounds(&out).unwrap();
         (r - l, b - t)
@@ -360,7 +455,8 @@ fn an_unknown_character_renders_a_box_rather_than_vanishing() {
             content: "\u{4e2d}".to_owned(),
         },
         ink(Style::stroked().with_font_size(24.0)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert!(
         ink_count(&out) > 10,
@@ -379,7 +475,8 @@ fn a_counter_draws_a_disc_with_a_legible_numeral() {
         Style::stroked()
             .with_fill(Some(Color::rgb(220, 0, 0)))
             .with_font_size(20.0),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     // The disc is red.
@@ -412,7 +509,8 @@ fn counter_discs_scale_with_font_size() {
             Style::stroked()
                 .with_fill(Some(Color::rgb(0, 0, 0)))
                 .with_font_size(size),
-        );
+        )
+        .expect("annotation id space available");
         let out = SkiaRenderer::new().render(&doc).unwrap();
         let (l, _, r, _) = ink_bounds(&out).unwrap();
         r - l
@@ -439,7 +537,8 @@ fn renumbering_after_a_deletion_is_visible_in_the_render() {
             Style::stroked()
                 .with_fill(Some(Color::rgb(0, 0, 0)))
                 .with_font_size(18.0),
-        );
+        )
+        .expect("annotation id space available");
     }
     let ids: Vec<_> = doc.annotations().iter().map(|o| o.id).collect();
     let three = SkiaRenderer::new().render(&doc).unwrap();
@@ -473,7 +572,8 @@ fn counters_render_double_digit_numbers() {
             Style::stroked()
                 .with_fill(Some(Color::rgb(0, 0, 0)))
                 .with_font_size(14.0),
-        );
+        )
+        .expect("annotation id space available");
     }
     let out = SkiaRenderer::new()
         .render(&doc)
@@ -491,7 +591,8 @@ fn opacity_lightens_without_removing() {
             .with_stroke(Color::TRANSPARENT)
             .with_fill(Some(Color::rgb(0, 0, 0)))
             .with_opacity(0.5)),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     let p = pixel(&out, 30, 30);
     assert!(
@@ -506,7 +607,8 @@ fn shapes_stay_crisp_at_high_export_scales() {
     doc.add(
         Annotation::Rectangle(rect(10.0, 10.0, 30.0, 30.0)),
         ink(Style::stroked().with_stroke_width(1.0)),
-    );
+    )
+    .expect("annotation id space available");
     // Vector annotations must be re-rasterised at the export scale, not
     // upscaled from a 1x render — a 4x export of a 1pt stroke should still be
     // a clean 4px line.

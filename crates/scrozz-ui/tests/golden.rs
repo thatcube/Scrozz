@@ -110,6 +110,14 @@ fn renderer() -> SoftwareRenderer {
     SoftwareRenderer::production()
 }
 
+#[test]
+fn every_production_scenario_uses_a_real_surface() {
+    assert_eq!(
+        SceneRegistry::production().placeholder_scenarios(),
+        Vec::<Scenario>::new()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 1. Determinism
 // ---------------------------------------------------------------------------

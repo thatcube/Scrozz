@@ -29,6 +29,7 @@ use std::{
 };
 
 use scrozz_core::{Frame, LogicalPoint, LogicalRect};
+use scrozz_shell::NativeSurface;
 use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
@@ -296,32 +297,63 @@ pub enum CardEvent {
     Save(CardId),
     /// Swiped left: throw it away.
     Dismiss(CardId),
-    /// Dragged right or up: prepare a drag onto another application.
-    Drag {
-        /// Card being dragged.
+    /// The pointer first took hold of a card.
+    DragStarted(CardId),
+    /// Dragged right or up past the commitment threshold: begin the native drag.
+    DragOut {
+        /// The capture being offered.
         id: CardId,
-        /// Card geometry in the source window.
+        /// Card bounds in the native view's top-left logical coordinates.
         rect: LogicalRect,
-        /// Pointer at release in the source window.
+        /// Release point in the same coordinate space.
         pointer: LogicalPoint,
     },
     /// Swiped down: collapse into the capture dock (D20).
     Collapse(CardId),
     /// Clicked: open it for editing.
     Open(CardId),
+    /// Upload and produce a shareable link.
+    Upload(CardId),
+    /// Persist a capture's pin state.
+    Pin {
+        /// The capture.
+        id: CardId,
+        /// The new state.
+        pinned: bool,
+    },
+    /// The whole pile collapsed into its dock.
+    DockCollapsed,
+    /// The whole pile expanded out of its dock.
+    DockExpanded,
+    /// The last visible card finished leaving.
+    Emptied,
+    /// A recently closed capture returned to the stack.
+    Restored(CardId),
+    /// Temporary overlay visibility changed.
+    VisibilityChanged {
+        /// Whether the overlay is intentionally hidden.
+        hidden: bool,
+    },
 }
 
 impl CardEvent {
     /// Which card this happened to.
     #[must_use]
-    pub const fn card(&self) -> CardId {
+    pub const fn card(&self) -> Option<CardId> {
         match self {
             Self::Copy(id)
             | Self::Save(id)
             | Self::Dismiss(id)
+            | Self::DragStarted(id)
             | Self::Collapse(id)
-            | Self::Open(id) => *id,
-            Self::Drag { id, .. } => *id,
+            | Self::Open(id)
+            | Self::Upload(id)
+            | Self::Restored(id) => Some(*id),
+            Self::DragOut { id, .. } | Self::Pin { id, .. } => Some(*id),
+            Self::DockCollapsed
+            | Self::DockExpanded
+            | Self::Emptied
+            | Self::VisibilityChanged { .. } => None,
         }
     }
 }
@@ -346,16 +378,16 @@ pub trait CardSurface {
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
 
-    /// Completes a native drag without losing the source card on cancellation.
-    ///
-    /// A drag source remains resident in its original slot until the operating
-    /// system confirms that another application accepted it. Rejected, cancelled,
-    /// and failed drags therefore need no reconstruction.
-    fn finish_drag(&mut self, id: CardId, accepted: bool) {
-        if accepted {
-            self.dismiss(id);
-        }
+    /// Removes a card after a successful action such as Copy or Save.
+    fn dismiss_after_action(&mut self, id: CardId) {
+        self.dismiss(id);
     }
+
+    /// Applies a pin state after capture history has persisted it.
+    fn set_pinned(&mut self, _id: CardId, _pinned: bool) {}
+
+    /// Removes every visible card.
+    fn dismiss_all(&mut self) {}
 
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
@@ -366,6 +398,23 @@ pub trait CardSurface {
 
     /// How many cards are showing.
     fn len(&self) -> usize;
+
+    /// Restores the most recently closed card, if one exists.
+    fn restore_recent(&mut self) {}
+
+    /// Requests upload of the newest card.
+    fn upload_latest(&mut self) {}
+
+    /// Temporarily hides or shows the entire overlay.
+    fn toggle_hidden(&mut self) {}
+
+    /// The native view the overlay is drawn into.
+    fn native_surface(&self) -> Option<NativeSurface> {
+        None
+    }
+
+    /// Reports how a native drag ended.
+    fn finish_drag(&mut self, _id: CardId, _accepted: bool) {}
 
     /// Whether the stack is empty — which, per D27, is Scrozz's resting state.
     fn is_empty(&self) -> bool {
@@ -388,6 +437,7 @@ pub trait CardSurface {
 pub struct Recording {
     log: Arc<Mutex<Vec<Card>>>,
     injected: Arc<Mutex<Vec<CardEvent>>>,
+    pin_updates: Arc<Mutex<Vec<(CardId, bool)>>>,
 }
 
 impl Recording {
@@ -421,6 +471,19 @@ impl Recording {
             .push(event);
     }
 
+    /// Pin acknowledgements applied to this surface, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    #[must_use]
+    pub fn pin_updates(&self) -> Vec<(CardId, bool)> {
+        self.pin_updates
+            .lock()
+            .expect("pin updates are poisoned")
+            .clone()
+    }
+
     /// A handle sharing this recorder's state.
     #[must_use]
     pub fn handle(&self) -> Self {
@@ -440,6 +503,17 @@ impl CardSurface for Recording {
             .lock()
             .expect("card log is poisoned")
             .retain(|card| card.id != id);
+    }
+
+    fn set_pinned(&mut self, id: CardId, pinned: bool) {
+        self.pin_updates
+            .lock()
+            .expect("pin updates are poisoned")
+            .push((id, pinned));
+    }
+
+    fn dismiss_all(&mut self) {
+        self.log.lock().expect("card log is poisoned").clear();
     }
 
     fn poll(&mut self) -> Option<CardEvent> {
@@ -573,18 +647,30 @@ mod tests {
             CardEvent::Copy(id),
             CardEvent::Save(id),
             CardEvent::Dismiss(id),
-            CardEvent::Drag {
+            CardEvent::DragStarted(id),
+            CardEvent::DragOut {
                 id,
                 rect: LogicalRect::new(
-                    LogicalPoint::new(10.0, 20.0),
-                    scrozz_core::LogicalSize::new(240.0, 160.0),
+                    LogicalPoint::new(1.0, 2.0),
+                    scrozz_core::LogicalSize::new(3.0, 4.0),
                 ),
-                pointer: LogicalPoint::new(100.0, 80.0),
+                pointer: LogicalPoint::new(5.0, 6.0),
             },
             CardEvent::Collapse(id),
             CardEvent::Open(id),
+            CardEvent::Upload(id),
+            CardEvent::Pin { id, pinned: true },
+            CardEvent::Restored(id),
         ] {
-            assert_eq!(event.card(), id);
+            assert_eq!(event.card(), Some(id));
+        }
+        for event in [
+            CardEvent::DockCollapsed,
+            CardEvent::DockExpanded,
+            CardEvent::Emptied,
+            CardEvent::VisibilityChanged { hidden: true },
+        ] {
+            assert_eq!(event.card(), None);
         }
     }
 

@@ -8,9 +8,10 @@
 mod common;
 
 use common::{PADDING_SENTINEL, decode, embedded_profile, frame, pattern, pixel_at, rgba, solid};
-use scrozz_core::{ColorSpace, PixelFormat};
+use scrozz_core::{ColorSpace, Error, PixelFormat};
 use scrozz_export::{
-    EncodeOptions, Encoder, FrameEncoder, ImageFormat, profile_for, to_straight_rgba8,
+    ColorConversion, EncodeOptions, Encoder, FrameEncoder, ImageFormat, RgbaImage, convert_to_srgb,
+    profile_for, to_straight_rgba8,
 };
 
 const LOSSLESS: [ImageFormat; 2] = [ImageFormat::Png, ImageFormat::WebP];
@@ -303,6 +304,62 @@ fn bgra_and_rgba_describing_the_same_picture_encode_identically() {
 // ---------------------------------------------------------------------------
 // Colour management
 // ---------------------------------------------------------------------------
+
+#[test]
+fn known_wide_gamut_vectors_are_converted_to_srgb_pixels() {
+    let image = RgbaImage {
+        width: 1,
+        height: 1,
+        data: vec![128, 64, 32, 73],
+    };
+
+    assert_eq!(
+        convert_to_srgb(&image, ColorSpace::DisplayP3).unwrap().data,
+        [138, 59, 21, 73]
+    );
+    assert_eq!(
+        convert_to_srgb(&image, ColorSpace::Rec2020).unwrap().data,
+        [167, 67, 39, 73]
+    );
+}
+
+#[test]
+fn encoder_srgb_conversion_changes_pixels_profile_and_preserves_alpha() {
+    let source = frame(
+        1,
+        1,
+        0,
+        PixelFormat::Rgba8,
+        ColorSpace::DisplayP3,
+        |_, _| [128, 64, 32, 73],
+    );
+    let bytes = FrameEncoder::with_options(EncodeOptions {
+        color_conversion: ColorConversion::ToSrgb,
+        drop_opaque_alpha: false,
+        ..EncodeOptions::default()
+    })
+    .encode(&source, ImageFormat::Png)
+    .unwrap();
+
+    let (width, _, data) = decode(&bytes);
+    assert_eq!(pixel_at(&data, width, 0, 0), [138, 59, 21, 73]);
+    assert_eq!(embedded_profile(&bytes), profile_for(ColorSpace::Srgb));
+}
+
+#[test]
+fn converting_unknown_samples_is_refused_instead_of_retagged() {
+    let source = frame(1, 1, 0, PixelFormat::Rgba8, ColorSpace::Unknown, |_, _| {
+        [1, 2, 3, 255]
+    });
+    let error = FrameEncoder::with_options(EncodeOptions {
+        color_conversion: ColorConversion::ToSrgb,
+        ..EncodeOptions::default()
+    })
+    .encode(&source, ImageFormat::Png)
+    .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidRequest(_)));
+}
 
 #[test]
 fn every_format_carries_a_display_p3_profile() {

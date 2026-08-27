@@ -30,6 +30,7 @@ use crate::{
     clipboard::{ClipboardReport, SystemClipboard},
     encode::FrameEncoder,
     naming::{NamePolicy, NameTemplate, NamingContext},
+    selection::{ContentKind, DestinationKind, DestinationProfile, select_export},
 };
 
 // ---------------------------------------------------------------------------
@@ -81,12 +82,12 @@ pub struct UnimplementedS3Uploader;
 
 impl S3Uploader for UnimplementedS3Uploader {
     fn upload(&self, _object: &S3Object<'_>) -> Result<String> {
-        todo!(
-            "S3-compatible upload: sign a PUT with AWS Signature Version 4 and send it to \
-             {{endpoint}}/{{bucket}}/{{key}}. Endpoint, region and credentials come from \
-             configuration so that R2, B2 and MinIO work alongside AWS. Deliberately not \
-             implemented with an AWS SDK — see the S3Uploader documentation."
-        )
+        Err(Error::Unsupported {
+            what: "S3-compatible upload".to_owned(),
+            why: "no uploader is configured; install an S3Uploader that signs a PUT with AWS \
+                  Signature Version 4"
+                .to_owned(),
+        })
     }
 }
 
@@ -225,9 +226,56 @@ impl FileExporter {
                     height: frame.height(),
                     ..context.clone()
                 };
-                self.deliver(&bytes, format, destination, &context)
+                self.deliver(&bytes, format, destination, &context, frame.scale)
             }
         }
+    }
+
+    /// Selects a destination-compatible format and compression, then exports.
+    ///
+    /// The existing [`FileExporter::export_frame`] remains available when a
+    /// caller needs to force a format.
+    ///
+    /// # Errors
+    ///
+    /// As [`FileExporter::export_frame`], plus [`Error::Unsupported`] when the
+    /// destination accepts no format that can preserve the frame.
+    pub fn export_frame_auto(
+        &self,
+        frame: &Frame,
+        destination: &Destination,
+        profile: &DestinationProfile,
+        content: ContentKind,
+        context: &NamingContext,
+    ) -> Result<ExportOutcome> {
+        let actual_kind = match destination {
+            Destination::Clipboard => DestinationKind::Clipboard,
+            Destination::Folder(_) => DestinationKind::Folder,
+            Destination::S3 { .. } => DestinationKind::Upload,
+        };
+        if actual_kind != profile.kind {
+            return Err(Error::InvalidRequest(format!(
+                "destination profile {:?} does not match {:?}",
+                profile.kind, actual_kind
+            )));
+        }
+
+        let selection = select_export(frame, profile, content)?;
+        if matches!(destination, Destination::Clipboard) {
+            return Ok(ExportOutcome {
+                clipboard: self.write_clipboard(frame)?,
+                ..ExportOutcome::default()
+            });
+        }
+
+        let encoder = FrameEncoder::with_options(selection.options);
+        let bytes = encoder.encode(frame, selection.format)?;
+        let context = NamingContext {
+            width: frame.width(),
+            height: frame.height(),
+            ..context.clone()
+        };
+        self.deliver(&bytes, selection.format, destination, &context, frame.scale)
     }
 
     /// Delivers already-encoded bytes, naming the file from `context`.
@@ -241,6 +289,34 @@ impl FileExporter {
         destination: &Destination,
         context: &NamingContext,
     ) -> Result<ExportOutcome> {
+        self.export_encoded(
+            bytes,
+            destination,
+            context,
+            context.width,
+            context.height,
+            ScaleFactor::IDENTITY,
+        )
+    }
+
+    /// Delivers already-encoded bytes without discarding raster metadata.
+    ///
+    /// Use this path when one canonical encoding is shared by several byte
+    /// destinations. `width`, `height`, and `scale` affect naming only; the
+    /// encoded payload is delivered byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// As [`FileExporter::export_frame`].
+    pub fn export_encoded(
+        &self,
+        bytes: &[u8],
+        destination: &Destination,
+        context: &NamingContext,
+        width: u32,
+        height: u32,
+        scale: ScaleFactor,
+    ) -> Result<ExportOutcome> {
         let format = ImageFormat::sniff(bytes).ok_or_else(|| {
             Error::Codec(
                 "cannot export: the bytes are not PNG, JPEG or WebP, so no file extension \
@@ -248,7 +324,12 @@ impl FileExporter {
                     .into(),
             )
         })?;
-        self.deliver(bytes, format, destination, context)
+        let context = NamingContext {
+            width,
+            height,
+            ..context.clone()
+        };
+        self.deliver(bytes, format, destination, &context, scale)
     }
 
     fn deliver(
@@ -257,10 +338,11 @@ impl FileExporter {
         format: ImageFormat,
         destination: &Destination,
         context: &NamingContext,
+        scale: ScaleFactor,
     ) -> Result<ExportOutcome> {
         match destination {
             Destination::Folder(directory) => {
-                let path = self.write_file(bytes, directory, format, context)?;
+                let path = self.write_file(bytes, directory, format, context, scale)?;
                 Ok(ExportOutcome {
                     url: path_url(&path),
                     path: Some(path),
@@ -275,7 +357,7 @@ impl FileExporter {
                 })
             }
             Destination::S3 { bucket, prefix } => {
-                let url = self.upload(bytes, format, bucket, prefix, context)?;
+                let url = self.upload(bytes, format, bucket, prefix, context, scale)?;
                 Ok(ExportOutcome {
                     url: Some(url),
                     ..ExportOutcome::default()
@@ -308,16 +390,18 @@ impl FileExporter {
         directory: &Path,
         format: ImageFormat,
         context: &NamingContext,
+        scale: ScaleFactor,
     ) -> Result<PathBuf> {
         fs::create_dir_all(directory)?;
         let extension = format.extension();
 
         for _ in 0..64 {
-            let path = self.policy.unique_path(
+            let path = self.policy.unique_path_for_scale(
                 directory,
                 &self.template,
                 context,
                 extension,
+                scale,
                 &mut |p| p.exists(),
             )?;
             match File::create_new(&path) {
@@ -346,6 +430,7 @@ impl FileExporter {
         bucket: &str,
         prefix: &str,
         context: &NamingContext,
+        scale: ScaleFactor,
     ) -> Result<String> {
         let uploader = self.uploader.as_ref().ok_or_else(|| Error::Unsupported {
             what: "upload to S3-compatible storage".into(),
@@ -354,9 +439,13 @@ impl FileExporter {
                 .into(),
         })?;
 
-        let name = self
-            .policy
-            .file_name(&self.template, context, format.extension(), None)?;
+        let name = self.policy.file_name_for_scale(
+            &self.template,
+            context,
+            format.extension(),
+            None,
+            scale,
+        )?;
         let key = format!("{}{name}", normalise_prefix(prefix));
         let url = uploader.upload(&S3Object {
             bucket,

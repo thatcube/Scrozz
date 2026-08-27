@@ -438,7 +438,7 @@ impl DragPayload {
     ///
     /// The bytes must be PNG regardless of what the promised file is: PNG is
     /// the one still-image encoding every platform's clipboard understands, and
-    /// on macOS `NSImage` re-derives TIFF from it for the apps that want that
+    /// the macOS backend derives TIFF from it for apps that request that flavour
     /// instead.
     #[must_use]
     pub fn with_image(mut self, png: ByteSource) -> Self {
@@ -531,6 +531,53 @@ impl NativeSurface {
     }
 }
 
+/// The native mouse event that authorized a drag.
+///
+/// AppKit requires the actual event from the initiating gesture. Retaining it
+/// lets Scrozz finish a persistence barrier before beginning the native session
+/// without substituting a later event or fabricating one.
+#[cfg(target_os = "macos")]
+pub use crate::macos::drag::NativeDragEvent;
+
+/// No native initiating-event token exists on platforms whose drag backend is
+/// not implemented yet.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Clone)]
+pub struct NativeDragEvent {
+    surface: usize,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl NativeDragEvent {
+    /// The native surface associated with this unavailable token.
+    #[must_use]
+    pub fn surface(&self) -> NativeSurface {
+        // SAFETY: this value can only originate from a platform native surface.
+        unsafe { NativeSurface::from_raw(self.surface as *mut std::ffi::c_void) }
+    }
+}
+
+/// Retains the current native mouse event and its source surface.
+///
+/// # Errors
+///
+/// Returns [`Error::TargetGone`] when there is no current mouse drag event or
+/// source window, and [`Error::Unsupported`] off macOS.
+pub fn current_native_drag_event() -> Result<NativeDragEvent> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::drag::current_drag_event()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Unsupported {
+            what: "retaining the initiating native drag event".to_owned(),
+            why: "the native drag backend is not implemented on this platform".to_owned(),
+        })
+    }
+}
+
 /// Finds the native content surface of one of this process's application
 /// windows by title.
 ///
@@ -564,12 +611,13 @@ pub fn native_surface_for_window(title: &str) -> Result<NativeSurface> {
 /// All coordinates are **window-local logical points with a top-left origin** —
 /// Scrozz's convention everywhere, and the space `scrozz-ui` already works in.
 /// The flip into AppKit's bottom-left space happens inside the macOS backend,
-/// via [`card_rect_in_view`].
-#[derive(Debug, Clone, Copy)]
+/// via [`card_rect_in_view`] and [`point_in_view`].
+#[derive(Debug, Clone)]
 pub struct DragOrigin {
     surface: NativeSurface,
     card: LogicalRect,
     pointer: LogicalPoint,
+    native_event: Option<NativeDragEvent>,
 }
 
 impl DragOrigin {
@@ -585,25 +633,42 @@ impl DragOrigin {
             surface,
             card,
             pointer,
+            native_event: None,
+        }
+    }
+
+    /// Describes a drag authorized by a retained initiating native event.
+    #[must_use]
+    pub fn from_event(event: NativeDragEvent, card: LogicalRect, pointer: LogicalPoint) -> Self {
+        Self {
+            surface: event.surface(),
+            card,
+            pointer,
+            native_event: Some(event),
         }
     }
 
     /// The surface the drag starts from.
     #[must_use]
-    pub const fn surface(self) -> NativeSurface {
+    pub const fn surface(&self) -> NativeSurface {
         self.surface
     }
 
     /// The card's rectangle, window-local, top-left origin.
     #[must_use]
-    pub const fn card(self) -> LogicalRect {
+    pub const fn card(&self) -> LogicalRect {
         self.card
     }
 
     /// The pointer position, window-local, top-left origin.
     #[must_use]
-    pub const fn pointer(self) -> LogicalPoint {
+    pub const fn pointer(&self) -> LogicalPoint {
         self.pointer
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_event(&self) -> Option<&NativeDragEvent> {
+        self.native_event.as_ref()
     }
 }
 
@@ -630,6 +695,16 @@ pub fn card_rect_in_view(card: LogicalRect, view_height: f64, flipped: bool) -> 
         )
     } else {
         logical_to_appkit(card, view_height)
+    }
+}
+
+/// Places a top-left-origin point in a native view's own coordinate system.
+#[must_use]
+pub fn point_in_view(point: LogicalPoint, view_height: f64, flipped: bool) -> LogicalPoint {
+    if flipped {
+        point
+    } else {
+        LogicalPoint::new(point.x, view_height - point.y)
     }
 }
 
@@ -689,23 +764,15 @@ impl DragOutcome {
 }
 
 #[derive(Debug, Default)]
-struct SessionProgress {
-    outcome: Option<DragOutcome>,
-    pending_acceptance: Option<DragOperation>,
-    waits_for_delivery: bool,
-    delivered: bool,
-}
-
-#[derive(Debug, Default)]
 struct SessionState {
-    progress: Mutex<SessionProgress>,
+    outcome: Mutex<Option<DragOutcome>>,
 }
 
 /// A drag in flight.
 ///
 /// Handed back by [`DragSource::begin`] and cheap to clone. The UI polls
-/// [`Self::outcome`] each frame; until it returns `Some`, the source remains
-/// resident and its cached payload stays alive.
+/// [`Self::outcome`] each frame; until it returns `Some`, the card stays in
+/// drag mode.
 ///
 /// Deliberately poll-based rather than callback-based. The alternative is a
 /// closure invoked from AppKit's drag callback, which would run *inside* the
@@ -732,20 +799,6 @@ impl DragSession {
         }
     }
 
-    /// A session whose accepted drop is not complete until its lazy bytes were
-    /// delivered successfully.
-    #[must_use]
-    pub fn awaiting_delivery() -> Self {
-        let session = Self::new();
-        session
-            .state
-            .progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .waits_for_delivery = true;
-        session
-    }
-
     /// A session that has already finished, for a backend that failed before
     /// the drag could start.
     #[must_use]
@@ -755,61 +808,24 @@ impl DragSession {
         session
     }
 
-    /// Records the drag operation.
+    /// Records the outcome. The first call wins; later ones are ignored.
     ///
-    /// Delivery-gated sessions hold an acceptance until a file promise or lazy
-    /// image provider confirms that bytes reached the destination. A failure
-    /// reported first remains terminal when the platform later reports its
-    /// operation mask.
+    /// Later calls are ignored rather than overwriting because AppKit can
+    /// deliver `draggingSession:endedAtPoint:operation:` after the promise has
+    /// already reported a failure, and the *first* thing that went wrong is the
+    /// one worth showing.
     pub fn finish(&self, outcome: DragOutcome) {
         // A poisoned lock here means a previous holder panicked while recording
         // an outcome. Recovering is strictly better than propagating: the drag
         // is over either way, and a panic in the UI thread over a finished drag
         // helps nobody.
-        let mut progress = self
+        let mut slot = self
             .state
-            .progress
+            .outcome
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if progress.outcome.is_some() {
-            return;
-        }
-        if let DragOutcome::Accepted(operation) = outcome
-            && progress.waits_for_delivery
-            && !progress.delivered
-        {
-            progress.pending_acceptance = Some(operation);
-        } else {
-            progress.pending_acceptance = None;
-            progress.outcome = Some(outcome);
-        }
-    }
-
-    /// Confirms that a lazy file or image provider delivered its bytes.
-    pub fn delivery_succeeded(&self) {
-        let mut progress = self
-            .state
-            .progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        progress.delivered = true;
-        if progress.outcome.is_none()
-            && let Some(operation) = progress.pending_acceptance.take()
-        {
-            progress.outcome = Some(DragOutcome::Accepted(operation));
-        }
-    }
-
-    /// Reports that a lazy file or image provider could not deliver its bytes.
-    pub fn delivery_failed(&self, reason: impl Into<String>) {
-        let mut progress = self
-            .state
-            .progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if progress.outcome.is_none() {
-            progress.pending_acceptance = None;
-            progress.outcome = Some(DragOutcome::Failed(reason.into()));
+        if slot.is_none() {
+            *slot = Some(outcome);
         }
     }
 
@@ -817,10 +833,9 @@ impl DragSession {
     #[must_use]
     pub fn outcome(&self) -> Option<DragOutcome> {
         self.state
-            .progress
+            .outcome
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcome
             .clone()
     }
 

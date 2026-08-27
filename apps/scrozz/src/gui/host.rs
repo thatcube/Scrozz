@@ -17,15 +17,15 @@ use std::{
 use scrozz_annotate::{Document, Renderer, SkiaRenderer};
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat};
 use scrozz_shell::{
-    DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
-    NativeSurface, byte_source, current_native_drag_surface, native_drag_source,
-    native_surface_for_window,
+    DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragEvent,
+    NativeDragSource, byte_source, current_native_drag_event, native_drag_source,
 };
 use scrozz_ui::{
     AnnotationEditor, EditorDestination, EditorDragRequest, EditorEvent, OverlayHandle, Theme,
-    history::{WINDOW_TITLE as HISTORY_WINDOW_TITLE, viewport_builder, viewport_id},
+    history::{viewport_builder, viewport_id},
     icons::IconStore,
-    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
+    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions, VisibilityHook},
+    stack::CardMetrics,
 };
 
 use scrozz_core::Error as CoreError;
@@ -34,9 +34,10 @@ use scrozz_store::CaptureId;
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, EditorResult, PendingDrag, Tick},
+        app::{App, Config, EditorResult, OverlayConfig, OverlayDisplay, PendingDrag, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
+        panel::NativeSurfaceSlot,
         pipeline::{DragGeometry, DragSubject},
     },
     report::Report,
@@ -106,10 +107,10 @@ impl Host for Headless {
             std::thread::sleep(IDLE);
         }
 
-        let report = app.report();
         // Before the report is printed, not after: the menu-bar item should be
         // gone by the time the user sees any output about it.
         app.shut_down();
+        let report = app.report();
         Ok(report)
     }
 
@@ -134,13 +135,13 @@ impl Host for Headless {
 /// headless. Silently running without a window when a window was asked for is
 /// the failure mode this whole module exists to avoid: the app appears to work
 /// and nothing ever appears on screen.
-pub fn for_platform(_config: &Config, emit: Emit) -> CliResult<Box<dyn Host>> {
+pub fn for_platform(config: &Config, emit: Emit) -> CliResult<Box<dyn Host>> {
     if headless_requested() {
         return Ok(Box::new(Headless));
     }
 
     if HAS_WINDOW {
-        return Ok(Box::new(Windowed::new(emit)));
+        return Ok(Box::new(Windowed::configured(emit, config.overlay)));
     }
 
     Err(CliError::NotImplemented {
@@ -178,15 +179,25 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
 pub struct Windowed {
     handle: OverlayHandle,
     emit: Emit,
+    config: OverlayConfig,
+    native_surface: NativeSurfaceSlot,
 }
 
 impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
+        Self::configured(emit, OverlayConfig::default())
+    }
+
+    /// A window host with explicit stack controls.
+    #[must_use]
+    pub fn configured(emit: Emit, config: OverlayConfig) -> Self {
         Self {
             handle: OverlayHandle::new(),
             emit,
+            config,
+            native_surface: NativeSurfaceSlot::default(),
         }
     }
 }
@@ -199,13 +210,22 @@ impl Default for Windowed {
 
 impl Host for Windowed {
     fn run(self: Box<Self>, app: App) -> CliResult<Report> {
-        let geometry = work_area();
+        let geometry = work_area(self.config.display);
         tracing::info!(?geometry, "opening the overlay");
 
+        let mut metrics = CardMetrics::default().scaled(self.config.card_scale);
+        metrics.margin = self.config.stack_margin;
+        let geometry_state = Arc::new(Mutex::new(geometry));
         let options = OverlayOptions {
             geometry,
-            panel: panel_hook(),
-            probe: pointer_probe(),
+            panel: panel_hook(self.native_surface.clone()),
+            visibility: visibility_hook(self.native_surface.clone()),
+            probe: pointer_probe(Arc::clone(&geometry_state)),
+            card_metrics: metrics,
+            auto_close_secs: self
+                .config
+                .auto_close
+                .map(|duration| duration.as_secs_f64()),
             ..Default::default()
         };
 
@@ -216,13 +236,13 @@ impl Host for Windowed {
         let sink = Arc::clone(&outcome);
         let handle = self.handle.clone();
         let reporting = self.handle.clone();
+        let display = self.config.display;
         let emit = self.emit;
 
         eframe::run_native(
             "Scrozz",
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
-                let native_surface = native_surface(cc);
                 let drag_source = match native_drag_source() {
                     Ok(source) => Some(source),
                     Err(err) => {
@@ -240,12 +260,18 @@ impl Host for Windowed {
                     emit: Some(emit),
                     announced: false,
                     stopped: false,
+                    shutdown_requested: false,
                     editors: HashMap::new(),
                     active_editor_export: None,
                     editor_icons,
-                    native_surface,
                     drag_source,
                     active_drag: None,
+                    history_drag_events: Arc::new(Mutex::new(Vec::new())),
+                    show_editor_color_names: true,
+                    display,
+                    geometry,
+                    geometry_state,
+                    last_display_probe: Instant::now(),
                 }))
             }),
         )
@@ -278,7 +304,10 @@ impl Host for Windowed {
     fn surface(&self) -> Box<dyn CardSurface> {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
-        Box::new(OverlayCards::new(self.handle.clone()))
+        Box::new(OverlayCards::with_native_surface(
+            self.handle.clone(),
+            self.native_surface.clone(),
+        ))
     }
 }
 
@@ -291,12 +320,18 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
+    shutdown_requested: bool,
     editors: HashMap<CaptureId, Arc<Mutex<EditorSession>>>,
     active_editor_export: Option<CaptureId>,
     editor_icons: Arc<IconStore>,
-    native_surface: NativeSurface,
     drag_source: Option<NativeDragSource>,
     active_drag: Option<ActiveDrag>,
+    history_drag_events: Arc<Mutex<Vec<(CaptureId, NativeDragEvent)>>>,
+    show_editor_color_names: bool,
+    display: OverlayDisplay,
+    geometry: OverlayGeometry,
+    geometry_state: Arc<Mutex<OverlayGeometry>>,
+    last_display_probe: Instant,
 }
 
 struct EditorSession {
@@ -309,7 +344,8 @@ struct EditorSession {
     in_flight: Option<RevisionSnapshot>,
     pending_drag: Option<PendingEditorDrag>,
     export: Option<PendingEditorExport>,
-    ready_drag: Option<EditorDragRequest>,
+    ready_drag: Option<ReadyEditorDrag>,
+    initiating_drag_event: Option<Result<NativeDragEvent, String>>,
     autosave_due: Option<Instant>,
     retry_blocked: bool,
     close_requested: bool,
@@ -324,6 +360,12 @@ struct RevisionSnapshot {
 struct PendingEditorDrag {
     snapshot: RevisionSnapshot,
     request: EditorDragRequest,
+    native_event: NativeDragEvent,
+}
+
+struct ReadyEditorDrag {
+    request: EditorDragRequest,
+    native_event: NativeDragEvent,
 }
 
 #[derive(Clone)]
@@ -335,9 +377,15 @@ struct PendingEditorExport {
 
 impl EditorSession {
     fn new(document: Document) -> Self {
+        Self::new_with_color_names(document, true)
+    }
+
+    fn new_with_color_names(document: Document, show_color_names: bool) -> Self {
         let latest_data = document.data();
+        let mut editor = AnnotationEditor::new(document);
+        editor.set_show_color_names(show_color_names);
         Self {
-            editor: AnnotationEditor::new(document),
+            editor,
             pending: Vec::new(),
             drag: None,
             latest_revision: 0,
@@ -347,6 +395,7 @@ impl EditorSession {
             pending_drag: None,
             export: None,
             ready_drag: None,
+            initiating_drag_event: None,
             autosave_due: None,
             retry_blocked: false,
             close_requested: false,
@@ -375,6 +424,7 @@ impl EditorSession {
             && self.pending_drag.is_none()
             && self.export.is_none()
             && self.ready_drag.is_none()
+            && self.initiating_drag_event.is_none()
             && self.drag.is_none()
     }
 
@@ -455,20 +505,27 @@ impl EditorSession {
         {
             self.autosave_due = None;
         }
-        if self
-            .pending_drag
-            .as_ref()
-            .is_some_and(|pending| pending.snapshot.revision == revision)
-            && let Some(pending) = self.pending_drag.take()
-        {
-            self.ready_drag = Some(pending.request);
-        }
+        self.promote_acknowledged_drag();
         if self.needs_save() {
             self.editor.mark_save_pending();
         } else {
             self.editor.mark_save_succeeded();
         }
         true
+    }
+
+    fn promote_acknowledged_drag(&mut self) {
+        if self
+            .pending_drag
+            .as_ref()
+            .is_some_and(|pending| pending.snapshot.revision <= self.acknowledged_revision)
+            && let Some(pending) = self.pending_drag.take()
+        {
+            self.ready_drag = Some(ReadyEditorDrag {
+                request: pending.request,
+                native_event: pending.native_event,
+            });
+        }
     }
 
     fn export_requested(
@@ -533,6 +590,19 @@ impl EditorSession {
     }
 }
 
+fn lock_editor<'a>(
+    capture: &CaptureId,
+    editor: &'a Mutex<EditorSession>,
+) -> std::sync::MutexGuard<'a, EditorSession> {
+    editor.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            capture = %capture.0,
+            "annotation editor state was poisoned; recovering its latest snapshot"
+        );
+        poisoned.into_inner()
+    })
+}
+
 struct ActiveDrag {
     subject: DragSubject,
     session: DragSession,
@@ -570,37 +640,39 @@ impl Driver {
             .is_some_and(|report| report.non_activating)
     }
 
-    fn collect_editor_requests(&mut self) {
+    fn collect_editor_requests(&mut self, ctx: &egui::Context) {
         for request in self.app.drain_editor_requests() {
-            self.editors
-                .entry(request.capture)
-                .or_insert_with(|| Arc::new(Mutex::new(EditorSession::new(request.document))));
+            let viewport = editor_viewport_id(&request.capture);
+            match self.editors.entry(request.capture) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(Mutex::new(EditorSession::new_with_color_names(
+                        request.document,
+                        self.show_editor_color_names,
+                    ))));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Focus);
+                }
+            }
         }
     }
 
     fn drain_editor_events(&mut self) {
         let mut pending = Vec::new();
         for (capture, editor) in &self.editors {
-            match editor.lock() {
-                Ok(mut session) => pending.extend(
-                    std::mem::take(&mut session.pending)
-                        .into_iter()
-                        .map(|event| (capture.clone(), event)),
-                ),
-                Err(_) => {
-                    tracing::error!(capture = %capture.0, "annotation editor state was poisoned")
-                }
-            }
+            let mut session = lock_editor(capture, editor);
+            pending.extend(
+                std::mem::take(&mut session.pending)
+                    .into_iter()
+                    .map(|event| (capture.clone(), event)),
+            );
         }
 
         for (capture, event) in pending {
             let Some(editor) = self.editors.get(&capture) else {
                 continue;
             };
-            let Ok(mut session) = editor.lock() else {
-                tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
-                continue;
-            };
+            let mut session = lock_editor(&capture, editor);
             match event {
                 EditorEvent::Changed(data) => {
                     session.changed(data, Instant::now());
@@ -608,12 +680,24 @@ impl Driver {
                 EditorEvent::Save(data) => {
                     session.save_requested(data);
                 }
-                EditorEvent::DragRequested(request) => {
-                    let snapshot = session.stage(request.data.clone());
-                    session.pending_drag = Some(PendingEditorDrag { snapshot, request });
-                    session.autosave_due = None;
-                    session.retry_blocked = false;
-                }
+                EditorEvent::DragRequested(request) => match session.initiating_drag_event.take() {
+                    Some(Ok(native_event)) => {
+                        let snapshot = session.stage(request.data.clone());
+                        session.pending_drag = Some(PendingEditorDrag {
+                            snapshot,
+                            request,
+                            native_event,
+                        });
+                        session.autosave_due = None;
+                        session.retry_blocked = false;
+                    }
+                    Some(Err(error)) => {
+                        session.editor.set_notice(format!("Drag failed: {error}"));
+                    }
+                    None => session
+                        .editor
+                        .set_notice("Drag failed: the initiating mouse event was not retained."),
+                },
                 EditorEvent::ExportRequested { destination, data } => {
                     if self.active_editor_export.is_some() {
                         session
@@ -622,6 +706,15 @@ impl Driver {
                     } else {
                         self.active_editor_export = Some(capture.clone());
                         session.export_requested(data, destination);
+                    }
+                }
+                EditorEvent::ColorNamesChanged(show) => {
+                    drop(session);
+                    self.show_editor_color_names = show;
+                    for (editor_capture, editor) in &self.editors {
+                        lock_editor(editor_capture, editor)
+                            .editor
+                            .set_show_color_names(show);
                     }
                 }
                 EditorEvent::CloseRequested => {
@@ -641,11 +734,7 @@ impl Driver {
             self.active_editor_export = None;
             return;
         };
-        let Ok(mut session) = editor.lock() else {
-            tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
-            self.active_editor_export = None;
-            return;
-        };
+        let mut session = lock_editor(&capture, editor);
         let Some(export) = session.export.as_mut() else {
             self.active_editor_export = None;
             return;
@@ -672,15 +761,10 @@ impl Driver {
     fn dispatch_editor_saves(&mut self) {
         let now = Instant::now();
         for (capture, editor) in &self.editors {
-            let Ok(mut session) = editor.lock() else {
-                tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
-                continue;
-            };
+            let mut session = lock_editor(capture, editor);
             let snapshot = session.next_save(now);
             let Some(snapshot) = snapshot else {
-                if let Some(pending) = session.pending_drag.take() {
-                    session.ready_drag = Some(pending.request);
-                }
+                session.promote_acknowledged_drag();
                 continue;
             };
             if self
@@ -698,6 +782,7 @@ impl Driver {
 
     fn show_history(&self, ctx: &egui::Context) {
         let history = self.app.history();
+        let drag_events = Arc::clone(&self.history_drag_events);
         let visible = history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -718,8 +803,37 @@ impl Driver {
                 return;
             }
             history.ui(ui);
+            for capture in history.drain_native_drag_intents() {
+                match current_native_drag_event() {
+                    Ok(event) => {
+                        if let Ok(mut events) = drag_events.lock() {
+                            events.push((capture, event));
+                        } else {
+                            history.cancel_native_drag(
+                                &capture,
+                                "Drag failed: native event state was unavailable.",
+                            );
+                        }
+                    }
+                    Err(error) => history.cancel_native_drag(
+                        &capture,
+                        format!("Drag failed before it could begin: {error}"),
+                    ),
+                }
+            }
             ui.ctx().request_repaint_after(IDLE);
         });
+    }
+
+    fn collect_history_drag_events(&mut self) {
+        let events = self
+            .history_drag_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default();
+        for (capture, event) in events {
+            self.app.retain_history_drag_event(capture, event);
+        }
     }
 
     fn service_drag(&mut self, ctx: &egui::Context) {
@@ -747,7 +861,7 @@ impl Driver {
             );
             return;
         };
-        let origin = match drag_origin(ctx, self.native_surface, &pending) {
+        let origin = match drag_origin(ctx, &pending) {
             Ok(origin) => origin,
             Err(error) => {
                 self.app.drag_finished(
@@ -776,10 +890,7 @@ impl Driver {
                     let Some(editor) = self.editors.get(&capture) else {
                         continue;
                     };
-                    let Ok(mut session) = editor.lock() else {
-                        tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
-                        continue;
-                    };
+                    let mut session = lock_editor(&capture, editor);
                     session.save_finished(revision, None);
                 }
                 EditorResult::SaveFailed {
@@ -790,10 +901,7 @@ impl Driver {
                     let Some(editor) = self.editors.get(&capture) else {
                         continue;
                     };
-                    let Ok(mut session) = editor.lock() else {
-                        tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
-                        continue;
-                    };
+                    let mut session = lock_editor(&capture, editor);
                     session.save_finished(revision, Some(error));
                 }
                 EditorResult::Exported {
@@ -802,9 +910,8 @@ impl Driver {
                     destination,
                     detail,
                 } => {
-                    if let Some(editor) = self.editors.get(&capture)
-                        && let Ok(mut session) = editor.lock()
-                    {
+                    if let Some(editor) = self.editors.get(&capture) {
+                        let mut session = lock_editor(&capture, editor);
                         session.export_finished(revision, destination, Ok(detail));
                     }
                     if self.active_editor_export.as_ref() == Some(&capture) {
@@ -817,9 +924,8 @@ impl Driver {
                     destination,
                     error,
                 } => {
-                    if let Some(editor) = self.editors.get(&capture)
-                        && let Ok(mut session) = editor.lock()
-                    {
+                    if let Some(editor) = self.editors.get(&capture) {
+                        let mut session = lock_editor(&capture, editor);
                         session.export_finished(revision, destination, Err(error));
                     }
                     if self.active_editor_export.as_ref() == Some(&capture) {
@@ -836,17 +942,13 @@ impl Driver {
         let closing: Vec<_> = self
             .editors
             .iter()
-            .filter_map(|(capture, editor)| {
-                editor
-                    .lock()
-                    .ok()
-                    .is_some_and(|session| session.is_ready_to_close())
-                    .then(|| capture.clone())
-            })
+            .filter(|(capture, editor)| lock_editor(capture, editor).is_ready_to_close())
+            .map(|(capture, _)| capture.clone())
             .collect();
         for capture in closing {
             ctx.send_viewport_cmd_to(editor_viewport_id(&capture), egui::ViewportCommand::Close);
             self.editors.remove(&capture);
+            self.app.release_editor(capture);
         }
     }
 
@@ -859,6 +961,35 @@ impl Driver {
                 Arc::clone(&self.editor_icons),
             );
         }
+    }
+
+    fn flush_editors_for_shutdown(&mut self) {
+        self.drain_editor_events();
+        for (capture, editor) in &self.editors {
+            let mut session = lock_editor(capture, editor);
+            session.close_requested();
+        }
+        self.dispatch_editor_saves();
+    }
+
+    fn finish_shutdown(&mut self, ctx: &egui::Context) {
+        self.stopped = true;
+        self.app.shut_down();
+        self.drain_editor_results();
+        let report = self.app.report();
+        if let Ok(mut slot) = self.sink.lock() {
+            *slot = Some(report.clone());
+        }
+
+        if self.converted() {
+            if let Some(emit) = self.emit.take() {
+                emit(&report);
+            }
+            tracing::debug!("leaving without dismantling the converted panel");
+            std::process::exit(0);
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
 
@@ -884,41 +1015,40 @@ fn show_editor_viewport(
             } else {
                 Theme::light()
             };
-            let drag = match editor.lock() {
-                Ok(mut session) => {
-                    session.poll_drag();
-                    session.editor.show(ui, &icons, &theme);
-                    let events = session.editor.drain_events();
-                    if events
-                        .iter()
-                        .any(|event| matches!(event, EditorEvent::CloseRequested))
-                    {
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    }
-                    session.pending.extend(events);
-                    let drag = session
-                        .ready_drag
-                        .take()
-                        .map(|request| (session.editor.document().clone(), request));
-                    if session.drag.as_ref().is_some_and(DragSession::is_active) {
-                        ui.ctx().request_repaint_after(IDLE);
-                    }
-                    drag
-                }
-                Err(_) => {
-                    ui.label("This editor could not recover its document state.");
-                    None
-                }
-            };
+            let mut session = lock_editor(&capture, &editor);
+            session.poll_drag();
+            session.editor.show(ui, &icons, &theme);
+            let events = session.editor.drain_events();
+            if events
+                .iter()
+                .any(|event| matches!(event, EditorEvent::DragRequested(_)))
+            {
+                session.initiating_drag_event =
+                    Some(current_native_drag_event().map_err(|error| error.to_string()));
+            }
+            if events
+                .iter()
+                .any(|event| matches!(event, EditorEvent::CloseRequested))
+            {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            session.pending.extend(events);
+            let drag = session
+                .ready_drag
+                .take()
+                .map(|request| (session.editor.document().clone(), request));
+            if session.drag.as_ref().is_some_and(DragSession::is_active) {
+                ui.ctx().request_repaint_after(IDLE);
+            }
+            drop(session);
 
             if let Some((document, request)) = drag {
                 match begin_editor_drag(&document, &request) {
                     Ok(drag) => {
-                        if let Ok(mut session) = editor.lock() {
-                            session.editor.set_notice("Drop to copy the edited image.");
-                            session.drag = Some(drag);
-                        }
+                        let mut session = lock_editor(&capture, &editor);
+                        session.editor.set_notice("Drop to copy the edited image.");
+                        session.drag = Some(drag);
                         ui.ctx().request_repaint_after(IDLE);
                     }
                     Err(error) => {
@@ -927,9 +1057,9 @@ fn show_editor_viewport(
                             %error,
                             "could not begin annotation drag"
                         );
-                        if let Ok(mut session) = editor.lock() {
-                            session.editor.set_notice(format!("Drag failed: {error}"));
-                        }
+                        lock_editor(&capture, &editor)
+                            .editor
+                            .set_notice(format!("Drag failed: {error}"));
                     }
                 }
             }
@@ -939,8 +1069,9 @@ fn show_editor_viewport(
 
 fn begin_editor_drag(
     document: &Document,
-    request: &EditorDragRequest,
+    ready: &ReadyEditorDrag,
 ) -> scrozz_core::Result<DragSession> {
+    let request = &ready.request;
     let mut snapshot = document.clone();
     snapshot.restore(request.data.clone())?;
     let frame = SkiaRenderer::new().render(&snapshot)?;
@@ -949,11 +1080,8 @@ fn begin_editor_drag(
     let bytes = byte_source(move || Ok(promised.as_ref().clone()));
     let preview = DragPreview::from_png(png, request.preview.size)?;
     let payload = DragPayload::png_capture("Scrozz annotation", bytes).with_preview(preview);
-    let origin = DragOrigin::new(
-        current_native_drag_surface()?,
-        request.preview,
-        request.pointer,
-    );
+    let origin =
+        DragOrigin::from_event(ready.native_event.clone(), request.preview, request.pointer);
     native_drag_source()?.begin(payload, origin)
 }
 
@@ -1001,41 +1129,62 @@ impl eframe::App for Driver {
     /// `scrozz-shell`: refuse to swizzle a class whose name already begins
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let root_close_requested = ctx.input(|input| input.viewport().close_requested());
         self.announce_panel();
-        self.collect_editor_requests();
+        self.collect_editor_requests(ctx);
         self.drain_editor_events();
+        self.collect_history_drag_events();
 
-        let tick = if self.stopped {
-            Tick::Continue
-        } else {
-            self.app.tick()
-        };
-        self.collect_editor_requests();
-        self.drain_editor_results();
-        self.close_finished_editors(ctx);
-        self.show_history(ctx);
-        self.service_drag(ctx);
-
-        if !self.stopped && tick == Tick::Stop {
-            self.stopped = true;
-            let report = self.app.report();
-            if let Ok(mut slot) = self.sink.lock() {
-                *slot = Some(report.clone());
-            }
-
-            // Before the window closes, so the menu-bar item never outlives
-            // what the user can see.
-            self.app.shut_down();
-
-            if self.converted() {
-                if let Some(emit) = self.emit.take() {
-                    emit(&report);
+        if self.last_display_probe.elapsed() >= Duration::from_millis(250) {
+            self.last_display_probe = Instant::now();
+            let geometry = work_area(self.display);
+            if geometry != self.geometry {
+                self.geometry = geometry;
+                if let Ok(mut current) = self.geometry_state.lock() {
+                    *current = geometry;
                 }
-                tracing::debug!("leaving without dismantling the converted panel");
-                std::process::exit(0);
+                self.handle.set_geometry(geometry);
+            }
+        }
+
+        if !self.stopped {
+            let tick = if self.shutdown_requested {
+                self.app.settle_for_shutdown();
+                Tick::Continue
+            } else {
+                self.app.tick()
+            };
+            self.collect_editor_requests(ctx);
+            self.drain_editor_results();
+            self.close_finished_editors(ctx);
+            self.show_history(ctx);
+            self.service_drag(ctx);
+
+            if tick == Tick::Stop || root_close_requested {
+                self.shutdown_requested = true;
+                self.flush_editors_for_shutdown();
             }
 
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if self.shutdown_requested {
+                // Keep the root and editor viewports alive until each newest
+                // revision has a matching durable acknowledgement. A queue or
+                // store failure remains visible and retryable instead of being
+                // discarded by process teardown.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.app.settle_for_shutdown();
+                self.drain_editor_results();
+                self.close_finished_editors(ctx);
+                if self.editors.is_empty()
+                    && self.active_editor_export.is_none()
+                    && self.active_drag.is_none()
+                    && self.app.native_drags_settled()
+                {
+                    self.finish_shutdown(ctx);
+                }
+            } else {
+                self.overlay.service_hidden(ctx);
+                self.app.drain_overlay_events();
+            }
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while
@@ -1046,6 +1195,7 @@ impl eframe::App for Driver {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.overlay.ui(ui, frame);
+        self.app.drain_overlay_events();
         self.show_editors(ui.ctx());
     }
 
@@ -1057,13 +1207,9 @@ impl eframe::App for Driver {
     }
 }
 
-fn drag_origin(
-    ctx: &egui::Context,
-    root_surface: NativeSurface,
-    pending: &PendingDrag,
-) -> scrozz_core::Result<DragOrigin> {
+fn drag_origin(ctx: &egui::Context, pending: &PendingDrag) -> scrozz_core::Result<DragOrigin> {
     let mut geometry = pending.geometry;
-    let surface = if matches!(pending.subject, DragSubject::History(_)) {
+    if matches!(pending.subject, DragSubject::History(_)) {
         let history_origin = ctx.input(|input| {
             input
                 .raw
@@ -1076,11 +1222,12 @@ fn drag_origin(
             CoreError::TargetGone("the capture history window closed before drag-out began".into())
         })?;
         geometry = geometry_in_viewport(geometry, history_origin);
-        native_surface_for_window(HISTORY_WINDOW_TITLE)?
-    } else {
-        root_surface
-    };
-    Ok(DragOrigin::new(surface, geometry.rect, geometry.pointer))
+    }
+    Ok(DragOrigin::from_event(
+        pending.native_event.clone(),
+        geometry.rect,
+        geometry.pointer,
+    ))
 }
 
 fn geometry_in_viewport(mut geometry: DragGeometry, origin: egui::Pos2) -> DragGeometry {
@@ -1091,26 +1238,6 @@ fn geometry_in_viewport(mut geometry: DragGeometry, origin: egui::Pos2) -> DragG
     geometry
 }
 
-#[cfg(target_os = "macos")]
-fn native_surface(cc: &eframe::CreationContext<'_>) -> NativeSurface {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = cc.window_handle() else {
-        return NativeSurface::null();
-    };
-    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-        return NativeSurface::null();
-    };
-    // SAFETY: the handle borrows eframe's live root window, and Driver cannot
-    // outlive that window.
-    unsafe { NativeSurface::from_raw(appkit.ns_view.as_ptr()) }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn native_surface(_cc: &eframe::CreationContext<'_>) -> NativeSurface {
-    NativeSurface::null()
-}
-
 /// Set to `0` to leave the overlay window as `eframe` made it.
 ///
 /// The conversion is what stops a capture card stealing focus (D27), so this
@@ -1119,16 +1246,16 @@ fn native_surface(_cc: &eframe::CreationContext<'_>) -> NativeSurface {
 pub const PANEL_ENV: &str = "SCROZZ_GUI_PANEL";
 
 /// The native panel conversion, unless it was switched off.
-fn panel_hook() -> Option<scrozz_ui::PanelHook> {
+fn panel_hook(native_surface: NativeSurfaceSlot) -> Option<scrozz_ui::PanelHook> {
     let enabled =
         std::env::var(PANEL_ENV).map_or(true, |raw| !matches!(raw.as_str(), "0" | "false" | "no"));
     if !enabled {
         tracing::warn!(
             "the panel conversion is disabled; capture cards will pull focus when clicked"
         );
-        return None;
+        return Some(crate::gui::panel::hook_without_conversion(native_surface));
     }
-    Some(crate::gui::panel::hook())
+    Some(crate::gui::panel::hook_with_surface(native_surface))
 }
 
 /// Where the overlay window goes.
@@ -1136,10 +1263,14 @@ fn panel_hook() -> Option<scrozz_ui::PanelHook> {
 /// The work area, not the display bounds: anchoring a card to the bottom-left
 /// of the *bounds* puts it behind the Dock. Falls back to a sensible default
 /// rather than failing, because a card in a slightly wrong place beats no card.
-fn work_area() -> OverlayGeometry {
+fn work_area(display: OverlayDisplay) -> OverlayGeometry {
     #[cfg(target_os = "macos")]
     {
-        match scrozz_shell::macos::display::active_display() {
+        let selected = match display {
+            OverlayDisplay::Active => scrozz_shell::macos::display::active_display(),
+            OverlayDisplay::Primary => scrozz_shell::macos::display::primary_display(),
+        };
+        match selected {
             Ok(display) => {
                 let area = display.work_area;
                 return OverlayGeometry::new(egui::Rect::from_min_size(
@@ -1158,24 +1289,45 @@ fn work_area() -> OverlayGeometry {
 
 /// An exact pointer source for the click-through logic, if one is available.
 ///
-/// Returns `None` today. See [`PROBE_GAP`] — the degradation is bounded and
-/// documented, and a probe that guessed would be worse than none.
-fn pointer_probe() -> Option<scrozz_ui::PointerProbe> {
-    tracing::debug!("{PROBE_GAP}");
-    None
+/// macOS exposes the global pointer in the same flipped coordinate system as the
+/// display work areas, so converting to overlay-local coordinates is exact.
+fn pointer_probe(geometry: Arc<Mutex<OverlayGeometry>>) -> Option<scrozz_ui::PointerProbe> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Arc::new(move || {
+            let point = scrozz_shell::macos::display::pointer_location().ok()?;
+            let geometry = *geometry.lock().ok()?;
+            Some(egui::pos2(
+                point.x as f32 - geometry.work_area.left(),
+                point.y as f32 - geometry.work_area.top(),
+            ))
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = geometry;
+        None
+    }
 }
 
-/// Why there is no pointer probe.
-pub const PROBE_GAP: &str = "no crate exposes the pointer as a point. \
-     scrozz-shell reads NSEvent::mouseLocation inside \
-     macos::display::active_display and returns the Display containing it, \
-     never the location, so the one correct implementation of the AppKit \
-     coordinate flip is not reachable from here. Exposing \
-     `pub fn pointer_location() -> Result<LogicalPoint>` next to \
-     active_display would be a three-line extraction and is the right fix; \
-     calling NSEvent::mouseLocation again from this crate would duplicate \
-     that flip and eventually disagree with it. Without a probe the overlay \
-     re-samples click-through every 350ms, which is imprecise but bounded";
+/// Focus-preserving native visibility control where the platform provides it.
+fn visibility_hook(surface: NativeSurfaceSlot) -> Option<VisibilityHook> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Arc::new(move |visible| {
+            if let Err(error) = surface.set_visible_without_activation(visible) {
+                tracing::warn!(%error, visible, "could not change overlay visibility");
+            }
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = surface;
+        None
+    }
+}
 
 /// Whether the environment asked for a run without a window.
 #[must_use]
@@ -1251,9 +1403,12 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_gap_names_the_fix_rather_than_apologising() {
-        assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
-        assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    fn macos_has_an_exact_pointer_probe() {
+        let geometry = Arc::new(Mutex::new(OverlayGeometry::default()));
+        #[cfg(target_os = "macos")]
+        assert!(pointer_probe(geometry).is_some());
+        #[cfg(not(target_os = "macos"))]
+        assert!(pointer_probe(geometry).is_none());
     }
 
     #[test]
@@ -1381,6 +1536,24 @@ mod tests {
 
         session.save_requested(session.latest_data.clone());
         assert!(session.next_save(now).is_some());
+    }
+
+    #[test]
+    fn poisoned_editor_state_is_recovered_for_shutdown_persistence() {
+        let capture = CaptureId("editor-poison".to_owned());
+        let editor = Mutex::new(EditorSession::new(sample_document(16, 12, 3, 1)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = editor.lock().expect("initial lock");
+            panic!("poison the advisory mutex");
+        }));
+        assert!(editor.is_poisoned());
+
+        let mut recovered = lock_editor(&capture, &editor);
+        recovered.close_requested();
+        assert!(
+            recovered.is_ready_to_close(),
+            "an unchanged recovered editor must not strand shutdown"
+        );
     }
 
     #[test]

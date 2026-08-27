@@ -29,9 +29,10 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     thread::JoinHandle,
     time::SystemTime,
@@ -43,7 +44,7 @@ use scrozz_core::{
     LogicalRect, Provenance, ScaleFactor,
 };
 use scrozz_export::{Destination, Encoder, FrameEncoder, ImageFormat, SystemClipboard};
-use scrozz_shell::{DragPayload, DragPreview, byte_source};
+use scrozz_shell::{ByteSource, DragPayload, DragPreview, byte_source};
 use scrozz_store::{
     CaptureId, CaptureRecord, DocumentState, History, NewCapture, RetentionPolicy, SearchQuery,
     SqliteStore, Store,
@@ -136,13 +137,6 @@ pub enum Job {
     Copy(CardId),
     /// Write a card's capture to the configured folder.
     Save(CardId),
-    /// Prepare a live card for native drag-out.
-    Drag {
-        /// Card being dragged.
-        card: CardId,
-        /// Geometry reported by the overlay.
-        geometry: DragGeometry,
-    },
     /// Restore a stored capture into a new live card.
     Restore {
         /// Durable capture.
@@ -176,6 +170,22 @@ pub enum Job {
     Delete(CaptureId),
     /// Enforce the current source-image retention policy.
     EnforceRetention(RetentionPolicy),
+    /// Upload a card through the configured provider.
+    Upload(CardId),
+    /// Persist a capture's pin state.
+    Pin {
+        /// The card.
+        card: CardId,
+        /// The new state.
+        pinned: bool,
+    },
+    /// Return cached or history-rehydrated PNG bytes to a native callback.
+    Bytes {
+        /// The card.
+        card: CardId,
+        /// One-shot result channel.
+        reply: SyncSender<Result<Vec<u8>, String>>,
+    },
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Persist an editor snapshot through the existing history document.
@@ -198,6 +208,8 @@ pub enum Job {
         /// User-selected delivery destination.
         destination: EditorDestination,
     },
+    /// Release immutable source pixels retained while an editor was open.
+    ReleaseEditor(CaptureId),
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -221,6 +233,17 @@ pub enum Outcome {
         /// Which card.
         card: CardId,
         /// What happened, e.g. "copied to the clipboard".
+        detail: String,
+        /// Whether successful completion retires the visible card.
+        dismiss: bool,
+    },
+    /// Capture history accepted a pin-state change.
+    PinUpdated {
+        /// Which card.
+        card: CardId,
+        /// The persisted state.
+        pinned: bool,
+        /// What happened.
         detail: String,
     },
     /// A card action failed.
@@ -409,6 +432,39 @@ impl Pipeline {
         self.outcomes.try_recv().ok()
     }
 
+    /// A delayed PNG producer backed by the worker cache.
+    ///
+    /// Native file promises call this only when a drop target asks for bytes.
+    #[must_use]
+    pub fn byte_source(&self, card: CardId) -> ByteSource {
+        let jobs = self.jobs.clone();
+        Arc::new(move || {
+            let (reply, result) = sync_channel(1);
+            jobs.send(Job::Bytes { card, reply }).map_err(|_| {
+                CoreError::TargetGone(format!(
+                    "{card} cannot provide drag bytes because the capture worker stopped"
+                ))
+            })?;
+            result
+                .recv()
+                .map_err(|_| {
+                    CoreError::TargetGone(format!(
+                        "{card} cannot provide drag bytes because the capture worker stopped"
+                    ))
+                })?
+                .map_err(CoreError::TargetGone)
+        })
+    }
+
+    /// Materializes a capture into a self-contained delayed byte source.
+    ///
+    /// AppKit may fulfill a promised file after the visible drag has ended and
+    /// the card cache has been released. Leasing the bytes before starting the
+    /// native session keeps that delayed callback independent of pipeline state.
+    pub fn lease_bytes(&self, card: CardId) -> Result<ByteSource, CoreError> {
+        Ok(leased_byte_source(self.byte_source(card)()?))
+    }
+
     /// Stops the worker and waits for it.
     ///
     /// Called from `Drop`, but exposed so a host can shut down deterministically
@@ -425,23 +481,49 @@ impl Pipeline {
     }
 }
 
+fn leased_byte_source(bytes: Vec<u8>) -> ByteSource {
+    let bytes = Arc::new(bytes);
+    Arc::new(move || Ok(bytes.as_ref().clone()))
+}
+
 impl Drop for Pipeline {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-/// What the worker remembers about a card it produced.
+/// Encoded pixels and the raster metadata needed for density-aware delivery.
+#[derive(Clone)]
 struct Cached {
     bytes: Arc<Vec<u8>>,
-    stem: String,
-    capture: Option<CaptureId>,
+    width: u32,
+    height: u32,
+    scale: ScaleFactor,
+}
+
+impl Cached {
+    fn new(bytes: Arc<Vec<u8>>, width: u32, height: u32, scale: ScaleFactor) -> Self {
+        Self {
+            bytes,
+            width,
+            height,
+            scale,
+        }
+    }
+}
+
+struct SavedExport {
+    path: PathBuf,
+    bytes: Arc<Vec<u8>>,
 }
 
 struct Worker {
     outcomes: Sender<Outcome>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
+    history_ids: HashMap<CardId, CaptureId>,
+    loaded_sources: HashMap<CaptureId, Capture>,
+    saved: HashMap<CardId, SavedExport>,
 }
 
 impl Worker {
@@ -466,6 +548,9 @@ impl Worker {
             outcomes,
             store,
             cache: HashMap::new(),
+            history_ids: HashMap::new(),
+            loaded_sources: HashMap::new(),
+            saved: HashMap::new(),
         }
     }
 
@@ -475,7 +560,6 @@ impl Worker {
                 Job::Capture { kind, card } => self.capture(kind, card),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
-                Job::Drag { card, geometry } => self.drag_card(card, geometry),
                 Job::Restore { capture, card } => self.restore(capture, card),
                 Job::OpenEditor(capture) => self.open_editor(capture),
                 Job::OpenCard(card) => self.open_card(card),
@@ -487,9 +571,6 @@ impl Worker {
                 Job::SetPinned { capture, pinned } => self.set_pinned(capture, pinned),
                 Job::Delete(capture) => self.delete(capture),
                 Job::EnforceRetention(policy) => self.enforce_retention(&policy),
-                Job::Release(card) => {
-                    self.cache.remove(&card);
-                }
                 Job::PersistEdits {
                     capture,
                     revision,
@@ -501,6 +582,18 @@ impl Worker {
                     data,
                     destination,
                 } => self.export_edits(capture, revision, data, destination),
+                Job::ReleaseEditor(capture) => {
+                    self.loaded_sources.remove(&capture);
+                }
+                Job::Upload(card) => self.upload(card),
+                Job::Pin { card, pinned } => self.pin(card, pinned),
+                Job::Bytes { card, reply } => {
+                    let result = self
+                        .png_bytes(card, "drag")
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Job::Release(card) => self.release(card),
                 Job::Stop => break,
             }
         }
@@ -567,12 +660,16 @@ impl Worker {
         };
         self.cache.insert(
             card,
-            Cached {
-                bytes: Arc::new(bytes),
-                stem: "Scrozz capture".to_owned(),
-                capture: built.capture_id.clone(),
-            },
+            Cached::new(
+                Arc::new(bytes),
+                capture.frame.width(),
+                capture.frame.height(),
+                capture.frame.scale,
+            ),
         );
+        if let Some(capture_id) = built.capture_id.clone() {
+            self.history_ids.insert(card, capture_id);
+        }
 
         Ok(built)
     }
@@ -599,43 +696,74 @@ impl Worker {
     }
 
     fn copy(&mut self, card: CardId) {
-        let result = self
-            .render_card(card, "copy")
-            .and_then(|bytes| Ok(scrozz_export::decode(&bytes)?))
-            .and_then(|frame| {
+        let result = self.png_bytes(card, "copy").and_then(|bytes| {
+            #[cfg(target_os = "macos")]
+            {
+                scrozz_shell::macos::clipboard::write_png(&bytes)?;
+                Ok("copied to the clipboard as PNG and TIFF".to_owned())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // The round trip through PNG is deliberate — see the module
+                // docs — and also supports history-rehydrated cards.
+                let frame = scrozz_export::decode(&bytes)?;
                 SystemClipboard::new().write_image_reporting(&frame)?;
                 Ok("copied to the clipboard".to_owned())
-            });
-        self.answer(card, result);
+            }
+        });
+        self.answer(card, result, true);
     }
 
     fn save(&mut self, card: CardId) {
-        let result = self.render_card(card, "save").and_then(|bytes| {
-            let path = crate::output::export_default(&bytes)?;
-            Ok(format!("saved to {}", path.display()))
+        let result = self.save_cached_with(card, |cached| {
+            crate::output::export_default_encoded(
+                cached.bytes.as_slice(),
+                cached.width,
+                cached.height,
+                cached.scale,
+            )
         });
-        self.answer(card, result);
+        self.answer(card, result, true);
     }
 
-    fn drag_card(&mut self, card: CardId, geometry: DragGeometry) {
-        let result = self
-            .cached(card, "drag")
-            .and_then(|cached| drag_payload(&cached.stem, Arc::clone(&cached.bytes), geometry));
-        match result {
-            Ok(payload) => {
-                let _ = self.outcomes.send(Outcome::DragReady {
-                    subject: DragSubject::Card(card),
-                    payload,
-                    geometry,
-                });
-            }
-            Err(error) => {
-                let _ = self.outcomes.send(Outcome::DragFailed {
-                    subject: DragSubject::Card(card),
-                    error,
-                });
-            }
+    fn save_with(
+        &mut self,
+        card: CardId,
+        export: impl FnOnce(&[u8]) -> CliResult<PathBuf>,
+    ) -> CliResult<String> {
+        self.save_cached_with(card, |cached| export(cached.bytes.as_slice()))
+    }
+
+    fn save_cached_with(
+        &mut self,
+        card: CardId,
+        export: impl FnOnce(&Cached) -> CliResult<PathBuf>,
+    ) -> CliResult<String> {
+        let cached = self.cached_capture(card, "save")?;
+        if let Some(saved) = self.saved.get(&card)
+            && saved.bytes.as_slice() == cached.bytes.as_slice()
+        {
+            return Ok(format!("already saved to {}", saved.path.display()));
         }
+        let path = export(&cached)?;
+        self.saved.insert(
+            card,
+            SavedExport {
+                path: path.clone(),
+                bytes: cached.bytes,
+            },
+        );
+        Ok(format!("saved to {}", path.display()))
+    }
+
+    fn upload(&mut self, card: CardId) {
+        let result = self.png_bytes(card, "upload").and_then(|_| {
+            Err(CliError::not_implemented(
+                "uploading a capture",
+                "an S3Uploader configured for the GUI capture pipeline",
+            ))
+        });
+        self.answer(card, result, false);
     }
 
     fn restore(&mut self, capture: CaptureId, card: CardId) {
@@ -655,12 +783,14 @@ impl Worker {
             };
             self.cache.insert(
                 card,
-                Cached {
-                    bytes: Arc::clone(&rendered.bytes),
-                    stem: stem_for(&rendered.record),
-                    capture: Some(capture.clone()),
-                },
+                Cached::new(
+                    Arc::clone(&rendered.bytes),
+                    rendered.frame.width(),
+                    rendered.frame.height(),
+                    rendered.frame.scale,
+                ),
             );
+            self.history_ids.insert(card, capture.clone());
             built
         });
 
@@ -684,6 +814,8 @@ impl Worker {
         let result = self.load_document(&capture);
         match result {
             Ok(document) => {
+                self.loaded_sources
+                    .insert(capture.clone(), document.source.clone());
                 let _ = self.outcomes.send(Outcome::EditorReady {
                     capture,
                     document: Box::new(document),
@@ -771,6 +903,9 @@ impl Worker {
             CliError::usage("history is unavailable, so the edited image cannot be exported")
         })?;
         store.save_edits(capture, &data)?;
+        if let Some(source) = self.loaded_sources.get(capture).cloned() {
+            return Ok(Document::from_data(source, data)?);
+        }
         let state = store
             .document(capture)?
             .ok_or_else(|| CliError::usage(format!("{} is no longer in history", capture.0)))?;
@@ -784,21 +919,18 @@ impl Worker {
     }
 
     fn capture_id(&self, card: CardId, verb: &str) -> CliResult<CaptureId> {
-        self.cached(card, verb)?
-            .capture
-            .clone()
+        self.history_ids
+            .get(&card)
+            .cloned()
             .ok_or_else(|| CliError::usage(format!("{card} is not available in history to {verb}")))
     }
 
     fn open_card(&mut self, card: CardId) {
-        let capture = match self.cached(card, "open for editing") {
-            Ok(cached) => cached.capture.clone().ok_or_else(|| {
-                CliError::Core(CoreError::Storage(format!(
-                        "{card} was captured while history was unavailable, so it has no stored document"
-                    )))
-            }),
-            Err(error) => Err(error),
-        };
+        let capture = self.history_ids.get(&card).cloned().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(format!(
+                "{card} cannot open for editing because it was captured while history was unavailable"
+            )))
+        });
         match capture {
             Ok(capture) => self.open_editor(capture),
             Err(error) => {
@@ -820,7 +952,12 @@ impl Worker {
 
     fn save_history(&mut self, capture: CaptureId) {
         let result = self.render_stored(&capture).and_then(|rendered| {
-            let path = crate::output::export_default(rendered.bytes.as_slice())?;
+            let path = crate::output::export_default_encoded(
+                rendered.bytes.as_slice(),
+                rendered.frame.width(),
+                rendered.frame.height(),
+                rendered.frame.scale,
+            )?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer_history(HistoryOperation::Save, capture, result);
@@ -964,20 +1101,70 @@ impl Worker {
         });
     }
 
-    fn cached(&self, card: CardId, verb: &str) -> CliResult<&Cached> {
+    fn pin(&mut self, card: CardId, pinned: bool) {
+        let result = (|| {
+            let capture = self
+                .history_ids
+                .get(&card)
+                .cloned()
+                .ok_or_else(|| CliError::usage(format!("{card} is not present in history")))?;
+            let store = self
+                .store
+                .as_mut()
+                .ok_or_else(|| CliError::usage("capture history is unavailable"))?;
+            store.set_pinned(&capture, pinned)?;
+            Ok(if pinned {
+                "pinned in capture history".to_owned()
+            } else {
+                "unpinned in capture history".to_owned()
+            })
+        })();
+        let message = match result {
+            Ok(detail) => Outcome::PinUpdated {
+                card,
+                pinned,
+                detail,
+            },
+            Err(error) => Outcome::Refused { card, error },
+        };
+        let _ = self.outcomes.send(message);
+    }
+
+    fn png_bytes(&mut self, card: CardId, verb: &str) -> CliResult<Vec<u8>> {
+        Ok(self.cached_capture(card, verb)?.bytes.as_ref().clone())
+    }
+
+    fn cached_capture(&mut self, card: CardId, verb: &str) -> CliResult<Cached> {
+        if let Some(capture) = self.history_ids.get(&card).cloned() {
+            let rendered = self.render_stored(&capture)?;
+            let cached = Cached::new(
+                rendered.bytes,
+                rendered.frame.width(),
+                rendered.frame.height(),
+                rendered.frame.scale,
+            );
+            self.cache.insert(card, cached.clone());
+            return Ok(cached);
+        }
+
         self.cache
             .get(&card)
+            .cloned()
             .ok_or_else(|| CliError::usage(format!("{card} has no capture to {verb}")))
     }
 
-    fn render_card(&mut self, card: CardId, verb: &str) -> CliResult<Vec<u8>> {
-        let capture = self.capture_id(card, verb)?;
-        Ok(self.render_stored(&capture)?.bytes.as_ref().clone())
+    fn release(&mut self, card: CardId) {
+        self.cache.remove(&card);
+        self.saved.remove(&card);
     }
 
-    fn answer(&self, card: CardId, result: CliResult<String>) {
+    fn answer(&self, card: CardId, result: CliResult<String>, dismiss: bool) {
         let message = match result {
-            Ok(detail) => Outcome::Done { card, detail },
+            Ok(detail) => Outcome::Done {
+                card,
+                detail,
+                dismiss,
+            },
             Err(error) => Outcome::Refused { card, error },
         };
         let _ = self.outcomes.send(message);
@@ -1143,11 +1330,8 @@ fn history_thumbnail(
     document: &Document,
     source_scale: ScaleFactor,
 ) -> CliResult<scrozz_core::Frame> {
-    let logical = document.logical_size();
-    let padding = document
-        .beautification()
-        .map_or(0.0, |beautification| beautification.padding.max(0.0) * 2.0);
-    let longest = (logical.width + padding).max(logical.height + padding);
+    let logical = document.output_logical_size();
+    let longest = logical.width.max(logical.height);
     if !longest.is_finite() || longest <= 0.0 {
         return Err(CliError::Core(CoreError::InvalidRequest(
             "capture history thumbnail has invalid geometry".to_owned(),
@@ -1211,10 +1395,13 @@ fn history_image_evicted(capture: &CaptureId) -> CliError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        cell::Cell,
+        sync::{Arc, Barrier},
+    };
 
     use scrozz_store::test_support::{
-        ScratchDir, richly_annotated_document, sample_document, sample_frame, scratch_dir,
+        ScratchDir, richly_annotated_document, sample_display_capture, sample_document, scratch_dir,
     };
 
     use super::*;
@@ -1229,6 +1416,9 @@ mod tests {
                 outcomes,
                 store: Some(store),
                 cache: HashMap::new(),
+                history_ids: HashMap::new(),
+                loaded_sources: HashMap::new(),
+                saved: HashMap::new(),
             },
             receiver,
         )
@@ -1240,6 +1430,20 @@ mod tests {
             .expect("worker outcome")
     }
 
+    fn worker(store: Option<SqliteStore>) -> (Worker, Receiver<Outcome>) {
+        let (outcomes, replies) = channel();
+        (
+            Worker {
+                outcomes,
+                store,
+                cache: HashMap::new(),
+                history_ids: HashMap::new(),
+                loaded_sources: HashMap::new(),
+                saved: HashMap::new(),
+            },
+            replies,
+        )
+    }
     #[test]
     fn a_pipeline_hands_out_distinct_card_identities() {
         let mut pipeline = Pipeline::start().expect("the worker should start");
@@ -1356,12 +1560,11 @@ mod tests {
             store: Some(store),
             cache: HashMap::from([(
                 card,
-                Cached {
-                    bytes: Arc::new(Vec::new()),
-                    stem: "test".to_owned(),
-                    capture: Some(capture_id.clone()),
-                },
+                Cached::new(Arc::new(Vec::new()), 0, 0, ScaleFactor::IDENTITY),
             )]),
+            history_ids: HashMap::from([(card, capture_id.clone())]),
+            loaded_sources: HashMap::new(),
+            saved: HashMap::new(),
         };
 
         worker.open_card(card);
@@ -1397,7 +1600,78 @@ mod tests {
     }
 
     #[test]
-    fn rendered_export_never_contains_pixels_hidden_by_persisted_redaction() {
+    fn an_open_editor_can_export_after_retention_evicts_its_stored_source() {
+        let (_dir, mut worker, receiver) = worker_with_store("pipeline-editor-eviction");
+        let original = sample_document(20, 14, 8, 0);
+        let capture = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&original))
+            .expect("insert capture");
+
+        worker.open_editor(capture.clone());
+        let loaded = match received(&receiver) {
+            Outcome::EditorReady {
+                capture: loaded_capture,
+                document,
+            } => {
+                assert_eq!(loaded_capture, capture);
+                *document
+            }
+            other => panic!("expected an editor document, got {other:?}"),
+        };
+        assert!(worker.loaded_sources.contains_key(&capture));
+
+        worker
+            .store
+            .as_mut()
+            .expect("store")
+            .enforce_retention(&RetentionPolicy {
+                max_image_bytes: 0,
+                ..RetentionPolicy::default()
+            })
+            .expect("evict source");
+        assert!(matches!(
+            worker
+                .store
+                .as_mut()
+                .unwrap()
+                .document(&capture)
+                .unwrap()
+                .unwrap(),
+            DocumentState::ImageEvicted(_)
+        ));
+
+        let mut changed = loaded.data();
+        changed.canvas.flip_horizontal = true;
+        let exported = worker
+            .document_for_export(&capture, changed.clone())
+            .expect("the open editor retains immutable source pixels");
+        assert_eq!(exported.data(), changed);
+        SkiaRenderer::new()
+            .render(&exported)
+            .expect("retained source renders");
+        assert!(matches!(
+            worker
+                .store
+                .as_mut()
+                .unwrap()
+                .document(&capture)
+                .unwrap()
+                .unwrap(),
+            DocumentState::ImageEvicted(_)
+        ));
+
+        worker.loaded_sources.remove(&capture);
+        let error = worker
+            .document_for_export(&capture, changed)
+            .expect_err("a closed editor must not synthesize an evicted source");
+        assert!(error.to_string().contains("evicted"), "{error}");
+    }
+
+    #[test]
+    fn every_live_card_byte_lease_renders_persisted_redaction_over_stale_cache_bytes() {
         use scrozz_annotate::{Annotation, RedactStyle, Style};
         use scrozz_core::{
             ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, PixelFormat,
@@ -1428,31 +1702,75 @@ mod tests {
         let capture_id = store
             .insert(NewCapture::new(&document))
             .expect("capture inserted");
-        document.add(
-            Annotation::Redact {
-                area: document.logical_bounds(),
-                style: RedactStyle::Solid,
-            },
-            Style::redaction(),
-        );
+        document
+            .add(
+                Annotation::Redact {
+                    area: document.logical_bounds(),
+                    style: RedactStyle::Solid,
+                },
+                Style::redaction(),
+            )
+            .expect("annotation id space available");
         store
             .save_edits(&capture_id, &document.data())
             .expect("redaction persisted");
+        let stale_original = FrameEncoder::new()
+            .encode(&document.source.frame, ImageFormat::Png)
+            .expect("encode deliberately stale source bytes");
+        let stale_pixels = scrozz_export::to_straight_rgba8(
+            &scrozz_export::decode(&stale_original).expect("decode stale source"),
+        )
+        .expect("normalise stale source");
+        assert!(
+            stale_pixels
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == SECRET),
+            "the test fixture must prove the stale cache contains the secret"
+        );
 
         let (outcome_tx, _outcome_rx) = channel();
+        let card = CardId(88);
         let mut worker = Worker {
             outcomes: outcome_tx,
             store: Some(store),
-            cache: HashMap::new(),
+            cache: HashMap::from([(
+                card,
+                Cached::new(
+                    Arc::new(stale_original.clone()),
+                    document.source.frame.width(),
+                    document.source.frame.height(),
+                    document.source.frame.scale,
+                ),
+            )]),
+            history_ids: HashMap::from([(card, capture_id.clone())]),
+            loaded_sources: HashMap::new(),
+            saved: HashMap::new(),
         };
-        let encoded = worker
-            .render_stored(&capture_id)
-            .expect("render persisted document");
-        let exported =
-            scrozz_export::decode(encoded.bytes.as_slice()).expect("decode rendered export");
+        let lease = leased_byte_source(
+            worker
+                .png_bytes(card, "drag")
+                .expect("external bytes render persisted document"),
+        );
+        let leased_bytes = lease().expect("native promise receives self-contained bytes");
+        assert_ne!(
+            leased_bytes, stale_original,
+            "the live-card cache must be replaced by the rendered edited document"
+        );
+        let exported = scrozz_export::to_straight_rgba8(
+            &scrozz_export::decode(&leased_bytes).expect("decode rendered export"),
+        )
+        .expect("normalise rendered export");
         assert!(
-            exported.data.chunks_exact(4).all(|pixel| pixel != SECRET),
-            "an external export exposed a source pixel hidden by redaction"
+            exported
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel != SECRET),
+            "copy, save, drag, and upload share this path; none may expose a redacted source pixel"
         );
 
         let retained = worker
@@ -1539,6 +1857,52 @@ mod tests {
                 preview.height()
             );
         }
+    }
+
+    #[test]
+    fn history_thumbnail_scales_from_final_crop_rotation_and_framing_geometry() {
+        use scrozz_annotate::{AspectPreset, Beautification, Canvas, CanvasRotation};
+        use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+
+        let mut document = Document::new(sample_display_capture(4_000, 2_000, 10));
+        document
+            .set_canvas(Canvas {
+                crop: Some(LogicalRect::new(
+                    LogicalPoint::new(200.0, 100.0),
+                    LogicalSize::new(400.0, 1_600.0),
+                )),
+                rotation: CanvasRotation::Clockwise90,
+                ..Canvas::default()
+            })
+            .expect("valid crop");
+        document
+            .set_beautification(Some(Beautification {
+                padding: 80.0,
+                aspect: AspectPreset::Story,
+                ..Beautification::default()
+            }))
+            .expect("valid framing");
+
+        let output = document.output_logical_size();
+        assert!(output.height > output.width);
+        let preview =
+            history_thumbnail(&document, ScaleFactor::new(2.0)).expect("render thumbnail");
+        assert!(preview.width().max(preview.height()) <= THUMBNAIL_MAX_EDGE);
+        assert!(
+            preview.height() > preview.width(),
+            "the thumbnail must preserve final portrait framing, got {}x{}",
+            preview.width(),
+            preview.height()
+        );
+        let expected_scale = (f64::from(THUMBNAIL_MAX_EDGE) / output.height).min(2.0);
+        let expected_width = (output.width * expected_scale).round() as u32;
+        assert!(
+            preview.width().abs_diff(expected_width) <= 1,
+            "thumbnail {}x{} did not use final output geometry {:?}",
+            preview.width(),
+            preview.height(),
+            output
+        );
     }
 
     #[test]
@@ -1631,75 +1995,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preparing_a_native_drag_keeps_the_live_cards_cache() {
-        let (_dir, mut worker, receiver) = worker_with_store("worker-drag");
-        let card = Card::placeholder(CardId(4), CaptureKind::Fullscreen);
-        let bytes = FrameEncoder::new()
-            .encode(&sample_frame(16, 8, 7), ImageFormat::Png)
-            .expect("encode");
-        worker.cache.insert(
-            card.id,
-            Cached {
-                bytes: Arc::new(bytes),
-                stem: "Drag me".to_owned(),
-                capture: None,
-            },
-        );
-        let geometry = DragGeometry {
-            rect: LogicalRect::new(
-                LogicalPoint::new(10.0, 20.0),
-                scrozz_core::LogicalSize::new(240.0, 160.0),
-            ),
-            pointer: LogicalPoint::new(80.0, 60.0),
-        };
-
-        worker.drag_card(card.id, geometry);
-        assert!(matches!(
-            received(&receiver),
-            Outcome::DragReady {
-                subject: DragSubject::Card(CardId(4)),
-                ..
-            }
-        ));
-        assert!(
-            worker.cache.contains_key(&card.id),
-            "the cache must survive until the native drop outcome is known"
-        );
-    }
-
-    #[test]
-    fn preparing_a_broken_drag_reports_failure_without_discarding_the_cache() {
-        let (_dir, mut worker, receiver) = worker_with_store("worker-broken-drag");
-        let card = Card::placeholder(CardId(5), CaptureKind::Fullscreen);
-        worker.cache.insert(
-            card.id,
-            Cached {
-                bytes: Arc::new(Vec::new()),
-                stem: "Broken".to_owned(),
-                capture: None,
-            },
-        );
-        let geometry = DragGeometry {
-            rect: LogicalRect::new(
-                LogicalPoint::new(0.0, 0.0),
-                scrozz_core::LogicalSize::new(100.0, 80.0),
-            ),
-            pointer: LogicalPoint::new(20.0, 20.0),
-        };
-        worker.drag_card(card.id, geometry);
-        worker.drag_card(card.id, geometry);
-        assert!(matches!(
-            received(&receiver),
-            Outcome::DragFailed {
-                subject: DragSubject::Card(CardId(5)),
-                ..
-            }
-        ));
-        assert!(worker.cache.contains_key(&card.id));
-    }
-
-    #[test]
     fn unavailable_history_is_an_explicit_worker_failure() {
         let (outcomes, receiver) = channel();
         let mut reader = HistoryReader {
@@ -1733,6 +2028,9 @@ mod tests {
             outcomes,
             store: Some(store),
             cache: HashMap::new(),
+            history_ids: HashMap::new(),
+            loaded_sources: HashMap::new(),
+            saved: HashMap::new(),
         };
         let gate = Arc::new(Barrier::new(2));
         let writer_gate = Arc::clone(&gate);
@@ -1764,6 +2062,178 @@ mod tests {
         assert_eq!(final_page.entries.len(), 12);
         drop(worker);
         drop(dir);
+    }
+
+    #[test]
+    fn byte_source_reaches_the_worker_and_reports_a_missing_card() {
+        let pipeline = Pipeline::start().expect("the worker should start");
+        let error =
+            pipeline.byte_source(CardId(404))().expect_err("an unknown card has no PNG bytes");
+        assert!(error.to_string().contains("404"), "{error}");
+    }
+
+    #[test]
+    fn released_bytes_are_rehydrated_from_history_on_demand() {
+        let dir = scratch_dir("pipeline-rehydrate");
+        let mut store = SqliteStore::open(dir.path()).expect("history opens");
+        let capture = store
+            .insert(NewCapture::new(&sample_document(4, 3, 7, 0)))
+            .expect("capture enters history");
+        let (mut worker, _) = worker(Some(store));
+        let card = CardId(12);
+        worker.history_ids.insert(card, capture);
+
+        let first = worker.png_bytes(card, "drag").expect("history rehydrates");
+        assert!(first.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(worker.cache.contains_key(&card));
+
+        worker.release(card);
+        assert!(!worker.cache.contains_key(&card));
+        let second = worker
+            .png_bytes(card, "copy")
+            .expect("a restored card rehydrates again");
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn a_materialized_byte_lease_survives_cache_release() {
+        let (mut worker, _) = worker(None);
+        let card = CardId(13);
+        let bytes = b"\x89PNG\r\n\x1a\nleased".to_vec();
+        worker.cache.insert(
+            card,
+            Cached::new(Arc::new(bytes.clone()), 1, 1, ScaleFactor::IDENTITY),
+        );
+
+        let leased = leased_byte_source(worker.png_bytes(card, "drag").expect("lease bytes"));
+        worker.release(card);
+
+        assert!(!worker.cache.contains_key(&card));
+        assert_eq!(leased().expect("delayed promise still owns bytes"), bytes);
+    }
+
+    #[test]
+    fn saving_the_same_live_card_exports_once_but_release_resets_the_memo() {
+        let (mut worker, _) = worker(None);
+        let card = CardId(8);
+        let bytes = b"\x89PNG\r\n\x1a\ncapture".to_vec();
+        worker.cache.insert(
+            card,
+            Cached::new(Arc::new(bytes.clone()), 1200, 800, ScaleFactor::new(2.0)),
+        );
+        let calls = Cell::new(0);
+        let path = PathBuf::from("/tmp/scrozz-save-once.png");
+
+        let first = worker
+            .save_cached_with(card, |given| {
+                calls.set(calls.get() + 1);
+                assert_eq!(given.bytes.as_slice(), bytes);
+                assert_eq!((given.width, given.height), (1200, 800));
+                assert_eq!(given.scale.get(), 2.0);
+                Ok(path.clone())
+            })
+            .expect("first save");
+        let second = worker
+            .save_with(card, |_| {
+                calls.set(calls.get() + 1);
+                Ok(PathBuf::from("/tmp/duplicate.png"))
+            })
+            .expect("second save");
+
+        assert_eq!(calls.get(), 1);
+        assert!(first.contains("saved to"));
+        assert!(second.contains("already saved"));
+        assert_eq!(
+            worker.saved.get(&card).map(|saved| &saved.path),
+            Some(&path)
+        );
+
+        worker.release(card);
+        worker.cache.insert(
+            card,
+            Cached::new(Arc::new(bytes), 1, 1, ScaleFactor::IDENTITY),
+        );
+        let restored_path = PathBuf::from("/tmp/scrozz-save-after-restore.png");
+        let restored = worker
+            .save_with(card, |_| {
+                calls.set(calls.get() + 1);
+                Ok(restored_path.clone())
+            })
+            .expect("a restored card saves its current rendered bytes");
+
+        assert_eq!(calls.get(), 2);
+        assert!(restored.contains("saved to"));
+        assert_eq!(
+            worker.saved.get(&card).map(|saved| &saved.path),
+            Some(&restored_path)
+        );
+    }
+
+    #[test]
+    fn saving_again_after_persisted_edits_exports_fresh_rendered_bytes() {
+        use scrozz_annotate::{Annotation, RedactStyle, Style};
+
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-save-fresh-edits");
+        let mut document = sample_document(24, 16, 31, 0);
+        let capture = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&document))
+            .expect("insert");
+        let card = CardId(52);
+        worker.history_ids.insert(card, capture.clone());
+
+        let first_bytes = std::cell::RefCell::new(Vec::new());
+        worker
+            .save_cached_with(card, |cached| {
+                *first_bytes.borrow_mut() = cached.bytes.as_ref().clone();
+                Ok(PathBuf::from("/tmp/scrozz-before-redaction.png"))
+            })
+            .expect("first save");
+
+        document
+            .add(
+                Annotation::Redact {
+                    area: document.logical_bounds(),
+                    style: RedactStyle::Solid,
+                },
+                Style::redaction(),
+            )
+            .expect("redaction");
+        worker
+            .store
+            .as_mut()
+            .expect("store")
+            .save_edits(&capture, &document.data())
+            .expect("persist redaction");
+
+        let calls = Cell::new(0);
+        let second_bytes = std::cell::RefCell::new(Vec::new());
+        let detail = worker
+            .save_cached_with(card, |cached| {
+                calls.set(calls.get() + 1);
+                *second_bytes.borrow_mut() = cached.bytes.as_ref().clone();
+                Ok(PathBuf::from("/tmp/scrozz-after-redaction.png"))
+            })
+            .expect("edited save");
+
+        assert_eq!(calls.get(), 1, "changed persisted pixels must be exported");
+        assert!(detail.contains("saved to"), "{detail}");
+        assert_ne!(*first_bytes.borrow(), *second_bytes.borrow());
+        let rendered = scrozz_export::to_straight_rgba8(
+            &scrozz_export::decode(&second_bytes.borrow()).expect("decode edited save"),
+        )
+        .expect("normalise edited save");
+        assert!(
+            rendered
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0, 0, 0, 255]),
+            "the second save must contain the newly persisted redaction"
+        );
     }
 
     /// Waits briefly for the worker, so the test does not depend on scheduling.

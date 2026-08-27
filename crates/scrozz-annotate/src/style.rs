@@ -6,6 +6,7 @@
 //! appearance has to be part of the persisted object, not a transient tool
 //! setting.
 
+use scrozz_core::LogicalPoint;
 use serde::{Deserialize, Serialize};
 
 /// An sRGB colour with straight — **not** premultiplied — alpha.
@@ -257,6 +258,11 @@ pub struct Style {
     /// Geometry and endings for arrow annotations.
     #[serde(default)]
     pub arrow_style: ArrowStyle,
+    /// Explicit quadratic control point for a curved arrow.
+    ///
+    /// `None` preserves the legacy automatically bowed curve.
+    #[serde(default)]
+    pub curve_control: Option<LogicalPoint>,
     /// Strength of destructive blur or pixelation in `0.0..=1.0`.
     #[serde(default = "default_redact_strength")]
     pub redact_strength: f32,
@@ -346,6 +352,20 @@ impl Style {
         self
     }
 
+    /// This style with a different arrow treatment.
+    #[must_use]
+    pub fn with_arrow_style(mut self, arrow_style: ArrowStyle) -> Self {
+        self.arrow_style = arrow_style;
+        self
+    }
+
+    /// This style with an explicit curved-arrow control point.
+    #[must_use]
+    pub fn with_curve_control(mut self, control: LogicalPoint) -> Self {
+        self.curve_control = Some(control);
+        self
+    }
+
     /// Stroke width clamped away from zero and non-finite values.
     #[must_use]
     pub fn effective_stroke_width(&self) -> f64 {
@@ -396,6 +416,7 @@ impl Default for Style {
             opacity: 1.0,
             font_size: 18.0,
             arrow_style: ArrowStyle::default(),
+            curve_control: None,
             redact_strength: default_redact_strength(),
             shadow: false,
             text_preset: TextPreset::default(),

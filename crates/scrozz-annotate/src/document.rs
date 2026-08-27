@@ -1,6 +1,7 @@
 //! The document: a capture plus every edit ever made to it.
 
 use std::{
+    collections::HashSet,
     hash::{BuildHasher, Hasher},
     sync::Arc,
 };
@@ -795,19 +796,13 @@ impl Document {
     /// silently accepted and then quietly rendered wrong.
     pub fn from_data(source: Capture, data: DocumentData) -> Result<Self> {
         let data = Self::prepare_data(&source, data)?;
-        let highest = data
-            .annotations
-            .iter()
-            .map(|o| o.id.0)
-            .max()
-            .map_or(0, |id| id + 1);
         let mut document = Self {
             source,
             objects: data.annotations,
             beautification: data.beautification,
             canvas: data.canvas,
             redaction_seed: data.redaction_seed,
-            next_id: data.next_id.max(highest).max(1),
+            next_id: data.next_id,
         };
         document.renumber_counters();
         Ok(document)
@@ -829,6 +824,7 @@ impl Document {
         if let Some(beautification) = &data.beautification {
             beautification.validate()?;
         }
+        normalize_annotation_ids(&mut data)?;
         data.canvas = normalize_canvas(capture_logical_bounds(source), data.canvas)?;
         if data.redaction_seed == 0 {
             data.redaction_seed = fresh_redaction_seed(source);
@@ -858,18 +854,12 @@ impl Document {
     pub fn restore(&mut self, data: DocumentData) -> Result<()> {
         let high_water = self.next_id;
         let data = Self::prepare_data(&self.source, data)?;
-        let highest = data
-            .annotations
-            .iter()
-            .map(|o| o.id.0)
-            .max()
-            .map_or(0, |id| id + 1);
         self.objects = data.annotations;
         self.beautification = data.beautification;
         self.canvas = data.canvas;
         // The seed identifies this document's destructive transform. Undoing an
         // edit must never replace it with an old-format snapshot's fresh seed.
-        self.next_id = high_water.max(data.next_id).max(highest).max(1);
+        self.next_id = high_water.max(data.next_id);
         self.renumber_counters();
         Ok(())
     }
@@ -1005,17 +995,29 @@ impl Document {
     ///
     /// Counter markers are numbered by the document, so the `index` on a
     /// [`Annotation::Counter`] passed in here is ignored and replaced.
-    pub fn add(&mut self, annotation: Annotation, style: Style) -> AnnotationId {
+    /// Returns [`Error::InvalidRequest`] if the document has exhausted its
+    /// identifier space.
+    pub fn add(&mut self, annotation: Annotation, style: Style) -> Result<AnnotationId> {
+        if self.next_id == u64::MAX {
+            return Err(Error::InvalidRequest(
+                "annotation identifier space is exhausted".to_owned(),
+            ));
+        }
         let id = AnnotationId(self.next_id);
         self.next_id += 1;
         self.objects
             .push(AnnotationObject::new(id, annotation, style));
         self.renumber_counters();
-        id
+        Ok(id)
     }
 
     /// Adds an annotation with the default style for its kind.
-    pub fn add_default(&mut self, annotation: Annotation) -> AnnotationId {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if the document has exhausted its
+    /// identifier space.
+    pub fn add_default(&mut self, annotation: Annotation) -> Result<AnnotationId> {
         let style = match &annotation {
             Annotation::Highlight(_) => Style::highlighter(),
             Annotation::Spotlight(_) => Style::spotlight(),
@@ -1072,6 +1074,12 @@ impl Document {
         match self.index_of(id) {
             Some(index) => {
                 self.objects[index].annotation.translate(dx, dy);
+                if matches!(self.objects[index].annotation, Annotation::Arrow { .. })
+                    && let Some(control) = &mut self.objects[index].style.curve_control
+                {
+                    control.x += dx;
+                    control.y += dy;
+                }
                 true
             }
             None => false,
@@ -1082,7 +1090,15 @@ impl Document {
     pub fn set_bounds(&mut self, id: AnnotationId, bounds: LogicalRect) -> bool {
         match self.index_of(id) {
             Some(index) => {
+                let old_bounds = self.objects[index].annotation.bounds();
+                let curve_control = self.objects[index].style.curve_control;
                 self.objects[index].annotation.set_bounds(bounds);
+                if matches!(self.objects[index].annotation, Annotation::Arrow { .. })
+                    && let Some(control) = curve_control
+                {
+                    self.objects[index].style.curve_control =
+                        Some(geom::remap(control, &old_bounds, &bounds));
+                }
                 true
             }
             None => false,
@@ -1237,6 +1253,27 @@ impl Document {
     }
 }
 
+fn normalize_annotation_ids(data: &mut DocumentData) -> Result<()> {
+    let mut seen = HashSet::with_capacity(data.annotations.len());
+    let mut next_id = 1_u64;
+    for object in &data.annotations {
+        let id = object.id.0;
+        if id == 0 || id == u64::MAX {
+            return Err(Error::InvalidRequest(format!(
+                "annotation identifier {id} is outside the supported range"
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(Error::InvalidRequest(format!(
+                "annotation identifier {id} appears more than once"
+            )));
+        }
+        next_id = next_id.max(id + 1);
+    }
+    data.next_id = data.next_id.max(next_id).max(1);
+    Ok(())
+}
+
 fn rect_is_finite(rect: &LogicalRect) -> bool {
     rect.origin.x.is_finite()
         && rect.origin.y.is_finite()
@@ -1377,12 +1414,6 @@ pub struct AnnotationMut<'a> {
 }
 
 impl AnnotationMut<'_> {
-    /// The annotation being edited.
-    #[must_use]
-    pub fn object(&mut self) -> &mut AnnotationObject {
-        &mut self.document.objects[self.index]
-    }
-
     /// The geometry being edited.
     #[must_use]
     pub fn annotation(&mut self) -> &mut Annotation {

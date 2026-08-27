@@ -11,9 +11,10 @@ use rustybuzz::{
     Direction, Face, UnicodeBuffer, shape,
     ttf_parser::{GlyphId, OutlineBuilder},
 };
-use scrozz_core::{LogicalPoint, LogicalSize};
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 use tiny_skia::{Path, PathBuilder};
 use unicode_bidi::BidiInfo;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::style::TextPreset;
 
@@ -45,11 +46,8 @@ impl FontKind {
         Face::from_slice(self.bytes(), 0).expect("embedded annotation font must parse")
     }
 
-    fn supports(self, text: &str) -> bool {
-        let face = self.face();
-        text.chars()
-            .filter(|ch| !ch.is_whitespace() && !ch.is_control())
-            .all(|ch| face.glyph_index(ch).is_some())
+    fn supports(self, ch: char) -> bool {
+        ch.is_whitespace() || ch.is_control() || self.face().glyph_index(ch).is_some()
     }
 }
 
@@ -95,17 +93,63 @@ fn primary_font(preset: TextPreset) -> FontKind {
     }
 }
 
-fn font_for_run(preset: TextPreset, text: &str) -> FontKind {
+fn font_for_cluster(preset: TextPreset, cluster: &str) -> FontKind {
     let primary = primary_font(preset);
-    if primary.supports(text) {
-        return primary;
-    }
-    for fallback in [FontKind::Arabic, FontKind::Hebrew, FontKind::Mono] {
-        if fallback.supports(text) {
-            return fallback;
+    for font in [
+        primary,
+        FontKind::Arabic,
+        FontKind::Hebrew,
+        FontKind::Mono,
+        FontKind::Inter,
+    ] {
+        if cluster.chars().all(|ch| font.supports(ch)) {
+            return font;
         }
     }
     primary
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FontSpan {
+    range: std::ops::Range<usize>,
+    font: FontKind,
+}
+
+fn font_spans(text: &str, preset: TextPreset) -> Vec<FontSpan> {
+    let mut spans: Vec<FontSpan> = Vec::new();
+    for (start, cluster) in text.grapheme_indices(true) {
+        let end = start + cluster.len();
+        let is_spacing = cluster
+            .chars()
+            .all(|ch| ch.is_whitespace() || ch.is_control());
+        let font = if is_spacing {
+            spans.last().map_or_else(
+                || {
+                    text[end..]
+                        .graphemes(true)
+                        .find(|next| !next.chars().all(|ch| ch.is_whitespace() || ch.is_control()))
+                        .map_or_else(
+                            || primary_font(preset),
+                            |next| font_for_cluster(preset, next),
+                        )
+                },
+                |span| span.font,
+            )
+        } else {
+            font_for_cluster(preset, cluster)
+        };
+        if let Some(span) = spans.last_mut()
+            && span.font == font
+        {
+            span.range.end = end;
+        } else {
+            spans.push(FontSpan {
+                range: start..end,
+                font,
+            });
+        }
+    }
+    spans
 }
 
 fn shape_line(line: &str, font_size: f64, preset: TextPreset) -> ShapedLine {
@@ -130,27 +174,33 @@ fn shape_line(line: &str, font_size: f64, preset: TextPreset) -> ShapedLine {
 
     for run in runs {
         let text = &expanded[run.clone()];
-        let font = font_for_run(preset, text);
-        let face = font.face();
-        let metrics = Metrics::new(&face, font_size);
-        let mut buffer = UnicodeBuffer::new();
-        buffer.push_str(text);
-        buffer.set_direction(if levels[run.start].is_rtl() {
-            Direction::RightToLeft
-        } else {
-            Direction::LeftToRight
-        });
-        buffer.guess_segment_properties();
-        let shaped = shape(&face, &[], buffer);
-
-        for (info, position) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
-            glyphs.push(PositionedGlyph {
-                font,
-                id: GlyphId(info.glyph_id as u16),
-                x: cursor + f64::from(position.x_offset) * metrics.scale,
-                y_offset: f64::from(position.y_offset) * metrics.scale,
+        let rtl = levels[run.start].is_rtl();
+        let mut spans = font_spans(text, preset);
+        if rtl {
+            spans.reverse();
+        }
+        for span in spans {
+            let face = span.font.face();
+            let metrics = Metrics::new(&face, font_size);
+            let mut buffer = UnicodeBuffer::new();
+            buffer.push_str(&text[span.range]);
+            buffer.set_direction(if rtl {
+                Direction::RightToLeft
+            } else {
+                Direction::LeftToRight
             });
-            cursor += f64::from(position.x_advance) * metrics.scale;
+            buffer.guess_segment_properties();
+            let shaped = shape(&face, &[], buffer);
+
+            for (info, position) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+                glyphs.push(PositionedGlyph {
+                    font: span.font,
+                    id: GlyphId(info.glyph_id as u16),
+                    x: cursor + f64::from(position.x_offset) * metrics.scale,
+                    y_offset: f64::from(position.y_offset) * metrics.scale,
+                });
+                cursor += f64::from(position.x_advance) * metrics.scale;
+            }
         }
     }
 
@@ -206,6 +256,21 @@ pub fn outline(text: &str, at: LogicalPoint, font_size: f64, preset: TextPreset)
     }
 
     any.then(|| path.finish()).flatten()
+}
+
+/// The exact filled-outline bounds in logical document coordinates.
+#[must_use]
+pub fn ink_bounds(
+    text: &str,
+    at: LogicalPoint,
+    font_size: f64,
+    preset: TextPreset,
+) -> Option<LogicalRect> {
+    let bounds = outline(text, at, font_size, preset)?.bounds();
+    Some(LogicalRect::new(
+        LogicalPoint::new(f64::from(bounds.left()), f64::from(bounds.top())),
+        LogicalSize::new(f64::from(bounds.width()), f64::from(bounds.height())),
+    ))
 }
 
 struct GlyphPath<'a> {
@@ -295,6 +360,35 @@ mod tests {
     }
 
     #[test]
+    fn combining_marks_remain_with_their_script_font() {
+        let arabic = font_spans("س\u{64e}لام", TextPreset::Standard);
+        assert_eq!(arabic.len(), 1);
+        assert_eq!(arabic[0].font, FontKind::Arabic);
+        let shaped = shape_line("س\u{64e}لام", 24.0, TextPreset::Standard);
+        assert!(
+            shaped
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.font == FontKind::Arabic && glyph.id.0 != 0)
+        );
+
+        let hebrew = font_spans("ש\u{5b8}לום", TextPreset::Standard);
+        assert_eq!(hebrew.len(), 1);
+        assert_eq!(hebrew[0].font, FontKind::Hebrew);
+    }
+
+    #[test]
+    fn mixed_script_runs_split_by_embedded_font_coverage() {
+        let spans = font_spans("Latin سلام אבג", TextPreset::Standard);
+        assert!(spans.iter().any(|span| span.font == FontKind::Inter));
+        assert!(spans.iter().any(|span| span.font == FontKind::Arabic));
+        assert!(spans.iter().any(|span| span.font == FontKind::Hebrew));
+
+        let shaped = shape_line("Latin سلام אבג", 24.0, TextPreset::Standard);
+        assert!(shaped.glyphs.iter().all(|glyph| glyph.id.0 != 0));
+    }
+
+    #[test]
     fn arabic_joining_uses_open_type_substitution() {
         let shaped = shape_line("سلام", 24.0, TextPreset::Standard);
         assert!(shaped.glyphs.iter().all(|glyph| glyph.id.0 != 0));
@@ -340,5 +434,16 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn ink_bounds_include_real_glyph_overhangs() {
+        let at = LogicalPoint::new(20.0, 30.0);
+        let bounds = ink_bounds("jÁ", at, 40.0, TextPreset::Standard).expect("text has outlines");
+        let layout = measure_with_preset("jÁ", 40.0, TextPreset::Standard);
+        assert!(bounds.size.width > 0.0);
+        assert!(bounds.size.height > 0.0);
+        assert!(bounds.origin.x <= at.x + layout.width);
+        assert!(bounds.origin.y < at.y + layout.height);
     }
 }

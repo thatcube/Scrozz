@@ -13,7 +13,7 @@ use scrozz_core::{ColorSpace, Error, Frame, Result};
 use crate::{
     Encoder, ImageFormat,
     icc::profile_for,
-    pixels::{RgbaImage, to_straight_rgba8},
+    pixels::{RgbaImage, convert_to_srgb, to_straight_rgba8},
 };
 
 /// How hard PNG works to make the file small.
@@ -36,6 +36,19 @@ impl From<PngEffort> for CompressionType {
             PngEffort::Maximum => Self::Best,
         }
     }
+}
+
+/// Colour-space handling applied before encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorConversion {
+    /// Keep the source samples and embed their source profile.
+    #[default]
+    Preserve,
+    /// Convert known source samples to sRGB and embed an sRGB profile.
+    ///
+    /// An unknown source is an error: tagging unknown bytes as sRGB would lie
+    /// about their meaning.
+    ToSrgb,
 }
 
 /// Knobs on the encoder, all with defaults tuned so nobody needs to touch them.
@@ -63,6 +76,8 @@ pub struct EncodeOptions {
     /// Screenshots are nearly always opaque, and three channels are about a
     /// quarter smaller than four for no visible difference.
     pub drop_opaque_alpha: bool,
+    /// Whether pixels retain their source colour space or are converted to sRGB.
+    pub color_conversion: ColorConversion,
 }
 
 impl Default for EncodeOptions {
@@ -73,6 +88,7 @@ impl Default for EncodeOptions {
             png_effort: PngEffort::default(),
             embed_srgb_profile: true,
             drop_opaque_alpha: true,
+            color_conversion: ColorConversion::Preserve,
         }
     }
 }
@@ -121,6 +137,14 @@ impl FrameEncoder {
         space: ColorSpace,
         format: ImageFormat,
     ) -> Result<Vec<u8>> {
+        let converted;
+        let (image, space) = match self.options.color_conversion {
+            ColorConversion::Preserve => (image, space),
+            ColorConversion::ToSrgb => {
+                converted = convert_to_srgb(image, space)?;
+                (&converted, ColorSpace::Srgb)
+            }
+        };
         let profile = self.profile(space);
         match format {
             ImageFormat::Png => self.encode_png(image, profile),

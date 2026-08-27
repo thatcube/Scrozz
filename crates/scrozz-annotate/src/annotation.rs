@@ -7,7 +7,10 @@
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 use serde::{Deserialize, Serialize};
 
-use crate::{font, geom, style::Style};
+use crate::{
+    font, geom,
+    style::{ArrowStyle, Style, TextPreset},
+};
 
 /// One editable annotation.
 ///
@@ -76,8 +79,10 @@ pub enum Annotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactStyle {
-    /// Gaussian blur.
+    /// Source-independent privacy blur.
     Blur,
+    /// Conventional source-dependent blur for cosmetic obscuring.
+    SmoothBlur,
     /// Mosaic.
     Pixelate,
     /// Solid fill.
@@ -235,6 +240,57 @@ pub struct AnnotationObject {
     pub style: Style,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ArrowShaft {
+    Line {
+        from: LogicalPoint,
+        to: LogicalPoint,
+    },
+    Quadratic {
+        from: LogicalPoint,
+        control: LogicalPoint,
+        to: LogicalPoint,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ArrowGeometry {
+    pub shaft: ArrowShaft,
+    pub heads: Vec<[LogicalPoint; 3]>,
+}
+
+impl ArrowGeometry {
+    fn visual_bounds(&self, half_stroke: f64) -> LogicalRect {
+        let shaft = match self.shaft {
+            ArrowShaft::Line { from, to } => {
+                geom::inflate(&LogicalRect::from_corners(from, to), half_stroke)
+            }
+            ArrowShaft::Quadratic { from, control, to } => {
+                geom::inflate(&geom::quadratic_bounds(from, control, to), half_stroke)
+            }
+        };
+        self.heads.iter().fold(shaft, |bounds, head| {
+            geom::union(&bounds, &geom::bounding_box(head))
+        })
+    }
+}
+
+fn arrow_head(
+    tip: LogicalPoint,
+    ux: f64,
+    uy: f64,
+    length: f64,
+    half_width: f64,
+) -> [LogicalPoint; 3] {
+    let base = LogicalPoint::new(ux.mul_add(-length, tip.x), uy.mul_add(-length, tip.y));
+    let perpendicular = LogicalPoint::new(-uy * half_width, ux * half_width);
+    [
+        tip,
+        LogicalPoint::new(base.x + perpendicular.x, base.y + perpendicular.y),
+        LogicalPoint::new(base.x - perpendicular.x, base.y - perpendicular.y),
+    ]
+}
+
 impl AnnotationObject {
     /// Extra slack, in logical points, around an annotation's true outline when
     /// hit-testing.
@@ -294,49 +350,12 @@ impl AnnotationObject {
     pub fn visual_bounds(&self) -> LogicalRect {
         let half_stroke = self.style.effective_stroke_width() / 2.0;
         let bounds = match &self.annotation {
-            Annotation::Text { .. } => {
-                let bounds = self.bounds();
-                if self.style.text_preset.is_boxed() {
-                    geom::inflate(&bounds, self.style.effective_font_size() * 0.28)
-                } else {
-                    bounds
-                }
-            }
+            Annotation::Text { at, content } => self.text_visual_bounds(*at, content),
             Annotation::Counter { .. } => self.bounds(),
-            Annotation::Arrow { from, to }
-                if self.style.arrow_style == crate::style::ArrowStyle::Curved =>
-            {
-                let control = geom::curved_arrow_control(*from, *to);
-                let curve =
-                    geom::inflate(&geom::quadratic_bounds(*from, control, *to), half_stroke);
-                let tangent_x = to.x - control.x;
-                let tangent_y = to.y - control.y;
-                let tangent_length = tangent_x.hypot(tangent_y);
-                if tangent_length <= f64::EPSILON {
-                    curve
-                } else {
-                    let ux = tangent_x / tangent_length;
-                    let uy = tangent_y / tangent_length;
-                    let chord = (to.x - from.x).hypot(to.y - from.y);
-                    let head_length = self.arrow_head_length().min(chord * 0.6);
-                    let half_width = self.arrow_head_half_width();
-                    let base = LogicalPoint::new(
-                        ux.mul_add(-head_length, to.x),
-                        uy.mul_add(-head_length, to.y),
-                    );
-                    let perpendicular = LogicalPoint::new(-uy * half_width, ux * half_width);
-                    let head = geom::bounding_box(&[
-                        *to,
-                        LogicalPoint::new(base.x + perpendicular.x, base.y + perpendicular.y),
-                        LogicalPoint::new(base.x - perpendicular.x, base.y - perpendicular.y),
-                    ]);
-                    geom::union(&curve, &head)
-                }
-            }
-            Annotation::Arrow { .. } => {
-                // The head is wider than the shaft, so grow by its half-width.
-                geom::inflate(&self.annotation.bounds(), self.arrow_head_half_width())
-            }
+            Annotation::Arrow { from, to } => self.arrow_geometry(*from, *to).map_or_else(
+                || self.annotation.bounds(),
+                |arrow| arrow.visual_bounds(half_stroke),
+            ),
             Annotation::Highlight(_) | Annotation::Spotlight(_) | Annotation::Redact { .. } => {
                 self.annotation.bounds()
             }
@@ -347,6 +366,100 @@ impl AnnotationObject {
         } else {
             bounds
         }
+    }
+
+    fn text_visual_bounds(&self, at: LogicalPoint, content: &str) -> LogicalRect {
+        let font_size = self.style.effective_font_size();
+        let mut ink = font::ink_bounds(content, at, font_size, self.style.text_preset);
+        let outline = match self.style.text_preset {
+            TextPreset::Outlined => font_size * 0.08,
+            TextPreset::Rounded => font_size * 0.0275,
+            _ => 0.0,
+        };
+        if outline > 0.0 {
+            ink = ink.map(|bounds| geom::inflate(&bounds, outline));
+        }
+        let boxed = self.style.text_preset.is_boxed().then(|| {
+            geom::inflate(
+                &LogicalRect::new(
+                    at,
+                    font::measure_with_preset(content, font_size, self.style.text_preset),
+                ),
+                font_size * 0.28,
+            )
+        });
+        match (ink, boxed) {
+            (Some(ink), Some(boxed)) => geom::union(&ink, &boxed),
+            (Some(ink), None) => ink,
+            (None, Some(boxed)) => boxed,
+            (None, None) => LogicalRect::new(at, LogicalSize::new(0.0, 0.0)),
+        }
+    }
+
+    pub(crate) fn arrow_geometry(
+        &self,
+        from: LogicalPoint,
+        to: LogicalPoint,
+    ) -> Option<ArrowGeometry> {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let length = dx.hypot(dy);
+        if length <= f64::EPSILON {
+            return None;
+        }
+        let (ux, uy) = (dx / length, dy / length);
+        let head_length = self.arrow_head_length().min(length * 0.6);
+        let half_width = self.arrow_head_half_width();
+
+        let mut heads = Vec::with_capacity(2);
+        let shaft = match self.style.arrow_style {
+            ArrowStyle::Curved => {
+                let control = self
+                    .style
+                    .curve_control
+                    .unwrap_or_else(|| geom::curved_arrow_control(from, to));
+                let tangent_x = to.x - control.x;
+                let tangent_y = to.y - control.y;
+                let tangent_length = tangent_x.hypot(tangent_y).max(f64::EPSILON);
+                let (tux, tuy) = (tangent_x / tangent_length, tangent_y / tangent_length);
+                let base = LogicalPoint::new(
+                    tux.mul_add(-head_length, to.x),
+                    tuy.mul_add(-head_length, to.y),
+                );
+                let end = LogicalPoint::new(
+                    tux.mul_add(head_length * 0.35, base.x),
+                    tuy.mul_add(head_length * 0.35, base.y),
+                );
+                heads.push(arrow_head(to, tux, tuy, head_length, half_width));
+                ArrowShaft::Quadratic {
+                    from,
+                    control,
+                    to: end,
+                }
+            }
+            ArrowStyle::Straight | ArrowStyle::Dashed | ArrowStyle::DoubleEnded => {
+                let end = LogicalPoint::new(
+                    ux.mul_add(-head_length * 0.65, to.x),
+                    uy.mul_add(-head_length * 0.65, to.y),
+                );
+                let start = if self.style.arrow_style == ArrowStyle::DoubleEnded {
+                    let start = LogicalPoint::new(
+                        ux.mul_add(head_length * 0.65, from.x),
+                        uy.mul_add(head_length * 0.65, from.y),
+                    );
+                    heads.push(arrow_head(from, -ux, -uy, head_length, half_width));
+                    start
+                } else {
+                    from
+                };
+                heads.push(arrow_head(to, ux, uy, head_length, half_width));
+                ArrowShaft::Line {
+                    from: start,
+                    to: end,
+                }
+            }
+        };
+        Some(ArrowGeometry { shaft, heads })
     }
 
     /// The radius of a counter marker, derived from its type size.
@@ -377,7 +490,7 @@ impl AnnotationObject {
     /// block everything it encloses.
     #[must_use]
     pub fn hit(&self, point: LogicalPoint) -> bool {
-        if self.style.effective_opacity() <= 0.0 {
+        if self.style.effective_opacity() <= 0.0 && !self.annotation.is_destructive() {
             return false;
         }
         let slack = self.style.effective_stroke_width() / 2.0 + Self::HIT_TOLERANCE;
@@ -387,7 +500,9 @@ impl AnnotationObject {
                     geom::distance_to_quadratic(
                         point,
                         *from,
-                        geom::curved_arrow_control(*from, *to),
+                        self.style
+                            .curve_control
+                            .unwrap_or_else(|| geom::curved_arrow_control(*from, *to)),
                         *to,
                     ) <= slack
                 } else {
@@ -423,12 +538,26 @@ impl AnnotationObject {
             | Annotation::Redact { area: r, .. } => {
                 geom::contains(&geom::inflate(r, Self::HIT_TOLERANCE), point)
             }
-            Annotation::Text { .. } => {
-                geom::contains(&geom::inflate(&self.bounds(), Self::HIT_TOLERANCE), point)
-            }
+            Annotation::Text { .. } => geom::contains(
+                &geom::inflate(&self.visual_bounds(), Self::HIT_TOLERANCE),
+                point,
+            ),
             Annotation::Counter { at, .. } => {
                 geom::distance(point, *at) <= self.counter_radius() + Self::HIT_TOLERANCE
             }
         }
+    }
+
+    /// Returns the editable quadratic control point for a curved arrow.
+    #[must_use]
+    pub fn curve_control(&self) -> Option<LogicalPoint> {
+        let Annotation::Arrow { from, to } = self.annotation else {
+            return None;
+        };
+        (self.style.arrow_style == ArrowStyle::Curved).then(|| {
+            self.style
+                .curve_control
+                .unwrap_or_else(|| geom::curved_arrow_control(from, to))
+        })
     }
 }

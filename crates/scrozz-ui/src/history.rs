@@ -266,6 +266,7 @@ pub struct HistoryViewModel {
     delete_armed: Option<CaptureId>,
     request: u64,
     actions: VecDeque<HistoryAction>,
+    native_drag_intents: VecDeque<CaptureId>,
     textures: HashMap<String, TextureHandle>,
 }
 
@@ -307,6 +308,7 @@ impl HistoryViewModel {
             delete_armed: None,
             request: 0,
             actions: VecDeque::new(),
+            native_drag_intents: VecDeque::new(),
             textures: HashMap::new(),
         }
     }
@@ -491,6 +493,20 @@ impl HistoryViewModel {
     /// Takes every action queued by the most recent UI frame.
     pub fn drain_actions(&mut self) -> Vec<HistoryAction> {
         self.actions.drain(..).collect()
+    }
+
+    /// Takes drag gestures that need their initiating native event retained
+    /// before this viewport callback returns to the event loop.
+    pub fn drain_native_drag_intents(&mut self) -> Vec<CaptureId> {
+        self.native_drag_intents.drain(..).collect()
+    }
+
+    /// Cancels an unstarted drag when its native initiating event was unavailable.
+    pub fn cancel_native_drag(&mut self, id: &CaptureId, error: impl Into<String>) {
+        self.actions.retain(
+            |action| !matches!(action, HistoryAction::Drag { id: queued, .. } if queued == id),
+        );
+        self.operation_failed(error);
     }
 
     fn reload_from_start(&mut self) {
@@ -969,6 +985,7 @@ impl HistoryViewModel {
         if drag.drag_started()
             && let Some(pointer) = drag.interact_pointer_pos()
         {
+            self.native_drag_intents.push_back(entry.id.clone());
             let viewport_origin = ui.ctx().input(|input| {
                 input
                     .viewport()

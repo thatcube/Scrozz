@@ -16,7 +16,8 @@ use scrozz_core::{ColorSpace, LogicalPoint};
 fn round_trip_preserves_every_annotation_exactly() {
     let mut doc = document(400, 300);
     for (annotation, style) in every_annotation() {
-        doc.add(annotation, style);
+        doc.add(annotation, style)
+            .expect("annotation id space available");
     }
     let before = doc.data();
 
@@ -43,15 +44,17 @@ fn round_trip_preserves_fractional_coordinates() {
     let mut doc = document(400, 300);
     // Logical coordinates are f64 and routinely fractional on a 2x display.
     // Silently rounding them would drift an arrow every time the file reloads.
-    let id = doc.add(
-        Annotation::Arrow {
-            from: LogicalPoint::new(10.123_456_789, 20.987_654_321),
-            to: LogicalPoint::new(300.5, 199.25),
-        },
-        Style::stroked()
-            .with_stroke_width(2.375)
-            .with_opacity(0.625),
-    );
+    let id = doc
+        .add(
+            Annotation::Arrow {
+                from: LogicalPoint::new(10.123_456_789, 20.987_654_321),
+                to: LogicalPoint::new(300.5, 199.25),
+            },
+            Style::stroked()
+                .with_stroke_width(2.375)
+                .with_opacity(0.625),
+        )
+        .expect("annotation id space available");
     let json = serde_json::to_string(&doc.data()).unwrap();
     let back: DocumentData = serde_json::from_str(&json).unwrap();
     let restored = Document::from_data(region_capture(400, 300), back).unwrap();
@@ -67,16 +70,44 @@ fn round_trip_preserves_fractional_coordinates() {
 }
 
 #[test]
+fn round_trip_preserves_an_explicit_curved_arrow_control() {
+    let control = LogicalPoint::new(83.25, 11.5);
+    let mut doc = document(200, 120);
+    let id = doc
+        .add(
+            Annotation::Arrow {
+                from: LogicalPoint::new(10.0, 90.0),
+                to: LogicalPoint::new(180.0, 75.0),
+            },
+            Style::stroked()
+                .with_arrow_style(ArrowStyle::Curved)
+                .with_curve_control(control),
+        )
+        .expect("annotation id space available");
+
+    let json = serde_json::to_string(&doc.data()).expect("serialize");
+    let data = serde_json::from_str(&json).expect("deserialize");
+    let restored = Document::from_data(region_capture(200, 120), data).expect("restore");
+
+    assert_eq!(restored.get(id).unwrap().style.curve_control, Some(control));
+    assert_eq!(restored.get(id).unwrap().curve_control(), Some(control));
+}
+
+#[test]
 fn round_trip_preserves_id_allocation() {
     let mut doc = document(200, 200);
-    let a = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
-        Style::stroked(),
-    );
-    let b = doc.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
-        Style::stroked(),
-    );
+    let a = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
+    let b = doc
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     doc.remove(a);
 
     let json = serde_json::to_string(&doc.data()).unwrap();
@@ -86,10 +117,12 @@ fn round_trip_preserves_id_allocation() {
     )
     .unwrap();
 
-    let c = restored.add(
-        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
-        Style::stroked(),
-    );
+    let c = restored
+        .add(
+            Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+            Style::stroked(),
+        )
+        .expect("annotation id space available");
     assert_ne!(
         c, a,
         "reloading must not restart id allocation and reuse a dead id"
@@ -99,7 +132,12 @@ fn round_trip_preserves_id_allocation() {
 
 #[test]
 fn round_trip_preserves_every_redaction_style() {
-    for style in [RedactStyle::Blur, RedactStyle::Pixelate, RedactStyle::Solid] {
+    for style in [
+        RedactStyle::Blur,
+        RedactStyle::SmoothBlur,
+        RedactStyle::Pixelate,
+        RedactStyle::Solid,
+    ] {
         let mut doc = document(100, 100);
         doc.add(
             Annotation::Redact {
@@ -107,7 +145,8 @@ fn round_trip_preserves_every_redaction_style() {
                 style,
             },
             Style::redaction(),
-        );
+        )
+        .expect("annotation id space available");
         let json = serde_json::to_string(&doc.data()).unwrap();
         let back: DocumentData = serde_json::from_str(&json).unwrap();
         let Annotation::Redact {
@@ -316,7 +355,8 @@ fn an_empty_document_round_trips() {
 #[test]
 fn a_v1_document_migrates_with_canvas_and_style_defaults() {
     let mut doc = document(100, 80);
-    doc.add_default(Annotation::Rectangle(rect(5.0, 6.0, 30.0, 20.0)));
+    doc.add_default(Annotation::Rectangle(rect(5.0, 6.0, 30.0, 20.0)))
+        .expect("annotation id space available");
     let mut value = serde_json::to_value(doc.data()).unwrap();
     value["version"] = serde_json::json!(1);
     value.as_object_mut().unwrap().remove("canvas");
@@ -449,7 +489,8 @@ fn json_is_human_legible() {
             style: RedactStyle::Pixelate,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let json = serde_json::to_string_pretty(&doc.data()).unwrap();
     assert!(json.contains("\"redact\""), "{json}");
     assert!(json.contains("\"pixelate\""), "{json}");

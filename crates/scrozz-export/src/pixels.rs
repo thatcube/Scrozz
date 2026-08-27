@@ -110,7 +110,7 @@ pub fn convert_to_srgb(image: &RgbaImage, source: ColorSpace) -> Result<RgbaImag
         ColorSpace::Srgb | ColorSpace::Unknown => unreachable!("handled above"),
     };
     let mut data = Vec::with_capacity(image.data.len());
-    for pixel in image.data.chunks_exact(4) {
+    for pixel in image.data.as_chunks::<4>().0 {
         let linear = [
             decode(f64::from(pixel[0]) / 255.0),
             decode(f64::from(pixel[1]) / 255.0),

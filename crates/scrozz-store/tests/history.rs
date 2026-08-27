@@ -349,7 +349,8 @@ fn editing_a_capture_persists_and_never_touches_its_pixels() {
             to: LogicalPoint::new(9.0, 9.0),
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     store.save_document(&id, &live).expect("save");
 
     let DocumentState::Complete(reloaded) = store.document(&id).expect("read").expect("present")

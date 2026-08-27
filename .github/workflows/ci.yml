@@ -114,11 +114,11 @@ jobs:
 
       - name: Type-check macOS, Windows and Linux
         env:
-          # These two crates depend on rusqlite's bundled sqlite, whose build
+          # These three crates depend on rusqlite's bundled sqlite, whose build
           # script compiles C for the *target*. Cross-compiling that needs a
           # foreign C toolchain no runner has. The host target still checks
-          # them in full, and neither contains platform-conditional code.
-          SCROZZ_XCHECK_EXCLUDE: "scrozz-store scrozz"
+          # them in full, and none contains platform-conditional code.
+          SCROZZ_XCHECK_EXCLUDE: "scrozz-store scrozz-ui scrozz"
         run: |
           if ! tools/check-all-platforms.sh; then
             echo "::error title=Cross-target check failed::A platform target does not type-check. Reproduce on any machine, no Windows or Linux box needed: tools/dev.sh platforms"

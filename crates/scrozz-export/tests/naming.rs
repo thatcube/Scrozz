@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use scrozz_core::ScaleFactor;
 use scrozz_export::{FilenameRules, NamePolicy, NameTemplate, NamingContext, Timestamp};
 
 fn context() -> NamingContext {
@@ -318,6 +319,68 @@ fn the_first_capture_gets_the_plain_name_and_the_rest_are_numbered() {
             "Screenshot 2025-03-09 at 14-05-07 2.png",
             "Screenshot 2025-03-09 at 14-05-07 3.png",
         ]
+    );
+}
+
+#[test]
+fn retina_suffix_precedes_extension_and_composes_with_collisions() {
+    let policy = NamePolicy::default();
+    let template = NameTemplate::parse("Capture").unwrap();
+    let dir = Path::new("/shots");
+    let mut taken = HashSet::new();
+
+    let first = policy
+        .unique_path_for_scale(
+            dir,
+            &template,
+            &context(),
+            "png",
+            ScaleFactor::new(1.999),
+            &mut |path| taken.contains(path),
+        )
+        .unwrap();
+    taken.insert(first.clone());
+    let second = policy
+        .unique_path_for_scale(
+            dir,
+            &template,
+            &context(),
+            "png",
+            ScaleFactor::new(2.0),
+            &mut |path| taken.contains(path),
+        )
+        .unwrap();
+
+    assert_eq!(first.file_name().unwrap(), "Capture@2x.png");
+    assert_eq!(second.file_name().unwrap(), "Capture@2x 2.png");
+}
+
+#[test]
+fn one_x_names_are_unchanged_and_existing_retina_suffix_is_not_duplicated() {
+    let policy = NamePolicy::default();
+    assert_eq!(
+        policy
+            .file_name_for_scale(
+                &NameTemplate::parse("Capture").unwrap(),
+                &context(),
+                "png",
+                None,
+                ScaleFactor::IDENTITY,
+            )
+            .unwrap(),
+        "Capture.png"
+    );
+    assert_eq!(
+        policy
+            .file_name_for_scale(
+                &NameTemplate::parse("Capture@2x").unwrap(),
+                &context(),
+                "png",
+                None,
+                ScaleFactor::new(2.0),
+            )
+            .unwrap(),
+        "Capture@2x.png"
     );
 }
 

@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{capture_with, checkerboard, flat, near, pixel, rect};
+use common::{capture_with, checkerboard, flat, frame_with, near, pixel, rect};
 use scrozz_annotate::{Annotation, Color, Document, RedactStyle, Renderer, SkiaRenderer, Style};
 use scrozz_core::{Frame, Provenance, ScaleFactor};
 
@@ -39,7 +39,8 @@ fn blur_destroys_the_original_pixels() {
             style: RedactStyle::Blur,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     let inside = interior(&out, 20, 20, 80, 80);
@@ -58,49 +59,55 @@ fn blur_destroys_the_original_pixels() {
 }
 
 #[test]
-fn blur_is_strong_enough_to_be_irreversible_in_practice() {
-    // A one-pixel blur is not a redaction. The variance inside the region has to
-    // collapse, not merely soften.
-    let mut doc = checkered(200, 200);
-    doc.add(
-        Annotation::Redact {
-            area: rect(40.0, 40.0, 120.0, 120.0),
-            style: RedactStyle::Blur,
-        },
-        Style::redaction(),
-    );
-    let out = SkiaRenderer::new().render(&doc).unwrap();
+fn blur_is_independent_of_the_covered_source() {
+    let mut first = checkered(200, 200);
+    first
+        .add(
+            Annotation::Redact {
+                area: rect(40.0, 40.0, 120.0, 120.0),
+                style: RedactStyle::Blur,
+            },
+            Style::redaction(),
+        )
+        .expect("annotation id space available");
+    let data = first.data();
+    let second = Document::from_data(
+        capture_with(flat(200, 200, [246, 31, 118, 255]), Provenance::Region),
+        data,
+    )
+    .unwrap();
 
-    let inside = interior(&out, 40, 40, 160, 160);
-    let mean = inside.iter().map(|p| f64::from(p[0])).sum::<f64>() / inside.len() as f64;
-    let spread = inside
-        .iter()
-        .map(|p| (f64::from(p[0]) - mean).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        spread < 40.0,
-        "the blurred region still varies by {spread:.1} levels; the checkerboard \
-         is still legible"
+    let first_render = SkiaRenderer::new().render(&first).unwrap();
+    let second_render = SkiaRenderer::new().render(&second).unwrap();
+    assert_eq!(
+        interior(&first_render, 40, 40, 160, 160),
+        interior(&second_render, 40, 40, 160, 160),
+        "secure blur must not encode any covered source pixel"
     );
 }
 
 #[test]
-fn blur_is_correct_at_the_edges_of_the_image() {
-    // A blur that pads with zeros darkens the border of the region, which both
-    // looks wrong and advertises exactly where the redaction is. Blurring a flat
-    // image must return that same flat image, corners included.
-    let mut doc = Document::new(capture_with(
+fn blur_is_opaque_at_the_edges_of_the_image() {
+    let mut first = Document::new(capture_with(
         flat(60, 60, [128, 64, 192, 255]),
         Provenance::Region,
     ));
-    doc.add(
-        Annotation::Redact {
-            area: rect(0.0, 0.0, 60.0, 60.0),
-            style: RedactStyle::Blur,
-        },
-        Style::redaction(),
-    );
-    let out = SkiaRenderer::new().render(&doc).unwrap();
+    first
+        .add(
+            Annotation::Redact {
+                area: rect(0.0, 0.0, 60.0, 60.0),
+                style: RedactStyle::Blur,
+            },
+            Style::redaction(),
+        )
+        .expect("annotation id space available");
+    let second = Document::from_data(
+        capture_with(flat(60, 60, [11, 221, 44, 255]), Provenance::Region),
+        first.data(),
+    )
+    .unwrap();
+    let first_render = SkiaRenderer::new().render(&first).unwrap();
+    let second_render = SkiaRenderer::new().render(&second).unwrap();
 
     for (x, y) in [
         (0, 0),
@@ -111,17 +118,14 @@ fn blur_is_correct_at_the_edges_of_the_image() {
         (0, 30),
         (30, 30),
     ] {
-        let p = pixel(&out, x, y);
-        assert!(
-            near(p, [128, 64, 192, 255], 2),
-            "blurring a flat image changed ({x},{y}) to {p:?} — the kernel is \
-             sampling outside the image"
-        );
+        let p = pixel(&first_render, x, y);
+        assert_eq!(p[3], 255, "secure blur must be opaque at ({x},{y})");
+        assert_eq!(p, pixel(&second_render, x, y));
     }
 }
 
 #[test]
-fn blur_at_a_region_touching_the_image_edge_does_not_darken() {
+fn blur_at_a_region_touching_the_image_edge_stays_local() {
     let mut doc = Document::new(capture_with(
         flat(80, 80, [200, 200, 200, 255]),
         Provenance::Region,
@@ -132,12 +136,12 @@ fn blur_at_a_region_touching_the_image_edge_does_not_darken() {
             style: RedactStyle::Blur,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
-    for (x, y) in [(0, 0), (1, 1), (15, 0), (0, 15), (29, 29)] {
-        let p = pixel(&out, x, y);
-        assert!(near(p, [200, 200, 200, 255], 2), "({x},{y}) became {p:?}");
-    }
+    assert_ne!(pixel(&out, 15, 15), [200, 200, 200, 255]);
+    assert_eq!(pixel(&out, 30, 15), [200, 200, 200, 255]);
+    assert_eq!(pixel(&out, 15, 30), [200, 200, 200, 255]);
 }
 
 #[test]
@@ -149,7 +153,8 @@ fn solid_destroys_the_original_pixels() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(20, 20, 20))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     for p in interior(&out, 10, 10, 60, 50) {
@@ -174,7 +179,8 @@ fn solid_defaults_to_opaque_even_if_the_style_is_transparent() {
         Style::redaction()
             .with_fill(Some(Color::TRANSPARENT))
             .with_stroke(Color::TRANSPARENT),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     for p in interior(&out, 10, 10, 50, 50) {
         assert_eq!(p[3], 255, "the redaction left transparent pixels: {p:?}");
@@ -182,6 +188,26 @@ fn solid_defaults_to_opaque_even_if_the_style_is_transparent() {
             p[0] < 40 && p[1] < 40 && p[2] < 40,
             "expected opaque black, got {p:?}"
         );
+    }
+}
+
+#[test]
+fn opacity_zero_never_disables_a_redaction() {
+    let mut doc = checkered(60, 60);
+    doc.add(
+        Annotation::Redact {
+            area: rect(10.0, 10.0, 40.0, 40.0),
+            style: RedactStyle::Solid,
+        },
+        Style::redaction()
+            .with_fill(Some(Color::rgb(12, 13, 14)))
+            .with_opacity(0.0),
+    )
+    .expect("annotation id space available");
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    for p in interior(&out, 10, 10, 50, 50) {
+        assert_eq!(p, [12, 13, 14, 255]);
     }
 }
 
@@ -194,7 +220,8 @@ fn pixelate_destroys_the_original_pixels() {
             style: RedactStyle::Pixelate,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     // Every block must be flat: within a block all pixels are identical.
@@ -218,7 +245,8 @@ fn pixelate_blocks_are_genuinely_uniform() {
             style: RedactStyle::Pixelate,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     // Walk outwards from an arbitrary interior pixel; it must be identical to at
@@ -233,13 +261,15 @@ fn pixelate_blocks_are_genuinely_uniform() {
 #[test]
 fn pixelate_retains_no_source_averages_and_is_reproducible() {
     let mut first = checkered(96, 96);
-    first.add(
-        Annotation::Redact {
-            area: rect(16.0, 16.0, 64.0, 64.0),
-            style: RedactStyle::Pixelate,
-        },
-        Style::redaction(),
-    );
+    first
+        .add(
+            Annotation::Redact {
+                area: rect(16.0, 16.0, 64.0, 64.0),
+                style: RedactStyle::Pixelate,
+            },
+            Style::redaction(),
+        )
+        .expect("annotation id space available");
     let data = first.data();
 
     let second_source = capture_with(flat(96, 96, [246, 31, 118, 255]), Provenance::Region);
@@ -267,6 +297,42 @@ fn pixelate_retains_no_source_averages_and_is_reproducible() {
 }
 
 #[test]
+fn filtered_scaling_cannot_move_covered_source_pixels_across_the_redaction_edge() {
+    let source = |secret| {
+        frame_with(48, 32, 1.0, move |x, y| {
+            if (8..24).contains(&x) && (7..25).contains(&y) {
+                secret
+            } else {
+                [17, 29, 43, 255]
+            }
+        })
+    };
+    let mut first = Document::new(capture_with(source([255, 0, 0, 255]), Provenance::Region));
+    first
+        .add(
+            Annotation::Redact {
+                area: rect(8.25, 7.25, 15.5, 17.5),
+                style: RedactStyle::Solid,
+            },
+            Style::redaction().with_fill(Some(Color::BLACK)),
+        )
+        .expect("annotation id space available");
+    let second = Document::from_data(
+        capture_with(source([0, 255, 255, 255]), Provenance::Region),
+        first.data(),
+    )
+    .unwrap();
+    let renderer = SkiaRenderer::new();
+    let first_render = renderer.render_at(&first, ScaleFactor::new(1.3)).unwrap();
+    let second_render = renderer.render_at(&second, ScaleFactor::new(1.3)).unwrap();
+
+    assert_eq!(
+        first_render.data, second_render.data,
+        "covered source samples escaped through bilinear filtering"
+    );
+}
+
+#[test]
 fn a_redaction_destroys_annotations_drawn_beneath_it() {
     // Redaction is applied in z-order, so it erases whatever is under it —
     // including an annotation that itself leaked something.
@@ -280,14 +346,16 @@ fn a_redaction_destroys_annotations_drawn_beneath_it() {
             .with_stroke(Color::TRANSPARENT)
             .with_stroke_width(0.0)
             .with_fill(Some(Color::rgb(255, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Redact {
             area: rect(10.0, 10.0, 60.0, 60.0),
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(0, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
 
     let out = SkiaRenderer::new().render(&doc).unwrap();
     for p in interior(&out, 10, 10, 70, 70) {
@@ -309,14 +377,16 @@ fn an_annotation_above_a_redaction_still_draws() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(0, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Rectangle(rect(20.0, 20.0, 20.0, 20.0)),
         Style::stroked()
             .with_stroke(Color::TRANSPARENT)
             .with_stroke_width(0.0)
             .with_fill(Some(Color::rgb(255, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
 
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert!(near(pixel(&out, 30, 30), [255, 0, 0, 255], 2));
@@ -331,7 +401,8 @@ fn redaction_scales_with_the_export() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(7, 7, 7))),
-    );
+    )
+    .expect("annotation id space available");
 
     let out = SkiaRenderer::new()
         .render_at(&doc, ScaleFactor::new(2.0))
@@ -365,7 +436,8 @@ fn redaction_survives_a_downscaled_export() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(0, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render_to_width(&doc, 100).unwrap();
     // 100..300 of 400 becomes 25..75 of 100.
     for p in interior(&out, 25, 25, 75, 75) {
@@ -379,7 +451,12 @@ fn redaction_survives_a_downscaled_export() {
 
 #[test]
 fn the_source_frame_is_untouched_by_every_redaction_style() {
-    for style in [RedactStyle::Blur, RedactStyle::Pixelate, RedactStyle::Solid] {
+    for style in [
+        RedactStyle::Blur,
+        RedactStyle::SmoothBlur,
+        RedactStyle::Pixelate,
+        RedactStyle::Solid,
+    ] {
         let mut doc = checkered(80, 80);
         let before = doc.source.frame.data.clone();
         doc.add(
@@ -388,13 +465,43 @@ fn the_source_frame_is_untouched_by_every_redaction_style() {
                 style,
             },
             Style::redaction(),
-        );
+        )
+        .expect("annotation id space available");
         let _ = SkiaRenderer::new().render(&doc).unwrap();
         assert_eq!(
             before, doc.source.frame.data,
             "{style:?} mutated the document's source; D14 requires it stay editable"
         );
     }
+}
+
+#[test]
+fn smooth_blur_is_explicitly_source_dependent() {
+    let render = |source: Document, style| {
+        let mut document = source;
+        document
+            .add(
+                Annotation::Redact {
+                    area: rect(0.0, 0.0, 80.0, 80.0),
+                    style,
+                },
+                Style::redaction(),
+            )
+            .unwrap();
+        SkiaRenderer::new().render(&document).unwrap().data
+    };
+    let checker = checkered(80, 80);
+    let mut inverse = checkered(80, 80);
+    for pixel in inverse.source.frame.data.chunks_exact_mut(4) {
+        pixel[0] = 255 - pixel[0];
+        pixel[1] = 255 - pixel[1];
+        pixel[2] = 255 - pixel[2];
+    }
+    assert_ne!(
+        render(checker, RedactStyle::SmoothBlur),
+        render(inverse, RedactStyle::SmoothBlur),
+        "cosmetic smooth blur should retain a visual relationship to its source"
+    );
 }
 
 #[test]
@@ -406,14 +513,16 @@ fn overlapping_redactions_all_apply() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(0, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Redact {
             area: rect(40.0, 40.0, 50.0, 50.0),
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(255, 255, 255))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     assert_eq!(pixel(&out, 20, 20), [0, 0, 0, 255]);
@@ -431,7 +540,8 @@ fn a_redaction_of_the_whole_image_leaves_nothing() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(30, 30, 30))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     for y in 0..64 {
         for x in 0..64 {
@@ -449,7 +559,8 @@ fn a_redaction_extending_past_the_image_is_clipped_and_still_applies() {
             style: RedactStyle::Solid,
         },
         Style::redaction().with_fill(Some(Color::rgb(1, 2, 3))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert_eq!(pixel(&out, 0, 0), [1, 2, 3, 255]);
     assert_eq!(pixel(&out, 49, 49), [1, 2, 3, 255]);
@@ -464,14 +575,16 @@ fn blur_and_pixelate_are_deterministic() {
             style: RedactStyle::Blur,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Redact {
             area: rect(55.0, 55.0, 40.0, 40.0),
             style: RedactStyle::Pixelate,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let renderer = SkiaRenderer::new();
     assert_eq!(
         renderer.render(&doc).unwrap().data,

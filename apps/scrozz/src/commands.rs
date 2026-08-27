@@ -19,9 +19,17 @@
 
 use std::path::Path;
 
-use scrozz_annotate::{Renderer as _, SkiaRenderer};
-use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Provenance};
-use scrozz_export::{Clipboard, Encoder, FrameEncoder, ImageFormat};
+use scrozz_annotate::{
+    Background, BackgroundImage, Beautification, BeautificationPreset, Document, Renderer as _,
+    SkiaRenderer,
+};
+use scrozz_core::{
+    CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
+};
+use scrozz_export::{
+    ContentKind, Destination, DestinationProfile, EncodeOptions, Encoder, FrameEncoder,
+    ImageFormat, select_export, to_straight_rgba8,
+};
 use scrozz_ocr::Ocr as _;
 use scrozz_store::{
     CaptureId, CaptureRecord, DocumentState, History as _, ImageState, Page, SearchQuery,
@@ -30,8 +38,9 @@ use scrozz_store::{
 
 use crate::{
     cli::{
-        CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand, HotkeyCommand,
-        InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
+        BeautifyBackground, CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand,
+        HotkeyCommand, InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink,
+        TargetSpec,
     },
     fault::{CliError, CliResult},
     hotkey_config, ipc,
@@ -68,15 +77,23 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     args.validate()?;
     let target = args.target.resolve()?;
     let sinks = args.sinks();
+    let beautification = resolve_beautification(args)?;
 
     let plan = Json::obj([
         ("target", target_json(&target)),
         ("interactive", Json::Bool(args.target.is_interactive())),
         ("cursor", Json::Bool(args.cursor)),
         ("window_shadow", Json::Bool(!args.no_window_shadow)),
-        ("format", Json::str(args.format().slug())),
+        (
+            "format",
+            Json::str(args.format.map_or("automatic", |format| format.slug())),
+        ),
         ("quality", Json::opt(args.quality, |q| Json::Int(q.into()))),
         ("delay_secs", Json::opt(args.delay, Json::Float)),
+        (
+            "beautification",
+            Json::opt(beautification.as_ref(), beautification_json),
+        ),
         ("sinks", Json::arr(sinks.iter().map(sink_json))),
     ]);
 
@@ -106,31 +123,37 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     }
 
     let capture = backend.capture(&request)?;
-    let frame = &capture.frame;
-
-    let bytes = FrameEncoder::new()
-        .encode(frame, args.format().to_export())
-        .map_err(CliError::Core)?;
+    let provenance = capture.provenance;
+    let mut document = Document::new(capture);
+    document.set_beautification(beautification)?;
+    let frame = SkiaRenderer::new().render(&document)?;
+    // Keep the report contract destination-independent: `bytes` is the size of
+    // one canonical encoded image, not a sum over every sink that received it.
+    let (encoded, _) = encode_for_destination(&frame, args, &DestinationProfile::folder())?;
+    let byte_count = encoded.len();
 
     let mut written = Vec::new();
     let mut raw = None;
     for sink in &sinks {
         match sink {
             Sink::File(path) => {
-                std::fs::write(path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
+                std::fs::write(path, &encoded).map_err(|e| CliError::Core(CoreError::Io(e)))?;
                 written.push(path.display().to_string());
             }
             Sink::Clipboard => {
-                scrozz_export::SystemClipboard::new()
-                    .write_image(frame)
-                    .map_err(CliError::Core)?;
+                crate::output::export_frame_auto(&frame, &Destination::Clipboard)?;
                 written.push("clipboard".to_string());
             }
-            Sink::Stdout => raw = Some(bytes.clone()),
+            Sink::Stdout => raw = Some(encoded.clone()),
             // D18: any folder the user picks, which is what lets a Dropbox or
             // iCloud directory provide sync for free with no service on our side.
             Sink::DefaultFolder => {
-                let path = crate::output::export_default(&bytes)?;
+                let path = crate::output::export_default_encoded(
+                    &encoded,
+                    frame.width(),
+                    frame.height(),
+                    frame.scale,
+                )?;
                 written.push(path.display().to_string());
             }
         }
@@ -141,8 +164,8 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         ("width", Json::Int(i64::from(frame.width()))),
         ("height", Json::Int(i64::from(frame.height()))),
         ("scale", Json::Float(frame.scale.get())),
-        ("bytes", Json::Int(bytes.len() as i64)),
-        ("provenance", Json::str(format!("{:?}", capture.provenance))),
+        ("bytes", Json::Int(byte_count as i64)),
+        ("provenance", Json::str(format!("{provenance:?}"))),
         (
             "written",
             Json::arr(written.iter().map(|w| Json::str(w.as_str()))),
@@ -154,7 +177,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         frame.width(),
         frame.height(),
         frame.scale.get(),
-        bytes.len() / 1024,
+        byte_count / 1024,
         if written.is_empty() {
             String::new()
         } else {
@@ -165,6 +188,115 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     let mut report = Report::new(data, human);
     report.raw = raw;
     Ok(report)
+}
+
+fn resolve_beautification(args: &CaptureArgs) -> CliResult<Option<Beautification>> {
+    if !args.requests_beautification() {
+        return Ok(None);
+    }
+
+    let mut beautification = Beautification::preset(
+        args.beautify
+            .map_or(BeautificationPreset::Clean, |preset| preset.to_model()),
+    );
+    if let Some(background) = &args.background {
+        beautification.background = match background {
+            BeautifyBackground::Transparent => Background::Transparent,
+            BeautifyBackground::Solid(color) => Background::Solid(*color),
+            BeautifyBackground::BuiltIn(background) => Background::BuiltIn(*background),
+            BeautifyBackground::Image(path) => {
+                let frame = scrozz_export::decode_file(path)?;
+                let image = to_straight_rgba8(&frame)?;
+                Background::Image(BackgroundImage::new(
+                    image.width,
+                    image.height,
+                    image.data,
+                    frame.color_space,
+                )?)
+            }
+        };
+    }
+    if let Some(padding) = args.padding {
+        beautification.padding = padding;
+    }
+    if let Some(aspect) = args.aspect {
+        beautification.aspect = aspect.to_model();
+    }
+    if let Some(alignment) = args.alignment {
+        beautification.alignment = alignment.to_model();
+    }
+    if args.auto_balance {
+        beautification.auto_balance = true;
+    }
+    if let Some(radius) = args.corner_radius {
+        beautification.corner_radius = radius;
+    }
+    if let Some(shadow) = args.shadow {
+        beautification.shadow = shadow;
+    }
+    if let Some(border) = args.border {
+        beautification.border_width = border;
+    }
+    beautification.validate()?;
+    Ok(Some(beautification))
+}
+
+fn beautification_json(beautification: &Beautification) -> Json {
+    Json::obj([
+        ("padding", Json::Float(beautification.padding)),
+        (
+            "aspect",
+            Json::str(format!("{:?}", beautification.aspect).to_lowercase()),
+        ),
+        (
+            "alignment",
+            Json::str(format!("{:?}", beautification.alignment).to_lowercase()),
+        ),
+        ("auto_balance", Json::Bool(beautification.auto_balance)),
+        ("corner_radius", Json::Float(beautification.corner_radius)),
+        ("shadow", Json::Float(beautification.shadow)),
+        ("border", Json::Float(beautification.border_width)),
+        (
+            "background",
+            Json::str(match &beautification.background {
+                Background::Transparent => "transparent".to_owned(),
+                Background::Solid(color) => {
+                    format!(
+                        "#{:02x}{:02x}{:02x}{:02x}",
+                        color.r, color.g, color.b, color.a
+                    )
+                }
+                Background::Gradient { .. } => "gradient".to_owned(),
+                Background::BuiltIn(background) => format!("{background:?}").to_lowercase(),
+                Background::Image(image) => {
+                    format!("image:{}x{}", image.width(), image.height())
+                }
+            }),
+        ),
+    ])
+}
+
+fn encode_for_destination(
+    frame: &Frame,
+    args: &CaptureArgs,
+    profile: &DestinationProfile,
+) -> CliResult<(Vec<u8>, ImageFormat)> {
+    let selection = select_export(frame, profile, ContentKind::Screenshot)?;
+    let format = args
+        .format
+        .map_or(selection.format, |format| format.to_export());
+    let mut options = selection.options;
+    apply_quality(&mut options, args, format);
+    let bytes = FrameEncoder::with_options(options).encode(frame, format)?;
+    Ok((bytes, format))
+}
+
+fn apply_quality(options: &mut EncodeOptions, args: &CaptureArgs, format: ImageFormat) {
+    if format == ImageFormat::Jpeg
+        && let Some(quality) = args.quality
+    {
+        options.jpeg_quality = quality;
+    }
 }
 
 /// Turns a resolved [`TargetSpec`] into the core request type.
@@ -1036,6 +1168,34 @@ mod tests {
         assert!(rendered.contains(r#""kind":"interactive""#), "{rendered}");
         assert!(rendered.contains(r#""mode":"region""#), "{rendered}");
         assert!(rendered.contains(r#""interactive":true"#), "{rendered}");
+        assert!(rendered.contains(r#""format":"automatic""#), "{rendered}");
+        assert!(rendered.contains(r#""beautification":null"#), "{rendered}");
+    }
+
+    #[test]
+    fn a_beautified_dry_run_reports_the_resolved_document_style() {
+        let rendered = json_of(&[
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,120,80",
+            "--beautify",
+            "story",
+            "--padding",
+            "30",
+            "--background",
+            "midnight",
+            "--alignment",
+            "bottom",
+            "--dry-run",
+        ]);
+        assert!(rendered.contains(r#""padding":30.0"#), "{rendered}");
+        assert!(rendered.contains(r#""aspect":"story""#), "{rendered}");
+        assert!(rendered.contains(r#""alignment":"bottom""#), "{rendered}");
+        assert!(
+            rendered.contains(r#""background":"midnight""#),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1076,17 +1236,17 @@ mod tests {
     }
 
     #[test]
-    fn format_and_quality_reach_the_plan() {
+    fn jpeg_format_and_quality_reach_the_plan() {
         let rendered = json_of(&[
             "scrozz",
             "capture",
             "--dry-run",
             "--format",
-            "webp",
+            "jpeg",
             "--quality",
             "72",
         ]);
-        assert!(rendered.contains(r#""format":"webp""#), "{rendered}");
+        assert!(rendered.contains(r#""format":"jpeg""#), "{rendered}");
         assert!(rendered.contains(r#""quality":72"#), "{rendered}");
     }
 

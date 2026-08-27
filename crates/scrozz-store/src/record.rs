@@ -301,13 +301,15 @@ mod tests {
             provenance: Provenance::Region,
             target: CaptureTarget::AllDisplays,
         });
-        document.add(
-            Annotation::Rectangle(LogicalRect::new(
-                LogicalPoint::new(1.0, 1.0),
-                LogicalSize::new(2.0, 2.0),
-            )),
-            Style::stroked(),
-        );
+        document
+            .add(
+                Annotation::Rectangle(LogicalRect::new(
+                    LogicalPoint::new(1.0, 1.0),
+                    LogicalSize::new(2.0, 2.0),
+                )),
+                Style::stroked(),
+            )
+            .expect("annotation id space available");
         document
             .set_beautification(Some(Beautification::padded(8.0, Background::default())))
             .expect("region captures may be beautified");

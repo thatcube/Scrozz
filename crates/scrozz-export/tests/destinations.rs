@@ -9,9 +9,10 @@ use std::{
 };
 
 use common::{embedded_profile, solid};
-use scrozz_core::{ColorSpace, Error, Frame, PixelFormat};
+use scrozz_core::{ColorSpace, Error, Frame, PixelFormat, ScaleFactor};
 use scrozz_export::{
-    Clipboard, ClipboardPlatform, ClipboardReport, Destination, Encoder, ExportOutcome,
+    Clipboard, ClipboardPlatform, ClipboardReport, ContentKind, Destination,
+    DestinationCapabilities, DestinationColorSpace, DestinationProfile, Encoder, ExportOutcome,
     FileExporter, FrameEncoder, ImageFormat, NamePolicy, NameTemplate, NamingContext, S3Object,
     S3Uploader, Timestamp, UnimplementedS3Uploader,
 };
@@ -285,6 +286,106 @@ fn a_custom_template_is_honoured() {
 }
 
 #[test]
+fn frame_scale_adds_retina_suffix_without_changing_one_x_exports() {
+    let dir = scratch("folder-retina");
+    let exporter = FileExporter::new().with_template(NameTemplate::parse("Capture").unwrap());
+    let one_x = solid(2, 2, [1, 2, 3]);
+    let mut retina = solid(2, 2, [1, 2, 3]);
+    retina.scale = ScaleFactor::new(2.0);
+
+    let first = exporter
+        .export_frame(
+            &one_x,
+            ImageFormat::Png,
+            &Destination::Folder(dir.clone()),
+            &context(),
+        )
+        .unwrap()
+        .path
+        .unwrap();
+    let second = exporter
+        .export_frame(
+            &retina,
+            ImageFormat::Png,
+            &Destination::Folder(dir.clone()),
+            &context(),
+        )
+        .unwrap()
+        .path
+        .unwrap();
+
+    assert_eq!(first.file_name().unwrap(), "Capture.png");
+    assert_eq!(second.file_name().unwrap(), "Capture@2x.png");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn already_encoded_delivery_preserves_dimensions_and_scale_for_naming() {
+    let dir = scratch("encoded-metadata");
+    let exporter =
+        FileExporter::new().with_template(NameTemplate::parse("Capture {width}x{height}").unwrap());
+    let bytes = png_bytes();
+
+    let path = exporter
+        .export_encoded(
+            &bytes,
+            &Destination::Folder(dir.clone()),
+            &context(),
+            640,
+            480,
+            ScaleFactor::new(2.0),
+        )
+        .expect("exports")
+        .path
+        .expect("path");
+
+    assert_eq!(
+        path.file_name().unwrap(),
+        "Capture 640x480@2x.png",
+        "already-encoded delivery must retain physical dimensions and Retina scale"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn automatic_export_uses_destination_format_and_colour_policy() {
+    let dir = scratch("folder-auto");
+    let source = common::frame(
+        1,
+        1,
+        0,
+        PixelFormat::Rgba8,
+        ColorSpace::DisplayP3,
+        |_, _| [128, 64, 32, 255],
+    );
+    let mut profile = DestinationProfile::folder();
+    profile.capabilities = DestinationCapabilities::new([ImageFormat::Png]);
+    profile.color_space = DestinationColorSpace::Srgb;
+
+    let path = FileExporter::new()
+        .export_frame_auto(
+            &source,
+            &Destination::Folder(dir.clone()),
+            &profile,
+            ContentKind::Screenshot,
+            &context(),
+        )
+        .unwrap()
+        .path
+        .unwrap();
+    let written = std::fs::read(path).unwrap();
+    let (width, _, data) = common::decode(&written);
+
+    assert_eq!(common::pixel_at(&data, width, 0, 0), [138, 59, 21, 255]);
+    assert_eq!(
+        embedded_profile(&written),
+        scrozz_export::profile_for(ColorSpace::Srgb)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_title_full_of_illegal_characters_still_produces_a_file() {
     let dir = scratch("folder-illegal");
     let ctx = context().with_title(r#"Re: <draft> "notes" 50/50?"#);
@@ -547,17 +648,17 @@ fn an_upload_failure_surfaces_so_the_queue_can_retry() {
 }
 
 #[test]
-#[should_panic(expected = "Signature Version 4")]
-fn the_stub_uploader_is_explicitly_unfinished() {
-    // Documents the deliberate stub: the interface is defined and wired, the
-    // protocol work is not done, and nothing reaches this unless it is
-    // installed on purpose.
-    let _ = UnimplementedS3Uploader.upload(&S3Object {
-        bucket: "b",
-        key: "k",
-        bytes: &[],
-        content_type: "image/png",
-    });
+fn the_stub_uploader_returns_an_actionable_error_instead_of_panicking() {
+    let error = UnimplementedS3Uploader
+        .upload(&S3Object {
+            bucket: "b",
+            key: "k",
+            bytes: &[],
+            content_type: "image/png",
+        })
+        .expect_err("the placeholder has no network implementation");
+    assert!(matches!(error, Error::Unsupported { .. }));
+    assert!(error.to_string().contains("Signature Version 4"), "{error}");
 }
 
 // ---------------------------------------------------------------------------

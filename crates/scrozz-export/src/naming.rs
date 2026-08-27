@@ -25,7 +25,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use scrozz_core::{Error, Result};
+use scrozz_core::{Error, Result, ScaleFactor};
 
 // ---------------------------------------------------------------------------
 // Time
@@ -534,7 +534,33 @@ impl NamePolicy {
         extension: &str,
         directory: Option<&Path>,
     ) -> Result<String> {
-        self.file_name_with_suffix(template, ctx, extension, directory, "")
+        self.file_name_with_suffix(
+            template,
+            ctx,
+            extension,
+            directory,
+            "",
+            ScaleFactor::IDENTITY,
+        )
+    }
+
+    /// As [`NamePolicy::file_name`], adding `@2x` for Retina-scale captures.
+    ///
+    /// A small tolerance accounts for platform scale values represented just
+    /// below two. An existing terminal `@2x` is retained rather than duplicated.
+    ///
+    /// # Errors
+    ///
+    /// As [`NamePolicy::file_name`].
+    pub fn file_name_for_scale(
+        &self,
+        template: &NameTemplate,
+        ctx: &NamingContext,
+        extension: &str,
+        directory: Option<&Path>,
+        scale: ScaleFactor,
+    ) -> Result<String> {
+        self.file_name_with_suffix(template, ctx, extension, directory, "", scale)
     }
 
     fn file_name_with_suffix(
@@ -543,9 +569,19 @@ impl NamePolicy {
         ctx: &NamingContext,
         extension: &str,
         directory: Option<&Path>,
-        suffix: &str,
+        collision_suffix: &str,
+        scale: ScaleFactor,
     ) -> Result<String> {
-        let budget = self.stem_budget(directory, extension, suffix.len());
+        let rendered = template.render(ctx, self);
+        let sanitised = self.sanitise(&rendered);
+        let retina_suffix = if scale.get() >= 1.95 { "@2x" } else { "" };
+        let base = if retina_suffix.is_empty() {
+            sanitised.as_str()
+        } else {
+            sanitised.strip_suffix(retina_suffix).unwrap_or(&sanitised)
+        };
+        let reserved = retina_suffix.len() + collision_suffix.len();
+        let budget = self.stem_budget(directory, extension, reserved);
         if budget == 0 {
             return Err(Error::InvalidRequest(format!(
                 "no filename fits in {} bytes under {}: choose a shorter save folder",
@@ -554,15 +590,16 @@ impl NamePolicy {
             )));
         }
 
-        let rendered = template.render(ctx, self);
-        let mut stem = truncate_bytes(&self.sanitise(&rendered), budget);
+        let mut stem = truncate_bytes(base, budget);
         // Truncation can expose a trailing dot or space that was legal mid-name,
         // so the trailing-character rule is re-applied afterwards.
         stem = stem.trim_end_matches(['.', ' ']).to_owned();
         if stem.is_empty() {
             stem = truncate_bytes(&self.fallback_stem, budget);
         }
-        Ok(format!("{stem}{suffix}.{extension}"))
+        Ok(format!(
+            "{stem}{retina_suffix}{collision_suffix}.{extension}"
+        ))
     }
 
     /// Finds a path in `directory` that nothing occupies yet.
@@ -584,6 +621,32 @@ impl NamePolicy {
         extension: &str,
         occupied: &mut dyn FnMut(&Path) -> bool,
     ) -> Result<PathBuf> {
+        self.unique_path_for_scale(
+            directory,
+            template,
+            ctx,
+            extension,
+            ScaleFactor::IDENTITY,
+            occupied,
+        )
+    }
+
+    /// As [`NamePolicy::unique_path`], adding `@2x` for Retina-scale captures.
+    ///
+    /// Collision numbering follows the density marker: `Capture@2x 2.png`.
+    ///
+    /// # Errors
+    ///
+    /// As [`NamePolicy::unique_path`].
+    pub fn unique_path_for_scale(
+        &self,
+        directory: &Path,
+        template: &NameTemplate,
+        ctx: &NamingContext,
+        extension: &str,
+        scale: ScaleFactor,
+        occupied: &mut dyn FnMut(&Path) -> bool,
+    ) -> Result<PathBuf> {
         const LIMIT: u32 = 10_000;
         for n in 1..=LIMIT {
             let suffix = if n == 1 {
@@ -591,8 +654,14 @@ impl NamePolicy {
             } else {
                 format!(" {n}")
             };
-            let name =
-                self.file_name_with_suffix(template, ctx, extension, Some(directory), &suffix)?;
+            let name = self.file_name_with_suffix(
+                template,
+                ctx,
+                extension,
+                Some(directory),
+                &suffix,
+                scale,
+            )?;
             let candidate = directory.join(name);
             if !occupied(&candidate) {
                 return Ok(candidate);

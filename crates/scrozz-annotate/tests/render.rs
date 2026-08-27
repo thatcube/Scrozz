@@ -31,7 +31,8 @@ fn an_empty_document_renders_the_source_unchanged() {
 fn rendering_is_deterministic() {
     let mut doc = document(160, 120);
     for (annotation, style) in common::every_annotation() {
-        doc.add(annotation, style);
+        doc.add(annotation, style)
+            .expect("annotation id space available");
     }
     doc.set_beautification(Some(Beautification {
         padding: 20.0,
@@ -69,7 +70,8 @@ fn rendering_never_mutates_the_source() {
             style: scrozz_annotate::RedactStyle::Solid,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let before = doc.source.frame.data.clone();
 
     let _ = SkiaRenderer::new().render(&doc).unwrap();
@@ -177,7 +179,8 @@ fn auto_expand_keeps_objects_drawn_beyond_the_source() {
         Style::stroked()
             .with_stroke(Color::BLACK)
             .with_stroke_width(3.0),
-    );
+    )
+    .expect("annotation id space available");
     doc.set_canvas(Canvas {
         auto_expand: true,
         ..Canvas::default()
@@ -203,7 +206,8 @@ fn geometry_at_2x_is_exactly_twice_geometry_at_1x() {
         Style::stroked()
             .with_stroke(Color::rgb(0, 0, 0))
             .with_stroke_width(4.0),
-    );
+    )
+    .expect("annotation id space available");
 
     let renderer = SkiaRenderer::new();
     let one = renderer.render_at(&doc, ScaleFactor::new(1.0)).unwrap();
@@ -238,7 +242,8 @@ fn stroke_width_scales_with_the_export() {
         Style::stroked()
             .with_stroke(Color::rgb(0, 0, 0))
             .with_stroke_width(6.0),
-    );
+    )
+    .expect("annotation id space available");
 
     let renderer = SkiaRenderer::new();
     let one = renderer.render_at(&doc, ScaleFactor::new(1.0)).unwrap();
@@ -324,7 +329,8 @@ fn annotations_land_where_they_were_authored() {
             .with_stroke(Color::TRANSPARENT)
             .with_stroke_width(0.0)
             .with_fill(Some(Color::rgb(255, 0, 0))),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     assert!(
@@ -350,7 +356,8 @@ fn a_highlight_darkens_rather_than_washing_out() {
     doc.add(
         Annotation::Highlight(rect(10.0, 10.0, 30.0, 20.0)),
         Style::highlighter(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     let inside = pixel(&out, 25, 20);
@@ -377,7 +384,8 @@ fn a_highlight_leaves_dark_text_readable() {
     doc.add(
         Annotation::Highlight(rect(0.0, 0.0, 40.0, 40.0)),
         Style::highlighter(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     let p = pixel(&out, 20, 20);
     assert!(
@@ -415,7 +423,8 @@ fn a_window_capture_renders_fine_without_beautification() {
     doc.add(
         Annotation::Rectangle(rect(5.0, 5.0, 20.0, 20.0)),
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new()
         .render(&doc)
         .expect("annotations are always allowed");
@@ -762,6 +771,26 @@ fn canvas_edits_also_use_an_srgb_working_space() {
 }
 
 #[test]
+fn temporary_canvas_edits_also_use_an_srgb_working_space() {
+    let mut frame = flat(40, 30, [180, 40, 210, 255]);
+    frame.color_space = ColorSpace::DisplayP3;
+    let doc = Document::new(capture_with(frame, Provenance::Region));
+
+    let out = SkiaRenderer::new()
+        .render_canvas(
+            &doc,
+            Canvas {
+                flip_horizontal: true,
+                ..Canvas::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(out.color_space, ColorSpace::Srgb);
+    assert_eq!(doc.source.frame.color_space, ColorSpace::DisplayP3);
+}
+
+#[test]
 fn a_noop_beautification_preserves_the_source_profile() {
     let mut frame = flat(4, 3, [180, 40, 210, 255]);
     frame.color_space = ColorSpace::DisplayP3;
@@ -827,7 +856,8 @@ fn comprehensive_canvas_annotation_and_beautification_has_a_stable_fingerprint()
         Style::stroked()
             .with_stroke(Color::rgb(249, 218, 74))
             .with_stroke_width(3.0),
-    );
+    )
+    .expect("annotation id space available");
     doc.set_beautification(Some(Beautification {
         padding: 17.0,
         corner_radius: 9.0,
@@ -861,7 +891,8 @@ fn a_fully_transparent_annotation_draws_nothing() {
     doc.add(
         Annotation::Rectangle(rect(5.0, 5.0, 30.0, 30.0)),
         Style::stroked().with_opacity(0.0),
-    );
+    )
+    .expect("annotation id space available");
     let annotated = SkiaRenderer::new().render(&doc).unwrap();
     assert_eq!(plain.data, annotated.data);
 }
@@ -870,7 +901,8 @@ fn a_fully_transparent_annotation_draws_nothing() {
 fn every_annotation_variant_renders_without_panicking() {
     let mut doc = document(200, 160);
     for (annotation, style) in common::every_annotation() {
-        doc.add(annotation, style);
+        doc.add(annotation, style)
+            .expect("annotation id space available");
     }
     for scale in [0.5, 1.0, 2.0, 3.0] {
         let out = SkiaRenderer::new()
@@ -889,34 +921,41 @@ fn degenerate_annotations_are_survivable() {
             to: LogicalPoint::new(20.0, 20.0),
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Rectangle(rect(10.0, 10.0, 0.0, 0.0)),
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Ellipse(rect(10.0, 10.0, 0.0, 30.0)),
         Style::stroked(),
-    );
-    doc.add(Annotation::Freehand(vec![]), Style::stroked());
+    )
+    .expect("annotation id space available");
+    doc.add(Annotation::Freehand(vec![]), Style::stroked())
+        .expect("annotation id space available");
     doc.add(
         Annotation::Freehand(vec![LogicalPoint::new(5.0, 5.0)]),
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Text {
             at: LogicalPoint::new(5.0, 40.0),
             content: String::new(),
         },
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Redact {
             area: rect(0.0, 0.0, 0.0, 0.0),
             style: scrozz_annotate::RedactStyle::Blur,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
 
     let out = SkiaRenderer::new()
         .render(&doc)
@@ -930,14 +969,16 @@ fn annotations_partly_outside_the_frame_are_clipped_not_fatal() {
     doc.add(
         Annotation::Rectangle(rect(-100.0, -100.0, 500.0, 500.0)),
         Style::stroked(),
-    );
+    )
+    .expect("annotation id space available");
     doc.add(
         Annotation::Redact {
             area: rect(-40.0, 40.0, 200.0, 200.0),
             style: scrozz_annotate::RedactStyle::Pixelate,
         },
         Style::redaction(),
-    );
+    )
+    .expect("annotation id space available");
     let out = SkiaRenderer::new().render(&doc).unwrap();
     assert_eq!(out.width(), 60);
     assert!(out.is_well_formed());
