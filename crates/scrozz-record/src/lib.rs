@@ -10,7 +10,10 @@
 //! Software fallback, if it ever exists, must be an optional non-default
 //! feature. See `docs/research/capture-stack-landscape.md`.
 
-#![forbid(unsafe_code)]
+// Platform APIs are reached through objc2 / windows-rs / x11rb, all of which
+// require `unsafe`. It is confined to this crate: every crate above it in the
+// dependency graph forbids unsafe outright.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::path::PathBuf;
 

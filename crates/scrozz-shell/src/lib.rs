@@ -4,7 +4,10 @@
 //! where Wayland may refuse outright. Nothing above this crate should contain a
 //! `cfg(target_os)`.
 
-#![forbid(unsafe_code)]
+// Platform APIs are reached through objc2 / windows-rs / x11rb, all of which
+// require `unsafe`. It is confined to this crate: every crate above it in the
+// dependency graph forbids unsafe outright.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use scrozz_core::{Display, LogicalRect, Result};
 

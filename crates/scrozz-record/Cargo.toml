@@ -14,5 +14,21 @@ thiserror.workspace = true
 tracing.workspace = true
 scrozz-capture.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-av-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-screen-capture-kit.workspace = true
+dispatch2.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Media_Transcoding",
+    "Media_MediaProperties",
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+] }
+
 [lints]
 workspace = true

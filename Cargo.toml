@@ -46,6 +46,36 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "webp",
 ] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+dirs = "6"
+tiny-skia = "0.12"
+resvg = "0.48"
+arboard = "3.6"
+rusqlite = { version = "0.40", features = ["bundled"] }
+global-hotkey = "0.8"
+tray-icon = "0.24"
+
+# --- macOS ---
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-vision = "0.3"
+objc2-av-foundation = "0.3"
+objc2-core-media = "0.3"
+dispatch2 = "0.3"
+
+# --- Windows ---
+windows = "0.62"
+
+# --- Linux ---
+x11rb = "0.14"
+ashpd = "0.13"
 
 [workspace.lints.rust]
 # An unimplemented contract must still compile. Phase 0 is deliberately a tree

@@ -795,53 +795,106 @@ first and generating its imagery last is strictly cheaper and cannot drift.
 
 ---
 
-## D27 — Every always-on-top surface has an escape hatch
+## D27 — The app is invisible at rest; only captures appear
 
-**Decision.** Any Scrozz window that floats above other applications must satisfy
-**all four** of the following. There are no exceptions, including for surfaces
-that are "obviously" transient.
+**Decision.** Scrozz's home is the **menu bar (macOS) / system tray (Windows,
+Linux)**. At rest the app shows **nothing**: no window, no Dock icon, no taskbar
+entry. The only thing that ever appears unbidden is a **capture card**.
 
-1. **It can be moved.** Dragging anywhere on its body relocates it. Borderless
-   windows have no titlebar, so the body *is* the drag handle.
-2. **It can be dismissed by keyboard**, from a key that works even when the
-   window does not have focus. Escape returns the surface to a normal,
-   interactive, movable state; a second Escape closes it.
-3. **It is never simultaneously always-on-top, click-through and undraggable.**
-   That combination is unreachable by mouse and unclosable by keyboard — a
-   window the user can neither move, click, nor dismiss.
-4. **It defaults to the least intrusive state that still works.** Always-on-top
-   is entered when a capture demands it and left immediately afterwards; it is
-   never the resting state.
+Every Scrozz surface falls into exactly one of three classes, and the class
+determines its window behaviour completely:
 
-**Why this is a decision and not a style note.** We learned it by inflicting it.
-The overlay spike was built exactly as specified — borderless, no titlebar,
-always-on-top — and within minutes it had made the machine unusable: it sat over
-the work in progress, could not be dragged aside, and had no obvious way out.
-The session was halted over it.
+| Class | Surfaces | Window behaviour |
+|---|---|---|
+| **Invisible** | tray/menu-bar item, hotkey listener, CLI | No window at all |
+| **Transient floating** | capture cards, capture dock, selection overlay, magnifier, pinned captures | Borderless, always-on-top, **fixed position — not user-movable**, dismissible |
+| **Ordinary window** | settings, annotation editor | **Native, movable, resizable, standard chrome** |
 
-That is worth taking seriously rather than treating as a spike accident, because
-**Scrozz's real surfaces have precisely this shape.** The capture stack, the
-capture dock, the pinned-to-screen captures and the selection overlay are all
-floating always-on-top windows, and every one of them will be on screen while the
-user is trying to do something else. A screenshot tool that gets this wrong is
-not merely unpolished; it is actively hostile, and it is uninstalled quickly.
+**Why the middle class is not movable, which reverses my earlier position.** I
+first concluded that every floating window must be draggable, having watched an
+undraggable always-on-top window make this machine unusable. That was the wrong
+lesson from the right incident. The actual failure was not immovability — it was
+that **a large window existed at all when nothing should have been on screen.**
+Capture cards live in fixed slots because the slot *is* their meaning: position
+encodes recency, and letting the user scatter them destroys the ordering that
+makes the pile readable. CleanShot's cards are not free-floating either.
 
-The general principle: **the more insistent a window is, the cheaper its escape
-must be.** A surface that claims the top of the window stack has to earn it, and
-must be trivially movable and dismissible by someone who did not read any
-documentation and is mid-task and annoyed.
+**What actually prevents the failure**, then, is not a drag handle but three
+properties every transient surface must have:
 
-**Consequences for D20 and D21.** Capture cards are already dismissible by
-swiping left and collapsible by swiping down, so the pile is well behaved. Two
-additions: the pile is **draggable as a unit** to anywhere on screen, not fixed to
-the bottom-left corner, and Escape collapses it to the dock from anywhere. Pinned
-captures get the same treatment — always draggable, always closable, never
-trapped on top.
+1. **It is small.** A capture card is a thumbnail, not a panel. Nothing in this
+   class ever covers a meaningful part of the screen.
+2. **It is escapable without documentation.** Swipe left dismisses, swipe down
+   collapses to the dock (D20), Escape clears everything. A user who is mid-task
+   and annoyed must be able to make it go away on the first guess.
+3. **It never blocks what is beneath it.** Empty space between cards passes
+   clicks through, so the surface is only "on top" where there is actually
+   something to see.
 
-**Consequences for development.** Any spike or debug build that creates a floating
+The selection overlay is the sole exception to "small": it is deliberately
+fullscreen, and it is also deliberately momentary — it exists between the hotkey
+and the click, and Escape always cancels it.
+
+**Ordinary windows are genuinely ordinary.** Settings and the annotation editor
+are real, native, movable, resizable windows with normal chrome. They are opened
+deliberately, they are long-lived, and they must behave exactly like every other
+window on the system, including tiling, mission control, snapping and window
+management shortcuts. Nothing is gained by making these custom, and everything is
+lost.
+
+**Consequence for development.** Any spike or debug build that creates a floating
 window starts at `WindowLevel::Normal`, makes always-on-top an explicit opt-in
-toggle with a visible legend, and closes its window when it is done rather than
-leaving it on the developer's desktop between runs.
+toggle with a visible legend, and closes its window when finished rather than
+leaving it on a developer's desktop between runs. The general principle stands
+even where drag does not: **the more insistent a window is, the cheaper its
+escape must be.**
+
+## D28 — The capture stack is bottom-anchored and grows upward
+
+**Decision.** The pile of capture cards is anchored to the **bottom-left of the
+screen** and grows **upward**. Cards enter and leave **only from the left**, and
+they only ever move **downward**.
+
+```
+   slot 5  ← 6th capture
+   slot 4
+   slot 3
+   slot 2
+   slot 1  ← 2nd capture
+   slot 0  ← 1st capture, and the first to leave
+   ─────── bottom-left of the work area
+```
+
+The complete behaviour, which is the whole specification:
+
+1. **First capture** appears at slot 0, the bottom, sliding in from the left.
+2. **Each subsequent capture** slides in from the left into the next slot up.
+   **Existing cards do not move at all** while the pile is still growing.
+3. **When the pile is full**, three things happen as one coordinated motion: the
+   oldest card at slot 0 slides out to the **left** — the same way it came in —
+   every remaining card **falls down** one slot, and the new card slides in from
+   the left into the top slot.
+4. **Dismissing any card** applies the same gravity: cards above it fall down one
+   slot to close the gap; cards below it never move.
+
+**The invariant, which is the thing to check an implementation against: a card
+never moves upward.** Upward change happens only when a new card arrives at a new
+top slot, and even then it is the arriving card, not existing cards shifting.
+
+**Slot count** is derived from the available work-area height, not hard-coded.
+Six is the target on a 16-inch MacBook Pro and matches the practical ceiling of
+comparable tools. It must clamp sensibly on small displays.
+
+**Why bottom-anchored.** Position encodes recency, and a bottom anchor makes the
+pile physical: things accumulate on top of each other and settle downward under
+gravity, which needs no explanation. A top-anchored pile behaves like phone
+notifications, where every arrival shoves the existing ones down — motion the
+user did not ask for, applied to cards they may be reaching toward. The bottom
+anchor keeps existing cards perfectly still until something actually leaves,
+which is the property that makes the pile safe to aim at.
+
+**Possible future setting.** Top-anchored may be offered as a preference later.
+It is not the default and is not built for v1.
 
 ---
 

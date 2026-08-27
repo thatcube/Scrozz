@@ -18,7 +18,10 @@
 //!   [`scrozz_core::Error::Unsupported`] and callers fall back to the portal's
 //!   own out-of-process picker.
 
-#![forbid(unsafe_code)]
+// Platform APIs are reached through objc2 / windows-rs / x11rb, all of which
+// require `unsafe`. It is confined to this crate: every crate above it in the
+// dependency graph forbids unsafe outright.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use scrozz_core::{CaptureBackend, Result};
 

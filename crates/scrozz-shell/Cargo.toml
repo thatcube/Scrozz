@@ -12,7 +12,24 @@ repository.workspace = true
 scrozz-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+global-hotkey.workspace = true
+tray-icon.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-graphics.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
 
 [lints]
 workspace = true
