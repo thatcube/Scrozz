@@ -62,7 +62,7 @@ background / custom image / plain color / transparent, shadow on/off.
 | CAP-10 | Window capture with background fill | T2 | Compositing, platform-agnostic once you have the frame |
 | CAP-11 | Adjust padding | T2 | Pure compositing |
 | CAP-12 | Background = desktop / custom image / solid color / transparent | T2 | "Desktop" source needs wallpaper path per platform |
-| CAP-13 | Window shadow toggle | T2 | macOS gives shadow free; Windows/Linux must synthesize |
+| CAP-13 | Window shadow toggle | T2 | Current native still paths exclude the shadow; Wayland's portal does not disclose its state. Never synthesize one onto window pixels (D9). |
 
 ### Advanced capture modes
 

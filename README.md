@@ -68,7 +68,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Area | macOS | Windows | Linux | Notes |
 |---|:--:|:--:|:--:|---|
 | Screen / display capture | ✅ | 🟡 | 🟡 | ScreenCaptureKit · Windows.Graphics.Capture · X11 + desktop portal |
-| Window & region capture | ✅ | 🟡 | 🟡 | Wayland cannot enumerate windows; the portal picker is used instead |
+| Window & region capture | ✅ | 🟡 | 🟡 | Wayland cannot enumerate windows; Screenshot portal v3's trusted picker is used where available |
 | Save, clipboard, encoding | ✅ | 🟡 | 🟡 | Shared, platform-agnostic code — one implementation, tested everywhere |
 | Menu-bar / tray app | ✅ | 🟡 | 🟡 | One cross-platform tray item; only the macOS one has been run by a person |
 | Global hotkeys | ✅ | 🟡 | 🟠 | Works where the desktop allows it. Wayland cannot grab keys, so Scrozz refuses and hands you the exact compositor config line to bind the CLI instead ([D11](docs/decisions.md)) |

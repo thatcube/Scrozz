@@ -159,20 +159,24 @@ the Scrozz CLI.
 1. Corner radius pixel-exact for the platform and OS version
 2. Correct alpha — genuine transparency outside the window, no matte
 3. No halo, fringe, or dark edge artifacts
-4. Shadow captured as a separable layer: includable, omittable, replaceable
+4. Shadow captured as a separable layer where the platform exposes one:
+   includable, omittable, replaceable; otherwise the limitation is reported
 5. Correct at every display scale factor, including mixed-DPI multi-monitor
 
 Each platform may reach these however works best, determined by experiment.
-**Every criterion is covered by per-platform golden-image regression tests.**
+Output-level regression tests enforce geometry, alpha, stride and the prohibition
+on double compositing; native runtime tests cover API behaviour that cannot be
+reproduced in a platform-independent fixture.
 
 **Why.** This is the specific quality gap between CleanShot X (flawless) and
 Capso (unclean radii). The likely cause of Capso's problem is compositing a
 rounded rectangle at a guessed radius rather than using the true value.
-macOS ScreenCaptureKit provides correct corners and alpha directly; Windows
-does not (DWM's extended frame bounds exclude the shadow, and Win11's radius
-varies by version); Linux requires compositing. Since the technique differs per
-platform, the *tests* are the real specification — and this class of silent
-visual regression is exactly what agents can catch automatically.
+macOS ScreenCaptureKit provides correct corners and alpha directly. Windows
+Graphics Capture also preserves native alpha, while its GDI fallback and X11 do
+not promise it. DWM's extended frame bounds and X11 window drawables exclude
+compositor shadows. Since the technique differs per platform, the *tests* are
+the real specification — and this class of silent visual regression is exactly
+what agents can catch automatically.
 
 **Note from the live CleanShot UI (2026-08-26) — corrected.** An earlier reading
 of this concluded that CleanShot uses an adjustable corner-radius slider for
@@ -183,17 +187,17 @@ only for non-window screenshots, where a plain rectangle is being composited ont
 a background and the radius is genuinely a design choice.
 
 **The real rule, and it is stronger:** for a window capture the OS output *is*
-the truth. ScreenCaptureKit already returns correct corners, shadow and alpha,
-so CleanShot does not post-process the geometry at all — that is why it is
-flawless. Capso's unclean radii come from doing post-processing that should not
-happen.
+the truth. ScreenCaptureKit's desktop-independent still path returns correct
+corners and alpha, but its `ignoreShadowsSingleWindow` flag does not produce a
+separable shadow in practice. Scrozz therefore reports the shadow as always
+excluded instead of exposing an inert toggle. Capso's unclean radii come from
+doing post-processing that should not happen.
 
 **Therefore, for Scrozz:** window captures are sacred. Take what the OS gives and
-composite nothing. Where a platform does *not* give correct corners and alpha
-(Windows, Linux), reconstructing them is a **fidelity gap to be closed**, held to
-the acceptance criteria above and to golden-image tests — never an invitation to
-apply an adjustable radius. Radius, shadow and inset controls apply only to
-non-window captures.
+composite nothing. A backend reports native alpha and shadow support separately;
+where either is unavailable, that is a **fidelity gap to be closed**, never an
+invitation to guess a radius or synthesize a shadow. Radius, shadow and inset
+controls apply only to non-window captures.
 
 **Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
 another, `inner_radius = outer_radius − padding`. Violating it makes corners look
