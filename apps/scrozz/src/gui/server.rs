@@ -103,7 +103,7 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
         // clap would answer with the help text rather than saying so.
         return (
             None,
-            text(2, "the forwarded command had no arguments".to_owned()),
+            stderr(2, "the forwarded command had no arguments\n".to_owned()),
         );
     }
 
@@ -121,7 +121,7 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
         Ok(cli) => cli,
         // clap's own rejection. There is no slug to report it under, because we
         // never got as far as knowing which subcommand was meant.
-        Err(err) => return (None, text(2, err.to_string())),
+        Err(err) => return (None, stderr(2, err.to_string())),
     };
 
     let command = cli.command.clone().unwrap_or(Command::Gui);
@@ -141,22 +141,30 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
                 Response {
                     code: 0,
                     stream: StreamKind::Binary,
-                    payload: bytes,
+                    stdout: bytes,
+                    stderr: if cli.global.quiet || report.human.is_empty() {
+                        Vec::new()
+                    } else {
+                        line(report.human).into_bytes()
+                    },
                 }
             } else if cli.global.json {
-                json(0, success_envelope(&slug, report.data).to_compact_string())
+                json(
+                    0,
+                    line(success_envelope(&slug, report.data).to_compact_string()),
+                )
             } else if cli.global.quiet {
                 text(0, String::new())
             } else {
-                text(0, report.human.trim_end().to_owned())
+                text(0, line(report.human))
             }
         }
         Err(err) => {
             let code = err.exit().code();
             if cli.global.json {
-                json(code, error_envelope(&slug, &err).to_compact_string())
+                json(code, line(error_envelope(&slug, &err).to_compact_string()))
             } else {
-                text(code, err.to_string())
+                stderr(code, err.to_human())
             }
         }
     };
@@ -183,7 +191,8 @@ fn text(code: u8, body: String) -> Response {
     Response {
         code,
         stream: StreamKind::Text,
-        payload: body.into_bytes(),
+        stdout: body.into_bytes(),
+        stderr: Vec::new(),
     }
 }
 
@@ -191,8 +200,26 @@ fn json(code: u8, body: String) -> Response {
     Response {
         code,
         stream: StreamKind::Json,
-        payload: body.into_bytes(),
+        stdout: body.into_bytes(),
+        stderr: Vec::new(),
     }
+}
+
+fn stderr(code: u8, body: String) -> Response {
+    Response {
+        code,
+        stream: StreamKind::Text,
+        stdout: Vec::new(),
+        stderr: body.into_bytes(),
+    }
+}
+
+fn line(mut body: String) -> String {
+    if !body.is_empty() {
+        body.truncate(body.trim_end().len());
+        body.push('\n');
+    }
+    body
 }
 
 /// The listener a running GUI holds.
@@ -491,7 +518,8 @@ mod tests {
         let (command, response) = run(&[], None);
         assert!(command.is_none());
         assert_eq!(response.code, 2);
-        assert!(!response.payload.is_empty());
+        assert!(response.stdout.is_empty());
+        assert!(!response.stderr.is_empty());
     }
 
     #[test]
@@ -500,7 +528,8 @@ mod tests {
         assert!(command.is_none(), "there is no command to name");
         assert_eq!(response.code, 2);
         assert_eq!(response.stream, StreamKind::Text);
-        let message = String::from_utf8_lossy(&response.payload);
+        assert!(response.stdout.is_empty());
+        let message = String::from_utf8_lossy(&response.stderr);
         assert!(message.contains("nonsuch"), "{message}");
     }
 
@@ -520,10 +549,22 @@ mod tests {
     fn a_forwarded_json_failure_is_an_envelope_not_a_sentence() {
         let (_, response) = run(&argv(&["--json", "list", "displays"]), None);
         assert_eq!(response.stream, StreamKind::Json);
-        let body = String::from_utf8_lossy(&response.payload);
+        assert!(response.stderr.is_empty());
+        let body = String::from_utf8_lossy(&response.stdout);
         assert!(body.starts_with('{'), "{body}");
         assert!(body.contains("\"ok\":false"), "{body}");
         assert!(body.contains("\"command\":\"list.displays\""), "{body}");
+        assert!(body.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_forwarded_human_failure_keeps_rich_diagnostics_on_stderr() {
+        let (_, response) = run(&argv(&["list", "displays"]), None);
+        assert_ne!(response.code, 0);
+        assert!(response.stdout.is_empty());
+        let body = String::from_utf8_lossy(&response.stderr);
+        assert!(body.starts_with("scrozz:"), "{body}");
+        assert!(body.ends_with('\n'), "{body}");
     }
 
     #[test]
@@ -532,28 +573,29 @@ mod tests {
         let (_, response) = run(&argv(&["capture", "--dry-run"]), None);
         assert_eq!(response.code, 0);
         assert_eq!(response.stream, StreamKind::Text);
-        let body = String::from_utf8_lossy(&response.payload);
+        assert!(response.stderr.is_empty());
+        let body = String::from_utf8_lossy(&response.stdout);
         assert!(body.contains("Would capture"), "{body}");
-        assert!(
-            !body.ends_with('\n'),
-            "the trailing newline is the wire's job"
-        );
+        assert!(body.ends_with('\n'));
     }
 
     #[test]
     fn a_quiet_forwarded_command_says_nothing() {
         let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None);
         assert_eq!(response.code, 0);
-        assert!(response.payload.is_empty());
+        assert!(response.stdout.is_empty());
+        assert!(response.stderr.is_empty());
     }
 
     #[test]
     fn a_json_forwarded_success_is_an_envelope() {
         let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None);
         assert_eq!(response.stream, StreamKind::Json);
-        let body = String::from_utf8_lossy(&response.payload);
+        assert!(response.stderr.is_empty());
+        let body = String::from_utf8_lossy(&response.stdout);
         assert!(body.contains("\"ok\":true"), "{body}");
         assert!(body.contains("\"command\":\"capture\""), "{body}");
+        assert!(body.ends_with('\n'));
     }
 
     #[test]
@@ -566,7 +608,8 @@ mod tests {
         let parsed = ipc::parse_response(&wire).expect("our own wire format must parse");
         assert_eq!(parsed.code, response.code);
         assert_eq!(parsed.stream, response.stream);
-        assert_eq!(parsed.payload, response.payload);
+        assert_eq!(parsed.stdout, response.stdout);
+        assert_eq!(parsed.stderr, response.stderr);
     }
 
     #[test]
@@ -684,9 +727,10 @@ mod tests {
             .expect("a well-formed answer");
         assert_eq!(response.code, 0);
         assert!(
-            String::from_utf8_lossy(&response.payload).contains("Would capture"),
+            String::from_utf8_lossy(&response.stdout).contains("Would capture"),
             "the forwarded output must match a local run"
         );
+        assert!(response.stderr.is_empty());
 
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);

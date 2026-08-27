@@ -68,6 +68,9 @@ jobs:
       MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
       WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_MSIX_IDENTITY_NAME: ${{ secrets.WINDOWS_MSIX_IDENTITY_NAME }}
+      WINDOWS_MSIX_PUBLISHER: ${{ secrets.WINDOWS_MSIX_PUBLISHER }}
+      WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME }}
     strategy:
       # Publish nothing rather than a partial set: if Windows fails we still
       # want to see whether macOS and Linux succeeded, so the draft can be
@@ -251,6 +254,7 @@ jobs:
 
       # --- Package ------------------------------------------------------------
       - name: Package
+        if: matrix.os != 'windows-latest'
         id: package
         run: |
           set -euo pipefail
@@ -281,13 +285,53 @@ jobs:
           cat "${ASSET}.sha256"
           echo "asset=$ASSET" >>"$GITHUB_OUTPUT"
 
+      - name: Package portable ZIP and MSIX
+        if: matrix.os == 'windows-latest'
+        run: |
+          set -euo pipefail
+          export SCROZZ_WINDOWS_VERIFY_DETERMINISM=1
+          export SCROZZ_MSIX_IDENTITY_NAME="$WINDOWS_MSIX_IDENTITY_NAME"
+          export SCROZZ_MSIX_PUBLISHER="$WINDOWS_MSIX_PUBLISHER"
+          export SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME="$WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME"
+
+          PFX="$RUNNER_TEMP/scrozz-msix-signing.pfx"
+          if [[ -n "$WINDOWS_CERTIFICATE_PFX" &&
+                -n "$WINDOWS_MSIX_IDENTITY_NAME" &&
+                -n "$WINDOWS_MSIX_PUBLISHER" ]]; then
+            echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$PFX"
+            export SCROZZ_MSIX_SIGN_PFX="$PFX"
+            export SCROZZ_MSIX_SIGN_PFX_PASSWORD="$WINDOWS_CERTIFICATE_PASSWORD"
+          elif [[ -n "$WINDOWS_CERTIFICATE_PFX" ]]; then
+            echo "::notice title=MSIX is unsigned::Set WINDOWS_MSIX_IDENTITY_NAME and WINDOWS_MSIX_PUBLISHER to the exact Partner Center values before the release workflow signs the MSIX."
+          fi
+
+          powershell.exe -NoLogo -NoProfile -NonInteractive \
+            -ExecutionPolicy Bypass \
+            -File tools/package-windows.ps1 \
+            -OutputDirectory release-artifacts \
+            -Binary dist/scrozz.exe \
+            -Version "${{ steps.version.outputs.version }}" \
+            -Stamp release \
+            -Architecture x86_64
+          rm -f "$PFX"
+
       - name: Upload artefact
+        if: matrix.os != 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.slug }}
           path: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Windows artifacts
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.slug }}
+          path: release-artifacts/*
           if-no-files-found: error
           retention-days: 7
 

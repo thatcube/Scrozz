@@ -57,21 +57,22 @@ result.
 
 These are properties of the shipped application, not promises about intent.
 
-- **No generative AI at runtime.** Scrozz contains no language model, no
-  diffusion model, and no inference of any kind. Nothing you capture is
-  interpreted, described, summarised, or generated.
+- **No generative AI at runtime.** Scrozz contains no large language model or
+  diffusion model. It does not describe, summarise, or generate capture content.
+  An explicit OCR command does interpret image pixels as text locally; that
+  narrow recognition step is the only model-backed processing.
 - **Your captures are never uploaded to an AI service.** There is no such
   integration, and none is planned.
 - **No telemetry, analytics, crash reporting, or usage tracking.**
 - **No account, no sign-in, no server.** There is no Scrozz backend to talk to.
 - **Your data is not monetised.** There is nothing to monetise, because none of
   it leaves your machine.
-- **Text recognition is local.** Optical character recognition uses the
-  recogniser already built into your operating system — Vision on macOS,
-  `Windows.Media.Ocr` on Windows — running on device. Linux ships no comparable
-  system engine, and per [D8](docs/decisions.md) Scrozz reports that honestly
-  rather than quietly returning an empty result. Nothing is sent off the machine
-  in any case.
+- **Text recognition is local.** Optical character recognition uses Vision on
+  macOS, `Windows.Media.Ocr` when the Windows process has package identity, and
+  an installed Tesseract executable for Linux and the portable Windows ZIP.
+  Scrozz bundles no OCR model, passes an explicit installed language model, and
+  returns an actionable error when the required executable or language data is
+  absent. Nothing is sent off the machine.
 
 ### How you can verify that
 

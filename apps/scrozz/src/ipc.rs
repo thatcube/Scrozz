@@ -25,28 +25,27 @@
 //!
 //! ```text
 //! -->  {"schema":1,"argv":["capture","--json"],"cwd":"/home/u"}\n   (then EOF)
-//! <--  SCROZZ/1 0 json\n
-//! <--  <payload bytes until EOF>
+//! <--  SCROZZ/2 0 json 12 0\n
+//! <--  <12 stdout bytes><0 stderr bytes>
 //! ```
 //!
 //! The request is one line of JSON; the response is a plain-text header followed
-//! by opaque bytes. That asymmetry is deliberate:
+//! by length-delimited, opaque stdout and stderr bytes. That asymmetry is
+//! deliberate:
 //!
 //! - The payload may be a PNG (`--stdout`). Base64-ing it through a JSON
 //!   envelope would cost memory and a decoder for no benefit.
-//! - The client must relay the payload **unmodified**. If it had to parse and
+//! - The client must relay both payloads **unmodified**. If it had to parse and
 //!   re-serialise JSON, the forwarded output could differ from the local output
 //!   in key order or float formatting, and the contract in D11 would be a lie.
-//! - It needs no JSON *parser* on the client side at all, only the writer this
-//!   crate already has.
+//! - Human failures retain rich diagnostics on stderr while JSON failures remain
+//!   machine-readable on stdout.
 //!
 //! # What is implemented here
 //!
 //! The protocol, the endpoint rules, encoding, parsing, and the policy for which
 //! commands forward. The **server** belongs to the GUI, which owns the event loop
-//! and the store; it does not exist yet, so `try_connect` reports
-//! [`Status::NotRunning`] and every caller falls through to doing the work
-//! locally. That is the correct behaviour today and stays correct afterwards.
+//! and the store.
 
 use std::path::{Path, PathBuf};
 
@@ -57,7 +56,7 @@ use crate::{
 };
 
 /// The protocol version token that opens every response.
-pub const PROTOCOL_TOKEN: &str = "SCROZZ/1";
+pub const PROTOCOL_TOKEN: &str = "SCROZZ/2";
 
 /// The request schema version.
 pub const REQUEST_SCHEMA: i64 = 1;
@@ -65,7 +64,7 @@ pub const REQUEST_SCHEMA: i64 = 1;
 /// Overrides the endpoint, for tests and for unusual sandboxes.
 pub const ENDPOINT_ENV: &str = "SCROZZ_IPC_SOCKET";
 
-/// How a payload should be written to stdout once relayed.
+/// The encoding of a relayed stdout payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
     /// One JSON document. Goes to stdout verbatim.
@@ -103,10 +102,12 @@ pub struct Response {
     /// The exit code the running instance produced. Adopted verbatim, so a
     /// script sees the same code whether the work happened here or there.
     pub code: u8,
-    /// How to write the payload.
+    /// The encoding of stdout, used for diagnostics and binary-safe relaying.
     pub stream: StreamKind,
-    /// The payload, byte for byte as the running instance produced it.
-    pub payload: Vec<u8>,
+    /// Standard output, byte for byte as the running instance produced it.
+    pub stdout: Vec<u8>,
+    /// Standard error, byte for byte as the running instance produced it.
+    pub stderr: Vec<u8>,
 }
 
 /// Whether an instance is reachable.
@@ -152,15 +153,18 @@ pub fn policy(command: &Command) -> Forwarding {
         // prevent.
         Command::Capture(_) | Command::Record(_) => Forwarding::Prefer,
         Command::History(_) => Forwarding::Prefer,
-        Command::Ocr(_) | Command::Barcodes(_) => Forwarding::Prefer,
         Command::Settings(args) if args.is_write() => Forwarding::Prefer,
 
         // Pure reads and pure functions. `list` asks the compositor, not Scrozz;
-        // `hotkey generate-config` is string formatting; `gui` is the thing that
-        // would be forwarded to.
-        Command::Settings(_) | Command::List(_) | Command::Hotkey(_) | Command::Gui => {
-            Forwarding::Never
-        }
+        // OCR and barcode work owns no GUI state and can block on native engines
+        // or subprocesses, so it must never occupy the GUI listener's main thread.
+        // Keeping it local also preserves stderr and human diagnostic rendering.
+        Command::Ocr(_)
+        | Command::Barcodes(_)
+        | Command::Settings(_)
+        | Command::List(_)
+        | Command::Hotkey(_)
+        | Command::Gui => Forwarding::Never,
     }
 }
 
@@ -287,23 +291,61 @@ pub fn parse_response(bytes: &[u8]) -> CliResult<Response> {
     let stream = StreamKind::parse(stream)
         .ok_or_else(|| CliError::ipc(format!("unknown stream kind {stream:?}")))?;
 
+    let stdout_len = parse_payload_length(fields.next(), "stdout")?;
+    let stderr_len = parse_payload_length(fields.next(), "stderr")?;
+    if fields.next().is_some() {
+        return Err(CliError::ipc(
+            "the response header carried unexpected trailing fields",
+        ));
+    }
+
+    let body = &bytes[split + 1..];
+    let expected_len = stdout_len
+        .checked_add(stderr_len)
+        .ok_or_else(|| CliError::ipc("the response payload lengths overflowed"))?;
+    if body.len() != expected_len {
+        return Err(CliError::ipc(format!(
+            "the response announced {expected_len} payload bytes but sent {}",
+            body.len()
+        )));
+    }
+    let (stdout, stderr) = body.split_at(stdout_len);
     Ok(Response {
         code,
         stream,
-        payload: bytes[split + 1..].to_vec(),
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
     })
+}
+
+fn parse_payload_length(field: Option<&str>, destination: &str) -> CliResult<usize> {
+    field
+        .ok_or_else(|| {
+            CliError::ipc(format!(
+                "the response header carried no {destination} payload length"
+            ))
+        })?
+        .parse()
+        .map_err(|_| {
+            CliError::ipc(format!(
+                "the response header carried a malformed {destination} payload length"
+            ))
+        })
 }
 
 /// Encodes a response. Used by the server side, and by the round-trip tests.
 #[must_use]
 pub fn encode_response(response: &Response) -> Vec<u8> {
     let mut out = format!(
-        "{PROTOCOL_TOKEN} {} {}\n",
+        "{PROTOCOL_TOKEN} {} {} {} {}\n",
         response.code,
-        response.stream.token()
+        response.stream.token(),
+        response.stdout.len(),
+        response.stderr.len()
     )
     .into_bytes();
-    out.extend_from_slice(&response.payload);
+    out.extend_from_slice(&response.stdout);
+    out.extend_from_slice(&response.stderr);
     out
 }
 
@@ -472,6 +514,8 @@ mod tests {
         for args in [
             vec!["scrozz", "list", "displays"],
             vec!["scrozz", "list", "windows"],
+            vec!["scrozz", "ocr", "--file", "image.png"],
+            vec!["scrozz", "barcodes", "--file", "image.png"],
             vec![
                 "scrozz",
                 "hotkey",
@@ -529,41 +573,45 @@ mod tests {
 
     #[test]
     fn a_well_formed_response_parses() {
-        let raw = b"SCROZZ/1 0 json\n{\"ok\":true}";
+        let raw = b"SCROZZ/2 0 json 11 0\n{\"ok\":true}";
         let response = parse_response(raw).unwrap();
         assert_eq!(response.code, 0);
         assert_eq!(response.stream, StreamKind::Json);
-        assert_eq!(response.payload, br#"{"ok":true}"#);
+        assert_eq!(response.stdout, br#"{"ok":true}"#);
+        assert!(response.stderr.is_empty());
     }
 
     #[test]
     fn a_binary_payload_survives_untouched() {
         let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff];
-        let mut raw = b"SCROZZ/1 0 binary\n".to_vec();
+        let mut raw = b"SCROZZ/2 0 binary 10 0\n".to_vec();
         raw.extend_from_slice(&png);
         let response = parse_response(&raw).unwrap();
         assert_eq!(response.stream, StreamKind::Binary);
-        assert_eq!(response.payload, png);
+        assert_eq!(response.stdout, png);
+        assert!(response.stderr.is_empty());
     }
 
     #[test]
-    fn a_payload_containing_newlines_is_not_truncated() {
-        let raw = b"SCROZZ/1 0 text\nline one\nline two\n";
+    fn payloads_containing_newlines_are_not_truncated_or_mixed() {
+        let raw = b"SCROZZ/2 7 text 18 11\nline one\nline two\nerror\nmore\n";
         let response = parse_response(raw).unwrap();
-        assert_eq!(response.payload, b"line one\nline two\n");
+        assert_eq!(response.stdout, b"line one\nline two\n");
+        assert_eq!(response.stderr, b"error\nmore\n");
     }
 
     #[test]
     fn an_empty_payload_is_valid() {
-        let response = parse_response(b"SCROZZ/1 3 text\n").unwrap();
+        let response = parse_response(b"SCROZZ/2 3 text 0 0\n").unwrap();
         assert_eq!(response.code, 3);
-        assert!(response.payload.is_empty());
+        assert!(response.stdout.is_empty());
+        assert!(response.stderr.is_empty());
     }
 
     #[test]
     fn every_exit_code_relays_verbatim() {
         for code in crate::exit::Exit::all() {
-            let raw = format!("SCROZZ/1 {} text\n", code.code());
+            let raw = format!("SCROZZ/2 {} text 0 0\n", code.code());
             let response = parse_response(raw.as_bytes()).unwrap();
             assert_eq!(response.code, code.code());
         }
@@ -577,20 +625,25 @@ mod tests {
 
     #[test]
     fn a_foreign_protocol_version_is_named_in_the_error() {
-        let err = parse_response(b"SCROZZ/2 0 json\n{}").unwrap_err();
+        let err = parse_response(b"SCROZZ/1 0 json\n{}").unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("SCROZZ/2"), "{message}");
         assert!(message.contains("SCROZZ/1"), "{message}");
+        assert!(message.contains("SCROZZ/2"), "{message}");
         assert!(message.contains("different versions"), "{message}");
     }
 
     #[test]
     fn malformed_headers_are_rejected_one_by_one() {
-        let cases: [(&[u8], &str); 4] = [
-            (b"SCROZZ/1\n", "no exit code"),
-            (b"SCROZZ/1 abc json\n", "malformed exit code"),
-            (b"SCROZZ/1 0\n", "no stream kind"),
-            (b"SCROZZ/1 0 pictures\n", "unknown stream kind"),
+        let cases: [(&[u8], &str); 9] = [
+            (b"SCROZZ/2\n", "no exit code"),
+            (b"SCROZZ/2 abc json 0 0\n", "malformed exit code"),
+            (b"SCROZZ/2 0\n", "no stream kind"),
+            (b"SCROZZ/2 0 pictures 0 0\n", "unknown stream kind"),
+            (b"SCROZZ/2 0 text\n", "no stdout payload length"),
+            (b"SCROZZ/2 0 text abc 0\n", "malformed stdout"),
+            (b"SCROZZ/2 0 text 0 abc\n", "malformed stderr"),
+            (b"SCROZZ/2 0 text 0 0 extra\n", "unexpected trailing"),
+            (b"SCROZZ/2 0 text 1 0\n", "announced 1 payload bytes"),
         ];
         for (raw, expected) in cases {
             let err = parse_response(raw).unwrap_err();
@@ -604,7 +657,7 @@ mod tests {
 
     #[test]
     fn an_exit_code_beyond_a_byte_is_rejected() {
-        assert!(parse_response(b"SCROZZ/1 300 json\n").is_err());
+        assert!(parse_response(b"SCROZZ/2 300 json 0 0\n").is_err());
     }
 
     #[test]
@@ -613,7 +666,8 @@ mod tests {
             let original = Response {
                 code: 7,
                 stream,
-                payload: vec![0, 1, 2, b'\n', 255],
+                stdout: vec![0, 1, 2, b'\n', 255],
+                stderr: b"diagnostic\n".to_vec(),
             };
             let encoded = encode_response(&original);
             assert_eq!(parse_response(&encoded).unwrap(), original);

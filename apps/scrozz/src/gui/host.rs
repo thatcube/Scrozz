@@ -211,7 +211,8 @@ impl Host for Windowed {
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
                 let onboarding_memory = crate::gui::onboarding::OcrOnboardingMemory::system();
-                let onboarding_visible = !onboarding_memory.has_seen();
+                let onboarding_visible =
+                    crate::gui::onboarding::workflow_available() && !onboarding_memory.has_seen();
                 Ok(Box::new(Driver {
                     app,
                     overlay,
@@ -332,7 +333,15 @@ impl Driver {
             |ui, _class| {
                 close = ui.input(|input| input.viewport().close_requested());
                 egui::CentralPanel::default().show(ui, |ui| {
-                    replay_onboarding = self.settings.ui(ui).show_onboarding;
+                    if crate::gui::onboarding::workflow_available() {
+                        replay_onboarding = self.settings.ui(ui).show_onboarding;
+                    } else {
+                        ui.heading("Scrozz Settings");
+                        ui.label(
+                            "Text recognition setup will appear here when screen selection can \
+                             copy recognized text and persist its settings.",
+                        );
+                    }
                 });
             },
         );
@@ -346,7 +355,7 @@ impl Driver {
     }
 
     fn show_onboarding(&mut self, ctx: &egui::Context) {
-        if !self.onboarding_visible {
+        if !crate::gui::onboarding::workflow_available() || !self.onboarding_visible {
             return;
         }
 

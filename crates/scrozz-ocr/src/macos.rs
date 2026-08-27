@@ -25,12 +25,12 @@
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
+use objc2::{AnyThread, sel};
 use objc2_core_graphics::{
     CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSLocale, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSLocale, NSObjectProtocol, NSString};
 use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
 };
@@ -129,13 +129,15 @@ fn configure(request: &VNRecognizeTextRequest, options: &Options) -> Result<()> 
     request.setMinimumTextHeight(0.0);
 
     if options.automatic_language_detection {
+        require_automatic_language_detection(
+            request.respondsToSelector(sel!(setAutomaticallyDetectsLanguage:)),
+        )?;
         request.setAutomaticallyDetectsLanguage(true);
         return Ok(());
     }
 
     let languages = supported_languages(request, &options.languages);
     if languages.is_empty() {
-        request.setAutomaticallyDetectsLanguage(false);
         if !options.languages.is_empty() {
             return Err(Error::Unsupported {
                 what: format!("text recognition in {}", options.languages.join(", ")),
@@ -151,8 +153,29 @@ fn configure(request: &VNRecognizeTextRequest, options: &Options) -> Result<()> 
     let strings: Vec<Retained<NSString>> =
         languages.iter().map(|s| NSString::from_str(s)).collect();
     request.setRecognitionLanguages(&NSArray::from_retained_slice(&strings));
-    request.setAutomaticallyDetectsLanguage(false);
     Ok(())
+}
+
+fn require_automatic_language_detection(available: bool) -> Result<()> {
+    if available {
+        Ok(())
+    } else {
+        Err(Error::Unsupported {
+            what: "automatic OCR language detection".to_string(),
+            why: "automatic language detection requires macOS 13 or newer; recognition with the \
+                  system or an explicitly selected language remains available on this macOS \
+                  version"
+                .to_string(),
+        })
+    }
+}
+
+/// Whether this macOS release exposes Vision's language-inference selector.
+///
+/// Querying the Objective-C runtime avoids claiming the macOS 13 capability on
+/// macOS 12 without ever sending the unavailable setter.
+pub fn supports_automatic_language_detection() -> bool {
+    VNRecognizeTextRequest::new().respondsToSelector(sel!(setAutomaticallyDetectsLanguage:))
 }
 
 /// Picks the language tags to request, keeping only ones Vision accepts.
@@ -307,4 +330,22 @@ unsafe extern "C-unwind" fn release_boxed_slice(
     // SAFETY: by this function's contract `slice` is the original boxed slice,
     // and Core Graphics calls this exactly once when the provider dies.
     drop(unsafe { Box::from_raw(slice) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_macos_13_auto_detection_is_a_typed_error() {
+        assert!(matches!(
+            require_automatic_language_detection(false),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn available_auto_detection_is_accepted() {
+        assert!(require_automatic_language_detection(true).is_ok());
+    }
 }

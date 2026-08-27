@@ -8,6 +8,16 @@ use std::{
 
 const MARKER_FILE: &str = "ocr-onboarding-v1.seen";
 
+/// Whether the GUI can currently deliver the workflow described by onboarding.
+///
+/// Keep this false until region selection runs OCR, copies its text, and exposes
+/// real persisted OCR settings. The CLI backend alone is not the promised GUI
+/// capability.
+#[must_use]
+pub const fn workflow_available() -> bool {
+    false
+}
+
 /// The durable marker controlling whether OCR onboarding appears automatically.
 #[derive(Debug, Clone)]
 pub struct OcrOnboardingMemory {
@@ -87,5 +97,10 @@ mod tests {
 
         fs::remove_file(marker).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn onboarding_stays_gated_until_the_gui_workflow_exists() {
+        assert!(!workflow_available());
     }
 }

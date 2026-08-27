@@ -41,14 +41,6 @@
         Square44x44Logo="Assets\Square44x44Logo.png"
         AppListEntry="default" />
       <Extensions>
-        <uap:Extension
-          Category="windows.protocol"
-          uap10:Parameters="url handle">
-          <uap:Protocol Name="scrozz">
-            <uap:DisplayName>Scrozz URL automation</uap:DisplayName>
-            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
-          </uap:Protocol>
-        </uap:Extension>
         <desktop:Extension
           Category="windows.startupTask"
           Executable="scrozz.exe"

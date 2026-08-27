@@ -402,18 +402,19 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
     if !platform::ocr_available() {
         return Err(CliError::Core(CoreError::Unsupported {
             what: "recognising text".to_string(),
-            why: "this build has no OCR engine. macOS uses Vision, Windows uses \
-                  Windows.Media.Ocr, and Linux builds can enable the default \
+            why: "this build has no OCR engine. macOS uses Vision, packaged Windows uses \
+                  Windows.Media.Ocr, and Linux plus portable Windows use the default \
                   `tesseract` subprocess integration without linking C libraries."
                 .to_string(),
         }));
     }
 
     let engine = platform::ocr_engine(args.options());
+    let engine_name = scrozz_ocr::SystemOcr::engine_name()?;
     if args.list_languages {
         let languages = engine.available_languages()?;
         let data = Json::obj([
-            ("engine", Json::str(scrozz_ocr::SystemOcr::engine_name())),
+            ("engine", Json::str(engine_name)),
             (
                 "automatic_language_detection",
                 Json::Bool(scrozz_ocr::SystemOcr::supports_automatic_language_detection()),
@@ -447,7 +448,7 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
         if let Some(minimum) = args.min_confidence {
             blocks.retain(|block| block.confidence >= minimum);
         }
-        return Ok(ocr_report(&blocks, "pointer", args));
+        return Ok(ocr_report(&blocks, "pointer", args, engine_name));
     }
 
     let subject = args.resolve()?;
@@ -464,7 +465,12 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
             if let Some(minimum) = args.min_confidence {
                 blocks.retain(|block| block.confidence >= minimum);
             }
-            Ok(ocr_report(&blocks, &path.display().to_string(), args))
+            Ok(ocr_report(
+                &blocks,
+                &path.display().to_string(),
+                args,
+                engine_name,
+            ))
         }
         OcrSubject::Capture(_) => {
             let _store = platform::store()?;
@@ -487,6 +493,7 @@ fn ocr_report(
     blocks: &[scrozz_ocr::TextBlock],
     source: &str,
     args: &crate::cli::OcrArgs,
+    engine_name: &str,
 ) -> Report {
     let text = scrozz_ocr::text(blocks, args.line_breaks.to_ocr());
     let links = if args.detect_links {
@@ -530,7 +537,7 @@ fn ocr_report(
                 ])
             })),
         ),
-        ("engine", Json::str(scrozz_ocr::SystemOcr::engine_name())),
+        ("engine", Json::str(engine_name)),
         (
             "accuracy",
             Json::str(if args.under_pointer {
@@ -889,7 +896,7 @@ mod tests {
         }];
         let suffix = format!(
             r#""engine":"{}","accuracy":"accurate","line_breaks":"preserve","language_mode":"system","languages":[],"min_confidence":0.5}}"#,
-            scrozz_ocr::SystemOcr::engine_name()
+            scrozz_ocr::SystemOcr::engine_name().unwrap()
         );
         let expected = [
             r#"{"source":"fixture.png","block_count":1,"text":"https://example.org","#,
@@ -900,9 +907,14 @@ mod tests {
         .concat();
 
         assert_eq!(
-            ocr_report(&blocks, "fixture.png", &args)
-                .data
-                .to_compact_string(),
+            ocr_report(
+                &blocks,
+                "fixture.png",
+                &args,
+                scrozz_ocr::SystemOcr::engine_name().unwrap(),
+            )
+            .data
+            .to_compact_string(),
             expected
         );
     }

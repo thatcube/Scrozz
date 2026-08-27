@@ -13,6 +13,7 @@ scrozz-core.workspace = true
 rxing.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+isolang = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Fixtures are generated, never committed: a test encodes a QR or a Code 128 and
@@ -25,8 +26,9 @@ rxing = { workspace = true, features = ["encoders"] }
 default = ["tesseract"]
 # Linux text recognition through the *system* `tesseract` binary (D8). Pure
 # `std::process`: no C library at build time, nothing bundled, and no engine
-# added to the download. Absent on macOS and Windows, which have system engines.
-tesseract = []
+# added to the download. It also keeps the portable Windows ZIP functional:
+# unpackaged processes cannot activate Windows.Media.Ocr, while MSIX builds can.
+tesseract = ["dep:isolang"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
@@ -44,6 +46,11 @@ windows = { workspace = true, features = [
     "Storage_Streams",
     # TryCreateFromLanguage; without it, requested languages are only advisory.
     "Globalization",
+    # Portable artifacts have no package identity and must select Tesseract
+    # rather than attempting to activate Windows.Media.Ocr.
+    "Win32_Storage_Packaging_Appx",
+    # Resolves the user's locale for the portable Tesseract backend.
+    "Win32_Globalization",
 ] }
 windows-core.workspace = true
 

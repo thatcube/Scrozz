@@ -2,14 +2,10 @@
 //!
 //! # The shape of the problem
 //!
-//! Two of Scrozz's three platforms ship a genuinely good text recogniser in the
-//! operating system — Vision on macOS, `Windows.Media.Ocr` on Windows. Using
-//! them instead of a bundled model is not a shortcut: they are better on the
-//! small, antialiased, light-on-dark UI text that screenshots are full of, they
-//! are already localised to whatever languages the user has installed, and they
-//! add nothing to the download. Linux ships no such engine, so per decision D8
-//! that gap is reported honestly rather than papered over with a silent empty
-//! result.
+//! macOS and packaged Windows builds use the operating system's recogniser:
+//! Vision and `Windows.Media.Ocr`, respectively. The portable Windows ZIP has no
+//! package identity and therefore uses the same timeout-bounded local Tesseract
+//! subprocess as Linux. None of these paths sends image content off the machine.
 //!
 //! # What is actually hard
 //!
@@ -60,9 +56,19 @@ pub use links::{Link, LinkKind, links};
 pub use live::{LiveOcr, block_at_point, frame_local_point};
 pub use prepare::UpscalePolicy;
 
+/// Optional absolute directory containing a local Tesseract installation.
+///
+/// Portable Windows expects `tesseract.exe` and `tessdata/*.traineddata` below
+/// this directory. Linux expects `tesseract` with the same `tessdata` layout.
+/// When unset, Scrozz resolves `tesseract` through `PATH`.
+pub const TESSERACT_DIRECTORY_ENV: &str = "SCROZZ_TESSERACT_DIR";
+
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(all(target_os = "linux", feature = "tesseract"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", test),
+    feature = "tesseract"
+))]
 mod tesseract;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -87,11 +93,8 @@ pub struct TextBlock {
 
 /// Extracts text from images.
 ///
-/// Every platform ships a competent engine — Vision on macOS, Windows OCR on
-/// Windows — and both are far better than a bundled model at the sizes and
-/// fonts screenshots actually contain. Linux has no system engine, so it needs
-/// Tesseract or an ONNX model; per decision D8 that gap is stated plainly rather
-/// than hidden.
+/// Vision runs on macOS, Windows OCR runs when the process has package identity,
+/// and Tesseract runs on Linux and in the unpackaged Windows artifact.
 pub trait Ocr {
     /// Recognises text in a frame.
     ///
@@ -119,14 +122,12 @@ pub enum Accuracy {
 pub struct Options {
     /// BCP-47 tags in priority order, e.g. `["en-US", "de-DE"]`.
     ///
-    /// Empty means "use the languages the user has configured", which is the
-    /// right default on both platforms.
+    /// Empty means "resolve the languages the user has configured".
     ///
     /// A tag with no installed recogniser is skipped. If *none* of the requested
-    /// languages is available, macOS falls back to automatic language detection
-    /// and Windows returns [`Error::Unsupported`] naming what is installed —
-    /// Windows has no detection mode, and recognising text with the wrong
-    /// recogniser yields plausible nonsense rather than a visible failure.
+    /// languages is available, the backend returns
+    /// [`Error::Unsupported`] naming what is installed. Recognising text with
+    /// the wrong model yields plausible nonsense rather than a visible failure.
     pub languages: Vec<String>,
     /// Ask a capable backend to infer the language from the image.
     ///
@@ -205,11 +206,11 @@ impl Options {
 
 /// The operating system's text recogniser.
 ///
-/// Vision on macOS, `Windows.Media.Ocr` on Windows, and the distro-provided
-/// `tesseract` executable on Linux when the default `tesseract` feature is
-/// enabled. The Linux integration links no native library and bundles no model;
-/// a missing executable or language package is returned as an actionable
-/// [`scrozz_core::Error::Unsupported`].
+/// Vision on macOS, `Windows.Media.Ocr` in a packaged Windows process, and the
+/// locally installed `tesseract` executable on Linux or portable Windows when
+/// the default `tesseract` feature is enabled. The subprocess integration links
+/// no native library and bundles no model; a missing executable or language
+/// package is returned as an actionable [`scrozz_core::Error::Unsupported`].
 #[derive(Debug, Clone, Default)]
 pub struct SystemOcr {
     options: Options,
@@ -247,20 +248,25 @@ impl SystemOcr {
         ))
     }
 
-    /// Stable backend name suitable for diagnostics and machine output.
-    #[must_use]
-    pub const fn engine_name() -> &'static str {
+    /// Backend name suitable for diagnostics and machine output.
+    ///
+    /// # Errors
+    ///
+    /// On Windows, returns a platform error if package identity cannot be
+    /// determined. The packaged artifact selects Windows Media OCR; the portable
+    /// artifact selects the local Tesseract subprocess integration.
+    pub fn engine_name() -> Result<&'static str> {
         #[cfg(target_os = "macos")]
         {
-            "vision"
+            Ok("vision")
         }
         #[cfg(target_os = "windows")]
         {
-            "windows-media-ocr"
+            windows::engine_name()
         }
         #[cfg(all(target_os = "linux", feature = "tesseract"))]
         {
-            "tesseract"
+            Ok("tesseract")
         }
         #[cfg(not(any(
             target_os = "macos",
@@ -268,14 +274,21 @@ impl SystemOcr {
             all(target_os = "linux", feature = "tesseract")
         )))]
         {
-            "unavailable"
+            Ok("unavailable")
         }
     }
 
     /// Whether this backend can infer language from arbitrary image content.
     #[must_use]
-    pub const fn supports_automatic_language_detection() -> bool {
-        cfg!(target_os = "macos")
+    pub fn supports_automatic_language_detection() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            macos::supports_automatic_language_detection()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Lists language tags accepted by this backend on this machine.

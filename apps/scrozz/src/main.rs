@@ -166,23 +166,34 @@ fn try_forward(command: &Command) -> CliResult<Option<u8>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let response = ipc::forward(&argv)?;
 
-    // Relayed byte for byte. The whole point of the single-instance design is
-    // that `scrozz capture --json` produces the same document whether or not the
-    // menu-bar app happens to be running; re-encoding here would break that.
-    let mut stdout = std::io::stdout().lock();
-    match stdout
-        .write_all(&response.payload)
-        .and_then(|()| stdout.flush())
-    {
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-        other => other.map_err(|e| CliError::ipc(format!("could not relay the response: {e}")))?,
-    }
+    // Relayed byte for byte and to the original destinations. Re-encoding here
+    // would break JSON and could corrupt a capture streamed on stdout.
+    relay(
+        std::io::stdout().lock(),
+        &response.stdout,
+        "standard output",
+    )?;
+    relay(std::io::stderr().lock(), &response.stderr, "standard error")?;
     tracing::debug!(
         stream = response.stream.token(),
-        bytes = response.payload.len(),
+        stdout_bytes = response.stdout.len(),
+        stderr_bytes = response.stderr.len(),
         "relayed from the running instance"
     );
     Ok(Some(response.code))
+}
+
+fn relay(mut destination: impl Write, payload: &[u8], destination_name: &str) -> CliResult<()> {
+    match destination
+        .write_all(payload)
+        .and_then(|()| destination.flush())
+    {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(CliError::ipc(format!(
+            "could not relay {destination_name}: {err}"
+        ))),
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Renders `--help`, `--version` and parse failures.

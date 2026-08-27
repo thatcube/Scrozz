@@ -74,7 +74,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Global hotkeys | ✅ | 🟡 | 🟠 | Works where the desktop allows it. Wayland cannot grab keys, so Scrozz refuses and hands you the exact compositor config line to bind the CLI instead ([D11](docs/decisions.md)) |
 | Capture stack overlay | ✅ | ⬜ | ⬜ | The native overlay window is retrofitted on macOS only; elsewhere it reports unsupported rather than silently doing nothing. GNOME/Wayland cannot position overlays at all — the adaptation is [D31](docs/decisions.md) |
 | Drag-out to another app | 🟡 | ⬜ | ⬜ | The hero interaction ([D12](docs/decisions.md)): promised-file drag exists on macOS; other backends are planned, not written |
-| Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
+| Text recognition (OCR) | ✅ | 🟡 | 🟡 | Local only: Vision · packaged `Windows.Media.Ocr` / portable Tesseract · Linux Tesseract. Tesseract and matching language data are host packages, with actionable errors when absent |
 | Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
@@ -188,11 +188,12 @@ decision is wrong, say so and change it there first — that is what it is for.
 A screenshot tool sees your screen, including things you never meant to share.
 That earns a direct answer rather than a marketing adjective, so:
 
-**Scrozz contains no AI.** No language model, no inference, nothing generated. It
-does not upload your captures anywhere, has no telemetry, no analytics, no
-account, no sign-in, and no server to talk to. There is nothing to monetise
-because nothing leaves your machine. Text recognition runs on device, using the
-recogniser already built into your operating system.
+**Scrozz contains no generative AI.** It does not describe, summarise, or
+generate capture content. It does not upload your captures anywhere, has no
+telemetry, no analytics, no account, no sign-in, and no server to talk to.
+There is nothing to monetise because nothing leaves your machine. Explicit OCR
+commands run locally through the operating system recogniser or a Tesseract
+installation on your machine.
 
 You can check that rather than believe it: **there is no HTTP client anywhere in
 the dependency tree** — search `Cargo.lock` for `reqwest`, `hyper`, `ureq` or

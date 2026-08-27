@@ -4,10 +4,9 @@
 binary:
 
 - a deterministic portable ZIP, which uses a locally installed Tesseract for
-  OCR and keeps per-user registry registration;
+  OCR;
 - an MSIX package, which has the package identity required by
-  `Windows.Media.Ocr` and owns its protocol and startup task through
-  `AppxManifest.xml`.
+  `Windows.Media.Ocr` and owns its startup task through `AppxManifest.xml`.
 
 The startup task is declared with `Enabled="false"`. Installing the package
 never opts the user into launch at login; `scrozz autostart enable` requests it
@@ -55,6 +54,21 @@ accepted.
 Each artifact has an adjacent `.artifact.json` file. Its `package_kind` and
 `ocr_backend` fields make the distribution contract explicit: portable means
 `tesseract`, while MSIX means `windows-media-ocr`.
+
+The portable ZIP does not bundle Tesseract or language models. By default it
+finds `tesseract.exe` through `PATH`. For a self-contained local test or managed
+installation, set `SCROZZ_TESSERACT_DIR` to an absolute directory with this
+layout:
+
+```text
+Tesseract-OCR/
+├── tesseract.exe
+└── tessdata/
+    └── <language>.traineddata
+```
+
+Scrozz passes the `tessdata` directory explicitly. A malformed override is a
+typed configuration error; it never silently falls back to another executable.
 
 On a Windows SDK host, `powershell -NoProfile -File tools/test-windows-packaging.ps1`
 runs MakeAppx against normalized inputs and checks both archive layouts,

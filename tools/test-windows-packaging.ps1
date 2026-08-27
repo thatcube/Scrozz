@@ -164,8 +164,6 @@ try {
         'Name="com.thatcube.Scrozz"',
         'Version="1.2.3.0"',
         'uap10:RuntimeBehavior="packagedClassicApp"',
-        'Category="windows.protocol"',
-        'uap10:Parameters="url handle"',
         'Category="windows.startupTask"',
         'TaskId="ScrozzStartup"',
         'Enabled="false"',

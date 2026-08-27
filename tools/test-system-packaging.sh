@@ -67,8 +67,6 @@ if tools/package.sh "$ROOT/root-output" >/dev/null 2>&1; then
   fail "filesystem root was accepted through an output-directory symlink"
 fi
 
-grep -q '<key>CFBundleURLTypes</key>' tools/make-app-bundle.sh ||
-  fail "bundle URL type is absent"
 grep -q 'developer-id-release)' tools/make-app-bundle.sh ||
   fail "Developer ID release signing mode is absent"
 grep -q '"signed_manifest": false' tools/package.sh ||
@@ -92,12 +90,6 @@ grep -q 'Id="Scrozz"' "$MANIFEST" ||
   fail "MSIX application id drifted"
 grep -q '<rescap:Capability Name="runFullTrust"' "$MANIFEST" ||
   fail "MSIX app does not declare full-trust capability"
-grep -q 'Category="windows.protocol"' "$MANIFEST" ||
-  fail "MSIX protocol registration is absent"
-grep -q '<uap:Protocol Name="scrozz"' "$MANIFEST" ||
-  fail "MSIX protocol name drifted"
-grep -q 'uap10:Parameters="url handle"' "$MANIFEST" ||
-  fail "MSIX protocol activation does not route through the allow-listed URL command"
 grep -q 'Category="windows.startupTask"' "$MANIFEST" ||
   fail "MSIX startup task is absent"
 grep -q 'TaskId="ScrozzStartup"' "$MANIFEST" ||
