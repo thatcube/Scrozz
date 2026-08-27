@@ -63,6 +63,8 @@ pub enum Symbology {
     QrCode,
     /// Micro QR code.
     MicroQrCode,
+    /// Rectangular Micro QR code.
+    RectangularMicroQrCode,
     /// Aztec.
     Aztec,
     /// Data Matrix.
@@ -101,6 +103,7 @@ impl Symbology {
         match self {
             Self::QrCode => "qr",
             Self::MicroQrCode => "micro-qr",
+            Self::RectangularMicroQrCode => "rectangular-micro-qr",
             Self::Aztec => "aztec",
             Self::DataMatrix => "data-matrix",
             Self::Pdf417 => "pdf417",
@@ -127,6 +130,7 @@ impl Symbology {
         match lower.as_str() {
             "qr" | "qrcode" | "qr-code" => Self::QrCode,
             "micro-qr" | "microqr" => Self::MicroQrCode,
+            "rectangular-micro-qr" | "rmqr" => Self::RectangularMicroQrCode,
             "aztec" => Self::Aztec,
             "data-matrix" | "datamatrix" => Self::DataMatrix,
             "pdf417" | "pdf-417" => Self::Pdf417,
@@ -150,7 +154,12 @@ impl Symbology {
     pub const fn is_matrix(&self) -> bool {
         matches!(
             self,
-            Self::QrCode | Self::MicroQrCode | Self::Aztec | Self::DataMatrix | Self::Pdf417
+            Self::QrCode
+                | Self::MicroQrCode
+                | Self::RectangularMicroQrCode
+                | Self::Aztec
+                | Self::DataMatrix
+                | Self::Pdf417
         )
     }
 
@@ -160,6 +169,7 @@ impl Symbology {
         vec![
             Self::QrCode,
             Self::MicroQrCode,
+            Self::RectangularMicroQrCode,
             Self::Aztec,
             Self::DataMatrix,
             Self::Pdf417,
@@ -329,15 +339,91 @@ impl BarcodeDetector for SystemBarcodes {
     fn detect(&self, frame: &Frame) -> Result<Vec<Barcode>> {
         #[cfg(target_os = "macos")]
         {
-            match VisionBarcodes::with_options(self.options.clone()).detect(frame) {
-                // Vision found nothing. Not necessarily an empty image: it is
-                // stricter about low-contrast linear codes than ZXing, so a
-                // second opinion is worth the milliseconds.
-                Ok(found) if found.is_empty() => {}
-                other => return other,
+            let vision = VisionBarcodes::with_options(self.options.clone()).detect(frame);
+            let portable = PortableBarcodes::with_options(self.options.clone()).detect(frame);
+            match (vision, portable) {
+                (Ok(vision), Ok(portable)) => Ok(merge_detections(vision, portable)),
+                (Ok(vision), Err(portable_error)) if !vision.is_empty() => {
+                    tracing::debug!(
+                        "portable barcode second opinion failed after Vision found results: \
+                         {portable_error}"
+                    );
+                    Ok(vision)
+                }
+                (Err(vision_error), Ok(portable)) if !portable.is_empty() => {
+                    tracing::debug!(
+                        "Vision barcode detection failed; portable results were retained: \
+                         {vision_error}"
+                    );
+                    Ok(portable)
+                }
+                (Ok(_), Err(error)) | (Err(error), Ok(_)) | (Err(error), Err(_)) => Err(error),
             }
         }
-        PortableBarcodes::with_options(self.options.clone()).detect(frame)
+        #[cfg(not(target_os = "macos"))]
+        {
+            PortableBarcodes::with_options(self.options.clone()).detect(frame)
+        }
+    }
+}
+
+fn merge_detections(mut preferred: Vec<Barcode>, additional: Vec<Barcode>) -> Vec<Barcode> {
+    for barcode in additional {
+        let duplicate = preferred.iter().any(|existing| {
+            existing.payload == barcode.payload
+                && existing.symbology == barcode.symbology
+                && substantially_overlaps(existing.bounds, barcode.bounds)
+        });
+        if !duplicate {
+            preferred.push(barcode);
+        }
+    }
+    preferred
+}
+
+pub(crate) fn substantially_overlaps(left: LogicalRect, right: LogicalRect) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let overlap_width = (left.origin.x + left.size.width).min(right.origin.x + right.size.width)
+        - left.origin.x.max(right.origin.x);
+    let overlap_height = (left.origin.y + left.size.height).min(right.origin.y + right.size.height)
+        - left.origin.y.max(right.origin.y);
+    if overlap_width <= 0.0 || overlap_height <= 0.0 {
+        return false;
+    }
+    let overlap = overlap_width * overlap_height;
+    let smaller = (left.size.width * left.size.height).min(right.size.width * right.size.height);
+    overlap >= smaller * 0.5
+}
+
+#[cfg(test)]
+fn barcode(payload: &str, x: f64) -> Barcode {
+    Barcode {
+        payload: payload.to_owned(),
+        symbology: Symbology::QrCode,
+        bounds: LogicalRect::new(
+            LogicalPoint::new(x, 0.0),
+            scrozz_core::LogicalSize::new(10.0, 10.0),
+        ),
+        corners: Vec::new(),
+        confidence: 1.0,
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn merging_backends_deduplicates_only_spatial_overlap() {
+        let merged = merge_detections(
+            vec![barcode("same", 0.0)],
+            vec![barcode("same", 1.0), barcode("same", 20.0)],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].bounds.origin.x, 20.0);
     }
 }
 
@@ -405,6 +491,7 @@ mod tests {
     #[test]
     fn matrix_and_linear_are_not_confused() {
         assert!(Symbology::QrCode.is_matrix());
+        assert!(Symbology::RectangularMicroQrCode.is_matrix());
         assert!(Symbology::Pdf417.is_matrix());
         assert!(!Symbology::Code128.is_matrix());
         assert!(!Symbology::Ean13.is_matrix());

@@ -264,6 +264,9 @@ fn requested_formats(symbologies: &[Symbology]) -> HashSet<BarcodeFormat> {
             Symbology::MicroQrCode => {
                 formats.insert(BarcodeFormat::MICRO_QR_CODE);
             }
+            Symbology::RectangularMicroQrCode => {
+                formats.insert(BarcodeFormat::RECTANGULAR_MICRO_QR_CODE);
+            }
             Symbology::Aztec => {
                 formats.insert(BarcodeFormat::AZTEC);
             }
@@ -451,7 +454,7 @@ fn cpp_qr_outline_layout(points: &[Point]) -> bool {
 }
 
 fn validated_qr_outline(points: &[Point], matrix: &BitMatrix) -> Option<PixelGeometry> {
-    let corners = canonical_quadrilateral(points)?;
+    let corners = cpp_qr_corners(points)?;
     let geometry = PixelGeometry {
         bounds: PixelBounds::from_points(&corners)?,
         corners,
@@ -499,7 +502,7 @@ fn point_in_convex_outline(point: Point, corners: &[Point], tolerance: f32) -> b
     true
 }
 
-fn canonical_quadrilateral(points: &[Point]) -> Option<Vec<Point>> {
+fn cpp_qr_corners(points: &[Point]) -> Option<Vec<Point>> {
     if points.len() != 4 {
         return None;
     }
@@ -512,16 +515,9 @@ fn canonical_quadrilateral(points: &[Point]) -> Option<Vec<Point>> {
         }
     }
 
-    let centroid = Point::new(
-        points.iter().map(|point| point.x).sum::<f32>() / 4.0,
-        points.iter().map(|point| point.y).sum::<f32>() / 4.0,
-    );
-    let mut ordered = points.to_vec();
-    ordered.sort_by(|left, right| {
-        (left.y - centroid.y)
-            .atan2(left.x - centroid.x)
-            .total_cmp(&(right.y - centroid.y).atan2(right.x - centroid.x))
-    });
+    // RXing's C++ QR reader reports TL, TR, BL, BR. Preserve those semantic
+    // identities while changing to the public TL, TR, BR, BL contract.
+    let ordered = vec![points[0], points[1], points[3], points[2]];
 
     let mut orientation = None;
     for index in 0..4 {
@@ -539,20 +535,6 @@ fn canonical_quadrilateral(points: &[Point]) -> Option<Vec<Point>> {
         }
         orientation = Some(sign);
     }
-    if orientation == Some(false) {
-        ordered.reverse();
-    }
-
-    let first = ordered
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            left.y
-                .total_cmp(&right.y)
-                .then_with(|| left.x.total_cmp(&right.x))
-        })
-        .map(|(index, _)| index)?;
-    ordered.rotate_left(first);
     Some(ordered)
 }
 
@@ -881,29 +863,13 @@ fn deduplicate_overlaps(barcodes: Vec<Barcode>) -> Vec<Barcode> {
         let duplicate = unique.iter().any(|existing| {
             existing.payload == barcode.payload
                 && existing.symbology == barcode.symbology
-                && substantially_overlaps(existing.bounds, barcode.bounds)
+                && super::substantially_overlaps(existing.bounds, barcode.bounds)
         });
         if !duplicate {
             unique.push(barcode);
         }
     }
     unique
-}
-
-fn substantially_overlaps(left: LogicalRect, right: LogicalRect) -> bool {
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    let overlap_width = (left.origin.x + left.size.width).min(right.origin.x + right.size.width)
-        - left.origin.x.max(right.origin.x);
-    let overlap_height = (left.origin.y + left.size.height).min(right.origin.y + right.size.height)
-        - left.origin.y.max(right.origin.y);
-    if overlap_width <= 0.0 || overlap_height <= 0.0 {
-        return false;
-    }
-    let overlap = overlap_width * overlap_height;
-    let smaller = (left.size.width * left.size.height).min(right.size.width * right.size.height);
-    overlap >= smaller * 0.5
 }
 
 fn symbology(format: BarcodeFormat) -> Symbology {
@@ -921,7 +887,7 @@ fn symbology(format: BarcodeFormat) -> Symbology {
         BarcodeFormat::CODE_128 => Symbology::Code128,
         BarcodeFormat::CODABAR => Symbology::Codabar,
         BarcodeFormat::ITF => Symbology::Itf,
-        BarcodeFormat::RECTANGULAR_MICRO_QR_CODE => Symbology::Other("rectangular-micro-qr".into()),
+        BarcodeFormat::RECTANGULAR_MICRO_QR_CODE => Symbology::RectangularMicroQrCode,
         BarcodeFormat::MAXICODE => Symbology::Other("maxicode".into()),
         BarcodeFormat::RSS_14 => Symbology::Other("rss-14".into()),
         BarcodeFormat::RSS_EXPANDED => Symbology::Other("rss-expanded".into()),
@@ -1000,15 +966,26 @@ mod tests {
     }
 
     #[test]
-    fn orders_a_rotated_quadrilateral_cyclically() {
+    fn rectangular_micro_qr_has_its_own_filter_and_result_mapping() {
+        let formats = requested_formats(&[Symbology::RectangularMicroQrCode]);
+        assert_eq!(formats.len(), 1);
+        assert!(formats.contains(&BarcodeFormat::RECTANGULAR_MICRO_QR_CODE));
+        assert_eq!(
+            symbology(BarcodeFormat::RECTANGULAR_MICRO_QR_CODE),
+            Symbology::RectangularMicroQrCode
+        );
+    }
+
+    #[test]
+    fn preserves_cpp_qr_corner_identities() {
         let points = [
-            Point::new(100.0, 170.0),
-            Point::new(170.0, 100.0),
             Point::new(100.0, 30.0),
+            Point::new(170.0, 100.0),
             Point::new(30.0, 100.0),
+            Point::new(100.0, 170.0),
         ];
 
-        let ordered = canonical_quadrilateral(&points).expect("valid quadrilateral");
+        let ordered = cpp_qr_corners(&points).expect("valid quadrilateral");
 
         assert_eq!(ordered[0], Point::new(100.0, 30.0));
         assert_eq!(ordered[1], Point::new(170.0, 100.0));

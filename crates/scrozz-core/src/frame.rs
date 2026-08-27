@@ -111,7 +111,32 @@ impl Frame {
     /// otherwise discovered as a panic deep inside an encoder.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        let min_stride = self.width() as usize * self.format.bytes_per_pixel();
-        self.stride >= min_stride && self.data.len() >= self.stride * self.height() as usize
+        let Some(min_stride) = (self.width() as usize).checked_mul(self.format.bytes_per_pixel())
+        else {
+            return false;
+        };
+        let Some(required_len) = self.stride.checked_mul(self.height() as usize) else {
+            return false;
+        };
+        self.stride >= min_stride && self.data.len() >= required_len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_stride_overflow_is_rejected_without_panicking() {
+        let frame = Frame {
+            data: Vec::new(),
+            size: PhysicalSize::new(1.0, 2.0),
+            stride: usize::MAX / 2 + 1,
+            format: PixelFormat::Rgba8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::IDENTITY,
+        };
+
+        assert!(!frame.is_well_formed());
     }
 }

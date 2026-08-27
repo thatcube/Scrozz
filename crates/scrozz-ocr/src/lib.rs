@@ -210,8 +210,9 @@ impl Options {
 /// Vision on macOS, `Windows.Media.Ocr` in a packaged Windows process, and the
 /// locally installed `tesseract` executable on Linux or portable Windows when
 /// the default `tesseract` feature is enabled. The subprocess integration links
-/// no native library and bundles no model; a missing executable or language
-/// package is returned as an actionable [`scrozz_core::Error::Unsupported`].
+/// no native library; artifact packaging decides whether to bundle its executable
+/// and models. A missing executable or language package is returned as an
+/// actionable [`scrozz_core::Error::Unsupported`].
 #[derive(Debug, Clone, Default)]
 pub struct SystemOcr {
     options: Options,

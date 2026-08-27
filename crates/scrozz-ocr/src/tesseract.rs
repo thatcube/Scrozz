@@ -508,6 +508,11 @@ fn first_configured_language_list<'a>(
 fn tesseract_language_aliases(tag: &str) -> Vec<String> {
     let normalized = tag.replace('_', "-").to_ascii_lowercase();
     let base = normalized.split('-').next().unwrap_or(normalized.as_str());
+    if matches!(base, "nb" | "nob" | "nn" | "nno") {
+        // Tesseract follows ISO 639-2's collective Norwegian model name even
+        // though BCP-47 distinguishes Bokmal and Nynorsk.
+        return vec!["nor".to_string()];
+    }
     if matches!(base, "zh" | "zho" | "chi") {
         let subtags = normalized.split('-').skip(1).collect::<Vec<_>>();
         let traditional = if normalized == "chi-tra" || subtags.contains(&"hant") {
@@ -755,6 +760,14 @@ mod tests {
         assert_eq!(
             resolve_languages(&["wel-GB".to_string()], &["cym".to_string()]).unwrap(),
             vec!["cym"]
+        );
+        assert_eq!(
+            resolve_languages(&["nb-NO".to_string()], &["nor".to_string()]).unwrap(),
+            vec!["nor"]
+        );
+        assert_eq!(
+            resolve_languages(&["nn-NO".to_string()], &["nor".to_string()]).unwrap(),
+            vec!["nor"]
         );
     }
 

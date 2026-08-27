@@ -90,6 +90,28 @@ fn rotated_matrix(matrix: &BitMatrix, radians: f64, padding: u32) -> BitMatrix {
     rotated
 }
 
+fn rotated_point(
+    source: &BitMatrix,
+    target: &BitMatrix,
+    radians: f64,
+    point: (f64, f64),
+) -> (f64, f64) {
+    let source_center = (
+        (f64::from(source.getWidth()) - 1.0) / 2.0,
+        (f64::from(source.getHeight()) - 1.0) / 2.0,
+    );
+    let target_center = (
+        (f64::from(target.getWidth()) - 1.0) / 2.0,
+        (f64::from(target.getHeight()) - 1.0) / 2.0,
+    );
+    let x = point.0 - source_center.0;
+    let y = point.1 - source_center.1;
+    (
+        radians.cos().mul_add(x, -radians.sin() * y) + target_center.0,
+        radians.sin().mul_add(x, radians.cos() * y) + target_center.1,
+    )
+}
+
 fn composite_frame(width: u32, height: u32, symbols: &[(&BitMatrix, u32, u32)]) -> Frame {
     let mut data = vec![255; width as usize * height as usize * 4];
     for alpha in data.iter_mut().skip(3).step_by(4) {
@@ -228,11 +250,10 @@ fn decodes_an_inverted_generated_linear_barcode() {
     assert!(!found[0].bounds.is_empty());
 }
 
-#[test]
-fn preserves_geometry_for_a_rotated_generated_qr() {
-    let payload = "https://example.org/rotated";
+fn assert_rotated_qr_corner_order(radians: f64) {
+    let payload = "https://example.org/rotated-corners";
     let matrix = encoded_matrix(payload, BarcodeFormat::QR_CODE, 240, 240);
-    let rotated = rotated_matrix(&matrix, std::f64::consts::FRAC_PI_4, 24);
+    let rotated = rotated_matrix(&matrix, radians, 24);
     let frame = matrix_frame(&rotated);
 
     let found = detector(Symbology::QrCode)
@@ -243,6 +264,31 @@ fn preserves_geometry_for_a_rotated_generated_qr() {
     assert_eq!(found[0].payload, payload);
     assert!(!found[0].bounds.is_empty());
     assert_eq!(found[0].corners.len(), 4, "{found:#?}");
+
+    let (left, top, right, bottom) = ink_bounds(&matrix);
+    let source_corners = [
+        (left + 0.5, top + 0.5),
+        (right - 0.5, top + 0.5),
+        (right - 0.5, bottom - 0.5),
+        (left + 0.5, bottom - 0.5),
+    ];
+    for (actual, source) in found[0].corners.iter().zip(source_corners) {
+        let expected = rotated_point(&matrix, &rotated, radians, source);
+        assert!(
+            (actual.x - expected.0).abs() <= 2.0,
+            "{actual:?} != {expected:?}"
+        );
+        assert!(
+            (actual.y - expected.1).abs() <= 2.0,
+            "{actual:?} != {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn preserves_corner_identities_for_both_qr_rotations() {
+    assert_rotated_qr_corner_order(std::f64::consts::FRAC_PI_4);
+    assert_rotated_qr_corner_order(-std::f64::consts::FRAC_PI_4);
 }
 
 #[test]

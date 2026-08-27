@@ -107,7 +107,12 @@ fn candidates(text: &str) -> Vec<&str> {
         .map(trim_candidate)
         .filter(|candidate| is_url(candidate) || is_email(candidate))
         .collect();
-    found.extend(telephone_candidates(text));
+    let claimed = found.clone();
+    found.extend(
+        telephone_candidates(text)
+            .into_iter()
+            .filter(|candidate| !claimed.iter().any(|span| contains_slice(span, candidate))),
+    );
     found.sort_by_key(|candidate| candidate.as_ptr() as usize);
     found.dedup();
     found
@@ -189,6 +194,9 @@ fn is_email(text: &str) -> bool {
 fn is_telephone(text: &str) -> bool {
     let explicit = strip_ascii_case_insensitive(text, "tel:");
     let number = explicit.unwrap_or(text);
+    if explicit.is_none() && is_date(number) {
+        return false;
+    }
     let digits = number
         .chars()
         .filter(|character| character.is_ascii_digit())
@@ -207,6 +215,28 @@ fn is_telephone(text: &str) -> bool {
             || number
                 .chars()
                 .any(|character| matches!(character, '-' | '(' | ')' | ' ')))
+}
+
+fn is_date(text: &str) -> bool {
+    ['-', '.'].into_iter().any(|separator| {
+        let parts = text.split(separator).collect::<Vec<_>>();
+        parts.len() == 3
+            && parts.iter().all(|part| {
+                !part.is_empty()
+                    && part.len() <= 4
+                    && part.chars().all(|character| character.is_ascii_digit())
+            })
+            && ((parts[0].len() == 4 && parts[1].len() <= 2 && parts[2].len() <= 2)
+                || (parts[2].len() == 4 && parts[0].len() <= 2 && parts[1].len() <= 2))
+    })
+}
+
+fn contains_slice(container: &str, candidate: &str) -> bool {
+    let container_start = container.as_ptr() as usize;
+    let container_end = container_start + container.len();
+    let candidate_start = candidate.as_ptr() as usize;
+    let candidate_end = candidate_start + candidate.len();
+    candidate_start >= container_start && candidate_end <= container_end
 }
 
 fn starts_ascii_case_insensitive(text: &str, prefix: &str) -> bool {
@@ -238,6 +268,18 @@ mod tests {
         assert_eq!(classify("person@example.org"), Some(LinkKind::Email));
         assert_eq!(classify("+1 (212) 555-0199"), Some(LinkKind::Telephone));
         assert_eq!(classify("0123456789012"), None);
+        assert_eq!(classify("2026-08-27"), None);
+        assert_eq!(classify("27.08.2026"), None);
+    }
+
+    #[test]
+    fn dates_and_numbers_inside_urls_are_not_telephone_links() {
+        let found = links(&[block(
+            "Published 2026-08-27 at https://example.org/archive/2026-08-27",
+        )]);
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].kind, LinkKind::Url);
     }
 
     #[test]

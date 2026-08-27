@@ -152,6 +152,7 @@ fn vision_names(symbology: &Symbology) -> &'static [&'static str] {
     match symbology {
         Symbology::QrCode => &["VNBarcodeSymbologyQR"],
         Symbology::MicroQrCode => &["VNBarcodeSymbologyMicroQR"],
+        Symbology::RectangularMicroQrCode => &[],
         Symbology::Aztec => &["VNBarcodeSymbologyAztec"],
         Symbology::DataMatrix => &["VNBarcodeSymbologyDataMatrix"],
         Symbology::Pdf417 => &["VNBarcodeSymbologyPDF417", "VNBarcodeSymbologyMicroPDF417"],
