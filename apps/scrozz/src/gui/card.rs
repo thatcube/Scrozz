@@ -28,7 +28,7 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_core::Frame;
+use scrozz_core::{Frame, Provenance};
 use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
@@ -209,6 +209,8 @@ pub struct Card {
     pub capture_id: Option<CaptureId>,
     /// What kind of capture produced it.
     pub kind: CaptureKind,
+    /// What source shape the captured pixels actually represent.
+    pub provenance: Provenance,
     /// Source width in pixels, before thumbnailing.
     pub source_width: u32,
     /// Source height in pixels.
@@ -231,6 +233,11 @@ impl Card {
             id,
             capture_id: None,
             kind,
+            provenance: match kind {
+                CaptureKind::AllInOne | CaptureKind::Region => Provenance::Region,
+                CaptureKind::Window => Provenance::Window,
+                CaptureKind::Fullscreen | CaptureKind::AllDisplays => Provenance::Display,
+            },
             source_width: 0,
             source_height: 0,
             scale: 1.0,

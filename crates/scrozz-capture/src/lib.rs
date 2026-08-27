@@ -32,8 +32,11 @@ mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::session::{
-    Compositor, PortalCapabilities, SessionEnv as LinuxSessionEnv, SessionKind as LinuxSessionKind,
-    capabilities as portal_capabilities, detect_compositor, detect_session,
+    Compositor, Compositor as LinuxCompositor, PortalCapabilities, SessionEnv as LinuxSessionEnv,
+    SessionKind as LinuxSessionKind, capabilities as portal_capabilities,
+    capabilities as linux_portal_capabilities, describe as describe_linux_session,
+    detect_compositor, detect_compositor as detect_linux_compositor, detect_session,
+    detect_session as detect_linux_session,
 };
 #[cfg(target_os = "linux")]
 pub use linux::wayland::portal::SessionPlan as PortalSessionPlan;

@@ -43,7 +43,7 @@ use scrozz_record::{
     },
 };
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
+    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions, Session,
     SystemPermissions, Tray, TrayAction,
 };
 use scrozz_store::{History as _, Page, Store as _};
@@ -60,7 +60,8 @@ use crate::{
         action::{Action, CaptureKind},
         card::{CardEvent, CardSurface},
         pipeline::{Job, Outcome, Pipeline},
-        server::{Request, Server},
+        selection::CaptureSelector,
+        server::{Forwarder, Request, Server},
     },
     json::Json,
     platform,
@@ -187,15 +188,22 @@ impl Config {
             config.deadline = Some(Duration::from_millis(ms));
         }
         if let Ok(raw) = std::env::var(AUTOCAPTURE_ENV) {
-            config.capture_on_start = match raw.as_str() {
-                "0" | "false" | "no" | "" => None,
-                "region" => Some(CaptureKind::Region),
-                "window" => Some(CaptureKind::Window),
-                _ => Some(CaptureKind::Fullscreen),
-            };
+            config.capture_on_start = Self::capture_on_start(&raw);
         }
 
         config
+    }
+
+    fn capture_on_start(raw: &str) -> Option<CaptureKind> {
+        match raw {
+            "0" | "false" | "no" | "" => None,
+            "all-in-one" => Some(CaptureKind::AllInOne),
+            "region" => Some(CaptureKind::Region),
+            "window" => Some(CaptureKind::Window),
+            "1" | "fullscreen" => Some(CaptureKind::Fullscreen),
+            "all-displays" => Some(CaptureKind::AllDisplays),
+            _ => None,
+        }
     }
 
     /// A configuration that touches nothing outside this process.
@@ -244,6 +252,8 @@ pub struct App {
     tray: Option<Tray>,
     hotkeys: GlobalHotkeys,
     server: Option<Server>,
+    forwarder: Option<Forwarder>,
+    selector: Arc<dyn CaptureSelector>,
     started: Instant,
     captures: u64,
     notes: Vec<String>,
@@ -274,8 +284,12 @@ impl App {
     /// already holds. A tray that will not appear, or a hotkey the system
     /// refuses, are *recorded* and the app runs on — per D8 a missing capability
     /// is explained, not fatal.
-    pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
-        let pipeline = Pipeline::start()?;
+    pub fn new(
+        config: Config,
+        surface: Box<dyn CardSurface>,
+        selector: Arc<dyn CaptureSelector>,
+    ) -> CliResult<Self> {
+        let pipeline = Pipeline::start(Arc::clone(&selector))?;
         let mut notes = Vec::new();
         let recording = match RecordingMachine::native(RecordingSettings::shipped()) {
             Ok(machine) => {
@@ -293,6 +307,14 @@ impl App {
         let recording_available = recording
             .as_ref()
             .is_some_and(|machine| machine.capabilities().video);
+        let session = Session::detect();
+        let selection_capabilities = selector.capabilities();
+        let capture_backend_ready = crate::platform::capture_backend_is_ready();
+        let action_available = |action: Action| match action {
+            Action::ToggleRecording => recording_available,
+            Action::OpenHistory => true,
+            _ => action.is_available(selection_capabilities, &session, capture_backend_ready),
+        };
 
         let server = if config.ipc {
             // The one failure worth stopping for: another instance is live,
@@ -304,9 +326,15 @@ impl App {
         } else {
             None
         };
+        let forwarder = server
+            .as_ref()
+            .map(|_| Forwarder::start(Arc::clone(&selector)))
+            .transpose()?;
 
         let tray = if config.tray {
-            match Tray::with_tooltip_and_recording("Scrozz", recording_available) {
+            match Tray::with_tooltip_and_availability("Scrozz", |entry| {
+                action_available(Action::from_tray(entry))
+            }) {
                 Ok(tray) => {
                     notes.push("menu-bar item shown".to_owned());
                     Some(tray)
@@ -320,7 +348,23 @@ impl App {
             None
         };
 
-        let mut hotkeys = if config.bindings.is_empty() {
+        let available_bindings: Vec<_> = config
+            .bindings
+            .iter()
+            .filter(|(_, action)| action_available(*action))
+            .collect();
+        for (accelerator, action) in config
+            .bindings
+            .iter()
+            .filter(|(_, action)| !action_available(*action))
+        {
+            notes.push(format!(
+                "{accelerator} not bound: {} is unavailable in this session",
+                action.id()
+            ));
+        }
+
+        let mut hotkeys = if available_bindings.is_empty() {
             // Nothing to bind means nothing should touch the keyboard. The
             // detached backend does the bookkeeping without an OS registration.
             GlobalHotkeys::detached()
@@ -335,7 +379,7 @@ impl App {
         };
         hotkeys.set_command("scrozz");
 
-        for (accelerator, action) in &config.bindings {
+        for (accelerator, action) in available_bindings {
             let hotkey = Hotkey {
                 accelerator: accelerator.clone(),
             };
@@ -355,6 +399,8 @@ impl App {
             tray,
             hotkeys,
             server,
+            forwarder,
+            selector,
             started: Instant::now(),
             captures: 0,
             notes,
@@ -489,19 +535,32 @@ impl App {
                 continue;
             }
 
-            let served = if matches!(parsed, Some(Command::Record(_))) {
-                request.serve_with(|command| self.dispatch_gui_recording(command))
+            if matches!(parsed, Some(Command::Record(_))) {
+                let _ = request.serve_with(|command| self.dispatch_gui_recording(command));
             } else {
-                request.serve()
-            };
-            if let Some(command) = served {
-                self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
-                if matches!(command, crate::cli::Command::Gui) {
-                    // A second `scrozz gui` means "show yourself", not "start
-                    // again". There is nothing to show yet, so it is a no-op
-                    // that has at least been answered rather than ignored.
-                    self.note("a second launch was answered by this instance");
+                let submitted = self
+                    .forwarder
+                    .as_ref()
+                    .is_some_and(|forwarder| forwarder.submit(request));
+                if !submitted {
+                    self.note("the forwarded-command worker has gone");
                 }
+            }
+        }
+
+        let mut completed = Vec::new();
+        if let Some(forwarder) = &self.forwarder {
+            while let Some(command) = forwarder.poll() {
+                completed.push(command);
+            }
+        }
+        for command in completed.into_iter().flatten() {
+            self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+            if matches!(command, crate::cli::Command::Gui) {
+                // A second `scrozz gui` means "show yourself", not "start
+                // again". There is nothing to show yet, so it is a no-op
+                // that has at least been answered rather than ignored.
+                self.note("a second launch was answered by this instance");
             }
         }
 
@@ -1576,6 +1635,10 @@ impl App {
             tray.close();
         }
         self.server = None;
+        self.selector.cancel();
+        if let Some(mut forwarder) = self.forwarder.take() {
+            forwarder.stop();
+        }
         self.pipeline.stop();
     }
 
@@ -1782,11 +1845,17 @@ pub fn menu_actions() -> Vec<Action> {
 mod tests {
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
+    use crate::gui::selection::UnsupportedSelector;
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
         let handle = surface.handle();
-        let app = App::new(Config::sealed(), Box::new(surface)).expect("a sealed app must start");
+        let app = App::new(
+            Config::sealed(),
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+        )
+        .expect("a sealed app must start");
         (app, handle)
     }
 
@@ -2113,6 +2182,11 @@ mod tests {
         assert_eq!(parsed[0].0, "Ctrl+Alt+P");
         assert_eq!(parsed[0].1, Action::Capture(CaptureKind::Fullscreen));
         assert_eq!(parsed[1].1, Action::Capture(CaptureKind::Region));
+    }
+
+    #[test]
+    fn documented_startup_capture_value_means_fullscreen() {
+        assert_eq!(Config::capture_on_start("1"), Some(CaptureKind::Fullscreen));
     }
 
     #[test]

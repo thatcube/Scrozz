@@ -463,9 +463,9 @@ pub fn simulated_error_from(name: &str) -> CliError {
         }),
         "unsupported" => CliError::Core(CoreError::Unsupported {
             what: "window enumeration".into(),
-            why: "Wayland has no protocol for listing windows. Use \
-                  `scrozz capture --interactive window`, which asks the desktop \
-                  portal to run its own picker."
+            why: "Wayland has no protocol for listing windows. Capture a display \
+                  instead; portal-owned window capture and positioned all-display \
+                  composition are not yet connected to the interactive selector."
                 .into(),
         }),
         "cancelled" => CliError::Core(CoreError::Cancelled),
@@ -516,7 +516,7 @@ mod tests {
             },
             CoreError::Unsupported {
                 what: "window enumeration".into(),
-                why: "no Wayland protocol; use the portal picker".into(),
+                why: "no Wayland protocol; capture a display instead".into(),
             },
             CoreError::TargetGone("window 7".into()),
             CoreError::InvalidRequest("zero area".into()),
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn unsupported_prints_the_reason_and_the_alternative_verbatim() {
-        let why = "Wayland has no protocol for listing windows. Use the portal picker.";
+        let why = "Wayland has no protocol for listing windows. Capture a display instead.";
         let err = CliError::Core(CoreError::Unsupported {
             what: "window enumeration".into(),
             why: why.into(),

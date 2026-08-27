@@ -91,6 +91,7 @@ pub mod paint;
 mod recording_controls;
 pub mod recording_hud;
 pub mod recording_overlay;
+pub mod select;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
@@ -115,6 +116,11 @@ pub use recording_hud::{
 pub use recording_overlay::{
     RecordingOverlay, RecordingOverlayAction, RecordingOverlayControls, RecordingOverlayModel,
     RecordingOverlayResponse, RecordingSelectionState,
+};
+pub use select::{
+    AxisDirection, DisplayLayout, FrozenDesktop, FrozenDisplayFrame, FrozenPixel, HudEntry,
+    HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,
+    SelectionAnnouncement, SelectionDecision, SelectionScene, SelectionState, SelectionUi,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
 pub use video_editor::{

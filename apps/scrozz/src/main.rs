@@ -50,6 +50,7 @@ mod json;
 mod output;
 mod platform;
 mod report;
+mod selection_store;
 mod settings;
 #[cfg(test)]
 mod test_env;

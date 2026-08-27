@@ -21,9 +21,14 @@
 
 use std::time::Duration;
 
-use scrozz_core::{Error, Result};
+use scrozz_core::{Error, Result, SelectionMode};
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+use crate::{
+    hotkey::{DisplayServer, Session},
+    selection::{SelectionIntegration, resolve_selection},
+};
 
 // ---------------------------------------------------------------------------
 // The menu model
@@ -35,12 +40,16 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 /// reachable only by hotkey or CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrayAction {
+    /// Open the selector with every still-capture mode available.
+    CaptureAllInOne,
     /// Drag out a region and capture it.
     CaptureRegion,
     /// Pick a window and capture it.
     CaptureWindow,
     /// Capture the display under the pointer.
     CaptureFullscreen,
+    /// Capture every connected display.
+    CaptureAllDisplays,
     /// Start recording; becomes "Stop Recording" while recording runs.
     ToggleRecording,
     /// Show previous captures.
@@ -53,10 +62,12 @@ pub enum TrayAction {
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
+        Self::CaptureAllInOne,
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
+        Self::CaptureAllDisplays,
         Self::ToggleRecording,
         Self::OpenHistory,
         Self::OpenSettings,
@@ -71,9 +82,11 @@ impl TrayAction {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::CaptureAllInOne => "capture.all-in-one",
             Self::CaptureRegion => "capture.region",
             Self::CaptureWindow => "capture.window",
             Self::CaptureFullscreen => "capture.fullscreen",
+            Self::CaptureAllDisplays => "capture.all-displays",
             Self::ToggleRecording => "record.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
@@ -85,9 +98,11 @@ impl TrayAction {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::CaptureAllInOne => "All-in-One Capture…",
             Self::CaptureRegion => "Capture Region",
             Self::CaptureWindow => "Capture Window",
             Self::CaptureFullscreen => "Capture Fullscreen",
+            Self::CaptureAllDisplays => "Capture All Displays",
             Self::ToggleRecording => "Start Recording",
             Self::OpenHistory => "History…",
             Self::OpenSettings => "Settings…",
@@ -111,7 +126,13 @@ impl TrayAction {
     pub const fn is_available(self) -> bool {
         matches!(
             self,
-            Self::CaptureFullscreen | Self::OpenHistory | Self::Quit
+            Self::CaptureAllInOne
+                | Self::CaptureRegion
+                | Self::CaptureWindow
+                | Self::CaptureFullscreen
+                | Self::CaptureAllDisplays
+                | Self::OpenHistory
+                | Self::Quit
         )
     }
 
@@ -122,6 +143,32 @@ impl TrayAction {
             recording_available
         } else {
             self.is_available()
+        }
+    }
+
+    /// Whether this row can complete in the measured desktop session.
+    #[must_use]
+    pub fn is_available_for(self, session: &Session) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        match self {
+            Self::CaptureAllInOne | Self::CaptureRegion | Self::CaptureWindow => {
+                let plan = resolve_selection(SelectionIntegration::for_session(session));
+                match self {
+                    Self::CaptureAllInOne => plan.is_available(),
+                    Self::CaptureRegion => plan.capabilities.supports(SelectionMode::Region),
+                    Self::CaptureWindow => plan.capabilities.supports(SelectionMode::Window),
+                    _ => unreachable!(),
+                }
+            }
+            Self::CaptureFullscreen => session.server != DisplayServer::Headless,
+            Self::CaptureAllDisplays => !matches!(
+                session.server,
+                DisplayServer::Wayland | DisplayServer::Headless
+            ),
+            Self::OpenHistory | Self::Quit => true,
+            Self::ToggleRecording | Self::OpenSettings => false,
         }
     }
 }
@@ -143,9 +190,11 @@ pub enum TrayEntry {
 #[must_use]
 pub const fn menu_model() -> &'static [TrayEntry] {
     &[
+        TrayEntry::Item(TrayAction::CaptureAllInOne),
         TrayEntry::Item(TrayAction::CaptureRegion),
         TrayEntry::Item(TrayAction::CaptureWindow),
         TrayEntry::Item(TrayAction::CaptureFullscreen),
+        TrayEntry::Item(TrayAction::CaptureAllDisplays),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::ToggleRecording),
         TrayEntry::Separator,
@@ -275,7 +324,8 @@ impl Tray {
     ///
     /// As [`Tray::new`].
     pub fn with_tooltip(tooltip: &str) -> Result<Self> {
-        Self::with_tooltip_and_recording(tooltip, false)
+        let session = Session::detect();
+        Self::with_tooltip_and_availability(tooltip, |action| action.is_available_for(&session))
     }
 
     /// Creates the tray item with recording enabled only when a real engine
@@ -285,6 +335,29 @@ impl Tray {
     ///
     /// As [`Tray::new`].
     pub fn with_tooltip_and_recording(tooltip: &str, recording_available: bool) -> Result<Self> {
+        let session = Session::detect();
+        Self::with_tooltip_and_availability(tooltip, |action| {
+            if action == TrayAction::ToggleRecording {
+                recording_available
+            } else {
+                action.is_available_for(&session)
+            }
+        })
+    }
+
+    /// Creates the tray item using application-measured action readiness.
+    ///
+    /// This lets the app combine the shell's session facts with backend and
+    /// selector readiness, so a visible row is never enabled merely because the
+    /// desktop protocol could support it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tray::new`].
+    pub fn with_tooltip_and_availability(
+        tooltip: &str,
+        mut is_available: impl FnMut(TrayAction) -> bool,
+    ) -> Result<Self> {
         let menu = Menu::new();
         let mut record_item = None;
 
@@ -298,7 +371,7 @@ impl Tray {
                     let item = MenuItem::with_id(
                         action.id(),
                         action.label(),
-                        action.is_available_with(recording_available),
+                        action.is_available_with(true) && is_available(action),
                         None,
                     );
                     append(&menu, &item)?;

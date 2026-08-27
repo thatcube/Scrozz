@@ -22,12 +22,22 @@
 //! because saving *and* copying is a real want; and `--stdout` conflicts with
 //! `--json` because raw image bytes and a JSON document cannot share one stream.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+use scrozz_core::{
+    AspectLock, LogicalPoint, LogicalRect, LogicalSize, SelectionMode, SelectionOptions,
+    SizeConstraint,
+};
 
-use crate::fault::{CliError, CliResult};
+use crate::{
+    fault::{CliError, CliResult},
+    json::Json,
+};
 
 /// Scrozz — screenshots and screen recording for macOS, Windows and Linux.
 #[derive(Debug, Clone, Parser)]
@@ -160,6 +170,49 @@ impl Command {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct PathAliases {
+    aliases: Vec<(String, String)>,
+}
+
+impl PathAliases {
+    fn absolutize(&mut self, path: &mut PathBuf, base: &Path) {
+        if path.is_absolute() {
+            return;
+        }
+        let reported = path.display().to_string();
+        *path = base.join(&*path);
+        self.aliases.push((path.display().to_string(), reported));
+    }
+
+    pub(crate) fn restore_text(&self, value: &str) -> String {
+        let mut aliases: Vec<_> = self.aliases.iter().collect();
+        aliases.sort_by_key(|(absolute, _)| std::cmp::Reverse(absolute.len()));
+        aliases
+            .into_iter()
+            .fold(value.to_owned(), |text, (absolute, reported)| {
+                text.replace(absolute, reported)
+            })
+    }
+
+    pub(crate) fn restore_json(&self, value: &mut Json) {
+        match value {
+            Json::Str(text) => *text = self.restore_text(text),
+            Json::Arr(items) => {
+                for item in items {
+                    self.restore_json(item);
+                }
+            }
+            Json::Obj(fields) => {
+                for (_, value) in fields {
+                    self.restore_json(value);
+                }
+            }
+            Json::Null | Json::Bool(_) | Json::Int(_) | Json::Float(_) => {}
+        }
+    }
+}
+
 impl Cli {
     /// Checks the rules that span a global option and a subcommand.
     ///
@@ -183,6 +236,56 @@ impl Cli {
             ));
         }
         Ok(())
+    }
+
+    /// Resolves file arguments against the directory of the process that
+    /// submitted this command.
+    ///
+    /// IPC commands execute on a worker in the already-running app. Changing
+    /// that process's global working directory would race captures on every
+    /// other thread, so relative paths are made absolute before dispatch.
+    pub(crate) fn absolutize_paths(&mut self, base: &Path) -> PathAliases {
+        let mut aliases = PathAliases::default();
+
+        match self.command.as_mut() {
+            Some(Command::Capture(args)) => {
+                if let Some(path) = &mut args.output {
+                    aliases.absolutize(path, base);
+                }
+            }
+            Some(Command::Record(args)) => {
+                if let Some(path) = &mut args.output {
+                    aliases.absolutize(path, base);
+                }
+            }
+            Some(Command::History(HistoryArgs {
+                command:
+                    HistoryCommand::Get {
+                        output: Some(path), ..
+                    },
+            })) => {
+                aliases.absolutize(path, base);
+            }
+            Some(Command::Ocr(args)) => {
+                if let Some(path) = &mut args.file {
+                    aliases.absolutize(path, base);
+                }
+                if let Some(subject) = &mut args.subject {
+                    let candidate = PathBuf::from(&*subject);
+                    if candidate.is_relative() {
+                        let candidate = base.join(candidate);
+                        if candidate.is_file() {
+                            aliases
+                                .aliases
+                                .push((candidate.display().to_string(), subject.clone()));
+                            *subject = candidate.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        aliases
     }
 }
 
@@ -218,8 +321,8 @@ pub struct TargetArgs {
 
     /// Pick the target on screen. Defaults to a region.
     ///
-    /// `--interactive window` is the documented path on Wayland, where windows
-    /// cannot be enumerated and the desktop portal runs its own picker.
+    /// On Wayland, interactive window selection requires a separate portal-owned
+    /// capture handoff and is refused until that handoff is available.
     #[arg(
         long,
         value_name = "MODE",
@@ -239,6 +342,32 @@ pub enum InteractiveMode {
     Window,
     /// Click a display.
     Display,
+    /// Open the heads-up display with every capture mode available.
+    AllInOne,
+}
+
+impl InteractiveMode {
+    /// The mode the selector opens in.
+    #[must_use]
+    pub const fn initial_mode(self) -> SelectionMode {
+        match self {
+            Self::Region | Self::AllInOne => SelectionMode::Region,
+            Self::Window => SelectionMode::Window,
+            Self::Display => SelectionMode::Display,
+        }
+    }
+
+    /// Whether the all-in-one mode switcher should be visible.
+    #[must_use]
+    pub const fn shows_hud(self) -> bool {
+        matches!(self, Self::AllInOne)
+    }
+
+    /// Whether region-only size and retake controls make sense.
+    #[must_use]
+    pub const fn supports_region_controls(self) -> bool {
+        matches!(self, Self::Region | Self::AllInOne)
+    }
 }
 
 /// How a display was named.
@@ -395,6 +524,91 @@ impl FromStr for RegionArg {
     }
 }
 
+/// A positive `WIDTHxHEIGHT` size supplied on the command line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FixedSizeArg {
+    /// Width in logical points.
+    pub width: f64,
+    /// Height in logical points.
+    pub height: f64,
+}
+
+impl FixedSizeArg {
+    /// Converts to the core geometry type.
+    #[must_use]
+    pub fn to_logical_size(self) -> LogicalSize {
+        LogicalSize::new(self.width, self.height)
+    }
+}
+
+impl FromStr for FixedSizeArg {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (width, height) = parse_positive_pair(raw, ['x', 'X'], "WIDTHxHEIGHT")?;
+        Ok(Self { width, height })
+    }
+}
+
+/// A positive `WIDTH:HEIGHT` aspect ratio supplied on the command line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AspectArg {
+    /// Ratio numerator.
+    pub width: f64,
+    /// Ratio denominator.
+    pub height: f64,
+}
+
+impl AspectArg {
+    /// Converts to the core ratio type.
+    pub fn to_lock(self) -> scrozz_core::Result<AspectLock> {
+        AspectLock::ratio(self.width, self.height)
+    }
+}
+
+impl FromStr for AspectArg {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (width, height) = parse_positive_pair(raw, [':'], "WIDTH:HEIGHT")?;
+        Ok(Self { width, height })
+    }
+}
+
+fn parse_positive_pair<const N: usize>(
+    raw: &str,
+    separators: [char; N],
+    expected: &str,
+) -> Result<(f64, f64), String> {
+    let Some((left, right)) = raw
+        .char_indices()
+        .find(|(_, ch)| separators.contains(ch))
+        .map(|(at, ch)| (&raw[..at], &raw[at + ch.len_utf8()..]))
+    else {
+        return Err(format!("expected `{expected}`, got {raw:?}"));
+    };
+    if right.chars().any(|ch| separators.contains(&ch)) {
+        return Err(format!(
+            "expected one separator in `{expected}`, got {raw:?}"
+        ));
+    }
+
+    let parse = |name: &str, text: &str| -> Result<f64, String> {
+        let value = text
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("{name} in {raw:?} is not a number: {text:?}"))?;
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!(
+                "{name} in {raw:?} must be finite and greater than zero"
+            ));
+        }
+        Ok(value)
+    };
+
+    Ok((parse("width", left)?, parse("height", right)?))
+}
+
 // ---------------------------------------------------------------------------
 // capture
 // ---------------------------------------------------------------------------
@@ -483,6 +697,48 @@ pub struct CaptureArgs {
     #[arg(long, value_name = "SECS", allow_hyphen_values = true)]
     pub delay: Option<f64>,
 
+    /// Hold an exact selection size, as `WIDTHxHEIGHT` logical points.
+    #[arg(long, value_name = "WIDTHxHEIGHT")]
+    pub fixed_size: Option<FixedSizeArg>,
+
+    /// Hold a selection aspect ratio, as `WIDTH:HEIGHT`.
+    #[arg(long, value_name = "WIDTH:HEIGHT")]
+    pub aspect: Option<AspectArg>,
+
+    /// Freeze region/display pixels while choosing. Window captures stay live.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub freeze: Option<bool>,
+
+    /// Start from the last region so it can be adjusted and captured again.
+    #[arg(long)]
+    pub retake: bool,
+
+    /// Show the pixel magnifier. Use `--magnifier=false` to hide it.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub magnifier: Option<bool>,
+
+    /// Show full-width pointer guides. Use `--crosshair=false` to hide them.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub crosshair: Option<bool>,
+
     /// Write the image to this path.
     #[arg(long, short = 'o', value_name = "PATH")]
     pub output: Option<PathBuf>,
@@ -551,6 +807,98 @@ impl CaptureArgs {
         self.format.unwrap_or(Format::Png)
     }
 
+    /// Builds the shared selector options for an interactive target.
+    ///
+    /// `remembered` comes from the app's remembered-region store. It is accepted
+    /// separately so parsing remains pure and dry-runs never touch user state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a usage error when a size, aspect, or retake option is attached to
+    /// a target that cannot use region controls.
+    pub fn selection_options(
+        &self,
+        remembered: Option<(LogicalRect, Option<scrozz_core::DisplayId>)>,
+    ) -> CliResult<Option<SelectionOptions>> {
+        let target = self.target.resolve()?;
+        let TargetSpec::Interactive(mode) = target else {
+            if self.has_selection_controls() {
+                return Err(CliError::usage(
+                    "--fixed-size, --aspect, --freeze, --retake, --magnifier and \
+                     --crosshair apply only to --interactive captures",
+                ));
+            }
+            return Ok(None);
+        };
+
+        if !mode.supports_region_controls()
+            && (self.fixed_size.is_some() || self.aspect.is_some() || self.retake)
+        {
+            return Err(CliError::usage(
+                "--fixed-size, --aspect and --retake require `--interactive region` \
+                 or `--interactive all-in-one`",
+            ));
+        }
+        if !mode.supports_region_controls()
+            && (self.magnifier == Some(true) || self.crosshair == Some(true))
+        {
+            return Err(CliError::usage(
+                "--magnifier and --crosshair require `--interactive region` \
+                 or `--interactive all-in-one`",
+            ));
+        }
+        if mode == InteractiveMode::Window && self.freeze == Some(true) {
+            return Err(CliError::usage(
+                "--freeze cannot preserve an isolated window capture; use \
+                 `--interactive region` for frozen pixels or `--freeze=false`",
+            ));
+        }
+
+        let mut constraint = SizeConstraint::free();
+        if let Some(size) = self.fixed_size {
+            constraint = constraint.with_exact(size.to_logical_size())?;
+        }
+        if let Some(aspect) = self.aspect {
+            let lock = aspect.to_lock()?;
+            if let Some(exact) = constraint.exact {
+                let exact_ratio = exact.width / exact.height;
+                let wanted = lock.value().expect("a parsed aspect is locked");
+                if (exact_ratio - wanted).abs() > 1e-9 {
+                    return Err(CliError::usage(format!(
+                        "--fixed-size {}x{} does not satisfy --aspect {}:{}",
+                        exact.width, exact.height, aspect.width, aspect.height
+                    )));
+                }
+            }
+            constraint = constraint.with_aspect(lock);
+        }
+
+        let defaults = SelectionOptions::for_mode(mode.initial_mode());
+        let delay = self.delay.map(checked_delay).transpose()?;
+        let (remembered, remembered_display) =
+            remembered.map_or((None, None), |(rect, display)| (Some(rect), display));
+        Ok(Some(SelectionOptions {
+            remembered: self.retake.then_some(remembered).flatten(),
+            remembered_display: self.retake.then_some(remembered_display).flatten(),
+            constraint,
+            freeze: self.freeze.unwrap_or(defaults.freeze),
+            crosshair: self.crosshair.unwrap_or(defaults.crosshair),
+            magnifier: self.magnifier.unwrap_or(defaults.magnifier),
+            delay,
+            hud: mode.shows_hud(),
+            ..defaults
+        }))
+    }
+
+    fn has_selection_controls(&self) -> bool {
+        self.fixed_size.is_some()
+            || self.aspect.is_some()
+            || self.freeze.is_some()
+            || self.retake
+            || self.magnifier.is_some()
+            || self.crosshair.is_some()
+    }
+
     /// Validates combinations `clap` cannot express.
     ///
     /// # Errors
@@ -558,12 +906,8 @@ impl CaptureArgs {
     /// Returns [`CliError::Usage`] for a negative or non-finite delay, or for
     /// `--quality` on a format that has no quality setting.
     pub fn validate(&self) -> CliResult<()> {
-        if let Some(delay) = self.delay
-            && (!delay.is_finite() || delay < 0.0)
-        {
-            return Err(CliError::usage(format!(
-                "--delay must be a non-negative number of seconds, got {delay}"
-            )));
+        if let Some(delay) = self.delay {
+            let _ = checked_delay(delay)?;
         }
         if self.quality.is_some() && self.format() == Format::Png {
             return Err(CliError::usage(
@@ -571,9 +915,29 @@ impl CaptureArgs {
                  use --format jpeg or --format webp",
             ));
         }
-        self.target.resolve()?;
+
+        self.selection_options(None)?;
         Ok(())
     }
+}
+
+fn checked_delay(seconds: f64) -> CliResult<Duration> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(CliError::usage(format!(
+            "--delay must be a non-negative number of seconds, got {seconds}"
+        )));
+    }
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| {
+        CliError::usage(format!(
+            "--delay is too large for this platform, got {seconds} seconds"
+        ))
+    })?;
+    if Instant::now().checked_add(duration).is_none() {
+        return Err(CliError::usage(format!(
+            "--delay is too large for this platform, got {seconds} seconds"
+        )));
+    }
+    Ok(duration)
 }
 
 // ---------------------------------------------------------------------------
@@ -866,9 +1230,7 @@ pub enum ListWhat {
     Displays,
     /// Capturable windows, front-most first.
     ///
-    /// Unavailable on Wayland, which has no window enumeration protocol. There
-    /// the answer is `scrozz capture --interactive window`, which asks the
-    /// desktop portal to run its own picker.
+    /// Unavailable on Wayland, which has no window enumeration protocol.
     Windows,
 }
 
@@ -1297,6 +1659,7 @@ mod tests {
             ("region", InteractiveMode::Region),
             ("window", InteractiveMode::Window),
             ("display", InteractiveMode::Display),
+            ("all-in-one", InteractiveMode::AllInOne),
         ];
         for (name, want) in cases {
             let Some(Command::Capture(args)) =
@@ -1621,6 +1984,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unrepresentably_large_delay_is_a_usage_error() {
+        let Some(Command::Capture(args)) =
+            parse(&["scrozz", "capture", "--delay", "1e300"]).command
+        else {
+            panic!("expected capture")
+        };
+        let error = args.validate().unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error}");
+    }
+
+    #[test]
     fn a_fractional_delay_is_accepted() {
         let Some(Command::Capture(args)) = parse(&["scrozz", "capture", "--delay", "1.5"]).command
         else {
@@ -1646,6 +2020,196 @@ mod tests {
         };
         assert!(args.cursor);
         assert!(args.no_window_shadow);
+    }
+
+    #[test]
+    fn fixed_size_and_aspect_parse_as_positive_pairs() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--interactive",
+            "region",
+            "--fixed-size",
+            "1200x630",
+            "--aspect",
+            "40:21",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+
+        assert_eq!(
+            args.fixed_size,
+            Some(FixedSizeArg {
+                width: 1200.0,
+                height: 630.0
+            })
+        );
+        assert_eq!(
+            args.aspect,
+            Some(AspectArg {
+                width: 40.0,
+                height: 21.0
+            })
+        );
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn forwarded_relative_outputs_are_resolved_without_changing_process_state() {
+        let mut cli = parse(&[
+            "scrozz",
+            "capture",
+            "--output",
+            "captures/shot.png",
+            "--dry-run",
+        ]);
+        cli.absolutize_paths(std::path::Path::new("/caller/work"));
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture")
+        };
+        assert_eq!(
+            args.output,
+            Some(PathBuf::from("/caller/work/captures/shot.png"))
+        );
+    }
+
+    #[test]
+    fn malformed_size_and_aspect_values_are_rejected_at_parse_time() {
+        for argv in [
+            vec!["scrozz", "capture", "--fixed-size", "1200"],
+            vec!["scrozz", "capture", "--fixed-size", "0x630"],
+            vec!["scrozz", "capture", "--aspect", "16"],
+            vec!["scrozz", "capture", "--aspect", "16:0"],
+            vec!["scrozz", "capture", "--aspect", "16:9:1"],
+        ] {
+            reject(&argv);
+        }
+    }
+
+    #[test]
+    fn selection_options_reach_the_shared_contract() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--interactive",
+            "all-in-one",
+            "--fixed-size",
+            "800x600",
+            "--aspect",
+            "4:3",
+            "--freeze=false",
+            "--magnifier=false",
+            "--crosshair=false",
+            "--retake",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        let remembered = LogicalRect::new(
+            LogicalPoint::new(10.0, 20.0),
+            LogicalSize::new(800.0, 600.0),
+        );
+        let options = args
+            .selection_options(Some((remembered, None)))
+            .unwrap()
+            .expect("interactive options");
+
+        assert_eq!(options.mode, SelectionMode::Region);
+        assert!(options.hud);
+        assert_eq!(
+            options.constraint.exact,
+            Some(LogicalSize::new(800.0, 600.0))
+        );
+        assert_eq!(options.constraint.aspect.value(), Some(4.0 / 3.0));
+        assert_eq!(options.remembered, Some(remembered));
+        assert!(!options.freeze);
+        assert!(!options.magnifier);
+        assert!(!options.crosshair);
+    }
+
+    #[test]
+    fn incompatible_exact_size_and_aspect_are_a_usage_error() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--fixed-size",
+            "1200x630",
+            "--aspect",
+            "16:9",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn selection_controls_do_not_silently_apply_to_fixed_targets() {
+        let Some(Command::Capture(args)) =
+            parse(&["scrozz", "capture", "--region", "0,0,100,100", "--freeze"]).command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn region_only_controls_are_rejected_for_other_picker_modes() {
+        for argv in [
+            vec!["scrozz", "capture", "--interactive", "window", "--retake"],
+            vec![
+                "scrozz",
+                "capture",
+                "--interactive",
+                "display",
+                "--fixed-size",
+                "100x100",
+            ],
+            vec![
+                "scrozz",
+                "capture",
+                "--interactive",
+                "display",
+                "--magnifier",
+            ],
+            vec![
+                "scrozz",
+                "capture",
+                "--interactive",
+                "window",
+                "--crosshair",
+            ],
+        ] {
+            let Some(Command::Capture(args)) = parse(&argv).command else {
+                panic!("expected capture")
+            };
+            assert!(args.validate().is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn window_selection_stays_live_to_preserve_native_window_capture() {
+        let Some(Command::Capture(args)) =
+            parse(&["scrozz", "capture", "--interactive", "window"]).command
+        else {
+            panic!("expected capture")
+        };
+        let options = args
+            .selection_options(None)
+            .unwrap()
+            .expect("interactive options");
+        assert!(!options.freeze);
+
+        let Some(Command::Capture(args)) =
+            parse(&["scrozz", "capture", "--interactive", "window", "--freeze"]).command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
     }
 
     // -- record -----------------------------------------------------------
