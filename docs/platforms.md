@@ -321,15 +321,21 @@ while rejecting apartment failures and unexplained GDI downgrades.
 that command only as the installed `%LOCALAPPDATA%\Microsoft\WindowsApps`
 app-execution alias, invokes the alias token rather than package-directory
 bytes, asserts a real package full name and `windows-media-ocr`, and permits
-only the documented missing-language-pack skip. Run packaged smoke from a
-directory without a portable `scrozz.exe`; a PATH hijack is rejected before
-launch and the child-side identity assertion fails closed as a second guard.
+only the documented missing-language-pack skip. `-ExpectedPackageFullName`
+optionally requires an exact, ordinal match for the installed package identity
+and is rejected for portable runs. Run packaged smoke from a directory without
+a portable `scrozz.exe`; a PATH hijack is rejected before launch and the
+child-side identity assertion fails closed as a second guard. Packaged mode also
+sets `SCROZZ_TESSERACT_DIR` to a unique nonexistent absolute path under its
+scratch directory, proving package identity—not an inherited environment
+override—selects `Windows.Media.Ocr`.
 `-TesseractDirectory` supplies the absolute override for source-built
 development artifacts; an extracted portable artifact is validated against its
-sibling `tesseract` directory instead. The script clears
-both an inherited Tesseract override when none is explicit and the unstable
-backend opt-in, so an incomplete ZIP cannot borrow a developer installation and
-capture must work with release-default policy. Before capture it starts the
+sibling `tesseract` directory instead. It remains invalid for packaged runs.
+Portable mode clears an inherited Tesseract override when none is explicit, and
+all modes clear the unstable backend opt-in, so an incomplete ZIP cannot borrow
+a developer installation and capture must work with release-default policy.
+Before capture it starts the
 staged `tesseract.exe --version` with a ten-second timeout and a system-only
 `PATH`, which catches a payload whose dependent DLLs were accidentally supplied
 only by the packaging machine. `-ExerciseIpc` first refuses an already-running

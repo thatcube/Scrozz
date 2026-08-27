@@ -43,6 +43,9 @@ param(
     [string] $TesseractDirectory,
 
     [Parameter()]
+    [string] $ExpectedPackageFullName,
+
+    [Parameter()]
     [switch] $RequireWgc,
 
     [Parameter()]
@@ -54,6 +57,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if ($PSVersionTable.PSEdition -eq "Core") {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 function Assert-Smoke {
     param(
@@ -189,8 +195,16 @@ function Invoke-ScrozzJson {
         $allArguments += "--no-ipc"
     }
     $allArguments += $Arguments
-    $stdoutLines = & $Executable @allArguments 2> $stderrPath
-    $exitCode = $LASTEXITCODE
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 promotes redirected native stderr to the error
+        # stream; keep it capturable without weakening the assertions below.
+        $ErrorActionPreference = "Continue"
+        $stdoutLines = & $Executable @allArguments 2> $stderrPath
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     $stdout = [string]::Join([Environment]::NewLine, @($stdoutLines))
     $stderr = if (Test-Path -LiteralPath $stderrPath) {
         [System.IO.File]::ReadAllText($stderrPath)
@@ -374,8 +388,12 @@ if ($ArtifactType -eq "packaged" -and $buildingFromSource) {
     throw "-ArtifactType packaged requires -Binary to name the installed MSIX/sparse-package executable"
 }
 if ($ArtifactType -eq "packaged" -and
-    -not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
+    $PSBoundParameters.ContainsKey("TesseractDirectory")) {
     throw "-TesseractDirectory applies only to -ArtifactType portable"
+}
+if ($ArtifactType -eq "portable" -and
+    $PSBoundParameters.ContainsKey("ExpectedPackageFullName")) {
+    throw "-ExpectedPackageFullName applies only to -ArtifactType packaged"
 }
 if ($buildingFromSource -and
     $ArtifactType -eq "portable" -and
@@ -474,7 +492,20 @@ try {
     # opt-in inherited from the calling shell.
     $env:SCROZZ_UNSTABLE_BACKENDS = $null
     $env:RUST_LOG = "scrozz=info,warn"
-    if (-not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
+    if ($ArtifactType -eq "packaged") {
+        $packagedTesseractOverride = [System.IO.Path]::GetFullPath(
+            (Join-Path $scratch (
+                "packaged-must-ignore-tesseract-" + [Guid]::NewGuid().ToString("N")
+            ))
+        )
+        Assert-Smoke (
+            [System.IO.Path]::IsPathRooted($packagedTesseractOverride) -and
+            -not (Test-Path -LiteralPath $packagedTesseractOverride)
+        ) "packaged OCR negative-control path must be absolute and nonexistent"
+        # Package identity must select Windows.Media.Ocr before consulting this
+        # intentionally unusable portable-backend override.
+        $env:SCROZZ_TESSERACT_DIR = $packagedTesseractOverride
+    } elseif (-not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
         Assert-Smoke (
             [System.IO.Path]::IsPathRooted($TesseractDirectory) -and
             $TesseractDirectory -notmatch "^[A-Za-z]:[^\\/]"
@@ -634,6 +665,15 @@ try {
     if ($ArtifactType -eq "packaged") {
         Assert-Smoke (-not [string]::IsNullOrWhiteSpace($identity.full_name)) `
             "packaged runtime reported no package full name"
+        if ($PSBoundParameters.ContainsKey("ExpectedPackageFullName")) {
+            Assert-Smoke (
+                [System.StringComparer]::Ordinal.Equals(
+                    [string] $identity.full_name,
+                    $ExpectedPackageFullName
+                )
+            ) `
+                "packaged runtime reported '$($identity.full_name)', expected '$ExpectedPackageFullName'"
+        }
     } else {
         Assert-Smoke ($null -eq $identity.full_name) `
             "portable runtime unexpectedly reported package '$($identity.full_name)'"

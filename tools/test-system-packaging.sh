@@ -77,6 +77,7 @@ grep -q '"signed_manifest": false' tools/package.sh ||
 MANIFEST="packaging/windows/AppxManifest.xml.in"
 WINDOWS_PACKAGE="tools/package-windows.ps1"
 WINDOWS_PACKAGE_TEST="tools/test-windows-packaging.ps1"
+WINDOWS_SMOKE="tools/windows-smoke.ps1"
 NATIVE_SMOKE="tools/smoke.sh"
 RELEASE_WORKFLOW=".github/workflows/release.yml"
 [[ -f "$MANIFEST" ]] || fail "Windows AppxManifest template is absent"
@@ -85,8 +86,16 @@ RELEASE_WORKFLOW=".github/workflows/release.yml"
 [[ -f "$NATIVE_SMOKE" ]] || fail "native artifact smoke script is absent"
 grep -Fq 'SCROZZ_IPC_SOCKET="\\\\.\\pipe\\scrozz-smoke-$$"' "$NATIVE_SMOKE" ||
   fail "native smoke does not select an isolated named-pipe endpoint on Windows"
-grep -Fq "packaged smoke requires an installed app-execution alias" tools/windows-smoke.ps1 ||
+grep -Fq "packaged smoke requires an installed app-execution alias" "$WINDOWS_SMOKE" ||
   fail "Windows smoke does not require the installed alias for packaged identity"
+grep -Fq "\$PSNativeCommandUseErrorActionPreference = \$false" "$WINDOWS_SMOKE" ||
+  fail "Windows smoke does not disable pwsh native error promotion"
+grep -Fq "\$ErrorActionPreference = \"Continue\"" "$WINDOWS_SMOKE" ||
+  fail "Windows smoke is not compatible with redirected native stderr in Windows PowerShell 5.1"
+grep -Fq "packaged-must-ignore-tesseract-" "$WINDOWS_SMOKE" ||
+  fail "Windows smoke does not prove packaged OCR ignores the portable override"
+grep -Fq '[System.StringComparer]::Ordinal.Equals' "$WINDOWS_SMOKE" ||
+  fail "Windows smoke does not compare the expected package full name ordinally"
 if command -v xmllint >/dev/null 2>&1; then
   xmllint --noout "$MANIFEST" ||
     fail "Windows AppxManifest template is not well-formed XML"
