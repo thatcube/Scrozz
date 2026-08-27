@@ -2,10 +2,8 @@
 
 use scrozz_core::{LogicalPoint, LogicalRect, ScaleFactor, ScrollAxis};
 
-/// Win32's conventional wheel delta, also used as the cross-platform estimate
-/// for one discrete X11 wheel notch.
+/// Win32's conventional wheel delta.
 const POINTS_PER_NOTCH: f64 = 120.0;
-const MAX_X11_NOTCHES: u32 = 32;
 
 pub(crate) fn macos_deltas(axis: ScrollAxis, amount: f64) -> (i32, i32) {
     let delta = rounded_nonzero(amount);
@@ -18,7 +16,7 @@ pub(crate) fn macos_deltas(axis: ScrollAxis, amount: f64) -> (i32, i32) {
 }
 
 pub(crate) fn windows_delta(axis: ScrollAxis, amount: f64) -> i32 {
-    let delta = rounded_nonzero(amount);
+    let delta = rounded_nonzero(amount).signum() * POINTS_PER_NOTCH as i32;
     match axis {
         // A positive Win32 vertical delta means wheel-up, the inverse of the
         // core contract. HWHEEL is different: positive means tilt/scroll right.
@@ -35,22 +33,11 @@ pub(crate) fn x11_button_and_notches(axis: ScrollAxis, amount: f64) -> (u8, u32)
         (ScrollAxis::Horizontal, false) => 6, // wheel left
     };
 
-    // XTEST exposes only discrete core-pointer buttons. Approximate 120 logical
-    // points as one notch, always preserve a non-zero request, and cap a single
-    // gesture so malformed input cannot flood the X server.
-    let notches = (amount.abs() / POINTS_PER_NOTCH)
-        .round()
-        .clamp(1.0, f64::from(MAX_X11_NOTCHES)) as u32;
-    (button, notches)
-}
-
-pub(crate) fn portal_deltas(axis: ScrollAxis, amount: f64) -> (f64, f64) {
-    match axis {
-        // RemoteDesktop follows Wayland/libinput axis direction: positive Y is
-        // wheel-down and positive X is wheel-right, matching the core contract.
-        ScrollAxis::Vertical => (0.0, amount),
-        ScrollAxis::Horizontal => (amount, 0.0),
-    }
+    // XTEST exposes only discrete core-pointer buttons. A requested viewport
+    // distance is not a safe notch count: applications apply their own line and
+    // page settings, so send one conservative detent and adapt from measured
+    // visual movement.
+    (button, 1)
 }
 
 pub(crate) fn finite_point(point: LogicalPoint) -> bool {
@@ -75,50 +62,6 @@ pub(crate) fn logical_to_device_point(
         rounded_coordinate(point.x * scale.get())?,
         rounded_coordinate(point.y * scale.get())?,
     ))
-}
-
-pub(crate) fn normalized_absolute_coordinate(value: i32, origin: i32, extent: i32) -> Option<i32> {
-    if extent <= 1 {
-        return None;
-    }
-    let maximum = i64::from(extent - 1);
-    let offset = (i64::from(value) - i64::from(origin)).clamp(0, maximum);
-    i32::try_from(offset * 65_535 / maximum).ok()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PortalStreamGeometry {
-    pub node_id: u32,
-    pub position: (i32, i32),
-    pub size: (i32, i32),
-}
-
-pub(crate) fn portal_stream_at(
-    streams: &[PortalStreamGeometry],
-    point: LogicalPoint,
-) -> Option<(u32, f64, f64)> {
-    if !finite_point(point) {
-        return None;
-    }
-
-    streams.iter().find_map(|stream| {
-        let (x, y) = stream.position;
-        let (width, height) = stream.size;
-        if width <= 0
-            || height <= 0
-            || point.x < f64::from(x)
-            || point.y < f64::from(y)
-            || point.x >= f64::from(x) + f64::from(width)
-            || point.y >= f64::from(y) + f64::from(height)
-        {
-            return None;
-        }
-        Some((
-            stream.node_id,
-            point.x - f64::from(x),
-            point.y - f64::from(y),
-        ))
-    })
 }
 
 fn rounded_nonzero(value: f64) -> i32 {
@@ -152,27 +95,25 @@ mod tests {
         assert_eq!(macos_deltas(ScrollAxis::Horizontal, 120.0), (0, -120));
         assert_eq!(windows_delta(ScrollAxis::Vertical, 120.0), -120);
         assert_eq!(windows_delta(ScrollAxis::Horizontal, 120.0), 120);
-        assert_eq!(portal_deltas(ScrollAxis::Vertical, 120.0), (0.0, 120.0));
-        assert_eq!(portal_deltas(ScrollAxis::Horizontal, 120.0), (120.0, 0.0));
     }
 
     #[test]
     fn a_subpoint_nonzero_gesture_is_not_lost_to_integer_rounding() {
-        assert_eq!(windows_delta(ScrollAxis::Vertical, 0.1), -1);
+        assert_eq!(windows_delta(ScrollAxis::Vertical, 0.1), -120);
         assert_eq!(macos_deltas(ScrollAxis::Horizontal, -0.1), (0, 1));
     }
 
     #[test]
     fn x11_uses_conservative_bounded_notches_and_directional_buttons() {
         assert_eq!(x11_button_and_notches(ScrollAxis::Vertical, 1.0), (5, 1));
-        assert_eq!(x11_button_and_notches(ScrollAxis::Vertical, -240.0), (4, 2));
+        assert_eq!(x11_button_and_notches(ScrollAxis::Vertical, -240.0), (4, 1));
         assert_eq!(
             x11_button_and_notches(ScrollAxis::Horizontal, 360.0),
-            (7, 3)
+            (7, 1)
         );
         assert_eq!(
             x11_button_and_notches(ScrollAxis::Horizontal, -100_000.0),
-            (6, MAX_X11_NOTCHES)
+            (6, 1)
         );
     }
 
@@ -192,44 +133,6 @@ mod tests {
         );
         assert_eq!(
             logical_to_device_point(LogicalPoint::new(1.0, 200.0), bounds, ScaleFactor::new(1.5)),
-            None
-        );
-    }
-
-    #[test]
-    fn windows_absolute_coordinates_cover_a_negative_origin_desktop() {
-        assert_eq!(normalized_absolute_coordinate(-1920, -1920, 3840), Some(0));
-        assert_eq!(
-            normalized_absolute_coordinate(1919, -1920, 3840),
-            Some(65_535)
-        );
-        assert_eq!(normalized_absolute_coordinate(0, -1920, 3840), Some(32_776));
-    }
-
-    #[test]
-    fn portal_stream_selection_rebases_global_points() {
-        let streams = [
-            PortalStreamGeometry {
-                node_id: 10,
-                position: (-1920, 0),
-                size: (1920, 1080),
-            },
-            PortalStreamGeometry {
-                node_id: 20,
-                position: (0, 0),
-                size: (2560, 1440),
-            },
-        ];
-        assert_eq!(
-            portal_stream_at(&streams, LogicalPoint::new(-100.0, 50.0)),
-            Some((10, 1820.0, 50.0))
-        );
-        assert_eq!(
-            portal_stream_at(&streams, LogicalPoint::new(0.0, 50.0)),
-            Some((20, 0.0, 50.0))
-        );
-        assert_eq!(
-            portal_stream_at(&streams, LogicalPoint::new(2560.0, 50.0)),
             None
         );
     }

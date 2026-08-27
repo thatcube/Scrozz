@@ -30,6 +30,7 @@ use std::{
 
 use scrozz_core::Frame;
 use scrozz_store::CaptureId;
+use scrozz_ui::{ScrollHudAction, ScrollHudState};
 
 use crate::gui::action::CaptureKind;
 
@@ -346,6 +347,15 @@ pub trait CardSurface {
     /// caller wins.
     fn poll(&mut self) -> Option<CardEvent>;
 
+    /// Show or update the scrolling-capture HUD.
+    fn show_scroll_hud(&mut self, state: ScrollHudState);
+
+    /// Hide the scrolling-capture HUD.
+    fn hide_scroll_hud(&mut self);
+
+    /// Takes one pending scrolling-HUD decision, if there is one.
+    fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction>;
+
     /// How many cards are showing.
     fn len(&self) -> usize;
 
@@ -370,6 +380,8 @@ pub trait CardSurface {
 pub struct Recording {
     log: Arc<Mutex<Vec<Card>>>,
     injected: Arc<Mutex<Vec<CardEvent>>>,
+    scroll_hud: Arc<Mutex<Option<ScrollHudState>>>,
+    scroll_actions: Arc<Mutex<Vec<ScrollHudAction>>>,
 }
 
 impl Recording {
@@ -403,6 +415,23 @@ impl Recording {
             .push(event);
     }
 
+    /// Queues a scrolling-HUD decision.
+    pub fn inject_scroll_action(&self, action: ScrollHudAction) {
+        self.scroll_actions
+            .lock()
+            .expect("scroll HUD events are poisoned")
+            .push(action);
+    }
+
+    /// The scrolling-HUD state most recently presented.
+    #[must_use]
+    pub fn scrolling_hud(&self) -> Option<ScrollHudState> {
+        self.scroll_hud
+            .lock()
+            .expect("scroll HUD state is poisoned")
+            .clone()
+    }
+
     /// A handle sharing this recorder's state.
     #[must_use]
     pub fn handle(&self) -> Self {
@@ -426,6 +455,32 @@ impl CardSurface for Recording {
 
     fn poll(&mut self) -> Option<CardEvent> {
         let mut queue = self.injected.lock().expect("card events are poisoned");
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
+    }
+
+    fn show_scroll_hud(&mut self, state: ScrollHudState) {
+        *self
+            .scroll_hud
+            .lock()
+            .expect("scroll HUD state is poisoned") = Some(state);
+    }
+
+    fn hide_scroll_hud(&mut self) {
+        *self
+            .scroll_hud
+            .lock()
+            .expect("scroll HUD state is poisoned") = None;
+    }
+
+    fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
+        let mut queue = self
+            .scroll_actions
+            .lock()
+            .expect("scroll HUD events are poisoned");
         if queue.is_empty() {
             None
         } else {

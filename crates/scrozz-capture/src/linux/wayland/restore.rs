@@ -42,17 +42,29 @@ pub enum TokenKey {
     Window,
     /// A grant covering the whole virtual desktop.
     AllDisplays,
+    /// A grant bound to one stable display-identity fingerprint.
+    Display(u64),
 }
 
 impl TokenKey {
     /// The stable on-disk spelling.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub fn storage_key(self) -> String {
         match self {
-            Self::Monitor => "monitor",
-            Self::Window => "window",
-            Self::AllDisplays => "all-displays",
+            Self::Monitor => "monitor".into(),
+            Self::Window => "window".into(),
+            Self::AllDisplays => "all-displays".into(),
+            Self::Display(fingerprint) => format!("display-{fingerprint:016x}"),
         }
+    }
+
+    /// Scopes a token to an opaque display id without writing that id to disk.
+    #[must_use]
+    pub fn for_display(id: &str) -> Self {
+        let fingerprint = id.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        Self::Display(fingerprint)
     }
 
     /// Parses the on-disk spelling.
@@ -62,7 +74,10 @@ impl TokenKey {
             "monitor" => Some(Self::Monitor),
             "window" => Some(Self::Window),
             "all-displays" => Some(Self::AllDisplays),
-            _ => None,
+            _ => text
+                .strip_prefix("display-")
+                .and_then(|value| u64::from_str_radix(value, 16).ok())
+                .map(Self::Display),
         }
     }
 }
@@ -83,7 +98,7 @@ impl TokenStore {
     /// The token for a session kind, if one was saved.
     #[must_use]
     pub fn get(&self, key: TokenKey) -> Option<&str> {
-        self.tokens.get(key.as_str()).map(String::as_str)
+        self.tokens.get(&key.storage_key()).map(String::as_str)
     }
 
     /// Records a token, replacing any previous one.
@@ -92,11 +107,11 @@ impl TokenStore {
     /// string when the user declined persistence, and storing that would make
     /// every later attempt send a token the portal must reject.
     pub fn set(&mut self, key: TokenKey, token: &str) {
+        let key = key.storage_key();
         if token.is_empty() {
-            self.tokens.remove(key.as_str());
+            self.tokens.remove(&key);
         } else {
-            self.tokens
-                .insert(key.as_str().to_owned(), token.to_owned());
+            self.tokens.insert(key, token.to_owned());
         }
     }
 
@@ -105,7 +120,7 @@ impl TokenStore {
     /// Called when a restore attempt fails, so the next capture presents the
     /// picker cleanly instead of retrying a token that will never work again.
     pub fn invalidate(&mut self, key: TokenKey) {
-        self.tokens.remove(key.as_str());
+        self.tokens.remove(&key.storage_key());
     }
 
     /// Whether anything is stored.

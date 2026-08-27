@@ -66,6 +66,7 @@ use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
+use crate::scrolling::{ScrollHudAction, ScrollHudState, ScrollingHud};
 use crate::stack::{CaptureStack, CardId, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 
@@ -405,6 +406,8 @@ pub enum OverlayEvent {
     DockExpanded,
     /// The last card left; the overlay can be hidden.
     Emptied,
+    /// A decision from the scrolling-capture HUD.
+    Scrolling(ScrollHudAction),
 }
 
 /// Something the application asks the overlay to do.
@@ -423,6 +426,7 @@ struct Shared {
     inbox: Mutex<Vec<CaptureRequest>>,
     outbox: Mutex<Vec<OverlayEvent>>,
     commands: Mutex<Vec<Command>>,
+    scroll_hud: Mutex<Option<ScrollHudState>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
 }
@@ -448,6 +452,22 @@ impl OverlayHandle {
     pub fn push(&self, request: CaptureRequest) {
         if let Ok(mut q) = self.shared.inbox.lock() {
             q.push(request);
+        }
+        self.wake();
+    }
+
+    /// Show or update the scrolling-capture HUD.
+    pub fn show_scroll_hud(&self, state: ScrollHudState) {
+        if let Ok(mut slot) = self.shared.scroll_hud.lock() {
+            *slot = Some(state);
+        }
+        self.wake();
+    }
+
+    /// Hide the scrolling-capture HUD.
+    pub fn hide_scroll_hud(&self) {
+        if let Ok(mut slot) = self.shared.scroll_hud.lock() {
+            *slot = None;
         }
         self.wake();
     }
@@ -1069,12 +1089,27 @@ impl eframe::App for OverlayApp {
         let surface = Surface::new(&self.theme, &self.icons, m);
         let frames = self.stack.frame(&m);
 
-        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
+        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 2);
         let mut hovered = None;
         let mut action = None;
         let mut drag_start = None;
         let mut drag_to = None;
         let mut drag_end = false;
+
+        let scroll_hud = self
+            .handle
+            .shared
+            .scroll_hud
+            .lock()
+            .ok()
+            .and_then(|state| state.clone());
+        if let Some(state) = scroll_hud {
+            let response = ScrollingHud::draw(ui, &self.theme, &state, true);
+            hits.push(response.rect);
+            if let Some(action) = response.action {
+                self.emit(OverlayEvent::Scrolling(action));
+            }
+        }
 
         for f in &frames {
             let Some(entry) = self.content.get(&f.id) else {

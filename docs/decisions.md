@@ -145,10 +145,11 @@ leak into the core API as implicit expectations.
 **Why.** Wayland has no protocol for window enumeration, and
 `xdg-desktop-portal-wlr` does not implement `GlobalShortcuts` at all — full
 wlroots parity is not achievable, so it is not promised. GNOME and KDE cover
-the large majority, and both support ScreenCast restore tokens (no repeated
-permission prompts) and the `RemoteDesktop` portal that scrolling capture
-requires. On wlroots, global hotkeys work by binding a compositor shortcut to
-the Scrozz CLI.
+the large majority and both support ScreenCast restore tokens (no repeated
+capture picker). Their separate `RemoteDesktop` portal cannot prove input is
+bound to the same ScreenCast-selected surface, so scrolling capture remains
+manual on every Wayland compositor until those grants can be safely coupled. On
+wlroots, global hotkeys work by binding a compositor shortcut to the Scrozz CLI.
 
 ---
 
@@ -356,7 +357,8 @@ abandoned. **But every invasive permission is requested at the moment a feature
 is first used, never during onboarding or at launch.**
 
 Applies to: Screen Recording, Accessibility, Input Monitoring (click and
-keystroke overlays), Camera, Microphone, and Wayland RemoteDesktop.
+keystroke overlays), Camera, Microphone, and any future Wayland RemoteDesktop
+integration that can bind input to the selected capture surface.
 
 **Why.** Maintainer: *"required effort should not stop us from trying."* Agreed
 — with one correction. The problem with click and keystroke overlays was never

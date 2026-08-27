@@ -79,7 +79,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
 | Screen recording | ⬜ | ⬜ | ⬜ | Contracts only. Hardware encoders only, for licence reasons |
-| Scrolling capture | ⬜ | ⬜ | ⬜ | No clean implementation exists on any platform; deliberately deferred |
+| Scrolling capture | ✅ | 🟡 | 🟡 | Vertical and horizontal stitching, sticky-chrome removal, progress, cancellation and partial salvage are wired end to end. macOS synthesizes target-bound gestures; Windows and X11 have native drivers awaiting real-desktop smoke, while Wayland is deliberately manual |
 
 **What 🟡 rests on, precisely.** Three automated layers, described in full in
 [`docs/platforms.md`](docs/platforms.md): every target type-checks from a single

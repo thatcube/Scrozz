@@ -30,12 +30,15 @@ use std::{
 };
 
 use scrozz_annotate::Document;
-use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_core::{
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, ScrollAxis,
+};
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_stitch::{AtomicCancellation, CancelAction, Progress};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
+    commands::ScrollingTarget,
     fault::{CliError, CliResult},
     gui::{
         action::CaptureKind,
@@ -55,12 +58,31 @@ pub enum Job {
         /// main thread can correlate the answer with the request.
         card: CardId,
     },
+    /// Take and assemble repeated frames along one explicit axis.
+    Scrolling {
+        /// Direction the stitched image grows.
+        axis: ScrollAxis,
+        /// Identity reserved for the resulting card.
+        card: CardId,
+        /// Window identity selected before the HUD and geometry refreshed when
+        /// the user chose an axis.
+        target: Box<ScrollingTarget>,
+    },
     /// Put a card's capture on the clipboard.
     Copy(CardId),
     /// Write a card's capture to the configured folder.
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Commit a completed scrolling capture after the HUD accepts it.
+    Accept(CardId),
+    /// Remove a capture that lost a race with an explicit scrolling abort.
+    Discard {
+        /// Session-local card identity.
+        card: CardId,
+        /// History identity, when persistence completed before the abort.
+        capture: Option<CaptureId>,
+    },
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -151,10 +173,15 @@ impl Pipeline {
 
     /// Posts a job. Returns `false` if the worker has gone.
     pub fn post(&self, job: Job) -> bool {
-        if matches!(&job, Job::Capture { .. }) {
+        if matches!(&job, Job::Scrolling { .. }) {
             self.cancellation.reset();
         }
         self.jobs.send(job).is_ok()
+    }
+
+    /// Ask the active scrolling session to keep its partial image or abort it.
+    pub fn cancel_scrolling(&self, action: CancelAction) {
+        self.cancellation.cancel(action);
     }
 
     /// Takes one finished piece of work, if there is one. Never blocks.
@@ -203,6 +230,7 @@ struct Worker {
     outcomes: Sender<Outcome>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
+    pending: HashMap<CardId, Capture>,
     cancellation: AtomicCancellation,
 }
 
@@ -228,6 +256,7 @@ impl Worker {
             outcomes,
             store,
             cache: HashMap::new(),
+            pending: HashMap::new(),
             cancellation,
         }
     }
@@ -235,11 +264,20 @@ impl Worker {
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
             match job {
-                Job::Capture { kind, card } => self.capture(kind, card),
+                Job::Capture { kind, card } => self.capture(kind, card, None),
+                Job::Scrolling { axis, card, target } => {
+                    self.capture(CaptureKind::Scrolling, card, Some((axis, *target)));
+                }
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
                 Job::Release(card) => {
                     self.cache.remove(&card);
+                }
+                Job::Accept(card) => self.accept(card),
+                Job::Discard { card, capture } => {
+                    if let Err(error) = self.discard(card, capture.as_ref()) {
+                        let _ = self.outcomes.send(Outcome::Refused { card, error });
+                    }
                 }
                 Job::Stop => break,
             }
@@ -247,10 +285,25 @@ impl Worker {
         tracing::debug!("capture worker stopped");
     }
 
-    fn capture(&mut self, kind: CaptureKind, card: CardId) {
-        match self.take(kind, card) {
+    fn capture(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        scrolling: Option<(ScrollAxis, ScrollingTarget)>,
+    ) {
+        match self.take(kind, card, scrolling) {
             Ok(built) => {
-                let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
+                if kind == CaptureKind::Scrolling
+                    && self.cancellation.requested() == Some(CancelAction::Abort)
+                {
+                    let error = self
+                        .discard(built.id, built.capture_id.as_ref())
+                        .err()
+                        .unwrap_or(CliError::Core(CoreError::Cancelled));
+                    let _ = self.outcomes.send(Outcome::Failed { card, error });
+                } else {
+                    let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
+                }
             }
             Err(error) => {
                 tracing::warn!(%card, "capture failed: {error}");
@@ -259,16 +312,28 @@ impl Worker {
         }
     }
 
-    fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
-        // Through `platform`, not `scrozz_capture` directly, so the
-        // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
+    fn take(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        scrolling: Option<(ScrollAxis, ScrollingTarget)>,
+    ) -> CliResult<Card> {
+        // Through `platform`, not `scrozz_capture` directly, so test builds stay
+        // isolated from the developer's real screen and backend errors keep the
+        // CLI/GUI fault contract.
         let backend = platform::capture_backend()?;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
-            CaptureKind::Fullscreen | CaptureKind::Scrolling => {
-                CaptureTarget::Display(backend.active_display()?.id)
-            }
+            CaptureKind::Fullscreen => CaptureTarget::Display(backend.active_display()?.id),
+            CaptureKind::Scrolling => scrolling
+                .as_ref()
+                .map(|(_, target)| target.capture_target())
+                .ok_or_else(|| {
+                    CliError::Core(CoreError::InvalidRequest(
+                        "a scrolling pipeline job must carry its snapshotted target".to_owned(),
+                    ))
+                })?,
             // Choosing a region or a window is the selection overlay's job, and
             // per D8 a missing capability is explained rather than approximated.
             // Silently capturing the whole display instead would be worse than
@@ -289,10 +354,15 @@ impl Worker {
         };
 
         let capture = if kind == CaptureKind::Scrolling {
+            let (axis, target) = scrolling.ok_or_else(|| {
+                CliError::Core(CoreError::InvalidRequest(
+                    "a scrolling pipeline job must name its axis and target".to_owned(),
+                ))
+            })?;
             let outcomes = self.outcomes.clone();
-            crate::commands::scrolling_capture_with(
-                backend.as_ref(),
-                request,
+            crate::commands::scrolling_capture_target_with(
+                target,
+                axis,
                 &mut self.cancellation,
                 move |progress| {
                     let _ = outcomes.send(Outcome::Progress { card, progress });
@@ -301,9 +371,26 @@ impl Worker {
         } else {
             backend.capture(&request)?
         };
+        self.fail_if_aborted(kind)?;
         let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
+        self.fail_if_aborted(kind)?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
-        let capture_id = self.remember(&capture);
+        self.fail_if_aborted(kind)?;
+        let source_width = capture.frame.width();
+        let source_height = capture.frame.height();
+        let scale = capture.frame.scale.get();
+        let capture_id = if kind == CaptureKind::Scrolling {
+            self.pending.insert(card, capture);
+            None
+        } else {
+            self.remember(capture)
+        };
+        if kind == CaptureKind::Scrolling
+            && self.cancellation.requested() == Some(CancelAction::Abort)
+        {
+            self.discard(card, capture_id.as_ref())?;
+            return Err(CliError::Core(CoreError::Cancelled));
+        }
 
         self.cache.insert(card, Cached { bytes });
 
@@ -311,9 +398,9 @@ impl Worker {
             id: card,
             capture_id,
             kind,
-            source_width: capture.frame.width(),
-            source_height: capture.frame.height(),
-            scale: capture.frame.scale.get(),
+            source_width,
+            source_height,
+            scale,
             thumbnail,
             // History persistence is internal and does not count as an export.
             // A visible file is created only when the user presses Save; writing
@@ -324,9 +411,9 @@ impl Worker {
     }
 
     /// Persists a capture, or explains in the log why it was not.
-    fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
+    fn remember(&mut self, capture: Capture) -> Option<CaptureId> {
         let store = self.store.as_mut()?;
-        let document = Document::new(capture.clone());
+        let document = Document::new(capture);
         match store.insert(NewCapture::new(&document)) {
             Ok(id) => Some(id),
             Err(err) => {
@@ -334,6 +421,30 @@ impl Worker {
                 None
             }
         }
+    }
+
+    fn accept(&mut self, card: CardId) {
+        if let Some(capture) = self.pending.remove(&card) {
+            self.remember(capture);
+        }
+    }
+
+    fn fail_if_aborted(&self, kind: CaptureKind) -> CliResult<()> {
+        if kind == CaptureKind::Scrolling
+            && self.cancellation.requested() == Some(CancelAction::Abort)
+        {
+            return Err(CliError::Core(CoreError::Cancelled));
+        }
+        Ok(())
+    }
+
+    fn discard(&mut self, card: CardId, capture: Option<&CaptureId>) -> CliResult<()> {
+        self.pending.remove(&card);
+        self.cache.remove(&card);
+        if let (Some(store), Some(capture)) = (self.store.as_mut(), capture) {
+            store.delete(capture)?;
+        }
+        Ok(())
     }
 
     fn copy(&mut self, card: CardId) {

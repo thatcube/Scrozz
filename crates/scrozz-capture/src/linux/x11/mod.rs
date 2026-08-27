@@ -12,12 +12,12 @@
 //!
 //! # MIT-SHM
 //!
-//! The shared-memory path is detected and reported but not used. It needs both
-//! `x11rb`'s `shm` feature and a way to call `shmget`/`shmat` or `memfd_create`
-//! — that is, `libc` or `rustix` — and this crate's manifest grants neither.
-//! `GetImage` is used instead, which is correct everywhere and slower on large
-//! captures. [`X11Backend::shm_available`] records what was found so the report
-//! is honest about which path ran.
+//! The shared-memory path is detected and reported but not used. The manifest
+//! enables `x11rb`'s protocol support, but this backend does not yet own the
+//! allocation, mapping and cleanup lifecycle needed to use a shared segment
+//! safely. `GetImage` is correct everywhere and slower on large captures.
+//! [`X11Backend::shm_available`] records what was found so the report is honest
+//! about which path ran.
 
 pub mod ewmh;
 pub mod layout;
@@ -630,12 +630,12 @@ impl TargetEnumerator for X11Backend {
 impl CaptureBackend for X11Backend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
         if request.cursor == scrozz_core::CursorMode::Visible {
-            // Compositing the pointer needs XFIXES for the cursor image, which
-            // is another feature-gated extension. Failing here would make the
+            // Compositing the pointer needs an XFIXES cursor-image path that this
+            // backend has not implemented. Failing here would make the
             // whole capture unavailable over an optional decoration, so the
             // capture proceeds and the omission is logged.
             tracing::warn!(
-                "cursor capture needs the XFIXES extension, which is not compiled in; \
+                "cursor capture through XFIXES is not implemented yet; \
                  capturing without the pointer"
             );
         }

@@ -1,6 +1,6 @@
 //! X11 scroll synthesis through the XTEST extension.
 
-use scrozz_core::{Error, Result, ScrollCapabilities, ScrollDriver, ScrollGesture};
+use scrozz_core::{Error, Result, ScrollCapabilities, ScrollDriver, ScrollGesture, WindowId};
 use x11rb::{
     connection::{Connection, RequestConnection},
     protocol::{xproto, xtest},
@@ -59,6 +59,87 @@ impl X11ScrollDriver {
     fn move_pointer(&self, x: i16, y: i16) -> Result<()> {
         self.fake_input(xproto::MOTION_NOTIFY_EVENT, 0, x, y)
     }
+
+    fn root_child_for(&self, mut window: u32) -> Result<u32> {
+        for _ in 0..64 {
+            let tree = xproto::query_tree(&self.conn, window)
+                .map_err(platform)?
+                .reply()
+                .map_err(platform)?;
+            if tree.parent == self.root {
+                return Ok(window);
+            }
+            if tree.parent == 0 || tree.parent == window {
+                return Err(Error::TargetGone(
+                    "the selected X11 window is no longer attached to this screen".into(),
+                ));
+            }
+            window = tree.parent;
+        }
+        Err(Error::Platform(
+            "the selected X11 target has an unexpectedly deep window hierarchy".into(),
+        ))
+    }
+
+    fn ensure_selected_window_owns_pointer(
+        &self,
+        gesture: &ScrollGesture,
+        x: i16,
+        y: i16,
+    ) -> Result<()> {
+        let id = gesture.window.as_ref().ok_or_else(|| Error::Unsupported {
+            what: "automatic scrolling of an unspecified X11 target".into(),
+            why: "XTEST wheel input is pointer-addressed, so Scrozz requires the exact selected \
+                  window before it can post one safely"
+                .into(),
+        })?;
+        let selected = parse_window_id(id)?;
+        let attributes = xproto::get_window_attributes(&self.conn, selected)
+            .map_err(platform)?
+            .reply()
+            .map_err(platform)?;
+        if attributes.map_state != xproto::MapState::VIEWABLE {
+            return Err(Error::TargetGone(format!(
+                "X11 window {} is no longer viewable",
+                id.0
+            )));
+        }
+        let geometry = xproto::get_geometry(&self.conn, selected)
+            .map_err(platform)?
+            .reply()
+            .map_err(platform)?;
+        let relative = xproto::query_pointer(&self.conn, selected)
+            .map_err(platform)?
+            .reply()
+            .map_err(platform)?;
+        let inside = relative.same_screen
+            && relative.win_x >= 0
+            && relative.win_y >= 0
+            && i32::from(relative.win_x) < i32::from(geometry.width)
+            && i32::from(relative.win_y) < i32::from(geometry.height);
+        if !inside {
+            return Err(Error::TargetGone(format!(
+                "X11 window {} no longer contains the selected scroll point",
+                id.0
+            )));
+        }
+
+        let selected_root_child = self.root_child_for(selected)?;
+        let root_pointer = xproto::query_pointer(&self.conn, self.root)
+            .map_err(platform)?
+            .reply()
+            .map_err(platform)?;
+        if root_pointer.root_x != x
+            || root_pointer.root_y != y
+            || root_pointer.child != selected_root_child
+        {
+            return Err(Error::TargetGone(format!(
+                "X11 window {} no longer owns the selected scroll point",
+                id.0
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl ScrollDriver for X11ScrollDriver {
@@ -105,10 +186,14 @@ impl ScrollDriver for X11ScrollDriver {
 
         self.move_pointer(x, y)?;
         let (button, notches) = scroll_units::x11_button_and_notches(gesture.axis, gesture.amount);
-        let delivery = (0..notches).try_for_each(|_| {
-            self.fake_input(xproto::BUTTON_PRESS_EVENT, button, x, y)?;
-            self.fake_input(xproto::BUTTON_RELEASE_EVENT, button, x, y)
-        });
+        let delivery = self
+            .ensure_selected_window_owns_pointer(gesture, x, y)
+            .and_then(|()| {
+                (0..notches).try_for_each(|_| {
+                    self.fake_input(xproto::BUTTON_PRESS_EVENT, button, x, y)?;
+                    self.fake_input(xproto::BUTTON_RELEASE_EVENT, button, x, y)
+                })
+            });
         let restore = self.move_pointer(original.root_x, original.root_y);
 
         match (delivery, restore) {
@@ -158,4 +243,28 @@ fn validate_xtest(conn: &RustConnection) -> Result<()> {
 
 fn platform(error: impl std::fmt::Display) -> Error {
     Error::Platform(format!("XTEST request failed: {error}"))
+}
+
+fn parse_window_id(id: &WindowId) -> Result<u32> {
+    id.0.strip_prefix("x11:")
+        .and_then(|raw| u32::from_str_radix(raw, 16).ok())
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!("window id {} is not an X11 window identity", id.0))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_window_id;
+    use scrozz_core::WindowId;
+
+    #[test]
+    fn target_identity_parser_accepts_only_x11_handles() {
+        assert_eq!(
+            parse_window_id(&WindowId("x11:00abcdef".to_owned())).expect("X11 id"),
+            0x00ab_cdef
+        );
+        assert!(parse_window_id(&WindowId("42".to_owned())).is_err());
+        assert!(parse_window_id(&WindowId("x11:not-hex".to_owned())).is_err());
+    }
 }

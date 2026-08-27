@@ -4,7 +4,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use scrozz_core::{
     ColorSpace, Error, Frame, LogicalPoint, PhysicalSize, PixelFormat, Result, ScaleFactor,
-    ScrollCapabilities, ScrollDriver, ScrollGesture,
+    ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
 };
 use scrozz_stitch::{
     AlignmentConfig, ChromeConfig, FrameSource, ScrollSessionConfig, StitchConfig,
@@ -43,6 +43,40 @@ pub fn viewport(
     gray_frame(&rows, width, scale)
 }
 
+pub fn gray_column_frame(columns: &[u8], height: u32, scale: f64) -> Frame {
+    let width = columns.len() as u32;
+    let mut data = Vec::with_capacity(columns.len() * height as usize * 4);
+    for y in 0..height {
+        for &value in columns {
+            let detail = value.wrapping_add((y % 5) as u8);
+            data.extend_from_slice(&[detail, detail, detail, 255]);
+        }
+    }
+    Frame {
+        data,
+        size: PhysicalSize::new(f64::from(width), f64::from(height)),
+        stride: width as usize * 4,
+        format: PixelFormat::Rgba8,
+        color_space: ColorSpace::Srgb,
+        scale: ScaleFactor::new(scale),
+    }
+}
+
+pub fn horizontal_viewport(
+    document: &[u8],
+    start: usize,
+    content_columns: usize,
+    sticky_left: &[u8],
+    sticky_right: &[u8],
+    height: u32,
+    scale: f64,
+) -> Frame {
+    let mut columns = sticky_left.to_vec();
+    columns.extend_from_slice(&document[start..start + content_columns]);
+    columns.extend_from_slice(sticky_right);
+    gray_column_frame(&columns, height, scale)
+}
+
 pub fn compact_stitch(expected_delta: Option<u32>) -> StitchConfig {
     StitchConfig {
         alignment: AlignmentConfig {
@@ -50,6 +84,7 @@ pub fn compact_stitch(expected_delta: Option<u32>) -> StitchConfig {
             row_buckets: 6,
             top_k: 6,
             basin_radius: 1,
+            min_stationary_edge: 2,
             max_mean_error: 24,
             min_confidence: 1,
             ..AlignmentConfig::default()
@@ -66,6 +101,21 @@ pub fn compact_stitch(expected_delta: Option<u32>) -> StitchConfig {
 pub fn session_config(amount: f64, max_frames: usize) -> ScrollSessionConfig {
     let mut config =
         ScrollSessionConfig::new(ScrollGesture::down(LogicalPoint::new(50.0, 50.0), amount));
+    config.max_frames = max_frames;
+    config.settle_delay = Duration::ZERO;
+    config.manual_poll_interval = Duration::ZERO;
+    config.stitch = compact_stitch(None);
+    config
+}
+
+pub fn horizontal_session_config(amount: f64, max_frames: usize) -> ScrollSessionConfig {
+    let mut config = ScrollSessionConfig::new(ScrollGesture {
+        axis: ScrollAxis::Horizontal,
+        at: LogicalPoint::new(50.0, 50.0),
+        display: None,
+        window: None,
+        amount,
+    });
     config.max_frames = max_frames;
     config.settle_delay = Duration::ZERO;
     config.manual_poll_interval = Duration::ZERO;

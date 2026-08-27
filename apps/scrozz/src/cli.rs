@@ -25,7 +25,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScrollAxis};
 
 use crate::fault::{CliError, CliResult};
 
@@ -253,6 +253,24 @@ pub enum DisplaySelector {
     Id(String),
 }
 
+/// The direction a scrolling capture grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScrollAxisArg {
+    /// Move down and build a tall image.
+    Vertical,
+    /// Move right and build a wide image.
+    Horizontal,
+}
+
+impl From<ScrollAxisArg> for ScrollAxis {
+    fn from(axis: ScrollAxisArg) -> Self {
+        match axis {
+            ScrollAxisArg::Vertical => Self::Vertical,
+            ScrollAxisArg::Horizontal => Self::Horizontal,
+        }
+    }
+}
+
 /// A resolved capture target.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetSpec {
@@ -264,8 +282,14 @@ pub enum TargetSpec {
     Display(DisplaySelector),
     /// Every display.
     AllDisplays,
-    /// Repeated frames from one display, assembled while its content scrolls.
-    Scrolling(DisplaySelector),
+    /// Repeated frames from the frontmost window on one display, assembled while
+    /// its content scrolls. Wayland delegates window selection to its portal.
+    Scrolling {
+        /// Display whose viewport is sampled.
+        display: DisplaySelector,
+        /// Direction the stitched canvas grows.
+        axis: ScrollAxis,
+    },
     /// Chosen on screen.
     Interactive(InteractiveMode),
 }
@@ -473,10 +497,13 @@ pub struct CaptureArgs {
     #[command(flatten)]
     pub target: TargetArgs,
 
-    /// Capture a scrolling page on a display.
+    /// Capture the frontmost scrolling window on a display.
     ///
     /// With no value, uses the display under the pointer. A selector may be an
-    /// id, `primary`, or `active`.
+    /// id, `primary`, or `active`. Focus the target window before capture. On
+    /// Wayland, omit the value (or use `active`) and choose one window in the
+    /// desktop portal; explicit display selectors are rejected rather than
+    /// silently ignored.
     #[arg(
         long,
         value_name = "ID|primary|active",
@@ -485,6 +512,12 @@ pub struct CaptureArgs {
         conflicts_with = "target"
     )]
     pub scrolling: Option<String>,
+
+    /// Direction the scrolling capture should grow.
+    ///
+    /// Defaults to vertical when omitted.
+    #[arg(long, value_enum, value_name = "vertical|horizontal")]
+    pub scroll_axis: Option<ScrollAxisArg>,
 
     /// Composite the pointer into the capture.
     #[arg(long)]
@@ -543,7 +576,12 @@ impl CaptureArgs {
     pub fn target_spec(&self) -> CliResult<TargetSpec> {
         self.scrolling.as_ref().map_or_else(
             || self.target.resolve(),
-            |selector| Ok(TargetSpec::Scrolling(parse_display_selector(selector)?)),
+            |selector| {
+                Ok(TargetSpec::Scrolling {
+                    display: parse_display_selector(selector)?,
+                    axis: self.scroll_axis.unwrap_or(ScrollAxisArg::Vertical).into(),
+                })
+            },
         )
     }
 
@@ -582,6 +620,11 @@ impl CaptureArgs {
     /// Returns [`CliError::Usage`] for a negative or non-finite delay, or for
     /// `--quality` on a format that has no quality setting.
     pub fn validate(&self) -> CliResult<()> {
+        if self.scroll_axis.is_some() && self.scrolling.is_none() {
+            return Err(CliError::usage(
+                "--scroll-axis only applies to --scrolling captures",
+            ));
+        }
         if let Some(delay) = self.delay
             && (!delay.is_finite() || delay < 0.0)
         {
@@ -1246,8 +1289,53 @@ mod tests {
             let Some(Command::Capture(parsed)) = parse(&args).command else {
                 panic!("expected capture")
             };
-            assert_eq!(parsed.target_spec().unwrap(), TargetSpec::Scrolling(want));
+            assert_eq!(
+                parsed.target_spec().unwrap(),
+                TargetSpec::Scrolling {
+                    display: want,
+                    axis: ScrollAxis::Vertical,
+                }
+            );
         }
+    }
+
+    #[test]
+    fn scrolling_axis_can_be_horizontal() {
+        let Some(Command::Capture(parsed)) = parse(&[
+            "scrozz",
+            "capture",
+            "--scrolling=primary",
+            "--scroll-axis",
+            "horizontal",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert_eq!(
+            parsed.target_spec().unwrap(),
+            TargetSpec::Scrolling {
+                display: DisplaySelector::Primary,
+                axis: ScrollAxis::Horizontal,
+            }
+        );
+    }
+
+    #[test]
+    fn scrolling_axis_requires_a_scrolling_capture() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--display",
+            "primary",
+            "--scroll-axis",
+            "horizontal",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
     }
 
     #[test]

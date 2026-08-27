@@ -12,33 +12,37 @@
 //! also set produces a screenshot missing every native Wayland window, with no
 //! error to explain it.
 //!
-//! # Manifest constraints on this build
+//! # X11 feature boundaries
 //!
-//! Two dependencies are declared without the features this backend needs, and
-//! this crate is not permitted to amend them. Both limits are load-bearing
-//! enough to state here rather than bury:
+//! The manifest enables the protocol features needed across both Linux capture
+//! paths, but enabling a wire protocol is not the same as implementing every
+//! capture path that can use it:
 //!
 //! | Need | Feature required | Consequence today |
 //! |---|---|---|
-//! | RandR monitor geometry | `x11rb/randr` | Encoded by hand in [`x11::wire`] — works |
-//! | MIT-SHM fast path | `x11rb/shm` **and** `libc`/`rustix` | Unavailable; `GetImage` used |
-//! | XFIXES cursor image | `x11rb/xfixes` | Cursor omitted from X11 captures |
-//! | Portal ScreenCast | `ashpd/screencast` | Wayland capture unavailable |
-//! | Portal Screenshot | `ashpd/screenshot` | Wayland fallback unavailable |
+//! | RandR monitor geometry / identity | `x11rb/randr` | Enabled; X11 keeps its tested wire parser and Wayland uses typed identity queries |
+//! | MIT-SHM fast path | `x11rb/shm` plus shared-memory lifecycle | Protocol enabled; allocation/mapping is not implemented, so `GetImage` is used |
+//! | XFIXES cursor image | `x11rb/xfixes` | Protocol enabled; cursor compositing remains unimplemented |
+//! | Synthetic wheel input | `x11rb/xtest` | Enabled and used by the X11 scrolling driver |
 //!
-//! RandR was worth hand-rolling because without it a multi-monitor desktop is
-//! indistinguishable from one enormous screen. MIT-SHM was not, because the
-//! feature alone is insufficient — the shared segment needs `shmget`/`shmat` or
-//! `memfd_create`, and neither `libc` nor `rustix` is a dependency of this
-//! crate, so there is no syscall to make.
+//! RandR was originally hand-rolled because without it a multi-monitor desktop
+//! is indistinguishable from one enormous screen; that parser remains the
+//! well-tested X11 path. MIT-SHM still needs ownership and cleanup code beyond
+//! the generated requests, so merely enabling the feature does not make it safe.
+//!
+//! The Wayland side has no such gap: `ashpd` is built with `screencast` and
+//! `screenshot`, and PipeWire is opened at run time rather than linked, so a
+//! machine without it still builds, still starts, and still captures over X11.
+//! See [`wayland::pipewire`] for why that indirection was chosen.
 
 pub mod session;
 pub mod wayland;
 pub mod x11;
 
-use scrozz_core::{CaptureBackend, Error, Result};
+use scrozz_core::{CaptureBackend, CaptureRequest, Error, Result};
 
 use self::session::{SessionEnv, SessionKind};
+use crate::FrameSession;
 
 /// Chooses and constructs the backend for this session.
 ///
@@ -73,6 +77,26 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
     }
 }
 
+/// Opens a repeated-frame source for the current Linux display server.
+///
+/// Wayland gets a native long-lived portal/PipeWire session. X11 uses the
+/// ordinary backend adapter because its direct capture has no permission session
+/// to preserve.
+pub fn frame_session(request: CaptureRequest) -> Result<Box<dyn FrameSession>> {
+    let env = SessionEnv::from_env();
+    let kind = session::detect_session(&env);
+
+    match kind {
+        SessionKind::Wayland | SessionKind::XWayland => {
+            let backend = wayland::WaylandBackend::new(&env)?;
+            Ok(Box::new(backend.open_frame_session(&request)?))
+        }
+        SessionKind::X11 | SessionKind::Headless => {
+            Ok(crate::backend_frame_session(backend()?, request))
+        }
+    }
+}
+
 /// Chooses and constructs the scroll-input driver for this Linux session.
 pub fn scroll_driver() -> Result<Box<dyn scrozz_core::ScrollDriver>> {
     let env = SessionEnv::from_env();
@@ -85,7 +109,12 @@ pub fn scroll_driver() -> Result<Box<dyn scrozz_core::ScrollDriver>> {
             Err(error) => Err(error),
         },
         SessionKind::Wayland | SessionKind::XWayland => {
-            Ok(wayland::scroll::driver_for_session(&env))
+            let compositor = session::detect_compositor(&env);
+            Ok(Box::new(scrozz_core::ManualScrollDriver::new(format!(
+                "Wayland cannot guarantee that RemoteDesktop input is bound to the same \
+                 portal-selected surface captured on {compositor}; scroll that surface manually \
+                 while Scrozz follows"
+            ))))
         }
         SessionKind::Headless => Err(Error::Unsupported {
             what: "scroll input".into(),

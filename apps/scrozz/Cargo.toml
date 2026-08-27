@@ -32,6 +32,7 @@ raw-window-handle.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 

@@ -17,16 +17,24 @@
 //! is reported as a mistake in the command line even now, and the resolution
 //! logic is exercised by tests that never touch a screen.
 
-use std::path::Path;
+use std::{
+    io::IsTerminal,
+    path::Path,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display,
-    Error as CoreError, ScrollGesture,
+    Error as CoreError, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, ScrollAxis,
+    ScrollGesture, Window, WindowId,
 };
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
 use scrozz_stitch::{
-    BackendFrameSource, CancelSignal, NeverCancel, Progress, ScrollSession, ScrollSessionConfig,
+    CancelAction, CancelSignal, FrameSource, Progress, ScrollSession, ScrollSessionConfig,
     ThreadPacer,
 };
 
@@ -42,6 +50,8 @@ use crate::{
     report::Report,
     settings,
 };
+
+const WAYLAND_PORTAL_PICKER_WINDOW_ID: &str = "xdg-desktop-portal-picker";
 
 /// Runs a command locally.
 ///
@@ -110,38 +120,54 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     }
 
-    let capture = if matches!(target, TargetSpec::Scrolling(_)) {
-        scrolling_capture(backend.as_ref(), request)?
-    } else {
-        backend.capture(&request)?
+    let (capture, mut terminal_cancel) = match target {
+        TargetSpec::Scrolling { axis, .. } => {
+            let (capture, cancel) = scrolling_capture(backend.as_ref(), request, axis)?;
+            (capture, Some(cancel))
+        }
+        _ => (backend.capture(&request)?, None),
     };
+    fail_if_terminal_abort(&mut terminal_cancel)?;
     let frame = &capture.frame;
 
     let bytes = FrameEncoder::new()
         .encode(frame, args.format().to_export())
         .map_err(CliError::Core)?;
+    fail_if_terminal_abort(&mut terminal_cancel)?;
 
+    let mut prepared = Vec::with_capacity(sinks.len());
+    for sink in &sinks {
+        fail_if_terminal_abort(&mut terminal_cancel)?;
+        match sink {
+            Sink::File(path) => prepared.push(PreparedSink::File(
+                crate::output::StagedFile::for_path(&bytes, path.clone())?,
+            )),
+            Sink::Clipboard => prepared.push(PreparedSink::Clipboard),
+            Sink::Stdout => prepared.push(PreparedSink::Stdout),
+            Sink::DefaultFolder => prepared.push(PreparedSink::File(
+                crate::output::StagedFile::for_default(&bytes)?,
+            )),
+        }
+    }
+
+    // This is the single irreversible boundary. Abort wins before it; once this
+    // compare-exchange wins, the signal handler can no longer turn a published
+    // output into a cancellation report.
+    seal_terminal_output(&mut terminal_cancel)?;
     let mut written = Vec::new();
     let mut raw = None;
-    for sink in &sinks {
+    for sink in prepared {
         match sink {
-            Sink::File(path) => {
-                std::fs::write(path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
-                written.push(path.display().to_string());
+            PreparedSink::File(staged) => {
+                written.push(staged.commit()?.display().to_string());
             }
-            Sink::Clipboard => {
+            PreparedSink::Clipboard => {
                 scrozz_export::SystemClipboard::new()
                     .write_image(frame)
                     .map_err(CliError::Core)?;
-                written.push("clipboard".to_string());
+                written.push("clipboard".to_owned());
             }
-            Sink::Stdout => raw = Some(bytes.clone()),
-            // D18: any folder the user picks, which is what lets a Dropbox or
-            // iCloud directory provide sync for free with no service on our side.
-            Sink::DefaultFolder => {
-                let path = crate::output::export_default(&bytes)?;
-                written.push(path.display().to_string());
-            }
+            PreparedSink::Stdout => raw = Some(bytes.clone()),
         }
     }
 
@@ -176,6 +202,12 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     Ok(report)
 }
 
+enum PreparedSink {
+    File(crate::output::StagedFile),
+    Clipboard,
+    Stdout,
+}
+
 /// Turns a resolved [`TargetSpec`] into the core request type.
 ///
 /// The interactive modes have no representation here on purpose: choosing a
@@ -189,7 +221,10 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
         // Resolving a name needs enumeration, so it goes through the same
         // backend the capture will use — an id resolved by a different object
         // is an id that can disagree.
-        TargetSpec::Display(sel) | TargetSpec::Scrolling(sel) => {
+        TargetSpec::Scrolling { display, .. } if is_wayland() => {
+            wayland_scrolling_capture_target(display)
+        }
+        TargetSpec::Display(sel) | TargetSpec::Scrolling { display: sel, .. } => {
             let displays = platform::target_enumerator()?.displays()?;
             let found = match sel {
                 DisplaySelector::Primary => displays.iter().find(|d| d.is_primary),
@@ -236,18 +271,176 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
     }
 }
 
-pub(crate) fn scrolling_capture(
+fn scrolling_capture(
     backend: &dyn CaptureBackend,
     request: CaptureRequest,
-) -> CliResult<Capture> {
-    scrolling_capture_with(backend, request, &mut NeverCancel, |event| {
-        tracing::debug!(?event, "scrolling capture progress")
-    })
+    axis: ScrollAxis,
+) -> CliResult<(Capture, TerminalCancellation)> {
+    let mut cancel = TerminalCancellation::install()?;
+    let capture = if std::io::stderr().is_terminal() {
+        eprintln!(
+            "scrozz: scrolling capture started; press Ctrl+C once to keep the stitched result, \
+             or twice quickly to discard it"
+        );
+        scrolling_capture_with(
+            backend,
+            request,
+            axis,
+            &mut cancel,
+            report_terminal_scroll_progress,
+        )
+    } else {
+        scrolling_capture_with(backend, request, axis, &mut cancel, |event| {
+            tracing::debug!(?event, "scrolling capture progress")
+        })
+    }?;
+    Ok((capture, cancel))
+}
+
+struct TerminalHandler {
+    state: Arc<AtomicU8>,
+    install_error: Option<String>,
+}
+
+static TERMINAL_HANDLER: OnceLock<TerminalHandler> = OnceLock::new();
+
+struct TerminalCancellation {
+    state: Arc<AtomicU8>,
+}
+
+impl TerminalCancellation {
+    fn install() -> CliResult<Self> {
+        let handler = TERMINAL_HANDLER.get_or_init(|| {
+            let state = Arc::new(AtomicU8::new(0));
+            let signal_state = Arc::clone(&state);
+            let install_error = ctrlc::set_handler(move || {
+                let _ = advance_terminal_cancellation(&signal_state);
+            })
+            .err()
+            .map(|error| error.to_string());
+            TerminalHandler {
+                state,
+                install_error,
+            }
+        });
+        if let Some(error) = &handler.install_error {
+            return Err(CliError::Core(CoreError::Platform(format!(
+                "could not install scrolling-capture cancellation: {error}"
+            ))));
+        }
+        handler.state.store(0, Ordering::Release);
+        Ok(Self {
+            state: Arc::clone(&handler.state),
+        })
+    }
+}
+
+impl CancelSignal for TerminalCancellation {
+    fn cancellation(&mut self) -> Option<CancelAction> {
+        match self.state.load(Ordering::Acquire) {
+            1 => Some(CancelAction::Keep),
+            2 => Some(CancelAction::Abort),
+            _ => None,
+        }
+    }
+}
+
+fn fail_if_terminal_abort(cancel: &mut Option<TerminalCancellation>) -> CliResult<()> {
+    if cancel
+        .as_mut()
+        .and_then(|signal| signal.cancellation())
+        .is_some_and(|action| action == CancelAction::Abort)
+    {
+        return Err(CliError::Core(CoreError::Cancelled));
+    }
+    Ok(())
+}
+
+fn seal_terminal_output(cancel: &mut Option<TerminalCancellation>) -> CliResult<()> {
+    let Some(cancel) = cancel else {
+        return Ok(());
+    };
+    loop {
+        match cancel.state.load(Ordering::Acquire) {
+            2 => return Err(CliError::Core(CoreError::Cancelled)),
+            3 => return Ok(()),
+            state @ (0 | 1) => {
+                if cancel
+                    .state
+                    .compare_exchange(state, 3, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn advance_terminal_cancellation(state: &AtomicU8) -> Option<u8> {
+    loop {
+        let current = state.load(Ordering::Acquire);
+        let next = match current {
+            0 => 1,
+            1 => 2,
+            // Publication has begun. A late signal must not report cancellation
+            // for output that is already becoming visible.
+            _ => return None,
+        };
+        if state
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(next);
+        }
+    }
+}
+
+fn report_terminal_scroll_progress(progress: Progress) {
+    match progress {
+        Progress::Prepared {
+            driver,
+            automatic: true,
+            ..
+        } => eprintln!("scrozz: {driver} will move the selected window"),
+        Progress::Prepared {
+            manual_reason: Some(reason),
+            ..
+        } => eprintln!("scrozz: scroll the selected window manually; {reason}"),
+        Progress::Prepared { .. } => {
+            eprintln!("scrozz: scroll the selected window manually while capture follows");
+        }
+        Progress::FrameCaptured { frame } => {
+            eprintln!("scrozz: captured viewport {frame}");
+        }
+        Progress::WaitingForManualScroll => {
+            eprintln!("scrozz: waiting for the selected window to scroll");
+        }
+        Progress::Advanced {
+            frame,
+            delta,
+            output_extent,
+            ..
+        } => eprintln!(
+            "scrozz: stitched viewport {frame} ({delta} px movement, {output_extent} px total)"
+        ),
+        Progress::Stalled { count } => {
+            eprintln!("scrozz: no movement detected (probe {count})");
+        }
+        Progress::Interrupted { reason } => {
+            eprintln!("scrozz: keeping the valid stitched prefix after: {reason}");
+        }
+        Progress::Finished { reason, .. } => {
+            eprintln!("scrozz: scrolling capture finished ({reason:?})");
+        }
+    }
 }
 
 pub(crate) fn scrolling_capture_with<C, F>(
     backend: &dyn CaptureBackend,
     request: CaptureRequest,
+    axis: ScrollAxis,
     cancel: &mut C,
     progress: F,
 ) -> CliResult<Capture>
@@ -255,9 +448,148 @@ where
     C: CancelSignal,
     F: FnMut(Progress),
 {
+    let target = resolve_scrolling_target(backend, request)?;
+    scrolling_capture_target_with(target, axis, cancel, progress)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScrollingTarget {
+    request: CaptureRequest,
+    context: ScrollingContext,
+}
+
+#[derive(Debug, Clone)]
+enum ScrollingContext {
+    Native {
+        display: Display,
+        viewport: LogicalRect,
+        window: WindowId,
+        crop: Option<FrameCrop>,
+    },
+    ManualPortal,
+}
+
+impl ScrollingTarget {
+    pub(crate) fn new(
+        request: CaptureRequest,
+        display: Display,
+        viewport: LogicalRect,
+        window: WindowId,
+    ) -> Self {
+        Self {
+            request,
+            context: ScrollingContext::Native {
+                display,
+                viewport,
+                window,
+                crop: None,
+            },
+        }
+    }
+
+    fn with_crop(mut self, crop: FrameCrop) -> Self {
+        if let ScrollingContext::Native {
+            crop: target_crop, ..
+        } = &mut self.context
+        {
+            *target_crop = Some(crop);
+        }
+        self
+    }
+
+    fn manual_portal(request: CaptureRequest) -> Self {
+        Self {
+            request,
+            context: ScrollingContext::ManualPortal,
+        }
+    }
+
+    pub(crate) fn capture_target(&self) -> CaptureTarget {
+        self.request.target.clone()
+    }
+
+    pub(crate) fn refresh(self, backend: &dyn CaptureBackend) -> CliResult<Self> {
+        if matches!(&self.context, ScrollingContext::ManualPortal) {
+            return Ok(self);
+        }
+        let windows = backend.windows()?;
+        let displays = backend.displays()?;
+        self.refresh_from_snapshots(windows, displays)
+    }
+
+    fn refresh_from_snapshots(
+        self,
+        windows: Vec<Window>,
+        displays: Vec<Display>,
+    ) -> CliResult<Self> {
+        let window_id = match &self.context {
+            ScrollingContext::ManualPortal => return Ok(self),
+            ScrollingContext::Native { window, .. } => window.clone(),
+        };
+        let window = windows
+            .into_iter()
+            .find(|window| window.id == window_id)
+            .ok_or_else(|| {
+                CliError::Core(CoreError::TargetGone(format!(
+                    "window {} vanished before scrolling capture started",
+                    window_id.0
+                )))
+            })?;
+        if !window.is_visible || window.bounds.is_empty() {
+            return Err(CliError::Core(CoreError::TargetGone(format!(
+                "window {} is no longer visible for scrolling capture",
+                window_id.0
+            ))));
+        }
+        let display = displays
+            .into_iter()
+            .find(|display| display.id == window.display)
+            .ok_or_else(|| {
+                CliError::Core(CoreError::TargetGone(format!(
+                    "display {} containing window {} is no longer connected",
+                    window.display.0, window_id.0
+                )))
+            })?;
+
+        resolved_native_scrolling_target(self.request, display, window)
+    }
+
+    fn session_config(&self, axis: ScrollAxis) -> CliResult<ScrollSessionConfig> {
+        match &self.context {
+            ScrollingContext::Native {
+                display,
+                viewport,
+                window,
+                ..
+            } => scroll_session_config(display, *viewport, axis, window.clone()),
+            ScrollingContext::ManualPortal => {
+                let at = LogicalPoint::new(0.0, 0.0);
+                let gesture = match axis {
+                    ScrollAxis::Vertical => ScrollGesture::down(at, 1.0),
+                    ScrollAxis::Horizontal => ScrollGesture::right(at, 1.0),
+                };
+                Ok(ScrollSessionConfig::new(gesture))
+            }
+        }
+    }
+}
+
+pub(crate) fn resolve_scrolling_target(
+    backend: &dyn CaptureBackend,
+    request: CaptureRequest,
+) -> CliResult<ScrollingTarget> {
+    if is_wayland() && request.target == wayland_portal_picker_target() {
+        return Ok(ScrollingTarget::manual_portal(request));
+    }
+    if request.target.is_window() {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "scrolling capture cannot treat an ordinary window id as a Wayland portal choice"
+                .to_owned(),
+        )));
+    }
     let CaptureTarget::Display(display_id) = &request.target else {
         return Err(CliError::Core(CoreError::InvalidRequest(
-            "scrolling capture requires one display".to_owned(),
+            "scrolling capture requires one display or a Wayland portal window".to_owned(),
         )));
     };
     let display = backend
@@ -270,18 +602,226 @@ where
                 display_id.0
             )))
         })?;
-    let config = scroll_session_config(&display)?;
-    let source = BackendFrameSource::new(backend, request.clone());
+    let window = match backend.windows() {
+        Ok(windows) => select_scrolling_window(windows, &display),
+        Err(error) => return Err(CliError::Core(error)),
+    }
+    .ok_or_else(|| {
+        CliError::Core(CoreError::InvalidRequest(format!(
+            "no visible application window is available on display {}; focus the window to \
+             capture and retry (or use --delay to switch to it after starting the command)",
+            display.id.0
+        )))
+    })?;
+    resolved_native_scrolling_target(request, display, window)
+}
+
+pub(crate) fn scrolling_capture_target_with<C, F>(
+    target: ScrollingTarget,
+    axis: ScrollAxis,
+    cancel: &mut C,
+    progress: F,
+) -> CliResult<Capture>
+where
+    C: CancelSignal,
+    F: FnMut(Progress),
+{
+    let config = target.session_config(axis)?;
+    let crop = match &target.context {
+        ScrollingContext::Native { crop, .. } => *crop,
+        ScrollingContext::ManualPortal => None,
+    };
+    let request = target.request;
+    let source = CaptureFrameSource {
+        session: scrozz_capture::frame_session(request.clone()).map_err(CliError::Core)?,
+        crop,
+    };
     let driver = platform::scroll_driver()?;
     let output = ScrollSession::new(source, driver, ThreadPacer, config).run(cancel, progress)?;
     Ok(output.into_capture(request.target))
 }
 
-fn scroll_session_config(display: &Display) -> CliResult<ScrollSessionConfig> {
-    let area = display.work_area;
+struct CaptureFrameSource {
+    session: Box<dyn scrozz_capture::FrameSession>,
+    crop: Option<FrameCrop>,
+}
+
+impl FrameSource for CaptureFrameSource {
+    fn capture_frame(&mut self) -> scrozz_core::Result<scrozz_core::Frame> {
+        let frame = self.session.capture_frame()?;
+        match self.crop {
+            Some(crop) => crop.apply(frame),
+            None => Ok(frame),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.session.name()
+    }
+}
+
+fn resolved_native_scrolling_target(
+    mut request: CaptureRequest,
+    display: Display,
+    window: Window,
+) -> CliResult<ScrollingTarget> {
+    let viewport = intersect_rect(window.bounds, display.work_area).ok_or_else(|| {
+        CliError::Core(CoreError::InvalidRequest(format!(
+            "the selected window is outside display {}'s usable area",
+            display.id.0
+        )))
+    })?;
+    let crop = FrameCrop::new(window.bounds, viewport)?;
+    let window_id = window.id;
+    request.target = CaptureTarget::Window(window_id.clone());
+    request.include_window_shadow = false;
+    Ok(ScrollingTarget::new(request, display, viewport, window_id).with_crop(crop))
+}
+
+pub(crate) fn wayland_portal_picker_target() -> CaptureTarget {
+    CaptureTarget::Window(WindowId(WAYLAND_PORTAL_PICKER_WINDOW_ID.to_owned()))
+}
+
+fn wayland_scrolling_capture_target(display: &DisplaySelector) -> CliResult<CaptureTarget> {
+    if *display != DisplaySelector::Active {
+        return Err(CliError::Core(CoreError::Unsupported {
+            what: "Wayland scrolling capture with an explicit display selector".to_owned(),
+            why: "Wayland can safely capture one scrolling window only through the desktop \
+                  portal picker; omit the selector or use `--scrolling=active`"
+                .to_owned(),
+        }));
+    }
+    Ok(wayland_portal_picker_target())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameCrop {
+    source_bounds: LogicalRect,
+    viewport: LogicalRect,
+}
+
+impl FrameCrop {
+    fn new(source_bounds: LogicalRect, viewport: LogicalRect) -> CliResult<Self> {
+        if source_bounds.is_empty() || viewport.is_empty() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "scrolling viewport must have positive dimensions".to_owned(),
+            )));
+        }
+        Ok(Self {
+            source_bounds,
+            viewport,
+        })
+    }
+
+    fn apply(self, frame: Frame) -> scrozz_core::Result<Frame> {
+        if frame.width() == 0 || frame.height() == 0 || !frame.is_well_formed() {
+            return Err(CoreError::Platform(
+                "the scrolling frame source returned malformed pixel geometry".to_owned(),
+            ));
+        }
+        let relative_x = self.viewport.origin.x - self.source_bounds.origin.x;
+        let relative_y = self.viewport.origin.y - self.source_bounds.origin.y;
+        let x_scale = f64::from(frame.width()) / self.source_bounds.size.width;
+        let y_scale = f64::from(frame.height()) / self.source_bounds.size.height;
+
+        // Round inward so pixels outside the selected display/work area can
+        // never enter matching or output, even at fractional scale factors.
+        let left = (relative_x.max(0.0) * x_scale).ceil() as u32;
+        let top = (relative_y.max(0.0) * y_scale).ceil() as u32;
+        let right = ((relative_x + self.viewport.size.width).min(self.source_bounds.size.width)
+            * x_scale)
+            .floor() as u32;
+        let bottom = ((relative_y + self.viewport.size.height).min(self.source_bounds.size.height)
+            * y_scale)
+            .floor() as u32;
+
+        if left >= right || top >= bottom || right > frame.width() || bottom > frame.height() {
+            return Err(CoreError::Platform(format!(
+                "selected scrolling viewport maps outside the captured frame: \
+                 crop=({left},{top})..({right},{bottom}), frame={}x{}",
+                frame.width(),
+                frame.height()
+            )));
+        }
+        if left == 0 && top == 0 && right == frame.width() && bottom == frame.height() {
+            return Ok(frame);
+        }
+
+        let bytes_per_pixel = frame.format.bytes_per_pixel();
+        let width = right - left;
+        let height = bottom - top;
+        let row_bytes = width as usize * bytes_per_pixel;
+        let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+        for y in top..bottom {
+            let start = y as usize * frame.stride + left as usize * bytes_per_pixel;
+            pixels.extend_from_slice(&frame.data[start..start + row_bytes]);
+        }
+
+        Ok(Frame {
+            data: pixels,
+            size: PhysicalSize::new(f64::from(width), f64::from(height)),
+            stride: row_bytes,
+            format: frame.format,
+            color_space: frame.color_space,
+            scale: frame.scale,
+        })
+    }
+}
+
+fn select_scrolling_window(windows: Vec<Window>, display: &Display) -> Option<Window> {
+    windows.into_iter().find(|window| {
+        window.is_visible
+            && window.display == display.id
+            && !window.bounds.is_empty()
+            && !is_capture_control_window(window)
+    })
+}
+
+fn is_capture_control_window(window: &Window) -> bool {
+    let Some(application) = window.application.as_deref() else {
+        return false;
+    };
+    let application = application.to_ascii_lowercase();
+    [
+        "scrozz",
+        "terminal",
+        "iterm2",
+        "warp",
+        "ghostty",
+        "wezterm",
+        "alacritty",
+        "kitty",
+        "windowsterminal",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "conhost",
+    ]
+    .contains(&application.as_str())
+}
+
+fn intersect_rect(left: LogicalRect, right: LogicalRect) -> Option<LogicalRect> {
+    let x = left.origin.x.max(right.origin.x);
+    let y = left.origin.y.max(right.origin.y);
+    let right_edge = (left.origin.x + left.size.width).min(right.origin.x + right.size.width);
+    let bottom = (left.origin.y + left.size.height).min(right.origin.y + right.size.height);
+    (right_edge > x && bottom > y).then(|| {
+        LogicalRect::new(
+            LogicalPoint::new(x, y),
+            LogicalSize::new(right_edge - x, bottom - y),
+        )
+    })
+}
+
+fn scroll_session_config(
+    display: &Display,
+    area: LogicalRect,
+    axis: ScrollAxis,
+    window: WindowId,
+) -> CliResult<ScrollSessionConfig> {
     if area.is_empty() {
         return Err(CliError::Core(CoreError::InvalidRequest(format!(
-            "display {} has no usable work area",
+            "display {} has no usable scrolling viewport",
             display.id.0
         ))));
     }
@@ -291,10 +831,13 @@ fn scroll_session_config(display: &Display) -> CliResult<ScrollSessionConfig> {
     );
     // Keeping roughly a third of the viewport as overlap gives the matcher real
     // evidence while still making useful progress on each capture.
-    Ok(ScrollSessionConfig::new(ScrollGesture::down(
-        at,
-        area.size.height * 0.65,
-    )))
+    let gesture = match axis {
+        ScrollAxis::Vertical => ScrollGesture::down(at, area.size.height * 0.65),
+        ScrollAxis::Horizontal => ScrollGesture::right(at, area.size.width * 0.65),
+    }
+    .on_display(display.id.clone())
+    .in_window(window);
+    Ok(ScrollSessionConfig::new(gesture))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,9 +973,26 @@ fn list(what: ListWhat) -> CliResult<Report> {
 }
 
 /// Whether this is a Wayland session.
-fn is_wayland() -> bool {
-    std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty())
-        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+pub(crate) fn is_wayland() -> bool {
+    is_wayland_environment(
+        std::env::var("SCROZZ_BACKEND").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+    )
+}
+
+fn is_wayland_environment(
+    forced_backend: Option<&str>,
+    wayland_display: Option<&str>,
+    session_type: Option<&str>,
+) -> bool {
+    match forced_backend.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(forced) if forced == "x11" || forced == "xcb" => return false,
+        Some(forced) if forced == "wayland" => return true,
+        _ => {}
+    }
+    wayland_display.is_some_and(|value| !value.is_empty())
+        || session_type.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
 }
 
 // ---------------------------------------------------------------------------
@@ -671,9 +1231,10 @@ pub fn target_json(target: &TargetSpec) -> Json {
             ("kind", Json::str("display")),
             ("selector", Json::str(display_selector_slug(selector))),
         ]),
-        TargetSpec::Scrolling(selector) => Json::obj([
+        TargetSpec::Scrolling { display, axis } => Json::obj([
             ("kind", Json::str("scrolling")),
-            ("selector", Json::str(display_selector_slug(selector))),
+            ("selector", Json::str(display_selector_slug(display))),
+            ("axis", Json::str(scroll_axis_slug(*axis))),
         ]),
         TargetSpec::AllDisplays => Json::obj([("kind", Json::str("all-displays"))]),
         TargetSpec::Interactive(mode) => Json::obj([
@@ -688,6 +1249,13 @@ fn display_selector_slug(selector: &DisplaySelector) -> &str {
         DisplaySelector::Primary => "primary",
         DisplaySelector::Active => "active",
         DisplaySelector::Id(id) => id.as_str(),
+    }
+}
+
+const fn scroll_axis_slug(axis: ScrollAxis) -> &'static str {
+    match axis {
+        ScrollAxis::Vertical => "vertical",
+        ScrollAxis::Horizontal => "horizontal",
     }
 }
 
@@ -725,14 +1293,27 @@ fn describe_target(target: &TargetSpec) -> String {
         TargetSpec::Display(DisplaySelector::Primary) => "the primary display".to_string(),
         TargetSpec::Display(DisplaySelector::Active) => "the active display".to_string(),
         TargetSpec::Display(DisplaySelector::Id(id)) => format!("display {id}"),
-        TargetSpec::Scrolling(DisplaySelector::Primary) => {
-            "a scrolling capture of the primary display".to_owned()
-        }
-        TargetSpec::Scrolling(DisplaySelector::Active) => {
-            "a scrolling capture of the active display".to_owned()
-        }
-        TargetSpec::Scrolling(DisplaySelector::Id(id)) => {
-            format!("a scrolling capture of display {id}")
+        TargetSpec::Scrolling { display, axis } => {
+            let direction = scroll_axis_slug(*axis);
+            match display {
+                DisplaySelector::Primary => {
+                    format!(
+                        "a {direction} scrolling capture of the frontmost window on the primary \
+                         display"
+                    )
+                }
+                DisplaySelector::Active => {
+                    format!(
+                        "a {direction} scrolling capture of the frontmost window on the active \
+                         display"
+                    )
+                }
+                DisplaySelector::Id(id) => {
+                    format!(
+                        "a {direction} scrolling capture of the frontmost window on display {id}"
+                    )
+                }
+            }
         }
         TargetSpec::AllDisplays => "every display".to_string(),
         TargetSpec::Interactive(mode) => {
@@ -773,6 +1354,7 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use scrozz_core::{ColorSpace, DisplayId, PixelFormat, ScaleFactor};
 
     use super::*;
     use crate::{cli::Cli, exit::Exit};
@@ -785,6 +1367,314 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    fn fixture_display() -> Display {
+        Display {
+            id: DisplayId("display-2".to_owned()),
+            name: "Fixture display".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(100.0, 50.0),
+                LogicalSize::new(1_200.0, 800.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(100.0, 70.0),
+                LogicalSize::new(1_200.0, 760.0),
+            ),
+            scale: ScaleFactor::new(1.5),
+            is_primary: false,
+        }
+    }
+
+    fn fixture_window(
+        id: &str,
+        application: &str,
+        display: &str,
+        bounds: LogicalRect,
+        is_visible: bool,
+    ) -> Window {
+        Window {
+            id: WindowId(id.to_owned()),
+            title: Some(format!("{application} window")),
+            application: Some(application.to_owned()),
+            bounds,
+            display: DisplayId(display.to_owned()),
+            is_visible,
+        }
+    }
+
+    #[test]
+    fn scrolling_uses_the_frontmost_application_window_on_the_selected_display() {
+        let display = fixture_display();
+        let bounds = LogicalRect::new(
+            LogicalPoint::new(120.0, 80.0),
+            LogicalSize::new(900.0, 700.0),
+        );
+        let windows = vec![
+            fixture_window("terminal", "WindowsTerminal", "display-2", bounds, true),
+            fixture_window("hud", "Scrozz", "display-2", bounds, true),
+            fixture_window("other-display", "Browser", "display-1", bounds, true),
+            fixture_window("minimized", "Browser", "display-2", bounds, false),
+            fixture_window("front", "Browser", "display-2", bounds, true),
+            fixture_window("back", "Notes", "display-2", bounds, true),
+        ];
+
+        let selected =
+            select_scrolling_window(windows, &display).expect("an application window is available");
+        assert_eq!(selected.id, WindowId("front".to_owned()));
+    }
+
+    #[test]
+    fn scrolling_viewport_is_cropped_to_the_selected_displays_work_area() {
+        let display = fixture_display();
+        let spanning_window = LogicalRect::new(
+            LogicalPoint::new(40.0, 20.0),
+            LogicalSize::new(1_000.0, 900.0),
+        );
+
+        assert_eq!(
+            intersect_rect(spanning_window, display.work_area),
+            Some(LogicalRect::new(
+                LogicalPoint::new(100.0, 70.0),
+                LogicalSize::new(940.0, 760.0),
+            ))
+        );
+    }
+
+    #[test]
+    fn scrolling_refresh_keeps_window_identity_and_recomputes_geometry() {
+        let initial_display = fixture_display();
+        let initial_window = fixture_window(
+            "browser-window",
+            "Browser",
+            "display-2",
+            LogicalRect::new(
+                LogicalPoint::new(120.0, 80.0),
+                LogicalSize::new(900.0, 700.0),
+            ),
+            true,
+        );
+        let target = resolved_native_scrolling_target(
+            CaptureRequest {
+                target: CaptureTarget::Display(initial_display.id.clone()),
+                cursor: CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            initial_display,
+            initial_window,
+        )
+        .expect("initial target");
+
+        let mut moved_display = fixture_display();
+        moved_display.id = DisplayId("display-3".to_owned());
+        moved_display.bounds.origin.x = 1_300.0;
+        moved_display.work_area.origin.x = 1_300.0;
+        let moved_bounds = LogicalRect::new(
+            LogicalPoint::new(1_340.0, 100.0),
+            LogicalSize::new(700.0, 500.0),
+        );
+        let refreshed = target
+            .refresh_from_snapshots(
+                vec![
+                    fixture_window("other", "Notes", "display-3", moved_bounds, true),
+                    fixture_window("browser-window", "Browser", "display-3", moved_bounds, true),
+                ],
+                vec![moved_display.clone()],
+            )
+            .expect("same window on its current display");
+
+        assert_eq!(
+            refreshed.capture_target(),
+            CaptureTarget::Window(WindowId("browser-window".to_owned()))
+        );
+        let ScrollingContext::Native {
+            display,
+            viewport,
+            window,
+            crop,
+        } = &refreshed.context
+        else {
+            panic!("native target became a portal target");
+        };
+        assert_eq!(display.id, moved_display.id);
+        assert_eq!(*viewport, moved_bounds);
+        assert_eq!(*window, WindowId("browser-window".to_owned()));
+        assert_eq!(crop.map(|crop| crop.source_bounds), Some(moved_bounds));
+
+        let config = refreshed
+            .session_config(ScrollAxis::Horizontal)
+            .expect("refreshed gesture");
+        assert_eq!(config.gesture.display, Some(moved_display.id));
+        assert_eq!(config.gesture.at, LogicalPoint::new(1_690.0, 350.0));
+    }
+
+    #[test]
+    fn scrolling_refresh_fails_closed_when_the_selected_window_vanishes() {
+        let display = fixture_display();
+        let window = fixture_window(
+            "browser-window",
+            "Browser",
+            "display-2",
+            display.work_area,
+            true,
+        );
+        let target = resolved_native_scrolling_target(
+            CaptureRequest {
+                target: CaptureTarget::Display(display.id.clone()),
+                cursor: CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display.clone(),
+            window,
+        )
+        .expect("initial target");
+
+        let error = target
+            .refresh_from_snapshots(Vec::new(), vec![display])
+            .expect_err("a different frontmost window must never replace the selected identity");
+        assert!(matches!(
+            error,
+            CliError::Core(CoreError::TargetGone(message))
+                if message.contains("browser-window")
+        ));
+    }
+
+    #[test]
+    fn selected_viewport_is_applied_to_every_captured_frame() {
+        let source_bounds =
+            LogicalRect::new(LogicalPoint::new(40.0, 20.0), LogicalSize::new(100.0, 50.0));
+        let viewport =
+            LogicalRect::new(LogicalPoint::new(50.0, 25.0), LogicalSize::new(80.0, 40.0));
+        let mut data = Vec::with_capacity(200 * 100 * 4);
+        for y in 0..100_u8 {
+            for x in 0..200_u8 {
+                data.extend_from_slice(&[x, y, 0, 255]);
+            }
+        }
+        let frame = Frame {
+            data,
+            size: PhysicalSize::new(200.0, 100.0),
+            stride: 200 * 4,
+            format: PixelFormat::Rgba8,
+            color_space: ColorSpace::DisplayP3,
+            scale: ScaleFactor::new(2.0),
+        };
+
+        let cropped = FrameCrop::new(source_bounds, viewport)
+            .expect("crop")
+            .apply(frame)
+            .expect("apply");
+
+        assert_eq!((cropped.width(), cropped.height()), (160, 80));
+        assert_eq!(&cropped.data[..4], &[20, 10, 0, 255]);
+        assert_eq!(cropped.format, PixelFormat::Rgba8);
+        assert_eq!(cropped.color_space, ColorSpace::DisplayP3);
+        assert_eq!(cropped.scale, ScaleFactor::new(2.0));
+    }
+
+    #[test]
+    fn scrolling_gesture_preserves_the_selected_display_and_window() {
+        let display = fixture_display();
+        let viewport = LogicalRect::new(
+            LogicalPoint::new(200.0, 100.0),
+            LogicalSize::new(800.0, 600.0),
+        );
+        let window = WindowId("browser-window".to_owned());
+
+        let config =
+            scroll_session_config(&display, viewport, ScrollAxis::Horizontal, window.clone())
+                .expect("valid viewport");
+
+        assert_eq!(config.gesture.axis, ScrollAxis::Horizontal);
+        assert_eq!(config.gesture.display, Some(display.id));
+        assert_eq!(config.gesture.window, Some(window));
+        assert_eq!(config.gesture.at, LogicalPoint::new(600.0, 400.0));
+        assert_eq!(config.gesture.amount, 520.0);
+    }
+
+    #[test]
+    fn wayland_manual_mode_needs_no_xwayland_geometry() {
+        let target = ScrollingTarget::manual_portal(CaptureRequest {
+            target: wayland_portal_picker_target(),
+            cursor: CursorMode::Hidden,
+            include_window_shadow: false,
+        });
+
+        let config = target
+            .session_config(ScrollAxis::Horizontal)
+            .expect("manual portal target");
+        assert_eq!(config.gesture.axis, ScrollAxis::Horizontal);
+        assert_eq!(config.gesture.amount, 1.0);
+        assert_eq!(config.gesture.display, None);
+        assert_eq!(config.gesture.window, None);
+    }
+
+    #[test]
+    fn wayland_scrolling_uses_only_the_explicit_manual_picker_sentinel() {
+        assert_eq!(
+            wayland_scrolling_capture_target(&DisplaySelector::Active).expect("portal target"),
+            CaptureTarget::Window(WindowId("xdg-desktop-portal-picker".to_owned()))
+        );
+
+        for selector in [
+            DisplaySelector::Primary,
+            DisplaySelector::Id("missing-display".to_owned()),
+        ] {
+            let error = wayland_scrolling_capture_target(&selector)
+                .expect_err("an explicit display selector must not be ignored");
+            assert!(matches!(
+                error,
+                CliError::Core(CoreError::Unsupported { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn forced_x11_routing_overrides_wayland_session_markers() {
+        assert!(!is_wayland_environment(
+            Some("x11"),
+            Some("wayland-0"),
+            Some("wayland")
+        ));
+        assert!(!is_wayland_environment(
+            Some(" XCB "),
+            Some("wayland-0"),
+            Some("wayland")
+        ));
+        assert!(is_wayland_environment(Some("wayland"), None, Some("x11")));
+    }
+
+    #[test]
+    fn terminal_abort_remains_authoritative_during_finalization() {
+        let state = Arc::new(AtomicU8::new(1));
+        let mut keep = Some(TerminalCancellation {
+            state: Arc::clone(&state),
+        });
+        assert!(fail_if_terminal_abort(&mut keep).is_ok());
+
+        state.store(2, Ordering::Release);
+        let error = fail_if_terminal_abort(&mut keep).expect_err("abort");
+        assert!(matches!(error, CliError::Core(CoreError::Cancelled)));
+    }
+
+    #[test]
+    fn output_publication_and_abort_have_one_ordered_winner() {
+        let state = Arc::new(AtomicU8::new(0));
+        let mut cancel = Some(TerminalCancellation {
+            state: Arc::clone(&state),
+        });
+        seal_terminal_output(&mut cancel).expect("publication wins");
+        assert_eq!(state.load(Ordering::Acquire), 3);
+        assert_eq!(advance_terminal_cancellation(&state), None);
+        assert!(fail_if_terminal_abort(&mut cancel).is_ok());
+
+        let state = Arc::new(AtomicU8::new(1));
+        assert_eq!(advance_terminal_cancellation(&state), Some(2));
+        let mut cancel = Some(TerminalCancellation { state });
+        assert!(matches!(
+            seal_terminal_output(&mut cancel),
+            Err(CliError::Core(CoreError::Cancelled))
+        ));
     }
 
     // -- dry-run capture ---------------------------------------------------

@@ -34,7 +34,45 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCaptureKitBackend;
 
-use scrozz_core::{CaptureBackend, Result, ScrollDriver};
+use scrozz_core::{CaptureBackend, CaptureRequest, Frame, Result, ScrollDriver};
+
+/// Supplies viewport frames from one logical capture session.
+///
+/// A platform may keep native resources open between calls. On Wayland this is
+/// the difference between reusing one portal/PipeWire stream and reopening the
+/// permission flow for every scrolling viewport. Dropping the session releases
+/// every native resource it owns.
+pub trait FrameSession {
+    /// Captures the viewport in its current state.
+    fn capture_frame(&mut self) -> Result<Frame>;
+
+    /// Human-readable source name for diagnostics.
+    fn name(&self) -> &str;
+}
+
+/// Repeated-frame fallback for platforms whose ordinary backend is already
+/// efficient enough to reopen per frame.
+struct BackendFrameSession {
+    backend: Box<dyn CaptureBackend>,
+    request: CaptureRequest,
+}
+
+impl FrameSession for BackendFrameSession {
+    fn capture_frame(&mut self) -> Result<Frame> {
+        Ok(self.backend.capture(&self.request)?.frame)
+    }
+
+    fn name(&self) -> &str {
+        self.backend.name()
+    }
+}
+
+pub(crate) fn backend_frame_session(
+    backend: Box<dyn CaptureBackend>,
+    request: CaptureRequest,
+) -> Box<dyn FrameSession> {
+    Box::new(BackendFrameSession { backend, request })
+}
 
 /// Constructs the best capture backend for the running system.
 ///
@@ -64,13 +102,40 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
     }
 }
 
+/// Opens a frame source suitable for a scrolling capture.
+///
+/// Wayland keeps one portal grant and PipeWire stream alive across calls.
+/// Other platforms currently adapt their ordinary capture backend.
+///
+/// # Errors
+///
+/// Returns the same platform, permission, and target errors as [`backend`] and
+/// [`FrameSession::capture_frame`].
+pub fn frame_session(request: CaptureRequest) -> Result<Box<dyn FrameSession>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::frame_session(request)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Ok(backend_frame_session(backend()?, request))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = request;
+        todo!("select and construct the platform frame session")
+    }
+}
+
 /// Constructs the scroll-input driver for the running desktop.
 ///
-/// Linux selection is runtime-sensitive: a native X11 session uses XTEST,
-/// GNOME/KDE Wayland uses the RemoteDesktop portal when it can be reached, and
-/// desktops without a safe synthesis route return a manual driver carrying the
-/// reason. Constructing the driver never opens a permission prompt; grants are
-/// acquired by [`ScrollDriver::prepare`].
+/// Linux selection is runtime-sensitive: a native X11 session uses XTEST, while
+/// Wayland stays manual because its separate RemoteDesktop grant cannot prove
+/// that input reaches the ScreenCast-selected surface. Constructing the driver
+/// never opens a permission prompt; grants are acquired by
+/// [`ScrollDriver::prepare`].
 ///
 /// # Errors
 ///
@@ -90,7 +155,7 @@ pub fn scroll_driver() -> Result<Box<dyn ScrollDriver>> {
 
     #[cfg(target_os = "windows")]
     {
-        Ok(Box::new(windows::scroll::SendInputScrollDriver::new()))
+        Ok(Box::new(windows::scroll::TargetedWheelScrollDriver::new()))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

@@ -12,10 +12,11 @@ different class of defect, and each one cheaper than the layer below it.
 
 ## Layer 1 — Cross-target type checking (local, seconds, free)
 
-`cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-Both targets check cleanly from macOS today for **every crate that contains
-platform-specific code** — including the real platform bindings: the `windows`
-crate, `x11rb`, and `ashpd` with its zbus stack.
+`cargo check` does not link, so Rust bindings need no Windows SDK or target
+linker. It still runs build scripts, which means a dependency that compiles C or
+queries target-native libraries can need a foreign toolchain or sysroot even
+though no executable is produced. Subject to that exact boundary, the compiler
+checks against the real `windows`, `x11rb`, and `ashpd`/zbus APIs.
 
 ```bash
 tools/check-all-platforms.sh
@@ -28,24 +29,44 @@ error on this machine** rather than a surprise days later. It is the difference
 between writing platform code blind and writing it with the type checker
 watching.
 
-### The one exception, and why it does not matter
+### The build-script exceptions, stated exactly
 
-**Crates whose dependencies compile C cannot be cross-checked without a cross C
-toolchain.** `cargo check` still runs build scripts, and `rusqlite`'s `bundled`
-feature compiles `sqlite3.c` *for the target*, which fails on this machine with
-`fatal error: 'stdlib.h' file not found`. `scrozz-store` and the `scrozz` binary
-that depends on it are therefore excluded, via `SCROZZ_XCHECK_EXCLUDE`.
+There are two distinct limitations:
 
-This costs nothing real. Only four crates are permitted to contain
-`cfg(target_os)` at all — `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and
-`scrozz-shell` — and **all four are still fully checked on all three targets**.
-`scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
-almost nothing, and CI compiles it natively on all three runners anyway (layer
-2), which is a strictly stronger check.
+1. **Target C compilation.** `rusqlite`'s `bundled` feature compiles `sqlite3.c`
+   for the target. On a foreign target that needs a cross C compiler and sysroot;
+   without them the macOS host fails with `fatal error: 'stdlib.h' file not
+   found`. `scrozz-store` and the `scrozz` binary that depends on it are therefore
+   excluded from cross targets through `SCROZZ_XCHECK_EXCLUDE`. Neither contains
+   platform-conditional code, and CI compiles both natively on every runner.
+2. **Target `pkg-config` probes.** On Linux, `scrozz-shell` reaches
+   libappindicator and GTK through `tray-icon`. The `glib-sys`, `gobject-sys`,
+   `gio-sys`, `pango-sys`, and GTK-family build scripts still run during `cargo
+   check` and require Linux `.pc` files. A macOS host has neither a Linux
+   GLib/GTK sysroot nor target `pkg-config` metadata, so the **full**
+   `x86_64-unknown-linux-gnu` workspace check fails there with `pkg-config has
+   not been configured to support cross-compilation`. Setting
+   `PKG_CONFIG_ALLOW_CROSS=1` is not a fix: it would describe Darwin libraries to
+   a Linux target.
 
-Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
-dependency, which matters far more than local cross-check coverage of a crate
-that has no platform code in it.
+`scrozz-shell` is deliberately not put in the standard exclusion list because it
+does contain Linux platform code; excluding it would make a full check look green
+by hiding the code the command exists to check. The CI gate runs on Ubuntu after
+`tools/ci-linux-deps.sh`, so it has native GLib/GObject/GIO/GTK metadata and
+checks the full shell. The PipeWire work itself has no build-time system
+dependency and passes independently from macOS:
+
+```bash
+cargo check --package scrozz-capture --all-targets \
+  --target x86_64-unknown-linux-gnu
+cargo clippy --package scrozz-capture --all-targets \
+  --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
+Keeping bundled SQLite is deliberate: shipped builds carry no system SQLite
+dependency. Keeping the shell failure visible is equally deliberate: it records
+the real limit of a macOS-only cross check rather than claiming coverage that did
+not happen.
 
 Its limit is exact: this layer proves the code is *well-formed*, never that it
 *works*.
@@ -92,6 +113,176 @@ behaviour the first three layers structurally cannot reach.
 
 ---
 
+## Worked example: Wayland screen capture
+
+Wayland capture is the sharpest case this document describes, so it is worth
+walking through concretely: it has more code that *cannot* be verified from this
+machine than anything else in the project, and the split between the layers is
+unusually clean.
+
+### How it is built, and why that decision is a platform-strategy decision
+
+Frames arrive over **PipeWire**, because `xdg-desktop-portal`'s `ScreenCast`
+interface hands back a *node id*, not pixels. The obvious way to consume that is
+the `pipewire` crate — and it is the wrong one here, for two reasons that are
+both about this document rather than about ergonomics:
+
+All-display capture is unavailable on Wayland for now. ScreenCast may return
+one stream per monitor, but stream positions are optional. Scrozz rejects the
+request before opening the portal picker rather than prompt and then compose
+guessed geometry—or quietly return only the first display. Single-display
+capture remains available.
+
+Still captures use the ordinary `CaptureBackend` API. Scrolling capture opens
+`scrozz_capture::frame_session` instead: its Wayland implementation retains one
+portal grant and one connected PipeWire stream across viewport frames, then
+tears the stream down before closing the portal session when dropped. Before
+every `capture_frame` after the first, `pw_stream_flush(stream, false)` clears
+the capture queue under the PipeWire thread-loop lock; the first subsequently
+published owned pixel copy is therefore newer than the request rather than just
+newer in callback order. Restore-token negotiation is serialised process-wide,
+but the gate is released before the long-lived PipeWire stream opens;
+independent frame sessions therefore cannot reuse one single-use token or block
+each other for their full lifetime.
+
+The PipeWire offer is deliberately opaque-only (`BGRx` then `RGBx`). SPA does
+not carry alpha-association metadata and compositors disagree on whether BGRA
+pixels are straight or premultiplied, so accepting them would make the core
+`PixelFormat` claim something the stream never proved. The unused `x` byte is
+forced to `0xFF`. Colour is likewise conservative: Scrozz maps only exact
+primaries/transfer pairs for sRGB, Display P3, and SDR Rec. 2020; absent,
+gamma-2.2, PQ, HLG, and unknown transfer metadata remain `ColorSpace::Unknown`.
+
+Restore tokens are scoped to the requested display identity, not to the broad
+class "monitor". Before connecting PipeWire, Scrozz compares the portal stream's
+compositor-space bounds with the selected display; a stale restored grant is
+discarded and retried once without it. Region captures require the selected
+stream to fully contain the region and are never restored. Wayland window ids
+cannot be matched to portal surfaces, so window sessions deliberately use a
+fresh authoritative picker and do not persist a token.
+
+Wayland scrolling input is deliberately manual. A separate RemoteDesktop portal
+grant cannot guarantee that synthesized wheel input reaches the same surface the
+user selected in ScreenCast, so Scrozz never prompts for a grant it cannot bind
+safely. X11 keeps automatic XTEST scrolling.
+
+For scrolling capture, `--scrolling` and `--scrolling=active` mean “choose one
+window in the ScreenCast portal.” Explicit `primary` or display-ID selectors are
+rejected before the picker opens rather than being silently ignored. Internally
+that flow uses the reserved advisory window ID `xdg-desktop-portal-picker`;
+ordinary OS window IDs never open the portal.
+
+Windows automatic scrolling does not use global `SendInput`: wheel input normally
+follows keyboard focus, which could scroll a terminal or another window after a
+focus change. Scrozz snapshots the selected HWND together with its process
+creation time, UI thread and class, revalidates that identity before every
+gesture, resolves the child at the selected point, and sends one conservative
+`WM_MOUSEWHEEL` or `WM_MOUSEHWHEEL` detent directly with a timeout. A recycled
+HWND, moved target, hung process or UIPI rejection is an error, never reported
+as successful scrolling. The selected `DisplayId` is retained through the
+gesture so overlapping logical rectangles on mixed-DPI desktops are not
+re-resolved heuristically.
+
+1. **`pipewire-sys` needs `pkg-config` and `bindgen`.** Adding it would take
+   `scrozz-capture` — one of the four crates that *must* stay cross-checkable —
+   out of layer 1 entirely, in exchange for a Linux sysroot nobody has. The
+   single most valuable check in the project would stop covering the largest
+   piece of unverifiable code in it.
+2. **Linking it puts a `DT_NEEDED` on `libpipewire-0.3.so.0`.** The whole binary
+   then fails to load on a machine without PipeWire — including every X11-only
+   desktop, where Scrozz otherwise works perfectly.
+
+So PipeWire is **`dlopen`ed at runtime** through `libloading`, and the SPA
+parameter objects are encoded by hand in `linux::wayland::pipewire::pod`. The
+cost is real: `spa_pod_builder_*` is header-only `static inline`, so there is
+nothing to call and the binary format is written out byte by byte. The benefits
+are that `cargo check --target x86_64-unknown-linux-gnu` still passes from
+macOS with no system packages installed, and that a missing PipeWire degrades to
+`Error::Unsupported` naming the package to install rather than to a binary that
+will not start.
+
+### What each layer actually proves here
+
+| Layer | Covers | Does not cover |
+|---|---|---|
+| 1 — cross-check | The ashpd/zbus calls, every signature | Anything behind `dlopen`; symbols are resolved by name at runtime |
+| 2 — CI tests | POD encoding byte for byte, opaque-only format negotiation, transfer-aware colour mapping, stride packing, empty/corrupt precedence, crop arithmetic, error mapping, lifecycle | Whether a real server accepts any of it |
+| 3 — golden images | Nothing; there is no UI in this path | — |
+| 4 — real session | Everything below | — |
+
+The unit tests are deliberately literal about the wire format, because a
+malformed POD is not rejected with an error — the stream simply never reaches
+`Streaming`, which is indistinguishable from a hang.
+
+### The native Linux command CI must run
+
+Layer 1 and layer 2 need nothing new. The runtime library belongs in the Linux
+dependency set, and `tools/ci-linux-deps.sh` installs it:
+
+```bash
+tools/ci-linux-deps.sh          # selects libpipewire-0.3-0t64 or the legacy name
+cargo test --workspace          # the pure Wayland tests run here, headless
+```
+
+The end-to-end path needs a real session and is therefore a **separate,
+non-blocking** step, run on a native Ubuntu runner:
+
+```bash
+tools/ci-linux-deps.sh
+tools/wayland-smoke.sh
+```
+
+For a destructive stale-token check, isolate the state first so no real desktop
+grant is overwritten:
+
+```bash
+XDG_STATE_HOME="$(mktemp -d)" \
+  RUST_LOG=scrozz_capture=debug \
+  tools/wayland-smoke.sh --require --stale-token
+```
+
+That mode fails unless the planted token is parsed, rejected by the portal, and
+retried exactly once. A successful run also retains one portal/PipeWire session
+for repeated frames and requires changed pixels after the second request; keep
+the invoking terminal visible on the monitor selected in the picker.
+
+`tools/wayland-smoke.sh` exits **77** — the automake "skipped" convention — with
+the specific missing piece on stderr when there is no `WAYLAND_DISPLAY`, no
+session bus, no `libpipewire-0.3.so.0`, no PipeWire socket, or no
+`org.freedesktop.portal.Desktop` on the bus. It exits 0 **only** when a real
+frame with varying pixels was captured. That distinction is the whole point: a
+job that skips and exits 0 records a pass for a test that never ran, which is
+exactly the failure mode decision D8 exists to prevent. Pass `--require` to turn
+every skip into a failure, which is what a dedicated Wayland VM job should do.
+
+Neither the `pipewire` daemon nor any `xdg-desktop-portal-*` backend is
+installed by `ci-linux-deps.sh`, because neither can be made to work in a
+headless container and installing them would imply otherwise.
+
+### What still needs a real Wayland session
+
+Honestly, and in order of risk:
+
+1. **The C ABI declarations in `pipewire::sys`.** A wrong struct layout compiles
+   perfectly and then reads a garbage pointer. Nothing short of running it
+   against a real `libpipewire-0.3.so.0` can prove those offsets.
+2. **That the hand-encoded POD is one a server accepts.** The tests prove it
+   matches the documented format; only a server proves the format was read
+   correctly.
+3. **That the modifier-less format offer plus the explicit
+   `SPA_PARAM_BUFFERS_dataType = MemFd | MemPtr` response produces shared-memory
+   buffers**, rather than failing to negotiate or returning DMA-BUF.
+4. **That `pw_stream_flush(stream, false)` establishes the intended fresh-frame
+   boundary on Mutter and KWin**, including an idle source that emits empty
+   priming buffers before the first post-scroll frame.
+5. **The portal dialog**, including that dismissing it produces
+   `Error::Cancelled` and not something alarming.
+6. **The restore-token round trip**, including the rejection-and-retry path. A
+   token that is stored but never accepted is invisible offline and shows up as
+   a permission dialog on every single capture.
+
+---
+
 ## What this means for anyone writing platform code
 
 1. **Never guess an API.** Read the vendored bindings under
@@ -129,35 +320,70 @@ These are the dangerous class: the call returns success and nothing works.
 3. **`tray-icon` and `muda` types are `Rc`-based and `!Send`**, and — along with
    `GlobalHotKeyManager` — require the main thread with a live event loop.
    Failure to satisfy that is also silent.
+4. **PipeWire delivers empty buffers, and they look exactly like real ones.**
+   Mutter hands over a buffer with `chunk->size == 0` when nothing on screen has
+   changed. Accepting the first buffer offered therefore yields a black PNG on
+   an idle desktop — a structurally perfect frame containing nothing. A still
+   capture must keep waiting until a buffer actually carries pixels.
+5. **A malformed SPA POD is not an error, it is a hang.** The server does not
+   reject a parameter it cannot read; the stream simply never reaches
+   `Streaming`. Encoding bugs must be caught by byte-level tests, because at
+   runtime they present as a timeout with nothing to go on.
+6. **`spa_pod_builder_pad` does nothing inside a Choice or an Array.** Every POD
+   is padded to eight bytes *except* the alternatives inside a choice body,
+   which are packed contiguously at exactly the child's size. Padding them "for
+   consistency" produces a POD the server reads as garbage — see the previous
+   entry for how that presents.
+
+7. **A full Linux workspace check from macOS reaches target `pkg-config`.**
+   `scrozz-shell -> tray-icon -> libappindicator -> GTK` asks for Linux
+   GLib/GObject/GIO/Pango/GTK metadata even though `cargo check` never links.
+   Without a Linux sysroot that failure is expected; check `scrozz-capture`
+   independently and let the Ubuntu CI gate check the native shell. Never point
+   `PKG_CONFIG_ALLOW_CROSS` at the host's Darwin libraries.
 
 ### Process-global state
 
-4. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
+8. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
    Setting it once permanently starves the process-global receiver channel for
    *every* other consumer in the process. Use `receiver()` instead; a library
    crate must never claim the handler.
 
 ### Coordinate systems
 
-5. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
+9. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
    `visibleFrame` and Vision's normalised text boxes all need flipping. This is
    the classic "everything is upside down" bug and it is easy to get almost-right.
-6. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
+10. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
    or above the primary. Never assume the origin is `(0, 0)`.
+11. **A PipeWire stride is not `width * 4`.** The producer picks it, and it is
+    routinely larger. Reading the buffer linearly gives the classic diagonal
+    shear, which looks like a decoding bug and is not. The last row is also
+    entitled to end after `width * 4` bytes rather than a full stride, so
+    demanding one more byte rejects a perfectly good buffer.
 
 ### Scale
 
-7. **There is no single app-wide scale factor on Windows or Wayland.** Windows
-   desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
-   Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+12. **There is no single app-wide scale factor on Windows or Wayland.** Windows
+    desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
+    Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+13. **On Wayland, do not use a display's scale factor to convert a region to
+    pixels.** Under fractional scaling the compositor rounds the output's pixel
+    size, so the nominal scale and the real ratio disagree. The delivered frame
+    and the portal's reported logical size describe the same monitor, so their
+    ratio is the only figure that is a fact rather than an assumption.
 
 ### Testing platform code
 
-8. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
-   thread.** Anything needing the main run loop — `NSApplication`, windows, tray
-   items, hotkey managers — is unreachable from an ordinary test. Doctests run on
-   the main thread and are the workaround; failing that, test the
-   off-main-thread guard and verify real behaviour another way.
+14. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
+    thread.** Anything needing the main run loop — `NSApplication`, windows, tray
+    items, hotkey managers — is unreachable from an ordinary test. Doctests run on
+    the main thread and are the workaround; failing that, test the
+    off-main-thread guard and verify real behaviour another way.
+15. **A skipped test that exits 0 is worse than no test.** It is
+    indistinguishable from a pass, so it records verification that never
+    happened. `tools/wayland-smoke.sh` exits 77 with the reason on stderr
+    instead.
 
 ---
 
