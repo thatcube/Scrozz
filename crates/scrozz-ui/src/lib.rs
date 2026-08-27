@@ -24,8 +24,34 @@
 //! | Assets | [`icons`] | SVG → texture, rasterised once per context |
 //! | Platform | [`vibrancy`] | OS window materials, where they exist |
 //! | Drawing | [`paint`] | Primitives and controls built from all of the above |
-//! | Surfaces | [`stack`] | The product's actual screens |
+//! | Surfaces | [`card`], [`stack`] | The product's actual screens |
+//! | Window | [`overlay_app`] | The floating window the stack lives in |
 //! | Verification | [`harness`] | Headless rendering of any surface |
+//!
+//! # Driving the overlay
+//!
+//! [`overlay_app`] is the seam the rest of the application uses. Build an
+//! [`OverlayHandle`], keep a clone, hand the other to [`OverlayApp::new`] inside
+//! `eframe`'s app creator, then [`OverlayHandle::push`] captures in and
+//! [`OverlayHandle::drain_events`] results out. The handle is `Send + Sync` and
+//! works before the window exists, so a hotkey thread can be wired to it at
+//! start-up.
+//!
+//! Two things the window cannot do for itself are supplied as hooks, because
+//! this crate is `#![forbid(unsafe_code)]` and does not depend on
+//! `scrozz-shell`: [`overlay_app::PanelHook`] converts the native window into a
+//! non-activating panel, and [`overlay_app::PointerProbe`] reports the cursor
+//! position while the window is passing clicks through.
+//!
+//! # Window captures are never composited onto
+//!
+//! Per decision D9 a window capture arrives with the compositor's own corner
+//! radius and shadow already in its pixels, and nothing synthetic may be layered
+//! over it — including the scrim behind a caption, which must take the same
+//! rounding as the thing beneath it or it squares the card's corners.
+//! [`card::CardChrome::for_provenance`] is the single place that decision is
+//! made, and [`card::CardChrome::composites`] reports it so a test can assert
+//! it.
 //!
 //! # Motion
 //!
@@ -54,13 +80,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod card;
 pub mod harness;
 pub mod icons;
 pub mod motion;
+pub mod overlay_app;
 pub mod paint;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
 
+pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
+pub use overlay_app::{
+    CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
+    OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+};
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
