@@ -29,6 +29,8 @@ Environment:
   SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME
                         Store-facing publisher name (Windows)
   SCROZZ_MSIX_VERSION   four-part package version override (Windows)
+  SCROZZ_TESSERACT_DIR  absolute portable OCR payload directory containing
+                        tesseract.exe and tessdata/eng.traineddata (Windows)
   SCROZZ_MSIX_SIGN_PFX  optional external package-signing certificate
   SCROZZ_MSIX_SIGN_PFX_PASSWORD
                         optional PFX password

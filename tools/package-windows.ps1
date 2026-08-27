@@ -14,7 +14,10 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidateSet("x86_64", "aarch64")]
-    [string] $Architecture
+    [string] $Architecture,
+
+    [Parameter()]
+    [string] $TesseractDirectory = $env:SCROZZ_TESSERACT_DIR
 )
 
 Set-StrictMode -Version Latest
@@ -33,6 +36,35 @@ if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
 }
 if ([IO.Path]::GetExtension($Binary) -ne ".exe") {
     throw "The Windows package binary must end in .exe: $Binary"
+}
+if ([String]::IsNullOrWhiteSpace($TesseractDirectory)) {
+    throw "SCROZZ_TESSERACT_DIR must name the artifact-local Tesseract payload"
+}
+if (-not [IO.Path]::IsPathRooted($TesseractDirectory) -or
+    $TesseractDirectory -match "^[A-Za-z]:[^\\/]") {
+    throw "SCROZZ_TESSERACT_DIR must be an absolute path: $TesseractDirectory"
+}
+$TesseractDirectory = [IO.Path]::GetFullPath($TesseractDirectory)
+if (-not (Test-Path -LiteralPath $TesseractDirectory -PathType Container)) {
+    throw "SCROZZ_TESSERACT_DIR does not name a directory: $TesseractDirectory"
+}
+$TesseractExecutable = Join-Path $TesseractDirectory "tesseract.exe"
+$EnglishTrainedData = Join-Path $TesseractDirectory "tessdata\eng.traineddata"
+if (-not (Test-Path -LiteralPath $TesseractExecutable -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $EnglishTrainedData -PathType Leaf)) {
+    throw (
+        "The portable OCR payload is incomplete. Expected " +
+        "$TesseractExecutable and $EnglishTrainedData"
+    )
+}
+$ReparsePoint = @(
+    Get-Item -LiteralPath $TesseractDirectory
+    Get-ChildItem -LiteralPath $TesseractDirectory -Recurse -Force
+) | Where-Object {
+    ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+} | Select-Object -First 1
+if ($null -ne $ReparsePoint) {
+    throw "The Tesseract payload cannot contain reparse points: $($ReparsePoint.FullName)"
 }
 if ($Stamp -notmatch "^[0-9A-Za-z._-]+$") {
     throw "Unsafe package stamp: $Stamp"
@@ -67,6 +99,16 @@ function Assert-SingleLine {
         $Value.Contains("`n")) {
         throw "Invalid $Label"
     }
+}
+
+function Test-PathWithin {
+    param([string] $Candidate, [string] $Parent)
+    $Comparison = [StringComparison]::OrdinalIgnoreCase
+    $ParentPrefix = $Parent.TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar
+    return (
+        $Candidate.Equals($Parent, $Comparison) -or
+        $Candidate.StartsWith($ParentPrefix, $Comparison)
+    )
 }
 
 function Convert-ToMsixVersion {
@@ -305,6 +347,10 @@ if ($PackageIdentityName -notmatch "^[0-9A-Za-z.-]{3,50}$") {
 }
 Assert-SingleLine $PackagePublisher "MSIX Publisher" 8192
 Assert-SingleLine $PublisherDisplayName "MSIX PublisherDisplayName" 256
+if ((Test-PathWithin $TesseractDirectory $OutputDirectory) -or
+    (Test-PathWithin $OutputDirectory $TesseractDirectory)) {
+    throw "SCROZZ_TESSERACT_DIR and the output directory must not overlap"
+}
 
 $Name = "scrozz-$Version-$Stamp-windows-$Architecture"
 $Portable = Join-Path $OutputDirectory "$Name.zip"
@@ -328,6 +374,11 @@ try {
     Copy-Item -LiteralPath $Binary -Destination (Join-Path $MsixRoot "scrozz.exe")
     Copy-DistributionDocuments $PortableRoot
     Copy-DistributionDocuments $MsixRoot
+    $PortableTesseract = Join-Path $PortableRoot "tesseract"
+    New-Item -ItemType Directory -Path $PortableTesseract | Out-Null
+    Get-ChildItem -LiteralPath $TesseractDirectory -Force | Copy-Item `
+        -Destination $PortableTesseract `
+        -Recurse
 
     foreach ($Asset in @(
         "Square44x44Logo.png",

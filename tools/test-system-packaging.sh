@@ -123,6 +123,14 @@ grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no all-artifact determinism check"
 grep -q 'determinism-check.zip' "$WINDOWS_PACKAGE" ||
   fail "portable ZIP is excluded from reproducibility verification"
+grep -q 'SCROZZ_TESSERACT_DIR' "$WINDOWS_PACKAGE" ||
+  fail "portable packaging does not require an explicit Tesseract payload"
+grep -Fq 'tessdata\eng.traineddata' "$WINDOWS_PACKAGE" ||
+  fail "portable packaging does not require English trained data"
+grep -Fq '"tesseract.exe"' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not verify the Tesseract executable"
+grep -Fq 'tessdata/eng.traineddata"' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not verify English trained data"
 grep -q 'SCROZZ_MSIX_SIGN_PFX' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no external PFX signing hook"
 grep -q 'SCROZZ_MSIX_SIGN_CERT_SHA1' "$WINDOWS_PACKAGE" ||
