@@ -1,26 +1,63 @@
-//! Deterministic text shaping over an embedded Inter face.
+//! Deterministic OpenType text shaping over embedded font faces.
 //!
-//! Text never consults the operating system. The same Inter bytes are parsed by
-//! `ttf-parser`, shaped from cmap/advance data, and converted to filled
-//! `tiny-skia` outlines on every platform. That keeps annotation exports and
-//! golden images byte-stable while rendering real lowercase and Unicode glyphs.
+//! Inter remains the ordinary annotation face. Noto Sans Mono is a real
+//! monospaced face for code presets, while script-specific Noto fallbacks cover
+//! Arabic and Hebrew bidirectional runs. Rustybuzz applies GSUB, GPOS, kerning,
+//! ligatures and mark positioning; `unicode-bidi` supplies visual run order.
+//! Rendering still ends as filled `tiny-skia` outlines, so no platform font
+//! service can make exports differ between machines.
 
+use rustybuzz::{
+    Direction, Face, UnicodeBuffer, shape,
+    ttf_parser::{GlyphId, OutlineBuilder},
+};
 use scrozz_core::{LogicalPoint, LogicalSize};
-use tiny_skia::{Path, PathBuilder, Rect};
-use ttf_parser::{Face, GlyphId, OutlineBuilder};
+use tiny_skia::{Path, PathBuilder};
+use unicode_bidi::BidiInfo;
 
 use crate::style::TextPreset;
 
 const INTER: &[u8] = include_bytes!("../../scrozz-ui/assets/fonts/Inter-Regular.ttf");
+const NOTO_MONO: &[u8] = include_bytes!("../../scrozz-ui/assets/fonts/NotoSansMono.ttf");
+const NOTO_ARABIC: &[u8] = include_bytes!("../../scrozz-ui/assets/fonts/NotoSansArabic.ttf");
+const NOTO_HEBREW: &[u8] = include_bytes!("../../scrozz-ui/assets/fonts/NotoSansHebrew.ttf");
 const DEFAULT_LINE_HEIGHT: f64 = 1.22;
-const MONO_ADVANCE: f64 = 0.64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FontKind {
+    Inter,
+    Mono,
+    Arabic,
+    Hebrew,
+}
+
+impl FontKind {
+    const fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Inter => INTER,
+            Self::Mono => NOTO_MONO,
+            Self::Arabic => NOTO_ARABIC,
+            Self::Hebrew => NOTO_HEBREW,
+        }
+    }
+
+    fn face(self) -> Face<'static> {
+        Face::from_slice(self.bytes(), 0).expect("embedded annotation font must parse")
+    }
+
+    fn supports(self, text: &str) -> bool {
+        let face = self.face();
+        text.chars()
+            .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+            .all(|ch| face.glyph_index(ch).is_some())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Metrics {
     scale: f64,
     ascender: f64,
     line_height: f64,
-    mono_advance: f64,
 }
 
 impl Metrics {
@@ -31,40 +68,96 @@ impl Metrics {
         Self {
             scale,
             ascender: f64::from(face.ascender()) * scale,
-            line_height: natural_height.max(font_size * DEFAULT_LINE_HEIGHT),
-            mono_advance: font_size * MONO_ADVANCE,
+            line_height: natural_height.max(font_size.max(1.0) * DEFAULT_LINE_HEIGHT),
         }
     }
 }
 
-fn face() -> Option<Face<'static>> {
-    Face::parse(INTER, 0).ok()
+#[derive(Debug, Clone, Copy)]
+struct PositionedGlyph {
+    font: FontKind,
+    id: GlyphId,
+    x: f64,
+    y_offset: f64,
 }
 
-fn glyph(face: &Face<'_>, ch: char) -> GlyphId {
-    face.glyph_index(ch)
-        .or_else(|| face.glyph_index('\u{fffd}'))
-        .unwrap_or(GlyphId(0))
+#[derive(Debug)]
+struct ShapedLine {
+    glyphs: Vec<PositionedGlyph>,
+    width: f64,
 }
 
-fn advance(face: &Face<'_>, glyph: GlyphId, metrics: Metrics, preset: TextPreset) -> f64 {
+fn primary_font(preset: TextPreset) -> FontKind {
     if preset.is_monospaced() {
-        metrics.mono_advance
+        FontKind::Mono
     } else {
-        f64::from(face.glyph_hor_advance(glyph).unwrap_or(face.units_per_em())) * metrics.scale
+        FontKind::Inter
     }
 }
 
-fn line_width(face: &Face<'_>, line: &str, metrics: Metrics, preset: TextPreset) -> f64 {
-    line.chars()
-        .map(|ch| {
-            if ch == '\t' {
-                metrics.mono_advance * 4.0
-            } else {
-                advance(face, glyph(face, ch), metrics, preset)
-            }
-        })
-        .sum()
+fn font_for_run(preset: TextPreset, text: &str) -> FontKind {
+    let primary = primary_font(preset);
+    if primary.supports(text) {
+        return primary;
+    }
+    for fallback in [FontKind::Arabic, FontKind::Hebrew, FontKind::Mono] {
+        if fallback.supports(text) {
+            return fallback;
+        }
+    }
+    primary
+}
+
+fn shape_line(line: &str, font_size: f64, preset: TextPreset) -> ShapedLine {
+    let expanded = line.replace('\t', "    ");
+    if expanded.is_empty() {
+        return ShapedLine {
+            glyphs: Vec::new(),
+            width: 0.0,
+        };
+    }
+
+    let bidi = BidiInfo::new(&expanded, None);
+    let Some(paragraph) = bidi.paragraphs.first() else {
+        return ShapedLine {
+            glyphs: Vec::new(),
+            width: 0.0,
+        };
+    };
+    let (levels, runs) = bidi.visual_runs(paragraph, paragraph.range.clone());
+    let mut glyphs = Vec::new();
+    let mut cursor = 0.0;
+
+    for run in runs {
+        let text = &expanded[run.clone()];
+        let font = font_for_run(preset, text);
+        let face = font.face();
+        let metrics = Metrics::new(&face, font_size);
+        let mut buffer = UnicodeBuffer::new();
+        buffer.push_str(text);
+        buffer.set_direction(if levels[run.start].is_rtl() {
+            Direction::RightToLeft
+        } else {
+            Direction::LeftToRight
+        });
+        buffer.guess_segment_properties();
+        let shaped = shape(&face, &[], buffer);
+
+        for (info, position) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+            glyphs.push(PositionedGlyph {
+                font,
+                id: GlyphId(info.glyph_id as u16),
+                x: cursor + f64::from(position.x_offset) * metrics.scale,
+                y_offset: f64::from(position.y_offset) * metrics.scale,
+            });
+            cursor += f64::from(position.x_advance) * metrics.scale;
+        }
+    }
+
+    ShapedLine {
+        glyphs,
+        width: cursor.max(0.0),
+    }
 }
 
 /// The measured text box using the standard Inter preset.
@@ -76,80 +169,39 @@ pub fn measure(text: &str, font_size: f64) -> LogicalSize {
 /// The measured text box for a specific text preset.
 #[must_use]
 pub fn measure_with_preset(text: &str, font_size: f64, preset: TextPreset) -> LogicalSize {
-    let Some(face) = face() else {
-        return fallback_measure(text, font_size, preset);
-    };
+    let face = primary_font(preset).face();
     let metrics = Metrics::new(&face, font_size);
-    let lines = text.split('\n').collect::<Vec<_>>();
-    let widest = lines
-        .iter()
-        .map(|line| line_width(&face, line, metrics, preset))
-        .fold(0.0_f64, f64::max);
-    let height = if lines.is_empty() {
-        font_size.max(1.0)
-    } else {
-        metrics.line_height * lines.len() as f64
-    };
-    LogicalSize::new(widest, height)
-}
-
-fn fallback_measure(text: &str, font_size: f64, preset: TextPreset) -> LogicalSize {
-    let advance = if preset.is_monospaced() {
-        MONO_ADVANCE
-    } else {
-        0.62
-    };
-    let mut widest = 0_usize;
-    let mut lines = 0_usize;
+    let mut widest = 0.0_f64;
+    let mut line_count = 0_usize;
     for line in text.split('\n') {
-        widest = widest.max(line.chars().count());
-        lines += 1;
+        widest = widest.max(shape_line(line, font_size, preset).width);
+        line_count += 1;
     }
-    LogicalSize::new(
-        widest as f64 * advance * font_size,
-        lines.max(1) as f64 * DEFAULT_LINE_HEIGHT * font_size,
-    )
+    LogicalSize::new(widest, metrics.line_height * line_count.max(1) as f64)
 }
 
-/// Filled Inter glyph outlines in logical document coordinates.
+/// Filled, shaped glyph outlines in logical document coordinates.
 #[must_use]
 pub fn outline(text: &str, at: LogicalPoint, font_size: f64, preset: TextPreset) -> Option<Path> {
-    let face = face()?;
-    let metrics = Metrics::new(&face, font_size);
+    let primary = primary_font(preset).face();
+    let metrics = Metrics::new(&primary, font_size);
     let mut path = PathBuilder::new();
     let mut any = false;
 
     for (row, line) in text.split('\n').enumerate() {
         let baseline = at.y + metrics.ascender + row as f64 * metrics.line_height;
-        let mut cursor = at.x;
-        for ch in line.chars() {
-            if ch == '\t' {
-                cursor += metrics.mono_advance * 4.0;
-                continue;
-            }
-            let glyph = glyph(&face, ch);
+        for glyph in shape_line(line, font_size, preset).glyphs {
+            let face = glyph.font.face();
+            let glyph_metrics = Metrics::new(&face, font_size);
             let mut sink = GlyphPath {
                 path: &mut path,
-                origin_x: cursor as f32,
-                baseline: baseline as f32,
-                scale: metrics.scale as f32,
+                origin_x: (at.x + glyph.x) as f32,
+                baseline: (baseline - glyph.y_offset) as f32,
+                scale: glyph_metrics.scale as f32,
             };
-            if face.outline_glyph(glyph, &mut sink).is_some() {
+            if face.outline_glyph(glyph.id, &mut sink).is_some() {
                 any = true;
-            } else if !ch.is_whitespace() {
-                let width = advance(&face, glyph, metrics, preset) as f32;
-                let top = (baseline - metrics.ascender) as f32;
-                if let Some(rect) = Rect::from_xywh(
-                    cursor as f32,
-                    top,
-                    width.max(1.0),
-                    font_size.max(1.0) as f32,
-                ) {
-                    path.push_rect(rect);
-                    any = true;
-                }
             }
-            cursor += advance(&face, glyph, metrics, preset);
         }
     }
 
@@ -206,25 +258,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_inter_has_real_lowercase_and_unicode_glyphs() {
-        let face = face().expect("embedded Inter parses");
-        assert!(face.glyph_index('a').is_some());
-        assert!(face.glyph_index('é').is_some());
+    fn embedded_faces_have_expected_real_glyphs() {
+        assert!(FontKind::Inter.face().glyph_index('é').is_some());
+        assert!(FontKind::Mono.face().glyph_index('W').is_some());
+        assert!(FontKind::Arabic.face().glyph_index('س').is_some());
+        assert!(FontKind::Hebrew.face().glyph_index('א').is_some());
+    }
+
+    #[test]
+    fn gpos_kerning_affects_layout() {
+        let kerned = shape_line("AV", 24.0, TextPreset::Standard).width;
+        let separate = shape_line("A", 24.0, TextPreset::Standard).width
+            + shape_line("V", 24.0, TextPreset::Standard).width;
+        assert!(kerned < separate, "Inter's GPOS kerning was not applied");
+    }
+
+    #[test]
+    fn combining_marks_and_bidi_runs_are_shaped() {
+        let decomposed = shape_line("e\u{301}", 24.0, TextPreset::Standard);
+        let composed = shape_line("é", 24.0, TextPreset::Standard);
+        assert_eq!(decomposed.glyphs.len(), composed.glyphs.len());
+        assert_eq!(
+            decomposed.glyphs.len(),
+            1,
+            "GSUB should compose the decomposed Latin cluster"
+        );
+        assert!((decomposed.width - composed.width).abs() < 0.01);
+
+        let bidi = shape_line("abc אבג", 24.0, TextPreset::Standard);
+        assert!(
+            bidi.glyphs
+                .iter()
+                .any(|glyph| glyph.font == FontKind::Hebrew)
+        );
+        assert!(bidi.glyphs.iter().all(|glyph| glyph.id.0 != 0));
+    }
+
+    #[test]
+    fn arabic_joining_uses_open_type_substitution() {
+        let shaped = shape_line("سلام", 24.0, TextPreset::Standard);
+        assert!(shaped.glyphs.iter().all(|glyph| glyph.id.0 != 0));
+        let face = FontKind::Arabic.face();
+        let nominal = "سلام"
+            .chars()
+            .map(|ch| face.glyph_index(ch).expect("Arabic glyph"))
+            .collect::<Vec<_>>();
+        let positioned = shaped
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.id)
+            .collect::<Vec<_>>();
+        assert_ne!(
+            positioned, nominal,
+            "Arabic contextual GSUB substitutions were not applied"
+        );
+    }
+
+    #[test]
+    fn monospaced_presets_use_the_embedded_mono_face() {
+        let narrow = measure_with_preset("iiii", 20.0, TextPreset::Monospaced);
+        let wide = measure_with_preset("WWWW", 20.0, TextPreset::Monospaced);
+        assert!((narrow.width - wide.width).abs() < 0.001);
+
+        let shaped = shape_line("code", 20.0, TextPreset::Monospaced);
+        assert!(
+            shaped
+                .glyphs
+                .iter()
+                .all(|glyph| glyph.font == FontKind::Mono)
+        );
+    }
+
+    #[test]
+    fn shaping_produces_filled_outlines() {
         assert!(
             outline(
-                "Scrozz café",
+                "Scrozz café — אבג",
                 LogicalPoint::new(0.0, 0.0),
                 24.0,
                 TextPreset::Standard,
             )
             .is_some()
         );
-    }
-
-    #[test]
-    fn monospaced_preset_uses_fixed_advances() {
-        let narrow = measure_with_preset("iiii", 20.0, TextPreset::Monospaced);
-        let wide = measure_with_preset("WWWW", 20.0, TextPreset::Monospaced);
-        assert_eq!(narrow.width, wide.width);
     }
 }

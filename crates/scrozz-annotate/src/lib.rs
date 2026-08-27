@@ -72,8 +72,9 @@ pub mod style;
 
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
 pub use document::{
-    AnnotationMut, Background, Beautification, Canvas, CanvasGeometry, CanvasRotation, Document,
+    Alignment, AnnotationMut, AspectPreset, Background, BackgroundImage, Beautification,
+    BeautificationPreset, BuiltInBackground, Canvas, CanvasGeometry, CanvasRotation, Document,
     DocumentData, UndoHistory,
 };
-pub use render::{Renderer, SkiaRenderer};
+pub use render::{PhysicalInsets, RenderGeometry, RenderedFrame, Renderer, SkiaRenderer};
 pub use style::{ArrowStyle, Color, Style, TextPreset};

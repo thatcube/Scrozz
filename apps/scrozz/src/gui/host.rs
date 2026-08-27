@@ -11,7 +11,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scrozz_annotate::{Document, Renderer, SkiaRenderer};
@@ -21,18 +21,19 @@ use scrozz_shell::{
     current_native_drag_surface, native_drag_source,
 };
 use scrozz_ui::{
-    AnnotationEditor, EditorDragRequest, EditorEvent, OverlayHandle, Theme,
+    AnnotationEditor, EditorDestination, EditorDragRequest, EditorEvent, OverlayHandle, Theme,
     icons::IconStore,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
 };
 
 use scrozz_core::Error as CoreError;
+use scrozz_store::CaptureId;
 
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, Tick},
-        card::{CardId, CardSurface, Recording},
+        app::{App, Config, EditorResult, Tick},
+        card::{CardSurface, Recording},
         overlay::OverlayCards,
     },
     report::Report,
@@ -47,6 +48,7 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 /// menu-bar app is not a busy loop — which matters, because this process is
 /// meant to sit there all day.
 const IDLE: Duration = Duration::from_millis(16);
+const EDITOR_AUTOSAVE_DELAY: Duration = Duration::from_millis(280);
 
 /// Something that can drive an [`App`] to completion.
 /// Writes the final report the way `main` would have.
@@ -228,6 +230,7 @@ impl Host for Windowed {
                     announced: false,
                     stopped: false,
                     editors: HashMap::new(),
+                    active_editor_export: None,
                     editor_icons,
                 }))
             }),
@@ -274,7 +277,8 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
-    editors: HashMap<CardId, Arc<Mutex<EditorSession>>>,
+    editors: HashMap<CaptureId, Arc<Mutex<EditorSession>>>,
+    active_editor_export: Option<CaptureId>,
     editor_icons: Arc<IconStore>,
 }
 
@@ -282,15 +286,219 @@ struct EditorSession {
     editor: AnnotationEditor,
     pending: Vec<EditorEvent>,
     drag: Option<DragSession>,
+    latest_revision: u64,
+    latest_data: scrozz_annotate::DocumentData,
+    acknowledged_revision: u64,
+    in_flight: Option<RevisionSnapshot>,
+    pending_drag: Option<PendingEditorDrag>,
+    export: Option<PendingEditorExport>,
+    ready_drag: Option<EditorDragRequest>,
+    autosave_due: Option<Instant>,
+    retry_blocked: bool,
+    close_requested: bool,
+}
+
+#[derive(Clone)]
+struct RevisionSnapshot {
+    revision: u64,
+    data: scrozz_annotate::DocumentData,
+}
+
+struct PendingEditorDrag {
+    snapshot: RevisionSnapshot,
+    request: EditorDragRequest,
+}
+
+#[derive(Clone)]
+struct PendingEditorExport {
+    snapshot: RevisionSnapshot,
+    destination: EditorDestination,
+    dispatched: bool,
 }
 
 impl EditorSession {
     fn new(document: Document) -> Self {
+        let latest_data = document.data();
         Self {
             editor: AnnotationEditor::new(document),
             pending: Vec::new(),
             drag: None,
+            latest_revision: 0,
+            latest_data,
+            acknowledged_revision: 0,
+            in_flight: None,
+            pending_drag: None,
+            export: None,
+            ready_drag: None,
+            autosave_due: None,
+            retry_blocked: false,
+            close_requested: false,
         }
+    }
+
+    fn stage(&mut self, data: scrozz_annotate::DocumentData) -> RevisionSnapshot {
+        if data != self.latest_data {
+            self.latest_revision = self.latest_revision.saturating_add(1);
+            self.latest_data = data;
+        }
+        RevisionSnapshot {
+            revision: self.latest_revision,
+            data: self.latest_data.clone(),
+        }
+    }
+
+    fn needs_save(&self) -> bool {
+        self.latest_revision > self.acknowledged_revision
+    }
+
+    fn is_ready_to_close(&self) -> bool {
+        self.close_requested
+            && !self.needs_save()
+            && self.in_flight.is_none()
+            && self.pending_drag.is_none()
+            && self.export.is_none()
+            && self.ready_drag.is_none()
+            && self.drag.is_none()
+    }
+
+    fn changed(&mut self, data: scrozz_annotate::DocumentData, now: Instant) {
+        let previous = self.latest_revision;
+        self.stage(data);
+        if self.latest_revision != previous {
+            self.autosave_due = Some(now + EDITOR_AUTOSAVE_DELAY);
+        }
+        self.retry_blocked = false;
+    }
+
+    fn save_requested(&mut self, data: scrozz_annotate::DocumentData) {
+        self.stage(data);
+        self.autosave_due = None;
+        self.retry_blocked = false;
+        if !self.needs_save() {
+            self.editor.mark_save_succeeded();
+        }
+    }
+
+    fn close_requested(&mut self) {
+        self.stage(self.editor.document_data());
+        self.autosave_due = None;
+        self.close_requested = true;
+        self.retry_blocked = false;
+    }
+
+    fn next_save(&self, now: Instant) -> Option<RevisionSnapshot> {
+        if self.in_flight.is_some() || self.retry_blocked || self.export.is_some() {
+            return None;
+        }
+        if let Some(pending) = self
+            .pending_drag
+            .as_ref()
+            .filter(|pending| pending.snapshot.revision > self.acknowledged_revision)
+        {
+            return Some(pending.snapshot.clone());
+        }
+        let barrier = self.close_requested || self.autosave_due.is_none();
+        let debounce_elapsed = self.autosave_due.is_some_and(|due| now >= due);
+        (self.needs_save() && (barrier || debounce_elapsed)).then(|| RevisionSnapshot {
+            revision: self.latest_revision,
+            data: self.latest_data.clone(),
+        })
+    }
+
+    fn save_dispatched(&mut self, snapshot: RevisionSnapshot) {
+        self.editor.mark_save_pending();
+        self.in_flight = Some(snapshot);
+    }
+
+    fn save_dispatch_failed(&mut self, error: impl Into<String>) {
+        self.retry_blocked = true;
+        self.editor.mark_save_failed(error);
+    }
+
+    fn save_finished(&mut self, revision: u64, failure: Option<String>) -> bool {
+        let Some(in_flight) = self.in_flight.as_ref() else {
+            return false;
+        };
+        if in_flight.revision != revision {
+            return false;
+        }
+        if let Some(error) = failure {
+            self.in_flight = None;
+            self.retry_blocked = true;
+            self.editor.mark_save_failed(error);
+            return true;
+        }
+
+        self.acknowledged_revision = self.acknowledged_revision.max(revision);
+        self.in_flight = None;
+        self.retry_blocked = false;
+        if self
+            .autosave_due
+            .is_some_and(|_| revision == self.latest_revision)
+        {
+            self.autosave_due = None;
+        }
+        if self
+            .pending_drag
+            .as_ref()
+            .is_some_and(|pending| pending.snapshot.revision == revision)
+            && let Some(pending) = self.pending_drag.take()
+        {
+            self.ready_drag = Some(pending.request);
+        }
+        if self.needs_save() {
+            self.editor.mark_save_pending();
+        } else {
+            self.editor.mark_save_succeeded();
+        }
+        true
+    }
+
+    fn export_requested(
+        &mut self,
+        data: scrozz_annotate::DocumentData,
+        destination: EditorDestination,
+    ) {
+        let snapshot = self.stage(data);
+        self.autosave_due = None;
+        self.retry_blocked = false;
+        self.export = Some(PendingEditorExport {
+            snapshot,
+            destination,
+            dispatched: false,
+        });
+        self.editor.mark_export_pending(destination);
+    }
+
+    fn export_finished(
+        &mut self,
+        revision: u64,
+        destination: EditorDestination,
+        result: Result<String, String>,
+    ) -> bool {
+        let Some(export) = self.export.as_ref() else {
+            return false;
+        };
+        if export.snapshot.revision != revision || export.destination != destination {
+            return false;
+        }
+        self.export = None;
+        match result {
+            Ok(detail) => {
+                self.acknowledged_revision = self.acknowledged_revision.max(revision);
+                self.retry_blocked = false;
+                if revision == self.latest_revision {
+                    self.autosave_due = None;
+                    self.editor.mark_save_succeeded();
+                }
+                self.editor.mark_export_succeeded(detail);
+            }
+            Err(error) => {
+                self.retry_blocked = true;
+                self.editor.mark_export_failed(error);
+            }
+        }
+        true
     }
 
     fn poll_drag(&mut self) {
@@ -343,46 +551,215 @@ impl Driver {
     fn collect_editor_requests(&mut self) {
         for request in self.app.drain_editor_requests() {
             self.editors
-                .entry(request.card)
+                .entry(request.capture)
                 .or_insert_with(|| Arc::new(Mutex::new(EditorSession::new(request.document))));
         }
     }
 
     fn drain_editor_events(&mut self) {
         let mut pending = Vec::new();
-        for (&card, editor) in &self.editors {
+        for (capture, editor) in &self.editors {
             match editor.lock() {
                 Ok(mut session) => pending.extend(
                     std::mem::take(&mut session.pending)
                         .into_iter()
-                        .map(|event| (card, event)),
+                        .map(|event| (capture.clone(), event)),
                 ),
-                Err(_) => tracing::error!(%card, "annotation editor state was poisoned"),
+                Err(_) => {
+                    tracing::error!(capture = %capture.0, "annotation editor state was poisoned")
+                }
             }
         }
 
-        let mut closing = Vec::new();
-        for (card, event) in pending {
+        for (capture, event) in pending {
+            let Some(editor) = self.editors.get(&capture) else {
+                continue;
+            };
+            let Ok(mut session) = editor.lock() else {
+                tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
+                continue;
+            };
             match event {
-                EditorEvent::Changed(data) | EditorEvent::Save(data) => {
-                    self.app.persist_editor(card, data);
+                EditorEvent::Changed(data) => {
+                    session.changed(data, Instant::now());
+                }
+                EditorEvent::Save(data) => {
+                    session.save_requested(data);
                 }
                 EditorEvent::DragRequested(request) => {
-                    self.app.persist_editor(card, request.data);
+                    let snapshot = session.stage(request.data.clone());
+                    session.pending_drag = Some(PendingEditorDrag { snapshot, request });
+                    session.autosave_due = None;
+                    session.retry_blocked = false;
                 }
-                EditorEvent::CloseRequested => closing.push(card),
+                EditorEvent::ExportRequested { destination, data } => {
+                    if self.active_editor_export.is_some() {
+                        session
+                            .editor
+                            .mark_export_failed("Another image export is already in progress.");
+                    } else {
+                        self.active_editor_export = Some(capture.clone());
+                        session.export_requested(data, destination);
+                    }
+                }
+                EditorEvent::CloseRequested => {
+                    session.close_requested();
+                }
             }
         }
-        for card in closing {
-            self.editors.remove(&card);
+        self.dispatch_editor_exports();
+        self.dispatch_editor_saves();
+    }
+
+    fn dispatch_editor_exports(&mut self) {
+        let Some(capture) = self.active_editor_export.clone() else {
+            return;
+        };
+        let Some(editor) = self.editors.get(&capture) else {
+            self.active_editor_export = None;
+            return;
+        };
+        let Ok(mut session) = editor.lock() else {
+            tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
+            self.active_editor_export = None;
+            return;
+        };
+        let Some(export) = session.export.as_mut() else {
+            self.active_editor_export = None;
+            return;
+        };
+        if export.dispatched {
+            return;
+        }
+        if self.app.export_editor(
+            capture.clone(),
+            export.snapshot.revision,
+            export.snapshot.data.clone(),
+            export.destination,
+        ) {
+            export.dispatched = true;
+        } else {
+            session.export = None;
+            session
+                .editor
+                .mark_export_failed("The capture worker is unavailable; try again.");
+            self.active_editor_export = None;
+        }
+    }
+
+    fn dispatch_editor_saves(&mut self) {
+        let now = Instant::now();
+        for (capture, editor) in &self.editors {
+            let Ok(mut session) = editor.lock() else {
+                tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
+                continue;
+            };
+            let snapshot = session.next_save(now);
+            let Some(snapshot) = snapshot else {
+                if let Some(pending) = session.pending_drag.take() {
+                    session.ready_drag = Some(pending.request);
+                }
+                continue;
+            };
+            if self
+                .app
+                .persist_editor(capture.clone(), snapshot.revision, snapshot.data.clone())
+            {
+                session.save_dispatched(snapshot);
+            } else {
+                session.save_dispatch_failed(
+                    "the capture worker is unavailable; the editor remains open",
+                );
+            }
+        }
+    }
+
+    fn drain_editor_results(&mut self) {
+        for result in self.app.drain_editor_results() {
+            match result {
+                EditorResult::Saved { capture, revision } => {
+                    let Some(editor) = self.editors.get(&capture) else {
+                        continue;
+                    };
+                    let Ok(mut session) = editor.lock() else {
+                        tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
+                        continue;
+                    };
+                    session.save_finished(revision, None);
+                }
+                EditorResult::SaveFailed {
+                    capture,
+                    revision,
+                    error,
+                } => {
+                    let Some(editor) = self.editors.get(&capture) else {
+                        continue;
+                    };
+                    let Ok(mut session) = editor.lock() else {
+                        tracing::error!(capture = %capture.0, "annotation editor state was poisoned");
+                        continue;
+                    };
+                    session.save_finished(revision, Some(error));
+                }
+                EditorResult::Exported {
+                    capture,
+                    revision,
+                    destination,
+                    detail,
+                } => {
+                    if let Some(editor) = self.editors.get(&capture)
+                        && let Ok(mut session) = editor.lock()
+                    {
+                        session.export_finished(revision, destination, Ok(detail));
+                    }
+                    if self.active_editor_export.as_ref() == Some(&capture) {
+                        self.active_editor_export = None;
+                    }
+                }
+                EditorResult::ExportFailed {
+                    capture,
+                    revision,
+                    destination,
+                    error,
+                } => {
+                    if let Some(editor) = self.editors.get(&capture)
+                        && let Ok(mut session) = editor.lock()
+                    {
+                        session.export_finished(revision, destination, Err(error));
+                    }
+                    if self.active_editor_export.as_ref() == Some(&capture) {
+                        self.active_editor_export = None;
+                    }
+                }
+            }
+        }
+        self.dispatch_editor_exports();
+        self.dispatch_editor_saves();
+    }
+
+    fn close_finished_editors(&mut self, ctx: &egui::Context) {
+        let closing: Vec<_> = self
+            .editors
+            .iter()
+            .filter_map(|(capture, editor)| {
+                editor
+                    .lock()
+                    .ok()
+                    .is_some_and(|session| session.is_ready_to_close())
+                    .then(|| capture.clone())
+            })
+            .collect();
+        for capture in closing {
+            ctx.send_viewport_cmd_to(editor_viewport_id(&capture), egui::ViewportCommand::Close);
+            self.editors.remove(&capture);
         }
     }
 
     fn show_editors(&self, ctx: &egui::Context) {
-        for (&card, editor) in &self.editors {
+        for (capture, editor) in &self.editors {
             show_editor_viewport(
                 ctx,
-                card,
+                capture.clone(),
                 Arc::clone(editor),
                 Arc::clone(&self.editor_icons),
             );
@@ -390,20 +767,20 @@ impl Driver {
     }
 }
 
-fn editor_viewport_id(card: CardId) -> egui::ViewportId {
-    egui::ViewportId::from_hash_of(("annotation-editor", card.0))
+fn editor_viewport_id(capture: &CaptureId) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("annotation-editor", &capture.0))
 }
 
 fn show_editor_viewport(
     ctx: &egui::Context,
-    card: CardId,
+    capture: CaptureId,
     editor: Arc<Mutex<EditorSession>>,
     icons: Arc<IconStore>,
 ) {
     ctx.show_viewport_deferred(
-        editor_viewport_id(card),
+        editor_viewport_id(&capture),
         egui::ViewportBuilder::default()
-            .with_title("Scrozz — Annotate")
+            .with_title(format!("Scrozz — Annotate — {}", capture.0))
             .with_inner_size([960.0, 680.0])
             .with_min_inner_size([900.0, 520.0]),
         move |ui, _class| {
@@ -417,13 +794,18 @@ fn show_editor_viewport(
                     session.poll_drag();
                     session.editor.show(ui, &icons, &theme);
                     let events = session.editor.drain_events();
-                    let drag = events.iter().find_map(|event| match event {
-                        EditorEvent::DragRequested(request) => {
-                            Some((session.editor.document().clone(), request.clone()))
-                        }
-                        _ => None,
-                    });
+                    if events
+                        .iter()
+                        .any(|event| matches!(event, EditorEvent::CloseRequested))
+                    {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    }
                     session.pending.extend(events);
+                    let drag = session
+                        .ready_drag
+                        .take()
+                        .map(|request| (session.editor.document().clone(), request));
                     if session.drag.as_ref().is_some_and(DragSession::is_active) {
                         ui.ctx().request_repaint_after(IDLE);
                     }
@@ -445,7 +827,11 @@ fn show_editor_viewport(
                         ui.ctx().request_repaint_after(IDLE);
                     }
                     Err(error) => {
-                        tracing::warn!(%card, %error, "could not begin annotation drag");
+                        tracing::warn!(
+                            capture = %capture.0,
+                            %error,
+                            "could not begin annotation drag"
+                        );
                         if let Ok(mut session) = editor.lock() {
                             session.editor.set_notice(format!("Drag failed: {error}"));
                         }
@@ -460,7 +846,9 @@ fn begin_editor_drag(
     document: &Document,
     request: &EditorDragRequest,
 ) -> scrozz_core::Result<DragSession> {
-    let frame = SkiaRenderer::new().render(document)?;
+    let mut snapshot = document.clone();
+    snapshot.restore(request.data.clone())?;
+    let frame = SkiaRenderer::new().render(&snapshot)?;
     let png = FrameEncoder::new().encode(&frame, ImageFormat::Png)?;
     let promised = Arc::new(png.clone());
     let bytes = byte_source(move || Ok(promised.as_ref().clone()));
@@ -522,7 +910,16 @@ impl eframe::App for Driver {
         self.collect_editor_requests();
         self.drain_editor_events();
 
-        if !self.stopped && self.app.tick() == Tick::Stop {
+        let tick = if self.stopped {
+            Tick::Continue
+        } else {
+            self.app.tick()
+        };
+        self.collect_editor_requests();
+        self.drain_editor_results();
+        self.close_finished_editors(ctx);
+
+        if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
             let report = self.app.report();
             if let Ok(mut slot) = self.sink.lock() {
@@ -713,22 +1110,124 @@ mod tests {
         ctx.set_embed_viewports(false);
         scrozz_ui::theme::install_fonts(&ctx);
         let icons = Arc::new(IconStore::new(&ctx));
-        let card = CardId(17);
+        let capture = CaptureId("editor-17".to_owned());
         let session = Arc::new(Mutex::new(EditorSession::new(sample_document(
             16, 12, 3, 1,
         ))));
 
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            show_editor_viewport(ui.ctx(), card, Arc::clone(&session), Arc::clone(&icons));
+            show_editor_viewport(
+                ui.ctx(),
+                capture.clone(),
+                Arc::clone(&session),
+                Arc::clone(&icons),
+            );
         });
 
         let viewport = output
             .viewport_output
-            .get(&editor_viewport_id(card))
+            .get(&editor_viewport_id(&capture))
             .expect("the editor viewport should be registered");
         assert!(viewport.class == egui::ViewportClass::Deferred);
         assert_eq!(viewport.builder.min_inner_size, Some([900.0, 520.0].into()));
-        assert_ne!(editor_viewport_id(card), editor_viewport_id(CardId(18)));
+        assert_ne!(
+            editor_viewport_id(&capture),
+            editor_viewport_id(&CaptureId("editor-18".to_owned()))
+        );
         output.textures_delta.clear();
+    }
+
+    fn edited_session() -> (EditorSession, Instant) {
+        let mut session = EditorSession::new(sample_document(16, 12, 3, 1));
+        let now = Instant::now();
+        let mut data = session.latest_data.clone();
+        data.canvas.flip_horizontal = true;
+        session.changed(data, now);
+        (session, now)
+    }
+
+    #[test]
+    fn changed_snapshots_wait_for_the_autosave_debounce() {
+        let (session, now) = edited_session();
+        assert!(session.next_save(now).is_none());
+        assert!(
+            session
+                .next_save(now + EDITOR_AUTOSAVE_DELAY - Duration::from_millis(1))
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .next_save(now + EDITOR_AUTOSAVE_DELAY)
+                .expect("the debounced snapshot should become eligible")
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_save_bypasses_the_autosave_debounce() {
+        let (mut session, now) = edited_session();
+        session.save_requested(session.latest_data.clone());
+        assert_eq!(
+            session
+                .next_save(now)
+                .expect("an explicit save is a barrier")
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn stale_save_acknowledgements_do_not_clear_the_current_barrier() {
+        let (mut session, now) = edited_session();
+        session.save_requested(session.latest_data.clone());
+        let snapshot = session.next_save(now).expect("save snapshot");
+        session.save_dispatched(snapshot);
+
+        assert!(!session.save_finished(0, None));
+        assert_eq!(
+            session.in_flight.as_ref().map(|save| save.revision),
+            Some(1)
+        );
+        assert_eq!(session.acknowledged_revision, 0);
+        assert!(session.needs_save());
+    }
+
+    #[test]
+    fn failed_close_save_stays_dirty_and_retries_before_closing() {
+        let (mut session, now) = edited_session();
+        session.save_requested(session.latest_data.clone());
+        session.close_requested = true;
+        let snapshot = session.next_save(now).expect("close barrier");
+        session.save_dispatched(snapshot);
+
+        assert!(session.save_finished(1, Some("disk full".to_owned())));
+        assert!(session.retry_blocked);
+        assert!(session.needs_save());
+        assert!(!session.is_ready_to_close());
+        assert!(session.next_save(now + Duration::from_secs(1)).is_none());
+
+        session.save_requested(session.latest_data.clone());
+        let retry = session.next_save(now).expect("retry snapshot");
+        session.save_dispatched(retry);
+        assert!(session.save_finished(1, None));
+        assert!(!session.needs_save());
+        assert!(session.is_ready_to_close());
+    }
+
+    #[test]
+    fn queue_failure_keeps_the_editor_open_with_a_retryable_snapshot() {
+        let (mut session, now) = edited_session();
+        session.save_requested(session.latest_data.clone());
+        session.close_requested = true;
+        assert!(session.next_save(now).is_some());
+
+        session.save_dispatch_failed("worker unavailable");
+        assert!(session.retry_blocked);
+        assert!(session.needs_save());
+        assert!(!session.is_ready_to_close());
+
+        session.save_requested(session.latest_data.clone());
+        assert!(session.next_save(now).is_some());
     }
 }

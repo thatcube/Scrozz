@@ -15,10 +15,11 @@
 //! true at once. The redaction object stays editable; the *exported pixels* are
 //! gone.
 //!
-//! The blur is a real separable Gaussian with clamp-to-edge sampling. A box blur
-//! leaves recoverable structure, and zero-padding at the image border darkens
-//! the edge of the redaction — a visible artifact that also advertises exactly
-//! where the sensitive content was.
+//! The blur is a real separable Gaussian with clamp-to-edge sampling. Secure
+//! pixelation uses a persisted random seed and colours that are independent of
+//! the covered pixels. Averaging source blocks would retain a recoverable,
+//! low-resolution copy of the secret; the randomized mosaic deliberately
+//! retains none of that information.
 
 use tiny_skia::{IntRect, Pixmap, PremultipliedColorU8};
 
@@ -73,61 +74,68 @@ pub fn solid(pixmap: &mut Pixmap, region: IntRect, color: Color) {
 /// Blocks are aligned to the region, not to the image, so a redaction looks the
 /// same wherever it is dragged.
 pub fn pixelate(pixmap: &mut Pixmap, region: IntRect) {
-    pixelate_with_strength(pixmap, region, 0.65);
+    pixelate_with_strength_and_seed(pixmap, region, 0.65, 1);
 }
 
-/// Replaces a region with a mosaic adjusted by the persisted editor strength.
+/// Replaces a region with a secure mosaic adjusted by the editor strength.
 pub fn pixelate_with_strength(pixmap: &mut Pixmap, region: IntRect, strength: f32) {
+    pixelate_with_strength_and_seed(pixmap, region, strength, 1);
+}
+
+/// Replaces a region with a deterministic, input-independent secure mosaic.
+///
+/// The seed is persisted by the document and mixed with the annotation id
+/// before it reaches this function. Each block is opaque and generated without
+/// reading the source pixels, so the exported mosaic contains no block averages
+/// from which a coarse copy of the hidden content could be reconstructed.
+pub fn pixelate_with_strength_and_seed(
+    pixmap: &mut Pixmap,
+    region: IntRect,
+    strength: f32,
+    seed: u64,
+) {
     let block =
         ((pixelate_block(region) as f32 * strength_factor(strength)).round() as u32).max(MIN_BLOCK);
     let width = pixmap.width() as usize;
     let (left, top) = (region.left(), region.top());
     let (right, bottom) = (region.right(), region.bottom());
 
+    let mut block_y = 0_u64;
     let mut by = top;
     while by < bottom {
         let block_bottom = (by + block as i32).min(bottom);
+        let mut block_x = 0_u64;
         let mut bx = left;
         while bx < right {
             let block_right = (bx + block as i32).min(right);
-            let mut sum = [0u64; 4];
-            let mut count = 0u64;
-            {
-                let pixels = pixmap.pixels();
-                for y in by..block_bottom {
-                    let row = y as usize * width;
-                    for x in bx..block_right {
-                        let p = pixels[row + x as usize];
-                        sum[0] += u64::from(p.red());
-                        sum[1] += u64::from(p.green());
-                        sum[2] += u64::from(p.blue());
-                        sum[3] += u64::from(p.alpha());
-                        count += 1;
-                    }
-                }
-            }
-            if count > 0 {
-                let avg = |c: u64| ((c + count / 2) / count) as u8;
-                let a = avg(sum[3]);
-                let flat = PremultipliedColorU8::from_rgba(
-                    avg(sum[0]).min(a),
-                    avg(sum[1]).min(a),
-                    avg(sum[2]).min(a),
-                    a,
-                )
-                .unwrap_or_else(transparent);
-                let pixels = pixmap.pixels_mut();
-                for y in by..block_bottom {
-                    let row = y as usize * width;
-                    for x in bx..block_right {
-                        pixels[row + x as usize] = flat;
-                    }
+            let random = splitmix64(
+                seed ^ block_x.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+                    ^ block_y.wrapping_mul(0xA5A3_564E_27F8_865D),
+            );
+            let level = 28 + (random & 0x5f) as u8;
+            let blue = level.saturating_add(((random >> 8) & 0x0f) as u8);
+            let flat = PremultipliedColorU8::from_rgba(level, level, blue, 255)
+                .expect("opaque channels are valid premultiplied colours");
+            let pixels = pixmap.pixels_mut();
+            for y in by..block_bottom {
+                let row = y as usize * width;
+                for x in bx..block_right {
+                    pixels[row + x as usize] = flat;
                 }
             }
             bx = block_right;
+            block_x += 1;
         }
         by = block_bottom;
+        block_y += 1;
     }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 /// Blurs a region with a separable Gaussian, sampling with clamp-to-edge.

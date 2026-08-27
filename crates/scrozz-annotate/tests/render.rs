@@ -6,10 +6,10 @@ use common::{
     capture_with, document, flat, near, pixel, pixels, rect, region_capture, window_capture,
 };
 use scrozz_annotate::{
-    Annotation, Background, Beautification, Canvas, CanvasRotation, Color, Document, Renderer,
-    SkiaRenderer, Style,
+    Alignment, Annotation, AspectPreset, Background, BackgroundImage, Beautification,
+    BeautificationPreset, Canvas, CanvasRotation, Color, Document, Renderer, SkiaRenderer, Style,
 };
-use scrozz_core::{Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
+use scrozz_core::{ColorSpace, Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
 
 #[test]
 fn an_empty_document_renders_the_source_unchanged() {
@@ -41,6 +41,7 @@ fn rendering_is_deterministic() {
             start: Color::rgb(250, 250, 250),
             end: Color::rgb(190, 200, 220),
         },
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -273,6 +274,31 @@ fn render_to_width_rejects_a_zero_width() {
 }
 
 #[test]
+fn render_to_width_is_exact_after_canvas_and_aspect_layout_rounding() {
+    let mut doc = document(120, 80);
+    doc.set_canvas(Canvas {
+        crop: Some(rect(10.0, 5.0, 60.0, 40.0)),
+        rotation: CanvasRotation::Clockwise90,
+        flip_horizontal: false,
+        flip_vertical: false,
+        auto_expand: false,
+    })
+    .unwrap();
+    let mut beautification = Beautification::preset(BeautificationPreset::Social);
+    beautification.padding = 40.0;
+    beautification.aspect = AspectPreset::Wide;
+    doc.set_beautification(Some(beautification)).unwrap();
+
+    let rendered = SkiaRenderer::new()
+        .render_to_width_with_geometry(&doc, 900)
+        .unwrap();
+    assert_eq!(rendered.frame.width(), 900);
+    assert_eq!(rendered.frame.height(), 300);
+    assert_eq!(rendered.geometry.output_width, 900);
+    assert_eq!(rendered.geometry.canvas.output_size().width, 40.0);
+}
+
+#[test]
 fn a_2x_source_renders_at_its_own_scale_by_default() {
     let mut frame = flat(200, 100, [40, 60, 80, 255]);
     frame.scale = ScaleFactor::new(2.0);
@@ -407,6 +433,7 @@ fn beautification_pads_the_canvas() {
         corner_radius: 0.0,
         shadow: 0.0,
         background: Background::Solid(Color::rgb(0, 0, 255)),
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -442,6 +469,39 @@ fn beautification_padding_scales_with_the_export() {
 }
 
 #[test]
+fn render_geometry_exposes_exact_beautified_content_placement() {
+    let mut doc = Document::new(capture_with(
+        flat(40, 30, [200, 30, 30, 255]),
+        Provenance::Region,
+    ));
+    doc.set_beautification(Some(Beautification::padded(7.25, Background::Transparent)))
+        .unwrap();
+
+    let rendered = SkiaRenderer::new()
+        .render_at_with_geometry(&doc, ScaleFactor::new(2.0))
+        .unwrap();
+    assert_eq!(rendered.frame.width(), 109);
+    assert_eq!(rendered.frame.height(), 89);
+    assert_eq!(rendered.geometry.output_width, 109);
+    assert_eq!(rendered.geometry.output_height, 89);
+    assert_eq!(rendered.geometry.content_rect.origin.x, 14.5);
+    assert_eq!(rendered.geometry.content_rect.origin.y, 14.5);
+    assert_eq!(rendered.geometry.content_rect.size.width, 80.0);
+    assert_eq!(rendered.geometry.content_rect.size.height, 60.0);
+
+    let source = LogicalPoint::new(11.25, 9.5);
+    let output = rendered.geometry.source_to_output(source);
+    let round_trip = rendered.geometry.output_to_source(output);
+    assert!((round_trip.x - source.x).abs() < 1e-9);
+    assert!((round_trip.y - source.y).abs() < 1e-9);
+    let insets = rendered.geometry.effective_insets();
+    assert_eq!(
+        [insets.top, insets.right, insets.bottom, insets.left],
+        [14.5; 4]
+    );
+}
+
+#[test]
 fn a_corner_radius_actually_rounds_the_corner() {
     let mut doc = Document::new(capture_with(
         flat(60, 60, [255, 0, 0, 255]),
@@ -452,6 +512,7 @@ fn a_corner_radius_actually_rounds_the_corner() {
         corner_radius: 16.0,
         shadow: 0.0,
         background: Background::Solid(Color::rgb(0, 0, 255)),
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -478,6 +539,7 @@ fn a_shadow_darkens_the_background_beneath_the_content() {
         corner_radius: 6.0,
         shadow: 18.0,
         background: Background::Solid(Color::WHITE),
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -503,11 +565,289 @@ fn a_noop_beautification_changes_nothing() {
         corner_radius: 0.0,
         shadow: 0.0,
         background: Background::Transparent,
+        ..Beautification::default()
     }))
     .unwrap();
     let framed = SkiaRenderer::new().render(&doc).unwrap();
 
     assert_eq!(plain.data, framed.data);
+}
+
+#[test]
+fn social_aspect_and_alignment_add_canvas_without_cropping() {
+    let content =
+        scrozz_annotate::render::raster::to_pixmap(&flat(100, 50, [120, 80, 40, 255])).unwrap();
+    let mut beauty = Beautification {
+        padding: 10.0,
+        aspect: AspectPreset::Square,
+        alignment: Alignment::TopLeft,
+        background: Background::Solid(Color::WHITE),
+        ..Beautification::default()
+    };
+    let top = scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0).unwrap();
+    assert_eq!((top.width, top.height), (120, 120));
+    assert_eq!((top.content.origin.x, top.content.origin.y), (10.0, 10.0));
+    assert_eq!(
+        (top.content.size.width, top.content.size.height),
+        (100.0, 50.0)
+    );
+
+    beauty.alignment = Alignment::BottomRight;
+    let bottom = scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0).unwrap();
+    assert_eq!(bottom.content.origin.x, 10.0);
+    assert_eq!(bottom.content.origin.y, 60.0);
+}
+
+#[test]
+fn visual_auto_balance_centres_salient_pixels_not_just_bounds() {
+    let mut frame = flat(100, 40, [20, 20, 20, 255]);
+    for y in 0..40usize {
+        for x in 80..100usize {
+            let index = (y * 100 + x) * 4;
+            frame.data[index..index + 4].copy_from_slice(&[245, 245, 245, 255]);
+        }
+    }
+    let content = scrozz_annotate::render::raster::to_pixmap(&frame).unwrap();
+    let mut beauty = Beautification {
+        padding: 30.0,
+        aspect: AspectPreset::Square,
+        background: Background::Solid(Color::WHITE),
+        ..Beautification::default()
+    };
+    let geometric =
+        scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0).unwrap();
+    beauty.auto_balance = true;
+    let visual = scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0).unwrap();
+
+    assert!(
+        visual.content.origin.x < geometric.content.origin.x,
+        "right-heavy content should move left: {} vs {}",
+        visual.content.origin.x,
+        geometric.content.origin.x
+    );
+    assert!(
+        visual.content.origin.x >= 10.0,
+        "auto-balance must retain at least 35% of the requested padding"
+    );
+}
+
+#[test]
+fn custom_image_background_covers_the_canvas_deterministically() {
+    let image =
+        BackgroundImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255], ColorSpace::Srgb).unwrap();
+    let mut doc = Document::new(capture_with(
+        flat(2, 2, [0, 255, 0, 255]),
+        Provenance::Region,
+    ));
+    doc.set_beautification(Some(Beautification {
+        padding: 2.0,
+        background: Background::Image(image),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let first = SkiaRenderer::new().render(&doc).unwrap();
+    let second = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(first.data, second.data);
+    assert!(pixel(&first, 0, 3)[0] > 200, "left crop should be red");
+    assert!(pixel(&first, 5, 3)[2] > 200, "right crop should be blue");
+    assert!(pixel(&first, 3, 3)[1] > 200, "capture stays visible");
+}
+
+#[test]
+fn custom_background_profile_is_converted_into_the_srgb_working_space() {
+    let p3 = [180, 40, 210, 255];
+    let expected = scrozz_export::convert_to_srgb(
+        &scrozz_export::RgbaImage {
+            width: 1,
+            height: 1,
+            data: p3.to_vec(),
+        },
+        ColorSpace::DisplayP3,
+    )
+    .unwrap();
+    let image = BackgroundImage::new(1, 1, p3.to_vec(), ColorSpace::DisplayP3).unwrap();
+    let mut doc = Document::new(capture_with(
+        flat(1, 1, [0, 255, 0, 255]),
+        Provenance::Region,
+    ));
+    doc.set_beautification(Some(Beautification {
+        padding: 1.0,
+        background: Background::Image(image),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(out.color_space, ColorSpace::Srgb);
+    assert!(near(
+        pixel(&out, 0, 0),
+        expected.data[..4].try_into().unwrap(),
+        1
+    ));
+}
+
+#[test]
+fn an_unknown_custom_background_keeps_the_composite_profile_unknown() {
+    let image = BackgroundImage::new(1, 1, vec![180, 40, 210, 255], ColorSpace::Unknown).unwrap();
+    let mut doc = Document::new(capture_with(
+        flat(1, 1, [0, 255, 0, 255]),
+        Provenance::Region,
+    ));
+    doc.set_beautification(Some(Beautification {
+        padding: 1.0,
+        background: Background::Image(image),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    assert_eq!(
+        SkiaRenderer::new().render(&doc).unwrap().color_space,
+        ColorSpace::Unknown
+    );
+}
+
+#[test]
+fn transparent_background_preserves_alpha_around_rounded_content() {
+    let mut doc = Document::new(capture_with(
+        flat(20, 20, [255, 0, 0, 255]),
+        Provenance::Region,
+    ));
+    doc.set_beautification(Some(Beautification {
+        padding: 8.0,
+        corner_radius: 8.0,
+        background: Background::Transparent,
+        ..Beautification::default()
+    }))
+    .unwrap();
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+
+    assert_eq!(pixel(&out, 0, 0)[3], 0);
+    assert_eq!(pixel(&out, 18, 18)[3], 255);
+    assert!(
+        pixel(&out, 8, 8)[3] < 255,
+        "the rounded edge should be antialiased against transparency"
+    );
+}
+
+#[test]
+fn beautification_uses_an_srgb_working_space_without_mutating_the_source() {
+    let mut frame = flat(40, 30, [180, 40, 210, 255]);
+    frame.color_space = ColorSpace::DisplayP3;
+    let mut doc = Document::new(capture_with(frame, Provenance::Region));
+    let source_before = doc.source.frame.data.clone();
+    doc.set_beautification(Some(Beautification::preset(BeautificationPreset::Social)))
+        .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(out.color_space, ColorSpace::Srgb);
+    assert_eq!(doc.source.frame.color_space, ColorSpace::DisplayP3);
+    assert_eq!(doc.source.frame.data, source_before);
+}
+
+#[test]
+fn canvas_edits_also_use_an_srgb_working_space() {
+    let mut frame = flat(40, 30, [180, 40, 210, 255]);
+    frame.color_space = ColorSpace::DisplayP3;
+    let mut doc = Document::new(capture_with(frame, Provenance::Region));
+    doc.set_canvas(Canvas {
+        flip_horizontal: true,
+        ..Canvas::default()
+    })
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(out.color_space, ColorSpace::Srgb);
+    assert_eq!(doc.source.frame.color_space, ColorSpace::DisplayP3);
+}
+
+#[test]
+fn a_noop_beautification_preserves_the_source_profile() {
+    let mut frame = flat(4, 3, [180, 40, 210, 255]);
+    frame.color_space = ColorSpace::DisplayP3;
+    let mut doc = Document::new(capture_with(frame, Provenance::Region));
+    doc.set_beautification(Some(Beautification::default()))
+        .unwrap();
+
+    assert_eq!(
+        SkiaRenderer::new().render(&doc).unwrap().color_space,
+        ColorSpace::DisplayP3
+    );
+}
+
+#[test]
+fn an_oversized_total_canvas_is_refused_before_allocation() {
+    let content = scrozz_annotate::render::raster::to_pixmap(&flat(1, 1, [0, 0, 0, 255])).unwrap();
+    let beauty = Beautification {
+        padding: 10_000.0,
+        background: Background::Solid(Color::WHITE),
+        ..Beautification::default()
+    };
+
+    let error = scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0)
+        .expect_err("a 20,001-square canvas exceeds the raster budget");
+    assert!(
+        error.to_string().contains("pixels"),
+        "the refusal should name the actual limit: {error}"
+    );
+}
+
+#[test]
+fn an_oversized_scaled_render_is_refused_before_output_allocation() {
+    let doc = Document::new(capture_with(flat(1, 1, [0, 0, 0, 255]), Provenance::Region));
+    let error = SkiaRenderer::new()
+        .render_to_width(&doc, 100_000)
+        .expect_err("a ten-billion-pixel output must be refused");
+    assert!(
+        error.to_string().contains("pixels"),
+        "the refusal should name the raster limit: {error}"
+    );
+}
+
+#[test]
+fn comprehensive_canvas_annotation_and_beautification_has_a_stable_fingerprint() {
+    let mut frame = flat(73, 41, [28, 44, 67, 255]);
+    for y in 4..35usize {
+        for x in 45..68usize {
+            let index = (y * 73 + x) * 4;
+            frame.data[index..index + 4].copy_from_slice(&[232, 171, 58, 255]);
+        }
+    }
+    let mut doc = Document::new(capture_with(frame, Provenance::Region));
+    doc.set_canvas(Canvas {
+        crop: Some(rect(3.0, 2.0, 67.0, 37.0)),
+        rotation: CanvasRotation::Clockwise90,
+        flip_horizontal: true,
+        flip_vertical: false,
+        auto_expand: true,
+    })
+    .unwrap();
+    doc.add(
+        Annotation::Rectangle(rect(8.0, 7.0, 22.0, 14.0)),
+        Style::stroked()
+            .with_stroke(Color::rgb(249, 218, 74))
+            .with_stroke_width(3.0),
+    );
+    doc.set_beautification(Some(Beautification {
+        padding: 17.0,
+        corner_radius: 9.0,
+        shadow: 11.0,
+        background: Background::BuiltIn(scrozz_annotate::BuiltInBackground::Iris),
+        auto_balance: true,
+        aspect: AspectPreset::Square,
+        border_width: 2.0,
+        border_color: Color::rgba(255, 255, 255, 180),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(out.width(), out.height());
+    assert_eq!(
+        fnv1a64(&out.data),
+        8_069_223_260_847_174_505,
+        "update only for an intentional visual change"
+    );
 }
 
 #[test]
@@ -664,4 +1004,10 @@ fn column_ink(frame: &Frame, x: u32) -> u32 {
             p[0] < 128 && p[1] < 128 && p[2] < 128
         })
         .count() as u32
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }

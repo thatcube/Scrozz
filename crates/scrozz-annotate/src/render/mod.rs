@@ -5,18 +5,25 @@ pub mod raster;
 pub mod redact;
 pub mod shapes;
 
-use scrozz_core::{Error, Frame, LogicalRect, Result, ScaleFactor};
+use scrozz_core::{
+    ColorSpace, Error, Frame, LogicalPoint, LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize,
+    PixelFormat, Result, ScaleFactor,
+};
+use scrozz_export::{RgbaImage, convert_to_srgb, to_straight_rgba8};
 use tiny_skia::{
     BlendMode, FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Rect, StrokeDash, Transform,
 };
 
 use crate::{
     annotation::{Annotation, AnnotationObject, RedactStyle},
-    document::Document,
+    document::{Beautification, Canvas, Document, MAX_RASTER_PIXELS},
     style::{ArrowStyle, Color, TextPreset},
 };
 
 use shapes::Scaled;
+
+const MAX_RENDER_WORKING_BYTES: u64 = 768 * 1024 * 1024;
+const BYTES_PER_PIXEL: u64 = 4;
 
 /// Renders a document to pixels.
 pub trait Renderer {
@@ -26,6 +33,92 @@ pub trait Renderer {
     ///
     /// Returns an error if rendering failed.
     fn render(&self, document: &Document) -> Result<Frame>;
+}
+
+/// Final raster placement after the reversible inner canvas and outer
+/// beautification have both been resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderGeometry {
+    /// Actual final raster width.
+    pub output_width: u32,
+    /// Actual final raster height.
+    pub output_height: u32,
+    /// The transformed inner canvas inside the final raster.
+    pub content_rect: PhysicalRect,
+    /// Physical pixels per source-logical point.
+    pub scale: ScaleFactor,
+    /// Reversible crop, expansion, flip, and rotation mapping.
+    pub canvas: crate::CanvasGeometry,
+}
+
+/// Effective outer spacing around the inner canvas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicalInsets {
+    /// Pixels above the inner canvas.
+    pub top: f64,
+    /// Pixels to the right of the inner canvas.
+    pub right: f64,
+    /// Pixels below the inner canvas.
+    pub bottom: f64,
+    /// Pixels to the left of the inner canvas.
+    pub left: f64,
+}
+
+impl RenderGeometry {
+    /// Physical offset of the transformed inner canvas.
+    #[must_use]
+    pub const fn content_offset(self) -> PhysicalPoint {
+        self.content_rect.origin
+    }
+
+    /// Final raster size in physical pixels.
+    #[must_use]
+    pub fn output_size(self) -> PhysicalSize {
+        PhysicalSize::new(f64::from(self.output_width), f64::from(self.output_height))
+    }
+
+    /// Effective spacing on each side after integer raster rounding.
+    #[must_use]
+    pub fn effective_insets(self) -> PhysicalInsets {
+        PhysicalInsets {
+            top: self.content_rect.origin.y,
+            right: f64::from(self.output_width)
+                - self.content_rect.origin.x
+                - self.content_rect.size.width,
+            bottom: f64::from(self.output_height)
+                - self.content_rect.origin.y
+                - self.content_rect.size.height,
+            left: self.content_rect.origin.x,
+        }
+    }
+
+    /// Maps source-logical coordinates into final physical output pixels.
+    #[must_use]
+    pub fn source_to_output(self, source: LogicalPoint) -> PhysicalPoint {
+        let inner = self.canvas.source_to_canvas(source);
+        PhysicalPoint::new(
+            self.content_rect.origin.x + inner.x * self.scale.get(),
+            self.content_rect.origin.y + inner.y * self.scale.get(),
+        )
+    }
+
+    /// Maps final physical output pixels back into source-logical coordinates.
+    #[must_use]
+    pub fn output_to_source(self, output: PhysicalPoint) -> LogicalPoint {
+        self.canvas.canvas_to_source(LogicalPoint::new(
+            (output.x - self.content_rect.origin.x) / self.scale.get(),
+            (output.y - self.content_rect.origin.y) / self.scale.get(),
+        ))
+    }
+}
+
+/// A rendered frame paired with the exact geometry used to produce it.
+#[derive(Debug, Clone)]
+pub struct RenderedFrame {
+    /// Flattened output pixels.
+    pub frame: Frame,
+    /// Placement and reversible source mapping for those pixels.
+    pub geometry: RenderGeometry,
 }
 
 /// The `tiny-skia` renderer.
@@ -53,7 +146,20 @@ impl SkiaRenderer {
     /// the output would be zero-sized or unallocatable, or if the document
     /// carries beautification for a window capture — see decision D9.
     pub fn render_at(&self, document: &Document, scale: ScaleFactor) -> Result<Frame> {
-        self.render_geometry_at(document, document.canvas_geometry(), scale)
+        Ok(self.render_at_with_geometry(document, scale)?.frame)
+    }
+
+    /// Renders at `scale` and returns the exact final raster placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render_at`].
+    pub fn render_at_with_geometry(
+        &self,
+        document: &Document,
+        scale: ScaleFactor,
+    ) -> Result<RenderedFrame> {
+        self.render_resolved_at(document, document.canvas_geometry(), scale, None)
     }
 
     /// Composites through a temporary canvas without changing the document.
@@ -66,16 +172,45 @@ impl SkiaRenderer {
     /// Returns the same errors as [`Self::render_at`], plus canvas validation
     /// errors from [`Document::canvas_geometry_for`].
     pub fn render_canvas(&self, document: &Document, canvas: crate::Canvas) -> Result<Frame> {
-        let geometry = document.canvas_geometry_for(canvas)?;
-        self.render_geometry_at(document, geometry, document.source.frame.scale)
+        Ok(self.render_canvas_with_geometry(document, canvas)?.frame)
     }
 
-    fn render_geometry_at(
+    /// Renders a temporary canvas and returns its exact final placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render_canvas`].
+    pub fn render_canvas_with_geometry(
         &self,
         document: &Document,
-        geometry: crate::CanvasGeometry,
+        canvas: crate::Canvas,
+    ) -> Result<RenderedFrame> {
+        self.render_canvas_at_with_geometry(document, canvas, document.source.frame.scale)
+    }
+
+    /// Renders a temporary canvas at an explicit scale with exact placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render_at`], plus canvas validation
+    /// errors from [`Document::canvas_geometry_for`].
+    pub fn render_canvas_at_with_geometry(
+        &self,
+        document: &Document,
+        canvas: crate::Canvas,
         scale: ScaleFactor,
-    ) -> Result<Frame> {
+    ) -> Result<RenderedFrame> {
+        let geometry = document.canvas_geometry_for(canvas)?;
+        self.render_resolved_at(document, geometry, scale, None)
+    }
+
+    fn render_resolved_at(
+        &self,
+        document: &Document,
+        canvas_geometry: crate::CanvasGeometry,
+        scale: ScaleFactor,
+        target_width: Option<u32>,
+    ) -> Result<RenderedFrame> {
         // D9, second gate. `Document::set_beautification` refuses this too, but
         // a document can also arrive from persistence or from a future editing
         // path, and shipping a re-shadowed window capture must be impossible
@@ -85,37 +220,118 @@ impl SkiaRenderer {
                 "beautification is not permitted for window captures (decision D9)".to_owned(),
             ));
         }
-        let source = raster::to_pixmap(&document.source.frame)?;
-        let logical = geometry.output_size();
-        let width = (logical.width * scale.get()).ceil().max(1.0) as u32;
-        let height = (logical.height * scale.get()).ceil().max(1.0) as u32;
+        let edited = !document.annotations().is_empty()
+            || *document.canvas() != Canvas::default()
+            || document
+                .beautification()
+                .is_some_and(|beautification| !beautification.is_noop());
+        let converts_source = edited
+            && matches!(
+                document.source.frame.color_space,
+                ColorSpace::DisplayP3 | ColorSpace::Rec2020
+            );
+        let logical = canvas_geometry.output_size();
+        let mut width = checked_render_dimension(logical.width * scale.get(), "width")?;
+        let height = checked_render_dimension(logical.height * scale.get(), "height")?;
+        if document
+            .beautification()
+            .is_none_or(Beautification::is_noop)
+            && let Some(target_width) = target_width
+        {
+            width = target_width;
+        }
+        let retained_background_bytes = document
+            .beautification()
+            .map_or(Ok(0), retained_background_bytes)?;
+        preflight_render(
+            &document.source.frame,
+            width,
+            height,
+            converts_source,
+            retained_background_bytes,
+        )?;
+
+        let converted_source = if converts_source {
+            Some(frame_to_srgb(&document.source.frame)?)
+        } else {
+            None
+        };
+        let source_frame = converted_source.as_ref().unwrap_or(&document.source.frame);
+        let source = raster::to_pixmap(source_frame)?;
 
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
         })?;
-        let xf = Scaled::for_canvas(scale.get(), geometry);
+        let xf = Scaled::for_canvas(scale.get(), canvas_geometry);
         draw_source(
             &mut canvas,
             &source,
             document.source.frame.scale,
-            geometry.source_crop(),
+            canvas_geometry.source_crop(),
             xf,
         )?;
 
         for object in document.annotations() {
-            draw_object(&mut canvas, object, xf);
+            draw_object(&mut canvas, object, xf, document.redaction_seed());
         }
 
-        let canvas = match document.beautification() {
-            Some(beautification) => beautify::apply(&canvas, beautification, scale.get())?,
-            None => canvas,
+        drop(source);
+        drop(converted_source);
+        let retained_source_bytes =
+            u64::try_from(document.source.frame.data.len()).map_err(|_| {
+                Error::InvalidRequest("source buffer size is not addressable".to_owned())
+            })?;
+        let (canvas, layout) = match document.beautification() {
+            Some(beautification) => beautify::apply_with_layout(
+                &canvas,
+                logical,
+                beautification,
+                scale.get(),
+                retained_source_bytes,
+                target_width,
+            )?,
+            None => (
+                canvas,
+                beautify::ResolvedLayout {
+                    width,
+                    height,
+                    content: PhysicalRect::new(
+                        PhysicalPoint::new(0.0, 0.0),
+                        PhysicalSize::new(f64::from(width), f64::from(height)),
+                    ),
+                },
+            ),
         };
-
-        Ok(raster::from_pixmap(
-            canvas,
-            document.source.frame.color_space,
+        if canvas.width() != layout.width || canvas.height() != layout.height {
+            return Err(Error::InvalidRequest(format!(
+                "resolved output {}x{} did not match rendered output {}x{}",
+                layout.width,
+                layout.height,
+                canvas.width(),
+                canvas.height()
+            )));
+        }
+        if let Some(target_width) = target_width
+            && canvas.width() != target_width
+        {
+            return Err(Error::InvalidRequest(format!(
+                "rendered width is {}, expected {target_width}",
+                canvas.width()
+            )));
+        }
+        let geometry = RenderGeometry {
+            output_width: layout.width,
+            output_height: layout.height,
+            content_rect: layout.content,
             scale,
-        ))
+            canvas: canvas_geometry,
+        };
+        let color_space = output_color_space(document, edited);
+
+        Ok(RenderedFrame {
+            frame: raster::from_pixmap(canvas, color_space, scale),
+            geometry,
+        })
     }
 
     /// Composites the document scaled so its output is `width` pixels wide.
@@ -125,18 +341,44 @@ impl SkiaRenderer {
     /// As [`Self::render_at`], plus [`Error::InvalidRequest`] if `width` is zero
     /// or the source has no width to scale from.
     pub fn render_to_width(&self, document: &Document, width: u32) -> Result<Frame> {
+        Ok(self.render_to_width_with_geometry(document, width)?.frame)
+    }
+
+    /// Scales to an exact final width and returns final raster placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render_to_width`].
+    pub fn render_to_width_with_geometry(
+        &self,
+        document: &Document,
+        width: u32,
+    ) -> Result<RenderedFrame> {
         if width == 0 {
             return Err(Error::InvalidRequest(
                 "export width must be greater than zero".to_owned(),
             ));
         }
-        let logical = document.canvas_size();
-        if logical.width <= 0.0 {
+        let canvas = document.canvas_geometry();
+        let logical_width = document.output_logical_size().width;
+        if logical_width <= 0.0 {
             return Err(Error::InvalidRequest(
                 "cannot scale a source with no width".to_owned(),
             ));
         }
-        self.render_at(document, ScaleFactor::new(f64::from(width) / logical.width))
+        let rendered = self.render_resolved_at(
+            document,
+            canvas,
+            ScaleFactor::new(f64::from(width) / logical_width),
+            Some(width),
+        )?;
+        if rendered.geometry.output_width != width {
+            return Err(Error::InvalidRequest(format!(
+                "requested {width}px output, but raster rounding produced {}px",
+                rendered.geometry.output_width
+            )));
+        }
+        Ok(rendered)
     }
 }
 
@@ -144,6 +386,111 @@ impl Renderer for SkiaRenderer {
     /// Composites at the source's own scale, which is the lossless default.
     fn render(&self, document: &Document) -> Result<Frame> {
         self.render_at(document, document.source.frame.scale)
+    }
+}
+
+fn checked_render_dimension(value: f64, name: &str) -> Result<u32> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return Err(Error::InvalidRequest(format!(
+            "rendered {name} {value} is not addressable"
+        )));
+    }
+    Ok(value.ceil().max(1.0) as u32)
+}
+
+fn preflight_render(
+    source: &Frame,
+    output_width: u32,
+    output_height: u32,
+    converts_source: bool,
+    retained_background_bytes: u64,
+) -> Result<()> {
+    let source_pixels = u64::from(source.width())
+        .checked_mul(u64::from(source.height()))
+        .ok_or_else(|| Error::InvalidRequest("source raster area overflowed".to_owned()))?;
+    let output_pixels = u64::from(output_width)
+        .checked_mul(u64::from(output_height))
+        .ok_or_else(|| Error::InvalidRequest("output raster area overflowed".to_owned()))?;
+    for (label, pixels) in [("source", source_pixels), ("output", output_pixels)] {
+        if pixels > MAX_RASTER_PIXELS {
+            return Err(Error::InvalidRequest(format!(
+                "{label} raster has {pixels} pixels; the limit is {MAX_RASTER_PIXELS}"
+            )));
+        }
+    }
+
+    let source_raster = source_pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| Error::InvalidRequest("source raster size overflowed".to_owned()))?;
+    let output_raster = output_pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| Error::InvalidRequest("output raster size overflowed".to_owned()))?;
+    let retained = u64::try_from(source.data.len())
+        .map_err(|_| Error::InvalidRequest("source buffer size is not addressable".to_owned()))?;
+    let source_copies = if converts_source { 2 } else { 1 };
+    let peak = source_raster
+        .checked_mul(source_copies)
+        .and_then(|bytes| bytes.checked_add(retained))
+        .and_then(|bytes| bytes.checked_add(retained_background_bytes))
+        .and_then(|bytes| bytes.checked_add(output_raster))
+        .ok_or_else(|| Error::InvalidRequest("render working set overflowed".to_owned()))?;
+    if peak > MAX_RENDER_WORKING_BYTES {
+        return Err(Error::InvalidRequest(format!(
+            "render needs about {} MiB of working memory; the limit is {} MiB",
+            peak.div_ceil(1024 * 1024),
+            MAX_RENDER_WORKING_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+fn retained_background_bytes(beautification: &Beautification) -> Result<u64> {
+    let crate::Background::Image(image) = &beautification.background else {
+        return Ok(0);
+    };
+    u64::from(image.width())
+        .checked_mul(u64::from(image.height()))
+        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        .and_then(|bytes| bytes.checked_add(image.encoded_len() as u64))
+        .ok_or_else(|| Error::InvalidRequest("background working set overflowed".to_owned()))
+}
+
+fn frame_to_srgb(frame: &Frame) -> Result<Frame> {
+    let source = to_straight_rgba8(frame)?;
+    let RgbaImage {
+        width,
+        height,
+        data,
+    } = convert_to_srgb(&source, frame.color_space)?;
+    let stride = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(PixelFormat::Rgba8.bytes_per_pixel()))
+        .ok_or_else(|| Error::InvalidRequest("converted source stride overflowed".to_owned()))?;
+    Ok(Frame {
+        data,
+        size: PhysicalSize::new(f64::from(width), f64::from(height)),
+        stride,
+        format: PixelFormat::Rgba8,
+        color_space: ColorSpace::Srgb,
+        scale: frame.scale,
+    })
+}
+
+fn output_color_space(document: &Document, edited: bool) -> ColorSpace {
+    if !edited {
+        return document.source.frame.color_space;
+    }
+    if document.source.frame.color_space == ColorSpace::Unknown
+        || document.beautification().is_some_and(|beautification| {
+            matches!(
+                &beautification.background,
+                crate::Background::Image(image) if image.color_space() == ColorSpace::Unknown
+            )
+        })
+    {
+        ColorSpace::Unknown
+    } else {
+        ColorSpace::Srgb
     }
 }
 
@@ -203,7 +550,7 @@ fn draw_source(
 /// Redactions are handled in z-order like everything else, and destroy whatever
 /// has been composited beneath them — including earlier annotations. That is the
 /// stricter reading and the safer one: a redaction always erases what it covers.
-fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
+fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, redaction_seed: u64) {
     let opacity = object.style.effective_opacity();
     if opacity <= 0.0 {
         return;
@@ -361,7 +708,12 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             match style {
                 RedactStyle::Blur => redact::blur_with_strength(canvas, region, strength),
                 RedactStyle::Pixelate => {
-                    redact::pixelate_with_strength(canvas, region, strength);
+                    redact::pixelate_with_strength_and_seed(
+                        canvas,
+                        region,
+                        strength,
+                        mix_redaction_seed(redaction_seed, object.id.0),
+                    );
                 }
                 RedactStyle::Solid => {
                     let color = object
@@ -375,6 +727,17 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             }
         }
     }
+}
+
+fn mix_redaction_seed(document_seed: u64, annotation_id: u64) -> u64 {
+    splitmix64(document_seed ^ annotation_id.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn draw_shape_shadow(

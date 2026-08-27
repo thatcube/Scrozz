@@ -112,6 +112,33 @@ fn canvas_mapping_round_trips_every_quarter_turn_and_flip() {
 }
 
 #[test]
+fn canvas_rejects_disjoint_crop_and_clamps_partial_overlap() {
+    let mut doc = document(200, 120);
+    let original = *doc.canvas();
+    let disjoint = Canvas {
+        crop: Some(rect(250.0, 200.0, 40.0, 30.0)),
+        ..Canvas::default()
+    };
+    assert!(doc.set_canvas(disjoint).is_err());
+    assert_eq!(
+        *doc.canvas(),
+        original,
+        "a rejected crop must not mutate state"
+    );
+
+    doc.set_canvas(Canvas {
+        crop: Some(rect(180.0, 100.0, 50.0, 40.0)),
+        ..Canvas::default()
+    })
+    .unwrap();
+    assert_eq!(
+        doc.canvas().crop,
+        Some(rect(180.0, 100.0, 20.0, 20.0)),
+        "partly overlapping crops are clamped rather than exposing the full source"
+    );
+}
+
+#[test]
 fn undo_and_redo_restore_only_editable_snapshots() {
     let mut doc = document(120, 80);
     let source = doc.source.frame.data.clone();
@@ -134,6 +161,25 @@ fn undo_and_redo_restore_only_editable_snapshots() {
     doc.remove(id);
     history.checkpoint(&doc);
     assert!(!history.can_redo(), "a divergent edit clears redo");
+}
+
+#[test]
+fn undo_never_reuses_an_exposed_annotation_id() {
+    let mut doc = document(120, 80);
+    let mut history = UndoHistory::new(&doc);
+    let first = doc.add_default(Annotation::Rectangle(rect(5.0, 5.0, 10.0, 10.0)));
+    history.checkpoint(&doc);
+    let undone = doc.add_default(Annotation::Rectangle(rect(20.0, 5.0, 10.0, 10.0)));
+    history.checkpoint(&doc);
+
+    assert!(history.undo(&mut doc).unwrap());
+    let replacement = doc.add_default(Annotation::Rectangle(rect(35.0, 5.0, 10.0, 10.0)));
+
+    assert_ne!(replacement, first);
+    assert_ne!(
+        replacement, undone,
+        "undo must not roll the allocator below its lifetime high-water mark"
+    );
 }
 
 #[test]
@@ -340,6 +386,35 @@ fn visual_bounds_covers_the_stroke_and_geometric_bounds_does_not() {
     assert!(
         object.visual_bounds().size.width > 40.0,
         "a 10pt stroke paints outside the geometry it outlines"
+    );
+}
+
+#[test]
+fn curved_arrow_visual_bounds_include_bezier_extrema_for_auto_expand() {
+    let mut doc = document(200, 70);
+    let mut style = Style::stroked().with_stroke_width(4.0);
+    style.arrow_style = scrozz_annotate::ArrowStyle::Curved;
+    let id = doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(20.0, 60.0),
+            to: LogicalPoint::new(180.0, 60.0),
+        },
+        style,
+    );
+    doc.set_canvas(Canvas {
+        auto_expand: true,
+        ..Canvas::default()
+    })
+    .unwrap();
+
+    let visual = doc.get(id).unwrap().visual_bounds();
+    assert!(
+        visual.origin.y + visual.size.height > 78.0,
+        "the curve's interior extremum must extend beyond its endpoint box"
+    );
+    assert!(
+        doc.canvas_geometry().source_bounds().size.height > 78.0,
+        "auto-expand must retain the painted curve"
     );
 }
 

@@ -124,6 +124,27 @@ pub fn quadratic_point(
     )
 }
 
+/// Tight axis-aligned bounds of a quadratic Bézier.
+#[must_use]
+pub fn quadratic_bounds(
+    from: LogicalPoint,
+    control: LogicalPoint,
+    to: LogicalPoint,
+) -> LogicalRect {
+    let mut points = vec![from, to];
+    for (start, middle, end) in [(from.x, control.x, to.x), (from.y, control.y, to.y)] {
+        let denominator = start - 2.0 * middle + end;
+        if denominator.abs() <= f64::EPSILON {
+            continue;
+        }
+        let t = (start - middle) / denominator;
+        if (0.0..1.0).contains(&t) {
+            points.push(quadratic_point(from, control, to, t));
+        }
+    }
+    bounding_box(&points)
+}
+
 /// Distance from `point` to a quadratic Bézier, sampled deterministically.
 ///
 /// Thirty-two straight segments are well below a pixel apart for the editor's

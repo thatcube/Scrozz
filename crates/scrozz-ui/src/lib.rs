@@ -92,7 +92,9 @@ pub mod theme;
 pub mod vibrancy;
 
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
-pub use editor::{AnnotationEditor, EditorDragRequest, EditorEvent, EditorMode, EditorTool};
+pub use editor::{
+    AnnotationEditor, EditorDestination, EditorDragRequest, EditorEvent, EditorMode, EditorTool,
+};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,

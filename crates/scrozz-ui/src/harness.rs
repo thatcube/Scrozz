@@ -261,6 +261,8 @@ pub enum Scenario {
     EditorAnnotating,
     /// The non-destructive crop workspace over the same capture.
     EditorCropping,
+    /// The share-framing workspace with a resolved outer canvas.
+    EditorBeautifying,
 }
 
 impl Scenario {
@@ -278,6 +280,7 @@ impl Scenario {
             Self::DockCollapsed,
             Self::EditorAnnotating,
             Self::EditorCropping,
+            Self::EditorBeautifying,
         ]
     }
 
@@ -298,6 +301,7 @@ impl Scenario {
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
             Self::EditorCropping => "editor-cropping",
+            Self::EditorBeautifying => "editor-beautifying",
         }
     }
 
@@ -758,6 +762,16 @@ impl Fixture {
                     true,
                     "Frame it without flattening",
                     "Crop, rotate, flip, and auto-expand remain reversible because the source capture is never rewritten.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorBeautifying => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Frame the final image",
+                    "Padding, aspect, alignment, background, border, and shadow live outside the reversible source canvas.",
                     instants::REST,
                     None,
                 ),
@@ -1897,6 +1911,10 @@ impl SceneRegistry {
         me.register(
             Scenario::EditorCropping,
             Box::new(crate::editor::EditorScene::cropping()),
+        );
+        me.register(
+            Scenario::EditorBeautifying,
+            Box::new(crate::editor::EditorScene::beautifying()),
         );
         me
     }
@@ -3403,7 +3421,7 @@ fn render_label_strip(
 /// What happened when an image was compared against its baseline.
 #[derive(Debug)]
 pub enum GoldenOutcome {
-    /// No baseline existed; one was written. Review it before committing.
+    /// No baseline existed and explicit update mode wrote it.
     Created(PathBuf),
     /// A baseline existed and was overwritten because updating was requested.
     Updated(PathBuf),
@@ -3540,6 +3558,19 @@ impl GoldenStore {
         let path = self.path_for(name);
 
         if !path.exists() {
+            if !self.update {
+                std::fs::create_dir_all(&self.failures)?;
+                let actual_path = self.failures.join(format!("{name}.actual.png"));
+                image.write_png(&actual_path)?;
+                return Err(Error::InvalidRequest(format!(
+                    "golden baseline is missing: {}\n\
+                     rendered output was written to {}\n\
+                     create baselines only through explicit update mode: \
+                     UPDATE_SNAPSHOTS=1 cargo test -p scrozz-ui --test golden",
+                    path.display(),
+                    actual_path.display()
+                )));
+            }
             std::fs::create_dir_all(&self.dir)?;
             image.write_png(&path)?;
             return Ok(GoldenOutcome::Created(path));
@@ -3587,13 +3618,7 @@ impl GoldenStore {
     pub fn assert(&self, name: &str, image: &Image) -> Result<()> {
         match self.compare(name, image)? {
             GoldenOutcome::Matched | GoldenOutcome::Updated(_) => Ok(()),
-            GoldenOutcome::Created(path) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "created a new golden baseline; review it before committing"
-                );
-                Ok(())
-            }
+            GoldenOutcome::Created(_) => Ok(()),
             GoldenOutcome::Mismatched(failure) => Err(Error::InvalidRequest(failure.to_string())),
         }
     }
@@ -3678,6 +3703,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
         Scenario::EditorCropping,
+        Scenario::EditorBeautifying,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

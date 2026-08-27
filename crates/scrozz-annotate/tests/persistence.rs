@@ -7,10 +7,10 @@ mod common;
 
 use common::{document, every_annotation, rect, region_capture, window_capture};
 use scrozz_annotate::{
-    Annotation, ArrowStyle, Background, Beautification, Canvas, CanvasRotation, Color, Document,
-    DocumentData, RedactStyle, Style, TextPreset,
+    Alignment, Annotation, ArrowStyle, AspectPreset, Background, BackgroundImage, Beautification,
+    Canvas, CanvasRotation, Color, Document, DocumentData, RedactStyle, Style, TextPreset,
 };
-use scrozz_core::LogicalPoint;
+use scrozz_core::{ColorSpace, LogicalPoint};
 
 #[test]
 fn round_trip_preserves_every_annotation_exactly() {
@@ -124,6 +124,18 @@ fn round_trip_preserves_every_redaction_style() {
 }
 
 #[test]
+fn round_trip_preserves_secure_pixelation_seed() {
+    let doc = document(100, 100);
+    let data = doc.data();
+    assert_ne!(data.redaction_seed, 0);
+
+    let json = serde_json::to_string(&data).unwrap();
+    let loaded: DocumentData = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded.redaction_seed, data.redaction_seed);
+    assert_eq!(loaded.version, DocumentData::VERSION);
+}
+
+#[test]
 fn round_trip_preserves_beautification() {
     let mut doc = document(200, 200);
     doc.set_beautification(Some(Beautification {
@@ -134,6 +146,11 @@ fn round_trip_preserves_beautification() {
             start: Color::rgb(240, 120, 40),
             end: Color::rgb(30, 40, 160),
         },
+        alignment: Alignment::BottomRight,
+        auto_balance: true,
+        aspect: AspectPreset::Portrait,
+        border_width: 2.5,
+        border_color: Color::rgba(255, 255, 255, 170),
     }))
     .expect("region captures may be beautified");
 
@@ -144,6 +161,10 @@ fn round_trip_preserves_beautification() {
     let b = restored.beautification().expect("beautification survives");
     assert!((b.padding - 48.5).abs() < 1e-9);
     assert!((b.corner_radius - 12.25).abs() < 1e-9);
+    assert_eq!(b.alignment, Alignment::BottomRight);
+    assert!(b.auto_balance);
+    assert_eq!(b.aspect, AspectPreset::Portrait);
+    assert!((b.border_width - 2.5).abs() < 1e-9);
     assert_eq!(
         b.background,
         Background::Gradient {
@@ -151,6 +172,135 @@ fn round_trip_preserves_beautification() {
             end: Color::rgb(30, 40, 160),
         }
     );
+}
+
+#[test]
+fn custom_background_pixels_survive_the_invisible_sidecar() {
+    let image = BackgroundImage::new(
+        2,
+        2,
+        vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 255, 255, 255, 0,
+        ],
+        ColorSpace::DisplayP3,
+    )
+    .unwrap();
+    let mut doc = document(20, 20);
+    doc.set_beautification(Some(Beautification {
+        padding: 10.0,
+        background: Background::Image(image.clone()),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let json = serde_json::to_vec(&doc.data()).unwrap();
+    let encoded = std::str::from_utf8(&json).unwrap();
+    assert!(encoded.contains("\"pixels_png\":"));
+    assert!(
+        !encoded.contains("\"pixels\":["),
+        "current sidecars must not materialize one JSON value per image byte"
+    );
+    let data: DocumentData = serde_json::from_slice(&json).unwrap();
+    let restored = Document::from_data(region_capture(20, 20), data).unwrap();
+    assert_eq!(
+        restored.beautification().unwrap().background,
+        Background::Image(image)
+    );
+}
+
+#[test]
+fn legacy_raw_background_pixels_migrate_to_compact_png_storage() {
+    let json = r#"{
+        "version": 1,
+        "annotations": [],
+        "beautification": {
+            "padding": 1.0,
+            "corner_radius": 0.0,
+            "shadow": 0.0,
+            "background": {
+                "image": {
+                    "width": 1,
+                    "height": 1,
+                    "pixels": [10, 20, 30, 255],
+                    "color_space": "Srgb"
+                }
+            }
+        },
+        "next_id": 1
+    }"#;
+    let data: DocumentData = serde_json::from_str(json).unwrap();
+    let restored = Document::from_data(region_capture(1, 1), data).unwrap();
+    let migrated = serde_json::to_string(&restored.data()).unwrap();
+    assert!(migrated.contains("\"version\":3"));
+    assert!(migrated.contains("\"pixels_png\":"));
+    assert!(!migrated.contains("\"pixels\":["));
+}
+
+#[test]
+fn custom_background_area_is_bounded_before_buffer_validation() {
+    let error = BackgroundImage::new(5_000, 5_000, Vec::new(), ColorSpace::Srgb)
+        .expect_err("25 million background pixels exceed the embedded-image limit");
+    assert!(error.to_string().contains("pixels"));
+}
+
+#[test]
+fn legacy_beautification_without_new_fields_uses_safe_defaults() {
+    let json = r#"{
+        "version": 1,
+        "annotations": [],
+        "beautification": {
+            "padding": 12.0,
+            "corner_radius": 4.0,
+            "shadow": 0.0,
+            "background": "transparent"
+        },
+        "next_id": 1
+    }"#;
+    let data: DocumentData = serde_json::from_str(json).unwrap();
+    let beauty = data.beautification.as_ref().unwrap();
+    assert_eq!(beauty.alignment, Alignment::Center);
+    assert_eq!(beauty.aspect, AspectPreset::Original);
+    assert!(!beauty.auto_balance);
+    assert_eq!(beauty.border_width, 0.0);
+    assert_eq!(beauty.border_color, Color::TRANSPARENT);
+    let restored = Document::from_data(region_capture(20, 20), data).unwrap();
+    assert_eq!(
+        restored.data().version,
+        DocumentData::VERSION,
+        "saving a migrated v1 sidecar must write the current version"
+    );
+}
+
+#[test]
+fn expanded_canvas_and_beautification_write_document_v3() {
+    assert_eq!(
+        DocumentData::VERSION,
+        3,
+        "the union of the two experimental v2 formats must use an unambiguous version"
+    );
+}
+
+#[test]
+fn malformed_custom_background_is_refused_on_rehydrate() {
+    let json = r#"{
+        "version": 1,
+        "annotations": [],
+        "beautification": {
+            "padding": 10.0,
+            "corner_radius": 0.0,
+            "shadow": 0.0,
+            "background": {
+                "image": {
+                    "width": 40,
+                    "height": 40,
+                    "pixels": [0, 0, 0, 0, 0, 0, 0],
+                    "color_space": "Srgb"
+                }
+            }
+        },
+        "next_id": 1
+    }"#;
+    assert!(serde_json::from_str::<DocumentData>(json).is_err());
 }
 
 #[test]
@@ -179,7 +329,7 @@ fn a_v1_document_migrates_with_canvas_and_style_defaults() {
     let legacy: DocumentData = serde_json::from_value(value).unwrap();
     let restored = Document::from_data(region_capture(100, 80), legacy).unwrap();
     let migrated = restored.data();
-    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.version, DocumentData::VERSION);
     assert_eq!(migrated.canvas, Canvas::default());
     assert_eq!(
         migrated.annotations[0].style.arrow_style,

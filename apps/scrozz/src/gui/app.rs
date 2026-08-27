@@ -33,6 +33,8 @@ use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
 };
+use scrozz_store::CaptureId;
+use scrozz_ui::EditorDestination;
 
 use crate::{
     cli::Cli,
@@ -186,10 +188,53 @@ pub enum Tick {
 /// A worker-loaded document ready to become a deferred editor viewport.
 #[derive(Debug)]
 pub struct EditorRequest {
-    /// The card whose Annotate action opened the document.
-    pub card: crate::gui::card::CardId,
+    /// Durable identity shared by card and history entry points.
+    pub capture: CaptureId,
     /// Source pixels and every persisted non-destructive edit.
     pub document: Document,
+}
+
+/// A revision-correlated worker result for an open editor.
+#[derive(Debug)]
+pub enum EditorResult {
+    /// The exact snapshot is durable.
+    Saved {
+        /// Durable capture identity.
+        capture: CaptureId,
+        /// Acknowledged revision.
+        revision: u64,
+    },
+    /// The snapshot remains dirty and may be retried.
+    SaveFailed {
+        /// Durable capture identity.
+        capture: CaptureId,
+        /// Failed revision.
+        revision: u64,
+        /// User-visible failure detail.
+        error: String,
+    },
+    /// The exact snapshot was persisted and delivered.
+    Exported {
+        /// Durable capture identity.
+        capture: CaptureId,
+        /// Acknowledged revision.
+        revision: u64,
+        /// Destination that completed.
+        destination: EditorDestination,
+        /// User-visible terminal result.
+        detail: String,
+    },
+    /// Persistence, rendering, or destination delivery failed.
+    ExportFailed {
+        /// Durable capture identity.
+        capture: CaptureId,
+        /// Revision that remains retryable.
+        revision: u64,
+        /// Destination that failed.
+        destination: EditorDestination,
+        /// User-visible failure detail.
+        error: String,
+    },
 }
 
 /// The running application.
@@ -204,6 +249,7 @@ pub struct App {
     captures: u64,
     notes: Vec<String>,
     editor_requests: VecDeque<EditorRequest>,
+    editor_results: VecDeque<EditorResult>,
 }
 
 impl App {
@@ -285,6 +331,7 @@ impl App {
             captures: 0,
             notes,
             editor_requests: VecDeque::new(),
+            editor_results: VecDeque::new(),
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -416,12 +463,54 @@ impl App {
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
-                Outcome::EditorLoaded { card, document } => {
+                Outcome::EditorLoaded { capture, document } => {
+                    let label = capture.0.clone();
                     self.editor_requests.push_back(EditorRequest {
-                        card,
+                        capture,
                         document: *document,
                     });
-                    self.note(format!("{card} opened for annotation"));
+                    self.note(format!("{label} opened for annotation"));
+                }
+                Outcome::EditsSaved { capture, revision } => {
+                    self.editor_results
+                        .push_back(EditorResult::Saved { capture, revision });
+                }
+                Outcome::EditsSaveFailed {
+                    capture,
+                    revision,
+                    error,
+                } => {
+                    self.editor_results.push_back(EditorResult::SaveFailed {
+                        capture,
+                        revision,
+                        error: error.to_string(),
+                    });
+                }
+                Outcome::EditsExported {
+                    capture,
+                    revision,
+                    destination,
+                    detail,
+                } => {
+                    self.editor_results.push_back(EditorResult::Exported {
+                        capture,
+                        revision,
+                        destination,
+                        detail,
+                    });
+                }
+                Outcome::EditsExportFailed {
+                    capture,
+                    revision,
+                    destination,
+                    error,
+                } => {
+                    self.editor_results.push_back(EditorResult::ExportFailed {
+                        capture,
+                        revision,
+                        destination,
+                        error: error.to_string(),
+                    });
                 }
             }
         }
@@ -526,10 +615,48 @@ impl App {
     }
 
     /// Persists the latest editor state on the worker-owned store connection.
-    pub fn persist_editor(&mut self, card: crate::gui::card::CardId, data: DocumentData) {
-        if !self.pipeline.post(Job::SaveEdits { card, data }) {
+    pub fn persist_editor(
+        &mut self,
+        capture: CaptureId,
+        revision: u64,
+        data: DocumentData,
+    ) -> bool {
+        if !self.pipeline.post(Job::PersistEdits {
+            capture,
+            revision,
+            data,
+        }) {
             self.note("the capture worker has gone; annotation edits were not saved");
+            false
+        } else {
+            true
         }
+    }
+
+    /// Persists, renders, and delivers one exact editor revision.
+    pub fn export_editor(
+        &mut self,
+        capture: CaptureId,
+        revision: u64,
+        data: DocumentData,
+        destination: EditorDestination,
+    ) -> bool {
+        if !self.pipeline.post(Job::ExportEdits {
+            capture,
+            revision,
+            data,
+            destination,
+        }) {
+            self.note("the capture worker has gone; the edited image was not exported");
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Takes revision-correlated editor persistence results.
+    pub fn drain_editor_results(&mut self) -> Vec<EditorResult> {
+        self.editor_results.drain(..).collect()
     }
 
     /// How many cards are on screen.

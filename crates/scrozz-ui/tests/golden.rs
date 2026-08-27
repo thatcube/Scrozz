@@ -420,9 +420,9 @@ fn a_mismatch_writes_a_legible_triptych() {
     // observe a mismatch. Without the override, anyone re-baselining the real
     // corpus turns this test into a no-op that still reports "ok" — a test
     // whose result depends on an unrelated ambient variable.
-    let store = GoldenStore::new(scratch.path().join("golden"))
+    let updating = GoldenStore::new(scratch.path().join("golden"))
         .with_failures_dir(scratch.path().join("failures"))
-        .with_update(false);
+        .with_update(true);
 
     let early = r
         .render(&RenderSpec::golden(
@@ -438,11 +438,12 @@ fn a_mismatch_writes_a_legible_triptych() {
         .expect("late");
 
     // Seed a baseline, then hand it a genuinely different picture.
-    match store.compare("triptych-case", &early).expect("create") {
+    match updating.compare("triptych-case", &early).expect("create") {
         GoldenOutcome::Created(p) => assert!(p.exists(), "baseline was not written"),
         other => panic!("expected a created baseline, got {other:?}"),
     }
 
+    let store = updating.with_update(false);
     let outcome = store.compare("triptych-case", &late).expect("compare");
     let GoldenOutcome::Mismatched(failure) = outcome else {
         panic!("a different picture did not fail the comparison");
@@ -480,6 +481,30 @@ fn a_mismatch_writes_a_legible_triptych() {
             "the failure message omits `{needle}`:\n{text}"
         );
     }
+}
+
+#[test]
+fn a_missing_baseline_fails_without_explicit_update_mode() {
+    let scratch = Scratch::new("missing-baseline");
+    let store = GoldenStore::new(scratch.path().join("golden"))
+        .with_failures_dir(scratch.path().join("failures"))
+        .with_update(false);
+    let image = Image::transparent(12, 8);
+
+    let error = store
+        .compare("must-be-committed", &image)
+        .expect_err("a normal check must never create a baseline");
+    let message = error.to_string();
+    assert!(message.contains("baseline is missing"), "{message}");
+    assert!(message.contains("UPDATE_SNAPSHOTS=1"), "{message}");
+    assert!(!store.path_for("must-be-committed").exists());
+    assert!(
+        store
+            .failures_dir()
+            .join("must-be-committed.actual.png")
+            .exists(),
+        "the rendered image should remain inspectable"
+    );
 }
 
 /// Differently sized images must not panic, and must not silently pass.
@@ -720,9 +745,8 @@ fn the_plans_are_well_formed() {
 
 /// The one that fails when somebody moves a rectangle.
 ///
-/// On a first run this writes every baseline and passes; that is deliberate, so
-/// a fresh clone is not blocked by files it has no way to produce. The baselines
-/// are committed, so on every subsequent run this is a real comparison.
+/// Missing baselines are failures. Creating or replacing one always requires
+/// explicit update mode followed by human review.
 #[test]
 fn golden_corpus_matches_baselines() {
     let r = renderer();

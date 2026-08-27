@@ -14,13 +14,16 @@ use egui::{
     Stroke, StrokeKind, TextureHandle, TextureId, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use scrozz_annotate::{
-    Annotation, AnnotationId, ArrowStyle, Canvas, CanvasRotation, Color, Document, DocumentData,
-    RedactStyle, Renderer, SkiaRenderer, Style, TextPreset, UndoHistory,
+    Alignment, Annotation, AnnotationId, ArrowStyle, AspectPreset, Background, BackgroundImage,
+    Beautification, BeautificationPreset, BuiltInBackground, Canvas, CanvasRotation, Color,
+    Document, DocumentData, RedactStyle, RenderGeometry, SkiaRenderer, Style, TextPreset,
+    UndoHistory,
 };
 use scrozz_core::{
-    Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
-    PhysicalSize, PixelFormat, Provenance, ScaleFactor,
+    Capture, CaptureTarget, ColorSpace, Error, Frame, LogicalPoint, LogicalRect, LogicalSize,
+    PhysicalPoint, PhysicalSize, PixelFormat, Provenance, Result, ScaleFactor,
 };
+use scrozz_export::to_straight_rgba8;
 use std::sync::{Arc, Mutex};
 
 const TOP_BAR_HEIGHT: f32 = 62.0;
@@ -37,6 +40,8 @@ pub enum EditorMode {
     Compose,
     /// Adjust non-destructive crop, rotation, flips, and expansion.
     Crop,
+    /// Frame the transformed canvas for sharing without changing source pixels.
+    Beautify,
 }
 
 impl EditorMode {
@@ -44,6 +49,25 @@ impl EditorMode {
         match self {
             Self::Compose => "Compose",
             Self::Crop => "Crop",
+            Self::Beautify => "Beautify",
+        }
+    }
+}
+
+/// Where an editor image export should be delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorDestination {
+    /// Copy a destination-compatible representation to the clipboard.
+    Clipboard,
+    /// Write a destination-compatible image to the configured/default folder.
+    DefaultFolder,
+}
+
+impl EditorDestination {
+    const fn progress(self) -> &'static str {
+        match self {
+            Self::Clipboard => "Copying image…",
+            Self::DefaultFolder => "Saving image…",
         }
     }
 }
@@ -139,6 +163,24 @@ impl EditorTool {
     const fn is_redaction(self) -> bool {
         matches!(self, Self::Blur | Self::Pixelate | Self::SolidRedact)
     }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Select => 0,
+            Self::Arrow => 1,
+            Self::Line => 2,
+            Self::Rectangle => 3,
+            Self::Ellipse => 4,
+            Self::Freehand => 5,
+            Self::Text => 6,
+            Self::Counter => 7,
+            Self::Highlight => 8,
+            Self::Spotlight => 9,
+            Self::Blur => 10,
+            Self::Pixelate => 11,
+            Self::SolidRedact => 12,
+        }
+    }
 }
 
 /// An event emitted by an editor surface.
@@ -150,6 +192,13 @@ pub enum EditorEvent {
     Save(DocumentData),
     /// The user wants to drag the rendered result into another application.
     DragRequested(EditorDragRequest),
+    /// Render and deliver the exact current snapshot to a named destination.
+    ExportRequested {
+        /// Destination selected by the user.
+        destination: EditorDestination,
+        /// The snapshot that must be persisted and rendered transactionally.
+        data: DocumentData,
+    },
     /// The viewport should close.
     CloseRequested,
 }
@@ -169,21 +218,30 @@ pub struct EditorDragRequest {
 struct Placement {
     rect: Rect,
     scale: f32,
+    geometry: RenderGeometry,
 }
 
 impl Placement {
-    fn canvas_to_screen(self, point: LogicalPoint) -> Pos2 {
+    fn output_to_screen(self, point: PhysicalPoint) -> Pos2 {
         pos2(
             self.rect.left() + point.x as f32 * self.scale,
             self.rect.top() + point.y as f32 * self.scale,
         )
     }
 
-    fn screen_to_canvas(self, point: Pos2) -> LogicalPoint {
-        LogicalPoint::new(
+    fn screen_to_output(self, point: Pos2) -> PhysicalPoint {
+        PhysicalPoint::new(
             f64::from((point.x - self.rect.left()) / self.scale),
             f64::from((point.y - self.rect.top()) / self.scale),
         )
+    }
+
+    fn source_to_screen(self, point: LogicalPoint) -> Pos2 {
+        self.output_to_screen(self.geometry.source_to_output(point))
+    }
+
+    fn screen_to_source(self, point: Pos2) -> LogicalPoint {
+        self.geometry.output_to_source(self.screen_to_output(point))
     }
 }
 
@@ -204,12 +262,15 @@ enum Gesture {
     },
     Move {
         id: AnnotationId,
-        last: LogicalPoint,
+        original: LogicalRect,
+        start: LogicalPoint,
+        current: LogicalPoint,
     },
     Resize {
         id: AnnotationId,
         handle: ResizeHandle,
         original: LogicalRect,
+        current: LogicalPoint,
     },
     Crop {
         start: LogicalPoint,
@@ -225,16 +286,23 @@ pub struct AnnotationEditor {
     mode: EditorMode,
     tool: EditorTool,
     selected: Option<AnnotationId>,
-    working_style: Style,
+    working_styles: [Style; EditorTool::ALL.len()],
     zoom: f32,
     gesture: Option<Gesture>,
     events: Vec<EditorEvent>,
     texture: Option<TextureHandle>,
     rendered: Option<(DocumentData, EditorMode)>,
+    render_geometry: Option<RenderGeometry>,
     render_error: Option<String>,
     notice: Option<String>,
+    save_pending: bool,
+    save_error: Option<String>,
+    export_pending: Option<EditorDestination>,
+    export_notice: Option<String>,
+    export_error: Option<String>,
     close_sent: bool,
     interactive: bool,
+    layer_focus: bool,
 }
 
 impl std::fmt::Debug for AnnotationEditor {
@@ -260,16 +328,23 @@ impl AnnotationEditor {
             mode: EditorMode::Compose,
             tool: EditorTool::Select,
             selected: None,
-            working_style: Style::stroked(),
+            working_styles: default_working_styles(),
             zoom: 1.0,
             gesture: None,
             events: Vec::new(),
             texture: None,
             rendered: None,
+            render_geometry: None,
             render_error: None,
             notice: None,
+            save_pending: false,
+            save_error: None,
+            export_pending: None,
+            export_notice: None,
+            export_error: None,
             close_sent: false,
             interactive: true,
+            layer_focus: false,
         }
     }
 
@@ -290,6 +365,49 @@ impl AnnotationEditor {
         self.notice = Some(notice.into());
     }
 
+    /// Shows that the latest revision is waiting for durable acknowledgement.
+    pub fn mark_save_pending(&mut self) {
+        self.save_pending = true;
+        self.save_error = None;
+        self.notice = Some("Saving changes…".to_owned());
+    }
+
+    /// Shows that the latest revision is durable.
+    pub fn mark_save_succeeded(&mut self) {
+        self.save_pending = false;
+        self.save_error = None;
+        self.notice = Some("Changes saved.".to_owned());
+    }
+
+    /// Keeps the editor retryable after queue or store failure.
+    pub fn mark_save_failed(&mut self, error: impl Into<String>) {
+        self.save_pending = false;
+        let error = error.into();
+        self.notice = Some(format!("Save failed: {error}. Select Retry to try again."));
+        self.save_error = Some(error);
+    }
+
+    /// Shows that a destination export is waiting for its terminal outcome.
+    pub fn mark_export_pending(&mut self, destination: EditorDestination) {
+        self.export_pending = Some(destination);
+        self.export_notice = None;
+        self.export_error = None;
+    }
+
+    /// Re-enables destination actions and keeps their terminal success visible.
+    pub fn mark_export_succeeded(&mut self, detail: impl Into<String>) {
+        self.export_pending = None;
+        self.export_error = None;
+        self.export_notice = Some(detail.into());
+    }
+
+    /// Re-enables destination actions and surfaces a retryable terminal failure.
+    pub fn mark_export_failed(&mut self, error: impl Into<String>) {
+        self.export_pending = None;
+        self.export_notice = None;
+        self.export_error = Some(error.into());
+    }
+
     /// Current workspace.
     #[must_use]
     pub const fn mode(&self) -> EditorMode {
@@ -300,6 +418,7 @@ impl AnnotationEditor {
     pub fn set_mode(&mut self, mode: EditorMode) {
         self.mode = mode;
         self.gesture = None;
+        self.layer_focus = false;
     }
 
     /// Current compose tool.
@@ -372,17 +491,35 @@ impl AnnotationEditor {
         if !self.interactive {
             return;
         }
-        let (undo, redo, save, delete, escape) = ui.input(|input| {
-            (
-                input.modifiers.command
-                    && !input.modifiers.shift
-                    && input.key_pressed(egui::Key::Z),
-                input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::Z),
-                input.modifiers.command && input.key_pressed(egui::Key::S),
-                input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace),
-                input.key_pressed(egui::Key::Escape),
-            )
-        });
+        let text_edit_focused = ui.ctx().text_edit_focused();
+        let focused = ui.memory(|memory| memory.focused());
+        let canvas_focused = focused == Some(Id::new("annotation-canvas"));
+        let (undo, redo, save, delete, escape, previous, next, arrow, modifiers) =
+            ui.input(|input| {
+                let arrow = [
+                    egui::Key::ArrowLeft,
+                    egui::Key::ArrowRight,
+                    egui::Key::ArrowUp,
+                    egui::Key::ArrowDown,
+                ]
+                .into_iter()
+                .find(|key| input.key_pressed(*key));
+                (
+                    input.modifiers.command
+                        && !input.modifiers.shift
+                        && input.key_pressed(egui::Key::Z),
+                    input.modifiers.command
+                        && input.modifiers.shift
+                        && input.key_pressed(egui::Key::Z),
+                    input.modifiers.command && input.key_pressed(egui::Key::S),
+                    input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace),
+                    input.key_pressed(egui::Key::Escape),
+                    input.modifiers.command && input.key_pressed(egui::Key::OpenBracket),
+                    input.modifiers.command && input.key_pressed(egui::Key::CloseBracket),
+                    arrow,
+                    input.modifiers,
+                )
+            });
         if undo {
             self.undo();
         } else if redo {
@@ -391,8 +528,27 @@ impl AnnotationEditor {
         if save {
             self.events.push(EditorEvent::Save(self.document.data()));
         }
-        if delete {
+        if delete && !text_edit_focused {
             self.delete_selected();
+        }
+        if previous && !text_edit_focused {
+            self.cycle_selection(false);
+        } else if next && !text_edit_focused {
+            self.cycle_selection(true);
+        }
+        if let Some(key) = arrow
+            && !text_edit_focused
+            && (canvas_focused || self.layer_focus)
+        {
+            let amount = if modifiers.shift { 10.0 } else { 1.0 };
+            let (dx, dy) = match key {
+                egui::Key::ArrowLeft => (-amount, 0.0),
+                egui::Key::ArrowRight => (amount, 0.0),
+                egui::Key::ArrowUp => (0.0, -amount),
+                egui::Key::ArrowDown => (0.0, amount),
+                _ => (0.0, 0.0),
+            };
+            self.keyboard_adjust_selected(dx, dy, modifiers.alt);
         }
         if escape {
             self.selected = None;
@@ -422,8 +578,18 @@ impl AnnotationEditor {
         );
 
         let mut x = rect.left() + 92.0;
-        for mode in [EditorMode::Compose, EditorMode::Crop] {
-            let button = Rect::from_min_size(pos2(x, rect.center().y - 17.0), vec2(72.0, 34.0));
+        for mode in [
+            EditorMode::Compose,
+            EditorMode::Crop,
+            EditorMode::Beautify,
+        ] {
+            let width = if mode == EditorMode::Beautify {
+                78.0
+            } else {
+                72.0
+            };
+            let button =
+                Rect::from_min_size(pos2(x, rect.center().y - 17.0), vec2(width, 34.0));
             if text_button(
                 ui,
                 surface,
@@ -437,7 +603,7 @@ impl AnnotationEditor {
             {
                 self.set_mode(mode);
             }
-            x += 74.0;
+            x += width + 2.0;
         }
 
         paint::divider_v(
@@ -488,31 +654,35 @@ impl AnnotationEditor {
         );
         x += Space::LG;
 
-        if self.mode == EditorMode::Compose {
-            for tool in EditorTool::ALL {
-                let button =
-                    Rect::from_min_size(pos2(x, rect.center().y - 18.0), Vec2::splat(CONTROL_SIZE));
-                let response = paint::icon_button(
-                    ui,
-                    surface,
-                    button,
-                    Id::new(("editor-tool", tool.label())),
-                    tool.icon(),
-                    tool.label(),
-                    ControlState {
-                        enabled: self.interactive,
-                        ..ControlState::new().selected(self.tool == tool)
-                    },
-                    Reveal::SHOWN,
-                )
-                .on_hover_text(tool.label());
-                if response.clicked() {
-                    self.set_tool(tool);
+        match self.mode {
+            EditorMode::Compose => {
+                for tool in EditorTool::ALL {
+                    let button = Rect::from_min_size(
+                        pos2(x, rect.center().y - 18.0),
+                        Vec2::splat(CONTROL_SIZE),
+                    );
+                    let response = paint::icon_button(
+                        ui,
+                        surface,
+                        button,
+                        Id::new(("editor-tool", tool.label())),
+                        tool.icon(),
+                        tool.label(),
+                        ControlState {
+                            enabled: self.interactive,
+                            ..ControlState::new().selected(self.tool == tool)
+                        },
+                        Reveal::SHOWN,
+                    )
+                    .on_hover_text(tool.label());
+                    if response.clicked() {
+                        self.set_tool(tool);
+                    }
+                    x += CONTROL_SIZE + Space::XS;
                 }
-                x += CONTROL_SIZE + Space::XS;
             }
-        } else {
-            self.paint_crop_actions(ui, surface, rect, x);
+            EditorMode::Crop => self.paint_crop_actions(ui, surface, rect, x),
+            EditorMode::Beautify => {}
         }
     }
 
@@ -580,10 +750,10 @@ impl AnnotationEditor {
             .id_salt("editor-inspector-scroll")
             .auto_shrink([false, false])
             .show(&mut child, |ui| {
-                if self.mode == EditorMode::Crop {
-                    self.crop_inspector(ui, surface);
-                } else {
-                    self.style_inspector(ui, surface);
+                match self.mode {
+                    EditorMode::Compose => self.style_inspector(ui, surface),
+                    EditorMode::Crop => self.crop_inspector(ui, surface),
+                    EditorMode::Beautify => self.beautify_inspector(ui, surface),
                 }
             });
     }
@@ -644,6 +814,198 @@ impl AnnotationEditor {
         helper_text(ui, surface, &transform);
     }
 
+    fn beautify_inspector(&mut self, ui: &mut Ui, surface: &Surface<'_>) {
+        section_title(ui, surface, "Framing bench");
+        helper_text(
+            ui,
+            surface,
+            "Add sharing canvas around the transformed image. Source pixels stay untouched.",
+        );
+        ui.add_space(Space::LG);
+
+        if !self.document.may_beautify() {
+            beautification_refusal(ui, surface);
+            return;
+        }
+
+        let mut config = self.document.beautification().cloned().unwrap_or_default();
+        let before = config.clone();
+
+        section_title(ui, surface, "Starting point");
+        ui.add_space(Space::XS);
+        for (label, value) in [
+            ("None", Beautification::default()),
+            (
+                "Clean",
+                Beautification::preset(BeautificationPreset::Clean),
+            ),
+            (
+                "Social",
+                Beautification::preset(BeautificationPreset::Social),
+            ),
+            (
+                "Story",
+                Beautification::preset(BeautificationPreset::Story),
+            ),
+            (
+                "Editorial",
+                Beautification::preset(BeautificationPreset::Editorial),
+            ),
+        ] {
+            if compact_choice(
+                ui,
+                surface,
+                Id::new(("beautification-preset", label)),
+                label,
+                !beautification_changed(&config, &value),
+                self.interactive,
+            ) {
+                config = value;
+            }
+        }
+        ui.add_space(Space::LG);
+
+        section_title(ui, surface, "Background");
+        ui.add_space(Space::SM);
+        let backgrounds = [
+            BuiltInBackground::Mist,
+            BuiltInBackground::Iris,
+            BuiltInBackground::Midnight,
+            BuiltInBackground::Sunrise,
+            BuiltInBackground::Lagoon,
+            BuiltInBackground::Sand,
+        ];
+        let start = ui.cursor().min;
+        for (index, background) in backgrounds.into_iter().enumerate() {
+            let column = index % 2;
+            let row = index / 2;
+            let rect = Rect::from_min_size(
+                pos2(
+                    start.x + column as f32 * 92.0,
+                    start.y + row as f32 * 34.0,
+                ),
+                vec2(86.0, 28.0),
+            );
+            if background_choice(
+                ui,
+                surface,
+                rect,
+                background,
+                config.background == Background::BuiltIn(background),
+                self.interactive,
+            )
+            .clicked()
+            {
+                config.background = Background::BuiltIn(background);
+            }
+        }
+        ui.add_space(104.0);
+        for (label, background) in [
+            ("Transparent", Background::Transparent),
+            ("Solid color", Background::Solid(Color::rgb(25, 29, 38))),
+        ] {
+            if compact_choice(
+                ui,
+                surface,
+                Id::new(("beautification-background", label)),
+                label,
+                std::mem::discriminant(&config.background)
+                    == std::mem::discriminant(&background),
+                self.interactive,
+            ) {
+                config.background = background;
+            }
+        }
+        if let Background::Solid(color) = &mut config.background {
+            let mut picked = to_egui(*color);
+            ui.horizontal(|ui| {
+                helper_text(ui, surface, "Fill color");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.color_edit_button_srgba(&mut picked).changed() && self.interactive {
+                        let [r, g, b, a] = picked.to_array();
+                        *color = Color::rgba(r, g, b, a);
+                    }
+                });
+            });
+            ui.add_space(Space::SM);
+        }
+        custom_background_drop(
+            ui,
+            surface,
+            &mut config,
+            &mut self.notice,
+            self.interactive,
+        );
+        ui.add_space(Space::LG);
+
+        section_title(ui, surface, "Canvas");
+        ui.add_space(Space::SM);
+        beauty_slider(ui, "Padding", &mut config.padding, 0.0..=220.0);
+        egui::ComboBox::from_id_salt("beautification-aspect")
+            .selected_text(aspect_label(config.aspect))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for aspect in [
+                    AspectPreset::Original,
+                    AspectPreset::Square,
+                    AspectPreset::Portrait,
+                    AspectPreset::Story,
+                    AspectPreset::Landscape,
+                    AspectPreset::Wide,
+                ] {
+                    ui.selectable_value(&mut config.aspect, aspect, aspect_label(aspect));
+                }
+            });
+        ui.add_space(Space::MD);
+        helper_text(ui, surface, "Placement");
+        ui.add_space(Space::XS);
+        alignment_matrix(ui, surface, &mut config.alignment, self.interactive);
+        ui.add_space(Space::MD);
+        let mut auto_balance = config.auto_balance;
+        if toggle_row(
+            ui,
+            surface,
+            "Visual balance",
+            "Keep at least 35% padding",
+            &mut auto_balance,
+            self.interactive,
+        ) {
+            config.auto_balance = auto_balance;
+        }
+        ui.add_space(Space::LG);
+
+        section_title(ui, surface, "Finish");
+        ui.add_space(Space::SM);
+        beauty_slider(
+            ui,
+            "Corner radius",
+            &mut config.corner_radius,
+            0.0..=80.0,
+        );
+        beauty_slider(ui, "Shadow", &mut config.shadow, 0.0..=80.0);
+        beauty_slider(ui, "Border", &mut config.border_width, 0.0..=12.0);
+        if config.border_width > 0.0 {
+            let mut picked = to_egui(config.border_color);
+            ui.horizontal(|ui| {
+                helper_text(ui, surface, "Border color");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.color_edit_button_srgba(&mut picked).changed() && self.interactive {
+                        let [r, g, b, a] = picked.to_array();
+                        config.border_color = Color::rgba(r, g, b, a);
+                    }
+                });
+            });
+        }
+
+        if self.interactive && beautification_changed(&before, &config) {
+            let beautification = (!config.is_noop()).then_some(config);
+            match self.document.set_beautification(beautification) {
+                Ok(()) => self.checkpoint(),
+                Err(error) => self.notice = Some(format!("Framing failed: {error}")),
+            }
+        }
+    }
+
     fn style_inspector(&mut self, ui: &mut Ui, surface: &Surface<'_>) {
         let selected = self.selected.and_then(|id| self.document.get(id)).cloned();
         let kind = selected.as_ref().map(|object| object.kind());
@@ -662,6 +1024,9 @@ impl AnnotationEditor {
         } else {
             helper_text(ui, surface, "New objects use these settings");
         }
+        ui.add_space(Space::LG);
+
+        self.layer_list(ui, surface);
         ui.add_space(Space::LG);
 
         section_title(ui, surface, "Color");
@@ -691,9 +1056,11 @@ impl AnnotationEditor {
                     kind,
                     Some(
                         scrozz_annotate::AnnotationKind::Highlight
+                            | scrozz_annotate::AnnotationKind::Spotlight
                             | scrozz_annotate::AnnotationKind::Redact
                     )
                 ) || self.tool == EditorTool::Highlight
+                    || self.tool == EditorTool::Spotlight
                     || self.tool.is_redaction()
                 {
                     style.fill = Some(color);
@@ -882,9 +1249,66 @@ impl AnnotationEditor {
                     self.checkpoint();
                 }
             } else {
-                self.working_style = style;
+                self.working_styles[self.tool.index()] = style;
             }
         }
+    }
+
+    fn layer_list(&mut self, ui: &mut Ui, surface: &Surface<'_>) {
+        section_title(ui, surface, "Layers");
+        ui.add_space(Space::XS);
+        if self.document.is_empty() {
+            helper_text(ui, surface, "Draw an object to add a layer.");
+            return;
+        }
+
+        let layers = self
+            .document
+            .annotations()
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, object)| {
+                (
+                    object.id,
+                    layer_label(object, index + 1, self.document.len()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut chosen = None;
+        let mut layer_focus = false;
+        let list = ui.vertical(|ui| {
+            for (id, label) in &layers {
+                let selected = self.selected == Some(*id);
+                let response =
+                    ui.add_enabled(self.interactive, egui::Button::selectable(selected, label));
+                response.ctx.accesskit_node_builder(response.id, |node| {
+                    node.set_role(egui::accesskit::Role::ListItem);
+                    node.set_label(label.as_str());
+                    node.set_selected(selected);
+                });
+                layer_focus |= response.has_focus();
+                if response.clicked() {
+                    chosen = Some(*id);
+                }
+            }
+        });
+        list.response
+            .ctx
+            .accesskit_node_builder(list.response.id, |node| {
+                node.set_role(egui::accesskit::Role::List);
+                node.set_label("Annotation layers");
+            });
+        if let Some(id) = chosen {
+            self.selected = Some(id);
+            self.tool = EditorTool::Select;
+        }
+        self.layer_focus = layer_focus;
+        helper_text(
+            ui,
+            surface,
+            "Tab to a layer; arrows move, Option+arrows resize.",
+        );
     }
 
     fn paint_workspace(&mut self, ui: &mut Ui, surface: &Surface<'_>, rect: Rect) {
@@ -897,7 +1321,7 @@ impl AnnotationEditor {
         ui.painter().rect_filled(rect, 0.0, mat);
         paint_precision_grid(ui.painter(), rect, palette);
 
-        let Some(texture) = self.ensure_texture(ui.ctx()) else {
+        let Some((texture, geometry)) = self.ensure_texture(ui.ctx()) else {
             let message = self
                 .render_error
                 .as_deref()
@@ -912,7 +1336,7 @@ impl AnnotationEditor {
             return;
         };
 
-        let placement = self.placement(rect);
+        let placement = self.placement(rect, geometry);
         paint::soft_shadow(ui.painter(), placement.rect, Radius::CHIP, palette, 0.85);
         ui.painter().image(
             texture,
@@ -927,14 +1351,16 @@ impl AnnotationEditor {
             StrokeKind::Inside,
         );
 
-        if self.mode == EditorMode::Crop {
-            self.paint_crop_overlay(ui, surface, placement);
-        } else {
-            self.paint_selection(ui, surface, placement);
-            self.paint_creation_preview(ui, surface, placement);
+        match self.mode {
+            EditorMode::Compose => {
+                self.paint_selection(ui, surface, placement);
+                self.paint_creation_preview(ui, surface, placement);
+            }
+            EditorMode::Crop => self.paint_crop_overlay(ui, surface, placement),
+            EditorMode::Beautify => {}
         }
 
-        if self.interactive {
+        if self.interactive && self.mode != EditorMode::Beautify {
             let response = ui
                 .interact(
                     placement.rect,
@@ -1016,11 +1442,13 @@ impl AnnotationEditor {
         let Some(object) = self.selected.and_then(|id| self.document.get(id)) else {
             return;
         };
-        let rect = self.source_rect_to_screen(object.bounds(), placement);
+        let bounds = self.gesture_bounds(object.id, object.bounds());
+        let handles = self.selection_handle_points(bounds, placement);
+        let rect = Rect::from_points(&handles.map(|(_, point)| point));
         let painter = ui.painter();
         let stroke = Stroke::new(1.5, surface.palette().accent_hi);
         painter.rect_stroke(rect, 2.0, stroke, StrokeKind::Outside);
-        for (_, point) in handle_points(rect) {
+        for (_, point) in handles {
             painter.circle_filled(point, 5.0, surface.palette().card_fill_raised);
             painter.circle_stroke(point, 5.0, Stroke::new(2.0, surface.palette().accent_hi));
         }
@@ -1035,9 +1463,8 @@ impl AnnotationEditor {
         else {
             return;
         };
-        let geometry = self.workspace_geometry();
-        let to_screen = |point| placement.canvas_to_screen(geometry.source_to_canvas(point));
-        let stroke = Stroke::new(2.0, to_egui(self.working_style.stroke));
+        let to_screen = |point| placement.source_to_screen(point);
+        let stroke = Stroke::new(2.0, to_egui(self.default_style_for_tool().stroke));
         match self.tool {
             EditorTool::Arrow | EditorTool::Line => {
                 ui.painter()
@@ -1059,11 +1486,7 @@ impl AnnotationEditor {
     }
 
     fn handle_canvas_response(&mut self, response: &Response, placement: Placement) {
-        let geometry = self.workspace_geometry();
-        let pointer_source = |position: Pos2| {
-            let canvas = placement.screen_to_canvas(position);
-            geometry.canvas_to_source(canvas)
-        };
+        let pointer_source = |position: Pos2| placement.screen_to_source(position);
 
         if response.drag_started()
             && let Some(origin) = response.ctx.input(|input| input.pointer.press_origin())
@@ -1098,19 +1521,8 @@ impl AnnotationEditor {
                         points.push(source);
                     }
                 }
-                Some(Gesture::Move { id, last }) => {
-                    let dx = source.x - last.x;
-                    let dy = source.y - last.y;
-                    self.document.translate(*id, dx, dy);
-                    *last = source;
-                }
-                Some(Gesture::Resize {
-                    id,
-                    handle,
-                    original,
-                }) => {
-                    let bounds = resized_rect(*original, *handle, source);
-                    self.document.set_bounds(*id, bounds);
+                Some(Gesture::Move { current, .. }) | Some(Gesture::Resize { current, .. }) => {
+                    *current = source
                 }
                 Some(Gesture::Crop { current, .. }) => *current = source,
                 None => {}
@@ -1130,8 +1542,8 @@ impl AnnotationEditor {
         if let Some(id) = self.selected
             && let Some(object) = self.document.get(id)
         {
-            let screen_bounds = self.source_rect_to_screen(object.bounds(), placement);
-            if let Some(handle) = handle_points(screen_bounds)
+            if let Some(handle) = self
+                .selection_handle_points(object.bounds(), placement)
                 .into_iter()
                 .find(|(_, point)| point.distance(pointer) <= 9.0)
                 .map(|(handle, _)| handle)
@@ -1140,17 +1552,25 @@ impl AnnotationEditor {
                     id,
                     handle,
                     original: object.bounds(),
+                    current: source,
                 });
                 return;
             }
         }
         self.selected = self.document.hit_test(source);
-        self.gesture = self.selected.map(|id| Gesture::Move { id, last: source });
+        self.gesture = self.selected.and_then(|id| {
+            self.document.get(id).map(|object| Gesture::Move {
+                id,
+                original: object.bounds(),
+                start: source,
+                current: source,
+            })
+        });
     }
 
     fn handle_canvas_click(&mut self, source: LogicalPoint) {
         match self.mode {
-            EditorMode::Crop => {}
+            EditorMode::Crop | EditorMode::Beautify => {}
             EditorMode::Compose => match self.tool {
                 EditorTool::Select => self.selected = self.document.hit_test(source),
                 EditorTool::Text => {
@@ -1197,7 +1617,32 @@ impl AnnotationEditor {
                     self.checkpoint();
                 }
             }
-            Gesture::Move { .. } | Gesture::Resize { .. } => self.checkpoint(),
+            Gesture::Move {
+                id,
+                original,
+                start,
+                current,
+            } => {
+                let dx = current.x - start.x;
+                let dy = current.y - start.y;
+                if dx != 0.0 || dy != 0.0 {
+                    self.document
+                        .set_bounds(id, translated_rect(original, dx, dy));
+                    self.checkpoint();
+                }
+            }
+            Gesture::Resize {
+                id,
+                handle,
+                original,
+                current,
+            } => {
+                let bounds = resized_rect(original, handle, current);
+                if bounds != original {
+                    self.document.set_bounds(id, bounds);
+                    self.checkpoint();
+                }
+            }
             Gesture::Crop { start, current } => {
                 let mut crop = normalized_rect(start, current);
                 crop = clamp_rect(crop, self.document.logical_bounds());
@@ -1255,18 +1700,31 @@ impl AnnotationEditor {
             .rect_filled(rect, 0.0, palette.card_fill_raised);
         paint::divider_h(ui.painter(), rect.left(), rect.right(), rect.top(), palette);
 
-        let status = self.notice.clone().unwrap_or_else(|| match self.mode {
-            EditorMode::Compose => {
-                format!("{} objects · {}", self.document.len(), self.tool.label())
+        let status = if let Some(destination) = self.export_pending {
+            destination.progress().to_owned()
+        } else if let Some(error) = &self.export_error {
+            format!("Export failed: {error}")
+        } else if let Some(notice) = &self.export_notice {
+            notice.clone()
+        } else if let Some(notice) = &self.notice {
+            notice.clone()
+        } else {
+            match self.mode {
+                EditorMode::Compose => {
+                    format!("{} objects · {}", self.document.len(), self.tool.label())
+                }
+                EditorMode::Crop => {
+                    let size = self.document.canvas_size();
+                    format!(
+                        "{:.0} × {:.0} pt · non-destructive",
+                        size.width, size.height
+                    )
+                }
+                EditorMode::Beautify => {
+                    "Framing preview · source unchanged".to_owned()
+                }
             }
-            EditorMode::Crop => {
-                let size = self.document.canvas_size();
-                format!(
-                    "{:.0} × {:.0} pt · non-destructive",
-                    size.width, size.height
-                )
-            }
-        });
+        };
         ui.painter().text(
             pos2(rect.left() + Space::LG, rect.center().y),
             Align2::LEFT_CENTER,
@@ -1276,7 +1734,7 @@ impl AnnotationEditor {
         );
 
         let zoom_area = Rect::from_center_size(
-            pos2(rect.center().x - 35.0, rect.center().y),
+            pos2(rect.center().x - 135.0, rect.center().y),
             vec2(190.0, 32.0),
         );
         if text_button(
@@ -1341,16 +1799,23 @@ impl AnnotationEditor {
             pos2(rect.right() - 96.0, rect.center().y - 18.0),
             vec2(80.0, 36.0),
         );
+        let save_label = if self.save_error.is_some() {
+            "Retry"
+        } else if self.save_pending {
+            "Saving"
+        } else {
+            "Save"
+        };
         if paint::pill_button_with_state(
             ui,
             surface,
             save,
             Id::new("editor-save"),
             Icon::DeviceFloppy,
-            "Save",
+            save_label,
             true,
             ControlState {
-                enabled: self.interactive,
+                enabled: self.interactive && !self.save_pending,
                 ..ControlState::new()
             },
             Reveal::SHOWN,
@@ -1383,7 +1848,13 @@ impl AnnotationEditor {
         if response.drag_started()
             && let Some(pointer) = response.interact_pointer_pos()
         {
-            let canvas = self.document.canvas_size();
+            let canvas = self
+                .render_geometry
+                .map(RenderGeometry::output_size)
+                .unwrap_or_else(|| {
+                    let logical = self.document.canvas_size();
+                    PhysicalSize::new(logical.width, logical.height)
+                });
             let scale = 240.0 / canvas.width.max(canvas.height).max(1.0);
             let preview_size = vec2(
                 (canvas.width * scale).max(1.0) as f32,
@@ -1400,10 +1871,69 @@ impl AnnotationEditor {
                     pointer: LogicalPoint::new(f64::from(pointer.x), f64::from(pointer.y)),
                 }));
         }
+
+        let export_enabled = self.interactive && self.export_pending.is_none();
+        let save_image = Rect::from_min_size(
+            pos2(drag.left() - 136.0, rect.center().y - 18.0),
+            vec2(124.0, 36.0),
+        );
+        if paint::pill_button_with_state(
+            ui,
+            surface,
+            save_image,
+            Id::new("editor-save-image"),
+            Icon::DeviceFloppy,
+            "Save image",
+            false,
+            ControlState {
+                enabled: export_enabled,
+                ..ControlState::new()
+            },
+            Reveal::SHOWN,
+        )
+        .on_hover_text("Export the edited image to the default folder")
+        .clicked()
+        {
+            let destination = EditorDestination::DefaultFolder;
+            self.mark_export_pending(destination);
+            self.events.push(EditorEvent::ExportRequested {
+                destination,
+                data: self.document.data(),
+            });
+        }
+
+        let copy_image = Rect::from_min_size(
+            pos2(save_image.left() - 100.0, rect.center().y - 18.0),
+            vec2(88.0, 36.0),
+        );
+        if paint::pill_button_with_state(
+            ui,
+            surface,
+            copy_image,
+            Id::new("editor-copy-image"),
+            Icon::Copy,
+            "Copy",
+            false,
+            ControlState {
+                enabled: export_enabled,
+                ..ControlState::new()
+            },
+            Reveal::SHOWN,
+        )
+        .on_hover_text("Copy the edited image")
+        .clicked()
+        {
+            let destination = EditorDestination::Clipboard;
+            self.mark_export_pending(destination);
+            self.events.push(EditorEvent::ExportRequested {
+                destination,
+                data: self.document.data(),
+            });
+        }
     }
 
-    fn placement(&self, workspace: Rect) -> Placement {
-        let size = self.workspace_geometry().output_size();
+    fn placement(&self, workspace: Rect, geometry: RenderGeometry) -> Placement {
+        let size = geometry.output_size();
         let available = workspace.shrink2(vec2(44.0, 34.0));
         let fit = (available.width() / size.width.max(1.0) as f32)
             .min(available.height() / size.height.max(1.0) as f32);
@@ -1412,49 +1942,85 @@ impl AnnotationEditor {
         Placement {
             rect: Rect::from_center_size(workspace.center(), image_size),
             scale,
+            geometry,
         }
     }
 
     fn source_rect_to_screen(&self, rect: LogicalRect, placement: Placement) -> Rect {
-        let geometry = self.workspace_geometry();
-        let points = source_corners(rect)
-            .map(|point| placement.canvas_to_screen(geometry.source_to_canvas(point)));
+        let points = source_corners(rect).map(|point| placement.source_to_screen(point));
         Rect::from_points(&points)
     }
 
-    fn ensure_texture(&mut self, ctx: &egui::Context) -> Option<TextureId> {
+    fn selection_handle_points(
+        &self,
+        rect: LogicalRect,
+        placement: Placement,
+    ) -> [(ResizeHandle, Pos2); 4] {
+        source_handle_points(rect)
+            .map(|(handle, point)| (handle, placement.source_to_screen(point)))
+    }
+
+    fn ensure_texture(&mut self, ctx: &egui::Context) -> Option<(TextureId, RenderGeometry)> {
         let data = self.document.data();
         let key = (data, self.mode);
         if self.rendered.as_ref() != Some(&key) {
             let renderer = SkiaRenderer::new();
             let rendered = match self.mode {
-                EditorMode::Compose => renderer.render(&self.document),
-                EditorMode::Crop => renderer.render_canvas(&self.document, self.workspace_canvas()),
+                EditorMode::Compose | EditorMode::Beautify => renderer
+                    .render_at_with_geometry(&self.document, self.document.source.frame.scale),
+                EditorMode::Crop => {
+                    renderer.render_canvas_with_geometry(&self.document, self.workspace_canvas())
+                }
             };
             match rendered {
-                Ok(frame) => {
-                    let image = frame_to_image(&frame);
+                Ok(rendered_frame) => {
+                    let image = frame_to_image(&rendered_frame.frame);
                     self.texture = Some(ctx.load_texture(
                         "annotation-editor-canvas",
                         image,
                         TextureOptions::LINEAR,
                     ));
+                    self.render_geometry = Some(rendered_frame.geometry);
                     self.rendered = Some(key);
                     self.render_error = None;
                 }
                 Err(error) => {
                     self.texture = None;
                     self.rendered = None;
+                    self.render_geometry = None;
                     self.render_error = Some(error.to_string());
                 }
             }
         }
-        self.texture.as_ref().map(TextureHandle::id)
+        self.texture
+            .as_ref()
+            .zip(self.render_geometry)
+            .map(|(texture, geometry)| (texture.id(), geometry))
+    }
+
+    fn gesture_bounds(&self, id: AnnotationId, fallback: LogicalRect) -> LogicalRect {
+        match self.gesture.as_ref() {
+            Some(Gesture::Move {
+                id: moving,
+                original,
+                start,
+                current,
+            }) if *moving == id => {
+                translated_rect(*original, current.x - start.x, current.y - start.y)
+            }
+            Some(Gesture::Resize {
+                id: resizing,
+                handle,
+                original,
+                current,
+            }) if *resizing == id => resized_rect(*original, *handle, *current),
+            _ => fallback,
+        }
     }
 
     fn workspace_canvas(&self) -> Canvas {
         match self.mode {
-            EditorMode::Compose => *self.document.canvas(),
+            EditorMode::Compose | EditorMode::Beautify => *self.document.canvas(),
             EditorMode::Crop => Canvas {
                 crop: None,
                 ..*self.document.canvas()
@@ -1469,19 +2035,7 @@ impl AnnotationEditor {
     }
 
     fn default_style_for_tool(&self) -> Style {
-        match self.tool {
-            EditorTool::Highlight => Style {
-                stroke: self.working_style.stroke,
-                fill: Some(self.working_style.stroke.scaled_alpha(0.7)),
-                ..Style::highlighter()
-            },
-            EditorTool::Spotlight => Style::spotlight(),
-            tool if tool.is_redaction() => Style {
-                redact_strength: self.working_style.redact_strength,
-                ..Style::redaction()
-            },
-            _ => self.working_style,
-        }
+        self.working_styles[self.tool.index()]
     }
 
     fn checkpoint(&mut self) {
@@ -1517,6 +2071,55 @@ impl AnnotationEditor {
         if let Some(id) = self.selected.take()
             && self.document.remove(id).is_some()
         {
+            self.checkpoint();
+        }
+    }
+
+    fn cycle_selection(&mut self, forward: bool) {
+        let objects = self.document.annotations();
+        if objects.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let current = self
+            .selected
+            .and_then(|id| objects.iter().position(|object| object.id == id));
+        let index = match (current, forward) {
+            (Some(index), true) => (index + 1) % objects.len(),
+            (Some(0), false) | (None, false) => objects.len() - 1,
+            (Some(index), false) => index - 1,
+            (None, true) => 0,
+        };
+        self.selected = Some(objects[index].id);
+        self.tool = EditorTool::Select;
+    }
+
+    fn keyboard_adjust_selected(&mut self, dx: f64, dy: f64, resize: bool) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let changed = if resize {
+            let Some(object) = self.document.get(id).cloned() else {
+                return;
+            };
+            match object.annotation {
+                Annotation::Text { .. } | Annotation::Counter { .. } => {
+                    let mut style = object.style;
+                    let delta = if dx != 0.0 { dx } else { dy };
+                    style.font_size = (style.effective_font_size() + delta).max(1.0);
+                    self.document.set_style(id, style)
+                }
+                _ => {
+                    let mut bounds = object.bounds();
+                    bounds.size.width = (bounds.size.width + dx).max(1.0);
+                    bounds.size.height = (bounds.size.height + dy).max(1.0);
+                    self.document.set_bounds(id, bounds)
+                }
+            }
+        } else {
+            self.document.translate(id, dx, dy)
+        };
+        if changed {
             self.checkpoint();
         }
     }
@@ -1689,6 +2292,319 @@ fn toggle_row(
     response.clicked()
 }
 
+fn beauty_slider(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(
+                egui::Slider::new(value, range)
+                    .suffix(" pt")
+                    .fixed_decimals(0),
+            );
+        });
+    });
+    ui.add_space(Space::SM);
+}
+
+fn aspect_label(aspect: AspectPreset) -> &'static str {
+    match aspect {
+        AspectPreset::Original => "Original canvas",
+        AspectPreset::Square => "Square · 1:1",
+        AspectPreset::Portrait => "Portrait · 4:5",
+        AspectPreset::Story => "Story · 9:16",
+        AspectPreset::Landscape => "Landscape · 16:9",
+        AspectPreset::Wide => "Header · 3:1",
+    }
+}
+
+fn built_in_label(background: BuiltInBackground) -> &'static str {
+    match background {
+        BuiltInBackground::Mist => "Mist",
+        BuiltInBackground::Iris => "Iris",
+        BuiltInBackground::Midnight => "Midnight",
+        BuiltInBackground::Sunrise => "Sunrise",
+        BuiltInBackground::Lagoon => "Lagoon",
+        BuiltInBackground::Sand => "Sand",
+    }
+}
+
+fn built_in_swatch(background: BuiltInBackground) -> Color32 {
+    match background {
+        BuiltInBackground::Mist => Color32::from_rgb(201, 211, 224),
+        BuiltInBackground::Iris => Color32::from_rgb(126, 105, 224),
+        BuiltInBackground::Midnight => Color32::from_rgb(25, 43, 72),
+        BuiltInBackground::Sunrise => Color32::from_rgb(239, 159, 150),
+        BuiltInBackground::Lagoon => Color32::from_rgb(51, 154, 166),
+        BuiltInBackground::Sand => Color32::from_rgb(213, 193, 166),
+    }
+}
+
+fn background_choice(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    background: BuiltInBackground,
+    selected: bool,
+    enabled: bool,
+) -> Response {
+    let response = ui.interact(
+        rect,
+        Id::new(("beautification-built-in", built_in_label(background))),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let palette = surface.palette();
+    let fill = if selected {
+        palette.accent.gamma_multiply(0.18)
+    } else if response.hovered() && enabled {
+        palette.hover
+    } else {
+        palette.chip_fill
+    };
+    ui.painter()
+        .rect_filled(rect, corner(Radius::BUTTON), fill);
+    ui.painter().rect_stroke(
+        rect,
+        corner(Radius::BUTTON),
+        Stroke::new(
+            if selected { 2.0 } else { 1.0 },
+            if selected {
+                palette.accent
+            } else {
+                palette.hairline
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    ui.painter().circle_filled(
+        pos2(rect.left() + 13.0, rect.center().y),
+        5.0,
+        built_in_swatch(background),
+    );
+    ui.painter().text(
+        pos2(rect.left() + 24.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        built_in_label(background),
+        surface.font(Text::Caption),
+        palette.text,
+    );
+    response
+}
+
+fn alignment_matrix(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    alignment: &mut Alignment,
+    enabled: bool,
+) {
+    let size = 72.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, corner(Radius::BUTTON), surface.palette().chip_fill);
+    ui.painter().rect_stroke(
+        rect,
+        corner(Radius::BUTTON),
+        Stroke::new(1.0, surface.palette().hairline),
+        StrokeKind::Inside,
+    );
+    let choices = [
+        Alignment::TopLeft,
+        Alignment::Top,
+        Alignment::TopRight,
+        Alignment::Left,
+        Alignment::Center,
+        Alignment::Right,
+        Alignment::BottomLeft,
+        Alignment::Bottom,
+        Alignment::BottomRight,
+    ];
+    let cell = size / 3.0;
+    for (index, choice) in choices.into_iter().enumerate() {
+        let center = pos2(
+            rect.left() + cell * (index % 3) as f32 + cell / 2.0,
+            rect.top() + cell * (index / 3) as f32 + cell / 2.0,
+        );
+        let hit = Rect::from_center_size(center, Vec2::splat(cell));
+        let cell_response = ui.interact(
+            hit,
+            response.id.with(index),
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        if cell_response.clicked() {
+            *alignment = choice;
+        }
+        ui.painter().circle_filled(
+            center,
+            if *alignment == choice { 5.0 } else { 2.5 },
+            if *alignment == choice {
+                surface.palette().accent
+            } else {
+                surface.palette().text_muted
+            },
+        );
+    }
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Group);
+        node.set_label("Image placement");
+    });
+}
+
+fn custom_background_drop(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    config: &mut Beautification,
+    notice: &mut Option<String>,
+    enabled: bool,
+) {
+    let hovering = enabled && ui.input(|input| !input.raw.hovered_files.is_empty());
+    let frame = egui::Frame::new()
+        .fill(if hovering {
+            surface.palette().accent.gamma_multiply(0.14)
+        } else {
+            surface.palette().chip_fill
+        })
+        .corner_radius(corner(Radius::BUTTON))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .stroke(Stroke::new(
+            if hovering { 2.0 } else { 1.0 },
+            if hovering {
+                surface.palette().accent
+            } else {
+                surface.palette().hairline
+            },
+        ));
+    let response = frame
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        if matches!(config.background, Background::Image(_)) {
+                            "CUSTOM"
+                        } else {
+                            "DROP"
+                        },
+                    )
+                    .font(surface.font(Text::Caption))
+                    .color(surface.palette().accent)
+                    .strong(),
+                );
+                helper_text(ui, surface, "PNG, JPEG, or WebP");
+            });
+        })
+        .response
+        .on_hover_cursor(CursorIcon::Copy);
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Group);
+        node.set_label("Drop a PNG, JPEG, or WebP custom background");
+    });
+
+    if !enabled {
+        return;
+    }
+    let dropped = ui.input(|input| input.raw.dropped_files.first().cloned());
+    let Some(file) = dropped else {
+        return;
+    };
+    match file
+        .bytes()
+        .map_err(Error::Codec)
+        .and_then(|bytes| background_from_bytes(&bytes))
+    {
+        Ok(image) => {
+            config.background = Background::Image(image);
+            *notice = Some(format!(
+                "Loaded custom background {}.",
+                file.path().file_name().map_or_else(
+                    || "image".to_owned(),
+                    |name| name.to_string_lossy().into_owned()
+                )
+            ));
+        }
+        Err(error) => *notice = Some(format!("Background failed: {error}")),
+    }
+}
+
+fn background_from_bytes(bytes: &[u8]) -> Result<BackgroundImage> {
+    let frame = scrozz_export::decode(bytes)?;
+    let image = to_straight_rgba8(&frame)?;
+    BackgroundImage::new(image.width, image.height, image.data, frame.color_space)
+}
+
+fn beautification_changed(before: &Beautification, after: &Beautification) -> bool {
+    match (&before.background, &after.background) {
+        (Background::Image(before_image), Background::Image(after_image)) => {
+            let background_changed = before_image.width() != after_image.width()
+                || before_image.height() != after_image.height()
+                || before_image.color_space() != after_image.color_space()
+                || !std::ptr::eq(before_image.pixels(), after_image.pixels());
+            if background_changed {
+                return true;
+            }
+            let mut before = before.clone();
+            let mut after = after.clone();
+            before.background = Background::Transparent;
+            after.background = Background::Transparent;
+            before != after
+        }
+        _ => before != after,
+    }
+}
+
+fn beautification_refusal(ui: &mut Ui, surface: &Surface<'_>) {
+    let danger = editor_danger(surface);
+    let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 132.0));
+    ui.painter().rect_filled(
+        rect,
+        corner(Radius::CARD),
+        danger.gamma_multiply(0.10),
+    );
+    ui.painter().rect_stroke(
+        rect,
+        corner(Radius::CARD),
+        Stroke::new(1.0, danger.gamma_multiply(0.7)),
+        StrokeKind::Inside,
+    );
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .id_salt("beautification-refusal")
+            .max_rect(rect.shrink(12.0))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    child.label(
+        egui::RichText::new("Window shape locked")
+            .font(surface.font(Text::Label))
+            .color(danger)
+            .strong(),
+    );
+    child.add_space(Space::SM);
+    helper_text(
+        &mut child,
+        surface,
+        "The system already supplied this window's true corners and shadow. Framing it again would make the capture subtly wrong.",
+    );
+    ui.add_space(140.0);
+}
+
+fn editor_danger(surface: &Surface<'_>) -> Color32 {
+    if surface.palette().is_dark() {
+        Color32::from_rgb(0xFF, 0x7A, 0x70)
+    } else {
+        Color32::from_rgb(0xB4, 0x23, 0x18)
+    }
+}
+
 fn paint_precision_grid(painter: &egui::Painter, rect: Rect, palette: &crate::theme::Palette) {
     let color = if palette.is_dark() {
         Color32::from_white_alpha(8)
@@ -1738,6 +2654,42 @@ fn palette_colors() -> [Color; 12] {
     ]
 }
 
+fn layer_label(
+    object: &scrozz_annotate::AnnotationObject,
+    visual_index: usize,
+    total: usize,
+) -> String {
+    let name = match &object.annotation {
+        Annotation::Text { content, .. } => {
+            let content = content.trim().replace('\n', " ");
+            if content.is_empty() {
+                "Empty text".to_owned()
+            } else {
+                format!("Text: {}", content.chars().take(28).collect::<String>())
+            }
+        }
+        Annotation::Arrow { .. } => "Arrow".to_owned(),
+        Annotation::Line { .. } => "Line".to_owned(),
+        Annotation::Rectangle(_) => "Rectangle".to_owned(),
+        Annotation::Ellipse(_) => "Ellipse".to_owned(),
+        Annotation::Freehand(_) => "Freehand".to_owned(),
+        Annotation::Counter { index, .. } => format!("Step {index}"),
+        Annotation::Highlight(_) => "Highlight".to_owned(),
+        Annotation::Spotlight(_) => "Spotlight".to_owned(),
+        Annotation::Redact { style, .. } => format!("{} redaction", redact_style_label(*style)),
+        _ => "Annotation".to_owned(),
+    };
+    format!("{visual_index} of {total}, {name}")
+}
+
+fn redact_style_label(style: RedactStyle) -> &'static str {
+    match style {
+        RedactStyle::Blur => "Blur",
+        RedactStyle::Pixelate => "Pixelate",
+        RedactStyle::Solid => "Solid",
+    }
+}
+
 fn normalized_rect(a: LogicalPoint, b: LogicalPoint) -> LogicalRect {
     LogicalRect::from_corners(
         LogicalPoint::new(a.x.min(b.x), a.y.min(b.y)),
@@ -1764,24 +2716,25 @@ fn clamp_rect(rect: LogicalRect, bounds: LogicalRect) -> LogicalRect {
     )
 }
 
-fn source_corners(rect: LogicalRect) -> [LogicalPoint; 4] {
+fn source_handle_points(rect: LogicalRect) -> [(ResizeHandle, LogicalPoint); 4] {
     let right = rect.origin.x + rect.size.width;
     let bottom = rect.origin.y + rect.size.height;
     [
-        rect.origin,
-        LogicalPoint::new(right, rect.origin.y),
-        LogicalPoint::new(right, bottom),
-        LogicalPoint::new(rect.origin.x, bottom),
+        (ResizeHandle::NorthWest, rect.origin),
+        (
+            ResizeHandle::NorthEast,
+            LogicalPoint::new(right, rect.origin.y),
+        ),
+        (ResizeHandle::SouthEast, LogicalPoint::new(right, bottom)),
+        (
+            ResizeHandle::SouthWest,
+            LogicalPoint::new(rect.origin.x, bottom),
+        ),
     ]
 }
 
-fn handle_points(rect: Rect) -> [(ResizeHandle, Pos2); 4] {
-    [
-        (ResizeHandle::NorthWest, rect.left_top()),
-        (ResizeHandle::NorthEast, rect.right_top()),
-        (ResizeHandle::SouthEast, rect.right_bottom()),
-        (ResizeHandle::SouthWest, rect.left_bottom()),
-    ]
+fn source_corners(rect: LogicalRect) -> [LogicalPoint; 4] {
+    source_handle_points(rect).map(|(_, point)| point)
 }
 
 fn resized_rect(original: LogicalRect, handle: ResizeHandle, pointer: LogicalPoint) -> LogicalRect {
@@ -1797,6 +2750,13 @@ fn resized_rect(original: LogicalRect, handle: ResizeHandle, pointer: LogicalPoi
     }
 }
 
+fn translated_rect(rect: LogicalRect, dx: f64, dy: f64) -> LogicalRect {
+    LogicalRect::new(
+        LogicalPoint::new(rect.origin.x + dx, rect.origin.y + dy),
+        rect.size,
+    )
+}
+
 fn rotation_label(rotation: CanvasRotation) -> &'static str {
     match rotation {
         CanvasRotation::None => "0°",
@@ -1806,9 +2766,19 @@ fn rotation_label(rotation: CanvasRotation) -> &'static str {
     }
 }
 
+fn default_working_styles() -> [Style; EditorTool::ALL.len()] {
+    let mut styles = [Style::stroked(); EditorTool::ALL.len()];
+    styles[EditorTool::Highlight.index()] = Style::highlighter();
+    styles[EditorTool::Spotlight.index()] = Style::spotlight();
+    styles[EditorTool::Blur.index()] = Style::redaction();
+    styles[EditorTool::Pixelate.index()] = Style::redaction();
+    styles[EditorTool::SolidRedact.index()] = Style::redaction();
+    styles
+}
+
 /// Real annotation-editor scene used by the deterministic screenshot harness.
 pub struct EditorScene {
-    cropping: bool,
+    mode: EditorMode,
 }
 
 struct EditorSceneState {
@@ -1820,33 +2790,45 @@ impl EditorScene {
     /// Compose-workspace scene.
     #[must_use]
     pub const fn composing() -> Self {
-        Self { cropping: false }
+        Self {
+            mode: EditorMode::Compose,
+        }
     }
 
     /// Crop-workspace scene.
     #[must_use]
     pub const fn cropping() -> Self {
-        Self { cropping: true }
+        Self {
+            mode: EditorMode::Crop,
+        }
+    }
+
+    /// Beautification-workspace scene.
+    #[must_use]
+    pub const fn beautifying() -> Self {
+        Self {
+            mode: EditorMode::Beautify,
+        }
     }
 
     fn state_id(&self) -> Id {
-        Id::new(("annotation-editor-scene", self.cropping))
+        Id::new(("annotation-editor-scene", self.mode.label()))
     }
 }
 
 impl Scene for EditorScene {
     fn name(&self) -> &str {
-        if self.cropping {
-            "annotation-editor-crop"
-        } else {
-            "annotation-editor-compose"
+        match self.mode {
+            EditorMode::Compose => "annotation-editor-compose",
+            EditorMode::Crop => "annotation-editor-crop",
+            EditorMode::Beautify => "annotation-editor-beautify",
         }
     }
 
     fn setup(&self, ctx: &egui::Context) {
         theme::install_fonts(ctx);
         let state = Arc::new(Mutex::new(EditorSceneState {
-            editor: demo_editor(self.cropping),
+            editor: demo_editor(self.mode),
             icons: IconStore::try_new(ctx).expect("embedded editor icons must rasterize"),
         }));
         ctx.data_mut(|data| data.insert_temp(self.state_id(), state));
@@ -1874,9 +2856,9 @@ impl Scene for EditorScene {
     }
 }
 
-fn demo_editor(cropping: bool) -> AnnotationEditor {
+fn demo_editor(mode: EditorMode) -> AnnotationEditor {
     let mut document = Document::new(demo_capture());
-    if cropping {
+    if mode == EditorMode::Crop {
         let _ = document.set_canvas(Canvas {
             crop: Some(LogicalRect::new(
                 LogicalPoint::new(54.0, 32.0),
@@ -1942,11 +2924,16 @@ fn demo_editor(cropping: bool) -> AnnotationEditor {
                 ..Style::default()
             },
         );
+        if mode == EditorMode::Beautify {
+            document
+                .set_beautification(Some(Beautification::preset(
+                    BeautificationPreset::Social,
+                )))
+                .expect("the demo capture accepts beautification");
+        }
     }
     let mut editor = AnnotationEditor::new(document);
-    if cropping {
-        editor.set_mode(EditorMode::Crop);
-    } else {
+    if mode == EditorMode::Compose {
         editor.selected = editor
             .document
             .annotations()
@@ -1954,6 +2941,8 @@ fn demo_editor(cropping: bool) -> AnnotationEditor {
             .find(|object| object.kind() == scrozz_annotate::AnnotationKind::Arrow)
             .map(|object| object.id);
         editor.tool = EditorTool::Select;
+    } else {
+        editor.set_mode(mode);
     }
     editor
 }
@@ -2029,7 +3018,7 @@ mod tests {
 
     #[test]
     fn crop_scene_retains_source_bytes() {
-        let editor = demo_editor(true);
+        let editor = demo_editor(EditorMode::Crop);
         let source = demo_capture();
         assert_eq!(editor.document.source.frame.data, source.frame.data);
         assert!(editor.document.canvas().crop.is_some());
@@ -2037,7 +3026,7 @@ mod tests {
 
     #[test]
     fn crop_workspace_keeps_the_full_source_available() {
-        let editor = demo_editor(true);
+        let editor = demo_editor(EditorMode::Crop);
         assert_eq!(
             editor.document.canvas_size(),
             LogicalSize::new(532.0, 314.0)
@@ -2046,5 +3035,176 @@ mod tests {
             editor.workspace_geometry().output_size(),
             editor.document.logical_size()
         );
+    }
+
+    #[test]
+    fn transformed_resize_handles_keep_their_source_corner_identity() {
+        let mut editor = demo_editor(EditorMode::Compose);
+        editor
+            .document
+            .set_canvas(Canvas {
+                rotation: CanvasRotation::Clockwise90,
+                ..Canvas::default()
+            })
+            .unwrap();
+        let bounds = LogicalRect::new(LogicalPoint::new(40.0, 30.0), LogicalSize::new(120.0, 70.0));
+        let geometry = SkiaRenderer::new()
+            .render_at_with_geometry(&editor.document, editor.document.source.frame.scale)
+            .unwrap()
+            .geometry;
+        let size = geometry.output_size();
+        let placement = Placement {
+            rect: Rect::from_min_size(Pos2::ZERO, vec2(size.width as f32, size.height as f32)),
+            scale: 1.0,
+            geometry,
+        };
+        let handles = editor.selection_handle_points(bounds, placement);
+        let (visual_north_west, _) = handles
+            .into_iter()
+            .map(|pair @ (_, point)| (pair, point.x + point.y))
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .expect("four handles");
+
+        assert!(
+            matches!(visual_north_west.0, ResizeHandle::SouthWest),
+            "a clockwise rotation moves the source south-west corner to visual north-west"
+        );
+        let moved_canvas = LogicalPoint::new(
+            f64::from(visual_north_west.1.x + 12.0),
+            f64::from(visual_north_west.1.y + 8.0),
+        );
+        let moved_source =
+            geometry.output_to_source(PhysicalPoint::new(moved_canvas.x, moved_canvas.y));
+        let resized = resized_rect(bounds, visual_north_west.0, moved_source);
+
+        assert_eq!(
+            resized.origin.y, bounds.origin.y,
+            "the opposite source north-east anchor keeps its top edge"
+        );
+        assert_eq!(
+            resized.origin.x + resized.size.width,
+            bounds.origin.x + bounds.size.width,
+            "the opposite source north-east anchor keeps its right edge"
+        );
+    }
+
+    #[test]
+    fn transform_gestures_defer_document_rerender_until_release() {
+        let mut editor = demo_editor(EditorMode::Compose);
+        let id = editor.document.annotations()[0].id;
+        let original = editor.document.get(id).unwrap().bounds();
+        let before = editor.document.data();
+        editor.gesture = Some(Gesture::Move {
+            id,
+            original,
+            start: LogicalPoint::new(10.0, 10.0),
+            current: LogicalPoint::new(55.0, 35.0),
+        });
+
+        assert_eq!(
+            editor.document.data(),
+            before,
+            "pointer frames use an overlay and must not invalidate the raster cache"
+        );
+        assert_ne!(editor.gesture_bounds(id, original), original);
+
+        editor.finish_gesture();
+        assert_eq!(
+            editor.document.get(id).unwrap().bounds().origin,
+            LogicalPoint::new(original.origin.x + 45.0, original.origin.y + 25.0)
+        );
+    }
+
+    #[test]
+    fn spotlight_and_each_redaction_tool_retain_independent_working_styles() {
+        let mut editor = demo_editor(EditorMode::Compose);
+        editor.working_styles[EditorTool::Spotlight.index()].opacity = 0.31;
+        editor.working_styles[EditorTool::Blur.index()].redact_strength = 0.22;
+        editor.working_styles[EditorTool::Pixelate.index()].redact_strength = 0.84;
+        editor.working_styles[EditorTool::SolidRedact.index()].stroke = Color::WHITE;
+
+        editor.set_tool(EditorTool::Spotlight);
+        assert_eq!(editor.default_style_for_tool().opacity, 0.31);
+        editor.set_tool(EditorTool::Blur);
+        assert_eq!(editor.default_style_for_tool().redact_strength, 0.22);
+        editor.set_tool(EditorTool::Pixelate);
+        assert_eq!(editor.default_style_for_tool().redact_strength, 0.84);
+        editor.set_tool(EditorTool::SolidRedact);
+        assert_eq!(editor.default_style_for_tool().stroke, Color::WHITE);
+    }
+
+    #[test]
+    fn focused_text_edit_receives_delete_before_object_deletion() {
+        let mut editor = demo_editor(EditorMode::Compose);
+        let selected = editor.selected.expect("demo selects an arrow");
+        let ctx = egui::Context::default();
+        let mut text = "editable".to_owned();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response =
+                ui.add(egui::TextEdit::singleline(&mut text).id_salt("focused-annotation-text"));
+            response.request_focus();
+        });
+        output.textures_delta.clear();
+        assert!(ctx.text_edit_focused());
+
+        let input = egui::RawInput {
+            focused: true,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| editor.handle_shortcuts(ui));
+        output.textures_delta.clear();
+
+        assert!(
+            editor.document.get(selected).is_some(),
+            "Delete belongs to the focused text editor, not the selected canvas object"
+        );
+    }
+
+    #[test]
+    fn keyboard_move_resize_and_selection_are_document_edits() {
+        let mut editor = demo_editor(EditorMode::Compose);
+        let selected = editor.selected.expect("demo selects an arrow");
+        let before = editor.document.get(selected).unwrap().bounds();
+
+        editor.keyboard_adjust_selected(10.0, -4.0, false);
+        let moved = editor.document.get(selected).unwrap().bounds();
+        assert_eq!(moved.origin.x, before.origin.x + 10.0);
+        assert_eq!(moved.origin.y, before.origin.y - 4.0);
+
+        editor.keyboard_adjust_selected(6.0, 3.0, true);
+        let resized = editor.document.get(selected).unwrap().bounds();
+        assert_eq!(resized.origin, moved.origin);
+        assert_eq!(resized.size.width, moved.size.width + 6.0);
+        assert_eq!(resized.size.height, moved.size.height + 3.0);
+
+        editor.cycle_selection(true);
+        assert_ne!(editor.selected, Some(selected));
+        assert!(editor.history.can_undo());
+        assert!(
+            editor
+                .events
+                .iter()
+                .any(|event| matches!(event, EditorEvent::Changed(_)))
+        );
+    }
+
+    #[test]
+    fn layer_labels_expose_order_kind_and_text() {
+        let editor = demo_editor(EditorMode::Compose);
+        let text = editor
+            .document
+            .annotations()
+            .iter()
+            .find(|object| matches!(object.annotation, Annotation::Text { .. }))
+            .expect("demo has text");
+        let label = layer_label(text, 2, editor.document.len());
+        assert_eq!(label, "2 of 5, Text: Share this view");
     }
 }

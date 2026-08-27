@@ -231,6 +231,42 @@ fn pixelate_blocks_are_genuinely_uniform() {
 }
 
 #[test]
+fn pixelate_retains_no_source_averages_and_is_reproducible() {
+    let mut first = checkered(96, 96);
+    first.add(
+        Annotation::Redact {
+            area: rect(16.0, 16.0, 64.0, 64.0),
+            style: RedactStyle::Pixelate,
+        },
+        Style::redaction(),
+    );
+    let data = first.data();
+
+    let second_source = capture_with(flat(96, 96, [246, 31, 118, 255]), Provenance::Region);
+    let second = Document::from_data(second_source, data.clone()).unwrap();
+    let first_render = SkiaRenderer::new().render(&first).unwrap();
+    let second_render = SkiaRenderer::new().render(&second).unwrap();
+
+    assert_eq!(
+        interior(&first_render, 16, 16, 80, 80),
+        interior(&second_render, 16, 16, 80, 80),
+        "secure pixelation must be independent of every covered source pixel"
+    );
+    assert_ne!(
+        pixel(&first_render, 0, 0),
+        pixel(&second_render, 0, 0),
+        "the fixture must prove that unredacted source pixels still differ"
+    );
+
+    let reopened = Document::from_data(first.source.clone(), data).unwrap();
+    assert_eq!(
+        SkiaRenderer::new().render(&first).unwrap().data,
+        SkiaRenderer::new().render(&reopened).unwrap().data,
+        "the persisted seed must reproduce the exact destructive mosaic"
+    );
+}
+
+#[test]
 fn a_redaction_destroys_annotations_drawn_beneath_it() {
     // Redaction is applied in z-order, so it erases whatever is under it —
     // including an annotation that itself leaked something.

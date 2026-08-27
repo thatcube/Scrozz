@@ -39,6 +39,7 @@ scrozz-ui = { path = "crates/scrozz-ui" }
 # Both are enabled so one binary serves X11 and Wayland sessions, which is what
 # D8 promises.
 eframe = { version = "=0.36.1", default-features = false, features = [
+    "accesskit",
     "glow",
     "default_fonts",
     "x11",
@@ -58,12 +59,15 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 anyhow = "1"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
 dirs = "6"
 tiny-skia = "0.12"
 ttf-parser = "0.25"
+rustybuzz = "0.20"
+unicode-bidi = "0.3"
 resvg = "0.48"
 arboard = "3.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }

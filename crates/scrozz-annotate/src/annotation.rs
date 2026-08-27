@@ -303,6 +303,36 @@ impl AnnotationObject {
                 }
             }
             Annotation::Counter { .. } => self.bounds(),
+            Annotation::Arrow { from, to }
+                if self.style.arrow_style == crate::style::ArrowStyle::Curved =>
+            {
+                let control = geom::curved_arrow_control(*from, *to);
+                let curve =
+                    geom::inflate(&geom::quadratic_bounds(*from, control, *to), half_stroke);
+                let tangent_x = to.x - control.x;
+                let tangent_y = to.y - control.y;
+                let tangent_length = tangent_x.hypot(tangent_y);
+                if tangent_length <= f64::EPSILON {
+                    curve
+                } else {
+                    let ux = tangent_x / tangent_length;
+                    let uy = tangent_y / tangent_length;
+                    let chord = (to.x - from.x).hypot(to.y - from.y);
+                    let head_length = self.arrow_head_length().min(chord * 0.6);
+                    let half_width = self.arrow_head_half_width();
+                    let base = LogicalPoint::new(
+                        ux.mul_add(-head_length, to.x),
+                        uy.mul_add(-head_length, to.y),
+                    );
+                    let perpendicular = LogicalPoint::new(-uy * half_width, ux * half_width);
+                    let head = geom::bounding_box(&[
+                        *to,
+                        LogicalPoint::new(base.x + perpendicular.x, base.y + perpendicular.y),
+                        LogicalPoint::new(base.x - perpendicular.x, base.y - perpendicular.y),
+                    ]);
+                    geom::union(&curve, &head)
+                }
+            }
             Annotation::Arrow { .. } => {
                 // The head is wider than the shaft, so grow by its half-width.
                 geom::inflate(&self.annotation.bounds(), self.arrow_head_half_width())
