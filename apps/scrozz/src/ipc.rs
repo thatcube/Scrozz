@@ -628,19 +628,20 @@ pub(crate) mod windows_pipe {
             Foundation::{
                 CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA,
                 ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-                ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, HLOCAL, LocalFree,
+                ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, LocalFree,
             },
             Security::{
                 Authorization::{
                     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                    SDDL_REVISION_1,
+                    GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
                 },
-                GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-                TOKEN_USER, TokenUser,
+                GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+                SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
             },
             Storage::FileSystem::{
                 CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE,
-                OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+                OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION,
+                SECURITY_SQOS_PRESENT, WriteFile,
             },
             System::{
                 Pipes::{
@@ -683,6 +684,14 @@ pub(crate) mod windows_pipe {
     impl Drop for SecurityDescriptor {
         fn drop(&mut self) {
             let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0))) };
+        }
+    }
+
+    struct LocalWideString(PWSTR);
+
+    impl Drop for LocalWideString {
+        fn drop(&mut self) {
+            let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0.cast()))) };
         }
     }
 
@@ -731,7 +740,9 @@ pub(crate) mod windows_pipe {
                     return Err(CliError::ipc("the IPC server is shutting down"));
                 }
                 match unsafe { ConnectNamedPipe(self.handle.0, None) } {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        std::thread::sleep(super::RETRY_DELAY);
+                    }
                     Err(_) => match unsafe { GetLastError() } {
                         ERROR_PIPE_CONNECTED => return Ok(()),
                         ERROR_PIPE_LISTENING => {
@@ -786,11 +797,11 @@ pub(crate) mod windows_pipe {
                 let result = unsafe {
                     CreateFileW(
                         PCWSTR(name.as_ptr()),
-                        GENERIC_READ | GENERIC_WRITE,
+                        GENERIC_READ | GENERIC_WRITE | READ_CONTROL.0,
                         FILE_SHARE_MODE(0),
                         None,
                         OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
+                        FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                         None,
                     )
                 };
@@ -799,6 +810,7 @@ pub(crate) mod windows_pipe {
                         let stream = Self {
                             handle: OwnedHandle(handle),
                         };
+                        verify_server_owner(stream.handle.0)?;
                         let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
                         if let Err(error) = unsafe {
                             SetNamedPipeHandleState(
@@ -948,18 +960,67 @@ pub(crate) mod windows_pipe {
         }
         .map_err(|error| CliError::ipc(format!("could not read the current user SID: {error}")))?;
         let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
-        let mut string = PWSTR::null();
-        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut string) }.map_err(|error| {
+        sid_to_string(user.User.Sid).map_err(|error| {
             CliError::ipc(format!("could not format the current user SID: {error}"))
-        })?;
-        let sid = unsafe { string.to_string() }
-            .map_err(|error| CliError::ipc(format!("the current user SID was invalid: {error}")))?;
-        let _ = unsafe { LocalFree(Some(HLOCAL(string.0.cast()))) };
-        Ok(sid)
+        })
+    }
+
+    fn verify_server_owner(handle: HANDLE) -> Result<(), ConnectError> {
+        let expected =
+            current_user_sid_string().map_err(|error| ConnectError::Unusable(error.to_string()))?;
+        let actual = server_owner_sid(handle).map_err(ConnectError::Unusable)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(ConnectError::Unusable(
+                "refusing a Scrozz named pipe not owned by the current user".to_owned(),
+            ))
+        }
+    }
+
+    fn server_owner_sid(handle: HANDLE) -> Result<String, String> {
+        let mut owner = PSID::default();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&raw mut owner),
+                None,
+                None,
+                None,
+                Some(&raw mut descriptor),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "could not inspect the Scrozz named-pipe owner: {}",
+                io::Error::from_raw_os_error(status.0 as i32)
+            ));
+        }
+        if descriptor.is_invalid() {
+            return Err(
+                "Windows returned no security descriptor for the Scrozz named pipe".to_owned(),
+            );
+        }
+        let _descriptor = SecurityDescriptor(descriptor);
+        if owner.is_invalid() {
+            return Err("Windows returned no owner for the Scrozz named pipe".to_owned());
+        }
+        sid_to_string(owner)
+            .map_err(|error| format!("the Scrozz named-pipe owner SID was invalid: {error}"))
+    }
+
+    fn sid_to_string(sid: PSID) -> Result<String, String> {
+        let mut string = PWSTR::null();
+        unsafe { ConvertSidToStringSidW(sid, &mut string) }.map_err(|error| error.to_string())?;
+        let string = LocalWideString(string);
+        unsafe { string.0.to_string() }.map_err(|error| error.to_string())
     }
 
     fn security_descriptor(sid: &str) -> CliResult<SecurityDescriptor> {
-        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
+        let sddl = format!("O:{sid}D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
         let wide: Vec<u16> = OsStr::new(&sddl).encode_wide().chain(Some(0)).collect();
         let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
         unsafe {
