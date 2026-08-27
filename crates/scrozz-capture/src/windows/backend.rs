@@ -53,7 +53,11 @@ impl WindowsBackend {
         gdi::capture_rect(monitor.bounds, monitor.scale)
     }
 
-    fn capture_window(&self, id: &scrozz_core::WindowId, request: &CaptureRequest) -> Result<Frame> {
+    fn capture_window(
+        &self,
+        id: &scrozz_core::WindowId,
+        request: &CaptureRequest,
+    ) -> Result<Frame> {
         let (record, monitors) = enumerate::window_by_id(id)?;
         let scale = monitors
             .get(record.monitor)
@@ -139,9 +143,7 @@ impl WindowsBackend {
         let width = (canvas.size.width * scale.get()).round() as u32;
         let height = (canvas.size.height * scale.get()).round() as u32;
         if width == 0 || height == 0 {
-            return Err(Error::TargetGone(
-                "the virtual desktop has no area".into(),
-            ));
+            return Err(Error::TargetGone("the virtual desktop has no area".into()));
         }
 
         let stride = pixels::min_stride(width);
@@ -176,7 +178,11 @@ impl WindowsBackend {
             data,
             size: Size::new(f64::from(width), f64::from(height)),
             stride,
-            format: scrozz_core::PixelFormat::Bgra8,
+            // Matches what `capture_display` produces on the WGC path. The
+            // uncovered gaps in a non-rectangular monitor arrangement stay
+            // zeroed, which is transparent black under this format and so
+            // reads correctly rather than as opaque black.
+            format: scrozz_core::PixelFormat::BgraPremultiplied8,
             color_space: scrozz_core::ColorSpace::Srgb,
             scale,
         })
