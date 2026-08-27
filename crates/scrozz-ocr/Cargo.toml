@@ -10,8 +10,23 @@ repository.workspace = true
 
 [dependencies]
 scrozz-core.workspace = true
+rxing.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Fixtures are generated, never committed: a test encodes a QR or a Code 128 and
+# then decodes it back, so the assertion covers the decoder rather than a blob
+# whose provenance nobody can check. `encoders` is a dev-only feature, so the
+# shipped library never links the writer.
+rxing = { workspace = true, features = ["encoders"] }
+
+[features]
+default = ["tesseract"]
+# Linux text recognition through the *system* `tesseract` binary (D8). Pure
+# `std::process`: no C library at build time, nothing bundled, and no engine
+# added to the download. Absent on macOS and Windows, which have system engines.
+tesseract = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

@@ -66,6 +66,22 @@ tiny-skia = "0.12"
 resvg = "0.48"
 arboard = "3.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+# The barcode decoder (OCR-04). A maintained pure-Rust ZXing port, taken with
+# `default-features = false` on purpose: the defaults drag in `image`,
+# `imageproc` and `resvg` to decode files, and Scrozz already has a decoder and
+# hands the reader raw luminance. What is left is `decoders` plus the symbology
+# families, whose only non-optional dependencies are chrono, num, once_cell,
+# regex and unicode-segmentation. `encoders` is enabled for tests only, where it
+# generates the fixtures rather than committing binary blobs.
+rxing = { version = "0.9", default-features = false, features = [
+    "decoders",
+    "multi_barcode_readers",
+    "qrcode",
+    "aztec",
+    "datamatrix",
+    "pdf417",
+    "oned",
+] }
 global-hotkey = "0.8"
 tray-icon = "0.24"
 
