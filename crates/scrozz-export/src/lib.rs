@@ -9,16 +9,21 @@ pub mod encode;
 pub mod icc;
 pub mod naming;
 pub mod pixels;
+pub mod selection;
 
 pub use clipboard::{
     ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,
 };
 pub use decode::{decode, decode_file};
 pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader, UnimplementedS3Uploader};
-pub use encode::{EncodeOptions, FrameEncoder, PngEffort};
+pub use encode::{ColorConversion, EncodeOptions, FrameEncoder, PngEffort};
 pub use icc::profile_for;
 pub use naming::{FilenameRules, NamePolicy, NameTemplate, NamingContext, Timestamp};
-pub use pixels::{RgbaImage, to_straight_rgba8};
+pub use pixels::{RgbaImage, convert_to_srgb, to_straight_rgba8};
+pub use selection::{
+    ContentKind, DestinationCapabilities, DestinationColorSpace, DestinationKind,
+    DestinationProfile, ExportSelection, select_export,
+};
 
 use std::path::PathBuf;
 

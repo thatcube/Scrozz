@@ -20,7 +20,7 @@
 //!   [`PixelFormat::Bgra8`]. Encoding that as RGBA swaps red and blue, which is
 //!   not subtle.
 
-use scrozz_core::{Error, Frame, PixelFormat, Result};
+use scrozz_core::{ColorSpace, Error, Frame, PixelFormat, Result};
 
 /// A tightly packed, straight-alpha, RGBA8 image.
 ///
@@ -44,6 +44,7 @@ impl RgbaImage {
         if x >= self.width || y >= self.height {
             return None;
         }
+
         let i = (y as usize * self.width as usize + x as usize) * 4;
         Some([
             self.data[i],
@@ -86,6 +87,144 @@ impl RgbaImage {
         }
         out
     }
+}
+
+/// Converts encoded RGB samples from `source` to sRGB, preserving alpha.
+///
+/// Display P3 uses the sRGB transfer function; Rec. 2020 uses the Rec. 709
+/// transfer function for the SDR samples represented by [`ColorSpace::Rec2020`].
+/// Conversion linearises the source, transforms through CIE XYZ (D65), then
+/// applies the sRGB transfer function. Out-of-gamut values are clipped only
+/// after the matrix transform.
+///
+/// [`ColorSpace::Unknown`] is refused. Treating unknown samples as sRGB would
+/// merely retag them, which is precisely the colour error this operation exists
+/// to avoid. Callers that want pass-through behaviour should not request a
+/// conversion.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidRequest`] when `source` is unknown.
+pub fn convert_to_srgb(image: &RgbaImage, source: ColorSpace) -> Result<RgbaImage> {
+    if source == ColorSpace::Unknown {
+        return Err(Error::InvalidRequest(
+            "cannot convert an image with an unknown colour space to sRGB".into(),
+        ));
+    }
+    if source == ColorSpace::Srgb {
+        return Ok(image.clone());
+    }
+
+    let to_xyz = match source {
+        ColorSpace::DisplayP3 => DISPLAY_P3_TO_XYZ,
+        ColorSpace::Rec2020 => REC2020_TO_XYZ,
+        ColorSpace::Srgb | ColorSpace::Unknown => unreachable!("handled above"),
+    };
+    let decode = match source {
+        ColorSpace::DisplayP3 => srgb_to_linear,
+        ColorSpace::Rec2020 => rec2020_to_linear,
+        ColorSpace::Srgb | ColorSpace::Unknown => unreachable!("handled above"),
+    };
+
+    let mut data = Vec::with_capacity(image.data.len());
+    for pixel in image.data.as_chunks::<4>().0 {
+        let linear = [
+            decode(f64::from(pixel[0]) / 255.0),
+            decode(f64::from(pixel[1]) / 255.0),
+            decode(f64::from(pixel[2]) / 255.0),
+        ];
+        let xyz = transform(to_xyz, linear);
+        let srgb = transform(XYZ_TO_SRGB, xyz);
+        data.extend_from_slice(&[
+            encode_srgb_u8(srgb[0]),
+            encode_srgb_u8(srgb[1]),
+            encode_srgb_u8(srgb[2]),
+            pixel[3],
+        ]);
+    }
+
+    Ok(RgbaImage {
+        width: image.width,
+        height: image.height,
+        data,
+    })
+}
+
+type Matrix = [[f64; 3]; 3];
+
+const DISPLAY_P3_TO_XYZ: &Matrix = &[
+    [
+        0.486_570_948_648_216_2,
+        0.265_667_693_169_093_06,
+        0.198_217_285_234_362_5,
+    ],
+    [
+        0.228_974_564_069_748_8,
+        0.691_738_521_836_506_4,
+        0.079_286_914_093_745,
+    ],
+    [0.0, 0.045_113_381_858_902_64, 1.043_944_368_900_976],
+];
+
+const REC2020_TO_XYZ: &Matrix = &[
+    [
+        0.636_958_048_301_291_4,
+        0.144_616_903_586_208_32,
+        0.168_880_975_164_172_1,
+    ],
+    [
+        0.262_700_212_011_267_1,
+        0.677_998_071_518_870_8,
+        0.059_301_716_469_861_96,
+    ],
+    [0.0, 0.028_072_693_049_087_428, 1.060_985_057_710_791],
+];
+
+const XYZ_TO_SRGB: &Matrix = &[
+    [
+        3.240_969_941_904_522_6,
+        -1.537_383_177_570_094,
+        -0.498_610_760_293_003_4,
+    ],
+    [
+        -0.969_243_636_280_879_6,
+        1.875_967_501_507_720_2,
+        0.041_555_057_407_175_59,
+    ],
+    [
+        0.055_630_079_696_993_66,
+        -0.203_976_958_888_976_52,
+        1.056_971_514_242_878_6,
+    ],
+];
+
+fn transform(matrix: &Matrix, value: [f64; 3]) -> [f64; 3] {
+    matrix.map(|row| row[0] * value[0] + row[1] * value[1] + row[2] * value[2])
+}
+
+fn srgb_to_linear(value: f64) -> f64 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn rec2020_to_linear(value: f64) -> f64 {
+    if value < 0.081 {
+        value / 4.5
+    } else {
+        ((value + 0.099) / 1.099).powf(1.0 / 0.45)
+    }
+}
+
+fn encode_srgb_u8(linear: f64) -> u8 {
+    let encoded = if linear <= 0.003_130_8 {
+        12.92 * linear
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// Normalises a frame into tightly packed straight-alpha RGBA8.

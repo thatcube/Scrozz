@@ -9,9 +9,10 @@ use std::{
 };
 
 use common::{embedded_profile, solid};
-use scrozz_core::{ColorSpace, Error, Frame, PixelFormat};
+use scrozz_core::{ColorSpace, Error, Frame, PixelFormat, ScaleFactor};
 use scrozz_export::{
-    Clipboard, ClipboardPlatform, ClipboardReport, Destination, Encoder, ExportOutcome,
+    Clipboard, ClipboardPlatform, ClipboardReport, ContentKind, Destination,
+    DestinationCapabilities, DestinationColorSpace, DestinationProfile, Encoder, ExportOutcome,
     FileExporter, FrameEncoder, ImageFormat, NamePolicy, NameTemplate, NamingContext, S3Object,
     S3Uploader, Timestamp, UnimplementedS3Uploader,
 };
@@ -281,6 +282,77 @@ fn a_custom_template_is_honoured() {
         "export_frame should fill the size in from the frame itself"
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn frame_scale_adds_retina_suffix_without_changing_one_x_exports() {
+    let dir = scratch("folder-retina");
+    let exporter = FileExporter::new().with_template(NameTemplate::parse("Capture").unwrap());
+    let one_x = solid(2, 2, [1, 2, 3]);
+    let mut retina = solid(2, 2, [1, 2, 3]);
+    retina.scale = ScaleFactor::new(2.0);
+
+    let first = exporter
+        .export_frame(
+            &one_x,
+            ImageFormat::Png,
+            &Destination::Folder(dir.clone()),
+            &context(),
+        )
+        .unwrap()
+        .path
+        .unwrap();
+    let second = exporter
+        .export_frame(
+            &retina,
+            ImageFormat::Png,
+            &Destination::Folder(dir.clone()),
+            &context(),
+        )
+        .unwrap()
+        .path
+        .unwrap();
+
+    assert_eq!(first.file_name().unwrap(), "Capture.png");
+    assert_eq!(second.file_name().unwrap(), "Capture@2x.png");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn automatic_export_uses_destination_format_and_colour_policy() {
+    let dir = scratch("folder-auto");
+    let source = common::frame(
+        1,
+        1,
+        0,
+        PixelFormat::Rgba8,
+        ColorSpace::DisplayP3,
+        |_, _| [128, 64, 32, 255],
+    );
+    let mut profile = DestinationProfile::folder();
+    profile.capabilities = DestinationCapabilities::new([ImageFormat::Png]);
+    profile.color_space = DestinationColorSpace::Srgb;
+
+    let path = FileExporter::new()
+        .export_frame_auto(
+            &source,
+            &Destination::Folder(dir.clone()),
+            &profile,
+            ContentKind::Screenshot,
+            &context(),
+        )
+        .unwrap()
+        .path
+        .unwrap();
+    let written = std::fs::read(path).unwrap();
+    let (width, _, data) = common::decode(&written);
+
+    assert_eq!(common::pixel_at(&data, width, 0, 0), [138, 59, 21, 255]);
+    assert_eq!(
+        embedded_profile(&written),
+        scrozz_export::profile_for(ColorSpace::Srgb)
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
