@@ -26,6 +26,8 @@ pub struct Inspection {
     pub truncate_to: u64,
     /// Number of complete `moof`/`mdat` pairs.
     pub complete_fragments: u64,
+    /// Number of complete fragments whose `mdat` payload is non-empty.
+    pub nonempty_fragments: u64,
     /// Whether both initialization boxes are complete.
     pub has_initialization: bool,
 }
@@ -34,7 +36,7 @@ impl Inspection {
     /// Whether the file contains initialization metadata and encoded media.
     #[must_use]
     pub const fn playable(self) -> bool {
-        self.has_initialization && self.complete_fragments != 0 && self.truncate_to != 0
+        self.has_initialization && self.nonempty_fragments != 0 && self.truncate_to != 0
     }
 }
 
@@ -48,6 +50,7 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<Inspection> {
     let mut has_ftyp = false;
     let mut has_moov = false;
     let mut complete_fragments = 0u64;
+    let mut nonempty_fragments = 0u64;
 
     while file_bytes.saturating_sub(offset) >= 8 {
         reader.seek(SeekFrom::Start(offset))?;
@@ -84,6 +87,9 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<Inspection> {
             }
             b"mdat" if pending_fragment.is_some() => {
                 complete_fragments = complete_fragments.saturating_add(1);
+                if box_bytes > header_bytes {
+                    nonempty_fragments = nonempty_fragments.saturating_add(1);
+                }
                 pending_fragment = None;
                 safe_end = end;
             }
@@ -99,6 +105,7 @@ pub fn inspect<R: Read + Seek>(reader: &mut R) -> io::Result<Inspection> {
         file_bytes,
         truncate_to: pending_fragment.unwrap_or(safe_end).min(file_bytes),
         complete_fragments,
+        nonempty_fragments,
         has_initialization: has_ftyp && has_moov,
     })
 }
