@@ -8,6 +8,8 @@
 # Spike scratch — run logs, pids, and anything an agent leaves behind
 *.log
 *.pid
+/.proof/
+/.gui-run.json
 
 # macOS
 .DS_Store

@@ -102,7 +102,17 @@ pub fn run(cli: &Cli) -> CliResult<Report> {
     crate::platform::become_accessory_app()?;
 
     let config = Config::from_cli(cli);
-    let host = host::for_platform(&config)?;
+
+    // Handed to the host because a windowed run cannot always return to `main`
+    // to have its report printed — see `host::Driver::logic`.
+    let reporter = crate::report::Reporter::from_global(&cli.global);
+    let emit: host::Emit = Box::new(move |report: &Report| {
+        if let Err(e) = reporter.emit("gui", report) {
+            tracing::warn!("the report could not be written: {e}");
+        }
+    });
+
+    let host = host::for_platform(&config, emit)?;
     let app = App::new(config, host.surface())?;
     host.run(app)
 }
@@ -130,7 +140,7 @@ mod tests {
         // that does not exist.
         if available() {
             assert!(
-                host::for_platform(&Config::sealed()).is_ok(),
+                host::for_platform(&Config::sealed(), Box::new(|_| {})).is_ok(),
                 "availability claims a window this build cannot open"
             );
         }

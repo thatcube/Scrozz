@@ -26,7 +26,8 @@
 use std::time::{Duration, Instant};
 
 use scrozz_shell::{
-    Accelerator, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Tray, TrayAction,
+    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
+    SystemPermissions, Tray, TrayAction,
 };
 
 use crate::{
@@ -49,10 +50,7 @@ use crate::{
 /// delivering an event — a trap `scrozz-shell` already knows about and refuses
 /// up front. These three are unclaimed on a default install.
 pub const DEFAULT_BINDINGS: &[(&str, Action)] = &[
-    (
-        "Cmd+Shift+7",
-        Action::Capture(CaptureKind::Fullscreen),
-    ),
+    ("Cmd+Shift+7", Action::Capture(CaptureKind::Fullscreen)),
     ("Cmd+Shift+8", Action::Capture(CaptureKind::Region)),
     ("Cmd+Shift+9", Action::Capture(CaptureKind::Window)),
 ];
@@ -474,6 +472,19 @@ impl App {
     }
 
     fn begin_capture(&mut self, kind: CaptureKind) {
+        // D15: ask at first use, not at launch. This must happen on the main
+        // thread before the capture job is posted: the missing piece that made
+        // Scrozz report PermissionDenied in an invisible log without ever
+        // invoking CGRequestScreenCaptureAccess, so it never appeared in System
+        // Settings at all.
+        let permissions = SystemPermissions::new();
+        if !permissions.is_granted(Capability::ScreenRecording)
+            && let Err(error) = permissions.request(Capability::ScreenRecording)
+        {
+            self.note(format!("capture permission is required: {error}"));
+            return;
+        }
+
         let card = self.pipeline.allocate();
         if !self.pipeline.post(Job::Capture { kind, card }) {
             self.note("the capture worker has gone");
@@ -496,7 +507,10 @@ impl App {
     #[must_use]
     pub fn report(&self) -> Report {
         let data = Json::obj([
-            ("captures", Json::Int(i64::try_from(self.captures).unwrap_or(i64::MAX))),
+            (
+                "captures",
+                Json::Int(i64::try_from(self.captures).unwrap_or(i64::MAX)),
+            ),
             ("surface", Json::str(self.surface.describe())),
             (
                 "bindings",
@@ -572,7 +586,11 @@ pub fn describe_conflict(accelerator: &str) -> CliResult<Option<String>> {
 /// The tray entries this build offers, for diagnostics.
 #[must_use]
 pub fn menu_actions() -> Vec<Action> {
-    TrayAction::ALL.iter().copied().map(Action::from_tray).collect()
+    TrayAction::ALL
+        .iter()
+        .copied()
+        .map(Action::from_tray)
+        .collect()
 }
 
 #[cfg(test)]

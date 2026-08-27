@@ -10,16 +10,10 @@
 //! # Why it takes a pointer
 //!
 //! [`PanelHook`] is `FnOnce(&eframe::CreationContext<'_>) -> PanelReport`, and
-//! naming `eframe::CreationContext` requires `eframe` to be a direct dependency
-//! of this crate, which it is not (see [`crate::gui::host::WINDOW_GAP`]). So the
-//! work is split at the one place the split is free: the platform handle is a
-//! raw pointer either way.
-//!
-//! [`convert_ns_view`] is the whole conversion and needs nothing but
-//! `scrozz-shell`. The hook is then six lines of pointer extraction, written out
-//! verbatim in [`HOOK_SOURCE`], which compile the moment `eframe` and
-//! `raw-window-handle` are available. That ordering is deliberate: the part with
-//! the platform risk in it is the part that can be compiled and tested today.
+//! the work is split in two: [`hook`] does the pointer extraction, and
+//! [`convert_ns_view`] does the conversion. The split is where the platform
+//! risk is — the conversion can be exercised without a window, so it is the
+//! part that carries the tests.
 //!
 //! # What the conversion actually does
 //!
@@ -35,6 +29,9 @@
 
 use std::ffi::c_void;
 
+use raw_window_handle::HasWindowHandle;
+#[cfg(target_os = "macos")]
+use raw_window_handle::RawWindowHandle;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
 use scrozz_ui::PanelReport;
 
@@ -86,44 +83,52 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
     }
 }
 
-/// The hook body, ready to paste once `eframe` is a dependency.
+/// The hook `scrozz-ui` runs while the overlay window is being created.
 ///
-/// Kept as source rather than prose because the thing most likely to go wrong
-/// when someone writes it from memory is silently taking the `ns_window` arm on
-/// a handle that reports `ns_view`, which produces a `PanelReport` that says
-/// "converted" about the wrong window.
+/// Extracts the platform handle from the `CreationContext` and hands it to
+/// [`convert_ns_view`]. That is the whole hook: everything with platform risk
+/// in it lives in the conversion, which is unit-tested without a window.
 ///
-/// Assign it where [`crate::gui::host::for_platform`] builds `OverlayOptions`:
-///
-/// ```text
-/// options.panel = Some(crate::gui::panel::hook());
-/// ```
-pub const HOOK_SOURCE: &str = r#"
-/// Requires `eframe` and `raw-window-handle` in apps/scrozz/Cargo.toml.
+/// The `ns_view` / `ns_window` distinction is the subtle one. `eframe` reports
+/// an **`NSView`**, and `scrozz-shell` offers `from_ns_view` and
+/// `from_ns_window` — both taking `*mut c_void`, so handing a view to the
+/// window entry point type-checks and then converts the wrong object. A test
+/// pins the arm this reaches for.
+#[must_use]
 pub fn hook() -> scrozz_ui::PanelHook {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
     Box::new(|cc: &eframe::CreationContext<'_>| {
-        let Ok(handle) = cc.window_handle() else {
-            return scrozz_ui::PanelReport::unsupported("eframe reported no window handle");
+        let handle = match cc.window_handle() {
+            Ok(handle) => handle,
+            Err(err) => {
+                return PanelReport::unsupported(format!(
+                    "eframe reported no window handle: {err}"
+                ));
+            }
         };
-        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-            return scrozz_ui::PanelReport::unsupported("the window is not an AppKit window");
+
+        #[cfg(target_os = "macos")]
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw()
+        else {
+            return PanelReport::unsupported(
+                "the overlay window is not an AppKit window, so it has no NSView to convert",
+            );
         };
-        // SAFETY: `handle` is borrowed for this scope, so the view is alive.
-        unsafe { crate::gui::panel::convert_ns_view(appkit.ns_view.as_ptr()) }
+
+        // SAFETY: `handle` borrows the window for this scope, so the view is
+        // alive; `OverlayApp::new` runs on the main thread.
+        #[cfg(target_os = "macos")]
+        return unsafe { convert_ns_view(appkit.ns_view.as_ptr()) };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = handle;
+            PanelReport::unsupported(
+                "only the macOS overlay backend is implemented so far, so the \
+                 window keeps its native activation behaviour",
+            )
+        }
     })
 }
-"#;
-
-/// Why the hook itself is not compiled in yet.
-pub const HOOK_GAP: &str = "the panel conversion is implemented and tested \
-     (gui::panel::convert_ns_view); what is missing is the six-line PanelHook \
-     that pulls the NSView pointer out of eframe's CreationContext. It needs \
-     `eframe` (to name CreationContext) and `raw-window-handle` (for the \
-     HasWindowHandle trait and the RawWindowHandle::AppKit arm) as direct \
-     dependencies of apps/scrozz. Neither is declared, and raw-window-handle \
-     is not in [workspace.dependencies] either. See gui::panel::HOOK_SOURCE";
 
 #[cfg(test)]
 mod tests {
@@ -152,20 +157,30 @@ mod tests {
     }
 
     #[test]
-    fn the_hook_source_names_the_view_arm_not_the_window_arm() {
+    fn the_hook_reaches_for_the_view_arm_not_the_window_arm() {
         // eframe reports `ns_view`. Reaching for `from_ns_window` with a view
-        // pointer type-checks (both are *mut c_void) and is wrong, so the
-        // pasteable source must not model that mistake.
-        assert!(HOOK_SOURCE.contains("ns_view"), "{HOOK_SOURCE}");
-        assert!(!HOOK_SOURCE.contains("from_ns_window"), "{HOOK_SOURCE}");
-        assert!(HOOK_SOURCE.contains("convert_ns_view"), "{HOOK_SOURCE}");
+        // pointer type-checks (both are *mut c_void) and converts the wrong
+        // object, so this pins the source rather than trusting review.
+        let source = include_str!("panel.rs");
+        let body = source
+            .split("pub fn hook()")
+            .nth(1)
+            .expect("the hook is defined in this file")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the hook ends before the tests do");
+        assert!(body.contains("ns_view"), "the hook must use the NSView arm");
+        assert!(
+            !body.contains("from_ns_window"),
+            "the hook must not convert the window handle as if it were a view"
+        );
     }
 
     #[test]
-    fn the_gap_names_both_missing_crates() {
-        // A gap that names one of two required dependencies gets fixed once,
-        // fails to compile, and gets called a broken suggestion.
-        assert!(HOOK_GAP.contains("eframe"), "{HOOK_GAP}");
-        assert!(HOOK_GAP.contains("raw-window-handle"), "{HOOK_GAP}");
+    fn a_hook_can_be_built_without_a_window() {
+        // Building the hook must not touch AppKit — it is constructed at
+        // start-up, long before `eframe` has a window to hand it.
+        let hook = hook();
+        drop(hook);
     }
 }

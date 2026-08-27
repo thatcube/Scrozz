@@ -27,6 +27,26 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$TARGET_DIR/release/scrozz" "$APP/Contents/MacOS/Scrozz"
 cp assets/icons/Scrozz.icns "$APP/Contents/Resources/Scrozz.icns"
 
+# macOS 26 puts legacy .icns artwork in a white/silver compatibility container
+# ("icon jail"). Compile the layered Icon Composer source into Assets.car so
+# Tahoe uses its native system-shaped plate, while CFBundleIconFile below keeps
+# the .icns fallback for Sequoia and older.
+ICON_DEVELOPER_DIR="${ICON_DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+if [[ -d assets/icons/Scrozz.icon && -x "$ICON_DEVELOPER_DIR/usr/bin/actool" ]]; then
+  DEVELOPER_DIR="$ICON_DEVELOPER_DIR" xcrun actool \
+    assets/icons/Scrozz.icon \
+    --compile "$APP/Contents/Resources" \
+    --app-icon Scrozz.icon \
+    --enable-on-demand-resources NO \
+    --development-region en \
+    --target-device mac \
+    --platform macosx \
+    --enable-icon-stack-fallback-generation=disabled \
+    --include-all-app-icons \
+    --minimum-deployment-target 12.3 \
+    --output-partial-info-plist /dev/null
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -38,6 +58,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>        <string>Scrozz</string>
   <key>CFBundleIdentifier</key>        <string>com.thatcube.Scrozz</string>
   <key>CFBundleIconFile</key>          <string>Scrozz</string>
+  <!-- Native macOS 26 layered icon from Assets.car; no extension here. -->
+  <key>CFBundleIconName</key>          <string>Scrozz</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key>           <string>1</string>

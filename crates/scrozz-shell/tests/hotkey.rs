@@ -9,9 +9,9 @@
 
 use scrozz_core::Error;
 use scrozz_shell::hotkey::{
-    reserved_shortcuts, Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, Session,
+    Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, Session, reserved_shortcuts,
 };
-use scrozz_shell::tray::{default_icon_rgba, menu_model, recording_label, TrayAction, TrayEntry};
+use scrozz_shell::tray::{TrayAction, TrayEntry, default_icon_rgba, menu_model, recording_label};
 use scrozz_shell::{Hotkey, HotkeyManager};
 
 fn hotkey(accelerator: &str) -> Hotkey {
@@ -167,7 +167,10 @@ fn every_reserved_shortcut_parses_and_is_detected() {
             entry.accelerator
         );
         assert!(!entry.owner.is_empty());
-        assert!(!entry.remedy.is_empty(), "a conflict without a remedy is a dead end");
+        assert!(
+            !entry.remedy.is_empty(),
+            "a conflict without a remedy is a dead end"
+        );
     }
 }
 
@@ -356,7 +359,10 @@ fn gnome_and_kde_are_recognised_and_do_have_a_portal() {
     ] {
         let session = Session::from_env(Some(desktop), Some("wayland-0"), Some("wayland"), None);
         assert_eq!(session.compositor, expected, "for {desktop}");
-        assert!(session.compositor.has_global_shortcut_portal(), "for {desktop}");
+        assert!(
+            session.compositor.has_global_shortcut_portal(),
+            "for {desktop}"
+        );
         assert!(
             !session.supports_global_hotkeys(),
             "the portal exists but is not wired up, so a binding here would never fire"
@@ -397,7 +403,9 @@ fn compositor_config_lines_are_exact() {
     let command = "scrozz capture region";
 
     assert_eq!(
-        Compositor::Sway.binding_for(&accelerator, command).as_deref(),
+        Compositor::Sway
+            .binding_for(&accelerator, command)
+            .as_deref(),
         Some("bindsym Shift+Mod4+4 exec scrozz capture region")
     );
     assert_eq!(
@@ -413,7 +421,9 @@ fn compositor_config_lines_are_exact() {
         Some("riverctl map normal Shift+Super 4 spawn 'scrozz capture region'")
     );
     assert_eq!(
-        Compositor::Niri.binding_for(&accelerator, command).as_deref(),
+        Compositor::Niri
+            .binding_for(&accelerator, command)
+            .as_deref(),
         Some("Shift+Mod+4 { spawn-sh \"scrozz capture region\"; }")
     );
 }
@@ -516,10 +526,7 @@ fn onboarding_can_generate_the_whole_config_block_at_once() {
     // is generated from what Scrozz *wanted* to bind.
     let region = parse("Win+Shift+4");
     let record = parse("Win+Shift+5");
-    let intended = [
-        (&region, "capture region"),
-        (&record, "record start"),
-    ];
+    let intended = [(&region, "capture region"), (&record, "record start")];
 
     let lines = manager.compositor_config(intended, |action| format!("scrozz {action}"));
     assert_eq!(
@@ -549,7 +556,10 @@ fn there_is_no_config_block_to_generate_on_a_platform_with_real_hotkeys() {
 #[test]
 fn a_wlroots_session_generates_one_config_line_per_binding() {
     let session = Session::from_env(Some("sway"), Some("wayland-1"), Some("wayland"), None);
-    let accelerators = [("Win+Shift+4", "capture.region"), ("Win+Shift+5", "record.toggle")];
+    let accelerators = [
+        ("Win+Shift+4", "capture.region"),
+        ("Win+Shift+5", "record.toggle"),
+    ];
 
     let lines: Vec<String> = accelerators
         .iter()
@@ -639,6 +649,26 @@ fn menu_ids_are_unique_and_round_trip() {
 }
 
 #[test]
+fn enabled_menu_items_are_never_clickable_no_ops() {
+    assert!(TrayAction::CaptureFullscreen.is_available());
+    assert!(TrayAction::Quit.is_available());
+
+    for unfinished in [
+        TrayAction::CaptureRegion,
+        TrayAction::CaptureWindow,
+        TrayAction::ToggleRecording,
+        TrayAction::OpenHistory,
+        TrayAction::OpenSettings,
+    ] {
+        assert!(
+            !unfinished.is_available(),
+            "{unfinished:?} has no end-to-end implementation and must look \
+             disabled rather than accept a click that appears to do nothing"
+        );
+    }
+}
+
+#[test]
 fn the_recording_entry_says_what_the_click_will_do() {
     assert_eq!(recording_label(false), "Start Recording");
     assert_eq!(recording_label(true), "Stop Recording");
@@ -648,12 +678,17 @@ fn the_recording_entry_says_what_the_click_will_do() {
 #[test]
 fn the_generated_menu_bar_icon_is_a_well_formed_template_image() {
     let rgba = default_icon_rgba();
-    assert_eq!(rgba.len(), 22 * 22 * 4, "22x22 RGBA");
+    assert_eq!(rgba.len(), 36 * 36 * 4, "36x36 RGBA, displayed at 18pt");
 
-    let opaque = rgba.as_chunks::<4>().0.iter().filter(|pixel| pixel[3] > 0).count();
+    let opaque = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] > 0)
+        .count();
     assert!(opaque > 0, "the icon must have some ink or nothing shows");
     assert!(
-        opaque < 22 * 22,
+        opaque < 36 * 36,
         "a fully opaque square is a solid block, not a glyph"
     );
 
@@ -661,7 +696,10 @@ fn the_generated_menu_bar_icon_is_a_well_formed_template_image() {
     // the RGB channels is discarded, and relying on it produces an icon that
     // vanishes on a dark menu bar.
     assert!(
-        rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0, 0, 0]),
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[..3] == [0, 0, 0]),
         "template images must be black with a shaped alpha channel"
     );
 }

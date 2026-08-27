@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use scrozz_core::{CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, TargetEnumerator};
+use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
 
@@ -340,7 +340,10 @@ fn list(what: ListWhat) -> CliResult<Report> {
                 Json::obj([
                     ("id", Json::str(w.id.0.as_str())),
                     ("title", Json::opt(w.title.as_deref(), Json::str)),
-                    ("application", Json::opt(w.application.as_deref(), Json::str)),
+                    (
+                        "application",
+                        Json::opt(w.application.as_deref(), Json::str),
+                    ),
                     ("width", Json::Float(w.bounds.size.width)),
                     ("height", Json::Float(w.bounds.size.height)),
                 ])

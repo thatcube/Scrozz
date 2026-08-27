@@ -37,6 +37,30 @@ pub fn unstable_backends_enabled() -> bool {
     std::env::var(UNSTABLE_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Whether the still-capture backend is ready without an opt-in guard.
+///
+/// macOS capture has been exercised against a real display, including Retina
+/// scale, stride, premultiplied alpha, encoding and clipboard delivery. Keeping
+/// that verified path behind an environment variable makes a Finder-launched
+/// app silently reject every menu capture because Finder does not inherit shell
+/// variables.
+#[must_use]
+pub const fn capture_backend_is_stable() -> bool {
+    // Unit tests deliberately retain the guard. Several command tests exercise
+    // error paths with synthetic capture arguments; letting those reach the
+    // verified backend captures the developer's real screen and writes into
+    // ~/Pictures, which is both invasive and nondeterministic.
+    cfg!(all(target_os = "macos", not(test)))
+}
+
+fn capture_guard(what: &str, provider: &'static str) -> CliResult<()> {
+    if capture_backend_is_stable() || unstable_backends_enabled() {
+        Ok(())
+    } else {
+        Err(CliError::not_implemented(what, provider))
+    }
+}
+
 fn guard(what: &str, provider: &'static str) -> CliResult<()> {
     if unstable_backends_enabled() {
         Ok(())
@@ -49,11 +73,12 @@ fn guard(what: &str, provider: &'static str) -> CliResult<()> {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::NotImplemented`] unless [`UNSTABLE_ENV`] is set, and
-/// otherwise whatever [`scrozz_capture::backend`] returns — including
+/// On a platform whose backend has not been verified, returns
+/// [`CliError::NotImplemented`] unless [`UNSTABLE_ENV`] is set. Otherwise returns
+/// whatever [`scrozz_capture::backend`] returns — including
 /// [`scrozz_core::Error::Unsupported`] on a compositor with no usable path.
 pub fn capture_backend() -> CliResult<Box<dyn CaptureBackend>> {
-    guard("taking a capture", "scrozz-capture")?;
+    capture_guard("taking a capture", "scrozz-capture")?;
     Ok(scrozz_capture::backend()?)
 }
 
@@ -65,7 +90,7 @@ pub fn capture_backend() -> CliResult<Box<dyn CaptureBackend>> {
 /// reports [`scrozz_core::Error::Unsupported`] under Wayland; that is a designed
 /// outcome (D8), not a failure of this function.
 pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
-    guard("listing displays and windows", "scrozz-capture")?;
+    capture_guard("listing displays and windows", "scrozz-capture")?;
     // Enumeration is part of the capture backend rather than a separate object:
     // the two have to agree about identifiers, and splitting them is how a
     // window id starts meaning two different things. `CaptureBackend` has
@@ -202,9 +227,15 @@ pub fn become_accessory_app() -> CliResult<()> {
 #[must_use]
 pub fn readiness() -> Vec<(&'static str, bool)> {
     vec![
-        ("capture", unstable_backends_enabled()),
+        (
+            "capture",
+            capture_backend_is_stable() || unstable_backends_enabled(),
+        ),
         ("record", unstable_backends_enabled()),
-        ("enumerate", unstable_backends_enabled()),
+        (
+            "enumerate",
+            capture_backend_is_stable() || unstable_backends_enabled(),
+        ),
         ("store", true),
         ("ocr", ocr_available()),
         ("decode", true),
@@ -226,9 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_backends_report_rather_than_panic() {
-        // The whole point: no `todo!()` is ever reached by default, so no user
-        // ever sees exit 101 and a backtrace for a thing we already know about.
+    fn test_builds_keep_the_capture_guard_even_on_macos() {
         let _env = test_env::lock();
         test_env::clear(UNSTABLE_ENV);
         let err = err_of(capture_backend());
@@ -335,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn enumeration_is_gated_but_no_longer_a_gap() {
+    fn enumeration_is_guarded_in_tests_but_no_longer_a_gap() {
         // Enumeration is now wired to the capture backend, so with the guard
         // lifted this either succeeds or fails for a *platform* reason — a
         // missing permission, or a compositor with no usable path. What it must
@@ -352,9 +381,8 @@ mod tests {
             );
         }
 
-        // With the guard in place it is still refused, so an unfinished backend
-        // is never reached by accident. Reuses the lock already held: taking it
-        // twice in one test deadlocks.
+        // Test builds always retain the guard, including on macOS, so a unit
+        // test never enumerates the developer's real desktop accidentally.
         assert_eq!(err_of(target_enumerator()).exit(), Exit::NotImplemented);
     }
 
@@ -396,7 +424,13 @@ mod tests {
         assert_eq!(
             names,
             [
-                "capture", "record", "enumerate", "store", "ocr", "decode", "gui"
+                "capture",
+                "record",
+                "enumerate",
+                "store",
+                "ocr",
+                "decode",
+                "gui"
             ]
         );
     }

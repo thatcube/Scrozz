@@ -98,6 +98,17 @@ impl TrayAction {
     pub fn from_id(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|action| action.id() == id)
     }
+
+    /// Whether this menu row has an end-to-end implementation in this build.
+    ///
+    /// An enabled item that only writes "not wired up yet" to a log the user
+    /// cannot see is indistinguishable from a broken button. Keep unfinished
+    /// rows visible so the intended product surface is legible, but disabled
+    /// until they can actually fulfil the click.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        matches!(self, Self::CaptureFullscreen | Self::Quit)
+    }
 }
 
 /// One row of the tray menu.
@@ -134,52 +145,27 @@ pub const fn menu_model() -> &'static [TrayEntry] {
 // The icon
 // ---------------------------------------------------------------------------
 
-/// The dimension of the generated menu-bar glyph, in pixels.
-const ICON_SIZE: u32 = 22;
-
-/// Draws Scrozz's menu-bar glyph: a camera body with a lens.
+/// Pixel dimensions of the 2× menu-bar template.
 ///
-/// Generated rather than shipped as a file so the crate has no asset
-/// dependency and the tray works from a bare `cargo run`. It is drawn in pure
-/// black with a shaped alpha channel, which is exactly what macOS wants from a
-/// template image — the system recolours it for light, dark and highlighted
-/// menu bars, and a coloured icon there looks broken.
+/// `tray-icon` displays this at 18 points on macOS, so 36 real pixels map
+/// exactly to a Retina backing scale. The original mark sits unscaled on a
+/// 32px grid inside it; no logo vertex is moved off Brandon's pixel grid.
+const ICON_SIZE: u32 = 36;
+
+/// Draws the Scrozz mark for the menu bar.
+///
+/// This is Brandon's exact 32px SVG mark — the same four crop corners, `zz`
+/// eyes and smile as the app icon — placed unscaled on a 36px Retina canvas.
+/// The pre-rasterized bytes avoid adding an image decoder to the shell crate
+/// while keeping every logo vertex on its original pixel.
+///
+/// RGB stays pure black and identity lives in alpha. That is exactly what macOS
+/// wants from a template image: the system recolours it for light, dark and
+/// highlighted menu bars. A purple menu-bar bitmap would look wrong in at least
+/// one of those states.
 #[must_use]
 pub fn default_icon_rgba() -> Vec<u8> {
-    let size = ICON_SIZE as f32;
-    let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-
-    let centre = size / 2.0;
-    let lens_outer = size * 0.26;
-    let lens_inner = size * 0.16;
-    let body_half_w = size * 0.44;
-    let body_half_h = size * 0.34;
-    let border = size * 0.09;
-
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            #[allow(clippy::cast_precision_loss)]
-            let (px, py) = (x as f32 + 0.5 - centre, y as f32 + 0.5 - centre);
-
-            // Camera body: a rounded rectangle outline, with a small hump for
-            // the viewfinder on its top-left.
-            let in_body = px.abs() <= body_half_w && py.abs() <= body_half_h;
-            let in_body_hole = px.abs() <= body_half_w - border && py.abs() <= body_half_h - border;
-            let hump = (-body_half_w * 0.75..=-body_half_w * 0.15).contains(&px)
-                && (-body_half_h - border * 1.2..=-body_half_h).contains(&py);
-
-            let distance = px.hypot(py);
-            let in_lens = distance <= lens_outer && distance >= lens_inner;
-
-            let ink = (in_body && !in_body_hole) || hump || in_lens;
-            if ink {
-                let index = ((y * ICON_SIZE + x) * 4) as usize;
-                rgba[index + 3] = 255;
-            }
-        }
-    }
-
-    rgba
+    include_bytes!("../assets/scrozz-menu-36.rgba").to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +271,8 @@ impl Tray {
                     append(&menu, &separator)?;
                 }
                 TrayEntry::Item(action) => {
-                    let item = MenuItem::with_id(action.id(), action.label(), true, None);
+                    let item =
+                        MenuItem::with_id(action.id(), action.label(), action.is_available(), None);
                     append(&menu, &item)?;
                     if action == TrayAction::ToggleRecording {
                         record_item = Some(item);

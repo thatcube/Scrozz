@@ -18,22 +18,22 @@ pub mod permissions;
 pub mod tray;
 
 pub use drag::{
-    byte_source, native_drag_source, ByteSource, DragCapability, DragFormat, DragOperation,
-    DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
-    NativeSurface, PromisedFile,
+    ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
+    DragPreview, DragSession, DragSource, NativeDragSource, NativeSurface, PromisedFile,
+    byte_source, native_drag_source,
 };
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,
 };
 pub use overlay::{
-    anchor_bottom_left, appkit_to_logical, logical_to_appkit, AppKitRect, NativeOverlay,
-    OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
+    AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
+    anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
 pub use permissions::SystemPermissions;
 pub use tray::{Tray, TrayAction, TrayEntry};
 
-use scrozz_core::{Display, LogicalRect, Result};
+use scrozz_core::{LogicalRect, Result};
 
 /// A floating, chrome-less window that lives over the desktop.
 ///
@@ -59,7 +59,8 @@ use scrozz_core::{Display, LogicalRect, Result};
 pub trait OverlayWindow {
     /// Anchors this overlay within a display's work area.
     ///
-    /// Callers pass [`Display::work_area`], never [`Display::bounds`]: anchoring
+    /// Callers pass [`scrozz_core::Display::work_area`], never
+    /// [`scrozz_core::Display::bounds`]: anchoring
     /// to raw display bounds puts the overlay behind the Dock or taskbar.
     ///
     /// # Errors
