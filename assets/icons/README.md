@@ -9,6 +9,7 @@ truth. Do not edit the PNGs, the `.icns` or the `.ico` by hand — regenerate th
 | `scrozz-icon-32.svg` | Pixel-snapped Finder-list/Dock artwork |
 | `scrozz-icon-16.svg` | 16px derivative of the exact 32px master |
 | `Scrozz.icon/` | Native layered macOS 26 icon (light and dark appearances) |
+| `scrozz-menu-50.png` | Maximized monochrome menu-bar template preview |
 | `scrozz-mark.svg` | The bare 32px mark on a flat plate, for in-app use and favicons |
 | `Scrozz.icns` | macOS app bundle |
 | `Scrozz.ico` | Windows executable and installer |
@@ -65,6 +66,18 @@ The layered icon has real light and dark appearances. Light mode uses a pale
 lavender plate with a dark-violet mark; dark mode keeps the near-black plate and
 the original purple mark. The foreground halo peaks at 16.5% opacity—exactly 25%
 below the first version—so it reads as ambient light rather than a visible disc.
+
+### Menu-bar mark
+
+The menu bar uses the logo, not a generic camera glyph. `tray-icon` fixes status
+images at 18 points regardless of input bitmap dimensions. Brandon's exact 32px
+mark is therefore doubled to 64px—preserving every pixel-grid decision—and
+cropped to a 50px canvas with one physical pixel of safety on every side.
+
+The painted 48px bounds occupy **17.28 of the available 18 points**, as large as
+the slot safely permits without clipping. The RGBA source is pure black with a
+shaped alpha channel so macOS recolors it correctly for light, dark, and
+highlighted menu bars.
 
 ## Regenerating
 

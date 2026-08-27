@@ -264,7 +264,6 @@ impl Worker {
         let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
-        let written = write_default(&bytes, ImageFormat::Png);
 
         self.cache.insert(
             card,
@@ -282,7 +281,10 @@ impl Worker {
             source_height: capture.frame.height(),
             scale: capture.frame.scale.get(),
             thumbnail,
-            written,
+            // History persistence is internal and does not count as an export.
+            // A visible file is created only when the user presses Save; writing
+            // one here made Save create a duplicate a few seconds later.
+            written: Vec::new(),
             taken_at: SystemTime::now(),
         })
     }
@@ -338,24 +340,7 @@ impl Worker {
     }
 }
 
-/// Writes a capture to the default folder, reporting where it went.
-///
-/// Failure is logged rather than propagated: a capture the user can still see
-/// and copy is better than no card at all because a disk was full.
-fn write_default(bytes: &[u8], format: ImageFormat) -> Vec<String> {
-    match default_path(format).and_then(|path| {
-        std::fs::write(&path, bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
-        Ok(path)
-    }) {
-        Ok(path) => vec![path.display().to_string()],
-        Err(err) => {
-            tracing::warn!("could not save the capture: {err}");
-            Vec::new()
-        }
-    }
-}
-
-/// Where an unasked-for capture goes.
+/// Where a capture goes when the user presses Save.
 ///
 /// Per D18 this is any folder the user picks, which is what lets a Dropbox or
 /// iCloud directory provide sync for free with no service on our side. Until

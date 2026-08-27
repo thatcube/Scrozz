@@ -145,19 +145,19 @@ pub const fn menu_model() -> &'static [TrayEntry] {
 // The icon
 // ---------------------------------------------------------------------------
 
-/// Pixel dimensions of the 2× menu-bar template.
+/// Pixel dimensions of the high-resolution menu-bar template.
 ///
-/// `tray-icon` displays this at 18 points on macOS, so 36 real pixels map
-/// exactly to a Retina backing scale. The original mark sits unscaled on a
-/// 32px grid inside it; no logo vertex is moved off Brandon's pixel grid.
-const ICON_SIZE: u32 = 36;
+/// `tray-icon` always displays this at 18 points on macOS. The original 32px
+/// mark is doubled to preserve its grid, then cropped to a 50px canvas with one
+/// physical pixel of safety on every side. Its visible bounds therefore occupy
+/// 48/50 × 18 = 17.28 points: as large as the system slot safely permits.
+const ICON_SIZE: u32 = 50;
 
 /// Draws the Scrozz mark for the menu bar.
 ///
 /// This is Brandon's exact 32px SVG mark — the same four crop corners, `zz`
-/// eyes and smile as the app icon — placed unscaled on a 36px Retina canvas.
-/// The pre-rasterized bytes avoid adding an image decoder to the shell crate
-/// while keeping every logo vertex on its original pixel.
+/// eyes and smile as the app icon — doubled on-grid and tightly cropped. The
+/// pre-rasterized bytes avoid adding an image decoder to the shell crate.
 ///
 /// RGB stays pure black and identity lives in alpha. That is exactly what macOS
 /// wants from a template image: the system recolours it for light, dark and
@@ -165,7 +165,7 @@ const ICON_SIZE: u32 = 36;
 /// one of those states.
 #[must_use]
 pub fn default_icon_rgba() -> Vec<u8> {
-    include_bytes!("../assets/scrozz-menu-36.rgba").to_vec()
+    include_bytes!("../assets/scrozz-menu-50.rgba").to_vec()
 }
 
 // ---------------------------------------------------------------------------
