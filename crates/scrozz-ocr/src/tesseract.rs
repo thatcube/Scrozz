@@ -126,14 +126,43 @@ struct TesseractInstallation {
 }
 
 fn tesseract_installation(directory: Option<&OsStr>) -> Result<TesseractInstallation> {
-    let Some(directory) = directory else {
-        return Ok(TesseractInstallation {
+    if let Some(directory) = directory {
+        return tesseract_installation_in(Path::new(directory), true);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let executable = std::env::current_exe().map_err(Error::Io)?;
+        let directory = sibling_tesseract_directory(&executable)?;
+        tesseract_installation_in(&directory, false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(TesseractInstallation {
             program: PathBuf::from("tesseract"),
             tessdata: None,
-        });
-    };
-    let directory = Path::new(directory);
-    if !directory.is_absolute() {
+        })
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn sibling_tesseract_directory(executable: &Path) -> Result<PathBuf> {
+    executable
+        .parent()
+        .map(|parent| parent.join("tesseract"))
+        .ok_or_else(|| {
+            Error::Platform(format!(
+                "cannot resolve the Tesseract payload beside {}",
+                executable.display()
+            ))
+        })
+}
+
+fn tesseract_installation_in(
+    directory: &Path,
+    explicitly_configured: bool,
+) -> Result<TesseractInstallation> {
+    if explicitly_configured && !directory.is_absolute() {
         return Err(Error::InvalidRequest(format!(
             "{TESSERACT_DIRECTORY_ENV} must be an absolute directory"
         )));
@@ -147,11 +176,19 @@ fn tesseract_installation(directory: Option<&OsStr>) -> Result<TesseractInstalla
     let program = directory.join(executable);
     let tessdata = directory.join("tessdata");
     if !program.is_file() || !tessdata.is_dir() {
+        let source = if explicitly_configured {
+            format!("{TESSERACT_DIRECTORY_ENV} must contain")
+        } else {
+            "the portable artifact must contain".to_string()
+        };
         return Err(Error::Unsupported {
-            what: "text recognition with the configured Tesseract installation".to_string(),
+            what: if explicitly_configured {
+                "text recognition with the configured Tesseract installation".to_string()
+            } else {
+                "text recognition from the portable Windows artifact".to_string()
+            },
             why: format!(
-                "{TESSERACT_DIRECTORY_ENV} must contain `{executable}` and a `tessdata` directory; \
-                 configured path: {}",
+                "{source} `{executable}` and a `tessdata` directory; checked path: {}",
                 directory.display()
             ),
         });
@@ -624,7 +661,7 @@ fn spawn_error(error: std::io::Error) -> Error {
         Error::Unsupported {
             what: "text recognition with Tesseract".to_string(),
             why: format!(
-                "the `tesseract` executable was not found on PATH. {}",
+                "the Tesseract executable could not be found. {}",
                 install_guidance()
             ),
         }
@@ -663,8 +700,8 @@ fn install_guidance() -> &'static str {
 
 #[cfg(target_os = "windows")]
 fn install_guidance() -> &'static str {
-    "Install the local Tesseract OCR distribution and its language data, then add its install \
-     directory to PATH; the UB Mannheim Windows build is the commonly maintained distribution."
+    "Keep the packaged `tesseract` directory beside `scrozz.exe`, or set \
+     `SCROZZ_TESSERACT_DIR` to an absolute Tesseract directory for a source build."
 }
 
 #[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
@@ -745,6 +782,14 @@ mod tests {
     fn configured_tesseract_directory_must_be_absolute() {
         let error = tesseract_installation(Some(OsStr::new("relative/tesseract"))).unwrap_err();
         assert!(matches!(error, Error::InvalidRequest(message) if message.contains("absolute")));
+    }
+
+    #[test]
+    fn portable_windows_layout_is_sibling_to_the_executable() {
+        assert_eq!(
+            sibling_tesseract_directory(Path::new("/artifact/scrozz.exe")).unwrap(),
+            PathBuf::from("/artifact/tesseract")
+        );
     }
 
     #[test]

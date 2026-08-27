@@ -60,7 +60,8 @@ pub use prepare::UpscalePolicy;
 ///
 /// Portable Windows expects `tesseract.exe` and `tessdata/*.traineddata` below
 /// this directory. Linux expects `tesseract` with the same `tessdata` layout.
-/// When unset, Scrozz resolves `tesseract` through `PATH`.
+/// When unset, portable Windows uses `tesseract/` beside `scrozz.exe`; Linux
+/// resolves `tesseract` through `PATH`.
 pub const TESSERACT_DIRECTORY_ENV: &str = "SCROZZ_TESSERACT_DIR";
 
 #[cfg(target_os = "macos")]
