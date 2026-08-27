@@ -539,7 +539,7 @@ fn runtime_json() -> Json {
     #[cfg(target_os = "windows")]
     {
         let identity = platform::windows_package_identity();
-        return Json::obj([(
+        Json::obj([(
             "package_identity",
             package_identity_json(
                 identity.state(),
@@ -547,7 +547,7 @@ fn runtime_json() -> Json {
                 identity.failure_status(),
                 identity.failure_detail(),
             ),
-        )]);
+        )])
     }
     #[cfg(not(target_os = "windows"))]
     {

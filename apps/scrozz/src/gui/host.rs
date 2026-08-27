@@ -464,11 +464,11 @@ fn pointer_probe() -> Option<scrozz_ui::PointerProbe> {
         // `Sync`). It closes over the handle as an integer instead; every call
         // it makes is a read-only query that Windows documents as usable from
         // any thread, and a stale handle is caught by `IsWindow`.
-        return Some(std::sync::Arc::new(|| {
+        Some(std::sync::Arc::new(|| {
             let hwnd = crate::gui::panel::overlay_hwnd();
             let (x, y) = scrozz_shell::windows::overlay::pointer_in_hwnd(hwnd)?;
             Some(egui::pos2(x as f32, y as f32))
-        }));
+        }))
     }
 
     #[cfg(not(target_os = "windows"))]
