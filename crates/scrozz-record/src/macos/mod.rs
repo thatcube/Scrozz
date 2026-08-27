@@ -3,13 +3,13 @@
 mod audio;
 mod compositor;
 mod content;
-mod error;
-mod mix;
+pub(crate) mod error;
+pub(crate) mod mix;
 mod overlay;
-mod pcm;
+pub(crate) mod pcm;
 mod permission;
 mod plan;
-mod settings;
+pub(crate) mod settings;
 mod stream;
 mod timeline;
 mod writer;

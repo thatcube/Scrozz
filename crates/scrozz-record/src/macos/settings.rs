@@ -11,7 +11,7 @@ use objc2_av_foundation::{
 use objc2_foundation::{NSMutableDictionary, NSNumber, NSString};
 use scrozz_core::{Error, Result};
 
-use crate::VideoCodec;
+use crate::{Quality, VideoCodec};
 
 use super::plan::RecordingPlan;
 
@@ -22,15 +22,46 @@ pub(crate) fn video(
     plan: &RecordingPlan,
     fps: u32,
 ) -> Result<objc2::rc::Retained<SettingsDictionary>> {
+    video_settings(
+        plan.codec,
+        plan.size.width.round() as u32,
+        plan.size.height.round() as u32,
+        plan.bitrate,
+        fps,
+    )
+}
+
+pub(crate) fn transcode_video(
+    width: u32,
+    height: u32,
+    fps: u32,
+    quality: Quality,
+) -> Result<objc2::rc::Retained<SettingsDictionary>> {
+    video_settings(
+        VideoCodec::H264,
+        width,
+        height,
+        quality.target_bitrate(width, height, fps),
+        fps,
+    )
+}
+
+fn video_settings(
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+    target_bitrate: u64,
+    fps: u32,
+) -> Result<objc2::rc::Retained<SettingsDictionary>> {
     let settings = SettingsDictionary::new();
     let compression = SettingsDictionary::new();
     let encoder = SettingsDictionary::new();
 
-    let bitrate = NSNumber::numberWithUnsignedLongLong(plan.bitrate);
+    let bitrate = NSNumber::numberWithUnsignedLongLong(target_bitrate);
     let frame_rate = NSNumber::numberWithUnsignedInt(fps);
     let keyframe_interval = NSNumber::numberWithDouble(MAX_KEYFRAME_INTERVAL_SECONDS);
-    let width = NSNumber::numberWithUnsignedInt(plan.size.width.round() as u32);
-    let height = NSNumber::numberWithUnsignedInt(plan.size.height.round() as u32);
+    let width = NSNumber::numberWithUnsignedInt(width);
+    let height = NSNumber::numberWithUnsignedInt(height);
     let require_hardware = NSNumber::numberWithBool(true);
     let hardware_key = NSString::from_str("RequireHardwareAcceleratedVideoEncoder");
 
@@ -77,7 +108,7 @@ pub(crate) fn video(
     compression.insert(keyframe_interval_key, any(&*keyframe_interval));
     encoder.insert(&*hardware_key, any(&*require_hardware));
 
-    let codec = match plan.codec {
+    let codec = match codec {
         // SAFETY: immutable weak-linked AVFoundation constants.
         VideoCodec::H264 => unsafe { required(AVVideoCodecTypeH264, "AVVideoCodecTypeH264") }?,
         // SAFETY: immutable weak-linked AVFoundation constants.
@@ -100,13 +131,18 @@ pub(crate) fn video(
 }
 
 pub(crate) fn audio() -> objc2::rc::Retained<SettingsDictionary> {
+    audio_for_channels(2)
+}
+
+pub(crate) fn audio_for_channels(channel_count: u16) -> objc2::rc::Retained<SettingsDictionary> {
     const MPEG4_AAC: u32 = u32::from_be_bytes(*b"aac ");
 
     let settings = SettingsDictionary::new();
     let format = NSNumber::numberWithUnsignedInt(MPEG4_AAC);
     let sample_rate = NSNumber::numberWithDouble(48_000.0);
-    let channels = NSNumber::numberWithUnsignedInt(2);
-    let bitrate = NSNumber::numberWithUnsignedInt(192_000);
+    let channels = NSNumber::numberWithUnsignedInt(u32::from(channel_count));
+    let bitrate =
+        NSNumber::numberWithUnsignedInt(if channel_count == 1 { 96_000 } else { 192_000 });
     let format_key = NSString::from_str("AVFormatIDKey");
     let sample_rate_key = NSString::from_str("AVSampleRateKey");
     let channels_key = NSString::from_str("AVNumberOfChannelsKey");
@@ -126,7 +162,7 @@ fn required<T>(value: Option<&'static T>, name: &str) -> Result<&'static T> {
     })
 }
 
-fn any<T: Message + ?Sized>(value: &T) -> &AnyObject {
+pub(crate) fn any<T: Message + ?Sized>(value: &T) -> &AnyObject {
     // SAFETY: every `Message` is an Objective-C object pointer and `AnyObject`
     // is its type-erased representation. The returned borrow cannot outlive it.
     unsafe { &*(std::ptr::from_ref(value).cast::<AnyObject>()) }

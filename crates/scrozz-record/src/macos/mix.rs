@@ -26,11 +26,19 @@ impl PcmChunk {
     }
 
     pub(crate) fn stereo_48khz(&self) -> Self {
-        if self.samples.is_empty() || self.sample_rate == 0 || self.channels == 0 {
+        self.to_48khz_channels(MIX_CHANNELS)
+    }
+
+    pub(crate) fn to_48khz_channels(&self, output_channels: u16) -> Self {
+        if self.samples.is_empty()
+            || self.sample_rate == 0
+            || self.channels == 0
+            || output_channels == 0
+        {
             return Self {
                 start_frame: scale_frame(self.start_frame, self.sample_rate, MIX_SAMPLE_RATE),
                 sample_rate: MIX_SAMPLE_RATE,
-                channels: MIX_CHANNELS,
+                channels: output_channels,
                 samples: Vec::new(),
             };
         }
@@ -38,7 +46,7 @@ impl PcmChunk {
         let source_frames = self.frames();
         let output_frames = ((source_frames as u64 * u64::from(MIX_SAMPLE_RATE))
             / u64::from(self.sample_rate)) as usize;
-        let mut samples = Vec::with_capacity(output_frames * usize::from(MIX_CHANNELS));
+        let mut samples = Vec::with_capacity(output_frames * usize::from(output_channels));
         for output_frame in 0..output_frames {
             let source_position =
                 output_frame as f64 * f64::from(self.sample_rate) / f64::from(MIX_SAMPLE_RATE);
@@ -46,9 +54,9 @@ impl PcmChunk {
             let second = (first + 1).min(source_frames.saturating_sub(1));
             let blend = (source_position - first as f64) as f32;
 
-            for channel in 0..usize::from(MIX_CHANNELS) {
-                let first_sample = self.channel_sample(first, channel);
-                let second_sample = self.channel_sample(second, channel);
+            for channel in 0..usize::from(output_channels) {
+                let first_sample = self.output_sample(first, channel, output_channels);
+                let second_sample = self.output_sample(second, channel, output_channels);
                 samples.push(first_sample + (second_sample - first_sample) * blend);
             }
         }
@@ -56,9 +64,20 @@ impl PcmChunk {
         Self {
             start_frame: scale_frame(self.start_frame, self.sample_rate, MIX_SAMPLE_RATE),
             sample_rate: MIX_SAMPLE_RATE,
-            channels: MIX_CHANNELS,
+            channels: output_channels,
             samples,
         }
+    }
+
+    fn output_sample(&self, frame: usize, output_channel: usize, output_channels: u16) -> f32 {
+        if output_channels == 1 && self.channels > 1 {
+            let channels = usize::from(self.channels);
+            return (0..channels)
+                .map(|channel| self.channel_sample(frame, channel))
+                .sum::<f32>()
+                / channels as f32;
+        }
+        self.channel_sample(frame, output_channel)
     }
 
     fn channel_sample(&self, frame: usize, output_channel: usize) -> f32 {

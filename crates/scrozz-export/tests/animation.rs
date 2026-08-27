@@ -61,6 +61,31 @@ fn encoding_is_deterministic_and_repeat_is_explicit() {
 }
 
 #[test]
+fn streaming_encoder_uses_cumulative_centisecond_quantization() {
+    let encoder = GifAnimationEncoder::with_repeat(AnimationRepeat::Once);
+    let mut stream = encoder.stream(Vec::new());
+    stream
+        .write_frame(solid(2, 2, [255, 0, 0, 255], 15))
+        .unwrap();
+    stream
+        .write_frame(solid(2, 2, [0, 0, 255, 255], 15))
+        .unwrap();
+    let bytes = stream.finish().unwrap();
+
+    let decoded = GifDecoder::new(Cursor::new(bytes))
+        .unwrap()
+        .into_frames()
+        .collect_frames()
+        .unwrap();
+    let delays: Vec<_> = decoded
+        .iter()
+        .map(|frame| frame.delay().numer_denom_ms().0)
+        .collect();
+    assert_eq!(delays, [20, 10]);
+    assert_eq!(delays.iter().sum::<u32>(), 30);
+}
+
+#[test]
 fn malformed_animation_inputs_are_errors_not_panics() {
     let encoder = GifAnimationEncoder::new();
     assert!(encoder.encode(&[]).is_err());

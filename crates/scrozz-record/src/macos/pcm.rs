@@ -17,11 +17,11 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
     CMAudioFormatDescriptionCreate, CMAudioFormatDescriptionGetStreamBasicDescription,
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
-    kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+    kCMSampleBufferError_ArrayTooSmall, kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
 };
 use scrozz_core::{Error, Result};
 
-use super::mix::{MIX_CHANNELS, MIX_SAMPLE_RATE, PcmChunk};
+use super::mix::PcmChunk;
 
 const FLOAT32_FLAGS: u32 = kAudioFormatFlagIsFloat | (1 << 3);
 
@@ -66,16 +66,30 @@ pub(crate) fn decode(sample: &CMSampleBuffer) -> Result<PcmChunk> {
         });
     }
 
-    let buffer_capacity = usize::try_from(asbd.mChannelsPerFrame)
-        .map_err(|_| Error::Codec("PCM channel count overflowed usize".to_owned()))?
-        .max(1);
-    let list_size = size_of::<AudioBufferList>()
-        .checked_add(
-            buffer_capacity
-                .saturating_sub(1)
-                .saturating_mul(size_of::<AudioBuffer>()),
+    let mut list_size = 0usize;
+    // SAFETY: a null output list with a zero size is CoreMedia's documented
+    // size-query operation.
+    let query_status = unsafe {
+        sample.audio_buffer_list_with_retained_block_buffer(
+            &mut list_size,
+            null_mut(),
+            0,
+            None,
+            None,
+            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            null_mut(),
         )
-        .ok_or_else(|| Error::Codec("PCM buffer list size overflowed usize".to_owned()))?;
+    };
+    if query_status != 0 && query_status != kCMSampleBufferError_ArrayTooSmall {
+        return Err(Error::Codec(format!(
+            "querying captured PCM buffer-list size failed with status {query_status}"
+        )));
+    }
+    if list_size < size_of::<AudioBufferList>() {
+        return Err(Error::Codec(format!(
+            "CoreMedia requested an invalid {list_size}-byte PCM buffer list"
+        )));
+    }
     let storage_words = list_size.div_ceil(size_of::<u64>());
     let mut storage = vec![0_u64; storage_words];
     let list = storage.as_mut_ptr().cast::<AudioBufferList>();
@@ -110,6 +124,8 @@ pub(crate) fn decode(sample: &CMSampleBuffer) -> Result<PcmChunk> {
     let buffers = unsafe {
         let count = usize::try_from((*list).mNumberBuffers)
             .map_err(|_| Error::Codec("PCM buffer count overflowed usize".to_owned()))?;
+        let list_header = size_of::<AudioBufferList>() - size_of::<AudioBuffer>();
+        let buffer_capacity = list_size.saturating_sub(list_header) / size_of::<AudioBuffer>();
         if count > buffer_capacity {
             return Err(Error::Codec(format!(
                 "CoreMedia returned {count} PCM buffers for capacity {buffer_capacity}"
@@ -147,9 +163,24 @@ pub(crate) fn decode(sample: &CMSampleBuffer) -> Result<PcmChunk> {
 
 pub(crate) fn encode(chunk: &PcmChunk) -> Result<CFRetained<CMSampleBuffer>> {
     let chunk = chunk.stereo_48khz();
+    encode_normalized(&chunk)
+}
+
+pub(crate) fn encode_normalized(chunk: &PcmChunk) -> Result<CFRetained<CMSampleBuffer>> {
     if chunk.samples.is_empty() {
         return Err(Error::Codec(
             "cannot create a CoreMedia buffer from empty PCM".to_owned(),
+        ));
+    }
+    if chunk.sample_rate == 0
+        || chunk.channels == 0
+        || !chunk
+            .samples
+            .len()
+            .is_multiple_of(usize::from(chunk.channels))
+    {
+        return Err(Error::Codec(
+            "cannot create a CoreMedia buffer from malformed PCM".to_owned(),
         ));
     }
     let data_length = chunk
@@ -193,15 +224,15 @@ pub(crate) fn encode(chunk: &PcmChunk) -> Result<CFRetained<CMSampleBuffer>> {
         )));
     }
 
-    let bytes_per_frame = u32::from(MIX_CHANNELS) * size_of::<f32>() as u32;
+    let bytes_per_frame = u32::from(chunk.channels) * size_of::<f32>() as u32;
     let stream = AudioStreamBasicDescription {
-        mSampleRate: f64::from(MIX_SAMPLE_RATE),
+        mSampleRate: f64::from(chunk.sample_rate),
         mFormatID: kAudioFormatLinearPCM,
         mFormatFlags: FLOAT32_FLAGS,
         mBytesPerPacket: bytes_per_frame,
         mFramesPerPacket: 1,
         mBytesPerFrame: bytes_per_frame,
-        mChannelsPerFrame: u32::from(MIX_CHANNELS),
+        mChannelsPerFrame: u32::from(chunk.channels),
         mBitsPerChannel: 32,
         mReserved: 0,
     };
@@ -232,9 +263,9 @@ pub(crate) fn encode(chunk: &PcmChunk) -> Result<CFRetained<CMSampleBuffer>> {
 
     let timing = CMSampleTimingInfo {
         // SAFETY: positive sample rate is a valid timescale.
-        duration: unsafe { CMTime::new(1, MIX_SAMPLE_RATE as i32) },
+        duration: unsafe { CMTime::new(1, chunk.sample_rate as i32) },
         // SAFETY: start_frame is expressed in the same positive timescale.
-        presentationTimeStamp: unsafe { CMTime::new(chunk.start_frame, MIX_SAMPLE_RATE as i32) },
+        presentationTimeStamp: unsafe { CMTime::new(chunk.start_frame, chunk.sample_rate as i32) },
         // SAFETY: zeroed flags represent CoreMedia's invalid decode-time sentinel.
         decodeTimeStamp: unsafe { std::mem::zeroed() },
     };
