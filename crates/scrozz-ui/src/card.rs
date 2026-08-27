@@ -20,21 +20,17 @@
 //! and why this module never wraps one in a fade. Instant feedback reads as
 //! faster than an eased one, and a control is not an object.
 //!
-//! # D9: exported window pixels are never composited onto
+//! # D9: preview treatment never changes exported pixels
 //!
-//! A window capture already carries the compositor's own corner radius, its
-//! shadow, and the transparency between the two. Painting a synthetic radius,
-//! shadow, padding or backing plate into those pixels produces a double corner
-//! and a double shadow.
-//!
-//! The floating stack is presentation, not export. Every thumbnail therefore
-//! fills the same removable, aspect-hugging preview container edge to edge,
-//! while a window thumbnail keeps its native alpha and receives no synthetic
-//! clipping or border. Hover and caption washes follow the outer container,
-//! never an unrelated fixed slot.
+//! The floating stack is presentation, not export. Every thumbnail is cover-fit
+//! into the same fixed frame and clipped to the same radius, regardless of
+//! capture type. That intentionally crops only the transient preview; the
+//! capture handed to the clipboard, file encoder and editor is untouched.
 
 use egui::epaint::{Mesh, Vertex};
-use egui::{Align2, Color32, Id, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{
+    Align2, Color32, Id, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
+};
 use scrozz_core::Provenance;
 
 use crate::icons::Icon;
@@ -59,22 +55,18 @@ const CAPTION_H: f32 = 58.0;
 const COMPACT_CHROME_W: f32 = 154.0;
 /// Height below which the two-row chrome collapses to icon-only controls.
 const COMPACT_CHROME_H: f32 = 72.0;
-/// Smallest outer dimension that can still carry one 28pt compact control.
-const MIN_INTERACTIVE_SIDE: f32 = ICON_BTN + CHROME_INSET * 2.0;
-
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
 
 /// The geometry a card is allowed to add around a capture.
 ///
-/// Derived from [`Provenance`] alone, so the D9 decision is one pure function
-/// with one input and no ambient state. Constructing it is free; asserting on it
-/// is exact.
+/// Accepts [`Provenance`] at the boundary so future platform-specific treatment
+/// cannot bypass this decision. Today every provenance intentionally resolves
+/// to the same preview chrome.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CardChrome {
-    /// Corner radius applied to the capture, in points. Zero when the capture
-    /// carries its own corners.
+    /// Corner radius applied to the preview, in points.
     pub thumb_radius: f32,
     /// Radius for anything drawn over the shared preview container.
     pub overlay_radius: f32,
@@ -86,7 +78,7 @@ pub struct CardChrome {
     pub shadow: bool,
     /// Whether the preview draws a hairline around the thumbnail.
     ///
-    /// Window captures keep the platform-provided edge and alpha untouched.
+    /// The border is preview chrome and is never written into exported pixels.
     pub capture_border: bool,
 }
 
@@ -103,26 +95,14 @@ impl CardChrome {
     /// The chrome permitted for a capture of this provenance.
     #[must_use]
     pub fn for_provenance(provenance: Provenance) -> Self {
-        if provenance.forbids_compositing() {
-            // The shared container lives outside the thumbnail. The thumbnail
-            // itself keeps the native window pixels, alpha and edge untouched.
-            Self {
-                thumb_radius: 0.0,
-                overlay_radius: Self::OUTER_RADIUS,
-                padding: Self::PADDING,
-                plate: true,
-                shadow: true,
-                capture_border: false,
-            }
-        } else {
-            Self {
-                thumb_radius: Self::OUTER_RADIUS,
-                overlay_radius: Self::OUTER_RADIUS,
-                padding: Self::PADDING,
-                plate: true,
-                shadow: true,
-                capture_border: true,
-            }
+        let _ = provenance;
+        Self {
+            thumb_radius: Self::OUTER_RADIUS,
+            overlay_radius: Self::OUTER_RADIUS,
+            padding: Self::PADDING,
+            plate: true,
+            shadow: true,
+            capture_border: true,
         }
     }
 
@@ -144,21 +124,13 @@ impl CardChrome {
         (Self::OUTER_RADIUS - self.padding - self.thumb_radius).abs() < 0.001
     }
 
-    /// Derives the aspect-hugging container and capture rectangles for a slot.
+    /// Uses the complete fixed slot for both the container and its preview.
     #[must_use]
     pub fn geometry(self, slot: Rect, source_px: (u32, u32)) -> CardGeometry {
-        let capture = fit(slot.shrink(self.padding), source_px);
-        let hugging = capture.expand(self.padding);
-        let size = vec2(
-            hugging.width().max(MIN_INTERACTIVE_SIDE).min(slot.width()),
-            hugging
-                .height()
-                .max(MIN_INTERACTIVE_SIDE)
-                .min(slot.height()),
-        );
+        let _ = (self, source_px);
         CardGeometry {
-            container: Rect::from_center_size(hugging.center(), size),
-            capture,
+            container: slot,
+            capture: slot,
         }
     }
 }
@@ -426,8 +398,8 @@ fn draw_capture(
     let palette = surface.palette();
 
     let Some(texture) = content.texture else {
-        // No pixels yet, so use the shared container silhouette. A window's
-        // native alpha is not available to preserve until its texture arrives.
+        // No pixels yet, so use the same silhouette the cover-filled thumbnail
+        // will occupy when its texture arrives.
         let fill = fade(palette.card_fill, alpha * 0.9);
         if angle.abs() > f32::EPSILON {
             paint::fill_rot_round_rect(
@@ -444,17 +416,23 @@ fn draw_capture(
         return;
     };
 
-    // Contain, never cover: cropping a thumbnail tells the user they captured
-    // something they did not.
-    let fitted = fit(capture, content.source_px);
+    // Every capture type fills the same preview frame. Cropping exists only in
+    // this texture mapping; the capture itself is never mutated.
+    let uv = cover_uv(capture, content.source_px);
     let tint = Color32::WHITE.gamma_multiply(alpha);
-    textured_round_rect(painter, texture, fitted, chrome.thumb_radius, angle, tint);
+    textured_round_rect_uv(
+        painter,
+        texture,
+        capture,
+        uv,
+        chrome.thumb_radius,
+        angle,
+        tint,
+    );
 
     if chrome.capture_border {
-        // A hairline only where we own the thumbnail geometry. Never around a
-        // window capture, whose edge is platform-provided (D9).
         painter.rect_stroke(
-            fitted,
+            capture,
             corner(chrome.thumb_radius),
             Stroke::new(1.0, fade(palette.thumb_border, alpha)),
             StrokeKind::Inside,
@@ -666,25 +644,29 @@ fn compact_primary_rects(inner: Rect) -> Option<[Rect; 2]> {
     None
 }
 
-/// Fit `source_px` inside `bounds`, preserving aspect and centring.
+/// The centred texture coordinates that cover `bounds` with `source_px`.
 ///
-/// Degenerate sizes fall back to the whole rectangle rather than producing a
-/// zero-area or NaN rectangle.
+/// The returned UV rectangle is always inside `0..=1`. A wide source crops its
+/// left and right edges; a tall source crops its top and bottom edges.
 #[must_use]
-pub fn fit(bounds: Rect, source_px: (u32, u32)) -> Rect {
+pub fn cover_uv(bounds: Rect, source_px: (u32, u32)) -> Rect {
+    let full = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
     let (w, h) = source_px;
     if w == 0 || h == 0 || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return bounds;
+        return full;
     }
     #[allow(clippy::cast_precision_loss)]
-    let aspect = w as f32 / h as f32;
-    let by_width = vec2(bounds.width(), bounds.width() / aspect);
-    let size = if by_width.y <= bounds.height() {
-        by_width
+    let source_aspect = w as f32 / h as f32;
+    let target_aspect = bounds.width() / bounds.height();
+    if source_aspect > target_aspect {
+        let visible = target_aspect / source_aspect;
+        let inset = (1.0 - visible) * 0.5;
+        Rect::from_min_max(pos2(inset, 0.0), pos2(1.0 - inset, 1.0))
     } else {
-        vec2(bounds.height() * aspect, bounds.height())
-    };
-    Rect::from_center_size(bounds.center(), size)
+        let visible = source_aspect / target_aspect;
+        let inset = (1.0 - visible) * 0.5;
+        Rect::from_min_max(pos2(0.0, inset), pos2(1.0, 1.0 - inset))
+    }
 }
 
 /// Draw a texture into a rounded — and optionally rotated — rectangle.
@@ -692,12 +674,32 @@ pub fn fit(bounds: Rect, source_px: (u32, u32)) -> Rect {
 /// egui has no rounded image primitive and no rotation primitive, so this builds
 /// the mesh: a triangle fan over [`paint::rounded_poly`], with UVs taken from the
 /// *unrotated* geometry so the image rotates with the shape instead of sliding
-/// under it. A `radius` of zero degenerates to a plain quad, which is precisely
-/// what a window capture wants.
+/// under it. A `radius` of zero degenerates to a plain quad for callers that do
+/// not want clipping.
 pub fn textured_round_rect(
     painter: &egui::Painter,
     texture: egui::TextureId,
     rect: Rect,
+    radius: f32,
+    radians: f32,
+    tint: Color32,
+) {
+    textured_round_rect_uv(
+        painter,
+        texture,
+        rect,
+        Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+        radius,
+        radians,
+        tint,
+    );
+}
+
+fn textured_round_rect_uv(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
+    rect: Rect,
+    uv: Rect,
     radius: f32,
     radians: f32,
     tint: Color32,
@@ -711,8 +713,8 @@ pub fn textured_round_rect(
     }
     let uv_of = |p: egui::Pos2| {
         pos2(
-            (p.x - rect.left()) / rect.width(),
-            (p.y - rect.top()) / rect.height(),
+            uv.left() + (p.x - rect.left()) / rect.width() * uv.width(),
+            uv.top() + (p.y - rect.top()) / rect.height() * uv.height(),
         )
     };
     let uvs: Vec<egui::Pos2> = pts.iter().map(|p| uv_of(*p)).collect();
@@ -753,15 +755,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_provenance_keeps_native_thumbnail_geometry_inside_shared_chrome() {
+    fn window_provenance_uses_the_same_fixed_preview_chrome() {
         let c = CardChrome::for_provenance(Provenance::Window);
         assert!(c.has_preview_container());
         assert!(c.plate);
         assert!(c.shadow);
         assert_eq!(c.padding, CardChrome::PADDING);
-        assert_eq!(c.thumb_radius, 0.0);
-        assert!(!c.capture_border);
+        assert_eq!(c.thumb_radius, CardChrome::OUTER_RADIUS);
+        assert!(c.capture_border);
         assert!(c.overlays_match_container());
+        assert!(c.is_concentric());
     }
 
     #[test]
@@ -781,34 +784,19 @@ mod tests {
     }
 
     #[test]
-    fn preview_geometry_is_edge_to_edge_for_normal_aspects() {
-        let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(232.0, 145.0));
+    fn every_source_uses_the_complete_fixed_preview() {
+        let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(210.0, 150.0));
         for source in [(100, 100), (1600, 1000), (1920, 1080), (900, 1600)] {
             let chrome = CardChrome::for_provenance(Provenance::Display);
             let geometry = chrome.geometry(slot, source);
-            assert!(slot.contains_rect(geometry.container), "{source:?}");
-            assert_eq!(geometry.container, geometry.capture, "{source:?}");
-            assert!(
-                (geometry.capture.left() - geometry.container.left() - chrome.padding).abs()
-                    < 0.001
-            );
-            assert!(
-                (geometry.capture.top() - geometry.container.top() - chrome.padding).abs() < 0.001
-            );
-            assert!(
-                (geometry.container.right() - geometry.capture.right() - chrome.padding).abs()
-                    < 0.001
-            );
-            assert!(
-                (geometry.container.bottom() - geometry.capture.bottom() - chrome.padding).abs()
-                    < 0.001
-            );
+            assert_eq!(geometry.container, slot, "{source:?}");
+            assert_eq!(geometry.capture, slot, "{source:?}");
         }
     }
 
     #[test]
     fn compact_primary_actions_fit_panorama_and_portrait_previews() {
-        let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(232.0, 145.0));
+        let slot = Rect::from_min_size(pos2(0.0, 0.0), vec2(210.0, 150.0));
         let chrome = CardChrome::for_provenance(Provenance::Display);
         for source in [
             (5760, 1080),
@@ -826,19 +814,28 @@ mod tests {
     }
 
     #[test]
-    fn fit_preserves_aspect() {
-        let bounds = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
-        let r = fit(bounds, (100, 100));
-        assert!((r.width() - r.height()).abs() < 0.001);
-        assert!(r.height() <= bounds.height() + 0.001);
-        assert!((r.center() - bounds.center()).length() < 0.001);
+    fn cover_uv_crops_wide_and_tall_sources_around_their_centres() {
+        let bounds = Rect::from_min_size(pos2(0.0, 0.0), vec2(210.0, 150.0));
+        let exact = cover_uv(bounds, (1400, 1000));
+        assert_eq!(exact, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)));
+
+        let wide = cover_uv(bounds, (2000, 1000));
+        assert!((wide.left() - 0.15).abs() < 0.001);
+        assert!((wide.right() - 0.85).abs() < 0.001);
+        assert_eq!((wide.top(), wide.bottom()), (0.0, 1.0));
+
+        let tall = cover_uv(bounds, (1000, 1000));
+        assert_eq!((tall.left(), tall.right()), (0.0, 1.0));
+        assert!((tall.top() - 1.0 / 7.0).abs() < 0.001);
+        assert!((tall.bottom() - 6.0 / 7.0).abs() < 0.001);
     }
 
     #[test]
-    fn fit_survives_degenerate_sizes() {
-        let bounds = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
-        assert_eq!(fit(bounds, (0, 10)), bounds);
-        assert_eq!(fit(bounds, (10, 0)), bounds);
+    fn cover_uv_survives_degenerate_sizes() {
+        let bounds = Rect::from_min_size(pos2(0.0, 0.0), vec2(210.0, 150.0));
+        let full = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+        assert_eq!(cover_uv(bounds, (0, 10)), full);
+        assert_eq!(cover_uv(bounds, (10, 0)), full);
     }
 
     #[test]

@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
 
-use crate::card::{self, CardAction, CardChrome, CardContent};
+use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
@@ -76,7 +76,7 @@ pub const RESAMPLE_SECS: f32 = 0.35;
 /// Default longest edge, in pixels, of a card thumbnail.
 ///
 /// A 6-card stack of full-resolution 5K captures is well over a gigabyte of
-/// texture. Cards are 232 pt wide, so 512 px is already generous at 2×.
+/// texture. Cards are 210 pt wide, so 512 px is already generous at 2×.
 pub const THUMBNAIL_PX: u32 = 512;
 
 // ---------------------------------------------------------------------------
@@ -865,14 +865,7 @@ impl OverlayApp {
 
     fn ingest(&mut self, m: &Motion) {
         for request in self.take_inbox() {
-            let metrics = self.stack.layout().metrics();
-            let max_rect =
-                Rect::from_min_size(Pos2::ZERO, Vec2::new(metrics.width, metrics.height));
-            let size = CardChrome::for_provenance(request.provenance)
-                .geometry(max_rect, request.source_px)
-                .container
-                .size();
-            let id = self.stack.push_sized(size, m);
+            let id = self.stack.push(m);
             let thumb = request
                 .thumbnail
                 .map(|image| downscale(&image, self.thumbnail_px));
@@ -1219,7 +1212,7 @@ mod tests {
 
     #[test]
     fn passthrough_is_off_over_a_card_and_on_beside_it() {
-        let card = rect(16.0, 700.0, 232.0, 145.0);
+        let card = rect(40.0, 700.0, 210.0, 150.0);
         assert!(!passes_through(Some(Pos2::new(100.0, 760.0)), &[card]));
         assert!(passes_through(Some(Pos2::new(600.0, 400.0)), &[card]));
     }
@@ -1228,7 +1221,7 @@ mod tests {
     fn unknown_pointer_never_passes_through() {
         // With something to hit, an unknown pointer keeps its clicks: the
         // alternative is an overlay that can never be touched again.
-        let card = rect(16.0, 700.0, 232.0, 145.0);
+        let card = rect(40.0, 700.0, 210.0, 150.0);
         assert!(!passes_through(None, &[card]));
     }
 

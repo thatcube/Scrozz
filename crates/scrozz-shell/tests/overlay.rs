@@ -101,7 +101,7 @@ fn work_area() -> LogicalRect {
 fn slot_zero_sits_at_the_bottom_left_of_the_work_area() {
     let layout = StackLayout::default();
     let slot = layout.slot_frame(work_area(), 0);
-    assert_eq!(slot.origin.x, work_area().origin.x + layout.margin);
+    assert_eq!(slot.origin.x, work_area().origin.x + layout.left_margin);
     let bottom = slot.origin.y + slot.size.height;
     assert_eq!(
         bottom,
@@ -134,6 +134,8 @@ fn adjacent_slots_are_separated_by_exactly_one_gap() {
     let layout = StackLayout::default();
     assert_eq!(layout.gap, 8.0);
     assert_eq!(layout.margin, 16.0);
+    assert_eq!(layout.left_margin, 40.0);
+    assert_eq!(layout.card, LogicalSize::new(210.0, 150.0));
     let area = work_area();
     let lower = layout.slot_frame(area, 0);
     let upper = layout.slot_frame(area, 1);
@@ -235,13 +237,14 @@ fn the_stack_respects_the_dock() {
 }
 
 #[test]
-fn anchor_bottom_left_matches_slot_zero() {
+fn the_stack_can_use_a_larger_left_inset_than_bottom_inset() {
     let layout = StackLayout::default();
     let area = work_area();
-    assert_eq!(
-        anchor_bottom_left(area, layout.card, layout.margin),
-        layout.slot_frame(area, 0)
-    );
+    let uniformly_anchored = anchor_bottom_left(area, layout.card, layout.margin);
+    let slot = layout.slot_frame(area, 0);
+    assert_eq!(uniformly_anchored.origin.y, slot.origin.y);
+    assert_eq!(slot.origin.x - area.origin.x, 40.0);
+    assert_eq!(uniformly_anchored.origin.x - area.origin.x, 16.0);
 }
 
 #[test]

@@ -101,8 +101,11 @@ impl NoMoveUp {
 #[test]
 fn sixteen_inch_macbook_pro_gets_six_slots() {
     let metrics = CardMetrics::default();
+    assert_eq!(metrics.width, 210.0);
+    assert_eq!(metrics.height, 150.0);
     assert_eq!(metrics.gap, 8.0);
     assert_eq!(metrics.margin, 16.0);
+    assert_eq!(metrics.left_margin, 40.0);
     assert_eq!(StackLayout::new(mbp16(), metrics).slots(), 6);
 }
 
@@ -162,7 +165,7 @@ fn slots_stack_upward_from_the_bottom_of_the_work_area() {
         slot0,
         Rect::from_min_size(
             pos2(
-                mbp16().left() + m.margin,
+                mbp16().left() + m.left_margin,
                 mbp16().bottom() - m.margin - m.height,
             ),
             vec2(m.width, m.height),
@@ -187,32 +190,23 @@ fn slots_stack_upward_from_the_bottom_of_the_work_area() {
 }
 
 #[test]
-fn variable_preview_heights_keep_exact_visible_gaps_and_bottom_margin() {
+fn live_pushes_use_fixed_size_spacing_and_margins() {
     let mut stack = stack();
     let metrics = stack.layout().metrics();
-    stack.push_sized(vec2(232.0, 136.625), &at(0));
-    stack.push_sized(vec2(88.0, 145.0), &at(0));
-    stack.push_sized(vec2(232.0, 54.875), &at(0));
+    for _ in 0..3 {
+        stack.push(&at(0));
+    }
     stack.advance(&at(SETTLED));
 
+    let expected = vec2(210.0, 150.0);
+    for frame in stack.frame(&at(SETTLED)) {
+        assert_eq!(frame.rect.size(), expected);
+        assert_eq!(frame.rect.left(), mbp16().left() + 40.0);
+    }
     let frames = stack.frame(&at(SETTLED));
-    assert!(
-        (frames[0].rect.bottom() - (mbp16().bottom() - metrics.margin)).abs() < 0.01,
-        "the visible bottom card must sit exactly at the Dock margin"
-    );
+    assert_eq!(frames[0].rect.bottom(), mbp16().bottom() - metrics.margin);
     for pair in frames.windows(2) {
-        let lower = pair[0].rect;
-        let upper = pair[1].rect;
-        assert!(
-            (lower.top() - upper.bottom() - metrics.gap).abs() < 0.01,
-            "visible cards are not exactly {}pt apart: {lower:?} {upper:?}",
-            metrics.gap
-        );
-        assert_eq!(
-            upper.left(),
-            mbp16().left() + metrics.margin,
-            "every aspect shares the same left edge"
-        );
+        assert_eq!(pair[0].rect.top() - pair[1].rect.bottom(), metrics.gap);
     }
 }
 

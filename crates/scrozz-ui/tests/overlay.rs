@@ -4,10 +4,9 @@
 //!
 //! 1. **The card paints, and hover changes it.** Baseline liveness: a card that
 //!    silently draws nothing would pass every logic test in the crate.
-//! 2. **Every provenance shares one preview silhouette.** Exported window pixels
-//!    remain sacred (D9), but the transient stack may frame their thumbnail.
-//!    The frame must hug the fitted aspect ratio, its padding must be uniform,
-//!    and every caption or hover wash must follow that same outer curve.
+//! 2. **Every provenance shares one fixed preview silhouette.** Exported pixels
+//!    remain sacred (D9), while every transient thumbnail cover-fills the same
+//!    frame and every caption or hover wash follows that same outer curve.
 //!
 //! Everything renders through [`scrozz_ui::harness`]: pure CPU, virtual clock,
 //! no window, no GPU, bit-identical on every machine. Nothing in this file
@@ -46,7 +45,7 @@ const SCALE: f32 = 2.0;
 const CARD_ORIGIN: (f32, f32) = (34.0, 34.0);
 
 /// The stack's card size.
-const CARD_SIZE: (f32, f32) = (232.0, 145.0);
+const CARD_SIZE: (f32, f32) = (210.0, 150.0);
 
 fn card_rect() -> Rect {
     Rect::from_min_size(
@@ -229,7 +228,7 @@ fn the_probe_points_are_inside_the_rendered_image() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Shared, aspect-hugging card geometry
+// 2. Shared, fixed card geometry
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -248,36 +247,20 @@ fn every_provenance_gets_the_same_outer_preview_container() {
     }
 
     let window = CardChrome::for_provenance(Provenance::Window);
-    assert_eq!(
-        window.thumb_radius, 0.0,
-        "the shared preview must not clip native window pixels"
-    );
-    assert!(
-        !window.capture_border,
-        "the shared preview must not redraw the native window edge"
-    );
+    assert_eq!(window.thumb_radius, CardChrome::OUTER_RADIUS);
+    assert!(window.capture_border);
 }
 
 #[test]
-fn preview_geometry_hugs_multiple_capture_aspects() {
-    let chrome = CardChrome::for_provenance(Provenance::Display);
-    for source in [(1600, 1000), (1920, 1080), (1000, 1000), (900, 1600)] {
-        let geometry = chrome.geometry(card_rect(), source);
-        assert!(card_rect().contains_rect(geometry.container), "{source:?}");
-        assert!(
-            (geometry.container.left() + chrome.padding - geometry.capture.left()).abs() < 0.01
-                && (geometry.container.top() + chrome.padding - geometry.capture.top()).abs()
-                    < 0.01
-                && (geometry.capture.right() + chrome.padding - geometry.container.right()).abs()
-                    < 0.01
-                && (geometry.capture.bottom() + chrome.padding - geometry.container.bottom()).abs()
-                    < 0.01,
-            "{source:?}: the fitted capture is not uniformly padded"
-        );
-        assert!(
-            chrome.is_concentric(),
-            "{source:?}: inner and outer radii must remain concentric"
-        );
+fn every_capture_aspect_uses_the_same_complete_frame() {
+    for provenance in [Provenance::Display, Provenance::Window, Provenance::Region] {
+        let chrome = CardChrome::for_provenance(provenance);
+        for source in [(1600, 1000), (1920, 1080), (1000, 1000), (900, 1600)] {
+            let geometry = chrome.geometry(card_rect(), source);
+            assert_eq!(geometry.container, card_rect(), "{provenance:?} {source:?}");
+            assert_eq!(geometry.capture, card_rect(), "{provenance:?} {source:?}");
+            assert!(chrome.is_concentric());
+        }
     }
 }
 
@@ -317,7 +300,7 @@ fn the_hover_scrim_does_not_square_the_container() {
 }
 
 #[test]
-fn the_caption_scrim_uses_the_aspect_hugging_container() {
+fn the_caption_scrim_uses_the_fixed_container() {
     let image = render(CardScene::resting(Provenance::Display));
     let rect = preview_rect(Provenance::Display, (1600, 1000));
 

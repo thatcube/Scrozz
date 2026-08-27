@@ -8,10 +8,10 @@
 //! - **`frame`** is the display's full bounds, including the strip the menu bar
 //!   occupies and the strip the Dock occupies. This becomes
 //!   [`Display::bounds`], and it is what a *capture* covers.
-//! - **`visibleFrame`** is the work area: AppKit has already subtracted the
-//!   menu bar and the Dock, at the Dock's current edge, at its current size,
-//!   and with auto-hide honoured. This becomes [`Display::work_area`], and it
-//!   is what an *overlay* anchors to.
+//! - **`visibleFrame`** is AppKit's work-area baseline. It subtracts the menu bar
+//!   and a permanently shown Dock. For an auto-hidden Dock AppKit gives that
+//!   space back even while the Dock is revealed, so Scrozz reserves the current
+//!   Dock tile plus its surround before producing [`Display::work_area`].
 //!
 //! Anchoring the capture stack to `frame` instead of `visibleFrame` puts the
 //! whole stack behind the Dock — the cards are there, they are just not
@@ -19,9 +19,9 @@
 //! hypothetical: the bottom-left corner of `frame` is exactly where the Dock
 //! is on a default Mac.
 //!
-//! `visibleFrame` is also not a fixed inset. It changes when the Dock moves to
-//! the left or right edge, when the user resizes it, when auto-hide is toggled,
-//! and on notched displays. Nothing here caches it.
+//! The result is not a fixed inset. It changes when the Dock moves to the left
+//! or right edge, when the user resizes it, when auto-hide is toggled, and on
+//! notched displays. Nothing here caches it.
 //!
 //! # Coordinates
 //!
@@ -31,11 +31,36 @@
 //! menu bar and therefore AppKit's global origin.
 
 use objc2_app_kit::{NSEvent, NSScreen};
+use objc2_core_foundation::{
+    CFNumber, CFPreferencesCopyAppValue, CFPreferencesGetAppBooleanValue, CFString,
+};
 use objc2_foundation::{MainThreadMarker, NSRect};
 use scrozz_core::{Display, DisplayId, Error, LogicalPoint, LogicalRect, Result, ScaleFactor};
 
 use crate::macos::main_thread;
 use crate::overlay::{AppKitRect, appkit_to_logical};
+
+/// Extra material around Dock tiles in the floating Dock background.
+///
+/// `tilesize` describes the icon, not the complete input-obscuring surface. The
+/// public work-area API excludes a permanently visible Dock, but intentionally
+/// excludes an auto-hidden Dock even while it is revealed. Reserving the tile
+/// plus this chrome keeps capture cards clear in both states.
+const AUTO_HIDE_DOCK_CHROME: f64 = 20.0;
+const DEFAULT_DOCK_TILE_SIZE: f64 = 64.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockEdge {
+    Bottom,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AutoHideDock {
+    edge: DockEdge,
+    thickness: f64,
+}
 
 /// Converts an `NSRect` in screen coordinates to [`AppKitRect`].
 ///
@@ -70,7 +95,11 @@ pub fn reference_height(mtm: MainThreadMarker) -> f64 {
 /// Converts one `NSScreen` into a Scrozz [`Display`].
 fn to_display(screen: &NSScreen, reference_height: f64, is_primary: bool) -> Display {
     let bounds = appkit_to_logical(ns_rect(screen.frame()), reference_height);
-    let work_area = appkit_to_logical(ns_rect(screen.visibleFrame()), reference_height);
+    let work_area = reserve_auto_hidden_dock(
+        bounds,
+        appkit_to_logical(ns_rect(screen.visibleFrame()), reference_height),
+        auto_hide_dock(),
+    );
 
     // `CGDirectDisplayID` is stable for as long as the display stays connected,
     // which is exactly the "stable for a session" contract `DisplayId` states,
@@ -96,6 +125,78 @@ fn to_display(screen: &NSScreen, reference_height: f64, is_primary: bool) -> Dis
         scale,
         is_primary,
     }
+}
+
+/// Reads the user's Dock placement without spawning `defaults`.
+///
+/// AppKit's `visibleFrame` deliberately gives auto-hidden Dock space back to
+/// applications. That is correct for ordinary windows and wrong for a capture
+/// card that remains visible while the user reveals the Dock.
+fn auto_hide_dock() -> Option<AutoHideDock> {
+    let domain = CFString::from_static_str("com.apple.dock");
+    let autohide_key = CFString::from_static_str("autohide");
+    let mut valid = 0_u8;
+    // SAFETY: `valid` is a live one-byte Boolean output, as required by Core
+    // Foundation.
+    let autohide = unsafe { CFPreferencesGetAppBooleanValue(&autohide_key, &domain, &mut valid) };
+    if valid == 0 || !autohide {
+        return None;
+    }
+
+    let tile_key = CFString::from_static_str("tilesize");
+    let tile = CFPreferencesCopyAppValue(&tile_key, &domain)
+        .and_then(|value| value.downcast::<CFNumber>().ok())
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_DOCK_TILE_SIZE);
+
+    let orientation_key = CFString::from_static_str("orientation");
+    let edge = CFPreferencesCopyAppValue(&orientation_key, &domain)
+        .and_then(|value| value.downcast::<CFString>().ok())
+        .map_or(DockEdge::Bottom, |value| match value.to_string().as_str() {
+            "left" => DockEdge::Left,
+            "right" => DockEdge::Right,
+            _ => DockEdge::Bottom,
+        });
+
+    Some(AutoHideDock {
+        edge,
+        thickness: tile.clamp(16.0, 256.0) + AUTO_HIDE_DOCK_CHROME,
+    })
+}
+
+fn reserve_auto_hidden_dock(
+    bounds: LogicalRect,
+    mut work_area: LogicalRect,
+    dock: Option<AutoHideDock>,
+) -> LogicalRect {
+    let Some(dock) = dock else {
+        return work_area;
+    };
+    let epsilon = 0.5;
+    match dock.edge {
+        DockEdge::Bottom => {
+            let work_bottom = work_area.origin.y + work_area.size.height;
+            let bounds_bottom = bounds.origin.y + bounds.size.height;
+            if (work_bottom - bounds_bottom).abs() <= epsilon {
+                work_area.size.height = (work_area.size.height - dock.thickness).max(1.0);
+            }
+        }
+        DockEdge::Left => {
+            if (work_area.origin.x - bounds.origin.x).abs() <= epsilon {
+                work_area.origin.x += dock.thickness;
+                work_area.size.width = (work_area.size.width - dock.thickness).max(1.0);
+            }
+        }
+        DockEdge::Right => {
+            let work_right = work_area.origin.x + work_area.size.width;
+            let bounds_right = bounds.origin.x + bounds.size.width;
+            if (work_right - bounds_right).abs() <= epsilon {
+                work_area.size.width = (work_area.size.width - dock.thickness).max(1.0);
+            }
+        }
+    }
+    work_area
 }
 
 /// Every connected display, primary first.
@@ -226,4 +327,59 @@ fn contains(rect: LogicalRect, point: LogicalPoint) -> bool {
         && point.y >= rect.origin.y
         && point.x < rect.origin.x + rect.size.width
         && point.y < rect.origin.y + rect.size.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scrozz_core::LogicalSize;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
+        LogicalRect::new(LogicalPoint::new(x, y), LogicalSize::new(width, height))
+    }
+
+    #[test]
+    fn an_auto_hidden_bottom_dock_is_reserved_even_when_visible_frame_reaches_the_edge() {
+        let bounds = rect(0.0, 0.0, 1728.0, 1117.0);
+        let visible = rect(0.0, 33.0, 1728.0, 1084.0);
+        let safe = reserve_auto_hidden_dock(
+            bounds,
+            visible,
+            Some(AutoHideDock {
+                edge: DockEdge::Bottom,
+                thickness: 134.0,
+            }),
+        );
+        assert_eq!(safe, rect(0.0, 33.0, 1728.0, 950.0));
+    }
+
+    #[test]
+    fn an_already_excluded_dock_is_not_reserved_twice() {
+        let bounds = rect(0.0, 0.0, 1728.0, 1117.0);
+        let visible = rect(0.0, 33.0, 1728.0, 950.0);
+        let safe = reserve_auto_hidden_dock(
+            bounds,
+            visible,
+            Some(AutoHideDock {
+                edge: DockEdge::Bottom,
+                thickness: 134.0,
+            }),
+        );
+        assert_eq!(safe, visible);
+    }
+
+    #[test]
+    fn side_docks_move_the_safe_edge_instead_of_the_bottom() {
+        let bounds = rect(0.0, 0.0, 1728.0, 1117.0);
+        let visible = rect(0.0, 33.0, 1728.0, 1084.0);
+        let safe = reserve_auto_hidden_dock(
+            bounds,
+            visible,
+            Some(AutoHideDock {
+                edge: DockEdge::Left,
+                thickness: 80.0,
+            }),
+        );
+        assert_eq!(safe, rect(80.0, 33.0, 1648.0, 1084.0));
+    }
 }

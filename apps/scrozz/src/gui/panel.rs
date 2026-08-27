@@ -34,6 +34,9 @@ use std::{cell::RefCell, rc::Rc};
 use raw_window_handle::HasWindowHandle;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use raw_window_handle::RawWindowHandle;
+use scrozz_core::LogicalRect;
+#[cfg(target_os = "macos")]
+use scrozz_shell::OverlayWindow;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
 use scrozz_ui::PanelReport;
 
@@ -52,6 +55,23 @@ pub struct BehaviorController {
 }
 
 impl BehaviorController {
+    /// Re-anchors the retained native window to an exact OS work-area frame.
+    ///
+    /// Eframe's viewport position is only a window-manager hint. The native
+    /// frame is authoritative on macOS and keeps the transparent overlay clipped
+    /// above the Dock after creation, selection and display changes.
+    pub fn set_frame(&self, frame: LogicalRect) {
+        #[cfg(target_os = "macos")]
+        if let Some(overlay) = self.overlay.borrow_mut().as_mut()
+            && let Err(error) = overlay.set_frame(frame)
+        {
+            tracing::warn!(%error, "could not re-anchor native overlay frame");
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
+    }
+
     /// Applies a card or selection behavior when a native adapter is retained.
     pub fn apply(&self, behavior: &OverlayBehavior) {
         #[cfg(target_os = "macos")]

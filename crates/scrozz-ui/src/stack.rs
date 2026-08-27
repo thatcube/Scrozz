@@ -89,13 +89,14 @@ pub const MIN_SLOTS: usize = 1;
 pub struct CardMetrics {
     /// Card width in points.
     pub width: f32,
-    /// Card height in points. The default is 16:10, matching a typical display
-    /// capture, so a thumbnail letterboxes as little as possible.
+    /// Card height in points.
     pub height: f32,
     /// Vertical gap between adjacent cards.
     pub gap: f32,
-    /// Inset from the work-area edges to the pile.
+    /// Inset from the top and bottom work-area edges.
     pub margin: f32,
+    /// Inset from the work area's left edge.
+    pub left_margin: f32,
     /// Extra travel past the screen edge before a departing card is considered
     /// gone. Without it a card with a shadow leaves a smudge at the edge.
     pub clearance: f32,
@@ -104,10 +105,11 @@ pub struct CardMetrics {
 impl Default for CardMetrics {
     fn default() -> Self {
         Self {
-            width: 232.0,
-            height: 145.0,
+            width: 210.0,
+            height: 150.0,
             gap: 8.0,
             margin: 16.0,
+            left_margin: 40.0,
             clearance: 24.0,
         }
     }
@@ -198,7 +200,7 @@ impl StackLayout {
         let m = self.metrics;
         let top = self.work_area.bottom() - m.margin - m.height - slot * m.pitch();
         Rect::from_min_size(
-            pos2(self.work_area.left() + m.margin, top),
+            pos2(self.work_area.left() + m.left_margin, top),
             vec2(m.width, m.height),
         )
     }
@@ -593,7 +595,6 @@ pub enum CardState {
 pub struct Card {
     id: CardId,
     born_slot: usize,
-    size: Vec2,
     entry: Option<Timeline>,
     fall: Option<(Timeline, Vec2)>,
     ret: Option<(Timeline, Vec2)>,
@@ -615,12 +616,6 @@ impl Card {
     #[must_use]
     pub fn born_slot(&self) -> usize {
         self.born_slot
-    }
-
-    /// The visible preview-container size used by stack spacing.
-    #[must_use]
-    pub fn size(&self) -> Vec2 {
-        self.size
     }
 
     /// Whether the pointer is over this card.
@@ -894,15 +889,6 @@ impl CaptureStack {
     /// user asked for the overlay to be out of the way, not to stop seeing what
     /// they captured.
     pub fn push(&mut self, m: &Motion) -> CardId {
-        let metrics = self.layout.metrics();
-        self.push_sized(vec2(metrics.width, metrics.height), m)
-    }
-
-    /// Adds a capture whose visible preview container has `size`.
-    ///
-    /// Heights participate directly in vertical layout, so visible cards remain
-    /// exactly one configured gap apart even when their aspect ratios differ.
-    pub fn push_sized(&mut self, size: Vec2, m: &Motion) -> CardId {
         if self.dock.is_stowing() {
             self.dock.expand(m);
         }
@@ -912,15 +898,9 @@ impl CaptureStack {
         let slot = self.cards.len();
         let id = CardId(self.next_id);
         self.next_id += 1;
-        let metrics = self.layout.metrics();
-        let size = vec2(
-            size.x.clamp(1.0, metrics.width),
-            size.y.clamp(1.0, metrics.height),
-        );
         self.cards.push(Card {
             id,
             born_slot: slot,
-            size,
             entry: Some(Timeline::starting(
                 m,
                 self.timing.enter,
@@ -1283,19 +1263,7 @@ impl CaptureStack {
     }
 
     fn home_rect(&self, slot: usize) -> Rect {
-        let metrics = self.layout.metrics();
-        let stack_below = self.cards[..slot]
-            .iter()
-            .map(|card| card.size.y + metrics.gap)
-            .sum::<f32>();
-        let bottom = self.layout.work_area().bottom() - metrics.margin - stack_below;
-        Rect::from_min_size(
-            pos2(
-                self.layout.work_area().left() + metrics.margin,
-                bottom - self.cards[slot].size.y,
-            ),
-            self.cards[slot].size,
-        )
+        self.layout.slot_rect(slot)
     }
 
     fn resident_frame(&self, slot: usize, m: &Motion) -> CardFrame {

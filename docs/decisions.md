@@ -196,11 +196,10 @@ apply an adjustable radius. Radius, shadow and inset controls apply only to
 non-window captures.
 
 This governs capture and export pixels, not transient UI around a preview. The
-floating stack uses one aspect-hugging outer container for every provenance so
-cards share a coherent silhouette and hit target. The image fills that container
-edge to edge without cropping or letterboxing. A window thumbnail still keeps
-its native alpha, corners and shadow: it is not clipped, bordered, flattened or
-written back into the capture.
+floating stack normalizes every provenance into the same fixed 210 × 150 point
+container. Each image cover-fills that frame and is centre-cropped and clipped
+to the shared radius. Cropping and chrome exist only in the thumbnail texture
+mapping; they are never written back into the capture.
 
 **Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
 another, `inner_radius = outer_radius − padding`. Violating it makes corners look
@@ -897,6 +896,13 @@ top slot, and even then it is the arriving card, not existing cards shifting.
 **Slot count** is derived from the available work-area height, not hard-coded.
 Six is the target on a 16-inch MacBook Pro and matches the practical ceiling of
 comparable tools. It must clamp sensibly on small displays.
+
+**Settled geometry is exact:** every card is 210 × 150 points, adjacent cards
+have an 8-point visible gap, the shared left edge is 40 points from the work
+area, and the bottom card is 16 points above the Dock or taskbar. The native
+overlay window is re-anchored to the operating system's live work area after any
+selector or display transition; window-manager placement hints are not accepted
+as proof that the Dock has been excluded.
 
 **Why bottom-anchored.** Position encodes recency, and a bottom anchor makes the
 pile physical: things accumulate on top of each other and settle downward under

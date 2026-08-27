@@ -323,8 +323,10 @@ impl OverlayBehavior {
 pub struct StackLayout {
     /// Size of one capture card, in points.
     pub card: LogicalSize,
-    /// Gap between the stack and the edges of the work area, in points.
+    /// Gap between the stack and the top/bottom of the work area, in points.
     pub margin: f64,
+    /// Gap between the stack and the left edge of the work area, in points.
+    pub left_margin: f64,
     /// Vertical gap between adjacent cards, in points.
     pub gap: f64,
     /// Upper bound on slots regardless of how tall the display is.
@@ -338,8 +340,9 @@ pub struct StackLayout {
 impl Default for StackLayout {
     fn default() -> Self {
         Self {
-            card: LogicalSize::new(232.0, 150.0),
+            card: LogicalSize::new(210.0, 150.0),
             margin: 16.0,
+            left_margin: 40.0,
             gap: 8.0,
             max_slots: 6,
         }
@@ -383,7 +386,7 @@ impl StackLayout {
         let offset = slot as f64 * pitch;
         LogicalRect::new(
             LogicalPoint::new(
-                work_area.origin.x + self.margin,
+                work_area.origin.x + self.left_margin,
                 bottom - self.card.height - offset,
             ),
             self.card,

@@ -258,6 +258,7 @@ impl Host for Windowed {
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
+                native.set_frame(logical_frame(geometry));
                 Ok(Box::new(Driver {
                     app,
                     overlay,
@@ -269,6 +270,7 @@ impl Host for Windowed {
                     display_id,
                     pointer_geometry,
                     next_work_area_refresh: Instant::now(),
+                    pending_native_frame: None,
                     announced: false,
                     stopped: false,
                 }))
@@ -442,6 +444,9 @@ struct Driver {
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
     next_work_area_refresh: Instant,
+    /// Work-area frame to apply natively on the pass after queued viewport
+    /// commands have reached winit.
+    pending_native_frame: Option<OverlayGeometry>,
     announced: bool,
     stopped: bool,
 }
@@ -524,10 +529,19 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        if !self.selection.owns_surface()
+            && let Some(geometry) = self.pending_native_frame.take()
+        {
+            self.native.set_frame(logical_frame(geometry));
+        }
         let selector_owned_the_window = self.selection.owns_surface();
         self.selection.logic(ctx, &self.native);
-        if selector_owned_the_window || self.selection.owns_surface() {
+        let selector_owns_the_window = self.selection.owns_surface();
+        if selector_owned_the_window || selector_owns_the_window {
             self.overlay.invalidate_passthrough_cache();
+            if selector_owned_the_window && !selector_owns_the_window {
+                self.pending_native_frame = Some(self.overlay.geometry());
+            }
         } else if Instant::now() >= self.next_work_area_refresh {
             self.next_work_area_refresh = Instant::now() + WORK_AREA_REFRESH;
             let geometry = refreshed_work_area(self.overlay.geometry(), &mut self.display_id);
@@ -537,6 +551,7 @@ impl eframe::App for Driver {
                     ctx,
                     &scrozz_ui::motion::Motion::from_context(ctx),
                 );
+                self.pending_native_frame = Some(geometry);
                 self.selection.set_cards_geometry(geometry);
                 if let Ok(mut current) = self.pointer_geometry.lock() {
                     *current = geometry;
@@ -689,6 +704,14 @@ fn geometry_for_display(display: &Display) -> OverlayGeometry {
     ))
 }
 
+fn logical_frame(geometry: OverlayGeometry) -> scrozz_core::LogicalRect {
+    let area = geometry.work_area;
+    scrozz_core::LogicalRect::new(
+        scrozz_core::LogicalPoint::new(f64::from(area.min.x), f64::from(area.min.y)),
+        scrozz_core::LogicalSize::new(f64::from(area.width()), f64::from(area.height())),
+    )
+}
+
 /// Whether the environment asked for a run without a window.
 #[must_use]
 pub fn headless_requested() -> bool {
@@ -782,6 +805,21 @@ mod tests {
         assert_eq!(
             local_pointer(geometry, scrozz_core::LogicalPoint::new(132.0, 91.0)),
             egui::pos2(32.0, 51.0)
+        );
+    }
+
+    #[test]
+    fn native_frame_matches_the_complete_global_work_area() {
+        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
+            egui::pos2(120.0, 85.0),
+            egui::vec2(1728.0, 999.0),
+        ));
+        assert_eq!(
+            logical_frame(geometry),
+            LogicalRect::new(
+                LogicalPoint::new(120.0, 85.0),
+                LogicalSize::new(1728.0, 999.0),
+            )
         );
     }
 
