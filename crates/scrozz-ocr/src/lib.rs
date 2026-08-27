@@ -43,6 +43,7 @@
 use scrozz_core::{Error, Frame, LogicalRect, Result};
 
 pub mod barcode;
+mod config;
 pub mod layout;
 pub mod links;
 mod live;
@@ -50,6 +51,10 @@ pub mod prepare;
 
 pub use barcode::{
     Barcode, BarcodeDetector, BarcodeOptions, PortableBarcodes, Symbology, SystemBarcodes,
+};
+pub use config::{
+    AUTO_DETECT_LANGUAGE_KEY, DETECT_LINKS_KEY, KEEP_LINE_BREAKS_KEY, LANGUAGES_KEY, LanguageMode,
+    RuntimeConfig,
 };
 pub use layout::{LineBreaks, plain_text, text};
 pub use links::{Link, LinkKind, links};
@@ -235,6 +240,11 @@ impl SystemOcr {
     #[must_use]
     pub const fn options(&self) -> &Options {
         &self.options
+    }
+
+    /// Replaces the options used by subsequent recognition calls.
+    pub fn set_options(&mut self, options: Options) {
+        self.options = options;
     }
 
     /// Whether this build has an engine integration.

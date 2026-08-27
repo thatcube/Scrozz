@@ -64,6 +64,18 @@ impl LiveOcr {
         }
     }
 
+    /// The options in force. Accuracy is always [`Accuracy::Fast`].
+    #[must_use]
+    pub const fn options(&self) -> &Options {
+        self.ocr.options()
+    }
+
+    /// Replaces preferences for subsequent pointer probes while retaining fast mode.
+    pub fn set_options(&mut self, mut options: Options) {
+        options.accuracy = Accuracy::Fast;
+        self.ocr.set_options(options);
+    }
+
     /// Recognizes a frame and returns the block under a frame-local logical point.
     ///
     /// # Errors
@@ -142,5 +154,20 @@ mod tests {
             frame_local_point(bounds, LogicalPoint::new(401.0, 80.0)),
             None
         );
+    }
+
+    #[test]
+    fn live_options_can_be_replaced_without_losing_fast_mode() {
+        let mut live = LiveOcr::new();
+        live.set_options(
+            Options::new()
+                .with_languages(["de-DE"])
+                .with_accuracy(Accuracy::Accurate)
+                .with_line_breaks(crate::LineBreaks::Collapse),
+        );
+
+        assert_eq!(live.options().accuracy, Accuracy::Fast);
+        assert_eq!(live.options().languages, ["de-DE"]);
+        assert_eq!(live.options().line_breaks, crate::LineBreaks::Collapse);
     }
 }
