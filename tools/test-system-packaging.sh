@@ -115,6 +115,13 @@ if grep -Eq 'internetClient|broadFileSystemAccess' "$MANIFEST"; then
 fi
 grep -q 'pack /o /h SHA256 /f' "$WINDOWS_PACKAGE" ||
   fail "MSIX package does not pin SHA-256 and a deterministic mapping"
+MAKEAPPX_MAPPING_LINE="$(
+  cat <<'POWERSHELL'
+        $Lines.Add(('"{0}" "{1}"' -f $File, $Relative))
+POWERSHELL
+)"
+grep -Fqx "$MAKEAPPX_MAPPING_LINE" "$WINDOWS_PACKAGE" ||
+  fail "MakeAppx mapping formatting is not passed as one PowerShell argument"
 grep -q '1980, 1, 1' "$WINDOWS_PACKAGE" ||
   fail "Windows package inputs do not receive a reproducible timestamp"
 grep -q 'SCROZZ_MSIX_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
