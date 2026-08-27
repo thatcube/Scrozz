@@ -29,6 +29,7 @@ pub mod capture;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod selection;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};

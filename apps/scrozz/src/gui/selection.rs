@@ -54,6 +54,13 @@ pub trait CaptureSelector: RegionSelector {
     /// selection.
     fn capture_finished(&self) {}
 
+    /// Cancels the current user-facing selection without shutting down future selections.
+    fn cancel_active(&self) -> Result<()> {
+        Err(Error::InvalidRequest(
+            "no interactive selection is active".to_owned(),
+        ))
+    }
+
     /// Cancels blocked selection calls during app shutdown.
     fn cancel(&self) {}
 }
@@ -125,6 +132,17 @@ impl CaptureSelector for UnsupportedSelector {
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.capture_finished();
         }
+    }
+
+    fn cancel_active(&self) -> Result<()> {
+        self.lifecycle.as_ref().map_or_else(
+            || {
+                Err(Error::InvalidRequest(
+                    "no interactive selection is active".to_owned(),
+                ))
+            },
+            |lifecycle| lifecycle.cancel_active(),
+        )
     }
 
     fn cancel(&self) {
@@ -231,6 +249,9 @@ enum BridgeEvent {
         id: u64,
         restored: Sender<()>,
     },
+    CancelActive {
+        id: u64,
+    },
     Cancel,
 }
 
@@ -259,6 +280,9 @@ enum ControllerPhase {
         hidden: Sender<()>,
     },
     WaitingForPreparation {
+        id: u64,
+    },
+    CancellingPreparation {
         id: u64,
     },
     Selecting {
@@ -588,6 +612,23 @@ impl CaptureSelector for ClientOverlaySelector {
         self.release(id);
     }
 
+    fn cancel_active(&self) -> Result<()> {
+        let id = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| bridge_error("the selector lifecycle lock was poisoned"))?
+            .active
+            .as_ref()
+            .map(|active| active.id)
+            .ok_or_else(|| {
+                Error::InvalidRequest("no interactive selection is active".to_owned())
+            })?;
+        self.events
+            .send(BridgeEvent::CancelActive { id })
+            .map_err(|_| bridge_error("the selector window closed before selection cancellation"))
+    }
+
     fn cancel(&self) {
         let (lock, changed) = &*self.gate;
         if let Ok(mut gate) = lock.lock() {
@@ -753,10 +794,27 @@ impl ClientOverlayController {
                     decision,
                 };
             }
+            BridgeEvent::Prepared { id, decision, .. }
+                if matches!(
+                    self.phase,
+                    ControllerPhase::CancellingPreparation { id: waiting } if waiting == id
+                ) =>
+            {
+                let _ = decision.send(Err(Error::Cancelled));
+                self.phase = ControllerPhase::AwaitingCapture { id };
+            }
             BridgeEvent::PreparationFailed { id }
                 if matches!(
                     self.phase,
                     ControllerPhase::WaitingForPreparation { id: waiting } if waiting == id
+                ) =>
+            {
+                self.phase = ControllerPhase::AwaitingCapture { id };
+            }
+            BridgeEvent::PreparationFailed { id }
+                if matches!(
+                    self.phase,
+                    ControllerPhase::CancellingPreparation { id: waiting } if waiting == id
                 ) =>
             {
                 self.phase = ControllerPhase::AwaitingCapture { id };
@@ -788,6 +846,33 @@ impl ClientOverlayController {
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
                 let _ = restored.send(());
+            }
+            BridgeEvent::CancelActive { id }
+                if matches!(
+                    self.phase,
+                    ControllerPhase::WaitingForPreparation { id: waiting } if waiting == id
+                ) =>
+            {
+                self.phase = ControllerPhase::CancellingPreparation { id };
+            }
+            BridgeEvent::CancelActive { id }
+                if matches!(
+                    self.phase,
+                    ControllerPhase::Selecting { id: active, .. } if active == id
+                ) =>
+            {
+                let phase = std::mem::replace(&mut self.phase, ControllerPhase::Cards);
+                if let ControllerPhase::Selecting {
+                    decision,
+                    viewports,
+                    ..
+                } = phase
+                {
+                    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+                    viewports.hide(ctx);
+                    let _ = decision.send(Err(Error::Cancelled));
+                    self.phase = ControllerPhase::AwaitingCapture { id };
+                }
             }
             BridgeEvent::Cancel => {
                 native.apply(&scrozz_shell::OverlayBehavior::capture_card());
@@ -1572,6 +1657,73 @@ mod tests {
 
         selector.cancel();
         second_worker.join().expect("second selector worker");
+    }
+
+    #[test]
+    fn active_cancellation_restores_cards_without_disabling_future_selection() {
+        let prepare: Arc<PrepareFn> = Arc::new(|options, _cursor| {
+            let bounds =
+                LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+            let displays = vec![Display {
+                id: DisplayId("main".to_owned()),
+                name: "Main".to_owned(),
+                bounds,
+                work_area: bounds,
+                scale: ScaleFactor::IDENTITY,
+                is_primary: true,
+            }];
+            Ok(PreparedSelection {
+                viewports: selector_viewports_for(&displays, false)
+                    .expect("test display has geometry"),
+                options,
+                displays,
+                windows: Vec::new(),
+                frozen: Vec::new(),
+                frozen_sources: Vec::new(),
+            })
+        });
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select(&SelectionOptions {
+                freeze: false,
+                magnifier: false,
+                ..SelectionOptions::region()
+            });
+            worker_selector.capture_finished();
+            result
+        });
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Selecting { .. })
+        });
+
+        selector.cancel_active().expect("active selector cancels");
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(
+                &controller.phase,
+                ControllerPhase::AwaitingCapture { .. } | ControllerPhase::RestoringCards { .. }
+            )
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Cards)
+        });
+
+        let error = worker
+            .join()
+            .expect("selector worker")
+            .expect_err("selection should be cancelled");
+        assert!(error.is_cancellation());
+        assert!(!selector.is_stopped());
+        assert!(selector.cancel_active().is_err());
     }
 
     #[test]

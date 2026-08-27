@@ -1041,6 +1041,7 @@ impl Fixture {
                     "The selector overlay at rest over a frozen display, ready for a new region drag.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorDragging => (
                     Vec::new(),
@@ -1050,6 +1051,7 @@ impl Fixture {
                     "Drag in any direction",
                     "A region drag in progress, showing the scrim cutout, resize handles, and live pixel-size readout.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorRemembered => (
@@ -1061,6 +1063,7 @@ impl Fixture {
                     "A remembered selection restored for adjustment before the next capture.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorExact => (
                     Vec::new(),
@@ -1070,6 +1073,7 @@ impl Fixture {
                     "Place an exact size",
                     "An exact-size region being positioned without resizing, preserving the requested physical output dimensions.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorAspect => (
@@ -1081,6 +1085,7 @@ impl Fixture {
                     "A live region drag constrained to a locked aspect ratio.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorMagnifier => (
                     Vec::new(),
@@ -1090,6 +1095,7 @@ impl Fixture {
                     "Inspect exact pixels",
                     "The pixel loupe sampling the frozen desktop at the owning display's real scale.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorAllInOne => (
@@ -1101,6 +1107,7 @@ impl Fixture {
                     "The All-in-One selector HUD exposing region, window, display, and all-displays capture modes with capability gating.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorMixedDpi => (
                     Vec::new(),
@@ -1110,6 +1117,7 @@ impl Fixture {
                     "Mixed-DPI without guessing",
                     "A region held wholly within one measured display on a mixed-DPI desktop, rather than pretending a cross-display span has one scale.",
                     instants::REST,
+                    None,
                     None,
                 ),
             };

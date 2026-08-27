@@ -32,7 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use scrozz_core::{CaptureTarget, Error as CoreError};
+use scrozz_core::{CaptureTarget, Error as CoreError, SelectionMode as CaptureSelectionMode};
 use scrozz_record::{
     MachineEvent, MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
     RecordingSettings,
@@ -53,7 +53,7 @@ use scrozz_ui::{
 };
 
 use crate::{
-    cli::{Cli, Command, RecordControl},
+    cli::{Cli, Command, InteractiveMode, RecordArgs, RecordControl},
     commands,
     fault::{CliError, CliResult},
     gui::{
@@ -99,6 +99,17 @@ enum PendingRecordingStart {
 struct ArmedRecordingStart {
     start: PendingRecordingStart,
     armed_tick: u64,
+}
+
+enum RecordingSelectionStart {
+    Settings { destination: std::path::PathBuf },
+    Request(RecordArgs),
+}
+
+struct PendingRecordingSelection {
+    start: RecordingSelectionStart,
+    result: Receiver<CliResult<CaptureTarget>>,
+    cancel_requested: bool,
 }
 
 /// What a hotkey is bound to unless the environment says otherwise.
@@ -148,6 +159,8 @@ pub struct Config {
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
     pub capture_on_start: Option<CaptureKind>,
+    /// Persist and restore the most recent interactive recording region.
+    pub remember_recording_selection: bool,
 }
 
 impl Default for Config {
@@ -161,6 +174,7 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
+            remember_recording_selection: true,
         }
     }
 }
@@ -218,6 +232,7 @@ impl Config {
             ipc: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
+            remember_recording_selection: false,
         }
     }
 }
@@ -266,6 +281,7 @@ pub struct App {
     recording_completion: Option<GuiRecordingCompletion>,
     recording_replies: Vec<Request>,
     recording_preflight: Option<RecordingHudSnapshot>,
+    recording_selection: Option<PendingRecordingSelection>,
     pending_recording_start: Option<ArmedRecordingStart>,
     recording_editor: Option<ActiveVideoEditor>,
     history_window: Option<HistoryWindowSnapshot>,
@@ -413,6 +429,7 @@ impl App {
             recording_completion: None,
             recording_replies: Vec::new(),
             recording_preflight: None,
+            recording_selection: None,
             pending_recording_start: None,
             recording_editor: None,
             history_window: None,
@@ -676,8 +693,8 @@ impl App {
     }
 
     fn toggle_recording(&mut self) {
-        if self.pending_recording_start.take().is_some() {
-            self.note("pending recording start cancelled");
+        if self.pending_recording_start.is_some() {
+            self.begin_recording_finalisation(None);
             return;
         }
         let Some(phase) = self.recording.as_ref().map(RecordingMachine::phase) else {
@@ -693,12 +710,22 @@ impl App {
                 self.begin_recording()
             }
             RecordingPhase::Selecting => {
-                let result = self
-                    .recording
-                    .as_mut()
-                    .expect("recording phase came from this machine")
-                    .cancel_selection();
-                self.finish_recording_action(result, "recording selection cancelled");
+                if let Some(selection) = &mut self.recording_selection {
+                    selection.cancel_requested = true;
+                    match self.selector.cancel_active() {
+                        Ok(()) => self.note("recording selection cancellation requested"),
+                        Err(error) => self.note(format!(
+                            "could not cancel recording selection immediately: {error}"
+                        )),
+                    }
+                } else {
+                    let result = self
+                        .recording
+                        .as_mut()
+                        .expect("recording phase came from this machine")
+                        .cancel_selection();
+                    self.finish_recording_action(result, "recording selection cancelled");
+                }
             }
             RecordingPhase::Countdown => {
                 let result = self
@@ -721,13 +748,6 @@ impl App {
             return;
         }
 
-        let target = match (self.recording_target)() {
-            Ok(target) => target,
-            Err(error) => {
-                self.present_recording_error(error);
-                return;
-            }
-        };
         let destination = match (self.recording_destination)() {
             Ok(destination) => destination,
             Err(error) => {
@@ -757,6 +777,27 @@ impl App {
         self.recording_preflight = None;
         self.recording_tick = Instant::now();
         self.recording_completion = None;
+        if self
+            .selector
+            .capabilities()
+            .supports(CaptureSelectionMode::Region)
+        {
+            if let Err(error) = self.begin_recording_selection(
+                RecordingSelectionStart::Settings { destination },
+                InteractiveMode::AllInOne,
+            ) {
+                self.present_recording_error(error);
+            }
+            return;
+        }
+
+        let target = match (self.recording_target)() {
+            Ok(target) => target,
+            Err(error) => {
+                self.present_recording_error(error);
+                return;
+            }
+        };
         self.pending_recording_start = Some(ArmedRecordingStart {
             start: PendingRecordingStart::Settings {
                 target,
@@ -765,6 +806,52 @@ impl App {
             armed_tick: self.tick_sequence,
         });
         self.note("recording start armed after overlay suppression");
+    }
+
+    fn begin_recording_selection(
+        &mut self,
+        start: RecordingSelectionStart,
+        mode: InteractiveMode,
+    ) -> CliResult<()> {
+        if self.recording_selection.is_some() || self.pending_recording_start.is_some() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "a recording selection or start is already pending".to_owned(),
+            )));
+        }
+        let machine = self.recording.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Unsupported {
+                what: "screen recording".to_owned(),
+                why: "no native recording engine is linked for this platform".to_owned(),
+            })
+        })?;
+        machine.begin_selection()?;
+
+        let selector = Arc::clone(&self.selector);
+        let remember_selection = self.config.remember_recording_selection;
+        let (send, result) = mpsc::channel();
+        if let Err(error) = std::thread::Builder::new()
+            .name("scrozz-recording-selector".to_owned())
+            .spawn(move || {
+                let selected = commands::select_recording_target_with_memory(
+                    mode,
+                    Some(selector.as_ref()),
+                    remember_selection,
+                );
+                let _ = send.send(selected);
+            })
+        {
+            let _ = machine.cancel_selection();
+            return Err(CliError::Core(CoreError::Platform(format!(
+                "could not start the recording selector: {error}"
+            ))));
+        }
+        self.recording_selection = Some(PendingRecordingSelection {
+            start,
+            result,
+            cancel_requested: false,
+        });
+        self.note("recording target selection started");
+        Ok(())
     }
 
     fn finish_recording_action(&mut self, result: scrozz_core::Result<()>, success: &str) {
@@ -782,6 +869,7 @@ impl App {
     fn advance_recording(&mut self) {
         self.finish_pending_recording();
         self.advance_video_export();
+        self.finish_recording_selection();
         self.start_pending_recording();
         let now = Instant::now();
         let delta = now.saturating_duration_since(self.recording_tick);
@@ -805,6 +893,69 @@ impl App {
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
+    }
+
+    fn finish_recording_selection(&mut self) {
+        let received = self
+            .recording_selection
+            .as_ref()
+            .map(|selection| selection.result.try_recv());
+        let mut result = match received {
+            None | Some(Err(TryRecvError::Empty)) => return,
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Disconnected)) => Err(CliError::Core(CoreError::Platform(
+                "the recording selector stopped without returning a target".to_owned(),
+            ))),
+        };
+        let selection = self
+            .recording_selection
+            .take()
+            .expect("a completed selector result has pending state");
+        if selection.cancel_requested {
+            result = Err(CliError::Core(CoreError::Cancelled));
+        }
+        let reset = self
+            .recording
+            .as_mut()
+            .ok_or_else(|| {
+                CoreError::InvalidRequest("no recording machine owns the selection".to_owned())
+            })
+            .and_then(RecordingMachine::cancel_selection);
+        if let Err(error) = reset {
+            self.present_recording_error(CliError::Core(error));
+            self.reply_recording_waiters();
+            return;
+        }
+
+        let target = match result {
+            Ok(target) => target,
+            Err(error) => {
+                self.present_recording_error(error);
+                self.reply_recording_waiters();
+                return;
+            }
+        };
+        let start = match selection.start {
+            RecordingSelectionStart::Settings { destination } => PendingRecordingStart::Settings {
+                target,
+                destination,
+            },
+            RecordingSelectionStart::Request(args) => {
+                match commands::prepare_recording_args_for_target(&args, target) {
+                    Ok(prepared) => PendingRecordingStart::Request(prepared.request),
+                    Err(error) => {
+                        self.present_recording_error(error);
+                        self.reply_recording_waiters();
+                        return;
+                    }
+                }
+            }
+        };
+        self.pending_recording_start = Some(ArmedRecordingStart {
+            start,
+            armed_tick: self.tick_sequence,
+        });
+        self.note("recording target selected; start armed after overlay suppression");
     }
 
     fn start_pending_recording(&mut self) {
@@ -902,14 +1053,14 @@ impl App {
             return commands::dispatch(command);
         }
 
-        let machine = self.recording.as_mut().ok_or_else(|| {
-            CliError::Core(CoreError::Unsupported {
-                what: "screen recording".into(),
-                why: "no native recording engine is linked for this platform".into(),
-            })
-        })?;
         match args.control() {
             Some(RecordControl::Pause) => {
+                let machine = self.recording.as_mut().ok_or_else(|| {
+                    CliError::Core(CoreError::Unsupported {
+                        what: "screen recording".into(),
+                        why: "no native recording engine is linked for this platform".into(),
+                    })
+                })?;
                 machine.pause()?;
                 Ok(recording_machine_report(
                     machine,
@@ -918,6 +1069,12 @@ impl App {
                 ))
             }
             Some(RecordControl::Resume) => {
+                let machine = self.recording.as_mut().ok_or_else(|| {
+                    CliError::Core(CoreError::Unsupported {
+                        what: "screen recording".into(),
+                        why: "no native recording engine is linked for this platform".into(),
+                    })
+                })?;
                 machine.resume()?;
                 Ok(recording_machine_report(
                     machine,
@@ -928,50 +1085,92 @@ impl App {
             Some(RecordControl::Stop) => Err(CliError::Core(CoreError::InvalidRequest(
                 "recording stop must be finalised asynchronously".into(),
             ))),
-            None => {
-                if let Err(error) = (self.recording_permission)() {
-                    return Err(CliError::Core(CoreError::PermissionDenied {
-                        capability: "screen recording".into(),
-                        remedy: error.to_string(),
-                    }));
-                }
-                if matches!(
-                    machine.phase(),
-                    RecordingPhase::Finished | RecordingPhase::Failed
-                ) {
-                    machine.reset()?;
-                }
-                let prepared = commands::prepare_recording_args(args)?;
-                let report = prepared.started_report();
-                if self
-                    .recording_editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.transcode_job.is_some())
-                {
-                    return Err(CliError::Core(CoreError::InvalidRequest(
-                        "cancel the active export before starting another recording".into(),
-                    )));
-                }
-                self.recording_editor = None;
-                if self.pending_recording_start.is_some() || machine.is_active() {
-                    return Err(CliError::Core(CoreError::InvalidRequest(
-                        "a recording start is already pending or active".into(),
-                    )));
-                }
-                self.pending_recording_start = Some(ArmedRecordingStart {
-                    start: PendingRecordingStart::Request(prepared.request),
-                    armed_tick: self.tick_sequence,
-                });
-                self.recording_tick = Instant::now();
-                self.recording_completion = None;
-                self.drain_recording_events();
-                self.refresh_recording_tray();
-                Ok(report)
-            }
+            None => self.dispatch_gui_recording_start(args),
         }
     }
 
+    fn dispatch_gui_recording_start(&mut self, args: &RecordArgs) -> CliResult<Report> {
+        if let Err(error) = (self.recording_permission)() {
+            return Err(CliError::Core(CoreError::PermissionDenied {
+                capability: "screen recording".into(),
+                remedy: error.to_string(),
+            }));
+        }
+        if self
+            .recording_editor
+            .as_ref()
+            .is_some_and(|editor| editor.transcode_job.is_some())
+        {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "cancel the active export before starting another recording".into(),
+            )));
+        }
+        if self.pending_recording_start.is_some() || self.recording_selection.is_some() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "a recording selection or start is already pending".into(),
+            )));
+        }
+        let machine = self.recording.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Unsupported {
+                what: "screen recording".into(),
+                why: "no native recording engine is linked for this platform".into(),
+            })
+        })?;
+        if matches!(
+            machine.phase(),
+            RecordingPhase::Finished | RecordingPhase::Failed
+        ) {
+            machine.reset()?;
+        }
+        if machine.is_active() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "a recording is already active".into(),
+            )));
+        }
+
+        self.recording_editor = None;
+        self.recording_tick = Instant::now();
+        self.recording_completion = None;
+        let requested = commands::recording_target_spec(args)?;
+        if let crate::cli::TargetSpec::Interactive(mode) = requested {
+            self.begin_recording_selection(RecordingSelectionStart::Request(args.clone()), mode)?;
+            return Ok(Report::new(
+                Json::obj([
+                    ("state", Json::str("selecting")),
+                    ("mode", Json::str(commands::interactive_slug(mode))),
+                ]),
+                format!(
+                    "Selecting a {} to record.",
+                    commands::interactive_slug(mode)
+                ),
+            ));
+        }
+
+        let prepared = commands::prepare_recording_args(args)?;
+        let report = prepared.started_report();
+        self.pending_recording_start = Some(ArmedRecordingStart {
+            start: PendingRecordingStart::Request(prepared.request),
+            armed_tick: self.tick_sequence,
+        });
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+        Ok(report)
+    }
+
     fn begin_recording_finalisation(&mut self, reply: Option<Request>) {
+        if let Some(selection) = &mut self.recording_selection {
+            selection.cancel_requested = true;
+            if let Some(reply) = reply {
+                self.recording_replies.push(reply);
+            }
+            match self.selector.cancel_active() {
+                Ok(()) => self.note("recording selection cancelled before native capture"),
+                Err(error) => self.note(format!(
+                    "recording selection cancellation is pending after selector error: {error}"
+                )),
+            }
+            return;
+        }
         if self.pending_recording_start.take().is_some() {
             if let Some(reply) = reply {
                 self.recording_replies.push(reply);
@@ -1847,6 +2046,36 @@ mod tests {
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
 
+    struct InstantRecordingSelector;
+
+    impl scrozz_core::RegionSelector for InstantRecordingSelector {
+        fn name(&self) -> &'static str {
+            "instant-recording-selector"
+        }
+
+        fn capabilities(&self) -> scrozz_core::SelectionCapabilities {
+            scrozz_core::SelectionCapabilities::CLIENT_OVERLAY
+        }
+
+        fn select(
+            &self,
+            _options: &scrozz_core::SelectionOptions,
+        ) -> scrozz_core::Result<scrozz_core::SelectionOutcome> {
+            let target =
+                CaptureTarget::Display(scrozz_core::DisplayId("selected-display".to_owned()));
+            Ok(scrozz_core::SelectionOutcome {
+                mode: scrozz_core::SelectionMode::Display,
+                target,
+                rect: None,
+                display: Some(scrozz_core::DisplayId("selected-display".to_owned())),
+                scale: scrozz_core::ScaleFactor::IDENTITY,
+                source: scrozz_core::SelectionSource::ClientOverlay,
+            })
+        }
+    }
+
+    impl crate::gui::selection::CaptureSelector for InstantRecordingSelector {}
+
     fn app() -> (App, Recording) {
         let surface = Recording::new();
         let handle = surface.handle();
@@ -1935,6 +2164,7 @@ mod tests {
                 "fixture-display".to_owned(),
             )))
         }
+
         fn destination() -> CliResult<std::path::PathBuf> {
             Ok(std::env::temp_dir().join("scrozz-gui-recording-test.mp4"))
         }
@@ -1991,6 +2221,63 @@ mod tests {
             app.notes()
                 .iter()
                 .any(|note| note.contains("rejected at the real-output boundary"))
+        );
+    }
+
+    #[test]
+    fn toggle_uses_the_real_selector_before_starting_native_recording() {
+        fn destination() -> CliResult<std::path::PathBuf> {
+            Ok(std::env::temp_dir().join("scrozz-gui-selected-recording.mp4"))
+        }
+
+        let surface = Recording::new();
+        let mut app = App::new(
+            Config::sealed(),
+            Box::new(surface),
+            Arc::new(InstantRecordingSelector),
+        )
+        .unwrap();
+        let mut settings = RecordingSettings::shipped();
+        settings.countdown.enabled = false;
+        app.recording = Some(
+            RecordingMachine::with_engine(
+                Box::new(scrozz_record::engine::MockEngine::fully_capable(
+                    scrozz_record::engine::MockSessionPlan::complete("mock.mp4", 2.0).unwrap(),
+                )),
+                settings,
+            )
+            .unwrap(),
+        );
+        app.recording_permission = || Ok(());
+        app.recording_destination = destination;
+
+        assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
+        assert_eq!(
+            app.recording.as_ref().map(RecordingMachine::phase),
+            Some(RecordingPhase::Selecting)
+        );
+        for _ in 0..100 {
+            app.tick();
+            if app.recording.as_ref().map(RecordingMachine::phase)
+                == Some(RecordingPhase::Recording)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let request = app
+            .recording
+            .as_ref()
+            .and_then(RecordingMachine::request)
+            .expect("selected recording request");
+        assert_eq!(
+            request.target,
+            CaptureTarget::Display(scrozz_core::DisplayId("selected-display".to_owned()))
+        );
+        assert_eq!(
+            request.destination.as_deref(),
+            Some(destination().unwrap().as_path())
         );
     }
 

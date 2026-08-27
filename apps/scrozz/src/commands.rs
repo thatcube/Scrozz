@@ -93,7 +93,7 @@ fn dispatch_inner(
 ) -> CliResult<Report> {
     match command {
         Command::Capture(args) => capture(args, selector),
-        Command::Record(args) => record(args, recording),
+        Command::Record(args) => record(args, recording, selector),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
         Command::Ocr(args) => ocr(args),
@@ -747,7 +747,11 @@ impl PreparedRecording {
     }
 }
 
-fn record(args: &RecordArgs, recording: &mut RecordingManager) -> CliResult<Report> {
+fn record(
+    args: &RecordArgs,
+    recording: &mut RecordingManager,
+    selector: Option<&dyn CaptureSelector>,
+) -> CliResult<Report> {
     if let Some(control) = args.control() {
         return match control {
             RecordControl::Stop => recording.stop(),
@@ -756,15 +760,15 @@ fn record(args: &RecordArgs, recording: &mut RecordingManager) -> CliResult<Repo
         };
     }
 
-    let target = resolve_recording_target(args)?;
-    let plan = recording_plan(args, &target);
+    let requested_target = recording_target_spec(args)?;
+    let plan = recording_plan(args, &requested_target);
 
     if args.dry_run {
         return Ok(Report::new(
             Json::obj([("dry_run", Json::Bool(true)), ("plan", plan)]),
             format!(
                 "Would record {} at {} fps.",
-                describe_target(&target),
+                describe_target(&requested_target),
                 args.fps
             ),
         ));
@@ -773,7 +777,9 @@ fn record(args: &RecordArgs, recording: &mut RecordingManager) -> CliResult<Repo
     if recording.is_active() {
         return Err(recording_already_active_error());
     }
-    let prepared = prepare_recording(args, target, plan)?;
+    let target = resolve_recording_capture_target(&requested_target, selector)?;
+    let resolved_plan = recording_plan_for_target(args, &target);
+    let prepared = prepare_recording(args, target, resolved_plan)?;
     let session = platform::start_recording(&prepared.request)?;
     recording.start(
         session,
@@ -784,21 +790,37 @@ fn record(args: &RecordArgs, recording: &mut RecordingManager) -> CliResult<Repo
 }
 
 pub(crate) fn prepare_recording_args(args: &RecordArgs) -> CliResult<PreparedRecording> {
-    let target = resolve_recording_target(args)?;
-    let plan = recording_plan(args, &target);
+    let target = recording_target_spec(args)?;
+    let concrete = capture_target(&target)?;
+    let plan = recording_plan_for_target(args, &concrete);
+    prepare_recording(args, concrete, plan)
+}
+
+pub(crate) fn prepare_recording_args_for_target(
+    args: &RecordArgs,
+    target: CaptureTarget,
+) -> CliResult<PreparedRecording> {
+    let requested = recording_target_spec(args)?;
+    if !matches!(requested, TargetSpec::Interactive(_)) {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "a caller-supplied recording target is only valid for an interactive request"
+                .to_owned(),
+        )));
+    }
+    let plan = recording_plan_for_target(args, &target);
     prepare_recording(args, target, plan)
 }
 
 fn prepare_recording(
     args: &RecordArgs,
-    target: TargetSpec,
+    target: CaptureTarget,
     plan: Json,
 ) -> CliResult<PreparedRecording> {
     let destination = absolute_recording_path(match &args.output {
         Some(path) => path.clone(),
         None => crate::output::default_recording_path()?,
     })?;
-    let mut request = RecordingRequest::new(capture_target(&target)?);
+    let mut request = RecordingRequest::new(target);
     request.destination = Some(destination.clone());
     request.microphone = args.microphone;
     request.system_audio = args.system_audio;
@@ -814,7 +836,7 @@ fn prepare_recording(
     })
 }
 
-fn resolve_recording_target(args: &RecordArgs) -> CliResult<TargetSpec> {
+pub(crate) fn recording_target_spec(args: &RecordArgs) -> CliResult<TargetSpec> {
     if args.target.region.is_none()
         && args.target.window.is_none()
         && args.target.display.is_none()
@@ -828,8 +850,16 @@ fn resolve_recording_target(args: &RecordArgs) -> CliResult<TargetSpec> {
 }
 
 fn recording_plan(args: &RecordArgs, target: &TargetSpec) -> Json {
+    recording_plan_with_target(args, target_json(target))
+}
+
+fn recording_plan_for_target(args: &RecordArgs, target: &CaptureTarget) -> Json {
+    recording_plan_with_target(args, capture_target_json(target))
+}
+
+fn recording_plan_with_target(args: &RecordArgs, target: Json) -> Json {
     Json::obj([
-        ("target", target_json(target)),
+        ("target", target),
         ("fps", Json::Int(args.fps.into())),
         ("quality", Json::str(args.quality.to_recording().slug())),
         ("resolution", Json::str(args.resolution.slug())),
@@ -839,6 +869,120 @@ fn recording_plan(args: &RecordArgs, target: &TargetSpec) -> Json {
         ("cursor", Json::Bool(args.cursor)),
         ("output", Json::opt(args.output.as_deref(), path_json)),
     ])
+}
+
+pub(crate) fn select_recording_target(
+    mode: InteractiveMode,
+    selector: Option<&dyn CaptureSelector>,
+) -> CliResult<CaptureTarget> {
+    select_recording_target_with_memory(mode, selector, true)
+}
+
+pub(crate) fn select_recording_target_with_memory(
+    mode: InteractiveMode,
+    selector: Option<&dyn CaptureSelector>,
+    remember_region: bool,
+) -> CliResult<CaptureTarget> {
+    let options = recording_selection_options(mode, remember_region)?;
+    let client_selector_available = selector
+        .map(|selector| selector.capabilities())
+        .is_some_and(|capabilities| capabilities.supports(options.mode));
+    if !client_selector_available && let Some(target) = compositor_recording_target(mode) {
+        return target;
+    }
+    let mut lifecycle = SelectorLifecycle::new(selector);
+    let outcome = if let Some(selector) = selector {
+        let capabilities = selector.capabilities();
+        if !capabilities.supports(options.mode) {
+            return Err(CliError::Core(CoreError::Unsupported {
+                what: format!("interactive {} recording selection", interactive_slug(mode)),
+                why: format!(
+                    "the {} selector does not support {} mode",
+                    selector.name(),
+                    options.mode.label()
+                ),
+            }));
+        }
+        selector.select(&capabilities.honour(&options))?
+    } else {
+        crate::gui::select_once(&options, CursorMode::Hidden, false)?.0
+    };
+    lifecycle.finish();
+    if remember_region && outcome.mode == scrozz_core::SelectionMode::Region {
+        match platform::capture_backend() {
+            Ok(backend) => remember_selection(&outcome, backend.as_ref()),
+            Err(error) => {
+                tracing::warn!(
+                    "recording target was selected but could not be remembered: {error}"
+                );
+            }
+        }
+    }
+    Ok(outcome.target)
+}
+
+fn recording_selection_options(
+    mode: InteractiveMode,
+    remember_region: bool,
+) -> CliResult<SelectionOptions> {
+    let mut options = SelectionOptions::for_mode(mode.initial_mode());
+    options.hud = mode.shows_hud();
+    if !remember_region || !matches!(mode, InteractiveMode::Region | InteractiveMode::AllInOne) {
+        return Ok(options);
+    }
+    let Some(remembered) =
+        crate::selection_store::RememberedRegionStore::default_location()?.load()?
+    else {
+        return Ok(options);
+    };
+    let displays = platform::target_enumerator()?.displays()?;
+    options.remembered_display = remembered.display_for(&displays);
+    options.remembered = Some(remembered.rect);
+    Ok(options)
+}
+
+#[cfg(target_os = "linux")]
+fn compositor_recording_target(mode: InteractiveMode) -> Option<CliResult<CaptureTarget>> {
+    use scrozz_shell::{DisplayServer, Session};
+
+    if Session::detect().server != DisplayServer::Wayland {
+        return None;
+    }
+    Some(match mode {
+        InteractiveMode::Window => Ok(CaptureTarget::Window(scrozz_core::WindowId(
+            "portal:interactive-window".to_owned(),
+        ))),
+        InteractiveMode::Display => Ok(CaptureTarget::Display(scrozz_core::DisplayId(
+            "portal:interactive-display".to_owned(),
+        ))),
+        InteractiveMode::Region => Err(CliError::Core(CoreError::Unsupported {
+            what: "interactive recording region selection on Wayland".to_owned(),
+            why: "the ScreenCast portal can choose a monitor or window but does not return \
+                  region coordinates; Scrozz will not fabricate capture geometry"
+                .to_owned(),
+        })),
+        InteractiveMode::AllInOne => Err(CliError::Core(CoreError::Unsupported {
+            what: "all-in-one recording selection on Wayland".to_owned(),
+            why: "the ScreenCast portal requires the source type before opening and cannot \
+                  return a client-side all-in-one window/display/region choice"
+                .to_owned(),
+        })),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn compositor_recording_target(_mode: InteractiveMode) -> Option<CliResult<CaptureTarget>> {
+    None
+}
+
+fn resolve_recording_capture_target(
+    target: &TargetSpec,
+    selector: Option<&dyn CaptureSelector>,
+) -> CliResult<CaptureTarget> {
+    match target {
+        TargetSpec::Interactive(mode) => select_recording_target(*mode, selector),
+        concrete => capture_target(concrete),
+    }
 }
 
 fn absolute_recording_path(path: PathBuf) -> CliResult<PathBuf> {
@@ -1826,10 +1970,40 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use clap::Parser;
 
     use super::*;
     use crate::{cli::Cli, exit::Exit};
+
+    struct FixedSelector {
+        outcome: scrozz_core::SelectionOutcome,
+        finished: AtomicBool,
+    }
+
+    impl scrozz_core::RegionSelector for FixedSelector {
+        fn name(&self) -> &'static str {
+            "fixed-recording-selector"
+        }
+
+        fn capabilities(&self) -> scrozz_core::SelectionCapabilities {
+            scrozz_core::SelectionCapabilities::CLIENT_OVERLAY
+        }
+
+        fn select(
+            &self,
+            _options: &SelectionOptions,
+        ) -> scrozz_core::Result<scrozz_core::SelectionOutcome> {
+            Ok(self.outcome.clone())
+        }
+    }
+
+    impl CaptureSelector for FixedSelector {
+        fn capture_finished(&self) {
+            self.finished.store(true, Ordering::Release);
+        }
+    }
 
     fn run(argv: &[&str]) -> CliResult<Report> {
         let cli = Cli::try_parse_from(argv).expect("should parse");
@@ -2029,6 +2203,60 @@ mod tests {
         assert!(rendered.contains(r#""fps":60"#), "{rendered}");
         assert!(rendered.contains(r#""microphone":true"#), "{rendered}");
         assert!(rendered.contains(r#""system_audio":false"#), "{rendered}");
+    }
+
+    #[test]
+    fn interactive_recording_uses_a_real_selector_and_releases_its_surface() {
+        let target = CaptureTarget::Window(scrozz_core::WindowId("selected-window".to_owned()));
+        let selector = FixedSelector {
+            outcome: scrozz_core::SelectionOutcome {
+                mode: scrozz_core::SelectionMode::Window,
+                target: target.clone(),
+                rect: None,
+                display: None,
+                scale: scrozz_core::ScaleFactor::IDENTITY,
+                source: scrozz_core::SelectionSource::ClientOverlay,
+            },
+            finished: AtomicBool::new(false),
+        };
+
+        assert_eq!(
+            select_recording_target(InteractiveMode::Window, Some(&selector)).unwrap(),
+            target
+        );
+        assert!(selector.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_selected_recording_target_keeps_every_requested_encoding_option() {
+        let output = std::env::temp_dir().join("scrozz-selected-recording.mp4");
+        let output_arg = output.to_string_lossy().into_owned();
+        let cli = Cli::try_parse_from([
+            "scrozz",
+            "record",
+            "--interactive",
+            "window",
+            "--fps",
+            "60",
+            "--system-audio",
+            "--output",
+            &output_arg,
+        ])
+        .unwrap();
+        let Some(Command::Record(args)) = cli.command else {
+            panic!("expected record command");
+        };
+        let target = CaptureTarget::Window(scrozz_core::WindowId("selected-window".to_owned()));
+
+        let prepared = prepare_recording_args_for_target(&args, target.clone()).unwrap();
+
+        assert_eq!(prepared.request.target, target);
+        assert_eq!(prepared.request.fps, 60);
+        assert!(prepared.request.system_audio);
+        assert_eq!(
+            prepared.request.destination.as_deref(),
+            Some(output.as_path())
+        );
     }
 
     #[test]

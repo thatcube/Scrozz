@@ -446,7 +446,10 @@ fn recording_scenarios_are_appended_after_editor_annotating() {
         .position(|scenario| *scenario == Scenario::EditorAnnotating)
         .unwrap();
     assert_eq!(Scenario::ALL[editor + 1], Scenario::RecordingIdle);
-    assert_eq!(&Scenario::ALL[editor + 1..], RECORDING_SCENARIOS);
+    assert_eq!(
+        &Scenario::ALL[editor + 1..editor + 1 + RECORDING_SCENARIOS.len()],
+        RECORDING_SCENARIOS
+    );
     assert_eq!(
         &Scenario::ALL[..=editor],
         &[

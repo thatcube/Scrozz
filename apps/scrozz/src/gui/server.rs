@@ -106,13 +106,19 @@ impl Request {
         &self,
         dispatch: impl FnOnce(&Command) -> CliResult<crate::report::Report>,
     ) -> CliResult<crate::report::Report> {
-        let command = self.command().ok_or_else(|| {
-            CliError::usage("the forwarded command could not be parsed for deferred execution")
-        })?;
-        let restore = enter(self.cwd.as_deref());
-        let result = dispatch(&command);
-        restore();
-        result
+        use clap::Parser as _;
+
+        let mut with_argv0 = Vec::with_capacity(self.argv.len() + 1);
+        with_argv0.push("scrozz".to_owned());
+        with_argv0.extend_from_slice(&self.argv);
+        let mut cli =
+            Cli::try_parse_from(with_argv0).map_err(|error| CliError::usage(error.to_string()))?;
+        let _aliases = self
+            .cwd
+            .as_deref()
+            .map_or_else(Default::default, |cwd| cli.absolutize_paths(cwd));
+        cli.validate()?;
+        dispatch(&cli.command.unwrap_or(Command::Gui))
     }
 
     /// Runs the command with a state-aware dispatcher retained by the host.
