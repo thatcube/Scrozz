@@ -51,6 +51,8 @@ impl MediaFoundation {
 
 impl Drop for MediaFoundation {
     fn drop(&mut self) {
-        let _ = unsafe { MFShutdown() };
+        if let Err(error) = unsafe { MFShutdown() } {
+            tracing::error!(%error, "Media Foundation shutdown failed");
+        }
     }
 }

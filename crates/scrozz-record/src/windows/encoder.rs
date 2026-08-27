@@ -28,9 +28,7 @@ use windows::{
     core::{Interface, PCWSTR},
 };
 
-use super::{
-    device::Device, mix::MixedChunk, plan::EncoderPlan, timing::HNS_PER_SECOND, video::FramePacket,
-};
+use super::{device::Device, mix::MixedChunk, plan::EncoderPlan, video::FramePacket};
 
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_CHANNELS: u32 = 2;
@@ -45,7 +43,6 @@ pub struct Encoder {
     _device_manager: IMFDXGIDeviceManager,
     video_stream: u32,
     audio_stream: Option<u32>,
-    frame_duration_hns: i64,
     accepted_samples: u64,
     video_frames: u64,
 }
@@ -137,14 +134,18 @@ impl Encoder {
             _device_manager: manager,
             video_stream,
             audio_stream,
-            frame_duration_hns: HNS_PER_SECOND / i64::from(plan.fps),
             accepted_samples: 0,
             video_frames: 0,
         })
     }
 
     /// Sends one GPU texture directly to the sink writer.
-    pub fn write_video(&mut self, packet: FramePacket, stream_hns: i64) -> Result<()> {
+    pub fn write_video(
+        &mut self,
+        packet: FramePacket,
+        stream_hns: i64,
+        duration_hns: i64,
+    ) -> Result<()> {
         let buffer =
             unsafe { MFCreateDXGISurfaceBuffer(&ID3D11_TEXTURE2D_IID, &packet.texture, 0, false) }
                 .map_err(|error| Error::Codec(format!("could not wrap D3D11 frame: {error}")))?;
@@ -162,7 +163,7 @@ impl Encoder {
             unsafe {
                 sample.AddBuffer(&buffer)?;
                 sample.SetSampleTime(stream_hns)?;
-                sample.SetSampleDuration(self.frame_duration_hns)?;
+                sample.SetSampleDuration(duration_hns)?;
                 self.writer.WriteSample(self.video_stream, &sample)?;
             }
             Ok(())
@@ -276,8 +277,24 @@ impl<'a> OutputCleanup<'a> {
 impl Drop for OutputCleanup<'_> {
     fn drop(&mut self) {
         if !self.keep {
-            let _ = unsafe { self.stream.Close() };
-            let _ = std::fs::remove_file(self.path);
+            if let Err(error) = unsafe { self.stream.Close() } {
+                tracing::error!(
+                    path = %self.path.display(),
+                    %error,
+                    "could not close failed Media Foundation output"
+                );
+            }
+            match std::fs::remove_file(self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(
+                        path = %self.path.display(),
+                        %error,
+                        "could not remove failed Media Foundation output; owner guard will retry"
+                    );
+                }
+            }
         }
     }
 }

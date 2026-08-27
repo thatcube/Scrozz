@@ -4,11 +4,13 @@ mod audio;
 mod com;
 mod device;
 mod encoder;
+mod geometry;
 mod mix;
 mod plan;
 mod salvage;
 mod session;
 mod target;
+mod terminal;
 mod timing;
 mod video;
 
