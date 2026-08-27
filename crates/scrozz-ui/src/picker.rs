@@ -454,9 +454,9 @@ mod tests {
         // exclusion it is the answer at every single point.
         let picker = fixtures::with_our_overlay().into_picker();
         assert!(
-            picker.window_at(at(300.0, 300.0)).is_some_and(|window| {
-                window.id != WindowId("scrozz-overlay".to_owned())
-            }),
+            picker
+                .window_at(at(300.0, 300.0))
+                .is_some_and(|window| { window.id != WindowId("scrozz-overlay".to_owned()) }),
             "the picker selected Scrozz's own overlay"
         );
         assert_eq!(picker.candidate_count(), 2);
