@@ -53,7 +53,7 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
     let image = cg_image(&prepared)?;
 
     let request = VNRecognizeTextRequest::new();
-    configure(&request, options);
+    configure(&request, options)?;
 
     // SAFETY: `image` is a live CGImage and the dictionary is a valid, empty
     // NSDictionary of the expected key/value types.
@@ -113,7 +113,7 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
 }
 
 /// Applies options to a freshly created request.
-fn configure(request: &VNRecognizeTextRequest, options: &Options) {
+fn configure(request: &VNRecognizeTextRequest, options: &Options) -> Result<()> {
     request.setRecognitionLevel(match options.accuracy {
         Accuracy::Accurate => VNRequestTextRecognitionLevel::Accurate,
         Accuracy::Fast => VNRequestTextRecognitionLevel::Fast,
@@ -128,18 +128,31 @@ fn configure(request: &VNRecognizeTextRequest, options: &Options) {
     // minimum", which is the behaviour to pin rather than inherit.
     request.setMinimumTextHeight(0.0);
 
+    if options.automatic_language_detection {
+        request.setAutomaticallyDetectsLanguage(true);
+        return Ok(());
+    }
+
     let languages = supported_languages(request, &options.languages);
     if languages.is_empty() {
-        // Nothing usable — let Vision pick. Better a default language than a
-        // hard failure from an empty language list.
-        request.setAutomaticallyDetectsLanguage(true);
-        return;
+        request.setAutomaticallyDetectsLanguage(false);
+        if !options.languages.is_empty() {
+            return Err(Error::Unsupported {
+                what: format!("text recognition in {}", options.languages.join(", ")),
+                why: format!(
+                    "Vision supports none of the requested OCR languages. Available languages: {}",
+                    available_languages(options.accuracy)?.join(", ")
+                ),
+            });
+        }
+        return Ok(());
     }
 
     let strings: Vec<Retained<NSString>> =
         languages.iter().map(|s| NSString::from_str(s)).collect();
     request.setRecognitionLanguages(&NSArray::from_retained_slice(&strings));
     request.setAutomaticallyDetectsLanguage(false);
+    Ok(())
 }
 
 /// Picks the language tags to request, keeping only ones Vision accepts.
@@ -193,12 +206,31 @@ fn supported_languages(request: &VNRecognizeTextRequest, requested: &[String]) -
     out
 }
 
+/// Lists OCR languages supported by Vision for the requested accuracy.
+pub fn available_languages(accuracy: Accuracy) -> Result<Vec<String>> {
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(match accuracy {
+        Accuracy::Accurate => VNRequestTextRecognitionLevel::Accurate,
+        Accuracy::Fast => VNRequestTextRecognitionLevel::Fast,
+    });
+    // SAFETY: `request` is live and fully initialized; this only reads a property.
+    let supported = unsafe { request.supportedRecognitionLanguagesAndReturnError() }
+        .map_err(|error| Error::Platform(format!("Vision language listing failed: {error}")))?;
+    let mut languages: Vec<String> = supported
+        .iter()
+        .map(|language| language.to_string())
+        .collect();
+    languages.sort_unstable();
+    languages.dedup();
+    Ok(languages)
+}
+
 /// Wraps a prepared image in a `CGImage` Vision can read.
 ///
 /// Returns an opaque owner rather than a named handle: Core Graphics types are
 /// reference-counted through `CFRetained`, and `objc2-core-foundation` is not a
 /// declared dependency of this crate, so the type is deliberately not spelled.
-fn cg_image(prepared: &Prepared) -> Result<impl std::ops::Deref<Target = CGImage>> {
+pub(crate) fn cg_image(prepared: &Prepared) -> Result<impl std::ops::Deref<Target = CGImage>> {
     let (width, height) = (
         prepared.image.width as usize,
         prepared.image.height as usize,

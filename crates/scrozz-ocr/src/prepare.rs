@@ -80,6 +80,24 @@ pub struct Rgba8Image {
     pub data: Vec<u8>,
 }
 
+/// Converts straight-alpha RGBA pixels to Rec.601 luma over opaque white.
+pub(crate) fn rec601_luma_on_white(image: &Rgba8Image) -> Vec<u8> {
+    image
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| {
+            let red = u32::from(pixel[0]);
+            let green = u32::from(pixel[1]);
+            let blue = u32::from(pixel[2]);
+            let alpha = u32::from(pixel[3]);
+            let luma = (299 * red + 587 * green + 114 * blue + 500) / 1_000;
+            ((luma * alpha + 255 * (255 - alpha) + 127) / 255) as u8
+        })
+        .collect()
+}
+
 impl Rgba8Image {
     /// Creates an image, checking that `data` matches `width * height * 4`.
     ///

@@ -75,6 +75,7 @@ rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 # generates the fixtures rather than committing binary blobs.
 rxing = { version = "0.9", default-features = false, features = [
     "decoders",
+    "encoding_rs",
     "multi_barcode_readers",
     "qrcode",
     "aztec",

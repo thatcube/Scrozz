@@ -64,6 +64,7 @@ pub mod action;
 pub mod app;
 pub mod card;
 pub mod host;
+pub mod onboarding;
 pub mod overlay;
 pub mod panel;
 pub mod pipeline;

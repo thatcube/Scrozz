@@ -152,7 +152,7 @@ pub fn policy(command: &Command) -> Forwarding {
         // prevent.
         Command::Capture(_) | Command::Record(_) => Forwarding::Prefer,
         Command::History(_) => Forwarding::Prefer,
-        Command::Ocr(_) => Forwarding::Prefer,
+        Command::Ocr(_) | Command::Barcodes(_) => Forwarding::Prefer,
         Command::Settings(args) if args.is_write() => Forwarding::Prefer,
 
         // Pure reads and pure functions. `list` asks the compositor, not Scrozz;

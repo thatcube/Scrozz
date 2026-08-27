@@ -192,7 +192,7 @@ impl Host for Windowed {
         let options = OverlayOptions {
             geometry,
             panel: panel_hook(),
-            probe: pointer_probe(),
+            probe: pointer_probe(geometry),
             ..Default::default()
         };
 
@@ -210,6 +210,8 @@ impl Host for Windowed {
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
+                let onboarding_memory = crate::gui::onboarding::OcrOnboardingMemory::system();
+                let onboarding_visible = !onboarding_memory.has_seen();
                 Ok(Box::new(Driver {
                     app,
                     overlay,
@@ -218,6 +220,11 @@ impl Host for Windowed {
                     emit: Some(emit),
                     announced: false,
                     stopped: false,
+                    settings_open: false,
+                    settings: scrozz_ui::OcrSettings,
+                    onboarding_visible,
+                    onboarding: scrozz_ui::OcrOnboarding,
+                    onboarding_memory,
                 }))
             }),
         )
@@ -263,6 +270,11 @@ struct Driver {
     emit: Option<Emit>,
     announced: bool,
     stopped: bool,
+    settings_open: bool,
+    settings: scrozz_ui::OcrSettings,
+    onboarding_visible: bool,
+    onboarding: scrozz_ui::OcrOnboarding,
+    onboarding_memory: crate::gui::onboarding::OcrOnboardingMemory,
 }
 
 impl Driver {
@@ -295,6 +307,76 @@ impl Driver {
         self.handle
             .panel_report()
             .is_some_and(|report| report.non_activating)
+    }
+
+    fn mark_onboarding_seen(&self) {
+        if let Err(error) = self.onboarding_memory.mark_seen() {
+            tracing::warn!(%error, "OCR onboarding completion could not be saved");
+        }
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        let mut close = false;
+        let mut replay_onboarding = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("scrozz-settings"),
+            egui::ViewportBuilder::default()
+                .with_title("Scrozz Settings")
+                .with_inner_size([520.0, 240.0])
+                .with_min_inner_size([520.0, 240.0])
+                .with_resizable(false),
+            |ui, _class| {
+                close = ui.input(|input| input.viewport().close_requested());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    replay_onboarding = self.settings.ui(ui).show_onboarding;
+                });
+            },
+        );
+
+        if close {
+            self.settings_open = false;
+        }
+        if replay_onboarding {
+            self.onboarding_visible = true;
+        }
+    }
+
+    fn show_onboarding(&mut self, ctx: &egui::Context) {
+        if !self.onboarding_visible {
+            return;
+        }
+
+        let mut close = false;
+        let mut completed = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("scrozz-ocr-onboarding"),
+            egui::ViewportBuilder::default()
+                .with_title("Text recognition")
+                .with_inner_size([760.0, 500.0])
+                .with_min_inner_size([760.0, 500.0])
+                .with_resizable(false),
+            |ui, _class| {
+                close = ui.input(|input| input.viewport().close_requested());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    completed = self.onboarding.ui(ui).completed;
+                });
+            },
+        );
+
+        if close || completed {
+            self.mark_onboarding_seen();
+            self.onboarding_visible = false;
+            if completed {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of("scrozz-ocr-onboarding"),
+                    egui::ViewportCommand::Close,
+                );
+            }
+        }
     }
 }
 
@@ -365,6 +447,10 @@ impl eframe::App for Driver {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        if self.app.take_settings_request() {
+            self.settings_open = true;
+        }
+
         // An idle overlay must still be woken, or a hotkey pressed while
         // nothing is on screen would not be noticed until something else woke
         // the window — which, for a window that is empty at rest, may be never.
@@ -373,6 +459,9 @@ impl eframe::App for Driver {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.overlay.ui(ui, frame);
+        let ctx = ui.ctx().clone();
+        self.show_settings(&ctx);
+        self.show_onboarding(&ctx);
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -430,24 +519,25 @@ fn work_area() -> OverlayGeometry {
 
 /// An exact pointer source for the click-through logic, if one is available.
 ///
-/// Returns `None` today. See [`PROBE_GAP`] — the degradation is bounded and
-/// documented, and a probe that guessed would be worse than none.
-fn pointer_probe() -> Option<scrozz_ui::PointerProbe> {
-    tracing::debug!("{PROBE_GAP}");
-    None
-}
+/// macOS needs this even while the overlay is ignoring mouse events: once
+/// click-through is enabled, window-local pointer events stop entirely.
+fn pointer_probe(geometry: OverlayGeometry) -> Option<scrozz_ui::PointerProbe> {
+    #[cfg(target_os = "macos")]
+    {
+        let origin = geometry.position();
+        Some(Arc::new(move || {
+            scrozz_shell::macos::display::pointer_location()
+                .ok()
+                .map(|point| egui::pos2(point.x as f32 - origin.x, point.y as f32 - origin.y))
+        }))
+    }
 
-/// Why there is no pointer probe.
-pub const PROBE_GAP: &str = "no crate exposes the pointer as a point. \
-     scrozz-shell reads NSEvent::mouseLocation inside \
-     macos::display::active_display and returns the Display containing it, \
-     never the location, so the one correct implementation of the AppKit \
-     coordinate flip is not reachable from here. Exposing \
-     `pub fn pointer_location() -> Result<LogicalPoint>` next to \
-     active_display would be a three-line extraction and is the right fix; \
-     calling NSEvent::mouseLocation again from this crate would duplicate \
-     that flip and eventually disagree with it. Without a probe the overlay \
-     re-samples click-through every 350ms, which is imprecise but bounded";
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = geometry;
+        None
+    }
+}
 
 /// Whether the environment asked for a run without a window.
 #[must_use]
@@ -522,8 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_gap_names_the_fix_rather_than_apologising() {
-        assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
-        assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    fn the_pointer_probe_is_wired_where_the_platform_needs_it() {
+        let probe = pointer_probe(OverlayGeometry::default());
+        assert_eq!(probe.is_some(), cfg!(target_os = "macos"));
     }
 }

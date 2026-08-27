@@ -65,6 +65,15 @@ const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 /// the machine has no OCR language pack installed, [`Error::Platform`] for any
 /// other WinRT failure.
 pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    if options.automatic_language_detection {
+        return Err(Error::Unsupported {
+            what: "automatic OCR language detection".to_string(),
+            why: "Windows.Media.Ocr requires an installed language pack selected explicitly or \
+                  through the user's profile; it cannot infer language from image content"
+                .to_string(),
+        });
+    }
+
     // Ask the engine for its ceiling first: the answer feeds the upscale
     // decision, so an image is never enlarged past what the engine will accept
     // and an already-oversized capture is shrunk rather than rejected.
@@ -232,19 +241,31 @@ fn engine_for(languages: &[String]) -> Result<OcrEngine> {
 
 /// The recognizer languages this machine has installed, for error messages.
 fn installed_languages() -> String {
-    let Ok(available) = OcrEngine::AvailableRecognizerLanguages() else {
+    let Ok(tags) = available_languages() else {
         return "unknown".to_string();
     };
-    let tags: Vec<String> = (0..available.Size().unwrap_or(0))
-        .filter_map(|i| available.GetAt(i).ok())
-        .filter_map(|language| language.LanguageTag().ok())
-        .map(|tag| tag.to_string_lossy())
-        .collect();
     if tags.is_empty() {
         "none".to_string()
     } else {
         tags.join(", ")
     }
+}
+
+/// Lists OCR recognizer languages installed in Windows.
+pub fn available_languages() -> Result<Vec<String>> {
+    let available = OcrEngine::AvailableRecognizerLanguages().map_err(|error| {
+        Error::Platform(format!(
+            "OcrEngine::AvailableRecognizerLanguages failed: {error}"
+        ))
+    })?;
+    let mut tags: Vec<String> = (0..available.Size().unwrap_or(0))
+        .filter_map(|index| available.GetAt(index).ok())
+        .filter_map(|language| language.LanguageTag().ok())
+        .map(|tag| tag.to_string_lossy())
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    Ok(tags)
 }
 
 /// Copies a prepared image into a `SoftwareBitmap` the engine can consume.

@@ -355,14 +355,8 @@ pub(crate) fn prepared_pixels_to_logical(
     prepared: &prepare::Prepared,
     frame: &Frame,
 ) -> LogicalRect {
-    let physical = layout::pixels_to_physical(
-        x,
-        y,
-        width,
-        height,
-        prepared.upscale,
-        prepared.source_size,
-    );
+    let physical =
+        layout::pixels_to_physical(x, y, width, height, prepared.upscale, prepared.source_size);
     layout::to_logical(physical, frame.scale)
 }
 

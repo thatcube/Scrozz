@@ -114,6 +114,7 @@ fn every_subcommand_has_working_help() {
         vec!["history", "delete", "--help"],
         vec!["history", "pin", "--help"],
         vec!["ocr", "--help"],
+        vec!["barcodes", "--help"],
         vec!["settings", "--help"],
         vec!["settings", "get", "--help"],
         vec!["settings", "set", "--help"],

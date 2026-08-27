@@ -21,7 +21,11 @@ fn blank(width: u32, height: u32, scale: f64) -> Frame {
 
 #[test]
 fn availability_matches_the_platform() {
-    let expected = cfg!(any(target_os = "macos", target_os = "windows"));
+    let expected = cfg!(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", feature = "tesseract")
+    ));
     assert_eq!(SystemOcr::is_available(), expected);
 }
 
@@ -35,6 +39,8 @@ fn options_default_to_accurate_and_no_language_correction() {
     );
     assert_eq!(options.upscale, UpscalePolicy::Automatic);
     assert!(options.languages.is_empty());
+    assert!(!options.automatic_language_detection);
+    assert_eq!(options.line_breaks, scrozz_ocr::LineBreaks::Preserve);
 }
 
 #[test]
@@ -43,11 +49,14 @@ fn options_builders_compose() {
         .with_languages(["en-US".to_string(), "de-DE".to_string()])
         .with_accuracy(scrozz_ocr::Accuracy::Fast)
         .with_upscale(UpscalePolicy::Off)
-        .with_language_correction(true);
+        .with_language_correction(true)
+        .with_automatic_language_detection(false)
+        .with_line_breaks(scrozz_ocr::LineBreaks::Collapse);
     assert_eq!(options.languages, ["en-US", "de-DE"]);
     assert_eq!(options.accuracy, scrozz_ocr::Accuracy::Fast);
     assert_eq!(options.upscale, UpscalePolicy::Off);
     assert!(options.language_correction);
+    assert_eq!(options.line_breaks, scrozz_ocr::LineBreaks::Collapse);
 }
 
 /// A malformed frame must be rejected the same way everywhere, before any
@@ -69,7 +78,11 @@ fn a_zero_sized_frame_never_panics() {
     assert!(SystemOcr::new().recognize(&frame).is_err());
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", feature = "tesseract")
+)))]
 mod no_system_engine {
     use super::{Ocr, SystemOcr, blank};
     use scrozz_core::Error;

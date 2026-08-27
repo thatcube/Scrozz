@@ -132,8 +132,14 @@ pub fn store() -> CliResult<scrozz_store::SqliteStore> {
 /// turns a path into a [`scrozz_core::Frame`]. What remains is the call that
 /// joins them, which lives in `commands::ocr`.
 #[must_use]
-pub fn ocr_engine() -> scrozz_ocr::SystemOcr {
-    scrozz_ocr::SystemOcr::new()
+pub const fn ocr_engine(options: scrozz_ocr::Options) -> scrozz_ocr::SystemOcr {
+    scrozz_ocr::SystemOcr::with_options(options)
+}
+
+/// The best barcode detector for this platform.
+#[must_use]
+pub const fn barcode_engine(options: scrozz_ocr::BarcodeOptions) -> scrozz_ocr::SystemBarcodes {
+    scrozz_ocr::SystemBarcodes::with_options(options)
 }
 
 /// Whether this build has a working OCR engine.

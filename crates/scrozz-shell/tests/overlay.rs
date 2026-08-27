@@ -415,6 +415,14 @@ mod off_main {
     }
 
     #[test]
+    fn the_pointer_location_is_refused_off_main() {
+        assert!(matches!(
+            display::pointer_location(),
+            Err(Error::Platform(_))
+        ));
+    }
+
+    #[test]
     fn a_point_lookup_is_refused_off_main() {
         use scrozz_core::LogicalPoint;
         assert!(matches!(

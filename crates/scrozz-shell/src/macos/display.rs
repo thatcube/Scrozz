@@ -198,13 +198,22 @@ pub fn display_at(point: LogicalPoint) -> Result<Display> {
 /// Returns [`Error::Platform`] off the main thread, and [`Error::TargetGone`]
 /// if there are no displays.
 pub fn active_display() -> Result<Display> {
-    let mtm = main_thread("reading the pointer's display")?;
+    display_at(pointer_location()?)
+}
+
+/// The pointer in Scrozz's top-left global logical coordinate space.
+///
+/// # Errors
+///
+/// Returns [`Error::Platform`] off the main thread.
+pub fn pointer_location() -> Result<LogicalPoint> {
+    let mtm = main_thread("reading the pointer location")?;
     let reference = reference_height(mtm);
     // `NSEvent::mouseLocation` is a class method with no receiver state and is
     // safe in these bindings; it reports AppKit global coordinates, so it needs
     // the same flip as every screen rectangle.
     let location = NSEvent::mouseLocation();
-    display_at(LogicalPoint::new(location.x, reference - location.y))
+    Ok(LogicalPoint::new(location.x, reference - location.y))
 }
 
 /// Whether a rectangle contains a point, half-open on the far edges.
