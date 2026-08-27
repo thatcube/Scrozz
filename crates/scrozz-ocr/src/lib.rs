@@ -2,14 +2,11 @@
 //!
 //! # The shape of the problem
 //!
-//! Two of Scrozz's three platforms ship a genuinely good text recogniser in the
-//! operating system — Vision on macOS, `Windows.Media.Ocr` on Windows. Using
-//! them instead of a bundled model is not a shortcut: they are better on the
-//! small, antialiased, light-on-dark UI text that screenshots are full of, they
-//! are already localised to whatever languages the user has installed, and they
-//! add nothing to the download. Linux ships no such engine, so per decision D8
-//! that gap is reported honestly rather than papered over with a silent empty
-//! result.
+//! macOS and packaged Windows builds use the operating system's recogniser:
+//! Vision and `Windows.Media.Ocr`, respectively. Portable Windows has no package
+//! identity and uses the artifact-local Tesseract payload instead. Linux ships no
+//! system engine, so per decision D8 that gap is reported honestly rather than
+//! papered over with a silent empty result.
 //!
 //! # What is actually hard
 //!
@@ -46,16 +43,30 @@
 
 use scrozz_core::{Frame, LogicalRect, Result};
 
+/// Windows COM-apartment setup and error mapping.
+pub mod apartment;
 pub mod layout;
 pub mod prepare;
 
 pub use layout::plain_text;
 pub use prepare::UpscalePolicy;
 
+/// Absolute Tesseract directory override for source builds and tests.
+///
+/// This does not select Tesseract: packaged Windows processes always use
+/// `Windows.Media.Ocr`. In an unpackaged process, an unset override resolves to
+/// `tesseract/` beside `scrozz.exe`. The directory must contain
+/// `tesseract.exe`, its dependent DLLs, and `tessdata/eng.traineddata`.
+pub const TESSERACT_DIRECTORY_ENV: &str = "SCROZZ_TESSERACT_DIR";
+
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "windows", test))]
+mod tesseract;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(any(target_os = "windows", test))]
+mod windows_runtime;
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod unsupported;
@@ -73,11 +84,9 @@ pub struct TextBlock {
 
 /// Extracts text from images.
 ///
-/// Every platform ships a competent engine — Vision on macOS, Windows OCR on
-/// Windows — and both are far better than a bundled model at the sizes and
-/// fonts screenshots actually contain. Linux has no system engine, so it needs
-/// Tesseract or an ONNX model; per decision D8 that gap is stated plainly rather
-/// than hidden.
+/// Vision runs on macOS, packaged Windows uses Windows Media OCR, and portable
+/// Windows uses its local Tesseract payload. Linux has no configured engine, so
+/// per decision D8 that gap is stated plainly rather than hidden.
 pub trait Ocr {
     /// Recognises text in a frame.
     ///
@@ -170,7 +179,8 @@ impl Options {
 
 /// The operating system's text recogniser.
 ///
-/// Vision on macOS, `Windows.Media.Ocr` on Windows, and an honest
+/// Vision on macOS, `Windows.Media.Ocr` in a packaged Windows process,
+/// artifact-local Tesseract in a portable Windows process, and an honest
 /// [`scrozz_core::Error::Unsupported`] elsewhere.
 ///
 /// # Extending to Linux
@@ -213,6 +223,27 @@ impl SystemOcr {
     #[must_use]
     pub const fn is_available() -> bool {
         cfg!(any(target_os = "macos", target_os = "windows"))
+    }
+
+    /// Stable backend token suitable for diagnostics and machine output.
+    ///
+    /// # Errors
+    ///
+    /// On Windows, returns a platform error if process package identity cannot be
+    /// determined. Package identity is the only input to backend selection.
+    pub fn engine_name() -> Result<&'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok("vision")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::engine_name()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Ok("unavailable")
+        }
     }
 
     /// Recognises text and returns it as lines, ready to copy.

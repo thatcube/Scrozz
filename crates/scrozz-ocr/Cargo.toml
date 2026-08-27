@@ -13,6 +13,9 @@ scrozz-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+isolang.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
@@ -24,13 +27,20 @@ windows = { workspace = true, features = [
     "Media_Ocr",
     "Graphics_Imaging",
     "Foundation",
+    "Win32_System_WinRT",
     # CopyFromBuffer, so the pixel upload need not hand-write an
     # IMemoryBufferByteAccess vtable.
     "Storage_Streams",
     # TryCreateFromLanguage; without it, requested languages are only advisory.
     "Globalization",
+    # Runtime package identity selects the WinRT or portable backend.
+    "Win32_Foundation",
+    "Win32_Storage_Packaging_Appx",
+    # Resolves the user's locale for portable Tesseract language selection.
+    "Win32_Globalization",
 ] }
 windows-core.workspace = true
+isolang.workspace = true
 
 [lints]
 workspace = true
