@@ -32,6 +32,9 @@
 //!   autostart label — that the OS keys permission grants, scheme handlers and
 //!   login items by. Every one of them fails silently when two subsystems
 //!   spell it differently, so there is exactly one spelling.
+//! - [`scroll::ScrollSynthesis`] makes D8's "query capabilities, never assume"
+//!   rule unavoidable for scrolling capture: a caller cannot reach the scroll
+//!   API without first having been told whether this desktop can scroll at all.
 
 #![forbid(unsafe_code)]
 
@@ -41,10 +44,15 @@ pub mod frame;
 pub mod geometry;
 pub mod identity;
 pub mod selection;
+pub mod scroll;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance, WindowPicking};
 pub use error::{Error, Result};
+pub use scroll::{
+    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
+    ScrollSynthesis,
+};
 pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
