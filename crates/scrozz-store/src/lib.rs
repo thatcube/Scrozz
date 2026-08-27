@@ -76,6 +76,21 @@ pub struct RetentionPolicy {
     pub max_image_age: RetentionWindow,
 }
 
+impl RetentionPolicy {
+    /// Builds a policy from the byte and day values persisted by settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scrozz_core::Error::InvalidRequest`] when `max_age_days` is
+    /// not one of `0`, `1`, `3`, `7`, or `30`.
+    pub fn from_limits(max_image_bytes: u64, max_age_days: u32) -> Result<Self> {
+        Ok(Self {
+            max_image_bytes,
+            max_image_age: RetentionWindow::from_days(max_age_days)?,
+        })
+    }
+}
+
 impl Default for RetentionPolicy {
     fn default() -> Self {
         // 10 GB. Generous enough that most users never hit it, bounded enough
@@ -113,4 +128,21 @@ pub trait Store {
     ///
     /// Returns an error if eviction could not complete.
     fn enforce_retention(&mut self, policy: &RetentionPolicy) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_builds_from_the_exact_persisted_limits() {
+        assert_eq!(
+            RetentionPolicy::from_limits(42, 7).unwrap(),
+            RetentionPolicy {
+                max_image_bytes: 42,
+                max_image_age: RetentionWindow::OneWeek,
+            }
+        );
+        assert!(RetentionPolicy::from_limits(42, 365).is_err());
+    }
 }

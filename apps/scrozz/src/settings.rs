@@ -789,26 +789,22 @@ mod tests {
     #[test]
     fn the_retention_default_matches_the_core_policy() {
         let setting = lookup("history.max-image-bytes").unwrap();
+        let age = lookup("history.max-age-days").unwrap();
         assert_eq!(
-            setting.default.parse::<u64>().unwrap(),
-            scrozz_store::RetentionPolicy::default().max_image_bytes
-        );
-
-        let age = lookup("history.max-image-age").unwrap();
-        assert_eq!(
-            scrozz_store::RetentionWindow::from_token(age.default).unwrap(),
-            scrozz_store::RetentionPolicy::default().max_image_age
+            scrozz_store::RetentionPolicy::from_limits(
+                setting.default.parse().unwrap(),
+                age.default.parse().unwrap(),
+            )
+            .unwrap(),
+            scrozz_store::RetentionPolicy::default()
         );
         let Kind::Choice(options) = age.kind else {
-            panic!("history.max-image-age should be a choice")
+            panic!("history.max-age-days should be a choice")
         };
-        assert_eq!(
-            options,
-            scrozz_store::RetentionWindow::all()
-                .iter()
-                .map(|window| window.as_token())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(options, &["0", "1", "3", "7", "30"]);
+        for option in options {
+            scrozz_store::RetentionWindow::from_days(option.parse().unwrap()).unwrap();
+        }
     }
 
     #[test]

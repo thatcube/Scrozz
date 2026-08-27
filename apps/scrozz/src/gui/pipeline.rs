@@ -183,7 +183,9 @@ pub enum Job {
     },
     /// Permanently delete a stored capture.
     Delete(CaptureId),
-    /// Enforce the current source-image retention policy.
+    /// Replace the live source-image retention policy and enforce it now.
+    ///
+    /// The worker also applies this policy after every future capture.
     EnforceRetention(RetentionPolicy),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
@@ -320,6 +322,15 @@ impl Pipeline {
     /// reports and continues past, because a capture the user can see and copy
     /// is worth more than a capture refused because history was unavailable.
     pub fn start() -> CliResult<Self> {
+        Self::start_with_retention(RetentionPolicy::default())
+    }
+
+    /// Starts the worker with the source-image policy loaded from settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::Core`] under the same conditions as [`Self::start`].
+    pub fn start_with_retention(retention_policy: RetentionPolicy) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (history_queries, history_rx) = channel();
         let (outcome_tx, outcomes) = channel();
@@ -333,7 +344,13 @@ impl Pipeline {
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
-                Worker::new(outcome_tx, worker_cancellations, worker_cancellation).run(&job_rx);
+                Worker::new(
+                    outcome_tx,
+                    worker_cancellations,
+                    worker_cancellation,
+                    retention_policy,
+                )
+                .run(&job_rx);
                 let _ = stopped_tx.send(());
             })
             .map_err(|err| {
@@ -402,6 +419,14 @@ impl Pipeline {
             .map_or(true, |cancellations| cancellations.contains(&card))
     }
 
+    /// Replaces the live policy and asks the worker to enforce it immediately.
+    ///
+    /// Completion or failure arrives as a retention history outcome.
+    #[must_use]
+    pub fn set_retention_policy(&self, policy: RetentionPolicy) -> bool {
+        self.post(Job::EnforceRetention(policy))
+    }
+
     /// Posts a coalescible history read on a worker independent of capture.
     pub fn query_history(&self, request: u64, query: SearchQuery) -> bool {
         self.history_queries
@@ -464,6 +489,7 @@ struct Worker {
     window_pickers: HashMap<CardId, Box<dyn CaptureBackend>>,
     cancellations: Arc<Mutex<HashSet<CardId>>>,
     cancellation: AtomicCancellation,
+    retention_policy: RetentionPolicy,
 }
 
 impl Worker {
@@ -471,6 +497,7 @@ impl Worker {
         outcomes: Sender<Outcome>,
         cancellations: Arc<Mutex<HashSet<CardId>>>,
         cancellation: AtomicCancellation,
+        retention_policy: RetentionPolicy,
     ) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
@@ -495,10 +522,14 @@ impl Worker {
             window_pickers: HashMap::new(),
             cancellations,
             cancellation,
+            retention_policy,
         }
     }
 
     fn run(mut self, jobs: &Receiver<Job>) {
+        if let Err(error) = self.enforce_current_retention() {
+            tracing::warn!("initial source-image retention could not run: {error}");
+        }
         while let Ok(job) = jobs.recv() {
             match job {
                 Job::Capture { kind, card } => self.capture(kind, card),
@@ -520,7 +551,7 @@ impl Worker {
                 }
                 Job::SetPinned { capture, pinned } => self.set_pinned(capture, pinned),
                 Job::Delete(capture) => self.delete(capture),
-                Job::EnforceRetention(policy) => self.enforce_retention(&policy),
+                Job::EnforceRetention(policy) => self.set_retention_policy(policy),
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
@@ -825,6 +856,7 @@ impl Worker {
 
     /// Persists a capture, or explains in the log why it was not.
     fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
+        let policy = self.retention_policy.clone();
         let store = self.store.as_mut()?;
         let document = Document::new(capture.clone());
         match store.insert(NewCapture::of_kind(
@@ -832,7 +864,7 @@ impl Worker {
             scrozz_store::MediaKind::Screenshot,
         )) {
             Ok(id) => {
-                if let Err(err) = store.enforce_retention(&RetentionPolicy::default()) {
+                if let Err(err) = store.enforce_retention(&policy) {
                     tracing::warn!("capture was stored but retention could not run: {err}");
                 }
                 Some(id)
@@ -1078,15 +1110,20 @@ impl Worker {
         self.answer_history(HistoryOperation::Delete, capture, result);
     }
 
-    fn enforce_retention(&mut self, policy: &RetentionPolicy) {
-        let result = self
-            .history_store()
-            .and_then(|store| Ok(store.enforce_retention(policy)?))
-            .map(|()| "source-image retention enforced".to_owned());
+    fn set_retention_policy(&mut self, policy: RetentionPolicy) {
+        self.retention_policy = policy;
+        let result = self.enforce_current_retention();
         match result {
             Ok(detail) => self.history_done(HistoryOperation::Retention, None, None, detail),
             Err(error) => self.history_failed(HistoryOperation::Retention, None, error),
         }
+    }
+
+    fn enforce_current_retention(&mut self) -> CliResult<String> {
+        let policy = self.retention_policy.clone();
+        self.history_store()
+            .and_then(|store| Ok(store.enforce_retention(&policy)?))
+            .map(|()| "source-image retention enforced".to_owned())
     }
 
     fn history_store(&mut self) -> CliResult<&mut SqliteStore> {
@@ -1449,6 +1486,7 @@ mod tests {
                 window_pickers: HashMap::new(),
                 cancellations: Arc::new(Mutex::new(HashSet::new())),
                 cancellation: AtomicCancellation::default(),
+                retention_policy: RetentionPolicy::default(),
             },
             receiver,
         )
@@ -1460,18 +1498,97 @@ mod tests {
             .expect("worker outcome")
     }
 
+    fn test_pipeline() -> Pipeline {
+        Pipeline::start_with_retention(RetentionPolicy {
+            max_image_bytes: u64::MAX,
+            max_image_age: scrozz_store::RetentionWindow::Forever,
+        })
+        .expect("the worker should start")
+    }
+
     #[test]
     fn a_pipeline_hands_out_distinct_card_identities() {
-        let mut pipeline = Pipeline::start().expect("the worker should start");
+        let mut pipeline = test_pipeline();
         let first = pipeline.allocate();
         let second = pipeline.allocate();
         assert_ne!(first, second);
         assert_eq!(first, CardId(1));
+        assert_eq!(second, CardId(2));
+    }
+
+    #[test]
+    fn a_live_policy_update_evicts_existing_images_and_governs_future_captures() {
+        let (_dir, mut worker, outcomes) = worker_with_store("pipeline-retention-update");
+        let first = worker
+            .remember(&sample_document(8, 8, 1, 0).source)
+            .expect("store existing capture");
+        assert!(
+            worker
+                .store
+                .as_mut()
+                .unwrap()
+                .image(&first)
+                .unwrap()
+                .is_some()
+        );
+
+        let policy = RetentionPolicy {
+            max_image_bytes: 0,
+            max_image_age: scrozz_store::RetentionWindow::Forever,
+        };
+        worker.set_retention_policy(policy.clone());
+        assert_eq!(worker.retention_policy, policy);
+        assert!(
+            worker
+                .store
+                .as_mut()
+                .unwrap()
+                .image(&first)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            received(&outcomes),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::Retention,
+                ..
+            }
+        ));
+
+        let future = worker
+            .remember(&sample_document(8, 8, 2, 0).source)
+            .expect("store future capture");
+        let store = worker.store.as_mut().unwrap();
+        assert!(store.image(&future).unwrap().is_none());
+        assert!(store.record(&future).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_startup_policy_is_enforced_before_the_first_job() {
+        let (dir, mut worker, _outcomes) = worker_with_store("pipeline-startup-retention");
+        let capture = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .insert(NewCapture::new(&sample_document(8, 8, 3, 0)))
+            .expect("store capture before worker startup");
+        worker.retention_policy = RetentionPolicy {
+            max_image_bytes: 0,
+            max_image_age: scrozz_store::RetentionWindow::Forever,
+        };
+
+        let (jobs, receiver) = channel();
+        jobs.send(Job::Stop).unwrap();
+        worker.run(&receiver);
+
+        let mut reopened = SqliteStore::open(dir.path()).expect("reopen history");
+        assert!(reopened.image(&capture).unwrap().is_none());
+        assert!(reopened.record(&capture).unwrap().is_some());
     }
 
     #[test]
     fn polling_an_idle_pipeline_does_not_block() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = test_pipeline();
         assert!(pipeline.poll().is_none());
     }
 
@@ -1515,7 +1632,7 @@ mod tests {
     fn a_pipeline_stops_cleanly_and_twice_is_harmless() {
         // Drop also stops it, so the second call must be a no-op rather than a
         // join on an already-joined handle.
-        let mut pipeline = Pipeline::start().expect("the worker should start");
+        let mut pipeline = test_pipeline();
         pipeline.stop();
         pipeline.stop();
     }
@@ -1531,7 +1648,7 @@ mod tests {
 
     #[test]
     fn copying_a_card_that_was_never_captured_is_refused_not_ignored() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = test_pipeline();
         assert!(pipeline.post(Job::Copy(CardId(404))));
 
         match wait_for(&pipeline) {
@@ -1545,7 +1662,7 @@ mod tests {
 
     #[test]
     fn saving_a_card_that_was_never_captured_is_refused_too() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = test_pipeline();
         assert!(pipeline.post(Job::Save(CardId(7))));
 
         match wait_for(&pipeline) {
@@ -1556,7 +1673,7 @@ mod tests {
 
     #[test]
     fn releasing_an_unknown_card_is_harmless() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = test_pipeline();
         assert!(pipeline.post(Job::Release(CardId(1))));
         assert!(pipeline.post(Job::Release(CardId(1))));
     }
@@ -1571,6 +1688,7 @@ mod tests {
             window_pickers: HashMap::new(),
             cancellations: Arc::new(Mutex::new(HashSet::new())),
             cancellation: AtomicCancellation::default(),
+            retention_policy: RetentionPolicy::default(),
         };
         let stride = 21;
         let mut data = vec![0xAB; stride * 2];
@@ -1623,6 +1741,7 @@ mod tests {
             window_pickers: HashMap::new(),
             cancellations,
             cancellation: AtomicCancellation::default(),
+            retention_policy: RetentionPolicy::default(),
         };
         let capture = Capture::new(
             Frame {
@@ -1906,6 +2025,7 @@ mod tests {
             window_pickers: HashMap::new(),
             cancellations: Arc::new(Mutex::new(HashSet::new())),
             cancellation: AtomicCancellation::default(),
+            retention_policy: RetentionPolicy::default(),
         };
         let gate = Arc::new(Barrier::new(2));
         let writer_gate = Arc::clone(&gate);

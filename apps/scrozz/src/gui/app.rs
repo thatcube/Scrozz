@@ -36,7 +36,7 @@ use scrozz_shell::{
     Accelerator, Capability, DragOutcome, DragPayload, GlobalHotkeys, Hotkey, HotkeyManager,
     KeyState, Permissions, SystemPermissions, Tray, TrayAction,
 };
-use scrozz_store::{CaptureId, Timestamp};
+use scrozz_store::{CaptureId, RetentionPolicy, Timestamp};
 use scrozz_ui::history::{HistoryAction, HistoryViewModel};
 
 use crate::{
@@ -119,6 +119,8 @@ pub struct Config {
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
     pub capture_on_start: Option<CaptureKind>,
+    /// Source-image retention applied by the history worker.
+    pub retention_policy: RetentionPolicy,
 }
 
 impl Default for Config {
@@ -132,6 +134,7 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
+            retention_policy: RetentionPolicy::default(),
         }
     }
 }
@@ -172,6 +175,25 @@ impl Config {
     }
 
     fn from_settings(store: &SettingsStore) -> CliResult<Self> {
+        let max_image_bytes = store
+            .get("history.max-image-bytes")?
+            .1
+            .parse::<u64>()
+            .map_err(|error| {
+                CliError::usage(format!(
+                    "history.max-image-bytes is not an unsigned integer: {error}"
+                ))
+            })?;
+        let max_age_days = store
+            .get("history.max-age-days")?
+            .1
+            .parse::<u32>()
+            .map_err(|error| {
+                CliError::usage(format!(
+                    "history.max-age-days is not an unsigned integer: {error}"
+                ))
+            })?;
+
         Ok(Self {
             bindings: SETTING_BINDINGS
                 .iter()
@@ -182,6 +204,7 @@ impl Config {
                 })
                 .collect::<CliResult<_>>()?,
             tray: store.get("system.tray-icon")?.1 == "true",
+            retention_policy: RetentionPolicy::from_limits(max_image_bytes, max_age_days)?,
             ..Self::default()
         })
     }
@@ -198,6 +221,10 @@ impl Config {
             ipc: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
+            retention_policy: RetentionPolicy {
+                max_image_bytes: u64::MAX,
+                max_image_age: scrozz_store::RetentionWindow::Forever,
+            },
         }
     }
 }
@@ -273,7 +300,7 @@ impl App {
     /// refuses, are *recorded* and the app runs on — per D8 a missing capability
     /// is explained, not fatal.
     pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
-        let pipeline = Pipeline::start()?;
+        let pipeline = Pipeline::start_with_retention(config.retention_policy.clone())?;
         let mut notes = Vec::new();
 
         let server = if config.ipc {
@@ -862,6 +889,27 @@ impl App {
         f(&mut history)
     }
 
+    /// The source-image policy currently applied to new captures.
+    #[must_use]
+    pub fn retention_policy(&self) -> &RetentionPolicy {
+        &self.config.retention_policy
+    }
+
+    /// Replaces the history worker's live policy and enforces it immediately.
+    ///
+    /// Returns `false` only if the worker has already stopped.
+    #[must_use]
+    pub fn set_retention_policy(&mut self, policy: RetentionPolicy) -> bool {
+        if self.config.retention_policy == policy {
+            return true;
+        }
+        if !self.pipeline.set_retention_policy(policy.clone()) {
+            return false;
+        }
+        self.config.retention_policy = policy;
+        true
+    }
+
     /// Shared state rendered by the secondary history viewport.
     #[must_use]
     pub fn history(&self) -> Arc<Mutex<HistoryViewModel>> {
@@ -957,6 +1005,13 @@ impl App {
                 self.notes.push("menu-bar item hidden".to_owned());
             }
             self.config.tray = desired.tray;
+        }
+
+        if !self.set_retention_policy(desired.retention_policy) {
+            return Err(CoreError::Platform(
+                "history worker stopped before accepting the retention policy".to_owned(),
+            )
+            .into());
         }
 
         self.settings_revision = self.settings_revision.saturating_add(1);
