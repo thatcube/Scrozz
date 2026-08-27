@@ -726,14 +726,32 @@ mod tests {
     fn the_screenshot_shortcuts_are_recognised_as_taken() {
         // The negative of the test above: if this stops holding, the one above
         // has stopped proving anything.
-        let taken = ["Cmd+Shift+3", "Cmd+Shift+4", "Cmd+Shift+5"]
-            .iter()
-            .filter_map(|a| describe_conflict(a).ok().flatten())
-            .count();
+        //
+        // The probes come from the platform's own table rather than a literal
+        // list, because that table *is* platform-specific: `Cmd+Shift+3` is
+        // reserved on macOS and completely free on Windows and Linux. Hard-coding
+        // the macOS spellings made this pass on the authoring machine and fail on
+        // the Linux runner, which was a defect in the test, not in the code.
+        let reserved = scrozz_shell::hotkey::reserved_shortcuts();
         assert!(
-            taken > 0,
-            "scrozz-shell should know macOS owns the screenshot shortcuts"
+            !reserved.is_empty(),
+            "every platform must declare the combinations it has already taken"
         );
+
+        for shortcut in reserved {
+            let conflict = describe_conflict(shortcut.accelerator).unwrap_or_else(|e| {
+                panic!(
+                    "the reserved table entry {} should parse: {e}",
+                    shortcut.accelerator
+                )
+            });
+            assert!(
+                conflict.is_some(),
+                "scrozz-shell lists {} as owned by {}, so describe_conflict must say so",
+                shortcut.accelerator,
+                shortcut.owner
+            );
+        }
     }
 
     #[test]
