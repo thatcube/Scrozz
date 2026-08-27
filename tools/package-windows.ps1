@@ -412,7 +412,7 @@ function New-MappingFile {
             throw "MakeAppx source paths cannot contain a quote: $File"
         }
         $Relative = $File.Substring($PackageRoot.Length + 1)
-        $Lines.Add('"{0}" "{1}"' -f $File, $Relative)
+        $Lines.Add(('"{0}" "{1}"' -f $File, $Relative))
     }
     Write-Utf8NoBom -Path $Destination -Text (($Lines -join "`r`n") + "`r`n")
 }
