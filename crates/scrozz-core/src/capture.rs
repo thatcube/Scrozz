@@ -2,6 +2,7 @@
 
 use crate::{
     frame::Frame,
+    selection::{SourceApp, WindowPickingCapability, WindowSelection},
     target::{CaptureTarget, TargetEnumerator},
 };
 
@@ -78,6 +79,70 @@ pub struct Capture {
     pub provenance: Provenance,
     /// The target that produced it, for re-capture and for display in history.
     pub target: CaptureTarget,
+    /// Which application the pixels came from, where the OS said.
+    ///
+    /// Recorded here rather than looked up later because it is not recoverable
+    /// later: the window may be closed and the process gone by the time history
+    /// draws a badge. Empty for display, region and all-display captures, which
+    /// belong to no single application.
+    pub source_app: SourceApp,
+    /// Whether the window's own shadow is actually in these pixels.
+    ///
+    /// The *resolved* answer, not the request: a platform that cannot omit the
+    /// shadow overrules [`CaptureRequest::include_window_shadow`], and recording
+    /// the request instead would label the capture wrongly. `None` for anything
+    /// that is not a window, where the question does not arise.
+    pub window_shadow: Option<bool>,
+}
+
+impl Capture {
+    /// A capture with no source-application metadata and no shadow question.
+    ///
+    /// The constructor for display, region and all-display captures, which is
+    /// most of them.
+    #[must_use]
+    pub fn new(frame: Frame, provenance: Provenance, target: CaptureTarget) -> Self {
+        Self {
+            frame,
+            provenance,
+            target,
+            source_app: SourceApp::default(),
+            window_shadow: None,
+        }
+    }
+
+    /// Records which application this came from.
+    #[must_use]
+    pub fn with_source_app(mut self, source_app: SourceApp) -> Self {
+        self.source_app = source_app;
+        self
+    }
+
+    /// Records what the shadow flag resolved to in the pixels.
+    #[must_use]
+    pub const fn with_window_shadow(mut self, present: bool) -> Self {
+        self.window_shadow = Some(present);
+        self
+    }
+}
+
+/// A backend's interactive window-capture capabilities.
+///
+/// Split from [`CaptureBackend`] rather than folded into it because the answer
+/// is needed *before* a capture is requested — the picker flow branches on it,
+/// and on Wayland the branch it takes is "do not open a picker at all".
+pub trait WindowPicking {
+    /// How the user picks a window here, and what the resulting pixels contain.
+    ///
+    /// Infallible on purpose: "this platform cannot do it" is
+    /// [`WindowSelection::Unavailable`], a value the caller can render, rather
+    /// than an error it must decide how to report.
+    fn window_picking(&self) -> WindowPickingCapability;
+
+    /// How the user picks a window here.
+    fn window_selection(&self) -> WindowSelection {
+        self.window_picking().selection
+    }
 }
 
 /// A platform backend that takes still captures.

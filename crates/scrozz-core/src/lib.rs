@@ -19,6 +19,12 @@
 //!   added together.
 //! - [`capture::Provenance`] carries D9 — window captures are never composited
 //!   onto — with the image, for the image's whole life.
+//! - [`selection::WindowSelection`] carries D8's Wayland gap: a caller cannot
+//!   accidentally open a window picker on a platform that has no window list,
+//!   because the two mechanisms are different values it must match on.
+//! - [`selection::ShadowSupport`] keeps CAP-13's shadow toggle honest: where the
+//!   compositor cannot omit a shadow, the control is disabled with a reason
+//!   rather than silently ignored.
 //! - [`Error::PermissionDenied`] and [`Error::Unsupported`] make D15's
 //!   permission-on-first-use and D8's documented platform gaps ordinary,
 //!   handled outcomes rather than crashes.
@@ -29,13 +35,17 @@ pub mod capture;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod selection;
 pub mod target;
 
-pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
+pub use capture::{
+    Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance, WindowPicking,
+};
 pub use error::{Error, Result};
 pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
+pub use selection::{ShadowSupport, SourceApp, WindowPickingCapability, WindowSelection};
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};
