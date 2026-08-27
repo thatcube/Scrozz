@@ -13,6 +13,8 @@ usage() {
   cat <<'USAGE'
 Usage:
   tools/cargo-pool.sh <command> [argument...]
+  tools/cargo-pool.sh --refresh-lock
+  tools/cargo-pool.sh --update-lock [cargo-update-argument...]
   tools/cargo-pool.sh --status
 
 Environment:
@@ -22,6 +24,7 @@ Environment:
 
 An explicit CARGO_TARGET_DIR bypasses the pool. CI also keeps its job-local
 target directory. Stale leases are reported but never removed automatically.
+Lockfile modes serialize the worktree but create no target artifacts.
 USAGE
 }
 
@@ -42,13 +45,25 @@ default_pool_root() {
 ROOT="${SCROZZ_CARGO_POOL_ROOT:-$(default_pool_root)}"
 SLOTS="${SCROZZ_CARGO_POOL_SLOTS:-2}"
 WAIT_SECONDS="${SCROZZ_CARGO_POOL_WAIT_SECONDS:-900}"
+REFRESH_LOCK=0
+UPDATE_LOCK=0
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
 
-if [[ "${1:-}" != "--status" ]]; then
+if [[ "${1:-}" == "--refresh-lock" ]]; then
+  REFRESH_LOCK=1
+  shift
+  if [[ "$#" -ne 0 ]]; then
+    echo "cargo-pool: --refresh-lock takes no arguments" >&2
+    exit 2
+  fi
+elif [[ "${1:-}" == "--update-lock" ]]; then
+  UPDATE_LOCK=1
+  shift
+elif [[ "${1:-}" != "--status" ]]; then
   if [[ "$#" -eq 0 ]]; then
     usage >&2
     exit 2
@@ -224,7 +239,7 @@ run_managed() {
   child_pid=""
   if ((status > 128)); then
     preserve_lease=1
-    echo "cargo-pool: child exited from a signal; retaining $lease" >&2
+    echo "cargo-pool: child exited from a signal; retaining acquired leases" >&2
   else
     child_started=0
   fi
@@ -273,6 +288,32 @@ done
   printf 'workspace=%s\n' "$workspace"
   printf 'started_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 } >"$workspace_lease/owner"
+
+if [[ "$REFRESH_LOCK" == "1" || "$UPDATE_LOCK" == "1" ]]; then
+  local_target_existed=0
+  [[ -e "$workspace/target" ]] && local_target_existed=1
+  unset CARGO_TARGET_DIR
+  if [[ "$REFRESH_LOCK" == "1" ]]; then
+    echo "cargo-pool: refreshing $workspace/Cargo.lock (no target slot)" >&2
+    if ! run_managed cargo metadata --manifest-path "$workspace/Cargo.toml" \
+      --format-version 1 >/dev/null; then
+      echo "cargo-pool: Cargo.lock refresh failed" >&2
+      exit 1
+    fi
+  else
+    echo "cargo-pool: updating $workspace/Cargo.lock (no target slot)" >&2
+    if ! run_managed cargo update --manifest-path "$workspace/Cargo.toml" "$@"; then
+      echo "cargo-pool: Cargo.lock update failed" >&2
+      exit 1
+    fi
+  fi
+  if [[ "$local_target_existed" == "0" && -e "$workspace/target" ]]; then
+    echo "cargo-pool: lock refresh unexpectedly created $workspace/target" >&2
+    exit 1
+  fi
+  echo "cargo-pool: Cargo.lock operation completed" >&2
+  exit 0
+fi
 
 while [[ -z "$lease" ]]; do
   for ((index = 1; index <= SLOTS; index++)); do

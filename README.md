@@ -156,7 +156,8 @@ tools/dev.sh lint       # clippy, warnings denied
 tools/dev.sh test       # the test suite
 tools/dev.sh platforms  # type-check macOS + Windows + Linux, from any of them
 tools/dev.sh golden     # headless golden-image tests
-tools/dev.sh update     # intentionally update Cargo.lock without build output
+tools/dev.sh lock       # refresh Cargo.lock after manifest changes, no build
+tools/dev.sh update     # intentionally update dependency versions, no build
 tools/dev.sh smoke      # build + smoke-test one release binary under one lease
 tools/dev.sh package    # build + package one release binary under one lease
 tools/dev.sh ci         # everything, in CI's order — the answer before pushing

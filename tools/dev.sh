@@ -18,7 +18,7 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 # each retain a full copy of the dependency graph. CI remains job-local, and an
 # explicit CARGO_TARGET_DIR remains the caller's responsibility.
 case "${1:-help}" in
-  fmt | fmt-check | help | -h | --help | linux-deps | update) ;;
+  fmt | fmt-check | help | -h | --help | linux-deps | lock | update) ;;
   *)
     if [[ "${SCROZZ_CARGO_LEASE_HELD:-0}" != "1" &&
           "${CI:-}" != "true" &&
@@ -44,6 +44,7 @@ Scrozz developer commands
     tools/dev.sh test         run the test suite
     tools/dev.sh build        debug build of the app
     tools/dev.sh run -- ...   run the CLI or GUI with Scrozz arguments
+    tools/dev.sh lock         refresh Cargo.lock after manifest changes
     tools/dev.sh update ...   update Cargo.lock without creating artifacts
     tools/dev.sh smoke        build and smoke-test one release binary
     tools/dev.sh package      build and package one release binary
@@ -108,7 +109,8 @@ cmd_check() { cargo check --workspace --all-targets; }
 cmd_lint() { cargo clippy --workspace --all-targets -- -D warnings; }
 cmd_test() { cargo test --workspace; }
 cmd_build() { cargo build --workspace; }
-cmd_update() { cargo update "$@"; }
+cmd_lock() { "$SCRIPT_DIR/cargo-pool.sh" --refresh-lock; }
+cmd_update() { "$SCRIPT_DIR/cargo-pool.sh" --update-lock "$@"; }
 cmd_run() {
   [[ "${1:-}" == "--" ]] && shift
   cargo run -p scrozz -- "$@"
@@ -165,6 +167,7 @@ case "${1:-help}" in
   lint | clippy) cmd_lint ;;
   test) cmd_test ;;
   build) cmd_build ;;
+  lock) cmd_lock ;;
   update)
     shift
     cmd_update "$@"
