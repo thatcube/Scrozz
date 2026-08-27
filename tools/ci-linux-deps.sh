@@ -78,6 +78,26 @@ PACKAGES=(
   mesa-vulkan-drivers
   libgl1-mesa-dri
   libvulkan1
+
+  # PipeWire, for Wayland screen capture.
+  #
+  # This is the *runtime* library only, deliberately not `libpipewire-0.3-dev`.
+  # scrozz-capture dlopens `libpipewire-0.3.so.0` rather than linking it, so
+  # there are no headers to compile against and no pkg-config module to resolve
+  # — which is exactly what keeps `cargo check --target x86_64-unknown-linux-gnu`
+  # working from a Mac, and what lets an X11-only machine run Scrozz at all
+  # instead of failing at load time with an unresolved DT_NEEDED.
+  #
+  # Two things are NOT installed here because they cannot be made to work in a
+  # headless CI container, and installing them would imply otherwise:
+  #
+  #   pipewire                  the daemon; needs a user session bus
+  #   xdg-desktop-portal-*      the portal backend; needs a live compositor
+  #
+  # tools/wayland-smoke.sh checks for both at runtime and skips with exit 77
+  # when they are missing, rather than reporting a pass for a test that never
+  # ran. See docs/platforms.md for the full picture.
+  libpipewire-0.3-0
 )
 
 echo "ci-linux-deps: updating package lists"

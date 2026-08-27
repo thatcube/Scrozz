@@ -23,25 +23,34 @@
 //!   is unusable. [`restore`] handles that, and it is treated as a requirement
 //!   rather than a nicety.
 //!
-//! # Current state
+//! # What this backend does and does not compile
 //!
-//! The negotiation is complete and tested; the D-Bus calls are not compiled.
-//! `ashpd`'s `screencast` and `screenshot` modules are behind Cargo features
-//! that this workspace's dependency declaration does not enable, and this crate
-//! is not permitted to change that declaration. See [`portal::acquire_frame`]
-//! for the second, larger gap: PipeWire.
+//! The portal conversation is real: [`screencast`] makes the D-Bus calls through
+//! `ashpd`, and [`pipewire`] turns the node it returns into pixels by opening
+//! `libpipewire-0.3.so.0` at run time. Everything that can be decided without a
+//! compositor — the session plan, the format offer, stride handling, the crop
+//! arithmetic, error classification — lives in modules with no platform
+//! dependencies and is tested on every host by `tests/linux.rs`.
+//!
+//! What still needs a real Wayland session is the part that cannot be faked: the
+//! FFI struct layouts, the picker, and the compositor's actual frame delivery.
+//! `tools/wayland-smoke.sh` covers those and skips loudly when there is no
+//! session to run against.
 
+pub mod pipewire;
 pub mod portal;
+pub mod region;
 pub mod restore;
+pub mod screencast;
 
 use std::sync::Mutex;
 
 use scrozz_core::{
-    Capture, CaptureBackend, CaptureRequest, CursorMode, Display, Error, Result, TargetEnumerator,
-    Window,
+    Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display, Error, Frame,
+    Provenance, Result, ScaleFactor, TargetEnumerator, Window,
 };
 
-use self::portal::SessionPlan;
+use self::portal::{PortalFailure, SessionPlan, StreamInfo};
 use self::restore::{TokenKey, TokenStore};
 use super::session::{self, Compositor, PortalCapabilities, SessionEnv, SessionKind};
 
@@ -193,29 +202,117 @@ impl WaylandBackend {
         })
     }
 
-    /// Negotiates a ScreenCast session for a request.
+    /// Negotiates a ScreenCast session, reusing a stored grant where possible.
     ///
-    /// Fully specified and currently unreachable. The plan it builds is exactly
-    /// what the D-Bus call would carry, which is why it is worth computing and
-    /// testing even while the call itself cannot be made.
-    fn open_session(&self, plan: &SessionPlan) -> Result<portal::StreamInfo> {
-        let _restore = self
+    /// A stored token that the portal no longer accepts is the interesting case.
+    /// It happens routinely — the user revoked the grant in system settings, the
+    /// monitor it referred to was unplugged, the portal was upgraded — and the
+    /// portal's answer is a plain failure, not a distinguishable "bad token"
+    /// code. Treating that as fatal would leave the user permanently unable to
+    /// capture with no way to discover why, so a first attempt made *with* a
+    /// token is retried once *without* one. That costs a picker dialog, which is
+    /// the correct price, and the stale token is discarded on the way past.
+    ///
+    /// Cancellation is never retried: the user said no, and asking again
+    /// immediately is precisely the behaviour that makes a tool feel hostile.
+    fn open_session(&self, plan: &SessionPlan) -> Result<screencast::Negotiation> {
+        let stored = self
             .capabilities
             .restore_tokens
             .then(|| self.stored_token(plan.restore_key))
             .flatten();
 
-        Err(Error::Unsupported {
-            what: "capturing on Wayland".into(),
-            why: format!(
-                "the ScreenCast portal is the only route to pixels on {compositor}, and this \
-                 build cannot call it: the `ashpd` dependency is declared without its \
-                 `screencast` and `screenshot` features, so those modules are not compiled in. \
-                 Adding `features = [\"screencast\", \"screenshot\"]` to the workspace's ashpd \
-                 dependency, plus a PipeWire client for frame acquisition, is what remains",
-                compositor = self.compositor
-            ),
-        })
+        let outcome = screencast::negotiate(plan, stored.as_deref());
+
+        let negotiation = match outcome {
+            Ok(negotiation) => negotiation,
+            Err(PortalFailure::Cancelled) => return Err(Error::Cancelled),
+            Err(failure) if stored.is_some() => {
+                tracing::info!(
+                    ?failure,
+                    "the stored portal restore token was not accepted; asking again without it"
+                );
+                self.forget_token(plan.restore_key);
+                self.persist_tokens();
+                screencast::negotiate(plan, None)
+                    .map_err(|err| err.into_error(&self.compositor.to_string()))?
+            }
+            Err(failure) => return Err(failure.into_error(&self.compositor.to_string())),
+        };
+
+        // Store on every success, not only when the token changed: the portal is
+        // entitled to rotate a token it accepted, and dropping the rotation is a
+        // silent regression to a prompt on the capture after next.
+        if let Some(token) = &negotiation.restore_token {
+            self.remember_token(plan.restore_key, token);
+        }
+
+        Ok(negotiation)
+    }
+
+    /// Writes the token store out after an invalidation.
+    fn persist_tokens(&self) {
+        let (Ok(store), Some(path)) = (self.tokens.lock(), &self.token_path) else {
+            return;
+        };
+        let write = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, store.serialise()));
+        if let Err(err) = write {
+            tracing::warn!(%err, path = %path.display(), "could not persist the portal restore token");
+        }
+    }
+
+    /// The scale to assume when the stream itself does not reveal one.
+    ///
+    /// Only reached when the portal reported no stream size, which is rare; the
+    /// active display's scale is the best available guess and an unreachable
+    /// XWayland leaves 1:1, which is right on the majority of such machines.
+    fn fallback_scale(&self) -> ScaleFactor {
+        self.geometry
+            .as_ref()
+            .and_then(|backend| backend.active_display().ok())
+            .map_or(ScaleFactor::IDENTITY, |display| display.scale)
+    }
+
+    /// Reads one frame from the first stream the portal granted.
+    fn frame_from(&self, negotiation: &screencast::Negotiation) -> Result<(Frame, StreamInfo)> {
+        // The portal may grant several streams for an all-displays request. Only
+        // the first is read here: compositing them needs each stream's position,
+        // which the specification makes optional, and stitching frames on
+        // guessed geometry would produce a misaligned image rather than an
+        // honest refusal.
+        let stream = *negotiation
+            .streams
+            .first()
+            .ok_or_else(|| PortalFailure::NoStreams.into_error(&self.compositor.to_string()))?;
+
+        if negotiation.streams.len() > 1 {
+            tracing::warn!(
+                granted = negotiation.streams.len(),
+                "the portal granted several streams; capturing the first, because compositing \
+                 them needs per-stream positions the portal does not guarantee"
+            );
+        }
+
+        // `OwnedFd` is moved into PipeWire, which closes it on teardown, so the
+        // negotiation's fd is duplicated rather than consumed — the caller may
+        // still want to report on the session afterwards.
+        let fd = negotiation.remote.try_clone().map_err(|err| {
+            Error::Platform(format!(
+                "could not duplicate the PipeWire socket the portal returned: {err}"
+            ))
+        })?;
+
+        let mut frame = pipewire::acquire_frame(fd, stream.node_id, self.fallback_scale())?;
+        frame.scale = region::resolve_scale(
+            &stream,
+            (frame.width(), frame.height()),
+            self.fallback_scale(),
+        );
+
+        Ok((frame, stream))
     }
 }
 
@@ -261,8 +358,34 @@ impl CaptureBackend for WaylandBackend {
             );
         }
 
-        let stream = self.open_session(&plan)?;
-        portal::acquire_frame(stream)
+        let negotiation = self.open_session(&plan)?;
+        let (frame, stream) = self.frame_from(&negotiation)?;
+
+        let frame = match &request.target {
+            CaptureTarget::Region(rect) => {
+                let crop = region::plan_crop(*rect, &stream, (frame.width(), frame.height()))
+                    .map_err(|err| err.into_error(&self.compositor.to_string()))?;
+                region::crop(&frame, crop)
+                    .map_err(|err| err.into_error(&self.compositor.to_string()))?
+            }
+            _ => frame,
+        };
+
+        debug_assert!(frame.is_well_formed());
+
+        Ok(Capture {
+            frame,
+            provenance: match &request.target {
+                CaptureTarget::Display(_) => Provenance::Display,
+                // D9: the portal's own picker decides which window this is, and
+                // the compositor supplies its true shape — the same guarantee
+                // that makes window pixels sacred everywhere else.
+                CaptureTarget::Window(_) => Provenance::Window,
+                CaptureTarget::Region(_) => Provenance::Region,
+                CaptureTarget::AllDisplays => Provenance::AllDisplays,
+            },
+            target: request.target.clone(),
+        })
     }
 
     fn name(&self) -> &str {

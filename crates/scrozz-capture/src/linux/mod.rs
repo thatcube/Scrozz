@@ -14,23 +14,25 @@
 //!
 //! # Manifest constraints on this build
 //!
-//! Two dependencies are declared without the features this backend needs, and
-//! this crate is not permitted to amend them. Both limits are load-bearing
-//! enough to state here rather than bury:
+//! Some optional features of the X11 dependency are not enabled, and the limits
+//! are load-bearing enough to state here rather than bury:
 //!
 //! | Need | Feature required | Consequence today |
 //! |---|---|---|
 //! | RandR monitor geometry | `x11rb/randr` | Encoded by hand in [`x11::wire`] — works |
 //! | MIT-SHM fast path | `x11rb/shm` **and** `libc`/`rustix` | Unavailable; `GetImage` used |
 //! | XFIXES cursor image | `x11rb/xfixes` | Cursor omitted from X11 captures |
-//! | Portal ScreenCast | `ashpd/screencast` | Wayland capture unavailable |
-//! | Portal Screenshot | `ashpd/screenshot` | Wayland fallback unavailable |
 //!
 //! RandR was worth hand-rolling because without it a multi-monitor desktop is
 //! indistinguishable from one enormous screen. MIT-SHM was not, because the
 //! feature alone is insufficient — the shared segment needs `shmget`/`shmat` or
 //! `memfd_create`, and neither `libc` nor `rustix` is a dependency of this
 //! crate, so there is no syscall to make.
+//!
+//! The Wayland side has no such gap: `ashpd` is built with `screencast` and
+//! `screenshot`, and PipeWire is opened at run time rather than linked, so a
+//! machine without it still builds, still starts, and still captures over X11.
+//! See [`wayland::pipewire`] for why that indirection was chosen.
 
 pub mod session;
 pub mod wayland;

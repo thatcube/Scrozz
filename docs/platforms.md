@@ -92,6 +92,102 @@ behaviour the first three layers structurally cannot reach.
 
 ---
 
+## Worked example: Wayland screen capture
+
+Wayland capture is the sharpest case this document describes, so it is worth
+walking through concretely: it has more code that *cannot* be verified from this
+machine than anything else in the project, and the split between the layers is
+unusually clean.
+
+### How it is built, and why that decision is a platform-strategy decision
+
+Frames arrive over **PipeWire**, because `xdg-desktop-portal`'s `ScreenCast`
+interface hands back a *node id*, not pixels. The obvious way to consume that is
+the `pipewire` crate — and it is the wrong one here, for two reasons that are
+both about this document rather than about ergonomics:
+
+1. **`pipewire-sys` needs `pkg-config` and `bindgen`.** Adding it would take
+   `scrozz-capture` — one of the four crates that *must* stay cross-checkable —
+   out of layer 1 entirely, in exchange for a Linux sysroot nobody has. The
+   single most valuable check in the project would stop covering the largest
+   piece of unverifiable code in it.
+2. **Linking it puts a `DT_NEEDED` on `libpipewire-0.3.so.0`.** The whole binary
+   then fails to load on a machine without PipeWire — including every X11-only
+   desktop, where Scrozz otherwise works perfectly.
+
+So PipeWire is **`dlopen`ed at runtime** through `libloading`, and the SPA
+parameter objects are encoded by hand in `linux::wayland::pipewire::pod`. The
+cost is real: `spa_pod_builder_*` is header-only `static inline`, so there is
+nothing to call and the binary format is written out byte by byte. The benefits
+are that `cargo check --target x86_64-unknown-linux-gnu` still passes from
+macOS with no system packages installed, and that a missing PipeWire degrades to
+`Error::Unsupported` naming the package to install rather than to a binary that
+will not start.
+
+### What each layer actually proves here
+
+| Layer | Covers | Does not cover |
+|---|---|---|
+| 1 — cross-check | The ashpd/zbus calls, every signature | Anything behind `dlopen`; symbols are resolved by name at runtime |
+| 2 — CI tests | POD encoding byte for byte, format negotiation, stride packing, crop arithmetic, error mapping, lifecycle | Whether a real server accepts any of it |
+| 3 — golden images | Nothing; there is no UI in this path | — |
+| 4 — real session | Everything below | — |
+
+The unit tests are deliberately literal about the wire format, because a
+malformed POD is not rejected with an error — the stream simply never reaches
+`Streaming`, which is indistinguishable from a hang.
+
+### The native Linux command CI must run
+
+Layer 1 and layer 2 need nothing new. The runtime library belongs in the Linux
+dependency set, and `tools/ci-linux-deps.sh` installs it:
+
+```bash
+tools/ci-linux-deps.sh          # includes libpipewire-0.3-0
+cargo test --workspace          # the pure Wayland tests run here, headless
+```
+
+The end-to-end path needs a real session and is therefore a **separate,
+non-blocking** step, run on a native Ubuntu runner:
+
+```bash
+tools/ci-linux-deps.sh
+tools/wayland-smoke.sh
+```
+
+`tools/wayland-smoke.sh` exits **77** — the automake "skipped" convention — with
+the specific missing piece on stderr when there is no `WAYLAND_DISPLAY`, no
+session bus, no `libpipewire-0.3.so.0`, no PipeWire socket, or no
+`org.freedesktop.portal.Desktop` on the bus. It exits 0 **only** when a real
+frame with varying pixels was captured. That distinction is the whole point: a
+job that skips and exits 0 records a pass for a test that never ran, which is
+exactly the failure mode decision D8 exists to prevent. Pass `--require` to turn
+every skip into a failure, which is what a dedicated Wayland VM job should do.
+
+Neither the `pipewire` daemon nor any `xdg-desktop-portal-*` backend is
+installed by `ci-linux-deps.sh`, because neither can be made to work in a
+headless container and installing them would imply otherwise.
+
+### What still needs a real Wayland session
+
+Honestly, and in order of risk:
+
+1. **The C ABI declarations in `pipewire::sys`.** A wrong struct layout compiles
+   perfectly and then reads a garbage pointer. Nothing short of running it
+   against a real `libpipewire-0.3.so.0` can prove those offsets.
+2. **That the hand-encoded POD is one a server accepts.** The tests prove it
+   matches the documented format; only a server proves the format was read
+   correctly.
+3. **That offering no DMA-BUF modifier really does force a shared-memory
+   fallback**, rather than failing to negotiate at all.
+4. **The portal dialog**, including that dismissing it produces
+   `Error::Cancelled` and not something alarming.
+5. **The restore-token round trip**, including the rejection-and-retry path. A
+   token that is stored but never accepted is invisible offline and shows up as
+   a permission dialog on every single capture.
+
+---
+
 ## What this means for anyone writing platform code
 
 1. **Never guess an API.** Read the vendored bindings under
@@ -129,35 +225,63 @@ These are the dangerous class: the call returns success and nothing works.
 3. **`tray-icon` and `muda` types are `Rc`-based and `!Send`**, and — along with
    `GlobalHotKeyManager` — require the main thread with a live event loop.
    Failure to satisfy that is also silent.
+4. **PipeWire delivers empty buffers, and they look exactly like real ones.**
+   Mutter hands over a buffer with `chunk->size == 0` when nothing on screen has
+   changed. Accepting the first buffer offered therefore yields a black PNG on
+   an idle desktop — a structurally perfect frame containing nothing. A still
+   capture must keep waiting until a buffer actually carries pixels.
+5. **A malformed SPA POD is not an error, it is a hang.** The server does not
+   reject a parameter it cannot read; the stream simply never reaches
+   `Streaming`. Encoding bugs must be caught by byte-level tests, because at
+   runtime they present as a timeout with nothing to go on.
+6. **`spa_pod_builder_pad` does nothing inside a Choice or an Array.** Every POD
+   is padded to eight bytes *except* the alternatives inside a choice body,
+   which are packed contiguously at exactly the child's size. Padding them "for
+   consistency" produces a POD the server reads as garbage — see the previous
+   entry for how that presents.
 
 ### Process-global state
 
-4. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
+7. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
    Setting it once permanently starves the process-global receiver channel for
    *every* other consumer in the process. Use `receiver()` instead; a library
    crate must never claim the handler.
 
 ### Coordinate systems
 
-5. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
+8. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
    `visibleFrame` and Vision's normalised text boxes all need flipping. This is
    the classic "everything is upside down" bug and it is easy to get almost-right.
-6. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
+9. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
    or above the primary. Never assume the origin is `(0, 0)`.
+10. **A PipeWire stride is not `width * 4`.** The producer picks it, and it is
+    routinely larger. Reading the buffer linearly gives the classic diagonal
+    shear, which looks like a decoding bug and is not. The last row is also
+    entitled to end after `width * 4` bytes rather than a full stride, so
+    demanding one more byte rejects a perfectly good buffer.
 
 ### Scale
 
-7. **There is no single app-wide scale factor on Windows or Wayland.** Windows
-   desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
-   Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+11. **There is no single app-wide scale factor on Windows or Wayland.** Windows
+    desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
+    Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+12. **On Wayland, do not use a display's scale factor to convert a region to
+    pixels.** Under fractional scaling the compositor rounds the output's pixel
+    size, so the nominal scale and the real ratio disagree. The delivered frame
+    and the portal's reported logical size describe the same monitor, so their
+    ratio is the only figure that is a fact rather than an assumption.
 
 ### Testing platform code
 
-8. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
-   thread.** Anything needing the main run loop — `NSApplication`, windows, tray
-   items, hotkey managers — is unreachable from an ordinary test. Doctests run on
-   the main thread and are the workaround; failing that, test the
-   off-main-thread guard and verify real behaviour another way.
+13. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
+    thread.** Anything needing the main run loop — `NSApplication`, windows, tray
+    items, hotkey managers — is unreachable from an ordinary test. Doctests run on
+    the main thread and are the workaround; failing that, test the
+    off-main-thread guard and verify real behaviour another way.
+14. **A skipped test that exits 0 is worse than no test.** It is
+    indistinguishable from a pass, so it records verification that never
+    happened. `tools/wayland-smoke.sh` exits 77 with the reason on stderr
+    instead.
 
 ---
 

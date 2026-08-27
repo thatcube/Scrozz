@@ -46,6 +46,21 @@ mod wayland {
 
     #[path = "portal.rs"]
     pub mod portal;
+
+    #[path = "region.rs"]
+    pub mod region;
+
+    #[path = "pipewire"]
+    pub mod pipewire {
+        #[path = "pod.rs"]
+        pub mod pod;
+
+        #[path = "format.rs"]
+        pub mod format;
+
+        #[path = "lifecycle.rs"]
+        pub mod lifecycle;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,6 +1611,1159 @@ mod portal_negotiation {
                 size: Some((1920, 1080)),
             }
             .is_placeable()
+        );
+    }
+}
+
+/// The SPA POD encoder, checked byte for byte.
+///
+/// These assertions are transcriptions of the layout in
+/// `spa/pod/pod.h`, and they are deliberately literal. A POD is a binary
+/// structure another process parses with pointer arithmetic; "it looked right in
+/// the debugger" is not a standard that catches a misplaced pad byte, and a
+/// misplaced pad byte produces a stream that silently never negotiates.
+mod spa_pod {
+    use super::wayland::pipewire::pod::{
+        Choice, Object, ObjectRef, Property, Scalar, choice, kind, pad_to_8,
+    };
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+    }
+
+    #[test]
+    fn padding_rounds_up_to_the_next_multiple_of_eight() {
+        assert_eq!(pad_to_8(0), 0);
+        assert_eq!(pad_to_8(1), 8);
+        assert_eq!(pad_to_8(8), 8);
+        assert_eq!(pad_to_8(9), 16);
+        assert_eq!(pad_to_8(16), 16);
+    }
+
+    /// A four-byte value still occupies sixteen bytes: an eight-byte header,
+    /// four bytes of body, and four of padding. The declared size covers the
+    /// body only, which is the part that is easy to get backwards.
+    #[test]
+    fn a_scalar_declares_its_body_size_and_pads_its_footprint() {
+        let encoded = Scalar::id(7).encode();
+
+        assert_eq!(encoded.len(), 16);
+        assert_eq!(u32_at(&encoded, 0), 4, "size counts the body only");
+        assert_eq!(u32_at(&encoded, 4), kind::ID);
+        assert_eq!(u32_at(&encoded, 8), 7);
+        assert_eq!(&encoded[12..], &[0, 0, 0, 0], "tail is zero padding");
+    }
+
+    /// Rectangles and fractions are two `u32`s, so they need no padding at all.
+    #[test]
+    fn eight_byte_scalars_need_no_padding() {
+        let rectangle = Scalar::rectangle(1920, 1080).encode();
+        assert_eq!(rectangle.len(), 16);
+        assert_eq!(u32_at(&rectangle, 0), 8);
+        assert_eq!(u32_at(&rectangle, 4), kind::RECTANGLE);
+        assert_eq!(u32_at(&rectangle, 8), 1920);
+        assert_eq!(u32_at(&rectangle, 12), 1080);
+
+        let fraction = Scalar::fraction(60, 1).encode();
+        assert_eq!(u32_at(&fraction, 4), kind::FRACTION);
+        assert_eq!(u32_at(&fraction, 8), 60);
+        assert_eq!(u32_at(&fraction, 12), 1);
+    }
+
+    /// The rule that makes choices different from everything else: inside a
+    /// choice body the alternatives are packed contiguously at exactly the
+    /// child's size, with no per-value padding. `spa_pod_builder_pad` returns
+    /// early while the body flag is set, and a client that pads anyway produces
+    /// a POD the server reads as garbage.
+    #[test]
+    fn choice_alternatives_are_packed_without_padding() {
+        let values = vec![Scalar::id(8), Scalar::id(7), Scalar::id(12)];
+        let encoded = Choice::enumerated(values)
+            .encode()
+            .expect("uniform id values encode");
+
+        // 8 header + 16 choice body header + 3 * 4 bytes of packed ids = 36,
+        // padded to 40.
+        assert_eq!(encoded.len(), 40);
+        assert_eq!(u32_at(&encoded, 0), 28, "body is 16 + 3 * 4");
+        assert_eq!(u32_at(&encoded, 4), kind::CHOICE);
+        assert_eq!(u32_at(&encoded, 8), choice::ENUM);
+        assert_eq!(u32_at(&encoded, 12), 0, "no choice flags");
+        assert_eq!(u32_at(&encoded, 16), 4, "child size is one id");
+        assert_eq!(u32_at(&encoded, 20), kind::ID);
+        assert_eq!(u32_at(&encoded, 24), 8, "default comes first");
+        assert_eq!(u32_at(&encoded, 28), 7);
+        assert_eq!(u32_at(&encoded, 32), 12);
+    }
+
+    /// A range is default, then minimum, then maximum. Swapping the first two —
+    /// the intuitive ordering — makes every negotiation pick the minimum.
+    #[test]
+    fn a_range_choice_orders_default_min_max() {
+        let encoded = Choice::range(Scalar::int(30), Scalar::int(1), Scalar::int(60))
+            .encode()
+            .expect("uniform int values encode");
+
+        assert_eq!(u32_at(&encoded, 8), choice::RANGE);
+        assert_eq!(u32_at(&encoded, 24), 30);
+        assert_eq!(u32_at(&encoded, 28), 1);
+        assert_eq!(u32_at(&encoded, 32), 60);
+    }
+
+    /// A choice whose alternatives disagree about their type cannot be encoded:
+    /// the body carries one child header for all of them.
+    #[test]
+    fn a_mixed_type_choice_is_refused_rather_than_encoded_wrongly() {
+        assert!(
+            Choice::enumerated(vec![Scalar::id(1), Scalar::int(2)])
+                .encode()
+                .is_none()
+        );
+        assert!(Choice::enumerated(Vec::new()).encode().is_none());
+    }
+
+    /// An object's declared size covers its `{ type, id }` body plus every
+    /// property, and a parse of the result must recover exactly what went in.
+    #[test]
+    fn an_object_round_trips_through_the_parser() {
+        let object = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![
+                Property::scalar(1, &Scalar::id(2)),
+                Property::scalar(0x0002_0003, &Scalar::rectangle(2560, 1440)),
+            ],
+        };
+        let encoded = object.encode();
+
+        assert_eq!(u32_at(&encoded, 0) as usize, encoded.len() - 8);
+        assert_eq!(u32_at(&encoded, 4), kind::OBJECT);
+
+        let parsed = ObjectRef::parse(&encoded).expect("the encoder produces parseable objects");
+        assert_eq!(parsed.object_type, 0x0004_0003);
+        assert_eq!(parsed.id, 4);
+        assert_eq!(parsed.properties().count(), 2);
+        assert_eq!(
+            parsed.property(1).and_then(|property| property.as_id()),
+            Some(2)
+        );
+        assert_eq!(
+            parsed
+                .property(0x0002_0003)
+                .and_then(|property| property.as_rectangle()),
+            Some((2560, 1440))
+        );
+        assert!(parsed.property(0xDEAD).is_none());
+    }
+
+    /// A server is entitled to report a fixated value still wrapped in a
+    /// single-alternative choice, and several do. Reading through that wrapper
+    /// is the difference between negotiating and hanging.
+    #[test]
+    fn a_fixated_value_is_read_through_its_choice_wrapper() {
+        let wrapped = Choice::enumerated(vec![Scalar::id(12)]);
+        let object = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![
+                Property::choice(0x0002_0001, &wrapped).expect("uniform choice encodes"),
+            ],
+        };
+        let encoded = object.encode();
+
+        let parsed = ObjectRef::parse(&encoded).expect("parseable");
+        assert_eq!(
+            parsed
+                .property(0x0002_0001)
+                .and_then(|property| property.as_id()),
+            Some(12)
+        );
+    }
+
+    /// This parses memory another process wrote, so every truncation must be a
+    /// `None` rather than a panic or an over-read.
+    #[test]
+    fn truncated_and_mistyped_pods_are_rejected() {
+        let encoded = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![Property::scalar(1, &Scalar::id(2))],
+        }
+        .encode();
+
+        assert!(ObjectRef::parse(&[]).is_none());
+        assert!(ObjectRef::parse(&encoded[..8]).is_none());
+        assert!(ObjectRef::parse(&encoded[..encoded.len() - 1]).is_none());
+        assert!(
+            ObjectRef::parse(&Scalar::id(1).encode()).is_none(),
+            "a scalar is not an object"
+        );
+    }
+}
+
+/// Format negotiation: what is offered, and what the answer is understood to
+/// mean.
+mod format_negotiation {
+    use scrozz_core::{ColorSpace, PixelFormat};
+
+    use super::wayland::pipewire::format::{
+        self, FormatError, MEDIA_SUBTYPE_RAW, MEDIA_TYPE_VIDEO, Negotiated, OBJECT_FORMAT,
+        PREFERRED_FORMATS, key, param, primaries, video_format,
+    };
+    use super::wayland::pipewire::pod::{Object, ObjectRef, Property, Scalar};
+
+    fn format_object(properties: Vec<Property>) -> Vec<u8> {
+        Object {
+            object_type: OBJECT_FORMAT,
+            id: param::FORMAT,
+            properties,
+        }
+        .encode()
+    }
+
+    fn raw_video(extra: Vec<Property>) -> Vec<u8> {
+        let mut properties = vec![
+            Property::scalar(key::MEDIA_TYPE, &Scalar::id(MEDIA_TYPE_VIDEO)),
+            Property::scalar(key::MEDIA_SUBTYPE, &Scalar::id(MEDIA_SUBTYPE_RAW)),
+        ];
+        properties.extend(extra);
+        format_object(properties)
+    }
+
+    /// The offer must announce raw video and carry a format list, a size range
+    /// and a framerate range. A missing `mediaType` is not a degraded offer —
+    /// the server discards it and the stream never starts.
+    #[test]
+    fn the_offer_is_a_well_formed_raw_video_enum_format() {
+        let offered = format::enum_format_param();
+        let parsed = ObjectRef::parse(&offered).expect("the offer is a valid object");
+
+        assert_eq!(parsed.object_type, OBJECT_FORMAT);
+        assert_eq!(parsed.id, param::ENUM_FORMAT);
+        assert_eq!(
+            parsed
+                .property(key::MEDIA_TYPE)
+                .and_then(|property| property.as_id()),
+            Some(MEDIA_TYPE_VIDEO)
+        );
+        assert_eq!(
+            parsed
+                .property(key::MEDIA_SUBTYPE)
+                .and_then(|property| property.as_id()),
+            Some(MEDIA_SUBTYPE_RAW)
+        );
+        assert!(parsed.property(key::VIDEO_FORMAT).is_some());
+        assert!(parsed.property(key::VIDEO_SIZE).is_some());
+        assert!(parsed.property(key::VIDEO_FRAMERATE).is_some());
+    }
+
+    /// No modifier is offered, and that is a decision rather than an oversight:
+    /// a client that names no DMA-BUF modifier cannot be handed a DMA-BUF, so
+    /// the server falls back to shared memory and no EGL, GBM or libdrm is
+    /// needed anywhere in this crate.
+    #[test]
+    fn the_offer_names_no_dma_buf_modifier() {
+        let offered = format::enum_format_param();
+        let parsed = ObjectRef::parse(&offered).expect("valid");
+        assert!(parsed.property(key::VIDEO_MODIFIER).is_none());
+    }
+
+    /// The framerate is a range including zero. An idle screen-cast source
+    /// reports 0/1, and a client that pinned 25/1 or 60/1 would fail to
+    /// intersect with it and wait forever for a stream that never starts.
+    #[test]
+    fn the_framerate_range_starts_at_zero() {
+        let offered = format::enum_format_param();
+        let parsed = ObjectRef::parse(&offered).expect("valid");
+        let framerate = parsed
+            .property(key::VIDEO_FRAMERATE)
+            .expect("a framerate is offered");
+        assert_eq!(
+            framerate.as_fraction(),
+            Some((0, 1)),
+            "the range's default is the idle rate"
+        );
+    }
+
+    /// BGRx first: it is what Mutter and KWin composite in, so matching it means
+    /// the server hands over its own buffer rather than converting every frame.
+    #[test]
+    fn bgrx_is_offered_ahead_of_the_alternatives() {
+        assert_eq!(PREFERRED_FORMATS[0], video_format::BGRX);
+        assert_eq!(PREFERRED_FORMATS.len(), 4);
+    }
+
+    /// Alpha honesty. SPA has no premultiplied video format, so `BGRA` means
+    /// straight alpha and must never be reported as premultiplied — doing so
+    /// black-fringes every antialiased edge downstream. The `x` variants have an
+    /// undefined fourth byte, which is a separate fact and is tracked
+    /// separately.
+    #[test]
+    fn pixel_formats_map_without_inventing_premultiplication() {
+        assert_eq!(
+            format::pixel_format(video_format::BGRX),
+            Some((PixelFormat::Bgra8, true))
+        );
+        assert_eq!(
+            format::pixel_format(video_format::RGBX),
+            Some((PixelFormat::Rgba8, true))
+        );
+        assert_eq!(
+            format::pixel_format(video_format::BGRA),
+            Some((PixelFormat::Bgra8, false))
+        );
+        assert_eq!(
+            format::pixel_format(video_format::RGBA),
+            Some((PixelFormat::Rgba8, false))
+        );
+        assert_eq!(format::pixel_format(0), None);
+
+        for spa in PREFERRED_FORMATS {
+            let (mapped, _) = format::pixel_format(spa).expect("every offered format maps");
+            assert!(
+                !mapped.is_premultiplied(),
+                "SPA has no premultiplied video format, so none may be reported"
+            );
+        }
+    }
+
+    /// An unrecognised or absent colour space stays unknown rather than
+    /// defaulting to sRGB, so an encoder can decline to embed a profile instead
+    /// of embedding a wrong one on a wide-gamut display.
+    #[test]
+    fn colour_primaries_map_conservatively() {
+        assert_eq!(
+            format::color_space(Some(primaries::BT709)),
+            ColorSpace::Srgb
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT2020)),
+            ColorSpace::Rec2020
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::SMPTE_RP431)),
+            ColorSpace::DisplayP3
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::SMPTE_EG432)),
+            ColorSpace::DisplayP3
+        );
+        assert_eq!(format::color_space(None), ColorSpace::Unknown);
+        assert_eq!(
+            format::color_space(Some(primaries::UNKNOWN)),
+            ColorSpace::Unknown
+        );
+        assert_eq!(format::color_space(Some(4242)), ColorSpace::Unknown);
+    }
+
+    #[test]
+    fn a_fixated_format_is_understood() {
+        let bytes = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(2560, 1440)),
+            Property::scalar(key::VIDEO_PRIMARIES, &Scalar::id(primaries::BT709)),
+        ]);
+
+        assert_eq!(
+            format::parse_format(&bytes),
+            Ok(Negotiated {
+                width: 2560,
+                height: 1440,
+                pixel_format: PixelFormat::Bgra8,
+                opaque_padding: true,
+                color_space: ColorSpace::Srgb,
+            })
+        );
+    }
+
+    #[test]
+    fn a_format_without_primaries_is_still_usable() {
+        let bytes = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::RGBA)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(800, 600)),
+        ]);
+
+        let negotiated = format::parse_format(&bytes).expect("usable");
+        assert_eq!(negotiated.color_space, ColorSpace::Unknown);
+        assert_eq!(negotiated.pixel_format, PixelFormat::Rgba8);
+        assert!(!negotiated.opaque_padding);
+        assert_eq!(negotiated.packed_stride(), 3200);
+        assert_eq!(negotiated.packed_len(), 3200 * 600);
+    }
+
+    /// Every way the answer can be unusable has to be distinguishable, because
+    /// each one points at a different thing being wrong on the user's machine.
+    #[test]
+    fn unusable_formats_are_classified_rather_than_lumped_together() {
+        assert_eq!(format::parse_format(&[]), Err(FormatError::NotAFormat));
+
+        let audio = format_object(vec![
+            Property::scalar(key::MEDIA_TYPE, &Scalar::id(1)),
+            Property::scalar(key::MEDIA_SUBTYPE, &Scalar::id(1)),
+        ]);
+        assert_eq!(
+            format::parse_format(&audio),
+            Err(FormatError::WrongMedia {
+                media_type: 1,
+                media_subtype: 1,
+            })
+        );
+
+        let no_format = raw_video(vec![Property::scalar(
+            key::VIDEO_SIZE,
+            &Scalar::rectangle(64, 64),
+        )]);
+        assert_eq!(
+            format::parse_format(&no_format),
+            Err(FormatError::MissingFormat)
+        );
+
+        let no_size = raw_video(vec![Property::scalar(
+            key::VIDEO_FORMAT,
+            &Scalar::id(video_format::BGRX),
+        )]);
+        assert_eq!(
+            format::parse_format(&no_size),
+            Err(FormatError::MissingSize)
+        );
+
+        let zero_size = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(1920, 0)),
+        ]);
+        assert_eq!(
+            format::parse_format(&zero_size),
+            Err(FormatError::MissingSize),
+            "a zero dimension is as unusable as a missing one"
+        );
+
+        let never_offered = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(9)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+        ]);
+        assert_eq!(
+            format::parse_format(&never_offered),
+            Err(FormatError::UnsupportedFormat(9))
+        );
+    }
+}
+
+/// Stride handling: the single most common way a screenshot comes out skewed.
+mod stride_packing {
+    use super::wayland::pipewire::format::{BufferError, pack_rows};
+
+    /// A padded buffer must be read row by row at the producer's stride and
+    /// written at the packed one. Reading it linearly gives the classic
+    /// diagonal shear, which looks like a decoding bug and is not.
+    #[test]
+    fn rows_are_lifted_out_of_padded_strides() {
+        // Two rows of two pixels, with sixteen bytes of padding per row.
+        let mut source = Vec::new();
+        for row in 0..2u8 {
+            for pixel in 0..2u8 {
+                source.extend_from_slice(&[row, pixel, 0x11, 0x22]);
+            }
+            source.extend_from_slice(&[0xEE; 16]);
+        }
+
+        let packed = pack_rows(&source, 24, 2, 2, false).expect("a padded buffer is readable");
+
+        assert_eq!(packed.len(), 16);
+        assert_eq!(
+            packed,
+            vec![
+                0, 0, 0x11, 0x22, 0, 1, 0x11, 0x22, //
+                1, 0, 0x11, 0x22, 1, 1, 0x11, 0x22,
+            ],
+            "no padding survives, and no row is shifted"
+        );
+    }
+
+    /// The final row needs only `width * 4` bytes. A producer is entitled to end
+    /// its mapping there, and demanding a full trailing stride would reject a
+    /// perfectly good buffer — which shows up as an intermittent failure on
+    /// exactly one compositor.
+    #[test]
+    fn a_buffer_ending_after_the_last_visible_row_is_accepted() {
+        let stride = 24usize;
+        let mut source = vec![0x40; stride + 8];
+        source[stride] = 0x41;
+
+        let packed = pack_rows(&source, stride as i32, 2, 2, false).expect("short tail is fine");
+        assert_eq!(packed.len(), 16);
+        assert_eq!(packed[8], 0x41);
+
+        assert_eq!(
+            pack_rows(&source[..stride + 7], stride as i32, 2, 2, false),
+            Err(BufferError::Short {
+                available: stride + 7,
+                needed: stride + 8,
+            }),
+            "one byte short is short"
+        );
+    }
+
+    /// In an `x` format the fourth byte is undefined, not opaque. Copying it
+    /// through produces a PNG with a random alpha channel — usually fully
+    /// transparent, which reads as "the screenshot is blank".
+    #[test]
+    fn undefined_padding_bytes_are_forced_opaque() {
+        let source = vec![0x10, 0x20, 0x30, 0x00, 0x40, 0x50, 0x60, 0x07];
+
+        let kept = pack_rows(&source, 8, 2, 1, false).expect("readable");
+        assert_eq!(kept[3], 0x00);
+        assert_eq!(kept[7], 0x07);
+
+        let forced = pack_rows(&source, 8, 2, 1, true).expect("readable");
+        assert_eq!(forced[3], 0xFF);
+        assert_eq!(forced[7], 0xFF);
+        assert_eq!(
+            &forced[..3],
+            &[0x10, 0x20, 0x30],
+            "only the fourth byte is touched"
+        );
+    }
+
+    /// A stride narrower than the row, or a negative one, describes a buffer
+    /// that cannot exist. Trusting it is an out-of-bounds read.
+    #[test]
+    fn impossible_strides_are_refused() {
+        let source = vec![0u8; 4096];
+
+        assert_eq!(
+            pack_rows(&source, 4, 2, 1, false),
+            Err(BufferError::BadStride {
+                stride: 4,
+                needed: 8,
+            })
+        );
+        assert_eq!(
+            pack_rows(&source, -8, 2, 1, false),
+            Err(BufferError::BadStride {
+                stride: -8,
+                needed: 8,
+            })
+        );
+        assert_eq!(
+            pack_rows(&source, 0, 2, 1, false),
+            Err(BufferError::BadStride {
+                stride: 0,
+                needed: 8,
+            })
+        );
+    }
+}
+
+/// The capture lifecycle, which decides when to keep waiting and when to give
+/// up — and what to say when it does.
+mod stream_lifecycle {
+    use scrozz_core::{ColorSpace, Error, PixelFormat};
+
+    use super::wayland::pipewire::format::Negotiated;
+    use super::wayland::pipewire::lifecycle::{
+        Action, Event, Failure, Lifecycle, Phase, StreamState,
+    };
+
+    fn negotiated() -> Negotiated {
+        Negotiated {
+            width: 64,
+            height: 32,
+            pixel_format: PixelFormat::Bgra8,
+            opaque_padding: true,
+            color_space: ColorSpace::Unknown,
+        }
+    }
+
+    fn started() -> Lifecycle {
+        let mut lifecycle = Lifecycle::new(10);
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Streaming, None)),
+            Action::Wait
+        );
+        assert_eq!(
+            lifecycle.observe(Event::FormatAgreed(negotiated())),
+            Action::Wait
+        );
+        lifecycle
+    }
+
+    #[test]
+    fn unknown_raw_states_are_treated_as_errors_rather_than_waited_on() {
+        assert_eq!(StreamState::from_raw(0), StreamState::Unconnected);
+        assert_eq!(StreamState::from_raw(3), StreamState::Streaming);
+        assert_eq!(StreamState::from_raw(-1), StreamState::Error);
+        assert_eq!(StreamState::from_raw(99), StreamState::Error);
+    }
+
+    #[test]
+    fn a_format_then_a_frame_is_a_successful_capture() {
+        let mut lifecycle = started();
+        assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
+        assert_eq!(*lifecycle.phase(), Phase::Captured);
+        assert_eq!(
+            lifecycle.outcome().expect("a capture succeeds"),
+            negotiated()
+        );
+    }
+
+    /// Mutter hands over empty buffers when nothing on screen has changed.
+    /// Accepting the first buffer offered is why a naive implementation produces
+    /// a black PNG on an idle desktop; an empty buffer is an ordinary event and
+    /// must not settle anything.
+    #[test]
+    fn empty_buffers_are_expected_and_keep_the_capture_waiting() {
+        let mut lifecycle = started();
+        for _ in 0..5 {
+            assert_eq!(lifecycle.observe(Event::EmptyBuffer), Action::Wait);
+            assert!(!lifecycle.is_settled());
+        }
+        assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
+        assert!(lifecycle.outcome().is_ok());
+    }
+
+    /// PipeWire keeps firing callbacks while a stream is torn down. A late
+    /// `state_changed(Unconnected)` arriving after a good frame must not turn a
+    /// captured screenshot into "the target disappeared".
+    #[test]
+    fn events_after_a_capture_cannot_undo_it() {
+        let mut lifecycle = started();
+        lifecycle.observe(Event::FrameReady);
+
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(
+                StreamState::Error,
+                Some("too late".into())
+            )),
+            Action::Stop
+        );
+        assert_eq!(*lifecycle.phase(), Phase::Captured);
+        assert!(lifecycle.outcome().is_ok());
+    }
+
+    /// The same raw state means two different things depending on whether the
+    /// stream ever ran, and the user needs to be told which.
+    #[test]
+    fn disconnection_reads_differently_before_and_after_streaming() {
+        let mut never = Lifecycle::new(10);
+        assert_eq!(
+            never.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        let Phase::Failed(Failure::Gone(before)) = never.phase().clone() else {
+            panic!("an unconnected stream is a failure");
+        };
+        assert!(
+            before.contains("does not exist"),
+            "before streaming it means the node was never there: {before}"
+        );
+
+        let mut after = started();
+        assert_eq!(
+            after.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        let Phase::Failed(Failure::Gone(during)) = after.phase().clone() else {
+            panic!("a disconnection mid-capture is a failure");
+        };
+        assert!(
+            during.contains("disappeared"),
+            "after streaming it means the target went away: {during}"
+        );
+
+        assert!(matches!(after.outcome(), Err(Error::TargetGone(_))));
+    }
+
+    /// Pixels whose layout is unknown are worse than no pixels: they would be
+    /// saved as a plausible-looking, wrong image.
+    #[test]
+    fn a_frame_before_any_agreed_format_is_a_failure() {
+        let mut lifecycle = Lifecycle::new(10);
+        lifecycle.observe(Event::StateChanged(StreamState::Streaming, None));
+        assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
+        assert!(matches!(
+            lifecycle.phase(),
+            Phase::Failed(Failure::Format(_))
+        ));
+    }
+
+    #[test]
+    fn structural_failures_settle_immediately_and_carry_their_reason() {
+        let mut rejected = started();
+        assert_eq!(
+            rejected.observe(Event::BufferRejected("dma-buf".into())),
+            Action::Stop
+        );
+        assert_eq!(
+            rejected.phase().clone(),
+            Phase::Failed(Failure::Buffer("dma-buf".into()))
+        );
+
+        let mut errored = Lifecycle::new(10);
+        assert_eq!(
+            errored.observe(Event::StateChanged(
+                StreamState::Error,
+                Some("node error".into())
+            )),
+            Action::Stop
+        );
+        assert_eq!(
+            errored.phase().clone(),
+            Phase::Failed(Failure::Stream("node error".into()))
+        );
+
+        let mut silent = Lifecycle::new(10);
+        silent.observe(Event::StateChanged(StreamState::Error, None));
+        let Phase::Failed(Failure::Stream(why)) = silent.phase().clone() else {
+            panic!("an error state is a failure");
+        };
+        assert!(!why.is_empty(), "a silent error still needs words");
+    }
+
+    /// A timeout is reported as a compositor problem with the timeout in it,
+    /// because by this point the user has already granted permission and is
+    /// looking at a screenshot that appears to have hung.
+    #[test]
+    fn a_timeout_names_the_wait_and_the_likely_cause() {
+        let mut lifecycle = started();
+        assert_eq!(lifecycle.observe(Event::TimedOut), Action::Stop);
+        assert_eq!(
+            lifecycle.phase().clone(),
+            Phase::Failed(Failure::Timeout(10))
+        );
+
+        let Err(Error::Platform(message)) = lifecycle.outcome() else {
+            panic!("a timeout is a platform failure");
+        };
+        assert!(message.contains("10s"));
+        assert!(message.contains("compositor"));
+    }
+
+    /// Connecting and paused are ordinary intermediate states; treating either
+    /// as terminal would abort most captures on a cold screen-cast source.
+    #[test]
+    fn intermediate_states_keep_the_capture_alive() {
+        let mut lifecycle = Lifecycle::new(10);
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Connecting, None)),
+            Action::Wait
+        );
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Paused, None)),
+            Action::Wait
+        );
+        assert!(!lifecycle.is_settled());
+        assert_eq!(*lifecycle.phase(), Phase::Connecting);
+    }
+}
+
+/// Turning portal failures into things a person can act on.
+mod portal_errors {
+    use scrozz_core::Error;
+
+    use super::wayland::portal::{PortalFailure, describe_sources, source_type};
+
+    /// The single most important mapping in this backend. Pressing Escape in the
+    /// portal's picker is not a fault, and a screenshot tool that shows an error
+    /// dialog when someone changes their mind is one people stop using.
+    #[test]
+    fn dismissing_the_picker_is_cancellation_and_nothing_else() {
+        assert!(matches!(
+            PortalFailure::Cancelled.into_error("GNOME"),
+            Error::Cancelled
+        ));
+    }
+
+    /// A missing portal must name the package to install, per-compositor. "Screen
+    /// capture failed" leaves the user with nothing to do next.
+    #[test]
+    fn a_missing_portal_names_the_packages_to_install() {
+        let Error::Unsupported { what, why } =
+            PortalFailure::Missing("no name owner".into()).into_error("sway")
+        else {
+            panic!("a missing portal is an unsupported capability");
+        };
+
+        assert!(what.contains("Wayland"));
+        assert!(why.contains("sway"), "the compositor is named: {why}");
+        assert!(why.contains("xdg-desktop-portal-wlr"));
+        assert!(why.contains("xdg-desktop-portal-gnome"));
+        assert!(why.contains("xdg-desktop-portal-kde"));
+        assert!(why.contains("no name owner"), "the detail survives: {why}");
+    }
+
+    /// A portal that offers monitors but not windows is a limitation of that
+    /// compositor's backend, and saying so is more useful than a generic
+    /// refusal.
+    #[test]
+    fn an_unavailable_source_type_explains_which_side_is_missing() {
+        let Error::Unsupported { what, why } = (PortalFailure::NoSources {
+            wanted: source_type::WINDOW,
+            available: source_type::MONITOR,
+        })
+        .into_error("wlroots") else {
+            panic!("an unavailable source is an unsupported capability");
+        };
+
+        assert!(what.contains("individual windows"));
+        assert!(why.contains("whole monitors"));
+        assert!(why.contains("wlroots"));
+    }
+
+    #[test]
+    fn portal_and_bus_faults_stay_platform_errors() {
+        assert!(matches!(
+            PortalFailure::NoStreams.into_error("KDE"),
+            Error::Platform(_)
+        ));
+
+        let Error::Platform(message) = PortalFailure::Bus("timed out".into()).into_error("KDE")
+        else {
+            panic!("a bus fault is a platform error");
+        };
+        assert!(message.contains("KDE"));
+        assert!(message.contains("timed out"));
+    }
+
+    #[test]
+    fn source_masks_are_described_in_readable_english() {
+        assert_eq!(describe_sources(0), "no capture sources");
+        assert_eq!(describe_sources(source_type::MONITOR), "whole monitors");
+        assert_eq!(
+            describe_sources(source_type::MONITOR | source_type::WINDOW),
+            "whole monitors and individual windows"
+        );
+        assert_eq!(
+            describe_sources(source_type::MONITOR | source_type::WINDOW | source_type::VIRTUAL),
+            "whole monitors, individual windows and virtual sources"
+        );
+    }
+}
+
+/// Placing a user-drawn region inside a portal-supplied monitor stream.
+mod region_cropping {
+    use scrozz_core::{
+        ColorSpace, Error, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
+        PixelFormat, ScaleFactor,
+    };
+
+    use super::wayland::portal::StreamInfo;
+    use super::wayland::region::{self, CropError, CropRect};
+
+    fn stream(position: Option<(i32, i32)>, size: Option<(i32, i32)>) -> StreamInfo {
+        StreamInfo {
+            node_id: 7,
+            position,
+            size,
+        }
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
+        LogicalRect {
+            origin: LogicalPoint::new(x, y),
+            size: LogicalSize::new(width, height),
+        }
+    }
+
+    /// A frame whose pixels encode their own coordinates, so a crop that is off
+    /// by one row or one column is visible in the assertion rather than hidden
+    /// behind a length check.
+    fn coordinate_frame(width: u32, height: u32, stride_padding: usize) -> Frame {
+        let stride = width as usize * 4 + stride_padding;
+        let mut data = vec![0xEE; stride * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let at = y * stride + x * 4;
+                data[at] = x as u8;
+                data[at + 1] = y as u8;
+                data[at + 2] = 0x33;
+                data[at + 3] = 0xFF;
+            }
+        }
+        Frame {
+            data,
+            size: PhysicalSize::new(f64::from(width), f64::from(height)),
+            stride,
+            format: PixelFormat::Bgra8,
+            color_space: ColorSpace::Unknown,
+            scale: ScaleFactor::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn a_region_on_an_unscaled_monitor_maps_one_to_one() {
+        let plan = region::plan_crop(
+            rect(100.0, 50.0, 200.0, 100.0),
+            &stream(Some((0, 0)), Some((1920, 1080))),
+            (1920, 1080),
+        );
+
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 100,
+                y: 50,
+                width: 200,
+                height: 100,
+            })
+        );
+    }
+
+    /// The monitor's own origin has to come out of the region's coordinates, or
+    /// a selection on a second monitor is cropped from the wrong place entirely
+    /// — usually producing a picture of the first monitor's left edge.
+    #[test]
+    fn the_monitors_desktop_origin_is_subtracted() {
+        let plan = region::plan_crop(
+            rect(2020.0, 100.0, 100.0, 100.0),
+            &stream(Some((1920, 0)), Some((1920, 1080))),
+            (1920, 1080),
+        );
+
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100,
+            })
+        );
+    }
+
+    /// The scale is derived from the frame the compositor actually delivered
+    /// against the logical size the portal reported, rather than from a display
+    /// scale factor. Under fractional scaling those disagree, and only the
+    /// former is a fact.
+    #[test]
+    fn the_scale_is_derived_from_the_delivered_frame() {
+        let plan = region::plan_crop(
+            rect(100.0, 100.0, 50.0, 50.0),
+            &stream(Some((0, 0)), Some((1920, 1080))),
+            (2400, 1350),
+        );
+
+        // 1.25x: 100 logical is pixel 125, and 50 logical is 62.5 pixels, which
+        // rounds outward to cover the whole selection.
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 125,
+                y: 125,
+                width: 63,
+                height: 63,
+            })
+        );
+    }
+
+    /// A selection dragged past the edge of the screen is clamped to what exists
+    /// rather than becoming a negative origin or an over-long read.
+    #[test]
+    fn a_region_overhanging_an_edge_is_clamped() {
+        let plan = region::plan_crop(
+            rect(-40.0, -40.0, 100.0, 100.0),
+            &stream(Some((0, 0)), Some((800, 600))),
+            (800, 600),
+        );
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 60,
+            })
+        );
+
+        let bottom_right = region::plan_crop(
+            rect(760.0, 560.0, 200.0, 200.0),
+            &stream(Some((0, 0)), Some((800, 600))),
+            (800, 600),
+        );
+        assert_eq!(
+            bottom_right,
+            Ok(CropRect {
+                x: 760,
+                y: 560,
+                width: 40,
+                height: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn a_region_that_misses_the_monitor_is_an_invalid_request() {
+        let plan = region::plan_crop(
+            rect(3000.0, 100.0, 100.0, 100.0),
+            &stream(Some((0, 0)), Some((1920, 1080))),
+            (1920, 1080),
+        );
+        assert_eq!(plan, Err(CropError::Outside));
+        assert!(matches!(
+            CropError::Outside.into_error("GNOME"),
+            Error::InvalidRequest(_)
+        ));
+    }
+
+    /// Some portals decline to say where a stream is. Returning the whole
+    /// monitor would hand back an image the user did not ask for and had no way
+    /// to notice was wrong, so the refusal is explicit and suggests what to do.
+    #[test]
+    fn a_stream_without_geometry_refuses_rather_than_guesses() {
+        assert_eq!(
+            region::plan_crop(
+                rect(0.0, 0.0, 10.0, 10.0),
+                &stream(None, Some((1920, 1080))),
+                (1920, 1080)
+            ),
+            Err(CropError::NoGeometry)
+        );
+        assert_eq!(
+            region::plan_crop(
+                rect(0.0, 0.0, 10.0, 10.0),
+                &stream(Some((0, 0)), None),
+                (1920, 1080)
+            ),
+            Err(CropError::NoGeometry)
+        );
+
+        let Error::Unsupported { what, why } = CropError::NoGeometry.into_error("Hyprland") else {
+            panic!("a placeless stream is an unsupported capability");
+        };
+        assert!(what.contains("region"));
+        assert!(why.contains("Hyprland"));
+        assert!(why.contains("whole display"), "it says what to do: {why}");
+    }
+
+    #[test]
+    fn a_degenerate_stream_is_a_platform_fault() {
+        assert_eq!(
+            region::plan_crop(
+                rect(0.0, 0.0, 10.0, 10.0),
+                &stream(Some((0, 0)), Some((0, 1080))),
+                (1920, 1080)
+            ),
+            Err(CropError::DegenerateStream)
+        );
+        assert!(matches!(
+            CropError::DegenerateStream.into_error("KDE"),
+            Error::Platform(_)
+        ));
+    }
+
+    /// The crop reads from a padded source and writes a packed destination, so
+    /// both strides are exercised at once. Checking the corner pixels is what
+    /// catches an off-by-one in either axis.
+    #[test]
+    fn cropping_copies_the_right_pixels_out_of_a_padded_frame() {
+        let frame = coordinate_frame(16, 8, 12);
+        let cropped = region::crop(
+            &frame,
+            CropRect {
+                x: 3,
+                y: 2,
+                width: 4,
+                height: 3,
+            },
+        )
+        .expect("an in-bounds crop succeeds");
+
+        assert_eq!(cropped.width(), 4);
+        assert_eq!(cropped.height(), 3);
+        assert_eq!(cropped.stride, 16, "the result is tightly packed");
+        assert_eq!(cropped.data.len(), 48);
+        assert!(cropped.is_well_formed());
+        assert_eq!(cropped.format, frame.format);
+        assert_eq!(cropped.color_space, frame.color_space);
+
+        assert_eq!(&cropped.data[0..2], &[3, 2], "top-left is (3, 2)");
+        assert_eq!(&cropped.data[12..14], &[6, 2], "top-right is (6, 2)");
+        assert_eq!(&cropped.data[32..34], &[3, 4], "bottom-left is (3, 4)");
+        assert_eq!(&cropped.data[44..46], &[6, 4], "bottom-right is (6, 4)");
+    }
+
+    /// The last line where a mistake could become an out-of-bounds read, so it
+    /// is checked rather than assumed even though `plan_crop` guarantees it.
+    #[test]
+    fn an_out_of_bounds_crop_is_refused_rather_than_read() {
+        let frame = coordinate_frame(8, 8, 0);
+
+        for bad in [
+            CropRect {
+                x: 6,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            CropRect {
+                x: 0,
+                y: 6,
+                width: 1,
+                height: 4,
+            },
+            CropRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 4,
+            },
+            CropRect {
+                x: u32::MAX,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+        ] {
+            assert_eq!(
+                region::crop(&frame, bad).err(),
+                Some(CropError::Outside),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recovered_scale_is_the_ratio_the_compositor_used() {
+        assert_eq!(
+            region::resolve_scale(
+                &stream(Some((0, 0)), Some((1920, 1080))),
+                (3840, 2160),
+                ScaleFactor::IDENTITY
+            )
+            .get(),
+            2.0
+        );
+        assert_eq!(
+            region::resolve_scale(
+                &stream(Some((0, 0)), Some((1920, 1080))),
+                (1920, 1080),
+                ScaleFactor::new(2.0)
+            )
+            .get(),
+            1.0,
+            "a delivered 1:1 frame overrides a guessed scale"
+        );
+    }
+
+    /// The only case with nothing to divide. Falling back is right; panicking in
+    /// `ScaleFactor::new` on a zero would not be.
+    #[test]
+    fn an_unmeasurable_stream_falls_back_to_the_displays_scale() {
+        let fallback = ScaleFactor::new(1.5);
+        assert_eq!(
+            region::resolve_scale(&stream(Some((0, 0)), None), (1920, 1080), fallback),
+            fallback
+        );
+        assert_eq!(
+            region::resolve_scale(&stream(Some((0, 0)), Some((0, 0))), (1920, 1080), fallback),
+            fallback
+        );
+        assert_eq!(
+            region::resolve_scale(&stream(Some((0, 0)), Some((1920, 1080))), (0, 0), fallback),
+            fallback
         );
     }
 }

@@ -99,10 +99,23 @@ x11rb = { version = "0.14", features = [
     "xfixes",         # cursor capture
     "allow-unsafe-code",
 ] }
-ashpd = { version = "0.13", features = [
+ashpd = { version = "0.13", default-features = false, features = [
     "screencast",     # without these the portal cannot be called at all
     "screenshot",
+    # ashpd defaults to a tokio-backed zbus, which would require every portal
+    # call to happen inside a tokio runtime. Scrozz is a synchronous desktop
+    # application with no runtime to speak of, so `async-io` is used instead:
+    # zbus then drives its own executor on an internal thread and a plain
+    # `block_on` from any thread is sufficient. It also keeps tokio out of the
+    # dependency graph entirely.
+    "async-io",
 ] }
+# Loaded with `dlopen` rather than linked, so a machine without PipeWire still
+# runs Scrozz and still captures over X11. See
+# `crates/scrozz-capture/src/linux/wayland/pipewire/sys.rs` for the reasoning.
+libloading = "0.8"
+# Just `block_on`: the portal is async and this crate is not.
+futures-lite = { version = "2", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 # An unimplemented contract must still compile. Phase 0 is deliberately a tree
