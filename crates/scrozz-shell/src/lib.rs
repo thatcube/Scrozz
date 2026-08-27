@@ -9,13 +9,16 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod autostart;
 pub mod drag;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod notify;
 pub mod overlay;
 pub mod permissions;
 pub mod tray;
+pub mod url_scheme;
 
 pub use drag::{
     ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
@@ -26,6 +29,7 @@ pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,
 };
+pub use notify::{Notification, NotificationPlan};
 pub use overlay::{
     AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,
@@ -33,7 +37,231 @@ pub use overlay::{
 pub use permissions::SystemPermissions;
 pub use tray::{Tray, TrayAction, TrayEntry};
 
-use scrozz_core::{LogicalRect, Result};
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+};
+
+use scrozz_core::{Error, LogicalRect, Result};
+
+/// A desktop platform supported by Scrozz's system-integration plans.
+///
+/// This is intentionally a value rather than a `cfg` branch. Tests can inspect
+/// all three plans on one host, while [`Self::current`] still selects the plan
+/// that may actually be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemPlatform {
+    /// macOS.
+    MacOS,
+    /// Microsoft Windows.
+    Windows,
+    /// Linux desktops.
+    Linux,
+}
+
+impl SystemPlatform {
+    /// Resolves one of the three supported operating-system names.
+    #[must_use]
+    pub const fn from_os(os: &str) -> Option<Self> {
+        match os.as_bytes() {
+            b"macos" => Some(Self::MacOS),
+            b"windows" => Some(Self::Windows),
+            b"linux" => Some(Self::Linux),
+            _ => None,
+        }
+    }
+
+    /// The platform this binary targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] on an unrecognised target.
+    pub fn current() -> Result<Self> {
+        Self::from_os(std::env::consts::OS).ok_or_else(|| Error::Unsupported {
+            what: "desktop system integration".to_owned(),
+            why: format!(
+                "{} is not one of the supported desktop targets",
+                std::env::consts::OS
+            ),
+        })
+    }
+
+    /// The stable lowercase platform token.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::MacOS => "macos",
+            Self::Windows => "windows",
+            Self::Linux => "linux",
+        }
+    }
+}
+
+/// One subprocess invocation, represented without a shell.
+///
+/// Arguments and environment values remain separate OS strings so paths do not
+/// need lossy quoting and user text can never become shell syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPlan {
+    program: PathBuf,
+    args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+}
+
+impl CommandPlan {
+    /// Creates a command plan.
+    #[must_use]
+    pub fn new(
+        program: impl Into<PathBuf>,
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Adds one environment value.
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// The executable that will be invoked.
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// The exact argument vector.
+    #[must_use]
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// Environment values added to the child.
+    #[must_use]
+    pub fn env(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
+
+    pub(crate) fn output(&self) -> Result<Output> {
+        Command::new(&self.program)
+            .args(&self.args)
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(Error::Io)
+    }
+
+    pub(crate) fn apply(&self, purpose: &str) -> Result<()> {
+        let output = self.output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Error::Platform(format!(
+            "{purpose} command `{}` failed with status {}: {}",
+            self.program.display(),
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+            stderr.trim()
+        )))
+    }
+
+    pub(crate) fn arg_eq(&self, value: &OsStr) -> bool {
+        self.args.iter().any(|argument| argument == value)
+    }
+}
+
+const REGISTRY_VALUE_INSPECT_SCRIPT: &str = concat!(
+    "$ErrorActionPreference='Stop';",
+    "try {",
+    "$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(",
+    "$env:SCROZZ_REGISTRY_SUBKEY);",
+    "if ($null -eq $k) { exit 3 };",
+    "try {",
+    "$v=$k.GetValue($env:SCROZZ_REGISTRY_VALUE,$null,",
+    "[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)",
+    "} finally { $k.Dispose() };",
+    "if ($null -eq $v) { exit 3 };",
+    "if ([System.StringComparer]::Ordinal.Equals(",
+    "[string]$v,$env:SCROZZ_REGISTRY_EXPECTED)) { exit 0 };",
+    "exit 4",
+    "} catch {",
+    "[Console]::Error.WriteLine($_.Exception.Message);",
+    "exit 2",
+    "}"
+);
+
+pub(crate) fn registry_value_inspection(
+    subkey: &str,
+    value_name: &str,
+    expected: &str,
+) -> CommandPlan {
+    CommandPlan::new(
+        "powershell.exe",
+        [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            REGISTRY_VALUE_INSPECT_SCRIPT,
+        ],
+    )
+    .with_env("SCROZZ_REGISTRY_SUBKEY", subkey)
+    .with_env("SCROZZ_REGISTRY_VALUE", value_name)
+    .with_env("SCROZZ_REGISTRY_EXPECTED", expected)
+}
+
+pub(crate) fn registry_value_status(
+    command: &CommandPlan,
+    purpose: &str,
+) -> Result<RegistrationStatus> {
+    let output = command.output()?;
+    match output.status.code() {
+        Some(0) => Ok(RegistrationStatus::Enabled),
+        Some(3) => Ok(RegistrationStatus::Disabled),
+        Some(4) => Ok(RegistrationStatus::Drifted),
+        _ => Err(Error::Platform(format!(
+            "{purpose} command failed with status {}: {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// Whether a planned system registration matches what is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationStatus {
+    /// No registration exists.
+    Disabled,
+    /// The registration exactly matches the current plan.
+    Enabled,
+    /// Something exists under Scrozz's identity, but its contents have drifted.
+    Drifted,
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn next_nonce() -> u64 {
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 /// A floating, chrome-less window that lives over the desktop.
 ///
