@@ -158,10 +158,7 @@ impl RecordingMachine {
     /// Returns [`Error::Unsupported`] until a native platform branch is linked,
     /// or [`Error::InvalidRequest`] for invalid settings.
     pub fn native(settings: RecordingSettings) -> Result<Self> {
-        let engine = detect_native_engine().ok_or_else(|| Error::Unsupported {
-            what: "screen recording".to_owned(),
-            why: "no native recording engine is linked for this platform yet".to_owned(),
-        })?;
+        let engine = detect_native_engine().ok_or_else(Self::native_engine_unavailable)?;
         Self::with_engine(engine, settings)
     }
 
@@ -175,6 +172,25 @@ impl RecordingMachine {
         self.clear_run();
         self.set_phase(RecordingPhase::Selecting);
         Ok(())
+    }
+
+    fn native_engine_unavailable() -> Error {
+        #[cfg(all(target_os = "linux", not(feature = "linux-native")))]
+        {
+            Error::Unsupported {
+                what: "Linux screen recording".to_owned(),
+                why: "this build omits the non-default `scrozz-record/linux-native` feature; enable it after installing PipeWire, FFmpeg, and VA-API development libraries"
+                    .to_owned(),
+            }
+        }
+
+        #[cfg(not(all(target_os = "linux", not(feature = "linux-native"))))]
+        {
+            Error::Unsupported {
+                what: "screen recording".to_owned(),
+                why: "no native recording engine is linked for this platform yet".to_owned(),
+            }
+        }
     }
 
     /// Cancels interactive selection and returns to idle.

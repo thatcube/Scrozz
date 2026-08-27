@@ -21,14 +21,25 @@ use std::{
 
 use scrozz_core::{CaptureTarget, Error, Frame, PhysicalPoint, PhysicalSize, Result};
 
+mod audio;
+mod config;
 pub mod edit;
+mod encoder;
 pub mod engine;
+mod format;
+mod h264;
+#[cfg(target_os = "linux")]
+mod linux;
 pub mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
+mod muxer;
 pub mod overlay;
+mod pacing;
 pub mod selection;
 pub mod settings;
+mod state;
+mod timeline;
 pub mod transcode;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -793,9 +804,21 @@ pub fn start_with_overlays(
 }
 
 fn no_native_engine_error() -> Error {
-    Error::Unsupported {
-        what: "screen recording".to_owned(),
-        why: "no native recording engine is linked for this platform".to_owned(),
+    #[cfg(all(target_os = "linux", not(feature = "linux-native")))]
+    {
+        Error::Unsupported {
+            what: "Linux screen recording".to_owned(),
+            why: "this build omits the non-default `scrozz-record/linux-native` feature; enable it after installing PipeWire, FFmpeg, and VA-API development libraries"
+                .to_owned(),
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", not(feature = "linux-native"))))]
+    {
+        Error::Unsupported {
+            what: "screen recording".to_owned(),
+            why: "no native recording engine is linked for this platform".to_owned(),
+        }
     }
 }
 
@@ -862,5 +885,17 @@ mod tests {
             output.partial_reason(),
             Some("capture ended before the first media fragment")
         );
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "linux-native")))]
+    #[test]
+    fn default_linux_build_explains_the_opt_in_native_feature() {
+        let error = match start(&RecordingRequest::new(CaptureTarget::AllDisplays)) {
+            Ok(_) => panic!("the default Linux build unexpectedly linked a native engine"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("linux-native"), "{message}");
+        assert!(message.contains("PipeWire"), "{message}");
     }
 }

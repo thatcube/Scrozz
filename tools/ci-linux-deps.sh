@@ -18,7 +18,7 @@ fi
 if ! command -v apt-get >/dev/null 2>&1; then
   echo "ci-linux-deps: no apt-get found. This script only knows Debian/Ubuntu." >&2
   echo "  Install the equivalents of: GTK 3, ayatana-appindicator, xdo, xkbcommon," >&2
-  echo "  wayland, X11/xcb, GL/EGL headers, and a software Vulkan driver." >&2
+  echo "  wayland, X11/xcb, GL/EGL, PipeWire, FFmpeg, VA-API, and Vulkan." >&2
   exit 1
 fi
 
@@ -67,6 +67,22 @@ PACKAGES=(
   # between Ubuntu releases, and the runner image is upgraded without warning.
   libgl-dev
   libegl-dev
+
+  # Native Linux recording. PipeWire provides portal video and both audio
+  # sources; FFmpeg provides AAC plus the exact h264_vaapi encoder; libva/libdrm
+  # provide the hardware-frame device boundary. These remain optional Cargo
+  # dependencies, but the native recording CI lane deliberately enables them.
+  libpipewire-0.3-dev
+  libspa-0.2-dev
+  libavcodec-dev
+  libavutil-dev
+  libva-dev
+  libdrm-dev
+
+  # Runtime probes for the X11 recording smoke test.
+  ffmpeg
+  xvfb
+  x11-xserver-utils
 
   # Software rasterisers, for the headless golden-image job (D25).
   #

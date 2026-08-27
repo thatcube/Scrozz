@@ -12,25 +12,15 @@
 //! also set produces a screenshot missing every native Wayland window, with no
 //! error to explain it.
 //!
-//! # Manifest constraints on this build
+//! # Native feature status
 //!
-//! Two dependencies are declared without the features this backend needs, and
-//! this crate is not permitted to amend them. Both limits are load-bearing
-//! enough to state here rather than bury:
-//!
-//! | Need | Feature required | Consequence today |
-//! |---|---|---|
-//! | RandR monitor geometry | `x11rb/randr` | Encoded by hand in [`x11::wire`] — works |
-//! | MIT-SHM fast path | `x11rb/shm` **and** `libc`/`rustix` | Unavailable; `GetImage` used |
-//! | XFIXES cursor image | `x11rb/xfixes` | Cursor omitted from X11 captures |
-//! | Portal ScreenCast | `ashpd/screencast` | Wayland capture unavailable |
-//! | Portal Screenshot | `ashpd/screenshot` | Wayland fallback unavailable |
-//!
-//! RandR was worth hand-rolling because without it a multi-monitor desktop is
-//! indistinguishable from one enormous screen. MIT-SHM was not, because the
-//! feature alone is insufficient — the shared segment needs `shmget`/`shmat` or
-//! `memfd_create`, and neither `libc` nor `rustix` is a dependency of this
-//! crate, so there is no syscall to make.
+//! The workspace enables `x11rb`'s `randr`, `shm`, `libc` and `xfixes` features,
+//! and `ashpd`'s `screencast` and `screenshot` features. RandR geometry and
+//! XFIXES cursor composition are used here. Static X11 captures retain the
+//! universally-correct `GetImage` baseline; MIT-SHM is an unimplemented
+//! performance optimisation, not a missing Cargo capability. Portal negotiation
+//! is available, while continuous PipeWire media acquisition lives in
+//! `scrozz-record` behind its optional native-library feature.
 
 pub mod session;
 pub mod wayland;

@@ -6,9 +6,9 @@
 #   Layer 2  real builds and tests on all three platforms           -> job: test
 #   Layer 3  headless golden images on all three platforms (D25)    -> job: golden
 #
-# Layer 4 (virtual machines, real desktop sessions) is deliberately absent —
-# it cannot be automated here, and pretending otherwise would be worse than
-# admitting the gap.
+# Layer 4 (full virtual machines and real compositor sessions) is deliberately
+# absent. The native recording lane does exercise a live Xvfb source, but that
+# narrow smoke test does not pretend to validate GNOME, KDE or physical hardware.
 name: CI
 
 on:
@@ -188,6 +188,51 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # NATIVE LINUX RECORDING — real pkg-config dependencies and a live X11 source.
+  #
+  # The media dependencies are non-default so macOS can still cross-check the
+  # pure recorder. This lane is the native counterpart: it compiles PipeWire,
+  # FFmpeg/VA-API and rav1e together, then records a real Xvfb desktop.
+  # ---------------------------------------------------------------------------
+  linux-recording:
+    name: Linux recording — native media
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - name: Install Linux system packages
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-recording
+
+      - name: Check native recording feature combinations
+        run: |
+          cargo check -p scrozz-record --features linux-native
+          cargo test -p scrozz-record --features linux-native,rav1e-fallback
+          cargo clippy -p scrozz-record --all-targets \
+            --features linux-native,rav1e-fallback -- -D warnings
+
+      - name: Build the shared-contract recording smoke harness
+        run: >-
+          cargo build -p scrozz-record --example linux_record_smoke
+          --features linux-native,rav1e-fallback
+
+      - name: Record and probe an X11 desktop
+        env:
+          SCROZZ_RECORD_BIN: target/debug/examples/linux_record_smoke
+        run: tools/smoke-recording-x11.sh
+
+  # ---------------------------------------------------------------------------
   # LAYER 3 — headless golden images (decision D25).
   #
   # The screenshot harness renders with no display server, which means it runs
@@ -280,7 +325,7 @@ jobs:
   ci-ok:
     name: CI passed
     if: always()
-    needs: [gate, test, golden]
+    needs: [gate, test, linux-recording, golden]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -288,11 +333,13 @@ jobs:
         run: |
           echo "gate:   ${{ needs.gate.result }}"
           echo "test:   ${{ needs.test.result }}"
+          echo "linux recording: ${{ needs.linux-recording.result }}"
           echo "golden: ${{ needs.golden.result }}"
 
           failed=0
           for pair in "gate:${{ needs.gate.result }}" \
                       "test:${{ needs.test.result }}" \
+                      "linux-recording:${{ needs.linux-recording.result }}" \
                       "golden:${{ needs.golden.result }}"; do
             name="${pair%%:*}"
             result="${pair#*:}"

@@ -1,8 +1,9 @@
 //! `xdg-desktop-portal` negotiation.
 //!
-//! Everything here that can be decided without D-Bus is decided here, as plain
-//! values, and tested. What remains — the calls themselves — is documented at
-//! [`acquire_frame`] and is not pretended to work.
+//! Everything here that can be decided without D-Bus is decided here as plain
+//! values and tested. The still-capture backend has not yet adopted the
+//! PipeWire consumer used by `scrozz-record`; [`acquire_frame`] marks that
+//! boundary without making stale claims about Cargo features.
 //!
 //! # The two portal interfaces, and why both matter
 //!
@@ -20,9 +21,8 @@
 //!
 //! # Wire constants
 //!
-//! Transcribed from the portal specification and cross-checked against
-//! `ashpd`'s own definitions, which are compiled out of this build by feature
-//! gating (see [`super`]).
+//! Transcribed from the portal specification and cross-checked against the
+//! enabled `ashpd` definitions.
 
 use scrozz_core::CaptureTarget;
 
@@ -211,26 +211,13 @@ impl StreamInfo {
 
 /// Reads pixels from a PipeWire node.
 ///
-/// # Not implemented, and why
+/// # Not implemented in the still-capture crate
 ///
-/// This is the honest boundary of the Wayland backend. Two independent things
-/// are missing, and neither can be worked around from inside this crate:
-///
-/// 1. **The portal call itself.** `ashpd`'s `screencast` module is behind a
-///    Cargo feature this build does not enable, so `Screencast::new()` does not
-///    exist here. The negotiation above is therefore fully specified and
-///    unexecutable. Enabling `features = ["screencast", "screenshot"]` on the
-///    workspace's `ashpd` dependency is the entire fix.
-///
-/// 2. **PipeWire.** Even with the portal available, `Start` returns a node id
-///    rather than pixels. Turning that into a frame needs a PipeWire client —
-///    `pipewire-rs`, or GStreamer's `pipewiresrc` — which is a substantial
-///    dependency with its own event loop, buffer negotiation and DMA-BUF
-///    handling. That is a task in its own right, not a detail of this one.
-///
-/// Writing a plausible-looking implementation that returned a blank buffer would
-/// hide both facts behind something that appears to work, which is worse than a
-/// panic that names them.
+/// The ashpd ScreenCast and Screenshot features are enabled. Turning `Start`'s
+/// node id into pixels still requires PipeWire system libraries; those are
+/// intentionally housed in `scrozz-record`'s non-default `linux-native`
+/// feature. Static capture will share that consumer when this crate grows an
+/// equivalent optional-native boundary.
 ///
 /// # Panics
 ///
@@ -238,9 +225,7 @@ impl StreamInfo {
 #[allow(clippy::needless_pass_by_value)]
 pub fn acquire_frame(_stream: StreamInfo) -> ! {
     todo!(
-        "PipeWire frame acquisition: connect to the node from Start, negotiate a \
-         BGRx/RGBx format, pull one buffer and copy it out. Needs a PipeWire client \
-         dependency (pipewire-rs) and ashpd's `screencast` feature, neither of which \
-         this crate's manifest currently grants."
+        "still-image PipeWire acquisition is not wired in scrozz-capture; \
+         scrozz-record owns the working continuous PipeWire consumer"
     )
 }

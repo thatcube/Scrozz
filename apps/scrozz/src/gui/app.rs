@@ -1351,6 +1351,7 @@ mod tests {
     #[test]
     fn unavailable_and_unwired_actions_say_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
+        app.recording = None;
         for action in [Action::OpenHistory, Action::OpenSettings] {
             assert_eq!(app.perform(action), Tick::Continue);
         }
