@@ -616,6 +616,7 @@ fn the_capture_actions_come_first_and_quit_comes_last() {
     assert_eq!(items[0], TrayAction::CaptureRegion);
     assert_eq!(items[1], TrayAction::CaptureWindow);
     assert_eq!(items[2], TrayAction::CaptureFullscreen);
+    assert_eq!(items[3], TrayAction::CaptureScrolling);
     assert_eq!(*items.last().expect("non-empty"), TrayAction::Quit);
 }
 
@@ -651,6 +652,7 @@ fn menu_ids_are_unique_and_round_trip() {
 #[test]
 fn enabled_menu_items_are_never_clickable_no_ops() {
     assert!(TrayAction::CaptureFullscreen.is_available());
+    assert!(TrayAction::CaptureScrolling.is_available());
     assert!(TrayAction::Quit.is_available());
 
     for unfinished in [

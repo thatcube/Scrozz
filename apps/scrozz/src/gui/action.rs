@@ -23,11 +23,18 @@ pub enum CaptureKind {
     Window,
     /// The whole display under the pointer. Needs nothing.
     Fullscreen,
+    /// A long image assembled while the active display scrolls.
+    Scrolling,
 }
 
 impl CaptureKind {
     /// Every kind, in menu order.
-    pub const ALL: [Self; 3] = [Self::Region, Self::Window, Self::Fullscreen];
+    pub const ALL: [Self; 4] = [
+        Self::Region,
+        Self::Window,
+        Self::Fullscreen,
+        Self::Scrolling,
+    ];
 
     /// The stable identifier, shared with the tray and the hotkey table.
     #[must_use]
@@ -36,6 +43,7 @@ impl CaptureKind {
             Self::Region => "capture.region",
             Self::Window => "capture.window",
             Self::Fullscreen => "capture.fullscreen",
+            Self::Scrolling => "capture.scrolling",
         }
     }
 
@@ -56,6 +64,7 @@ impl CaptureKind {
             Self::Region => "region",
             Self::Window => "window",
             Self::Fullscreen => "display",
+            Self::Scrolling => "scrolling page",
         }
     }
 }
@@ -89,6 +98,7 @@ impl Action {
             TrayAction::CaptureRegion => Self::Capture(CaptureKind::Region),
             TrayAction::CaptureWindow => Self::Capture(CaptureKind::Window),
             TrayAction::CaptureFullscreen => Self::Capture(CaptureKind::Fullscreen),
+            TrayAction::CaptureScrolling => Self::Capture(CaptureKind::Scrolling),
             TrayAction::ToggleRecording => Self::ToggleRecording,
             TrayAction::OpenHistory => Self::OpenHistory,
             TrayAction::OpenSettings => Self::OpenSettings,
@@ -133,6 +143,7 @@ impl Action {
             Self::Capture(CaptureKind::Region) => "scrozz capture --interactive".to_owned(),
             Self::Capture(CaptureKind::Window) => "scrozz capture --interactive-window".to_owned(),
             Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active".to_owned(),
+            Self::Capture(CaptureKind::Scrolling) => "scrozz capture --scrolling".to_owned(),
             Self::ToggleRecording => "scrozz record --toggle".to_owned(),
             Self::OpenHistory => "scrozz history list".to_owned(),
             Self::OpenSettings => "scrozz settings show".to_owned(),
@@ -193,6 +204,7 @@ mod tests {
         assert!(CaptureKind::Region.needs_selection());
         assert!(CaptureKind::Window.needs_selection());
         assert!(!CaptureKind::Fullscreen.needs_selection());
+        assert!(!CaptureKind::Scrolling.needs_selection());
     }
 
     #[test]

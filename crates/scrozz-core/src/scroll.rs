@@ -26,7 +26,7 @@
 //! that cannot do it at all report [`crate::Error::Unsupported`] with the reason
 //! and the alternative, rather than appearing broken.
 
-use crate::geometry::LogicalPoint;
+use crate::geometry::{LogicalPoint, ScaleFactor};
 
 /// The direction content is gathered in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -157,6 +157,21 @@ impl ScrollGesture {
 pub trait ScrollDriver: Send {
     /// What this driver can do, before anything is attempted.
     fn capabilities(&self) -> ScrollCapabilities;
+
+    /// Predicts the resulting content displacement in physical pixels.
+    ///
+    /// Most native wheel APIs cannot make this promise: applications translate
+    /// wheel notches through their own line height and scroll settings. Drivers
+    /// return `Some` only when their input unit is a logical pixel, allowing the
+    /// stitcher to use the value as a prior without turning a wheel delta into a
+    /// false seam.
+    fn expected_physical_delta(
+        &self,
+        _gesture: &ScrollGesture,
+        _frame_scale: ScaleFactor,
+    ) -> Option<u32> {
+        None
+    }
 
     /// Acquires whatever grant or session synthesis needs.
     ///

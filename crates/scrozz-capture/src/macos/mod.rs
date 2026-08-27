@@ -20,6 +20,7 @@ mod display;
 mod error;
 mod image;
 mod sck;
+pub(crate) mod scroll;
 mod window;
 
 use objc2::rc::Retained;

@@ -24,6 +24,7 @@ pub mod layout;
 pub mod pixels;
 pub mod randr;
 pub mod scale;
+pub(crate) mod scroll;
 pub mod wire;
 
 use scrozz_core::{

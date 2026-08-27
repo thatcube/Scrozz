@@ -244,7 +244,13 @@ mod tests {
     use super::*;
     use scrozz_core::{ColorSpace, PhysicalSize, ScaleFactor};
 
-    fn frame(format: PixelFormat, width: u32, height: u32, pixels: &[[u8; 4]], pad: usize) -> Frame {
+    fn frame(
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+        pixels: &[[u8; 4]],
+        pad: usize,
+    ) -> Frame {
         let stride = width as usize * 4 + pad;
         let mut data = vec![0xAA; stride * height as usize];
         for (i, px) in pixels.iter().enumerate() {
@@ -263,19 +269,40 @@ mod tests {
 
     #[test]
     fn channel_order_does_not_change_the_luma() {
-        let rgba = frame(PixelFormat::Rgba8, 2, 1, &[[10, 20, 30, 255], [200, 100, 50, 255]], 0);
-        let bgra = frame(PixelFormat::Bgra8, 2, 1, &[[30, 20, 10, 255], [50, 100, 200, 255]], 0);
+        let rgba = frame(
+            PixelFormat::Rgba8,
+            2,
+            1,
+            &[[10, 20, 30, 255], [200, 100, 50, 255]],
+            0,
+        );
+        let bgra = frame(
+            PixelFormat::Bgra8,
+            2,
+            1,
+            &[[30, 20, 10, 255], [50, 100, 200, 255]],
+            0,
+        );
 
         let a = LumaPlane::from_frame(&rgba).expect("rgba");
         let b = LumaPlane::from_frame(&bgra).expect("bgra");
-        assert_eq!(a, b, "the same colours in two byte orders are the same grey");
+        assert_eq!(
+            a, b,
+            "the same colours in two byte orders are the same grey"
+        );
     }
 
     #[test]
     fn stride_padding_is_skipped_rather_than_read_as_pixels() {
         // The padding bytes are 0xAA. Reading them would show up immediately as
         // a bright column that is not in the image — the classic skew bug.
-        let padded = frame(PixelFormat::Rgba8, 2, 2, &[[0; 4], [0; 4], [0; 4], [0; 4]], 16);
+        let padded = frame(
+            PixelFormat::Rgba8,
+            2,
+            2,
+            &[[0; 4], [0; 4], [0; 4], [0; 4]],
+            16,
+        );
         let plane = LumaPlane::from_frame(&padded).expect("padded");
         assert_eq!(plane.data, vec![0, 0, 0, 0]);
     }
@@ -284,7 +311,13 @@ mod tests {
     fn premultiplied_colour_is_recovered_before_measuring_brightness() {
         // Mid-grey at 50% alpha, stored premultiplied, is byte value 64.
         let straight = frame(PixelFormat::Rgba8, 1, 1, &[[128, 128, 128, 255]], 0);
-        let premul = frame(PixelFormat::RgbaPremultiplied8, 1, 1, &[[64, 64, 64, 128]], 0);
+        let premul = frame(
+            PixelFormat::RgbaPremultiplied8,
+            1,
+            1,
+            &[[64, 64, 64, 128]],
+            0,
+        );
 
         let a = LumaPlane::from_frame(&straight).expect("straight");
         let b = LumaPlane::from_frame(&premul).expect("premultiplied");

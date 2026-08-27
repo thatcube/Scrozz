@@ -19,9 +19,16 @@
 
 use std::path::Path;
 
-use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_core::{
+    Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display,
+    Error as CoreError, ScrollGesture,
+};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
+use scrozz_stitch::{
+    BackendFrameSource, CancelSignal, NeverCancel, Progress, ScrollSession, ScrollSessionConfig,
+    ThreadPacer,
+};
 
 use crate::{
     cli::{
@@ -61,12 +68,15 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 
 fn capture(args: &CaptureArgs) -> CliResult<Report> {
     args.validate()?;
-    let target = args.target.resolve()?;
+    let target = args.target_spec()?;
     let sinks = args.sinks();
 
     let plan = Json::obj([
         ("target", target_json(&target)),
-        ("interactive", Json::Bool(args.target.is_interactive())),
+        (
+            "interactive",
+            Json::Bool(matches!(target, TargetSpec::Interactive(_))),
+        ),
         ("cursor", Json::Bool(args.cursor)),
         ("window_shadow", Json::Bool(!args.no_window_shadow)),
         ("format", Json::str(args.format().slug())),
@@ -100,7 +110,11 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     }
 
-    let capture = backend.capture(&request)?;
+    let capture = if matches!(target, TargetSpec::Scrolling(_)) {
+        scrolling_capture(backend.as_ref(), request)?
+    } else {
+        backend.capture(&request)?
+    };
     let frame = &capture.frame;
 
     let bytes = FrameEncoder::new()
@@ -175,7 +189,7 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
         // Resolving a name needs enumeration, so it goes through the same
         // backend the capture will use — an id resolved by a different object
         // is an id that can disagree.
-        TargetSpec::Display(sel) => {
+        TargetSpec::Display(sel) | TargetSpec::Scrolling(sel) => {
             let displays = platform::target_enumerator()?.displays()?;
             let found = match sel {
                 DisplaySelector::Primary => displays.iter().find(|d| d.is_primary),
@@ -197,6 +211,7 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
                     )))
                 })
         }
+
         TargetSpec::Window(name) => {
             let windows = platform::target_enumerator()?.windows()?;
             windows
@@ -219,6 +234,67 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
             "scrozz-ui (the selection overlay)",
         )),
     }
+}
+
+pub(crate) fn scrolling_capture(
+    backend: &dyn CaptureBackend,
+    request: CaptureRequest,
+) -> CliResult<Capture> {
+    scrolling_capture_with(backend, request, &mut NeverCancel, |event| {
+        tracing::debug!(?event, "scrolling capture progress")
+    })
+}
+
+pub(crate) fn scrolling_capture_with<C, F>(
+    backend: &dyn CaptureBackend,
+    request: CaptureRequest,
+    cancel: &mut C,
+    progress: F,
+) -> CliResult<Capture>
+where
+    C: CancelSignal,
+    F: FnMut(Progress),
+{
+    let CaptureTarget::Display(display_id) = &request.target else {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "scrolling capture requires one display".to_owned(),
+        )));
+    };
+    let display = backend
+        .displays()?
+        .into_iter()
+        .find(|display| display.id == *display_id)
+        .ok_or_else(|| {
+            CliError::Core(CoreError::TargetGone(format!(
+                "display {} vanished before scrolling capture started",
+                display_id.0
+            )))
+        })?;
+    let config = scroll_session_config(&display)?;
+    let source = BackendFrameSource::new(backend, request.clone());
+    let driver = platform::scroll_driver()?;
+    let output = ScrollSession::new(source, driver, ThreadPacer, config).run(cancel, progress)?;
+    Ok(output.into_capture(request.target))
+}
+
+fn scroll_session_config(display: &Display) -> CliResult<ScrollSessionConfig> {
+    let area = display.work_area;
+    if area.is_empty() {
+        return Err(CliError::Core(CoreError::InvalidRequest(format!(
+            "display {} has no usable work area",
+            display.id.0
+        ))));
+    }
+    let at = scrozz_core::LogicalPoint::new(
+        area.origin.x + area.size.width / 2.0,
+        area.origin.y + area.size.height / 2.0,
+    );
+    // Keeping roughly a third of the viewport as overlap gives the matcher real
+    // evidence while still making useful progress on each capture.
+    Ok(ScrollSessionConfig::new(ScrollGesture::down(
+        at,
+        area.size.height * 0.65,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -593,20 +669,25 @@ pub fn target_json(target: &TargetSpec) -> Json {
         ]),
         TargetSpec::Display(selector) => Json::obj([
             ("kind", Json::str("display")),
-            (
-                "selector",
-                Json::str(match selector {
-                    DisplaySelector::Primary => "primary",
-                    DisplaySelector::Active => "active",
-                    DisplaySelector::Id(id) => id.as_str(),
-                }),
-            ),
+            ("selector", Json::str(display_selector_slug(selector))),
+        ]),
+        TargetSpec::Scrolling(selector) => Json::obj([
+            ("kind", Json::str("scrolling")),
+            ("selector", Json::str(display_selector_slug(selector))),
         ]),
         TargetSpec::AllDisplays => Json::obj([("kind", Json::str("all-displays"))]),
         TargetSpec::Interactive(mode) => Json::obj([
             ("kind", Json::str("interactive")),
             ("mode", Json::str(interactive_slug(*mode))),
         ]),
+    }
+}
+
+fn display_selector_slug(selector: &DisplaySelector) -> &str {
+    match selector {
+        DisplaySelector::Primary => "primary",
+        DisplaySelector::Active => "active",
+        DisplaySelector::Id(id) => id.as_str(),
     }
 }
 
@@ -644,6 +725,15 @@ fn describe_target(target: &TargetSpec) -> String {
         TargetSpec::Display(DisplaySelector::Primary) => "the primary display".to_string(),
         TargetSpec::Display(DisplaySelector::Active) => "the active display".to_string(),
         TargetSpec::Display(DisplaySelector::Id(id)) => format!("display {id}"),
+        TargetSpec::Scrolling(DisplaySelector::Primary) => {
+            "a scrolling capture of the primary display".to_owned()
+        }
+        TargetSpec::Scrolling(DisplaySelector::Active) => {
+            "a scrolling capture of the active display".to_owned()
+        }
+        TargetSpec::Scrolling(DisplaySelector::Id(id)) => {
+            format!("a scrolling capture of display {id}")
+        }
         TargetSpec::AllDisplays => "every display".to_string(),
         TargetSpec::Interactive(mode) => {
             format!("an interactively chosen {}", interactive_slug(*mode))
@@ -723,6 +813,14 @@ mod tests {
     }
 
     #[test]
+    fn a_scrolling_dry_run_reports_a_noninteractive_stitched_target() {
+        let rendered = json_of(&["scrozz", "capture", "--scrolling=primary", "--dry-run"]);
+        assert!(rendered.contains(r#""kind":"scrolling""#), "{rendered}");
+        assert!(rendered.contains(r#""selector":"primary""#), "{rendered}");
+        assert!(rendered.contains(r#""interactive":false"#), "{rendered}");
+    }
+
+    #[test]
     fn destinations_are_additive_and_ordered() {
         let rendered = json_of(&[
             "scrozz",
@@ -799,6 +897,7 @@ mod tests {
             vec!["scrozz", "capture", "--dry-run"],
             vec!["scrozz", "capture", "--display", "primary", "--dry-run"],
             vec!["scrozz", "capture", "--window", "Safari", "--dry-run"],
+            vec!["scrozz", "capture", "--scrolling=active", "--dry-run"],
             vec!["scrozz", "record", "--dry-run"],
         ] {
             assert!(run(&argv).is_ok(), "{argv:?}");

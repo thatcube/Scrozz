@@ -39,6 +39,8 @@ pub enum TrayAction {
     CaptureWindow,
     /// Capture the display under the pointer.
     CaptureFullscreen,
+    /// Capture a scrolling page on the display under the pointer.
+    CaptureScrolling,
     /// Start recording; becomes "Stop Recording" while recording runs.
     ToggleRecording,
     /// Show previous captures.
@@ -51,10 +53,11 @@ pub enum TrayAction {
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
+        Self::CaptureScrolling,
         Self::ToggleRecording,
         Self::OpenHistory,
         Self::OpenSettings,
@@ -72,6 +75,7 @@ impl TrayAction {
             Self::CaptureRegion => "capture.region",
             Self::CaptureWindow => "capture.window",
             Self::CaptureFullscreen => "capture.fullscreen",
+            Self::CaptureScrolling => "capture.scrolling",
             Self::ToggleRecording => "record.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
@@ -86,6 +90,7 @@ impl TrayAction {
             Self::CaptureRegion => "Capture Region",
             Self::CaptureWindow => "Capture Window",
             Self::CaptureFullscreen => "Capture Fullscreen",
+            Self::CaptureScrolling => "Capture Scrolling Page",
             Self::ToggleRecording => "Start Recording",
             Self::OpenHistory => "History…",
             Self::OpenSettings => "Settings…",
@@ -107,7 +112,10 @@ impl TrayAction {
     /// until they can actually fulfil the click.
     #[must_use]
     pub const fn is_available(self) -> bool {
-        matches!(self, Self::CaptureFullscreen | Self::Quit)
+        matches!(
+            self,
+            Self::CaptureFullscreen | Self::CaptureScrolling | Self::Quit
+        )
     }
 }
 
@@ -131,6 +139,7 @@ pub const fn menu_model() -> &'static [TrayEntry] {
         TrayEntry::Item(TrayAction::CaptureRegion),
         TrayEntry::Item(TrayAction::CaptureWindow),
         TrayEntry::Item(TrayAction::CaptureFullscreen),
+        TrayEntry::Item(TrayAction::CaptureScrolling),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::ToggleRecording),
         TrayEntry::Separator,

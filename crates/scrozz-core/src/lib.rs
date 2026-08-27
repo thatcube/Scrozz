@@ -37,13 +37,13 @@ pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
 pub use error::{Error, Result};
-pub use scroll::{
-    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
-    ScrollSynthesis,
-};
 pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
     PhysicalSize, Point, Rect, ScaleFactor, Size,
+};
+pub use scroll::{
+    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
+    ScrollSynthesis,
 };
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};

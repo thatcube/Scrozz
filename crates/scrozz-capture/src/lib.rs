@@ -27,13 +27,14 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod scroll_units;
 #[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCaptureKitBackend;
 
-use scrozz_core::{CaptureBackend, Result};
+use scrozz_core::{CaptureBackend, Result, ScrollDriver};
 
 /// Constructs the best capture backend for the running system.
 ///
@@ -60,5 +61,55 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         todo!("select and construct the platform capture backend")
+    }
+}
+
+/// Constructs the scroll-input driver for the running desktop.
+///
+/// Linux selection is runtime-sensitive: a native X11 session uses XTEST,
+/// GNOME/KDE Wayland uses the RemoteDesktop portal when it can be reached, and
+/// desktops without a safe synthesis route return a manual driver carrying the
+/// reason. Constructing the driver never opens a permission prompt; grants are
+/// acquired by [`ScrollDriver::prepare`].
+///
+/// # Errors
+///
+/// Returns [`scrozz_core::Error::Platform`] when the selected native input
+/// service cannot be reached, or [`scrozz_core::Error::Unsupported`] on an
+/// unknown operating system.
+pub fn scroll_driver() -> Result<Box<dyn ScrollDriver>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::scroll::CgEventScrollDriver::new()))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux::scroll_driver()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::scroll::SendInputScrollDriver::new()))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(scrozz_core::Error::Unsupported {
+            what: "automatic scroll input".into(),
+            why: "Scrozz has no scroll-input driver for this operating system".into(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod scroll_factory_tests {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn native_factory_reports_its_static_capabilities_without_preparing() {
+        let driver = super::scroll_driver().expect("native construction does not acquire a grant");
+        let capabilities = driver.capabilities();
+        assert!(capabilities.is_automatic());
+        assert_eq!(capabilities.requires_permission, cfg!(target_os = "macos"));
     }
 }
