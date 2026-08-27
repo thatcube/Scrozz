@@ -35,7 +35,7 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
-        card::{CardEvent, CardSurface},
+        card::{CardEvent, CardId, CardSurface},
         pipeline::{Job, Outcome, Pipeline},
         server::Server,
     },
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn an_unrouted_card_gesture_is_recorded_not_swallowed() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Drag(CardId(5)));
+        surface.inject(CardEvent::Collapse(CardId(5)));
         app.tick();
         assert!(
             app.notes().iter().any(|n| n.contains("not routed yet")),

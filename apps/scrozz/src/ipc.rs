@@ -78,6 +78,9 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum combined response frame accepted by a client.
 const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 
+/// The response header is five short, whitespace-delimited fields.
+const MAX_RESPONSE_HEADER_BYTES: usize = 128;
+
 /// No IPC peer gets to hold a process forever.
 #[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -387,10 +390,51 @@ pub(crate) fn decode_os(value: &serde_json::Value, encoding: &str) -> CliResult<
 /// an IPC fault rather than passed through, because relaying an unparsed payload
 /// with a guessed exit code is how a broken daemon becomes a silent data bug.
 pub fn parse_response(bytes: &[u8]) -> CliResult<Response> {
-    let split = bytes
-        .iter()
-        .position(|b| *b == b'\n')
+    let header = parse_response_header(bytes)?
         .ok_or_else(|| CliError::ipc("the running instance sent no response header"))?;
+    let body = &bytes[header.body_offset..];
+    let expected_len = header
+        .stdout_len
+        .checked_add(header.stderr_len)
+        .ok_or_else(|| CliError::ipc("the response payload lengths overflowed"))?;
+    if bytes.len() != header.frame_len {
+        return Err(CliError::ipc(format!(
+            "the response announced {expected_len} payload bytes but sent {}",
+            body.len()
+        )));
+    }
+    let (stdout, stderr) = body.split_at(header.stdout_len);
+    Ok(Response {
+        code: header.code,
+        stream: header.stream,
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+    })
+}
+
+struct ResponseHeader {
+    code: u8,
+    stream: StreamKind,
+    stdout_len: usize,
+    stderr_len: usize,
+    body_offset: usize,
+    frame_len: usize,
+}
+
+fn parse_response_header(bytes: &[u8]) -> CliResult<Option<ResponseHeader>> {
+    let Some(split) = bytes.iter().position(|b| *b == b'\n') else {
+        if bytes.len() > MAX_RESPONSE_HEADER_BYTES {
+            return Err(CliError::ipc(format!(
+                "the response header exceeded the {MAX_RESPONSE_HEADER_BYTES}-byte limit"
+            )));
+        }
+        return Ok(None);
+    };
+    if split > MAX_RESPONSE_HEADER_BYTES {
+        return Err(CliError::ipc(format!(
+            "the response header exceeded the {MAX_RESPONSE_HEADER_BYTES}-byte limit"
+        )));
+    }
 
     let header = std::str::from_utf8(&bytes[..split])
         .map_err(|_| CliError::ipc("the response header was not valid UTF-8"))?;
@@ -426,7 +470,6 @@ pub fn parse_response(bytes: &[u8]) -> CliResult<Response> {
         ));
     }
 
-    let body = &bytes[split + 1..];
     let expected_len = stdout_len
         .checked_add(stderr_len)
         .ok_or_else(|| CliError::ipc("the response payload lengths overflowed"))?;
@@ -436,19 +479,25 @@ pub fn parse_response(bytes: &[u8]) -> CliResult<Response> {
              {MAX_RESPONSE_BYTES}-byte response limit"
         )));
     }
-    if body.len() != expected_len {
+    let body_offset = split + 1;
+    let frame_len = body_offset
+        .checked_add(expected_len)
+        .ok_or_else(|| CliError::ipc("the response frame length overflowed"))?;
+    if frame_len > MAX_RESPONSE_BYTES {
         return Err(CliError::ipc(format!(
-            "the response announced {expected_len} payload bytes but sent {}",
-            body.len()
+            "the response frame requires {frame_len} bytes, exceeding the \
+             {MAX_RESPONSE_BYTES}-byte response limit"
         )));
     }
-    let (stdout, stderr) = body.split_at(stdout_len);
-    Ok(Response {
+
+    Ok(Some(ResponseHeader {
         code,
         stream,
-        stdout: stdout.to_vec(),
-        stderr: stderr.to_vec(),
-    })
+        stdout_len,
+        stderr_len,
+        body_offset,
+        frame_len,
+    }))
 }
 
 fn parse_payload_length(field: Option<&str>, destination: &str) -> CliResult<usize> {
@@ -636,6 +685,11 @@ fn exchange_until(path: &Path, request: &str, deadline: Instant) -> CliResult<Re
                     )));
                 }
                 buffer.extend_from_slice(&chunk[..count]);
+                if parse_response_header(&buffer)?
+                    .is_some_and(|header| buffer.len() >= header.frame_len)
+                {
+                    break;
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
@@ -902,6 +956,42 @@ mod tests {
         assert!(
             error.to_string().contains("absolute deadline"),
             "unexpected error: {error}"
+        );
+
+        server.join().expect("test server");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_complete_response_does_not_wait_for_the_peer_to_close() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
+
+        let path = PathBuf::from(format!(
+            "/tmp/scrozz-ipc-complete-response-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("test listener");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test connection");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("test request");
+            stream
+                .write_all(b"SCROZZ/3 0 text 2 0\nok")
+                .expect("complete response");
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let response = exchange_until(&path, "{}\n", started + Duration::from_millis(200)).unwrap();
+        assert_eq!(response.stdout, b"ok");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the client waited for EOF after receiving the complete frame"
         );
 
         server.join().expect("test server");
