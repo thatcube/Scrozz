@@ -212,65 +212,6 @@ at rest.
 
 ---
 
-## D17 — Competitor UI reference lives outside the repository
-
-**Decision.** Competitor screenshots (CleanShot X, Capso) are kept at
-`~/.copilot/scrozz-ui-reference/`, indexed by `INDEX.md`, and are **never
-committed to this repository**. Documentation references them by path only.
-
-Agents may study them to calibrate the *quality bar* — spacing rhythm, corner
-radii, shadow softness, control density, information hierarchy, and which
-options are worth exposing at all. Agents may **not** copy their designs, icons,
-colour values, or layouts. Scrozz's visual design is original and uses Tabler
-Icons (MIT).
-
-**Why.** These are copyrighted product UI. A GPL-3.0 repository must stay clean
-of them permanently. Keeping the library in a stable location outside any
-worktree also means it survives branch switches and new worktrees, so every
-future agent session can find it.
-
----
-
-## D18 — Storage and sharing: any folder, plus the one thing folders can't do
-
-**Decision.** Two distinct capabilities, both in the v1 plan:
-
-1. **Arbitrary save location** — the export path accepts *any* mounted path:
-   local folder, network/SMB share, or a synced folder (iCloud Drive, Dropbox,
-   Google Drive, OneDrive). This is a hard requirement regardless of any cloud
-   feature.
-2. **S3-compatible upload → shareable URL** — bring-your-own bucket (R2, S3, B2,
-   generic S3). No hosted service, no accounts, no bills to us.
-
-**Hard architectural constraint:** saving and uploading happen **off the capture
-path** — queued, asynchronous, with visible progress and retry. A capture must
-never block on I/O. Writing straight to a slow SMB share on the capture thread
-would stall the app at the worst possible moment.
-
-**Why.** The maintainer's observation sharpens the scope: *"there's like local
-storage and you point at a folder but you could just select a network drive and
-then bam you're good to go… how ever would they bring it aside from that?"*
-
-A configurable folder target genuinely delivers most of what "cloud" means —
-captures land somewhere synced, on every device, on infrastructure the user
-already pays for. And since a configurable save location is required anyway, that
-capability is nearly free.
-
-The **one thing a folder cannot do is produce a shareable URL at the moment of
-capture.** A synced folder needs a manual trip to get a link. That single gap is
-the entire justification for S3-compatible upload, and it is what CleanShot Cloud
-actually sells.
-
-Deliberately excluded: link expiry, password-protected links, and view analytics
-all need a server or a viewer page — T3 at best, possibly never. Team management
-is a permanent non-goal.
-
-**Sequencing.** In the plan and designed for from the start so the storage
-abstraction is never retrofitted; built after the core capture → annotate → drag
-loop is solid.
-
----
-
 ## D10 — Clipboard-compatible everywhere, smallest size that looks untouched
 
 **Decision.** Captures are offered to the clipboard in **multiple formats
@@ -359,62 +300,6 @@ card itself is the drag handle**, so the hero interaction needs no chrome at all
 Grabbability is communicated through cursor change and a subtle lift on press,
 never a visible handle. Copy and Save are the primary *buttons*; drag is the
 primary *gesture*; they occupy different channels and do not compete.
-
----
-
-## D19 — Motion is part of the design system, not decoration
-
-**Decision.** Micro-interactions and animation are a **product requirement**.
-Motion lives in the shared token layer alongside colour, spacing and type —
-named duration tokens, named easing curves (including a spring), and per-element
-animation state — never ad-hoc interpolation scattered through drawing code.
-
-**The governing principle: motion belongs to objects that move through space;
-controls respond instantly.**
-
-- **Animate — the capture cards.** A new capture **slides in from the anchored
-  screen edge** and the list springs to make room. A card is **grabbable and
-  follows the pointer 1:1**, tilts while moving, and **flings off toward that
-  edge with real momentum** past a velocity or distance threshold — or **springs
-  back** below it. Neighbours settle when one leaves. Velocity tracking is
-  essential: a dismissal that ignores throw speed feels dead.
-- **Do not animate — buttons, pills, menu rows.** Hover and press are **instant**
-  state changes. No fade, no scale, no easing.
-
-**Why the split.** Maintainer: *"i think the button animations dont NEED to be
-anything, the instant background changes are GOOD actually. make it feel more
-responsive."* He is right, and it corrects an earlier draft of this decision that
-called for animated button feedback. Easing a control makes an app feel
-*sluggish*; instant feedback makes it feel *responsive*. Physical motion on
-spatial objects is what makes it feel *alive*. Spending motion budget on controls
-actively degrades the product.
-
-**Accessibility gate (per D13):** the OS reduce-motion setting collapses every
-duration to zero. Motion is never load-bearing — it must not be the only carrier
-of meaning.
-
-**Why motion at all.** Maintainer: *"things like micro-interactions and
-animations are also really essential IMO to building a great app."* This is the
-difference between an app that works and an app that feels good, and it is judged
-in the first ten seconds of use.
-
-**Known cost, deliberately accepted.** egui has **no built-in animation system** —
-only `animate_bool_with_time` / `animate_value_with_time` primitives. Easing,
-springs and staggering must be built. epaint also has **no rotation primitive**,
-so a tilting card is hand-built from rotated polygons. That is precisely why it is
-being proven in a spike rather than assumed: a stack that cannot animate well
-fails a stated requirement, and better to learn that now than in month three.
-
-**Implementation note.** egui is immediate-mode and only repaints on input, so an
-animation silently does nothing unless `ctx.request_repaint()` is called while it
-is in flight — and repainting unconditionally pins the CPU, which would undermine
-the native-performance argument that justified choosing egui. Animate, then go
-idle.
-
-**Consequence for review.** Still screenshots cannot convey feel. Any UI work
-that changes interaction must be reviewed by **running it**, not by looking at
-stills — the first spike produced convincing static *depictions* of motion while
-containing no motion at all.
 
 ---
 
@@ -515,6 +400,121 @@ the test already exist.
 
 ---
 
+## D17 — Competitor UI reference lives outside the repository
+
+**Decision.** Competitor screenshots (CleanShot X, Capso) are kept at
+`~/.copilot/scrozz-ui-reference/`, indexed by `INDEX.md`, and are **never
+committed to this repository**. Documentation references them by path only.
+
+Agents may study them to calibrate the *quality bar* — spacing rhythm, corner
+radii, shadow softness, control density, information hierarchy, and which
+options are worth exposing at all. Agents may **not** copy their designs, icons,
+colour values, or layouts. Scrozz's visual design is original and uses Tabler
+Icons (MIT).
+
+**Why.** These are copyrighted product UI. A GPL-3.0 repository must stay clean
+of them permanently. Keeping the library in a stable location outside any
+worktree also means it survives branch switches and new worktrees, so every
+future agent session can find it.
+
+---
+
+## D18 — Storage and sharing: any folder, plus the one thing folders can't do
+
+**Decision.** Two distinct capabilities, both in the v1 plan:
+
+1. **Arbitrary save location** — the export path accepts *any* mounted path:
+   local folder, network/SMB share, or a synced folder (iCloud Drive, Dropbox,
+   Google Drive, OneDrive). This is a hard requirement regardless of any cloud
+   feature.
+2. **S3-compatible upload → shareable URL** — bring-your-own bucket (R2, S3, B2,
+   generic S3). No hosted service, no accounts, no bills to us.
+
+**Hard architectural constraint:** saving and uploading happen **off the capture
+path** — queued, asynchronous, with visible progress and retry. A capture must
+never block on I/O. Writing straight to a slow SMB share on the capture thread
+would stall the app at the worst possible moment.
+
+**Why.** The maintainer's observation sharpens the scope: *"there's like local
+storage and you point at a folder but you could just select a network drive and
+then bam you're good to go… how ever would they bring it aside from that?"*
+
+A configurable folder target genuinely delivers most of what "cloud" means —
+captures land somewhere synced, on every device, on infrastructure the user
+already pays for. And since a configurable save location is required anyway, that
+capability is nearly free.
+
+The **one thing a folder cannot do is produce a shareable URL at the moment of
+capture.** A synced folder needs a manual trip to get a link. That single gap is
+the entire justification for S3-compatible upload, and it is what CleanShot Cloud
+actually sells.
+
+Deliberately excluded: link expiry, password-protected links, and view analytics
+all need a server or a viewer page — T3 at best, possibly never. Team management
+is a permanent non-goal.
+
+**Sequencing.** In the plan and designed for from the start so the storage
+abstraction is never retrofitted; built after the core capture → annotate → drag
+loop is solid.
+
+---
+
+## D19 — Motion is part of the design system, not decoration
+
+**Decision.** Micro-interactions and animation are a **product requirement**.
+Motion lives in the shared token layer alongside colour, spacing and type —
+named duration tokens, named easing curves (including a spring), and per-element
+animation state — never ad-hoc interpolation scattered through drawing code.
+
+**The governing principle: motion belongs to objects that move through space;
+controls respond instantly.**
+
+- **Animate — the capture cards.** A new capture **slides in from the anchored
+  screen edge** and the list springs to make room. A card is **grabbable and
+  follows the pointer 1:1**, tilts while moving, and **flings off toward that
+  edge with real momentum** past a velocity or distance threshold — or **springs
+  back** below it. Neighbours settle when one leaves. Velocity tracking is
+  essential: a dismissal that ignores throw speed feels dead.
+- **Do not animate — buttons, pills, menu rows.** Hover and press are **instant**
+  state changes. No fade, no scale, no easing.
+
+**Why the split.** Maintainer: *"i think the button animations dont NEED to be
+anything, the instant background changes are GOOD actually. make it feel more
+responsive."* He is right, and it corrects an earlier draft of this decision that
+called for animated button feedback. Easing a control makes an app feel
+*sluggish*; instant feedback makes it feel *responsive*. Physical motion on
+spatial objects is what makes it feel *alive*. Spending motion budget on controls
+actively degrades the product.
+
+**Accessibility gate (per D13):** the OS reduce-motion setting collapses every
+duration to zero. Motion is never load-bearing — it must not be the only carrier
+of meaning.
+
+**Why motion at all.** Maintainer: *"things like micro-interactions and
+animations are also really essential IMO to building a great app."* This is the
+difference between an app that works and an app that feels good, and it is judged
+in the first ten seconds of use.
+
+**Known cost, deliberately accepted.** egui has **no built-in animation system** —
+only `animate_bool_with_time` / `animate_value_with_time` primitives. Easing,
+springs and staggering must be built. epaint also has **no rotation primitive**,
+so a tilting card is hand-built from rotated polygons. That is precisely why it is
+being proven in a spike rather than assumed: a stack that cannot animate well
+fails a stated requirement, and better to learn that now than in month three.
+
+**Implementation note.** egui is immediate-mode and only repaints on input, so an
+animation silently does nothing unless `ctx.request_repaint()` is called while it
+is in flight — and repainting unconditionally pins the CPU, which would undermine
+the native-performance argument that justified choosing egui. Animate, then go
+idle.
+
+**Consequence for review.** Still screenshots cannot convey feel. Any UI work
+that changes interaction must be reviewed by **running it**, not by looking at
+stills — the first spike produced convincing static *depictions* of motion while
+containing no motion at all.
+
+---
+
 ## D20 — The capture dock
 
 **Decision.** Swiping the capture list **down** collapses it into a **dock**: a
@@ -599,9 +599,83 @@ a hard requirement."* Motion concentrated on the few moments that carry the
 product's feel beats motion sprinkled everywhere — and per D19, easing controls
 actively makes an app feel slower.
 
-- **Q12 — UI stack (egui).** Provisional, pending the visual spike in
-  `spikes/ui-spike/`. Decided on screenshots, not argument.
+---
+
+## D22 — The UI stack is Rust + egui/eframe
+
+**Decision.** Scrozz's UI is built on **Rust + egui/eframe**, custom-drawn and
+shared across all three platforms. Versions pinned exactly — egui is 0.x and
+churns between minor releases.
+
+**Why it won.** It is the only option satisfying every constraint at once:
+
+- **Native performance (D6).** Instant startup — measured "nearly instant" on an
+  unoptimised debug build. Tauri's 300–800 ms WebView cold start disqualifies it
+  for a hotkey-driven capture app.
+- **Real transparent, click-through, always-on-top overlays** on every platform —
+  the app's most critical window type. Tauri supports only whole-window
+  click-through; Slint has no transparent overlay support at all.
+- **Accessibility (D13)** via AccessKit, which exists precisely for toolkits that
+  draw their own widgets.
+- **Headless verification (D5, D11).** `egui_kittest` renders offscreen through
+  wgpu with **no display server** and diffs against committed PNG baselines —
+  proven working in the spike. This is what lets agents verify their own UI work.
+- **One language** shared with the capture layer.
+
+**Decided on evidence, not argument.** A throwaway spike (`spikes/ui-spike/`)
+built the real surfaces with a custom token layer, vendored Tabler icons and
+macOS Liquid Glass. The objection was aesthetic — *"egui is pretty ugly… that is
+gonna need some work"* — and the pixels answered it: *"this is all looking very
+good."* Motion, the last open risk, was retired separately once egui was
+confirmed to animate well.
+
+**The honest characterisation, from the spike's own findings:** *"egui isn't
+ugly, it's bare."* It is a beautiful **canvas**, not a beautiful **widget kit**.
+The polish does not live in egui; it lives in the token layer you bring. Rerun's
+`re_ui` took exactly this path.
+
+**Costs accepted, with their consequences:**
+
+1. **The entire control library is hand-built.** No stock components to lean on.
+   Phase 0 must therefore produce a **shared widget library**, not per-surface
+   drawing — the spike's `paint.rs` hit 446 lines for three surfaces, and that
+   only scales through a real component layer.
+2. **No gradient primitive in epaint.** Gradients are stacked translucent shapes;
+   a moving gradient would need a shader.
+3. **No rotation primitive** — not for images, rounded rects or text. Tilt is
+   hand-built from rotated polygons, and **rotated text is unachievable** without
+   a render-to-texture path. Design around it.
+4. **Grayscale text antialiasing**, not subpixel. Indistinguishable from native on
+   Retina, slightly softer at 1× — relevant to 1080p Windows and Linux users.
+5. **True Liquid Glass behind *live desktop content*** needs native `NSView` work,
+   not a library call. Glass drawn over the captured image looks excellent and is
+   already achieved; genuine OS glass over the live desktop deserves its own spike
+   if it becomes an identity requirement.
+6. **The eframe build in use diverges from upstream egui's `App` trait.** Resolve
+   and pin this deliberately **before Phase 0** — it affects every future upgrade,
+   and upstream examples will not drop in unmodified.
+
+---
+
+## D23 — History retention
+
+**Decision.** **Annotation documents are kept forever** — they are kilobytes, and
+keeping them is what makes D14's "annotations are never permanent" actually true.
+**Source images are evicted against a size cap**, default ~10 GB and
+user-configurable, oldest first. **Pinned captures are never evicted.**
+
+**Why.** Documents are tiny and carry all the value; images are the bulk. Evicting
+only images preserves the promise at negligible cost. CleanShot's equivalent is a
+blunt time slider — Never / 1 day / 3 days / 1 week / 1 month — which throws away
+the edit history along with the pixels.
+
+---
+
+# Open questions
+
 - **Onboarding and first-run flow.** Not yet designed. Interacts with D15's
-  permission sequencing.
-- **Scrozz design language.** Colour ramp, type scale, spacing, elevation, icon
-  set (Tabler, MIT). Being explored by the spike.
+  permission sequencing — every invasive permission is requested at first use of
+  the feature it belongs to, never during onboarding.
+- **The Scrozz design language.** Seeded by the spike's token layer; needs
+  deliberate definition rather than inheritance from throwaway code.
+- **The eframe API-divergence question** (D22, cost 6) — resolve before Phase 0.
