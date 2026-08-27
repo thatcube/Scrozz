@@ -1,9 +1,9 @@
 //! Painting the interactive window picker.
 //!
-//! The selected hole and its outline use the exact logical bounds supplied by
-//! the backend. In particular, the outline is square: guessing the platform's
-//! window corner radius would make the picker promise geometry the captured
-//! pixels may not have.
+//! The selected wash and outline use the exact logical bounds supplied by the
+//! backend and a platform-specific visual estimate for the compositor's corner
+//! radius. The estimate affects only picker chrome; capture output keeps the
+//! platform's native edge pixels and alpha untouched.
 
 use egui::{
     Align2, Color32, CornerRadius, Key, Painter, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2, pos2,
@@ -13,16 +13,53 @@ use scrozz_core::{LogicalPoint, LogicalRect};
 
 use crate::theme::{Radius, Space, Text, Theme, corner};
 
-use super::Highlight;
-use super::WindowPicker;
+use super::{FocusMethod, Highlight, WindowPicker};
 
 const SCRIM_ALPHA: u8 = 88;
-const SELECTION_TINT: f32 = 0.16;
-const OUTLINE_WIDTH: f32 = 5.0;
-const INNER_OUTLINE_WIDTH: f32 = 2.0;
+const SELECTION_TINT: f32 = 0.10;
+const POINTER_OUTLINE_WIDTH: f32 = 2.0;
+const POINTER_OUTLINE_OPACITY: f32 = 0.72;
+const KEYBOARD_OUTLINE_WIDTH: f32 = 5.0;
+const KEYBOARD_INNER_OUTLINE_WIDTH: f32 = 2.0;
 const LABEL_GAP: f32 = Space::SM;
 const LABEL_PADDING_X: f32 = 11.0;
 const LABEL_PADDING_Y: f32 = 6.0;
+
+// Public window APIs do not expose the compositor's final per-window radius.
+// These logical-point estimates follow each platform's current window language;
+// Wayland uses its portal picker and never reaches this paint path.
+#[cfg(target_os = "macos")]
+const PLATFORM_WINDOW_RADIUS: f32 = 10.0;
+#[cfg(target_os = "windows")]
+const PLATFORM_WINDOW_RADIUS: f32 = 8.0;
+#[cfg(target_os = "linux")]
+const PLATFORM_WINDOW_RADIUS: f32 = 10.0;
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+const PLATFORM_WINDOW_RADIUS: f32 = 8.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SelectionStyle {
+    outline_width: f32,
+    outline_opacity: f32,
+    inner_outline_width: Option<f32>,
+}
+
+impl SelectionStyle {
+    const fn for_focus(method: FocusMethod) -> Self {
+        match method {
+            FocusMethod::Pointer => Self {
+                outline_width: POINTER_OUTLINE_WIDTH,
+                outline_opacity: POINTER_OUTLINE_OPACITY,
+                inner_outline_width: None,
+            },
+            FocusMethod::Keyboard => Self {
+                outline_width: KEYBOARD_OUTLINE_WIDTH,
+                outline_opacity: 1.0,
+                inner_outline_width: Some(KEYBOARD_INNER_OUTLINE_WIDTH),
+            },
+        }
+    }
+}
 
 /// What the picker UI asks its owner to do after one frame of input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +115,8 @@ pub fn draw(
     };
 
     let layout = Layout::new(viewport, desktop_origin, highlight.bounds);
+    let style = SelectionStyle::for_focus(highlight.focus_method);
+    let outer_radius = corner(PLATFORM_WINDOW_RADIUS);
     for rect in &layout.scrim {
         painter.rect_filled(
             *rect,
@@ -87,22 +126,30 @@ pub fn draw(
     }
 
     painter.rect_filled(
-        layout.highlight.intersect(viewport),
-        CornerRadius::ZERO,
+        layout.highlight,
+        outer_radius,
         theme.palette.accent.linear_multiply(SELECTION_TINT),
     );
     painter.rect_stroke(
         layout.highlight,
-        CornerRadius::ZERO,
-        Stroke::new(OUTLINE_WIDTH, theme.palette.accent_hi),
+        outer_radius,
+        Stroke::new(
+            style.outline_width,
+            theme
+                .palette
+                .accent_hi
+                .linear_multiply(style.outline_opacity),
+        ),
         StrokeKind::Inside,
     );
-    painter.rect_stroke(
-        layout.highlight.shrink(OUTLINE_WIDTH),
-        CornerRadius::ZERO,
-        Stroke::new(INNER_OUTLINE_WIDTH, Color32::WHITE),
-        StrokeKind::Inside,
-    );
+    if let Some(inner_width) = style.inner_outline_width {
+        painter.rect_stroke(
+            layout.highlight.shrink(style.outline_width),
+            corner((PLATFORM_WINDOW_RADIUS - style.outline_width).max(0.0)),
+            Stroke::new(inner_width, Color32::WHITE),
+            StrokeKind::Inside,
+        );
+    }
 
     let (width, height) = highlight.pixel_size();
     let text = format!(
@@ -311,5 +358,16 @@ mod tests {
             layout.highlight,
             Rect::from_min_size(pos2(240.0, 50.0), vec2(500.0, 300.0))
         );
+    }
+
+    #[test]
+    fn pointer_outline_is_subtle_and_keyboard_outline_is_emphasised() {
+        let pointer = SelectionStyle::for_focus(FocusMethod::Pointer);
+        let keyboard = SelectionStyle::for_focus(FocusMethod::Keyboard);
+
+        assert!(pointer.outline_width < keyboard.outline_width);
+        assert!(pointer.outline_opacity < keyboard.outline_opacity);
+        assert_eq!(pointer.inner_outline_width, None);
+        assert!(keyboard.inner_outline_width.is_some());
     }
 }

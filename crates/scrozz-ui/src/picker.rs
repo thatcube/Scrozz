@@ -40,13 +40,13 @@
 //! them too, because focusing something invisible leaves the user with a
 //! highlight they cannot see.
 //!
-//! # Why the highlight is square
+//! # Why the highlight radius is platform-specific
 //!
-//! The highlight traces the window's true bounds exactly, with no corner
-//! rounding. Rounding it would draw a radius Scrozz *guessed*, over a window
-//! whose real radius is the compositor's — the precise class of defect D9 exists
-//! to prevent. The highlight never reaches the captured pixels, so this costs
-//! nothing but honesty about where the window actually ends.
+//! Public capture APIs do not expose the compositor's final radius for arbitrary
+//! windows. The picker therefore uses a platform-specific visual estimate while
+//! preserving the OS-reported rectangular bounds exactly. This approximation is
+//! selection chrome only: it never masks or composites the captured pixels, whose
+//! native alpha remains the source of truth under D9.
 //!
 //! # Keyboard operation
 //!
@@ -63,6 +63,15 @@ use scrozz_core::{
 };
 use std::sync::{Arc, Mutex};
 
+/// The input method currently controlling the picker highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusMethod {
+    /// Hovering or clicking with a pointer.
+    Pointer,
+    /// Cycling with Tab or Shift-Tab.
+    Keyboard,
+}
+
 /// What the picker is currently pointing at.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Highlight {
@@ -70,9 +79,8 @@ pub struct Highlight {
     pub id: WindowId,
     /// The window's true frame in global logical desktop points.
     ///
-    /// Exactly what the OS reported — never inset, expanded or rounded. The
-    /// highlight is drawn on this rectangle so that what the user sees outlined
-    /// is what the capture will contain.
+    /// Exactly what the OS reported — never inset or expanded. Visual corner
+    /// rounding is selection chrome and does not alter this geometry.
     pub bounds: LogicalRect,
     /// The scale the capture will be taken at.
     ///
@@ -88,6 +96,8 @@ pub struct Highlight {
     /// Which application owns it, for the label chip and for the eventual
     /// history badge.
     pub source_app: SourceApp,
+    /// Whether pointer or keyboard input owns the current focus.
+    pub focus_method: FocusMethod,
 }
 
 impl Highlight {
@@ -262,12 +272,22 @@ impl WindowPicker {
     /// What to draw, if anything is focused.
     #[must_use]
     pub fn highlight(&self) -> Option<Highlight> {
-        self.focused().map(|window| self.describe(window))
+        let focus_method = if self.keyboard_focus {
+            FocusMethod::Keyboard
+        } else {
+            FocusMethod::Pointer
+        };
+        self.focused()
+            .map(|window| self.describe_with_focus(window, focus_method))
     }
 
-    /// The highlight for an arbitrary window, used by fixtures and by tests.
+    /// A pointer-style highlight for an arbitrary window, used by fixtures and tests.
     #[must_use]
     pub fn describe(&self, window: &Window) -> Highlight {
+        self.describe_with_focus(window, FocusMethod::Pointer)
+    }
+
+    fn describe_with_focus(&self, window: &Window, focus_method: FocusMethod) -> Highlight {
         let (scale, spans) = self.scale_of(window);
         Highlight {
             id: window.id.clone(),
@@ -275,6 +295,7 @@ impl WindowPicker {
             scale,
             spans_displays: spans,
             source_app: SourceApp::from_window(window),
+            focus_method,
         }
     }
 
@@ -828,11 +849,21 @@ mod tests {
             "pointer absence must not clear keyboard focus"
         );
         assert_eq!(picker.focused_id(), Some(&keyboard_window));
+        assert_eq!(
+            picker.highlight().expect("highlight").focus_method,
+            FocusMethod::Keyboard
+        );
         assert!(
             !picker.point_at(at(300.0, 300.0)),
             "passive pointer re-entry at the same position is not movement"
         );
         assert_eq!(picker.focused_id(), Some(&keyboard_window));
+
+        picker.point_at(at(301.0, 300.0));
+        assert_eq!(
+            picker.highlight().expect("highlight").focus_method,
+            FocusMethod::Pointer
+        );
     }
 
     #[test]
