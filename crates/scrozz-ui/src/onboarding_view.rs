@@ -117,14 +117,29 @@ impl OnboardingTopic {
                  any time in Settings → Shortcuts."
             }
             Self::WhereCapturesGo => {
-                "Scrozz saves every capture in the folder below. You can choose any \
-                 folder now or change it later in Settings."
+                "When you choose Save on a capture, Scrozz writes it to the folder \
+                 below. You can choose any folder now or change it later in Settings."
             }
             Self::CompositorKeybinding => {
                 "Some Wayland compositors don't let apps register global shortcuts. \
                  If this system needs a manual binding, add the exact line below to \
                  your compositor config and reload it."
             }
+        }
+    }
+
+    fn body_for(self, values: &OnboardingContent) -> &'static str {
+        match self {
+            Self::DragOut if !values.drag_out_available => {
+                "Direct drag-out is not available in this build. Use Copy to send \
+                 the image through the clipboard, or Save to create a file."
+            }
+            Self::CaptureHotkey if !values.capture_hotkey_available => {
+                "Region capture is not available in this desktop session, so Scrozz \
+                 has not registered its shortcut. Available capture actions remain \
+                 in the menu."
+            }
+            _ => self.body(),
         }
     }
 
@@ -151,6 +166,10 @@ pub struct OnboardingContent {
     pub capture_shortcut: String,
     /// The currently configured capture folder.
     pub capture_folder: String,
+    /// Whether the native host can drag a capture card into another app.
+    pub drag_out_available: bool,
+    /// Whether region capture and its global shortcut are available this session.
+    pub capture_hotkey_available: bool,
     /// The exact compositor line to add, or `None` when no manual binding is
     /// needed on this system.
     pub compositor_config: Option<String>,
@@ -163,6 +182,8 @@ impl Default for OnboardingContent {
         Self {
             capture_shortcut: "Super+Shift+4".to_owned(),
             capture_folder: "~/Pictures/Scrozz".to_owned(),
+            drag_out_available: true,
+            capture_hotkey_available: true,
             compositor_config: Some(
                 "bindsym Mod4+Shift+4 exec scrozz capture --interactive region".to_owned(),
             ),
@@ -352,7 +373,7 @@ pub fn render(
         pos2(content.right(), content.bottom() - 56.0),
     );
     let wrapped_body = wrap(
-        state.topic().body(),
+        state.topic().body_for(values),
         body_rect.width(),
         surface,
         Text::Subtitle,
@@ -725,6 +746,31 @@ mod tests {
         assert_eq!(OnboardingState::start().topic(), OnboardingTopic::DragOut);
         assert_eq!(OnboardingState::start().step_number(), 1);
         assert!(!OnboardingState::start().can_go_back());
+    }
+
+    #[test]
+    fn unavailable_runtime_features_are_described_honestly() {
+        let content = OnboardingContent {
+            drag_out_available: false,
+            capture_hotkey_available: false,
+            ..OnboardingContent::default()
+        };
+
+        assert!(
+            OnboardingTopic::DragOut
+                .body_for(&content)
+                .contains("not available")
+        );
+        assert!(
+            OnboardingTopic::CaptureHotkey
+                .body_for(&content)
+                .contains("not available")
+        );
+        assert!(
+            OnboardingTopic::WhereCapturesGo
+                .body_for(&content)
+                .starts_with("When you choose Save")
+        );
     }
 
     #[test]

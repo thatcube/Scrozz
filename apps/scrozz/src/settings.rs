@@ -271,9 +271,14 @@ const CAPTURE_DISPLAY_HOTKEY: &str = if cfg!(target_os = "macos") {
     "Super+Shift+3"
 };
 const CAPTURE_ALL_DISPLAYS_HOTKEY: &str = if cfg!(target_os = "macos") {
-    "Cmd+Shift+0"
+    "Cmd+Shift+1"
 } else {
     "Super+Shift+6"
+};
+const CAPTURE_SCROLLING_HOTKEY: &str = if cfg!(target_os = "macos") {
+    "Cmd+Shift+0"
+} else {
+    "Super+Shift+0"
 };
 const RECORD_START_HOTKEY: &str = if cfg!(target_os = "macos") {
     "Cmd+Shift+R"
@@ -343,6 +348,14 @@ pub const SETTINGS: &[Setting] = &[
         Kind::Template,
         NameTemplate::DEFAULT,
         "Name new captures from date, time, window and sequence fields.",
+    ),
+    Setting::new(
+        "capture.ask-for-filename",
+        Capture,
+        "Ask where to save",
+        Kind::Bool,
+        "false",
+        "Show a native save dialog after GUI captures; command-line captures stay non-interactive.",
     ),
     Setting::new(
         "capture.retina-suffix",
@@ -465,6 +478,14 @@ pub const SETTINGS: &[Setting] = &[
         "Hotkey for capturing every display.",
     ),
     Setting::new(
+        "hotkey.capture-scrolling",
+        Shortcuts,
+        "Capture scrolling page",
+        Kind::Accelerator,
+        CAPTURE_SCROLLING_HOTKEY,
+        "Hotkey for capturing a scrolling page.",
+    ),
+    Setting::new(
         "hotkey.record-start",
         Shortcuts,
         "Start recording",
@@ -508,6 +529,14 @@ pub const SETTINGS: &[Setting] = &[
         "Comma-separated BCP-47 language tags, or empty to use system languages.",
     ),
     Setting::new(
+        "ocr.auto-detect-language",
+        Ocr,
+        "Detect language automatically",
+        Kind::Bool,
+        "false",
+        "Infer the recognition language from image content instead of using configured system languages.",
+    ),
+    Setting::new(
         "ocr.keep-line-breaks",
         Ocr,
         "Keep line breaks",
@@ -521,7 +550,7 @@ pub const SETTINGS: &[Setting] = &[
         "Detect links",
         Kind::Bool,
         "true",
-        "Make recognized web addresses available as links.",
+        "Include recognized web, email, and telephone links in structured OCR output.",
     ),
     Setting::new(
         "quick-access.enabled",
@@ -545,7 +574,7 @@ pub const SETTINGS: &[Setting] = &[
         "Panel size",
         Kind::Int { min: 96, max: 512 },
         "192",
-        "Set the quick-access panel size in logical pixels.",
+        "Request the card width in logical pixels; the stack constrains it to its safe 116–464 point range.",
     ),
     Setting::new(
         "quick-access.active-display",
@@ -553,7 +582,7 @@ pub const SETTINGS: &[Setting] = &[
         "Follow active display",
         Kind::Bool,
         "true",
-        "Move quick access to the display containing the pointer.",
+        "Choose the pointer's display instead of the primary display at next launch.",
     ),
     Setting::new(
         "quick-access.auto-close-seconds",

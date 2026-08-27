@@ -11,7 +11,7 @@ use common::{decode, pixel_at, rgba, solid};
 use scrozz_core::{ColorSpace, PixelFormat};
 use scrozz_export::{
     ClipboardPlatform, FlavourKind, ImageFormat, RgbaImage,
-    clipboard::{arboard_delivers, bmp, dib_24, dib_v5, gaps, offer, preferred_kinds, tiff},
+    clipboard::{backend_delivers, bmp, dib_24, dib_v5, gaps, offer, preferred_kinds, tiff},
     profile_for, to_straight_rgba8,
 };
 
@@ -87,7 +87,7 @@ fn the_platform_type_names_are_the_ones_the_platform_actually_uses() {
 
     assert_eq!(
         names(ClipboardPlatform::MacOs),
-        ["public.png", "NSPasteboardTypeTIFF"]
+        ["public.png", "public.tiff"]
     );
     assert_eq!(
         names(ClipboardPlatform::Windows),
@@ -399,25 +399,20 @@ fn the_tiff_carries_its_profile_at_an_even_offset() {
 }
 
 // ---------------------------------------------------------------------------
-// The honest gap report
+// The verified delivery report
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_platform_reports_at_least_one_thing_arboard_cannot_do() {
-    // If this ever becomes empty it should be because the gap was closed, not
-    // because the report quietly stopped being maintained.
+fn every_platform_closes_the_previously_reported_flavour_gaps() {
     for platform in PLATFORMS {
-        assert!(
-            !gaps(platform).is_empty(),
-            "{platform:?} claims a complete offer"
-        );
+        assert!(gaps(platform).is_empty(), "{platform:?} still has a gap");
     }
 }
 
 #[test]
 fn nothing_is_reported_as_both_delivered_and_missing() {
     for platform in PLATFORMS {
-        let delivered = arboard_delivers(platform);
+        let delivered = backend_delivers(platform);
         for gap in gaps(platform) {
             assert!(
                 !delivered.contains(&gap.platform_type),
@@ -433,7 +428,7 @@ fn delivered_and_missing_together_account_for_every_flavour_d10_asks_for() {
     // The report is only useful if it is exhaustive: a flavour that is neither
     // delivered nor listed as a gap is one nobody knows is absent.
     for platform in PLATFORMS {
-        let delivered = arboard_delivers(platform);
+        let delivered = backend_delivers(platform);
         let missing: Vec<_> = gaps(platform).iter().map(|g| g.platform_type).collect();
 
         for kind in preferred_kinds(platform) {
@@ -447,7 +442,7 @@ fn delivered_and_missing_together_account_for_every_flavour_d10_asks_for() {
 }
 
 #[test]
-fn each_gap_explains_itself_and_says_what_would_fix_it() {
+fn any_future_gap_must_explain_itself_and_say_what_would_fix_it() {
     for platform in PLATFORMS {
         for gap in gaps(platform) {
             assert!(
@@ -465,13 +460,12 @@ fn each_gap_explains_itself_and_says_what_would_fix_it() {
 }
 
 #[test]
-fn the_macos_gap_is_the_missing_png_declaration() {
+fn macos_delivers_png_and_tiff() {
     let macos = gaps(ClipboardPlatform::MacOs);
-    assert_eq!(macos.len(), 1);
-    assert_eq!(macos[0].platform_type, "public.png");
+    assert!(macos.is_empty());
     assert_eq!(
-        arboard_delivers(ClipboardPlatform::MacOs),
-        ["NSPasteboardTypeTIFF"]
+        backend_delivers(ClipboardPlatform::MacOs),
+        ["public.png", "public.tiff"]
     );
 }
 
@@ -493,17 +487,8 @@ fn writing_to_the_real_clipboard() {
 
     use scrozz_export::{Clipboard, SystemClipboard};
 
-    let saved = arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.get_text().ok());
     let frame = solid(8, 8, [20, 140, 255]);
     let result = SystemClipboard::new().write_image_with_report(&frame);
-
-    if let Some(text) = saved
-        && let Ok(mut c) = arboard::Clipboard::new()
-    {
-        let _ = c.set_text(text);
-    }
 
     let report = result.expect("writes").expect("SystemClipboard reports");
     assert_eq!(report.platform, ClipboardPlatform::current());

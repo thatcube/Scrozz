@@ -285,7 +285,7 @@ impl Host for Windowed {
                     }
                 };
                 let overlay = OverlayApp::new(cc, handle, options);
-                let settings = SettingsWindow::new(&cc.egui_ctx, app.settings_revision())?;
+                let settings = SettingsWindow::new(&cc.egui_ctx, &app, drag_source.is_some())?;
                 Ok(Box::new(Driver {
                     app,
                     overlay,

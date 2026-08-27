@@ -80,7 +80,10 @@ impl CaptureKind {
         match self {
             Self::AllInOne => capabilities != SelectionCapabilities::NONE,
             Self::Region => capabilities.supports(SelectionMode::Region),
-            Self::Window => capabilities.supports(SelectionMode::Window),
+            // The shared selector cannot yet retain one backend instance from
+            // enumeration through commit and capture. Advertising this action
+            // would allow session-relative window IDs to cross backend instances.
+            Self::Window => false,
             Self::Fullscreen => true,
             Self::AllDisplays => !matches!(
                 session.server,
@@ -304,6 +307,16 @@ mod tests {
         assert!(!Action::Capture(CaptureKind::AllDisplays).is_available(
             SelectionCapabilities::CLIENT_OVERLAY,
             &wayland,
+            true,
+        ));
+    }
+
+    #[test]
+    fn window_action_waits_for_the_retained_backend_picker() {
+        let desktop = Session::from_env(None, None, None, Some(":0"));
+        assert!(!Action::Capture(CaptureKind::Window).is_available(
+            SelectionCapabilities::CLIENT_OVERLAY,
+            &desktop,
             true,
         ));
     }

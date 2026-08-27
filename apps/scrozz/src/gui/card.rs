@@ -31,6 +31,7 @@ use std::{
 use scrozz_core::{Frame, LogicalPoint, LogicalRect, Provenance, SourceApp};
 use scrozz_shell::NativeSurface;
 use scrozz_store::CaptureId;
+use scrozz_ui::stack::CardMetrics;
 
 use crate::gui::action::CaptureKind;
 
@@ -439,6 +440,12 @@ pub trait CardSurface {
 
     /// Temporarily hides or shows the entire overlay.
     fn toggle_hidden(&mut self) {}
+
+    /// Applies live card size and spacing.
+    fn set_card_metrics(&mut self, _metrics: CardMetrics) {}
+
+    /// Applies a live inactivity deadline.
+    fn set_auto_close(&mut self, _seconds: Option<f64>) {}
 
     /// The native view the overlay is drawn into.
     fn native_surface(&self) -> Option<NativeSurface> {

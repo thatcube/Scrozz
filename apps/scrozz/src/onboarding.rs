@@ -54,7 +54,7 @@ impl Topic {
                 "Use the region shortcut from any app. Scrozz returns you to what you were doing after the capture."
             }
             Self::CaptureFolder => {
-                "Every capture is saved to your chosen folder unless you provide another destination."
+                "When you choose Save, the capture is written to your chosen folder unless you provide another destination."
             }
             Self::CompositorKeybinding => {
                 "Some Wayland compositors keep global shortcuts in their own configuration. Paste the generated line there once."

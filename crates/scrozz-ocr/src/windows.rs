@@ -1,13 +1,12 @@
-//! Windows text recognition via `Windows.Media.Ocr`.
+//! Windows text recognition selected once from process package identity.
 //!
-//! # Why the OS engine
+//! # Packaged and portable artifacts
 //!
-//! Same reasoning as macOS: it ships with Windows, it is already localised to
-//! the languages the user installed, it costs nothing in binary size, and it is
-//! tuned for screen content. `OcrEngine::TryCreateFromUserProfileLanguages` is
-//! exactly the "use the user's locale" behaviour we want, with no configuration.
+//! Packaged processes use `Windows.Media.Ocr`; unpackaged processes use the
+//! Tesseract payload beside the executable. Selection happens before recognition
+//! and errors never trigger a fallback to the other backend.
 //!
-//! # Language selection
+//! # Native language selection
 //!
 //! [`Options::languages`](crate::Options::languages) is authoritative here. Each
 //! requested tag is tried in priority order against
@@ -37,10 +36,15 @@ use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
+use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows::core::HSTRING;
 
 use crate::layout;
-use crate::prepare::{self, Prepared, Rgba8Image};
+use crate::prepare::{self, Prepared};
+use crate::windows_runtime::{
+    Backend, PackageIdentityProbe, backend_for_package_identity, bgra_premultiplied_on_white,
+    classify_package_identity_probe, dispatch,
+};
 use crate::{Options, TextBlock};
 
 /// `AsyncStatus::Started`. Spelled out because `windows_future` is not a direct
@@ -57,14 +61,53 @@ const ASYNC_CANCELED: i32 = 2;
 /// so a wedged engine surfaces as an error instead of a hung UI thread.
 const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Recognises text in a frame using the Windows OCR engine.
+fn active_backend() -> Result<Backend> {
+    let mut utf16_len = 0u32;
+    // SAFETY: the documented sizing probe writes only to `utf16_len` and accepts
+    // a null output buffer.
+    let status = unsafe { GetCurrentPackageFullName(&mut utf16_len, None) };
+    let has_identity = match classify_package_identity_probe(status.0, utf16_len) {
+        PackageIdentityProbe::Packaged => true,
+        PackageIdentityProbe::Unpackaged => false,
+        PackageIdentityProbe::Failed(status) => {
+            return Err(Error::Platform(format!(
+                "GetCurrentPackageFullName failed with Win32 status {status}"
+            )));
+        }
+    };
+    Ok(backend_for_package_identity(has_identity))
+}
+
+/// Name of the backend selected for this process artifact.
+pub(crate) fn engine_name() -> Result<&'static str> {
+    Ok(active_backend()?.engine_name())
+}
+
+/// Recognises text using the one backend selected for this process artifact.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRequest`] for a malformed frame, [`Error::Unsupported`] if
-/// the machine has no OCR language pack installed, [`Error::Platform`] for any
-/// other WinRT failure.
+/// [`Error::InvalidRequest`] for malformed input or unsupported portable
+/// language configuration, [`Error::Unsupported`] when the selected backend's
+/// language payload is absent, and [`Error::Platform`] for backend failures.
 pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    dispatch(
+        active_backend()?,
+        || recognize_native(frame, options),
+        || crate::tesseract::recognize(frame, options),
+    )
+}
+
+fn recognize_native(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    if options.automatic_language_detection {
+        return Err(Error::Unsupported {
+            what: "automatic OCR language detection".to_string(),
+            why: "Windows.Media.Ocr requires an installed language pack selected explicitly or \
+                  through the user's profile; it cannot infer language from image content"
+                .to_string(),
+        });
+    }
+
     // Ask the engine for its ceiling first: the answer feeds the upscale
     // decision, so an image is never enlarged past what the engine will accept
     // and an already-oversized capture is shrunk rather than rejected.
@@ -247,6 +290,32 @@ fn installed_languages() -> String {
     }
 }
 
+/// Lists OCR recognizer languages installed in Windows.
+fn available_languages_native() -> Result<Vec<String>> {
+    let available = OcrEngine::AvailableRecognizerLanguages().map_err(|error| {
+        Error::Platform(format!(
+            "OcrEngine::AvailableRecognizerLanguages failed: {error}"
+        ))
+    })?;
+    let mut tags: Vec<String> = (0..available.Size().unwrap_or(0))
+        .filter_map(|index| available.GetAt(index).ok())
+        .filter_map(|language| language.LanguageTag().ok())
+        .map(|tag| tag.to_string_lossy())
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    Ok(tags)
+}
+
+/// Lists OCR languages available to this process's selected backend.
+pub fn available_languages() -> Result<Vec<String>> {
+    dispatch(
+        active_backend()?,
+        available_languages_native,
+        crate::tesseract::available_languages,
+    )
+}
+
 /// Copies a prepared image into a `SoftwareBitmap` the engine can consume.
 fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
     let width = i32::try_from(prepared.image.width)
@@ -259,7 +328,7 @@ fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
     let writer =
         DataWriter::new().map_err(|e| Error::Platform(format!("DataWriter::new failed: {e}")))?;
     writer
-        .WriteBytes(&bgra_premultiplied(&prepared.image))
+        .WriteBytes(&bgra_premultiplied_on_white(&prepared.image))
         .map_err(|e| Error::Platform(format!("DataWriter::WriteBytes failed: {e}")))?;
     let buffer = writer
         .DetachBuffer()
@@ -271,33 +340,4 @@ fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
     // are premultiplied on the way in.
     SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Bgra8, width, height)
         .map_err(|e| Error::Platform(format!("SoftwareBitmap::CreateCopyFromBuffer failed: {e}")))
-}
-
-/// Converts straight-alpha RGBA into the premultiplied BGRA `SoftwareBitmap`
-/// expects, in one pass.
-fn bgra_premultiplied(image: &Rgba8Image) -> Vec<u8> {
-    let mut out = vec![0u8; image.data.len()];
-    for (s, d) in image
-        .data
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(out.as_chunks_mut::<4>().0.iter_mut())
-    {
-        let a = s[3];
-        d[0] = premultiply(s[2], a);
-        d[1] = premultiply(s[1], a);
-        d[2] = premultiply(s[0], a);
-        d[3] = a;
-    }
-    out
-}
-
-/// Scales a straight-alpha channel by its alpha.
-fn premultiply(channel: u8, alpha: u8) -> u8 {
-    match alpha {
-        255 => channel,
-        0 => 0,
-        a => ((u32::from(channel) * u32::from(a) + 127) / 255) as u8,
-    }
 }

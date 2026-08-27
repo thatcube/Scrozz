@@ -66,9 +66,9 @@ These are properties of the shipped application, not promises about intent.
 - **No account, no sign-in, no server.** There is no Scrozz backend to talk to.
 - **Your data is not monetised.** There is nothing to monetise, because none of
   it leaves your machine.
-- **Text recognition is local.** Optical character recognition uses the
-  recogniser already built into your operating system — Vision on macOS,
-  `Windows.Media.Ocr` on Windows — running on device. Linux ships no comparable
+- **Text recognition is local.** Optical character recognition uses Vision on
+  macOS, `Windows.Media.Ocr` in packaged Windows installs, and the shipped
+  Tesseract payload in portable Windows installs. Linux ships no comparable
   system engine, and per [D8](docs/decisions.md) Scrozz reports that honestly
   rather than quietly returning an empty result. Nothing is sent off the machine
   in any case.

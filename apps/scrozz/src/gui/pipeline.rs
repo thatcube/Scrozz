@@ -43,7 +43,7 @@ use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, LogicalPoint,
     LogicalRect, Provenance, ScaleFactor, SelectionMode, SelectionOptions,
 };
-use scrozz_export::{Encoder, FrameEncoder, ImageFormat, NamingContext, SystemClipboard};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat, NamingContext};
 use scrozz_shell::{ByteSource, DragPayload, DragPreview, byte_source};
 use scrozz_stitch::{AtomicCancellation, CancelAction, Progress};
 use scrozz_store::{
@@ -137,6 +137,15 @@ pub enum Job {
     Copy(CardId),
     /// Write a card's capture to the configured folder.
     Save(CardId),
+    /// Resolve a legal suggestion before the GUI thread opens its native dialog.
+    PrepareSave(CardId),
+    /// Write a card's capture to an exact user-approved path.
+    SaveAs {
+        /// Card being saved.
+        card: CardId,
+        /// Exact path returned by the native dialog.
+        path: PathBuf,
+    },
     /// Prepare a live card for native drag-out.
     Drag {
         /// Card being dragged.
@@ -230,6 +239,13 @@ pub enum Outcome {
         detail: String,
         /// Whether successful completion retires the visible card.
         dismiss: bool,
+    },
+    /// A card is ready for the GUI thread to open its native save dialog.
+    SaveReady {
+        /// Card waiting for a destination.
+        card: CardId,
+        /// Configured folder plus a legal generated filename.
+        suggested_path: PathBuf,
     },
     /// Capture history accepted a pin-state change.
     PinUpdated {
@@ -585,6 +601,8 @@ impl Worker {
                 Job::Capture { kind, card } => self.capture(kind, card),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
+                Job::PrepareSave(card) => self.prepare_save(card),
+                Job::SaveAs { card, path } => self.save_as(card, path),
                 Job::Drag { card, geometry } => self.drag_card(card, geometry),
                 Job::Restore { capture, card } => self.restore(capture, card),
                 Job::OpenEditor(capture) => self.open_editor(capture),
@@ -645,6 +663,12 @@ impl Worker {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
+        let output = CaptureOutput::load()?;
+        let cursor = if output.include_cursor() {
+            CursorMode::Visible
+        } else {
+            CursorMode::Hidden
+        };
         let mut selection_outcome = None;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
@@ -672,23 +696,16 @@ impl Worker {
                 }
                 let outcome = self
                     .selector
-                    .select_for_capture(&capabilities.honour(&options), CursorMode::Hidden)?;
+                    .select_for_capture(&capabilities.honour(&options), cursor)?;
                 selection_outcome = Some(outcome.clone());
                 outcome.target
             }
         };
-        let output = CaptureOutput::load()?;
 
         let include_window_shadow = target.is_window();
         let request = CaptureRequest {
             target,
-            cursor: if selection_outcome.is_some() {
-                CursorMode::Hidden
-            } else if output.include_cursor() {
-                CursorMode::Visible
-            } else {
-                CursorMode::Hidden
-            },
+            cursor,
             include_window_shadow: include_window_shadow && output.include_window_shadow(),
         };
 
@@ -735,17 +752,20 @@ impl Worker {
             .encode(&capture.frame, output.format())?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
-        if output.copy_to_clipboard()
-            && let Err(error) = SystemClipboard::new().write_image_reporting(&capture.frame)
-        {
-            tracing::warn!("capture succeeded but automatic clipboard copy failed: {error}");
-        }
-
         let naming = NamingContext {
+            app: capture.source_app.name.clone(),
+            title: capture.source_app.window_title.clone(),
+            sequence: card.0,
             width: capture.frame.width(),
             height: capture.frame.height(),
             ..NamingContext::now()
         };
+        if output.copy_to_clipboard()
+            && let Err(error) =
+                output.write_clipboard_encoded(&capture.frame, &bytes, output.format(), &naming)
+        {
+            tracing::warn!("capture succeeded but automatic clipboard copy failed: {error}");
+        }
         let stem = capture
             .source_app
             .window_title
@@ -827,20 +847,17 @@ impl Worker {
     }
 
     fn copy(&mut self, card: CardId) {
-        let result = self.png_bytes(card, "copy").and_then(|bytes| {
-            #[cfg(target_os = "macos")]
-            {
-                scrozz_shell::macos::clipboard::write_png(&bytes)?;
-                Ok("copied to the clipboard as PNG and TIFF".to_owned())
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                // The round trip through PNG is deliberate — see the module
-                // docs — and also supports history-rehydrated cards.
+        let naming = self
+            .cached(card, "copy")
+            .map(|cached| cached.naming.clone());
+        let result = naming.and_then(|naming| {
+            self.png_bytes(card, "copy").and_then(|bytes| {
+                // Cards rehydrate through PNG so history-backed cards and
+                // freshly captured cards take the same clipboard path.
                 let frame = scrozz_export::decode(&bytes)?;
-                SystemClipboard::new().write_image_reporting(&frame)?;
+                CaptureOutput::load()?.write_clipboard(&frame, &naming)?;
                 Ok("copied to the clipboard".to_owned())
-            }
+            })
         });
         let succeeded = result.is_ok();
         self.answer(card, result, true);
@@ -854,6 +871,38 @@ impl Worker {
             let output = cached.output.clone();
             let naming = cached.naming.clone();
             move |bytes: &[u8]| output.export(bytes, &naming)
+        });
+        let result = export.and_then(|export| self.save_with(card, export));
+        let succeeded = result.is_ok();
+        self.answer(card, result, true);
+        if succeeded {
+            self.release(card);
+        }
+    }
+
+    fn prepare_save(&mut self, card: CardId) {
+        let result = self.cached(card, "prepare save").and_then(|cached| {
+            cached
+                .output
+                .suggested_path_for_bytes(&cached.naming, cached.bytes.as_slice())
+        });
+        match result {
+            Ok(suggested_path) => {
+                let _ = self.outcomes.send(Outcome::SaveReady {
+                    card,
+                    suggested_path,
+                });
+            }
+            Err(error) => {
+                let _ = self.outcomes.send(Outcome::Refused { card, error });
+            }
+        }
+    }
+
+    fn save_as(&mut self, card: CardId, path: PathBuf) {
+        let export = self.cached(card, "save").map(|cached| {
+            let output = cached.output.clone();
+            move |bytes: &[u8]| output.export_as(bytes, &path)
         });
         let result = export.and_then(|export| self.save_with(card, export));
         let succeeded = result.is_ok();
@@ -916,6 +965,9 @@ impl Worker {
             let thumbnail = Thumbnail::from_frame(&rendered.frame, THUMBNAIL_MAX_EDGE).ok();
             let output = CaptureOutput::load()?;
             let naming = NamingContext {
+                app: rendered.record.source_app.name.clone(),
+                title: rendered.record.source_app.window_title.clone(),
+                sequence: card.0,
                 width: rendered.frame.width(),
                 height: rendered.frame.height(),
                 ..NamingContext::now()
@@ -997,13 +1049,18 @@ impl Worker {
     }
 
     fn copy_history(&mut self, capture: CaptureId) {
-        let result = self
-            .render_stored(&capture)
-            .and_then(|rendered| Ok(scrozz_export::decode(rendered.bytes.as_slice())?))
-            .and_then(|frame| {
-                SystemClipboard::new().write_image_reporting(&frame)?;
-                Ok("copied to the clipboard".to_owned())
-            });
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let frame = scrozz_export::decode(rendered.bytes.as_slice())?;
+            CaptureOutput::load()?.write_clipboard(
+                &frame,
+                &NamingContext {
+                    width: frame.width(),
+                    height: frame.height(),
+                    ..NamingContext::now()
+                },
+            )?;
+            Ok("copied to the clipboard".to_owned())
+        });
         self.answer_history(HistoryOperation::Copy, capture, result);
     }
 
@@ -1218,6 +1275,9 @@ impl Worker {
                 bytes: Arc::new(bytes.clone()),
                 output: CaptureOutput::load()?,
                 naming: NamingContext {
+                    app: rendered.record.source_app.name.clone(),
+                    title: rendered.record.source_app.window_title.clone(),
+                    sequence: card.0,
                     width: rendered.frame.width(),
                     height: rendered.frame.height(),
                     ..NamingContext::now()
@@ -1484,11 +1544,11 @@ fn remember_region(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::sync::{
         Arc, Barrier,
         atomic::{AtomicU64, Ordering},
     };
+    use std::{cell::Cell, fs};
 
     use scrozz_store::test_support::{
         ScratchDir, richly_annotated_document, sample_document, sample_frame, scratch_dir,
@@ -1799,7 +1859,11 @@ mod tests {
         let card = worker
             .build_card(CaptureKind::Window, CardId(9), capture, test_output())
             .expect("builds a card");
-        let encoded = &worker.cache.get(&CardId(9)).expect("cached").bytes;
+        let cached = worker.cache.get(&CardId(9)).expect("cached");
+        assert_eq!(cached.naming.app.as_deref(), Some("Browser"));
+        assert_eq!(cached.naming.title.as_deref(), Some("Document"));
+        assert_eq!(cached.naming.sequence, 9);
+        let encoded = &cached.bytes;
         let decoded = scrozz_export::decode(encoded).expect("encoded PNG decodes");
 
         assert_eq!(card.source_px(), (2, 2), "window bounds must not grow");
@@ -2200,6 +2264,77 @@ mod tests {
         assert!(first.contains("saved to"));
         assert!(second.contains("already saved"));
         assert_eq!(worker.saved.get(&card), Some(&path));
+    }
+
+    #[test]
+    fn preparing_a_save_returns_a_real_filename_without_releasing_the_card() {
+        let (mut worker, receiver) = worker(None);
+        let card = CardId(18);
+        let bytes = b"\x89PNG\r\n\x1a\ncapture".to_vec();
+        worker.cache.insert(
+            card,
+            Cached {
+                bytes: Arc::new(bytes),
+                output: test_output(),
+                naming: NamingContext {
+                    width: 640,
+                    height: 480,
+                    ..NamingContext::now()
+                },
+                stem: "Prepared".to_owned(),
+                capture_id: None,
+            },
+        );
+
+        worker.prepare_save(card);
+
+        let Outcome::SaveReady {
+            card: ready,
+            suggested_path,
+        } = received(&receiver)
+        else {
+            panic!("expected save preparation");
+        };
+        assert_eq!(ready, card);
+        assert_eq!(
+            suggested_path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert!(worker.cache.contains_key(&card));
+        assert!(!worker.saved.contains_key(&card));
+    }
+
+    #[test]
+    fn saving_to_an_approved_path_writes_once_and_dismisses_on_success() {
+        let directory = scratch_dir("pipeline-save-as");
+        let (mut worker, receiver) = worker(None);
+        let card = CardId(19);
+        let bytes = b"\x89PNG\r\n\x1a\ncapture".to_vec();
+        worker.cache.insert(
+            card,
+            Cached {
+                bytes: Arc::new(bytes.clone()),
+                output: test_output(),
+                naming: NamingContext::now(),
+                stem: "Approved".to_owned(),
+                capture_id: None,
+            },
+        );
+        let path = directory.path().join("Chosen.png");
+
+        worker.save_as(card, path.clone());
+
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!worker.cache.contains_key(&card));
+        assert_eq!(worker.saved.get(&card), Some(&path));
+        assert!(matches!(
+            received(&receiver),
+            Outcome::Done {
+                card: done,
+                dismiss: true,
+                ..
+            } if done == card
+        ));
     }
 
     /// Waits briefly for the worker, so the test does not depend on scheduling.

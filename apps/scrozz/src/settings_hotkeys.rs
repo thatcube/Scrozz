@@ -11,6 +11,7 @@ use crate::{
     fault::CliResult,
     settings::{Kind, SETTINGS},
     settings_store::SettingsStore,
+    settings_support,
 };
 
 /// Checks a proposed shortcut against the OS table and every other Scrozz
@@ -25,12 +26,16 @@ pub fn check_edit(store: &SettingsStore, key: &str, value: &str) -> CliResult<Op
     if setting.kind != Kind::Accelerator {
         return Ok(None);
     }
+    if !settings_support::actionable_shortcut(key) {
+        return Ok(None);
+    }
 
     let mut hotkeys = GlobalHotkeys::detached_for_conflict_checks();
-    for existing in SETTINGS
-        .iter()
-        .filter(|existing| existing.kind == Kind::Accelerator && existing.key != key)
-    {
+    for existing in SETTINGS.iter().filter(|existing| {
+        existing.kind == Kind::Accelerator
+            && existing.key != key
+            && settings_support::actionable_shortcut(existing.key)
+    }) {
         let (accelerator, _) = store.resolve(existing);
         let parsed = Accelerator::parse(accelerator)?;
         // `register` would correctly refuse a system-owned default, but it would
@@ -129,14 +134,25 @@ mod tests {
     }
 
     #[test]
+    fn shortcuts_without_runtime_actions_do_not_create_false_conflicts() {
+        let (directory, mut store) = store("inert-shortcut");
+        store.set("hotkey.capture-region", "Ctrl+Alt+P").unwrap();
+        assert_eq!(
+            check_edit(&store, "hotkey.record-start", "Ctrl+Alt+P").unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn another_scrozz_binding_is_reported_by_the_real_manager() {
         let (directory, mut store) = store("duplicate");
-        store.set("hotkey.capture-window", "Ctrl+Alt+P").unwrap();
+        store.set("hotkey.capture-display", "Ctrl+Alt+P").unwrap();
         let conflict = check_edit(&store, "hotkey.capture-region", "Ctrl+Alt+P").unwrap();
         assert_eq!(
             conflict,
             Some(Conflict::AlreadyBound {
-                action: "hotkey.capture-window".to_owned()
+                action: "hotkey.capture-display".to_owned()
             })
         );
         let _ = fs::remove_dir_all(directory);

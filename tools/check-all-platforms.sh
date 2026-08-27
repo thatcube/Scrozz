@@ -64,7 +64,8 @@ if [[ -n "${SCROZZ_XCHECK_EXCLUDE:-}" ]]; then
   EXCLUDES=(${SCROZZ_XCHECK_EXCLUDE})
 fi
 
-LOG_DIR="target/xcheck-logs"
+TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
+LOG_DIR="$TARGET_ROOT/xcheck-logs"
 mkdir -p "$LOG_DIR"
 
 failed=0
@@ -83,9 +84,9 @@ for target in "${TARGETS[@]}"; do
 
   log="$LOG_DIR/$target.log"
 
-  # A separate target dir per platform stops artifacts thrashing each other.
-  if CARGO_TARGET_DIR="target/xcheck-$target" \
-       cargo "${args[@]}" 2>&1 | tee "$log" | tail -n 15; then
+  # Cargo already separates explicit targets beneath the selected target root.
+  # Preserve a leased CARGO_TARGET_DIR when this script runs through cargo-pool.
+  if cargo "${args[@]}" 2>&1 | tee "$log" | tail -n 15; then
     echo "  ok"
   else
     echo "  FAILED"

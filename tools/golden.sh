@@ -26,7 +26,8 @@ fi
 
 CRATE="scrozz-ui"
 CRATE_DIR="crates/scrozz-ui"
-ARTIFACT_DIR="target/golden-artifacts"
+TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
+ARTIFACT_DIR="$TARGET_ROOT/golden-artifacts"
 
 # Tell CI a thing worth reading on the run summary page, not just in the log.
 note() {
@@ -114,7 +115,7 @@ while IFS= read -r -d '' img; do
   cp "$img" "$dest"
   found=$((found + 1))
 done < <(
-  find ./crates ./target -type f \
+  find ./crates "$TARGET_ROOT" -type f \
     \( -name '*.png' -o -name '*.webp' \) \
     \( -path '*snapshots*' -o -name '*.new.*' -o -name '*.diff.*' -o -name '*.old.*' \) \
     -print0 2>/dev/null

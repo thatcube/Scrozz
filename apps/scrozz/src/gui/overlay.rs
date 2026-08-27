@@ -30,6 +30,7 @@ use scrozz_shell::NativeSurface;
 use scrozz_ui::{
     CaptureRequest, OverlayEvent, OverlayHandle,
     overlay_app::{RECENTLY_CLOSED_LIMIT, THUMBNAIL_PX},
+    stack::CardMetrics,
 };
 
 use crate::gui::{
@@ -313,6 +314,14 @@ impl CardSurface for OverlayCards {
 
     fn toggle_hidden(&mut self) {
         self.handle.toggle_hidden();
+    }
+
+    fn set_card_metrics(&mut self, metrics: CardMetrics) {
+        self.handle.set_card_metrics(metrics);
+    }
+
+    fn set_auto_close(&mut self, seconds: Option<f64>) {
+        self.handle.set_auto_close(seconds);
     }
 
     fn native_surface(&self) -> Option<NativeSurface> {

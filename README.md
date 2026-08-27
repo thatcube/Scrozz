@@ -74,7 +74,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Global hotkeys | ✅ | 🟡 | 🟠 | Works where the desktop allows it. Wayland cannot grab keys, so Scrozz refuses and hands you the exact compositor config line to bind the CLI instead ([D11](docs/decisions.md)) |
 | Capture stack overlay | ✅ | ⬜ | ⬜ | The native overlay window is retrofitted on macOS only; elsewhere it reports unsupported rather than silently doing nothing. GNOME/Wayland cannot position overlays at all — the adaptation is [D31](docs/decisions.md) |
 | Drag-out to another app | 🟡 | ⬜ | ⬜ | The hero interaction ([D12](docs/decisions.md)): promised-file drag exists on macOS; other backends are planned, not written |
-| Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
+| Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device engines: Vision · packaged `Windows.Media.Ocr` / portable Tesseract · Linux ships none |
 | Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |

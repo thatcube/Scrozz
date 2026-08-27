@@ -13,7 +13,7 @@ use std::{
 
 use eframe::egui::{self, ViewportBuilder, ViewportClass, ViewportId};
 use scrozz_core::Error as CoreError;
-use scrozz_shell::{Accelerator, Conflict, FolderPicker, FolderPickerRequest};
+use scrozz_shell::{Accelerator, Conflict, FolderPicker, FolderPickerRequest, RegistrationStatus};
 use scrozz_ui::{
     form::{Row, RowChange, RowId, RowKind, SettingsForm, ShortcutChord, ShortcutStatus},
     onboarding_view::{
@@ -27,9 +27,10 @@ use crate::{
     fault::{CliError, CliResult},
     gui::app::App,
     onboarding,
-    settings::{self, Kind, SETTINGS, Section, Setting},
+    settings::{self, Kind, SETTINGS, Section, Setting, ValueSource},
     settings_hotkeys, settings_runtime,
     settings_store::SettingsStore,
+    settings_support::{SettingsSupport, Support},
 };
 
 const EXTERNAL_CHANGE_ERROR: RowId = "window.external-change";
@@ -60,15 +61,20 @@ struct State {
 }
 
 impl State {
-    fn new(ctx: &egui::Context, store: &SettingsStore) -> CliResult<Self> {
+    fn new(
+        ctx: &egui::Context,
+        store: &SettingsStore,
+        support: SettingsSupport,
+        drag_out_available: bool,
+    ) -> CliResult<Self> {
         let flow = onboarding::Flow::from_store(store)?;
         let onboarding_required = flow.is_visible();
-        let mut form = form_from_store(store)?;
+        let mut form = form_from_store(store, support)?;
         validate_form(&mut form);
         Ok(Self {
             form,
             onboarding: OnboardingState::start(),
-            onboarding_content: onboarding_content(store)?,
+            onboarding_content: onboarding_content(store, support, drag_out_available)?,
             page: if onboarding_required {
                 Page::Onboarding
             } else {
@@ -89,19 +95,36 @@ pub struct SettingsWindow {
     picker: Box<dyn FolderPicker>,
     state: Arc<Mutex<State>>,
     seen_settings_revision: u64,
+    support: SettingsSupport,
+    drag_out_available: bool,
 }
 
 impl SettingsWindow {
     /// Loads the settings view model and native folder picker.
-    pub fn new(ctx: &egui::Context, seen_settings_revision: u64) -> CliResult<Self> {
-        let store = SettingsStore::load()?;
+    pub fn new(ctx: &egui::Context, app: &App, drag_out_available: bool) -> CliResult<Self> {
+        let mut store = SettingsStore::load()?;
+        let autostart = settings_runtime::reconcile_autostart(&mut store);
         let picker = Box::new(scrozz_shell::picker::native_folder_picker()?);
-        let state = Arc::new(Mutex::new(State::new(ctx, &store)?));
+        let support = SettingsSupport::from_actions(|action| app.action_available(action));
+        let mut initial = State::new(ctx, &store, support, drag_out_available)?;
+        match autostart {
+            Ok(RegistrationStatus::Drifted) => initial.form.set_notice(Some(
+                "Launch-at-login registration changed outside Scrozz. Toggle and save it to repair the registration."
+                    .to_owned(),
+            )),
+            Ok(_) => {}
+            Err(error) => initial.form.set_notice(Some(format!(
+                "Couldn't inspect launch-at-login registration: {error}"
+            ))),
+        }
+        let state = Arc::new(Mutex::new(initial));
         Ok(Self {
             store,
             picker,
             state,
-            seen_settings_revision,
+            seen_settings_revision: app.settings_revision(),
+            support,
+            drag_out_available,
         })
     }
 
@@ -179,8 +202,8 @@ impl SettingsWindow {
             return !already_reported;
         }
         match SettingsStore::load().and_then(|store| {
-            let form = form_from_store(&store)?;
-            let content = onboarding_content(&store)?;
+            let form = form_from_store(&store, self.support)?;
+            let content = onboarding_content(&store, self.support, self.drag_out_available)?;
             Ok((store, form, content))
         }) {
             Ok((store, mut form, content)) => {
@@ -250,6 +273,8 @@ impl SettingsWindow {
             }
             SettingsAction::Save => self.save(app),
             SettingsAction::Reset => self.reset_form(app.settings_revision()),
+            SettingsAction::ResetRow { row_id } => self.reset_persisted(Some(row_id), app),
+            SettingsAction::ResetAll => self.reset_persisted(None, app),
             SettingsAction::RerunOnboarding => {
                 let mut state = self
                     .state
@@ -271,7 +296,7 @@ impl SettingsWindow {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.form.row(row_id).and_then(|row| match &row.kind {
-                RowKind::Path { value, .. } => Some(PathBuf::from(value)),
+                RowKind::Path { value, .. } => picker_starting_directory(value),
                 _ => None,
             })
         };
@@ -314,6 +339,9 @@ impl SettingsWindow {
             }
             edits_from_form(&state.form)
         };
+        if edits.is_empty() {
+            return;
+        }
 
         match settings_runtime::apply(&mut self.store, &edits) {
             Ok(()) => {
@@ -323,7 +351,7 @@ impl SettingsWindow {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.form.commit();
-                match onboarding_content(&self.store) {
+                match onboarding_content(&self.store, self.support, self.drag_out_available) {
                     Ok(content) => state.onboarding_content = content,
                     Err(error) => state.form.set_notice(Some(format!(
                         "Settings saved, but onboarding couldn't reload: {error}"
@@ -368,6 +396,70 @@ impl SettingsWindow {
         validate_form(&mut state.form);
     }
 
+    fn reset_persisted(&mut self, row_id: Option<RowId>, app: &mut App) {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .form
+            .is_dirty()
+        {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .form
+                .set_notice(Some(
+                    "Save or discard unsaved changes before resetting persisted settings."
+                        .to_owned(),
+                ));
+            return;
+        }
+
+        let result = match row_id {
+            Some(key) => settings_runtime::reset(&mut self.store, key).map(|_| ()),
+            None => settings_runtime::reset_all(&mut self.store).map(|_| ()),
+        };
+        if let Err(error) = result {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .form
+                .set_notice(Some(format!("Couldn't reset settings: {error}")));
+            return;
+        }
+
+        let reload = app.reload_settings();
+        match form_from_store(&self.store, self.support) {
+            Ok(mut form) => {
+                validate_form(&mut form);
+                if let Err(error) = reload {
+                    form.set_notice(Some(format!(
+                        "Settings reset, but the running app couldn't reload them: {error}"
+                    )));
+                }
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.form = form;
+                if let Ok(content) =
+                    onboarding_content(&self.store, self.support, self.drag_out_available)
+                {
+                    state.onboarding_content = content;
+                }
+                self.seen_settings_revision = app.settings_revision();
+            }
+            Err(error) => self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .form
+                .set_notice(Some(format!(
+                    "Settings reset, but the form couldn't reload: {error}"
+                ))),
+        }
+    }
+
     fn apply_onboarding_action(&mut self, action: OnboardingAction) {
         let mut state = self
             .state
@@ -409,6 +501,29 @@ impl SettingsWindow {
             state.onboarding_required = false;
         }
         state.open = false;
+    }
+}
+
+fn expand_picker_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+        .and_then(|relative| dirs::home_dir().map(|home| home.join(relative)))
+        .unwrap_or_else(|| PathBuf::from(value))
+}
+
+fn picker_starting_directory(value: &str) -> Option<PathBuf> {
+    let mut candidate = expand_picker_path(value);
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !candidate.pop() {
+            return None;
+        }
     }
 }
 
@@ -463,7 +578,7 @@ enum Rendered {
     Onboarding(onboarding_view::OnboardingResponse),
 }
 
-fn form_from_store(store: &SettingsStore) -> CliResult<SettingsForm> {
+fn form_from_store(store: &SettingsStore, support: SettingsSupport) -> CliResult<SettingsForm> {
     let mut rows = Vec::with_capacity(SETTINGS.len() + 10);
     let mut section = None;
     for setting in SETTINGS
@@ -477,8 +592,12 @@ fn form_from_store(store: &SettingsStore) -> CliResult<SettingsForm> {
                 setting.section.title(),
             ));
         }
-        let (value, _) = store.resolve(setting);
-        rows.push(row_from_setting(setting, value)?);
+        let (value, source) = store.resolve(setting);
+        let mut row = row_from_setting(setting, value)?.resettable(source == ValueSource::User);
+        if let Support::Disabled(reason) = support.setting(setting.key) {
+            row = row.disabled(reason);
+        }
+        rows.push(row);
     }
     Ok(SettingsForm::new(rows))
 }
@@ -574,12 +693,23 @@ fn edits_from_form(form: &SettingsForm) -> Vec<(String, String)> {
 
 fn validate_form(form: &mut SettingsForm) {
     form.set_external_error("window.shortcut-validation", None);
+    form.set_external_error("window.ocr-validation", None);
     let mut shortcuts = Vec::new();
     for setting in SETTINGS
         .iter()
         .filter(|setting| setting.section != Section::Onboarding)
     {
-        let Some(value) = form.row(setting.key).and_then(row_value) else {
+        let Some((enabled, value)) = form
+            .row(setting.key)
+            .map(|row| (row.enabled, row_value(row)))
+        else {
+            continue;
+        };
+        if !enabled {
+            form.set_external_error(setting.key, None);
+            continue;
+        }
+        let Some(value) = value else {
             continue;
         };
         match setting.kind {
@@ -605,6 +735,25 @@ fn validate_form(form: &mut SettingsForm) {
                     .map(|error| error.to_string()),
             ),
         }
+    }
+
+    let ocr_values = (
+        form.row(scrozz_ocr::LANGUAGES_KEY).and_then(row_value),
+        form.row(scrozz_ocr::AUTO_DETECT_LANGUAGE_KEY)
+            .and_then(row_value),
+        form.row(scrozz_ocr::KEEP_LINE_BREAKS_KEY)
+            .and_then(row_value),
+        form.row(scrozz_ocr::DETECT_LINKS_KEY).and_then(row_value),
+    );
+    if let (Some(languages), Some(automatic), Some(line_breaks), Some(links)) = ocr_values
+        && let Err(error) = scrozz_ocr::RuntimeConfig::from_settings(
+            &languages,
+            automatic == "true",
+            line_breaks == "true",
+            links == "true",
+        )
+    {
+        form.set_external_error("window.ocr-validation", Some(error.to_string()));
     }
 
     match settings_hotkeys::check_all(&shortcuts) {
@@ -672,13 +821,25 @@ fn chord_value(chord: &ShortcutChord) -> String {
     parts.join("+")
 }
 
-fn onboarding_content(store: &SettingsStore) -> CliResult<OnboardingContent> {
+fn onboarding_content(
+    store: &SettingsStore,
+    support: SettingsSupport,
+    drag_out_available: bool,
+) -> CliResult<OnboardingContent> {
     let shortcut = store.get("hotkey.capture-region")?.1;
+    let capture_hotkey_available =
+        matches!(support.setting("hotkey.capture-region"), Support::Enabled);
     Ok(OnboardingContent {
         capture_shortcut: shortcut_chord(shortcut)
             .map_or_else(|| shortcut.to_owned(), |chord| chord.glyphs()),
         capture_folder: store.get("capture.folder")?.1.to_owned(),
-        compositor_config: onboarding::compositor_config(store)?,
+        drag_out_available,
+        capture_hotkey_available,
+        compositor_config: if capture_hotkey_available {
+            onboarding::compositor_config(store)?
+        } else {
+            None
+        },
         error: None,
     })
 }
@@ -704,10 +865,14 @@ mod tests {
         (directory, store)
     }
 
+    fn all_supported() -> SettingsSupport {
+        SettingsSupport::from_actions(|_| true)
+    }
+
     #[test]
     fn production_schema_round_trips_through_the_ui_form() {
         let (directory, store) = store("round-trip");
-        let form = form_from_store(&store).unwrap();
+        let form = form_from_store(&store, all_supported()).unwrap();
         for setting in SETTINGS
             .iter()
             .filter(|setting| setting.section != Section::Onboarding)
@@ -729,15 +894,44 @@ mod tests {
     }
 
     #[test]
+    fn settings_without_runtime_consumers_are_truthfully_disabled() {
+        let (directory, store) = store("support");
+        let form = form_from_store(&store, all_supported()).unwrap();
+
+        assert!(form.row("capture.folder").unwrap().enabled);
+        let recording = form.row("record.fps").unwrap();
+        assert!(!recording.enabled);
+        assert!(
+            recording
+                .disabled_reason
+                .is_some_and(|reason| reason.contains("recording runtime"))
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn persisted_overrides_get_a_reset_affordance_even_when_disabled() {
+        let (directory, mut store) = store("resettable");
+        store.set("record.fps", "60").unwrap();
+
+        let form = form_from_store(&store, all_supported()).unwrap();
+
+        let row = form.row("record.fps").unwrap();
+        assert!(!row.enabled);
+        assert!(row.resettable);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn unsaved_shortcut_duplicates_block_both_rows() {
         let (directory, store) = store("shortcut-conflict");
-        let mut form = form_from_store(&store).unwrap();
+        let mut form = form_from_store(&store, all_supported()).unwrap();
         let chord = shortcut_chord("Cmd+Alt+P").unwrap();
         form.apply(
             "hotkey.capture-region",
             RowChange::ShortcutRecorded(chord.clone()),
         );
-        form.apply("hotkey.capture-window", RowChange::ShortcutRecorded(chord));
+        form.apply("hotkey.capture-display", RowChange::ShortcutRecorded(chord));
         validate_form(&mut form);
         assert!(matches!(
             form.row("hotkey.capture-region").unwrap().kind,
@@ -747,12 +941,30 @@ mod tests {
             }
         ));
         assert!(matches!(
-            form.row("hotkey.capture-window").unwrap().kind,
+            form.row("hotkey.capture-display").unwrap().kind,
             RowKind::Shortcut {
                 status: ShortcutStatus::Conflict { .. },
                 ..
             }
         ));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn contradictory_ocr_edits_are_blocked_before_persistence() {
+        let (directory, store) = store("ocr-cross-validation");
+        let mut form = form_from_store(&store, all_supported()).unwrap();
+        form.apply("ocr.languages", RowChange::Text("en-US".to_owned()));
+        form.apply("ocr.auto-detect-language", RowChange::Toggle(true));
+
+        validate_form(&mut form);
+
+        assert!(form.has_errors());
+        assert!(
+            form.errors()
+                .iter()
+                .any(|(_, message)| message.contains("ocr.auto-detect-language"))
+        );
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -778,11 +990,34 @@ mod tests {
     }
 
     #[test]
+    fn picker_paths_expand_the_home_shorthand() {
+        assert_eq!(
+            expand_picker_path("/tmp/scrozz"),
+            PathBuf::from("/tmp/scrozz")
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_picker_path("~"), home);
+            assert_eq!(
+                expand_picker_path("~/Pictures/Scrozz"),
+                home.join("Pictures/Scrozz")
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!("scrozz-picker-start-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            picker_starting_directory(&root.join("missing/child").to_string_lossy()),
+            Some(root.clone())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn onboarding_uses_the_real_folder_and_shortcut() {
         let (directory, mut store) = store("onboarding-values");
         store.set("capture.folder", "/tmp/captures").unwrap();
         store.set("hotkey.capture-region", "Cmd+Alt+P").unwrap();
-        let content = onboarding_content(&store).unwrap();
+        let content = onboarding_content(&store, all_supported(), true).unwrap();
         assert_eq!(content.capture_folder, "/tmp/captures");
         assert!(content.capture_shortcut.ends_with('P'));
         let _ = fs::remove_dir_all(directory);

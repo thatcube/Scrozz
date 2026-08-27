@@ -353,6 +353,10 @@ pub struct Row {
     /// never hidden — so a setting that is temporarily unavailable does not
     /// look like it was removed.
     pub enabled: bool,
+    /// Why a visible control cannot currently be changed.
+    pub disabled_reason: Option<&'static str>,
+    /// Whether the app can remove a persisted override for this row.
+    pub resettable: bool,
 }
 
 impl Row {
@@ -365,6 +369,8 @@ impl Row {
             help: None,
             kind: RowKind::Section,
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -377,6 +383,8 @@ impl Row {
             help: Some(help),
             kind: RowKind::Section,
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -394,6 +402,8 @@ impl Row {
             help,
             kind: RowKind::Toggle { value },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -415,6 +425,8 @@ impl Row {
                 placeholder,
             },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -443,6 +455,8 @@ impl Row {
                 options,
             },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -471,6 +485,8 @@ impl Row {
                 unit,
             },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -494,6 +510,8 @@ impl Row {
                 browse_label,
             },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -514,6 +532,8 @@ impl Row {
                 status: ShortcutStatus::Idle,
             },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -533,6 +553,8 @@ impl Row {
             help,
             kind: RowKind::Template { value, validation },
             enabled: true,
+            disabled_reason: None,
+            resettable: false,
         }
     }
 
@@ -540,6 +562,24 @@ impl Row {
     #[must_use]
     pub const fn enabled(mut self, yes: bool) -> Self {
         self.enabled = yes;
+        if yes {
+            self.disabled_reason = None;
+        }
+        self
+    }
+
+    /// This row disabled with a visible explanation.
+    #[must_use]
+    pub const fn disabled(mut self, reason: &'static str) -> Self {
+        self.enabled = false;
+        self.disabled_reason = Some(reason);
+        self
+    }
+
+    /// This row with a persisted-override reset affordance.
+    #[must_use]
+    pub const fn resettable(mut self, yes: bool) -> Self {
+        self.resettable = yes;
         self
     }
 }

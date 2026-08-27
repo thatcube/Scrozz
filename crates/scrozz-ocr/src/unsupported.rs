@@ -57,3 +57,15 @@ pub fn recognize(_frame: &Frame, _options: &Options) -> Result<Vec<TextBlock>> {
             .to_string(),
     })
 }
+
+/// Reports that this build has no OCR language inventory.
+///
+/// # Errors
+///
+/// Always returns [`Error::Unsupported`].
+pub fn available_languages() -> Result<Vec<String>> {
+    Err(Error::Unsupported {
+        what: "listing OCR languages".to_string(),
+        why: "this platform has no configured OCR engine".to_string(),
+    })
+}

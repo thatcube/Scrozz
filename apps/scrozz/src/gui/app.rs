@@ -34,10 +34,14 @@ use scrozz_core::Error as CoreError;
 use scrozz_annotate::Document;
 use scrozz_shell::{
     Accelerator, Capability, DragOutcome, DragPayload, GlobalHotkeys, Hotkey, HotkeyManager,
-    KeyState, Permissions, Session, SystemPermissions, Tray, TrayAction,
+    KeyState, Permissions, SaveFilePicker, SaveFileRequest, Session, SystemPermissions, Tray,
+    TrayAction, native_save_file_picker,
 };
 use scrozz_store::{CaptureId, RetentionPolicy, Timestamp};
-use scrozz_ui::history::{HistoryAction, HistoryViewModel};
+use scrozz_ui::{
+    history::{HistoryAction, HistoryViewModel},
+    stack::CardMetrics,
+};
 
 use crate::{
     cli::{Cli, Command, SettingsCommand},
@@ -67,9 +71,6 @@ pub const DEFAULT_BINDINGS: &[(&str, Action)] = &[
 ];
 
 /// Settings keys that currently have a live GUI action.
-///
-/// Recording and all-display shortcuts remain in the schema, but are not
-/// registered until those actions can complete end to end.
 pub const SETTING_BINDINGS: &[(&str, Action)] = &[
     (
         "hotkey.capture-region",
@@ -82,6 +83,14 @@ pub const SETTING_BINDINGS: &[(&str, Action)] = &[
     (
         "hotkey.capture-display",
         Action::Capture(CaptureKind::Fullscreen),
+    ),
+    (
+        "hotkey.capture-all-displays",
+        Action::Capture(CaptureKind::AllDisplays),
+    ),
+    (
+        "hotkey.capture-scrolling",
+        Action::Capture(CaptureKind::Scrolling),
     ),
 ];
 
@@ -172,6 +181,8 @@ pub struct Config {
     pub retention_policy: RetentionPolicy,
     /// Capture-stack size, position, timeout, and display behavior.
     pub overlay: OverlayConfig,
+    /// Whether GUI captures open a native save dialog after presentation.
+    pub ask_for_filename: bool,
 }
 
 impl Default for Config {
@@ -187,6 +198,7 @@ impl Default for Config {
             capture_on_start: None,
             retention_policy: RetentionPolicy::default(),
             overlay: OverlayConfig::default(),
+            ask_for_filename: false,
         }
     }
 }
@@ -263,6 +275,34 @@ impl Config {
                     "history.max-age-days is not an unsigned integer: {error}"
                 ))
             })?;
+        let card_size = store
+            .get("quick-access.size")?
+            .1
+            .parse::<u32>()
+            .map_err(|error| {
+                CliError::usage(format!(
+                    "quick-access.size is not an unsigned integer: {error}"
+                ))
+            })?;
+        let auto_close_seconds = store
+            .get("quick-access.auto-close-seconds")?
+            .1
+            .parse::<u64>()
+            .map_err(|error| {
+                CliError::usage(format!(
+                    "quick-access.auto-close-seconds is not an unsigned integer: {error}"
+                ))
+            })?;
+        let overlay = OverlayConfig {
+            card_scale: settings_card_scale(card_size),
+            auto_close: (auto_close_seconds > 0).then(|| Duration::from_secs(auto_close_seconds)),
+            display: if store.boolean("quick-access.active-display")? {
+                OverlayDisplay::Active
+            } else {
+                OverlayDisplay::Primary
+            },
+            ..OverlayConfig::default()
+        };
 
         Ok(Self {
             bindings: SETTING_BINDINGS
@@ -275,6 +315,8 @@ impl Config {
                 .collect::<CliResult<_>>()?,
             tray: store.get("system.tray-icon")?.1 == "true",
             retention_policy: RetentionPolicy::from_limits(max_image_bytes, max_age_days)?,
+            overlay,
+            ask_for_filename: store.boolean("capture.ask-for-filename")?,
             ..Self::default()
         })
     }
@@ -309,8 +351,42 @@ impl Config {
                 max_image_age: scrozz_store::RetentionWindow::Forever,
             },
             overlay: OverlayConfig::default(),
+            ask_for_filename: false,
         }
     }
+}
+
+fn registered_bindings_match(
+    hotkeys: &GlobalHotkeys,
+    desired: &[(String, Action)],
+    session: &Session,
+    is_available: impl Fn(Action) -> bool,
+) -> bool {
+    let mut actual: Vec<_> = hotkeys
+        .bindings()
+        .filter(|(_, action)| *action != OVERLAY_ESCAPE_ACTION)
+        .map(|(accelerator, action)| (accelerator.to_string(), action.to_owned()))
+        .collect();
+    actual.sort_unstable();
+
+    if !session.supports_global_hotkeys() {
+        return actual.is_empty();
+    }
+
+    let mut expected = Vec::new();
+    for (accelerator, action) in desired.iter().filter(|(_, action)| is_available(*action)) {
+        let Ok(accelerator) = Accelerator::parse(accelerator) else {
+            return false;
+        };
+        expected.push((accelerator.to_string(), action.id().to_owned()));
+    }
+    expected.sort_unstable();
+
+    (expected.is_empty() || hotkeys.is_bound_to_os()) && actual == expected
+}
+
+fn settings_card_scale(requested_width: u32) -> f32 {
+    (requested_width as f32 / CardMetrics::default().width).clamp(0.5, 2.0)
 }
 
 /// Parses `accel=action-id` pairs separated by commas or semicolons.
@@ -345,6 +421,7 @@ pub struct App {
     server: Option<Server>,
     forwarder: Option<Forwarder>,
     selector: Arc<dyn CaptureSelector>,
+    save_file_picker: Box<dyn SaveFilePicker>,
     started: Instant,
     captures: u64,
     notes: Vec<String>,
@@ -383,6 +460,20 @@ impl App {
         config: Config,
         surface: Box<dyn CardSurface>,
         selector: Arc<dyn CaptureSelector>,
+    ) -> CliResult<Self> {
+        Self::new_with_save_file_picker(
+            config,
+            surface,
+            selector,
+            Box::new(native_save_file_picker()),
+        )
+    }
+
+    fn new_with_save_file_picker(
+        config: Config,
+        surface: Box<dyn CardSurface>,
+        selector: Arc<dyn CaptureSelector>,
+        save_file_picker: Box<dyn SaveFilePicker>,
     ) -> CliResult<Self> {
         let pipeline =
             Pipeline::start_with_retention(Arc::clone(&selector), config.retention_policy.clone())?;
@@ -442,31 +533,33 @@ impl App {
             ));
         }
 
-        let mut hotkeys = if available_bindings.is_empty() {
+        let (mut hotkeys, hotkeys_operational) = if available_bindings.is_empty() {
             // Nothing to bind means nothing should touch the keyboard. The
             // detached backend does the bookkeeping without an OS registration.
-            GlobalHotkeys::detached()
+            (GlobalHotkeys::detached(), true)
         } else {
             match GlobalHotkeys::new() {
-                Ok(manager) => manager,
+                Ok(manager) => (manager, true),
                 Err(err) => {
                     notes.push(format!("hotkeys unavailable: {err}"));
-                    GlobalHotkeys::detached()
+                    (GlobalHotkeys::detached(), false)
                 }
             }
         };
         hotkeys.set_command("scrozz");
 
-        for (accelerator, action) in available_bindings {
-            let hotkey = Hotkey {
-                accelerator: accelerator.clone(),
-            };
-            match hotkeys.register(&hotkey, action.id()) {
-                Ok(()) => notes.push(format!("{accelerator} → {}", action.id())),
-                // Wayland answers `Unsupported` carrying the compositor config
-                // line to paste, which is the actual remedy (D11). Losing it in
-                // a generic "hotkey failed" would be the wrong trade.
-                Err(err) => notes.push(format!("{accelerator} not bound: {err}")),
+        if hotkeys_operational {
+            for (accelerator, action) in available_bindings {
+                let hotkey = Hotkey {
+                    accelerator: accelerator.clone(),
+                };
+                match hotkeys.register(&hotkey, action.id()) {
+                    Ok(()) => notes.push(format!("{accelerator} → {}", action.id())),
+                    // Wayland answers `Unsupported` carrying the compositor config
+                    // line to paste, which is the actual remedy (D11). Losing it in
+                    // a generic "hotkey failed" would be the wrong trade.
+                    Err(err) => notes.push(format!("{accelerator} not bound: {err}")),
+                }
             }
         }
 
@@ -479,6 +572,7 @@ impl App {
             server,
             forwarder,
             selector,
+            save_file_picker,
             started: Instant::now(),
             captures: 0,
             notes,
@@ -661,6 +755,9 @@ impl App {
                     } else {
                         self.ensure_escape_binding();
                         self.note(summary);
+                        if self.config.ask_for_filename {
+                            self.pipeline.post(Job::PrepareSave(card_id));
+                        }
                     }
                     if history_changed {
                         self.with_history(|history| history.refresh_from_start(Timestamp::now()));
@@ -695,6 +792,24 @@ impl App {
                     }
                     self.note(format!("{card} {detail}"));
                 }
+                Outcome::SaveReady {
+                    card,
+                    suggested_path,
+                } => match select_save_path(self.save_file_picker.as_ref(), suggested_path) {
+                    Ok(Some(path)) => {
+                        if !self.pipeline.post(Job::SaveAs { card, path }) {
+                            self.note(format!(
+                                "{card} could not save because the capture worker stopped"
+                            ));
+                        }
+                    }
+                    Ok(None) => {
+                        self.note(format!("{card} save cancelled"));
+                    }
+                    Err(error) => {
+                        self.note(format!("{card} save dialog failed: {error}"));
+                    }
+                },
                 Outcome::PinUpdated {
                     card,
                     pinned,
@@ -703,6 +818,7 @@ impl App {
                     self.surface.set_pinned(card, pinned);
                     self.note(format!("{card} {detail}"));
                 }
+
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
@@ -795,7 +911,11 @@ impl App {
                     self.pipeline.post(Job::Copy(id));
                 }
                 CardEvent::Save(id) => {
-                    self.pipeline.post(Job::Save(id));
+                    if self.config.ask_for_filename {
+                        self.pipeline.post(Job::PrepareSave(id));
+                    } else {
+                        self.pipeline.post(Job::Save(id));
+                    }
                 }
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
@@ -1102,7 +1222,17 @@ impl App {
         self.settings_revision
     }
 
-    /// Reloads settings that affect live tray and hotkey integration.
+    /// Whether a GUI action can complete with this app's measured capabilities.
+    #[must_use]
+    pub(crate) fn action_available(&self, action: Action) -> bool {
+        action.is_available(
+            self.selector.capabilities(),
+            &Session::detect(),
+            crate::platform::capture_backend_is_ready(),
+        )
+    }
+
+    /// Reloads settings that affect live runtime integration.
     ///
     /// Environment overrides remain authoritative for the lifetime of this
     /// process. Registration failures are reported in the app notes, matching
@@ -1117,8 +1247,33 @@ impl App {
             action.is_available(selection_capabilities, &session, capture_backend_ready)
         };
 
-        if std::env::var_os(HOTKEYS_ENV).is_none() && desired.bindings != self.config.bindings {
-            self.hotkeys.unregister_all();
+        if std::env::var_os(HOTKEYS_ENV).is_none()
+            && (desired.bindings != self.config.bindings
+                || !registered_bindings_match(
+                    &self.hotkeys,
+                    &desired.bindings,
+                    &session,
+                    action_available,
+                ))
+        {
+            self.unregister_hotkeys_for_reload();
+            if session.supports_global_hotkeys()
+                && desired
+                    .bindings
+                    .iter()
+                    .any(|(_, action)| action_available(*action))
+                && !self.hotkeys.is_bound_to_os()
+            {
+                match GlobalHotkeys::new() {
+                    Ok(mut manager) => {
+                        manager.set_command("scrozz");
+                        self.hotkeys = manager;
+                    }
+                    Err(error) => self
+                        .notes
+                        .push(format!("hotkeys still unavailable: {error}")),
+                }
+            }
             for (accelerator, action) in &desired.bindings {
                 if !action_available(*action) {
                     self.notes.push(format!(
@@ -1130,18 +1285,23 @@ impl App {
                 let hotkey = Hotkey {
                     accelerator: accelerator.clone(),
                 };
-                match self.hotkeys.register(&hotkey, action.id()) {
-                    Ok(()) => self.notes.push(format!("{accelerator} → {}", action.id())),
-                    Err(error) => self
-                        .notes
-                        .push(format!("{accelerator} not rebound: {error}")),
+                if session.supports_global_hotkeys() && !self.hotkeys.is_bound_to_os() {
+                    self.notes.push(format!(
+                        "{accelerator} not rebound: the system hotkey manager is unavailable"
+                    ));
+                } else if let Err(error) = self.hotkeys.register(&hotkey, action.id()) {
+                    self.notes
+                        .push(format!("{accelerator} not rebound: {error}"));
+                } else {
+                    self.notes.push(format!("{accelerator} → {}", action.id()));
                 }
             }
             self.config.bindings = desired.bindings;
+            self.reconcile_escape_binding();
         }
 
-        if std::env::var_os(TRAY_ENV).is_none() && desired.tray != self.config.tray {
-            if desired.tray {
+        if std::env::var_os(TRAY_ENV).is_none() {
+            if desired.tray && self.tray.is_none() {
                 match Tray::with_tooltip_and_availability("Scrozz", |entry| {
                     action_available(Action::from_tray(entry))
                 }) {
@@ -1153,12 +1313,37 @@ impl App {
                         .notes
                         .push(format!("menu-bar item could not be shown: {error}")),
                 }
-            } else if let Some(tray) = self.tray.take() {
+            } else if !desired.tray
+                && let Some(tray) = self.tray.take()
+            {
                 tray.close();
                 self.notes.push("menu-bar item hidden".to_owned());
             }
             self.config.tray = desired.tray;
         }
+
+        if std::env::var_os(CARD_SCALE_ENV).is_none()
+            && desired.overlay.card_scale != self.config.overlay.card_scale
+        {
+            let mut metrics = CardMetrics::default().scaled(desired.overlay.card_scale);
+            metrics.margin = self.config.overlay.stack_margin;
+            self.surface.set_card_metrics(metrics);
+            self.config.overlay.card_scale = desired.overlay.card_scale;
+        }
+        if std::env::var_os(AUTO_CLOSE_ENV).is_none()
+            && desired.overlay.auto_close != self.config.overlay.auto_close
+        {
+            self.surface
+                .set_auto_close(desired.overlay.auto_close.map(|span| span.as_secs_f64()));
+            self.config.overlay.auto_close = desired.overlay.auto_close;
+        }
+        if std::env::var_os(DISPLAY_ENV).is_none()
+            && desired.overlay.display != self.config.overlay.display
+        {
+            self.notes
+                .push("quick-access display policy will apply after restart".to_owned());
+        }
+        self.config.ask_for_filename = desired.ask_for_filename;
 
         if !self.set_retention_policy(desired.retention_policy) {
             return Err(CoreError::Platform(
@@ -1169,6 +1354,12 @@ impl App {
 
         self.settings_revision = self.settings_revision.saturating_add(1);
         Ok(())
+    }
+
+    fn unregister_hotkeys_for_reload(&mut self) {
+        self.hotkeys.unregister_all();
+        self.escape_registered = false;
+        self.escape_retry_at = None;
     }
 
     /// What happened, for the report the CLI prints when the app exits.
@@ -1231,6 +1422,16 @@ impl App {
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
+}
+
+fn select_save_path(
+    picker: &dyn SaveFilePicker,
+    suggested_path: std::path::PathBuf,
+) -> scrozz_core::Result<Option<std::path::PathBuf>> {
+    let request = SaveFileRequest::new("Save capture", suggested_path)?;
+    picker
+        .pick_file(&request)
+        .map(|selection| selection.map(|path| request.normalize_selection(path)))
 }
 
 fn describe_scroll_progress(progress: &scrozz_stitch::Progress) -> String {
@@ -1316,6 +1517,7 @@ mod tests {
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
+    use scrozz_shell::StubSaveFilePicker;
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
@@ -1350,6 +1552,52 @@ mod tests {
     }
 
     #[test]
+    fn detached_bookkeeping_never_claims_desktop_hotkeys_are_registered() {
+        let mut hotkeys =
+            GlobalHotkeys::detached_in(Session::from_env(None, None, None, Some(":0")));
+        hotkeys
+            .register(
+                &Hotkey {
+                    accelerator: "Ctrl+Alt+P".to_owned(),
+                },
+                "capture.fullscreen",
+            )
+            .unwrap();
+        let desired = vec![(
+            "Ctrl+Alt+P".to_owned(),
+            Action::Capture(CaptureKind::Fullscreen),
+        )];
+
+        assert!(!registered_bindings_match(
+            &hotkeys,
+            &desired,
+            &Session::from_env(None, None, None, Some(":0")),
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn transient_escape_binding_does_not_make_persisted_hotkeys_stale() {
+        let mut hotkeys =
+            GlobalHotkeys::detached_in(Session::from_env(None, None, None, Some(":0")));
+        hotkeys
+            .register(
+                &Hotkey {
+                    accelerator: OVERLAY_ESCAPE_ACCELERATOR.to_owned(),
+                },
+                OVERLAY_ESCAPE_ACTION,
+            )
+            .unwrap();
+
+        assert!(registered_bindings_match(
+            &hotkeys,
+            &[],
+            &Session::from_env(None, None, None, Some(":0")),
+            |_| true,
+        ));
+    }
+
+    #[test]
     fn persisted_shortcuts_and_tray_visibility_drive_gui_configuration() {
         let (directory, mut store) = settings_store("persisted");
         store.set("hotkey.capture-region", "Ctrl+Alt+P").unwrap();
@@ -1360,6 +1608,56 @@ mod tests {
         assert_eq!(config.bindings[0].0, "Ctrl+Alt+P");
         assert_eq!(config.bindings[0].1, Action::Capture(CaptureKind::Region));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn persisted_quick_access_values_drive_the_startup_overlay() {
+        let (directory, mut store) = settings_store("overlay");
+        store.set("quick-access.size", "288").unwrap();
+        store.set("quick-access.auto-close-seconds", "0").unwrap();
+        store.set("quick-access.active-display", "false").unwrap();
+
+        let config = Config::from_settings(&store).unwrap();
+
+        assert_eq!(config.overlay.card_scale, 288.0 / 232.0);
+        assert_eq!(config.overlay.auto_close, None);
+        assert_eq!(config.overlay.display, OverlayDisplay::Primary);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn persisted_card_width_respects_the_stack_safety_range() {
+        assert_eq!(settings_card_scale(96), 0.5);
+        assert_eq!(settings_card_scale(192), 192.0 / 232.0);
+        assert_eq!(settings_card_scale(512), 2.0);
+    }
+
+    #[test]
+    fn persisted_filename_prompt_is_gui_configuration() {
+        let (directory, mut store) = settings_store("filename-prompt");
+        store.set("capture.ask-for-filename", "true").unwrap();
+
+        let config = Config::from_settings(&store).unwrap();
+
+        assert!(config.ask_for_filename);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn native_save_approval_and_cancellation_stay_distinct() {
+        let suggested = std::path::PathBuf::from("/tmp/Screenshot.png");
+        assert_eq!(
+            select_save_path(
+                &StubSaveFilePicker::selecting("/tmp/Approved.jpg"),
+                suggested.clone(),
+            )
+            .unwrap(),
+            Some(std::path::PathBuf::from("/tmp/Approved.png"))
+        );
+        assert_eq!(
+            select_save_path(&StubSaveFilePicker::cancelling(), suggested).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1509,6 +1807,24 @@ mod tests {
 
         assert!(!app.escape_registered);
         assert_eq!(app.hotkeys.action_for(&escape), None);
+    }
+
+    #[test]
+    fn reloading_shortcuts_reinstates_the_transient_escape_binding() {
+        let (mut app, _) = app();
+        app.surface
+            .present(Card::placeholder(CardId(10), CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+        app.ensure_escape_binding();
+        assert!(app.escape_registered);
+
+        app.unregister_hotkeys_for_reload();
+        assert!(!app.escape_registered);
+        app.reconcile_escape_binding();
+
+        let escape = Accelerator::parse(OVERLAY_ESCAPE_ACCELERATOR).expect("Escape parses");
+        assert!(app.escape_registered);
+        assert_eq!(app.hotkeys.action_for(&escape), Some(OVERLAY_ESCAPE_ACTION));
     }
 
     #[test]

@@ -94,6 +94,13 @@ pub enum SettingsAction {
     Save,
     /// The user asked to discard changes back to the last saved state.
     Reset,
+    /// The user asked the app to remove one persisted override.
+    ResetRow {
+        /// Which row should return to its resolved default.
+        row_id: RowId,
+    },
+    /// The user asked the app to remove every persisted override.
+    ResetAll,
     /// The user asked to see the onboarding wizard again.
     RerunOnboarding,
 }
@@ -206,10 +213,11 @@ fn draw_row(ui: &mut Ui, surface: &Surface<'_>, row: &Row, actions: &mut Vec<Set
         ink,
     );
 
+    let reset_width = if row.resettable { ROW_H } else { 0.0 };
     let control_left = rect.left() + rect.width() * LABEL_FRACTION;
     let control_rect = Rect::from_min_size(
         pos2(control_left, row_top.top()),
-        vec2(rect.right() - control_left, ROW_H),
+        vec2((rect.right() - control_left - reset_width).max(0.0), ROW_H),
     );
 
     let control_state = if row.enabled {
@@ -300,11 +308,14 @@ fn draw_row(ui: &mut Ui, surface: &Surface<'_>, row: &Row, actions: &mut Vec<Set
                 row.id,
                 chord.as_ref(),
                 status,
+                control_state,
                 actions,
             );
         }
         RowKind::Template { value, .. } => {
-            if let Some(next) = draw_text(ui, surface, control_rect, row.id, value, "") {
+            if let Some(next) =
+                draw_text(ui, surface, control_rect, row.id, value, "", control_state)
+            {
                 actions.push(SettingsAction::RowChanged {
                     row_id: row.id,
                     change: RowChange::Template(next),
@@ -312,7 +323,15 @@ fn draw_row(ui: &mut Ui, surface: &Surface<'_>, row: &Row, actions: &mut Vec<Set
             }
         }
         RowKind::TextField { value, placeholder } => {
-            if let Some(next) = draw_text(ui, surface, control_rect, row.id, value, placeholder) {
+            if let Some(next) = draw_text(
+                ui,
+                surface,
+                control_rect,
+                row.id,
+                value,
+                placeholder,
+                control_state,
+            ) {
                 actions.push(SettingsAction::RowChanged {
                     row_id: row.id,
                     change: RowChange::Text(next),
@@ -320,6 +339,27 @@ fn draw_row(ui: &mut Ui, surface: &Surface<'_>, row: &Row, actions: &mut Vec<Set
             }
         }
         RowKind::Section => unreachable!("handled above"),
+    }
+
+    if row.resettable {
+        let reset_rect = Rect::from_center_size(
+            pos2(rect.right() - ROW_H / 2.0, row_top.center().y),
+            vec2(28.0, 28.0),
+        );
+        if paint::icon_button(
+            ui,
+            surface,
+            reset_rect,
+            Id::new(("scrozz.settings.reset-row", row.id)),
+            Icon::ArrowBackUp,
+            &format!("Reset {} to its default", row.label),
+            ControlState::new(),
+            Reveal::SHOWN,
+        )
+        .clicked()
+        {
+            actions.push(SettingsAction::ResetRow { row_id: row.id });
+        }
     }
 
     if let Some((text, alert)) = note {
@@ -344,6 +384,11 @@ fn draw_row(ui: &mut Ui, surface: &Surface<'_>, row: &Row, actions: &mut Vec<Set
 /// message when the row has one to show (which always takes priority over
 /// help — an active error is more useful than a description of the setting).
 fn row_note(row: &Row) -> Option<(String, bool)> {
+    if !row.enabled
+        && let Some(reason) = row.disabled_reason
+    {
+        return Some((reason.to_owned(), false));
+    }
     match &row.kind {
         RowKind::Template {
             validation: Validation::Invalid(reason),
@@ -634,16 +679,9 @@ fn draw_text(
     row_id: RowId,
     value: &str,
     placeholder: &str,
+    state: ControlState,
 ) -> Option<String> {
-    draw_text_field(
-        ui,
-        surface,
-        control_rect,
-        row_id,
-        value,
-        placeholder,
-        ControlState::new(),
-    )
+    draw_text_field(ui, surface, control_rect, row_id, value, placeholder, state)
 }
 
 /// The shared text-field primitive behind [`draw_text`] and [`draw_path`].
@@ -724,6 +762,7 @@ fn draw_text_field(
 /// [`SettingsAction::StopRecordingShortcut`]. A conflict or an invalid chord
 /// is drawn in [`ALERT`] rather than the accent, so it cannot be mistaken for
 /// an ordinary idle chord.
+#[allow(clippy::too_many_arguments)]
 fn draw_shortcut_row(
     ui: &mut Ui,
     surface: &Surface<'_>,
@@ -731,6 +770,7 @@ fn draw_shortcut_row(
     row_id: RowId,
     chord: Option<&ShortcutChord>,
     status: &ShortcutStatus,
+    state: ControlState,
     actions: &mut Vec<SettingsAction>,
 ) {
     let palette = surface.palette();
@@ -744,7 +784,7 @@ fn draw_shortcut_row(
     let response = ui.interact(
         rect,
         Id::new(("scrozz.settings.shortcut", row_id)),
-        Sense::click(),
+        sense_for(state),
     );
 
     let border = if alert {
@@ -756,7 +796,7 @@ fn draw_shortcut_row(
     };
     let fill = if recording {
         palette.chip_fill
-    } else if response.hovered() {
+    } else if state.enabled && response.hovered() {
         palette.hover
     } else {
         palette.chip_fill
@@ -780,10 +820,16 @@ fn draw_shortcut_row(
         Align2::CENTER_CENTER,
         label,
         surface.font(Text::Shortcut),
-        if alert { ALERT } else { palette.text },
+        if !state.enabled {
+            palette.text_faint
+        } else if alert {
+            ALERT
+        } else {
+            palette.text
+        },
     );
 
-    if response.clicked() {
+    if state.enabled && response.clicked() {
         if recording {
             actions.push(SettingsAction::StopRecordingShortcut { row_id });
         } else {
@@ -791,7 +837,7 @@ fn draw_shortcut_row(
         }
     }
 
-    if recording {
+    if state.enabled && recording {
         capture_shortcut(ui, row_id, actions);
     }
 }
@@ -923,10 +969,10 @@ fn draw_footer(
     }
 
     let save_rect = Rect::from_min_size(pos2(rect.right() - 96.0, button_y), vec2(96.0, 30.0));
-    let save_state = if !errors.is_empty() {
-        ControlState::disabled()
-    } else {
+    let save_state = if errors.is_empty() && form.is_dirty() {
         ControlState::new()
+    } else {
+        ControlState::disabled()
     };
     if paint::pill_button_with_state(
         ui,
@@ -941,6 +987,7 @@ fn draw_footer(
     )
     .clicked()
         && errors.is_empty()
+        && form.is_dirty()
     {
         response.actions.push(SettingsAction::Save);
     }
@@ -957,7 +1004,7 @@ fn draw_footer(
         reset_rect,
         Id::new("scrozz.settings.reset"),
         Icon::ArrowBackUp,
-        "Reset",
+        "Discard",
         false,
         reset_state,
         Reveal::SHOWN,
@@ -966,6 +1013,30 @@ fn draw_footer(
         && form.is_dirty()
     {
         response.actions.push(SettingsAction::Reset);
+    }
+
+    let defaults_rect =
+        Rect::from_min_size(pos2(reset_rect.left() - 100.0, button_y), vec2(92.0, 30.0));
+    let defaults_state = if form.rows().iter().any(|row| row.resettable) {
+        ControlState::new()
+    } else {
+        ControlState::disabled()
+    };
+    if paint::pill_button_with_state(
+        ui,
+        surface,
+        defaults_rect,
+        Id::new("scrozz.settings.reset-all"),
+        Icon::ArrowBackUp,
+        "Defaults",
+        false,
+        defaults_state,
+        Reveal::SHOWN,
+    )
+    .clicked()
+        && defaults_state.enabled
+    {
+        response.actions.push(SettingsAction::ResetAll);
     }
 }
 

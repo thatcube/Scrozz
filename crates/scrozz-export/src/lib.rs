@@ -11,7 +11,8 @@ pub mod naming;
 pub mod pixels;
 
 pub use clipboard::{
-    ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,
+    ClipboardDelivery, ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind,
+    SystemClipboard,
 };
 pub use decode::{decode, decode_file};
 pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader, UnimplementedS3Uploader};

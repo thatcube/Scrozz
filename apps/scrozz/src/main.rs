@@ -56,6 +56,7 @@ mod settings;
 mod settings_hotkeys;
 mod settings_runtime;
 mod settings_store;
+mod settings_support;
 mod system_integration;
 #[cfg(test)]
 mod test_env;

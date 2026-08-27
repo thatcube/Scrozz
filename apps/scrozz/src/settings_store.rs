@@ -156,6 +156,16 @@ impl SettingsStore {
         Ok(value == "true")
     }
 
+    /// Resolves the persisted OCR rows into the runtime adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scrozz_core::Error::InvalidRequest`] for contradictory or
+    /// malformed language settings.
+    pub fn ocr_config(&self) -> CliResult<scrozz_ocr::RuntimeConfig> {
+        ocr_config(&self.document)
+    }
+
     /// The stable provenance token for one key.
     ///
     /// # Errors
@@ -179,6 +189,7 @@ impl SettingsStore {
 
         let mut next = self.document.clone();
         next.values.insert(key.to_owned(), value.to_owned());
+        ocr_config(&next)?;
         self.write_document(&next)?;
         self.document = next;
         Ok(ValueSource::User)
@@ -232,6 +243,7 @@ impl SettingsStore {
             setting.validate(value)?;
             next.values.insert(key.clone(), value.clone());
         }
+        ocr_config(&next)?;
         self.write_document(&next)?;
         self.document = next;
         Ok(())
@@ -352,7 +364,30 @@ fn validate_document(document: &Document, path: &Path) -> CliResult<()> {
             ))
         })?;
     }
+    ocr_config(document).map_err(|error| {
+        storage(format!(
+            "{} contains invalid OCR settings: {error}",
+            path.display()
+        ))
+    })?;
     Ok(())
+}
+
+fn ocr_config(document: &Document) -> CliResult<scrozz_ocr::RuntimeConfig> {
+    let value = |key| -> CliResult<&str> {
+        let setting = settings::lookup(key)?;
+        Ok(document
+            .values
+            .get(key)
+            .map_or(setting.default, String::as_str))
+    };
+    scrozz_ocr::RuntimeConfig::from_settings(
+        value(scrozz_ocr::LANGUAGES_KEY)?,
+        value(scrozz_ocr::AUTO_DETECT_LANGUAGE_KEY)? == "true",
+        value(scrozz_ocr::KEEP_LINE_BREAKS_KEY)? == "true",
+        value(scrozz_ocr::DETECT_LINKS_KEY)? == "true",
+    )
+    .map_err(Into::into)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> CliResult<()> {
@@ -536,6 +571,48 @@ mod tests {
         let mut store = SettingsStore::open(scratch.settings()).unwrap();
         assert!(store.set("capture.quality", "101").is_err());
         assert_eq!(store.get("capture.quality").unwrap().1, "90");
+        assert!(!scratch.settings().exists());
+    }
+
+    #[test]
+    fn ocr_settings_are_validated_together_before_an_atomic_write() {
+        let scratch = Scratch::new("ocr-config");
+        let mut store = SettingsStore::open(scratch.settings()).unwrap();
+
+        let error = store
+            .apply(&[
+                ("ocr.languages".to_owned(), "en-US".to_owned()),
+                ("ocr.auto-detect-language".to_owned(), "true".to_owned()),
+            ])
+            .unwrap_err();
+        assert_eq!(error.exit(), crate::exit::Exit::InvalidRequest);
+        assert!(!scratch.settings().exists());
+
+        store
+            .apply(&[
+                ("ocr.languages".to_owned(), "de-DE,en-US".to_owned()),
+                ("ocr.keep-line-breaks".to_owned(), "false".to_owned()),
+                ("ocr.detect-links".to_owned(), "false".to_owned()),
+            ])
+            .unwrap();
+        let config = store.ocr_config().unwrap();
+        assert_eq!(config.language_mode(), scrozz_ocr::LanguageMode::Configured);
+        assert_eq!(config.options().languages, ["de-DE", "en-US"]);
+        assert_eq!(
+            config.options().line_breaks,
+            scrozz_ocr::LineBreaks::Collapse
+        );
+        assert!(!config.detects_links());
+    }
+
+    #[test]
+    fn malformed_ocr_language_tags_never_reach_disk() {
+        let scratch = Scratch::new("ocr-malformed");
+        let mut store = SettingsStore::open(scratch.settings()).unwrap();
+
+        let error = store.set("ocr.languages", "en--US").unwrap_err();
+        assert_eq!(error.exit(), crate::exit::Exit::InvalidRequest);
+        assert!(error.to_string().contains("ocr.languages"), "{error}");
         assert!(!scratch.settings().exists());
     }
 

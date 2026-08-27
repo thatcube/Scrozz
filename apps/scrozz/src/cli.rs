@@ -1568,6 +1568,8 @@ pub enum HotkeyAction {
     CaptureDisplay,
     /// Capture every display at once.
     CaptureAllDisplays,
+    /// Capture and stitch a scrolling page.
+    CaptureScrolling,
     /// Start recording a region.
     RecordStart,
     /// Stop the recording in progress.
@@ -1724,6 +1726,7 @@ impl HotkeyAction {
             Self::CaptureWindow,
             Self::CaptureDisplay,
             Self::CaptureAllDisplays,
+            Self::CaptureScrolling,
             Self::RecordStart,
             Self::RecordStop,
         ]
@@ -1737,6 +1740,7 @@ impl HotkeyAction {
             Self::CaptureWindow => "capture-window",
             Self::CaptureDisplay => "capture-display",
             Self::CaptureAllDisplays => "capture-all-displays",
+            Self::CaptureScrolling => "capture-scrolling",
             Self::RecordStart => "record-start",
             Self::RecordStop => "record-stop",
         }
@@ -1755,6 +1759,7 @@ impl HotkeyAction {
             Self::CaptureWindow => &["capture", "--interactive", "window"],
             Self::CaptureDisplay => &["capture", "--display", "active"],
             Self::CaptureAllDisplays => &["capture", "--all-displays"],
+            Self::CaptureScrolling => &["capture", "--scrolling"],
             Self::RecordStart => &["record", "--interactive", "region"],
             Self::RecordStop => &["record", "--stop"],
         }
@@ -1772,6 +1777,7 @@ impl HotkeyAction {
             Self::CaptureWindow => "Super+Shift+5",
             Self::CaptureDisplay => "Super+Shift+3",
             Self::CaptureAllDisplays => "Super+Shift+6",
+            Self::CaptureScrolling => "Super+Shift+0",
             Self::RecordStart => "Super+Shift+R",
             Self::RecordStop => "Super+Shift+Escape",
         }
@@ -1785,6 +1791,7 @@ impl HotkeyAction {
             Self::CaptureWindow => "Capture a window",
             Self::CaptureDisplay => "Capture the display under the pointer",
             Self::CaptureAllDisplays => "Capture every display",
+            Self::CaptureScrolling => "Capture a scrolling page",
             Self::RecordStart => "Start recording a region",
             Self::RecordStop => "Stop recording",
         }

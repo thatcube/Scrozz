@@ -13,7 +13,12 @@ scrozz-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 image.workspace = true
-arboard.workspace = true
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+clipboard-rs.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win.workspace = true
 
 [lints]
 workspace = true

@@ -26,7 +26,7 @@ use scrozz_core::{
     Error as CoreError, Provenance, ScrollGesture, SelectionOptions, SelectionOutcome, SourceApp,
     TargetEnumerator,
 };
-use scrozz_export::{Clipboard, Encoder, FrameEncoder, ImageFormat, NamingContext};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat, NamingContext};
 use scrozz_ocr::Ocr as _;
 use scrozz_shell::{
     Notification, RegistrationStatus, autostart::AutostartTarget, url_scheme::SchemeTarget,
@@ -127,6 +127,11 @@ fn capture_with_output(
         .map_or_else(|| output.format(), |format| format.to_export());
     let quality = args.quality.unwrap_or(output.quality());
     let cursor = args.cursor || output.include_cursor();
+    let cursor_mode = if cursor {
+        CursorMode::Visible
+    } else {
+        CursorMode::Hidden
+    };
     let window_shadow = !args.no_window_shadow && output.include_window_shadow();
     let selection = args.selection_options(None)?;
 
@@ -191,7 +196,8 @@ fn capture_with_output(
             let options = args
                 .selection_options(remembered)?
                 .expect("an interactive target has selection options");
-            let (outcome, frozen) = select_target(&options, args, selector)?;
+            let (outcome, frozen) =
+                select_target(&options, args, selector, cursor_mode, window_shadow)?;
             (outcome.target.clone(), Some(outcome), frozen)
         }
         concrete => (
@@ -203,11 +209,7 @@ fn capture_with_output(
 
     let request = CaptureRequest {
         target,
-        cursor: if cursor {
-            CursorMode::Visible
-        } else {
-            CursorMode::Hidden
-        },
+        cursor: cursor_mode,
         include_window_shadow: window_shadow,
     };
 
@@ -244,6 +246,14 @@ fn capture_with_output(
         .encoder(args.quality)
         .encode(frame, format)
         .map_err(CliError::Core)?;
+    let naming = NamingContext {
+        app: capture.source_app.name.clone(),
+        title: capture.source_app.window_title.clone(),
+        sequence: 1,
+        width: frame.width(),
+        height: frame.height(),
+        ..NamingContext::now()
+    };
 
     let mut written = Vec::new();
     let mut raw = None;
@@ -254,23 +264,14 @@ fn capture_with_output(
                 written.push(path.display().to_string());
             }
             Sink::Clipboard => {
-                scrozz_export::SystemClipboard::new()
-                    .write_image(frame)
-                    .map_err(CliError::Core)?;
+                output.write_clipboard_encoded(frame, &bytes, format, &naming)?;
                 written.push("clipboard".to_string());
             }
             Sink::Stdout => raw = Some(bytes.clone()),
             // D18: any folder the user picks, which is what lets a Dropbox or
             // iCloud directory provide sync for free with no service on our side.
             Sink::DefaultFolder => {
-                let path = output.export(
-                    &bytes,
-                    &NamingContext {
-                        width: frame.width(),
-                        height: frame.height(),
-                        ..NamingContext::now()
-                    },
-                )?;
+                let path = output.export(&bytes, &naming)?;
                 written.push(path.display().to_string());
             }
         }
@@ -362,12 +363,9 @@ fn select_target(
     options: &SelectionOptions,
     args: &CaptureArgs,
     selector: Option<&dyn CaptureSelector>,
+    cursor: CursorMode,
+    include_window_shadow: bool,
 ) -> CliResult<(SelectionOutcome, Option<Capture>)> {
-    let cursor = if args.cursor {
-        CursorMode::Visible
-    } else {
-        CursorMode::Hidden
-    };
     if let Some(selector) = selector {
         let capabilities = selector.capabilities();
         let downgrades = capabilities.downgrades(options);
@@ -395,7 +393,7 @@ fn select_target(
         let request = CaptureRequest {
             target: outcome.target.clone(),
             cursor,
-            include_window_shadow: !args.no_window_shadow,
+            include_window_shadow,
         };
         let frozen = selector.take_frozen_capture(&request);
         return Ok((outcome, frozen));
@@ -404,7 +402,7 @@ fn select_target(
     Ok(crate::gui::select_once(
         options,
         cursor,
-        !args.no_window_shadow,
+        include_window_shadow,
     )?)
 }
 
@@ -1044,14 +1042,18 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
     if !platform::ocr_available() {
         return Err(CliError::Core(CoreError::Unsupported {
             what: "recognising text".to_string(),
-            why: "this build has no OCR engine. macOS uses Vision and Windows \
-                  uses Windows.Media.Ocr, both supplied by the system; Linux has \
-                  no system recogniser, and bundling one would add tens of \
-                  megabytes of language model to every install."
+            why: "this build has no OCR engine. macOS uses Vision; packaged Windows \
+                  uses Windows.Media.Ocr and portable Windows ships Tesseract. Linux \
+                  has no system recogniser, and this build does not bundle a language \
+                  model there."
                 .to_string(),
         }));
     }
 
+    let settings = SettingsStore::load()?;
+    let config = settings.ocr_config()?;
+    let mut engine = platform::ocr_engine();
+    engine.set_options(config.options().clone());
     match subject {
         OcrSubject::File(path) => {
             if !path.exists() {
@@ -1061,20 +1063,18 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
                 ))));
             }
             let frame = platform::decode_image_file(&path)?;
-            let blocks = confident_blocks(
-                platform::ocr_engine().recognize(&frame)?,
-                args.min_confidence,
-            );
-            Ok(ocr_report(&blocks, &path.display().to_string()))
+            let engine_name = scrozz_ocr::SystemOcr::engine_name()?;
+            let blocks = confident_blocks(engine.recognize(&frame)?, args.min_confidence);
+            Ok(ocr_report(
+                &blocks,
+                &path.display().to_string(),
+                &config,
+                engine_name,
+            ))
         }
         OcrSubject::Capture(id) => {
             let mut store = platform::store()?;
-            ocr_stored_capture(
-                &mut store,
-                &platform::ocr_engine(),
-                &id,
-                args.min_confidence,
-            )
+            ocr_stored_capture(&mut store, &engine, &config, &id, args.min_confidence)
         }
     }
 }
@@ -1082,6 +1082,7 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
 fn ocr_stored_capture(
     store: &mut SqliteStore,
     engine: &impl scrozz_ocr::Ocr,
+    config: &scrozz_ocr::RuntimeConfig,
     id: &str,
     min_confidence: Option<f32>,
 ) -> CliResult<Report> {
@@ -1091,10 +1092,11 @@ fn ocr_stored_capture(
         Some(DocumentState::ImageEvicted(_)) => return Err(history_image_evicted(id)),
         None => return Err(history_not_found(id)),
     };
+    let engine_name = scrozz_ocr::SystemOcr::engine_name()?;
     let blocks = confident_blocks(engine.recognize(&document.source.frame)?, min_confidence);
-    let text = scrozz_ocr::plain_text(&blocks);
+    let text = config.text(&blocks);
     store.set_ocr_text(&capture_id, Some(&text))?;
-    Ok(ocr_report(&blocks, id))
+    Ok(ocr_report(&blocks, id, config, engine_name))
 }
 
 fn confident_blocks(
@@ -1117,13 +1119,35 @@ fn confident_blocks(
 /// belong in `--json`, where a consumer asked for structure; printing them in
 /// the human path would corrupt the far more common case of piping the text
 /// somewhere.
-fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
-    let text = scrozz_ocr::plain_text(blocks);
+fn ocr_report(
+    blocks: &[scrozz_ocr::TextBlock],
+    source: &str,
+    config: &scrozz_ocr::RuntimeConfig,
+    engine: &str,
+) -> Report {
+    let text = config.text(blocks);
+    let links = config.links(blocks);
 
     let data = Json::obj([
         ("source", Json::str(source)),
+        ("engine", Json::str(engine)),
         ("block_count", Json::Int(blocks.len() as i64)),
         ("text", Json::str(text.as_str())),
+        ("link_count", Json::Int(links.len() as i64)),
+        (
+            "links",
+            Json::arr(links.iter().map(|link| {
+                Json::obj([
+                    ("text", Json::str(&link.text)),
+                    ("target", Json::str(&link.target)),
+                    ("kind", Json::str(link.kind.token())),
+                    ("x", Json::Float(link.bounds.origin.x)),
+                    ("y", Json::Float(link.bounds.origin.y)),
+                    ("width", Json::Float(link.bounds.size.width)),
+                    ("height", Json::Float(link.bounds.size.height)),
+                ])
+            })),
+        ),
         (
             "blocks",
             Json::arr(blocks.iter().map(|b| {
@@ -1234,36 +1258,25 @@ fn hotkey(command: &HotkeyCommand) -> CliResult<Report> {
 // ---------------------------------------------------------------------------
 
 fn autostart(command: AutostartCommand) -> CliResult<Report> {
-    let context = SystemContext::current()?;
-    let plan = context.autostart()?;
-    match command {
-        AutostartCommand::Status => {
-            let status = plan.status()?;
-            Ok(registration_report(
-                "autostart",
-                status,
-                autostart_target(plan.target()),
-            ))
-        }
+    let mut store = SettingsStore::load()?;
+    let status = match command {
+        AutostartCommand::Status => settings_runtime::reconcile_autostart(&mut store)?,
         AutostartCommand::Enable => {
-            plan.apply()?;
-            let status = plan.status()?;
-            Ok(registration_report(
-                "autostart",
-                status,
-                autostart_target(plan.target()),
-            ))
+            settings_runtime::set(&mut store, "system.launch-at-login", "true")?;
+            SystemContext::current()?.autostart()?.status()?
         }
         AutostartCommand::Disable => {
-            plan.remove()?;
-            let status = plan.status()?;
-            Ok(registration_report(
-                "autostart",
-                status,
-                autostart_target(plan.target()),
-            ))
+            settings_runtime::set(&mut store, "system.launch-at-login", "false")?;
+            SystemContext::current()?.autostart()?.status()?
         }
-    }
+    };
+    let context = SystemContext::current()?;
+    let plan = context.autostart()?;
+    Ok(registration_report(
+        "autostart",
+        status,
+        autostart_target(plan.target()),
+    ))
 }
 
 fn url_command(command: &UrlCommand) -> CliResult<Report> {
@@ -2785,7 +2798,8 @@ mod tests {
     #[test]
     fn ocr_on_a_stored_capture_filters_and_persists_searchable_text() {
         let (_dir, mut store, first, _) = history_fixture();
-        let report = ocr_stored_capture(&mut store, &StubOcr, &first.0, Some(0.8))
+        let config = scrozz_ocr::RuntimeConfig::default();
+        let report = ocr_stored_capture(&mut store, &StubOcr, &config, &first.0, Some(0.8))
             .expect("recognise stored capture");
         assert_eq!(report.human, "keep me");
         assert_eq!(
@@ -2797,6 +2811,30 @@ mod tests {
             .expect("search OCR text");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, first);
+    }
+
+    #[test]
+    fn ocr_report_applies_line_break_and_link_settings() {
+        let blocks = vec![
+            scrozz_ocr::TextBlock {
+                text: "visit".into(),
+                bounds: LogicalRect::new(LogicalPoint::new(1.0, 1.0), LogicalSize::new(6.0, 2.0)),
+                confidence: 1.0,
+            },
+            scrozz_ocr::TextBlock {
+                text: "https://example.org".into(),
+                bounds: LogicalRect::new(LogicalPoint::new(1.0, 4.0), LogicalSize::new(20.0, 2.0)),
+                confidence: 1.0,
+            },
+        ];
+        let config = scrozz_ocr::RuntimeConfig::from_settings("", false, false, true).unwrap();
+        let report = ocr_report(&blocks, "fixture", &config, "vision");
+
+        assert_eq!(report.human, "visit https://example.org");
+        let json = report.data.to_compact_string();
+        assert!(json.contains(r#""link_count":1"#), "{json}");
+        assert!(json.contains(r#""engine":"vision""#), "{json}");
+        assert!(json.contains(r#""target":"https://example.org""#), "{json}");
     }
 
     // -- shared rendering --------------------------------------------------

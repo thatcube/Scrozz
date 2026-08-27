@@ -227,7 +227,8 @@ mod windows_picker {
         CoUninitialize,
     };
     use windows::Win32::UI::Shell::{
-        FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+        FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem,
+        SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
     };
     use windows::core::{HRESULT, HSTRING, IUnknown};
 
@@ -321,6 +322,23 @@ mod windows_picker {
                     // A failure here is cosmetic (no title shown) and not
                     // worth aborting the whole picker over.
                     let _ = dialog.SetTitle(&HSTRING::from(title.as_str()));
+                }
+                if let Some(directory) = &request.starting_directory {
+                    let folder: IShellItem = SHCreateItemFromParsingName(
+                        &HSTRING::from(directory.to_string_lossy().as_ref()),
+                        None,
+                    )
+                    .map_err(|error| {
+                        Error::Platform(format!(
+                            "resolving the folder picker start directory {} failed: {error}",
+                            directory.display()
+                        ))
+                    })?;
+                    dialog.SetFolder(&folder).map_err(|error| {
+                        Error::Platform(format!(
+                            "setting the folder picker start directory failed: {error}"
+                        ))
+                    })?;
                 }
 
                 match dialog.Show(None) {

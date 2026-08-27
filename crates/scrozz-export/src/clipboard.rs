@@ -10,24 +10,15 @@
 //! to put several representations on the clipboard at once and let the receiving
 //! application choose. All three operating systems support exactly this.
 //!
-//! # What this module actually delivers today
-//!
-//! `arboard` offers **one** image representation per platform. That is a real
-//! shortfall against D10, and rather than quietly offering less, this module:
-//!
-//! 1. builds the bytes for every flavour the platform should be offered —
-//!    [`Flavour`], produced by [`offer`] — all in safe Rust with no new
-//!    dependencies, so a native shim would be a thin layer over tested code;
-//! 2. writes what `arboard` supports; and
-//! 3. reports precisely what is missing and what native work would close it —
-//!    [`ClipboardReport`] and [`gaps`].
-//!
-//! The gap analysis is data rather than prose so it can be asserted on in tests
-//! and surfaced in diagnostics, and so it cannot rot silently.
+//! Image data and file references are committed in one clipboard replacement.
+//! This is what makes the `image-and-file` setting real rather than two writes
+//! where the second silently erases the first. Every backend is verified after
+//! the write; a backend that reports success while omitting a required flavour
+//! is an error, not an optimistic success report.
 
-use std::borrow::Cow;
+use std::path::PathBuf;
 
-use scrozz_core::{ColorSpace, Error, Frame, Result};
+use scrozz_core::{Error, Frame, Result};
 
 use crate::{
     Clipboard, ImageFormat,
@@ -39,7 +30,8 @@ use crate::{
 /// The clipboard implementation in play, which is not simply the OS.
 ///
 /// X11 and Wayland are separate because they are separate protocols with
-/// separate ownership models, and `arboard` implements them separately.
+/// separate ownership models, and the clipboard library implements them
+/// separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardPlatform {
     /// macOS `NSPasteboard`.
@@ -55,15 +47,16 @@ pub enum ClipboardPlatform {
 impl ClipboardPlatform {
     /// The platform this build targets.
     ///
-    /// X11 is assumed on Unix because it is what `arboard` falls back to and
-    /// because XWayland makes it work under a Wayland session anyway. The
-    /// distinction only affects the advisory gap report, never correctness.
+    /// Linux chooses Wayland only when this process is connected to a Wayland
+    /// display; otherwise the X11 selection backend owns the clipboard.
     #[must_use]
-    pub const fn current() -> Self {
+    pub fn current() -> Self {
         if cfg!(target_os = "macos") {
             Self::MacOs
         } else if cfg!(target_os = "windows") {
             Self::Windows
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            Self::Wayland
         } else {
             Self::X11
         }
@@ -93,7 +86,7 @@ impl FlavourKind {
             (Self::Png, ClipboardPlatform::MacOs) => "public.png",
             (Self::Png, ClipboardPlatform::Windows) => "PNG",
             (Self::Png, _) => "image/png",
-            (Self::Tiff, ClipboardPlatform::MacOs) => "NSPasteboardTypeTIFF",
+            (Self::Tiff, ClipboardPlatform::MacOs) => "public.tiff",
             (Self::Tiff, _) => "image/tiff",
             (Self::DibV5, _) => "CF_DIBV5",
             (Self::Dib, _) => "CF_DIB",
@@ -178,89 +171,36 @@ pub fn offer(frame: &Frame, platform: ClipboardPlatform) -> Result<Vec<Flavour>>
 // Gap analysis
 // ---------------------------------------------------------------------------
 
-/// A flavour D10 calls for that this build does not actually put on the
-/// clipboard, and what it would take to.
+/// A flavour D10 calls for that a clipboard backend does not deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlavourGap {
     /// The platform type that is missing.
     pub platform_type: &'static str,
-    /// Why `arboard` does not offer it.
+    /// Why the active backend does not offer it.
     pub reason: &'static str,
     /// The native work that would close the gap.
     pub native_work: &'static str,
 }
 
-/// What `arboard` genuinely delivers for an image, per platform.
-///
-/// Read off `arboard` 3.6's own source rather than assumed, because this is the
-/// input to every claim below.
+/// Image flavours Scrozz commits and verifies on each platform.
 #[must_use]
-pub const fn arboard_delivers(platform: ClipboardPlatform) -> &'static [&'static str] {
+pub const fn backend_delivers(platform: ClipboardPlatform) -> &'static [&'static str] {
     match platform {
-        // `Set::image` builds an `NSImage` and calls `writeObjects`. `NSImage`
-        // advertises TIFF (and PDF for vector representations) as its writable
-        // types; a bitmap therefore lands as TIFF alone.
-        ClipboardPlatform::MacOs => &["NSPasteboardTypeTIFF"],
-        // `set_image` calls both `add_png_file` and `add_cf_dibv5`.
-        ClipboardPlatform::Windows => &["PNG", "CF_DIBV5"],
-        ClipboardPlatform::X11 | ClipboardPlatform::Wayland => &["image/png"],
+        ClipboardPlatform::MacOs => &["public.png", "public.tiff"],
+        ClipboardPlatform::Windows => &["PNG", "CF_DIBV5", "CF_DIB"],
+        ClipboardPlatform::X11 | ClipboardPlatform::Wayland => {
+            &["image/png", "image/bmp", "image/tiff"]
+        }
     }
 }
 
-/// The flavours D10 wants that `arboard` will not put on the clipboard.
+/// Required image flavours the backend still cannot deliver.
+///
+/// Empty because every flavour in [`preferred_kinds`] is now committed and
+/// verified before a copy is reported as successful.
 #[must_use]
-pub const fn gaps(platform: ClipboardPlatform) -> &'static [FlavourGap] {
-    match platform {
-        ClipboardPlatform::MacOs => &[FlavourGap {
-            platform_type: "public.png",
-            reason: "arboard writes an NSImage via writeObjects, which advertises only \
-                     NSPasteboardTypeTIFF for a bitmap. PNG is never declared, so any \
-                     application that requests public.png and does not fall back to TIFF \
-                     receives nothing — and the TIFF it does get is uncompressed, so a \
-                     4K capture occupies roughly 33 MB of pasteboard.",
-            native_work: "Call NSPasteboard::clearContents, then setData:forType: once per \
-                          flavour with the bytes from `offer`, declaring public.png before \
-                          NSPasteboardTypeTIFF. That is objc2 message dispatch, so it needs \
-                          an unsafe block and cannot live in this crate while it forbids \
-                          unsafe code — a small platform shim crate, or a cfg-gated module \
-                          with a scoped allow, is the change required.",
-        }],
-        ClipboardPlatform::Windows => &[FlavourGap {
-            platform_type: "CF_DIB",
-            reason: "arboard offers CF_DIBV5 and a registered PNG format but never CF_DIB. \
-                     Windows does synthesise CF_DIB from CF_DIBV5, which covers most \
-                     callers, but the synthesised bitmap keeps the alpha channel as \
-                     uninterpreted bytes: an application that ignores the alpha mask shows \
-                     transparent pixels as whatever colour sits underneath them, which for \
-                     a premultiplied source is black.",
-            native_work: "After OpenClipboard, add a third SetClipboardData for CF_DIB with \
-                          the 24-bit bitmap from `offer` (already composited over white, so \
-                          alpha-ignoring applications get the intended picture). This needs \
-                          direct Win32 clipboard calls rather than arboard's Set::image, \
-                          which clears the clipboard on entry.",
-        }],
-        ClipboardPlatform::X11 | ClipboardPlatform::Wayland => &[
-            FlavourGap {
-                platform_type: "image/bmp",
-                reason: "arboard advertises only the image/png target. Several GTK2-era and \
-                         Qt applications request image/bmp and treat an unavailable target \
-                         as an empty clipboard.",
-                native_work: "arboard's X11 backend already serves an arbitrary list of \
-                              (atom, bytes) pairs internally — its ClipboardData type is \
-                              exactly that — but the public API funnels images through a \
-                              single PNG target. Closing this means either an upstream API \
-                              taking multiple targets, or owning the selection directly \
-                              with x11rb and the wl_data_device protocol.",
-            },
-            FlavourGap {
-                platform_type: "image/tiff",
-                reason: "Not offered, for the same reason as image/bmp. Qt applications \
-                         commonly list it among their accepted image targets.",
-                native_work: "Same as image/bmp: one more (atom, bytes) pair on the same \
-                              selection owner.",
-            },
-        ],
-    }
+pub const fn gaps(_platform: ClipboardPlatform) -> &'static [FlavourGap] {
+    &[]
 }
 
 /// What actually happened, and what did not.
@@ -272,6 +212,15 @@ pub struct ClipboardReport {
     pub delivered: &'static [&'static str],
     /// The flavours D10 asks for that were not delivered.
     pub missing: &'static [FlavourGap],
+}
+
+/// What one verified clipboard replacement contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardDelivery {
+    /// Whether image representations were committed.
+    pub image: bool,
+    /// Number of file references committed.
+    pub files: usize,
 }
 
 impl ClipboardReport {
@@ -286,7 +235,7 @@ impl ClipboardReport {
 // The clipboard itself
 // ---------------------------------------------------------------------------
 
-/// A [`Clipboard`] backed by `arboard`.
+/// The native system clipboard.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClipboard {
     platform: Option<ClipboardPlatform>,
@@ -299,11 +248,10 @@ impl SystemClipboard {
         Self::default()
     }
 
-    /// A clipboard whose *reporting* pretends to be `platform`.
+    /// A clipboard whose image report pretends to be `platform`.
     ///
-    /// The write still goes through `arboard` to the real clipboard; only the
-    /// gap analysis is overridden. It exists so the report for every platform
-    /// can be exercised from one machine.
+    /// The write still targets the real host clipboard; only the report is
+    /// overridden. It exists so report formatting can be exercised anywhere.
     #[must_use]
     pub const fn reporting_as(platform: ClipboardPlatform) -> Self {
         Self {
@@ -315,6 +263,38 @@ impl SystemClipboard {
         self.platform.unwrap_or_else(ClipboardPlatform::current)
     }
 
+    /// Replaces the clipboard with image data, file references, or both.
+    ///
+    /// Image and file representations are committed in one operation. Every
+    /// requested representation is then queried from the native clipboard; a
+    /// partial write is returned as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] when both inputs are empty, a file is
+    /// relative, missing, or not Unicode, or the frame is malformed. Returns
+    /// [`Error::Platform`] when the clipboard cannot be opened or verified.
+    pub fn write_content(
+        &self,
+        image: Option<&Frame>,
+        files: &[PathBuf],
+    ) -> Result<ClipboardDelivery> {
+        if image.is_none() && files.is_empty() {
+            return Err(Error::InvalidRequest(
+                "clipboard content must include an image, a file, or both".to_owned(),
+            ));
+        }
+        validate_files(files)?;
+
+        let platform = ClipboardPlatform::current();
+        let flavours = image.map(|frame| offer(frame, platform)).transpose()?;
+        write_platform(platform, flavours.as_deref().unwrap_or_default(), files)?;
+        Ok(ClipboardDelivery {
+            image: image.is_some(),
+            files: files.len(),
+        })
+    }
+
     /// Writes the capture and reports which flavours the platform received.
     ///
     /// # Errors
@@ -323,43 +303,199 @@ impl SystemClipboard {
     /// [`Error::Platform`] if the clipboard was unavailable — which on Linux
     /// includes there being no display server at all, the ordinary case in CI.
     pub fn write_image_reporting(&self, frame: &Frame) -> Result<ClipboardReport> {
-        let image = to_straight_rgba8(frame)?;
-        if frame.color_space != ColorSpace::Srgb && frame.color_space != ColorSpace::Unknown {
-            // `arboard` takes raw samples with no way to attach a profile, so a
-            // wide-gamut capture is pasted as though it were sRGB. Saving the
-            // same capture to a file keeps its profile; the clipboard cannot.
-            tracing::debug!(
-                space = ?frame.color_space,
-                "clipboard flavours carry no colour profile through arboard; \
-                 pasted colours will be interpreted as sRGB"
-            );
-        }
-
-        let mut clipboard = arboard::Clipboard::new()
-            .map_err(|e| Error::Platform(format!("clipboard unavailable: {e}")))?;
-        clipboard
-            .set_image(arboard::ImageData {
-                width: image.width as usize,
-                height: image.height as usize,
-                bytes: Cow::Borrowed(&image.data),
-            })
-            .map_err(|e| Error::Platform(format!("could not write to the clipboard: {e}")))?;
+        self.write_content(Some(frame), &[])?;
 
         let platform = self.platform();
         let report = ClipboardReport {
             platform,
-            delivered: arboard_delivers(platform),
+            delivered: backend_delivers(platform),
             missing: gaps(platform),
         };
-        if !report.is_complete() {
-            tracing::debug!(
-                ?platform,
-                delivered = ?report.delivered,
-                missing = ?report.missing.iter().map(|g| g.platform_type).collect::<Vec<_>>(),
-                "clipboard offer is narrower than decision D10 requires"
+        Ok(report)
+    }
+}
+
+fn validate_files(files: &[PathBuf]) -> Result<()> {
+    for path in files {
+        if !path.is_absolute() {
+            return Err(Error::InvalidRequest(format!(
+                "clipboard file references must be absolute: {}",
+                path.display()
+            )));
+        }
+        if !path.is_file() {
+            return Err(Error::InvalidRequest(format!(
+                "clipboard file reference does not exist: {}",
+                path.display()
+            )));
+        }
+        if path.to_str().is_none() {
+            return Err(Error::InvalidRequest(format!(
+                "clipboard file reference is not valid Unicode: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_platform(
+    platform: ClipboardPlatform,
+    flavours: &[Flavour],
+    files: &[PathBuf],
+) -> Result<()> {
+    use clipboard_rs::{Clipboard as _, ClipboardContent, ClipboardContext};
+
+    #[cfg(target_os = "macos")]
+    let clipboard = ClipboardContext::new()
+        .map_err(|error| Error::Platform(format!("clipboard unavailable: {error}")))?;
+    #[cfg(not(target_os = "macos"))]
+    let clipboard_guard = {
+        use std::sync::{Mutex, OnceLock};
+
+        static CLIPBOARD: OnceLock<Mutex<Option<ClipboardContext>>> = OnceLock::new();
+        let mut guard = CLIPBOARD
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|_| Error::Platform("clipboard context lock was poisoned".to_owned()))?;
+        if guard.is_none() {
+            *guard = Some(
+                ClipboardContext::new()
+                    .map_err(|error| Error::Platform(format!("clipboard unavailable: {error}")))?,
             );
         }
-        Ok(report)
+        guard
+    };
+    #[cfg(not(target_os = "macos"))]
+    let clipboard = clipboard_guard
+        .as_ref()
+        .expect("clipboard context was initialized");
+    let mut contents = flavours
+        .iter()
+        .map(|flavour| {
+            ClipboardContent::Other(flavour.platform_type.to_owned(), flavour.bytes.clone())
+        })
+        .collect::<Vec<_>>();
+    if !files.is_empty() {
+        contents.push(ClipboardContent::Files(
+            files
+                .iter()
+                .map(|path| path.to_str().expect("validated as Unicode").to_owned())
+                .collect(),
+        ));
+    }
+    clipboard
+        .set(contents)
+        .map_err(|error| Error::Platform(format!("could not write to the clipboard: {error}")))?;
+
+    let expected_file_type = file_platform_type(platform);
+    let mut missing = Vec::new();
+    for _ in 0..5 {
+        let available = clipboard.available_formats().map_err(|error| {
+            Error::Platform(format!("could not verify clipboard formats: {error}"))
+        })?;
+        missing = flavours
+            .iter()
+            .map(|flavour| flavour.platform_type)
+            .chain((!files.is_empty()).then_some(expected_file_type))
+            .filter(|required| !available.iter().any(|actual| actual == required))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(Error::Platform(format!(
+        "clipboard omitted required format(s): {}",
+        missing.join(", ")
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn write_platform(
+    _platform: ClipboardPlatform,
+    flavours: &[Flavour],
+    files: &[PathBuf],
+) -> Result<()> {
+    use clipboard_win::{
+        Clipboard as WindowsClipboard, formats, options,
+        raw::{set_file_list_with, set_without_clear},
+    };
+
+    let _clipboard = WindowsClipboard::new_attempts(10)
+        .map_err(|code| Error::Platform(format!("clipboard unavailable: error {code}")))?;
+    clipboard_win::empty()
+        .map_err(|code| Error::Platform(format!("could not clear the clipboard: error {code}")))?;
+
+    for flavour in flavours {
+        let format = match flavour.kind {
+            FlavourKind::Png => clipboard_win::register_format("PNG")
+                .ok_or_else(|| Error::Platform("could not register the PNG format".to_owned()))?
+                .get(),
+            FlavourKind::DibV5 => formats::CF_DIBV5,
+            FlavourKind::Dib => formats::CF_DIB,
+            FlavourKind::Tiff | FlavourKind::Bmp => {
+                return Err(Error::InvalidRequest(format!(
+                    "unexpected Windows clipboard flavour: {:?}",
+                    flavour.kind
+                )));
+            }
+        };
+        set_without_clear(format, &flavour.bytes).map_err(|code| {
+            Error::Platform(format!(
+                "could not write {} to the clipboard: error {code}",
+                flavour.platform_type
+            ))
+        })?;
+    }
+
+    if !files.is_empty() {
+        let paths = files
+            .iter()
+            .map(|path| path.to_str().expect("validated as Unicode").to_owned())
+            .collect::<Vec<_>>();
+        set_file_list_with(&paths, options::NoClear).map_err(|code| {
+            Error::Platform(format!(
+                "could not write file references to the clipboard: error {code}"
+            ))
+        })?;
+    }
+
+    let png = clipboard_win::register_format("PNG")
+        .ok_or_else(|| Error::Platform("could not verify the PNG format".to_owned()))?
+        .get();
+    let missing = flavours
+        .iter()
+        .filter_map(|flavour| {
+            let format = match flavour.kind {
+                FlavourKind::Png => png,
+                FlavourKind::DibV5 => formats::CF_DIBV5,
+                FlavourKind::Dib => formats::CF_DIB,
+                FlavourKind::Tiff | FlavourKind::Bmp => return Some(flavour.platform_type),
+            };
+            (!clipboard_win::is_format_avail(format)).then_some(flavour.platform_type)
+        })
+        .chain(
+            (!files.is_empty() && !clipboard_win::is_format_avail(formats::CF_HDROP))
+                .then_some(file_platform_type(ClipboardPlatform::Windows)),
+        )
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Platform(format!(
+            "clipboard omitted required format(s): {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+const fn file_platform_type(platform: ClipboardPlatform) -> &'static str {
+    match platform {
+        ClipboardPlatform::MacOs => "public.file-url",
+        ClipboardPlatform::Windows => "CF_HDROP",
+        ClipboardPlatform::X11 | ClipboardPlatform::Wayland => "text/uri-list",
     }
 }
 
