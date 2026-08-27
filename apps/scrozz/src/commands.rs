@@ -19,9 +19,14 @@
 
 use std::path::Path;
 
-use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
-use scrozz_export::{Clipboard, Encoder, FrameEncoder};
+use scrozz_annotate::{Renderer as _, SkiaRenderer};
+use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Provenance};
+use scrozz_export::{Clipboard, Encoder, FrameEncoder, ImageFormat};
 use scrozz_ocr::Ocr as _;
+use scrozz_store::{
+    CaptureId, CaptureRecord, DocumentState, History as _, ImageState, Page, SearchQuery,
+    SqliteStore, Store as _, Timestamp,
+};
 
 use crate::{
     cli::{
@@ -364,31 +369,279 @@ fn is_wayland() -> bool {
 // ---------------------------------------------------------------------------
 
 fn history(command: &HistoryCommand) -> CliResult<Report> {
+    let mut store = platform::store()?;
+    history_with_store(&mut store, command)
+}
+
+fn history_with_store(store: &mut SqliteStore, command: &HistoryCommand) -> CliResult<Report> {
     match command {
-        HistoryCommand::List { .. } => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "listing the capture history",
-                "scrozz-store",
-            ))
+        HistoryCommand::List {
+            limit,
+            offset,
+            kind,
+            search,
+            app,
+            after,
+            before,
+            pinned,
+            images_only,
+        } => {
+            let mut query = SearchQuery::all()
+                .between(after.map(Timestamp), before.map(Timestamp))
+                .paged(Page::new(*limit, *offset));
+            if let Some(kind) = kind {
+                query = query.kind(*kind);
+            }
+            if let Some(search) = search {
+                query = query.text(search);
+            }
+            if let Some(app) = app {
+                query = query.app(app);
+            }
+            if *pinned {
+                query = query.pinned_only();
+            }
+            if *images_only {
+                query = query.images_only();
+            }
+
+            let captures = store.search(&query)?;
+            let total = store.count_matching(&query)?;
+            let data = Json::obj([
+                ("total", Json::Int(i64::try_from(total).unwrap_or(i64::MAX))),
+                ("count", Json::Int(captures.len() as i64)),
+                ("limit", Json::Int(i64::from(*limit))),
+                ("offset", Json::Int(i64::from(*offset))),
+                (
+                    "captures",
+                    Json::arr(captures.iter().map(capture_record_json)),
+                ),
+            ]);
+            Ok(Report::new(data, history_table(&captures, total)))
         }
-        HistoryCommand::Get { .. } => Err(CliError::not_implemented(
-            "reading a stored capture",
-            "scrozz-store (the Store trait has list, set_pinned and \
-             enforce_retention, but no way to read a capture back)",
-        )),
-        HistoryCommand::Delete { .. } => Err(CliError::not_implemented(
-            "deleting a stored capture",
-            "scrozz-store (the Store trait exposes no delete)",
-        )),
-        HistoryCommand::Pin { .. } => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "pinning a capture",
-                "scrozz-store",
+        HistoryCommand::Get { id, output, stdout } => {
+            history_get(store, id, output.as_deref(), *stdout)
+        }
+        HistoryCommand::Delete { ids } => {
+            let mut deleted = Vec::new();
+            let mut not_found = Vec::new();
+            for id in ids {
+                if store.delete(&CaptureId(id.clone()))? {
+                    deleted.push(id.clone());
+                } else {
+                    not_found.push(id.clone());
+                }
+            }
+            let count = deleted.len();
+            let data = Json::obj([
+                (
+                    "deleted",
+                    Json::arr(deleted.iter().map(|id| Json::str(id.as_str()))),
+                ),
+                (
+                    "not_found",
+                    Json::arr(not_found.iter().map(|id| Json::str(id.as_str()))),
+                ),
+                ("count", Json::Int(count as i64)),
+            ]);
+            let noun = if count == 1 { "capture" } else { "captures" };
+            let mut human = format!("Deleted {count} {noun}.");
+            if !not_found.is_empty() {
+                human.push_str(&format!(" Not found: {}.", not_found.join(", ")));
+            }
+            Ok(Report::new(data, human))
+        }
+        HistoryCommand::Pin { id, unpin } => {
+            let capture_id = CaptureId(id.clone());
+            if store.record(&capture_id)?.is_none() {
+                return Err(history_not_found(id));
+            }
+            let pinned = !unpin;
+            store.set_pinned(&capture_id, pinned)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("id", Json::str(id.as_str())),
+                    ("pinned", Json::Bool(pinned)),
+                ]),
+                format!(
+                    "{} capture {id}.",
+                    if pinned { "Pinned" } else { "Unpinned" }
+                ),
             ))
         }
     }
+}
+
+fn history_get(
+    store: &mut SqliteStore,
+    id: &str,
+    output: Option<&Path>,
+    stdout: bool,
+) -> CliResult<Report> {
+    let capture_id = CaptureId(id.to_owned());
+    let document = match store.document(&capture_id)? {
+        Some(DocumentState::Complete(document)) => document,
+        Some(DocumentState::ImageEvicted(_)) => return Err(history_image_evicted(id)),
+        None => return Err(history_not_found(id)),
+    };
+    let frame = SkiaRenderer::new().render(&document)?;
+    let width = frame.width();
+    let height = frame.height();
+    let bytes = FrameEncoder::new().encode(&frame, ImageFormat::Png)?;
+
+    let path = if stdout {
+        None
+    } else if let Some(path) = output {
+        std::fs::write(path, &bytes)?;
+        Some(path.to_path_buf())
+    } else {
+        Some(crate::output::export_default(&bytes)?)
+    };
+    let human = path.as_ref().map_or_else(
+        || format!("Wrote capture {id} to stdout."),
+        |path| format!("Saved capture {id} to {}.", path.display()),
+    );
+    let data = Json::obj([
+        ("id", Json::str(id)),
+        (
+            "path",
+            Json::opt(path.as_ref(), |path| path_json(path.as_path())),
+        ),
+        ("bytes", Json::Int(bytes.len() as i64)),
+        ("format", Json::str("png")),
+        ("width", Json::Int(i64::from(width))),
+        ("height", Json::Int(i64::from(height))),
+    ]);
+    let report = Report::new(data, human);
+    Ok(if stdout {
+        report.with_raw(bytes)
+    } else {
+        report
+    })
+}
+
+fn capture_record_json(record: &CaptureRecord) -> Json {
+    Json::obj([
+        ("id", Json::str(record.id.0.as_str())),
+        ("created_at", Json::Int(record.created_at.as_millis())),
+        ("media_kind", Json::str(record.media_kind.as_token())),
+        ("pinned", Json::Bool(record.pinned)),
+        ("app_name", Json::opt(record.app_name.as_deref(), Json::str)),
+        (
+            "window_title",
+            Json::opt(record.window_title.as_deref(), Json::str),
+        ),
+        ("provenance", Json::str(provenance_slug(record.provenance))),
+        ("width", Json::Float(record.frame.size.width)),
+        ("height", Json::Float(record.frame.size.height)),
+        ("scale", Json::Float(record.frame.scale.get())),
+        ("image_state", Json::str(image_state_slug(&record.image))),
+        (
+            "image_bytes",
+            Json::Int(i64::try_from(record.image.byte_len()).unwrap_or(i64::MAX)),
+        ),
+        (
+            "annotation_count",
+            Json::Int(record.annotation_count as i64),
+        ),
+        ("has_ocr", Json::Bool(record.ocr_text.is_some())),
+        ("ocr_text", Json::opt(record.ocr_text.as_deref(), Json::str)),
+    ])
+}
+
+fn history_table(captures: &[CaptureRecord], total: u64) -> String {
+    if captures.is_empty() {
+        return "No captures matched.".to_owned();
+    }
+    let mut lines = Vec::with_capacity(captures.len() + 2);
+    lines.push("ID\tTIME (UTC)\tKIND\tAPP / TITLE\tPIN\tPIXELS\tEDITS\tOCR".to_owned());
+    for record in captures {
+        let app_title = match (&record.app_name, &record.window_title) {
+            (Some(app), Some(title)) => format!("{app} / {title}"),
+            (Some(app), None) => app.clone(),
+            (None, Some(title)) => title.clone(),
+            (None, None) => "-".to_owned(),
+        };
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            record.id.0,
+            format_utc_millis(record.created_at),
+            record.media_kind.as_token(),
+            app_title,
+            if record.pinned { "yes" } else { "no" },
+            match &record.image {
+                ImageState::Present { byte_len, .. } => format_bytes(*byte_len),
+                ImageState::Evicted { .. } => "evicted".to_owned(),
+                ImageState::Absent => "absent".to_owned(),
+            },
+            record.annotation_count,
+            if record.ocr_text.is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+        ));
+    }
+    lines.push(format!(
+        "Showing {} of {total} matching captures.",
+        captures.len()
+    ));
+    lines.join("\n")
+}
+
+fn format_utc_millis(timestamp: Timestamp) -> String {
+    let millis = timestamp.as_millis();
+    let civil = scrozz_export::Timestamp::from_unix_seconds(millis.div_euclid(1_000));
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        civil.year,
+        civil.month,
+        civil.day,
+        civil.hour,
+        civil.minute,
+        civil.second,
+        millis.rem_euclid(1_000)
+    )
+}
+
+const fn image_state_slug(state: &ImageState) -> &'static str {
+    match state {
+        ImageState::Present { .. } => "present",
+        ImageState::Evicted { .. } => "evicted",
+        ImageState::Absent => "absent",
+    }
+}
+
+const fn provenance_slug(provenance: Provenance) -> &'static str {
+    match provenance {
+        Provenance::Display => "display",
+        Provenance::Window => "window",
+        Provenance::Region => "region",
+        Provenance::AllDisplays => "all-displays",
+        Provenance::Stitched => "stitched",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn history_not_found(id: &str) -> CliError {
+    CliError::Core(CoreError::Storage(format!(
+        "capture {id:?} was not found in history"
+    )))
+}
+
+fn history_image_evicted(id: &str) -> CliError {
+    CliError::Core(CoreError::Storage(format!(
+        "capture {id:?} is still in history, but its source image was evicted by the retention policy"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -422,17 +675,53 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
                 ))));
             }
             let frame = platform::decode_image_file(&path)?;
-            let blocks = platform::ocr_engine().recognize(&frame)?;
+            let blocks = confident_blocks(
+                platform::ocr_engine().recognize(&frame)?,
+                args.min_confidence,
+            );
             Ok(ocr_report(&blocks, &path.display().to_string()))
         }
-        OcrSubject::Capture(_) => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "recognising text in a stored capture",
-                "scrozz-store",
-            ))
+        OcrSubject::Capture(id) => {
+            let mut store = platform::store()?;
+            ocr_stored_capture(
+                &mut store,
+                &platform::ocr_engine(),
+                &id,
+                args.min_confidence,
+            )
         }
     }
+}
+
+fn ocr_stored_capture(
+    store: &mut SqliteStore,
+    engine: &impl scrozz_ocr::Ocr,
+    id: &str,
+    min_confidence: Option<f32>,
+) -> CliResult<Report> {
+    let capture_id = CaptureId(id.to_owned());
+    let document = match store.document(&capture_id)? {
+        Some(DocumentState::Complete(document)) => document,
+        Some(DocumentState::ImageEvicted(_)) => return Err(history_image_evicted(id)),
+        None => return Err(history_not_found(id)),
+    };
+    let blocks = confident_blocks(engine.recognize(&document.source.frame)?, min_confidence);
+    let text = scrozz_ocr::plain_text(&blocks);
+    store.set_ocr_text(&capture_id, Some(&text))?;
+    Ok(ocr_report(&blocks, id))
+}
+
+fn confident_blocks(
+    blocks: Vec<scrozz_ocr::TextBlock>,
+    min_confidence: Option<f32>,
+) -> Vec<scrozz_ocr::TextBlock> {
+    let Some(min) = min_confidence else {
+        return blocks;
+    };
+    blocks
+        .into_iter()
+        .filter(|block| block.confidence >= min)
+        .collect()
 }
 
 /// Renders recognised text for both `--json` and human output.
@@ -443,11 +732,7 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
 /// the human path would corrupt the far more common case of piping the text
 /// somewhere.
 fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
-    let text = blocks
-        .iter()
-        .map(|b| b.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = scrozz_ocr::plain_text(blocks);
 
     let data = Json::obj([
         ("source", Json::str(source)),
@@ -683,6 +968,11 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+    use scrozz_store::{
+        MediaKind, NewCapture, RetentionPolicy, RetentionWindow,
+        test_support::{ScratchDir, id_at, sample_document, scratch_dir},
+    };
 
     use super::*;
     use crate::{cli::Cli, exit::Exit};
@@ -695,6 +985,32 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    fn history_fixture() -> (ScratchDir, SqliteStore, CaptureId, CaptureId) {
+        let dir = scratch_dir("commands-history");
+        let mut store = SqliteStore::open_ephemeral(dir.path()).expect("open history");
+        let first_document = sample_document(16, 8, 1, 2);
+        let first = store
+            .insert(
+                NewCapture::new(&first_document)
+                    .from_app("Preview")
+                    .titled("January invoice")
+                    .with_ocr("Total due")
+                    .taken_at(Timestamp(1_735_776_000_000))
+                    .pinned(),
+            )
+            .expect("insert screenshot");
+        let second_document = sample_document(12, 6, 2, 0);
+        let second = store
+            .insert(
+                NewCapture::of_kind(&second_document, MediaKind::Video)
+                    .from_app("Safari")
+                    .titled("Product demo")
+                    .taken_at(Timestamp(1_735_862_400_000)),
+            )
+            .expect("insert video");
+        (dir, store, first, second)
     }
 
     // -- dry-run capture ---------------------------------------------------
@@ -851,10 +1167,6 @@ mod tests {
         let cases = [
             vec!["scrozz", "capture", "--region", "0,0,10,10"],
             vec!["scrozz", "record"],
-            vec!["scrozz", "history", "list"],
-            vec!["scrozz", "history", "get", "abc"],
-            vec!["scrozz", "history", "delete", "abc"],
-            vec!["scrozz", "history", "pin", "abc"],
             vec!["scrozz", "gui"],
         ];
         for argv in cases {
@@ -868,17 +1180,119 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_store_reads_are_named_precisely() {
-        // These are the two the Store trait genuinely cannot express today, as
-        // opposed to merely lacking an implementation.
-        let err = run(&["scrozz", "history", "get", "abc"]).unwrap_err();
-        assert!(
-            err.to_string().contains("no way to read a capture back"),
-            "{err}"
+    fn history_list_filters_paginates_and_keeps_json_key_order_stable() {
+        let (_dir, mut store, first, _) = history_fixture();
+        let report = history_with_store(
+            &mut store,
+            &HistoryCommand::List {
+                limit: 1,
+                offset: 0,
+                kind: Some(MediaKind::Screenshot),
+                search: Some("invoice".into()),
+                app: Some("preview".into()),
+                after: Some(1_735_689_600_000),
+                before: Some(1_735_862_399_999),
+                pinned: true,
+                images_only: true,
+            },
+        )
+        .expect("list history");
+        let Json::Obj(fields) = report.data else {
+            panic!("history list must return an object")
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["total", "count", "limit", "offset", "captures"]
         );
+        assert_eq!(fields[0].1, Json::Int(1));
+        let Json::Arr(captures) = &fields[4].1 else {
+            panic!("captures must be an array")
+        };
+        let Json::Obj(capture) = &captures[0] else {
+            panic!("capture must be an object")
+        };
+        assert_eq!(
+            capture
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "id",
+                "created_at",
+                "media_kind",
+                "pinned",
+                "app_name",
+                "window_title",
+                "provenance",
+                "width",
+                "height",
+                "scale",
+                "image_state",
+                "image_bytes",
+                "annotation_count",
+                "has_ocr",
+                "ocr_text",
+            ]
+        );
+        assert_eq!(capture[0].1, Json::str(first.0));
+        assert!(report.human.contains("January invoice"));
+    }
 
-        let err = run(&["scrozz", "history", "delete", "abc"]).unwrap_err();
-        assert!(err.to_string().contains("no delete"), "{err}");
+    #[test]
+    fn history_get_renders_the_stored_document_to_png() {
+        let (_dir, mut store, first, _) = history_fixture();
+        let report = history_get(&mut store, &first.0, None, true).expect("read stored screenshot");
+        let bytes = report.raw.expect("stdout mode returns bytes");
+        assert_eq!(ImageFormat::sniff(&bytes), Some(ImageFormat::Png));
+        assert!(report.data.to_compact_string().contains(r#""path":null"#));
+    }
+
+    #[test]
+    fn history_pin_and_delete_mutate_the_durable_record() {
+        let (_dir, mut store, _, second) = history_fixture();
+        history_with_store(
+            &mut store,
+            &HistoryCommand::Pin {
+                id: second.0.clone(),
+                unpin: false,
+            },
+        )
+        .expect("pin capture");
+        assert!(store.record(&second).unwrap().unwrap().pinned);
+
+        let missing = id_at(1_600_000_000_000);
+        let report = history_with_store(
+            &mut store,
+            &HistoryCommand::Delete {
+                ids: vec![second.0.clone(), missing.0.clone()],
+            },
+        )
+        .expect("delete capture");
+        assert!(store.record(&second).unwrap().is_none());
+        let rendered = report.data.to_compact_string();
+        assert!(rendered.contains(r#""count":1"#), "{rendered}");
+        assert!(
+            rendered.contains(&format!(r#""not_found":["{}"]"#, missing.0)),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn history_get_reports_retention_eviction_without_losing_the_record() {
+        let (_dir, mut store, _, second) = history_fixture();
+        store
+            .evict(&RetentionPolicy {
+                max_image_bytes: 0,
+                max_image_age: RetentionWindow::Forever,
+            })
+            .expect("evict images");
+        let err = history_get(&mut store, &second.0, None, true).unwrap_err();
+        assert_eq!(err.exit(), Exit::Storage);
+        assert!(err.to_string().contains("evicted"), "{err}");
+        assert!(store.record(&second).unwrap().is_some());
     }
 
     #[test]
@@ -1074,6 +1488,52 @@ mod tests {
         }
         let err = run(&["scrozz", "ocr", "--file", "./definitely-not-here.png"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Io);
+    }
+
+    #[derive(Debug)]
+    struct StubOcr;
+
+    impl scrozz_ocr::Ocr for StubOcr {
+        fn recognize(
+            &self,
+            _frame: &scrozz_core::Frame,
+        ) -> scrozz_core::Result<Vec<scrozz_ocr::TextBlock>> {
+            Ok(vec![
+                scrozz_ocr::TextBlock {
+                    text: "keep me".into(),
+                    bounds: LogicalRect::new(
+                        LogicalPoint::new(1.0, 1.0),
+                        LogicalSize::new(6.0, 2.0),
+                    ),
+                    confidence: 0.95,
+                },
+                scrozz_ocr::TextBlock {
+                    text: "discard me".into(),
+                    bounds: LogicalRect::new(
+                        LogicalPoint::new(1.0, 4.0),
+                        LogicalSize::new(6.0, 2.0),
+                    ),
+                    confidence: 0.2,
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn ocr_on_a_stored_capture_filters_and_persists_searchable_text() {
+        let (_dir, mut store, first, _) = history_fixture();
+        let report = ocr_stored_capture(&mut store, &StubOcr, &first.0, Some(0.8))
+            .expect("recognise stored capture");
+        assert_eq!(report.human, "keep me");
+        assert_eq!(
+            store.record(&first).unwrap().unwrap().ocr_text.as_deref(),
+            Some("keep me")
+        );
+        let found = store
+            .search(&SearchQuery::all().text("keep me"))
+            .expect("search OCR text");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, first);
     }
 
     // -- shared rendering --------------------------------------------------
