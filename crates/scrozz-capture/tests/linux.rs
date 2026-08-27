@@ -1316,14 +1316,26 @@ mod randr_wire {
 // ---------------------------------------------------------------------------
 
 mod restore_tokens {
-    use super::wayland::restore::{TokenKey, TokenStore, token_path};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::wayland::restore::{
+        TokenFileLock, TokenKey, TokenStore, load, persist, persist_fail_closed, token_path,
+    };
 
     #[test]
     fn keys_round_trip_through_their_on_disk_spelling() {
-        for key in [TokenKey::Monitor, TokenKey::Window, TokenKey::AllDisplays] {
+        for key in [
+            TokenKey::Monitor,
+            TokenKey::Window,
+            TokenKey::AllDisplays,
+            TokenKey::display(&scrozz_core::DisplayId("x11:1:DP-1".into())),
+        ] {
             assert_eq!(TokenKey::parse(key.as_str()), Some(key));
         }
-        assert_eq!(TokenKey::parse("display"), None);
+        assert_eq!(TokenKey::parse("display:not-hex"), None);
         assert_eq!(TokenKey::parse(""), None);
     }
 
@@ -1332,12 +1344,47 @@ mod restore_tokens {
     #[test]
     fn tokens_are_kept_apart_by_session_kind() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::Monitor, "mon-token");
-        store.set(TokenKey::Window, "win-token");
+        store.set(&TokenKey::Monitor, "mon-token");
+        store.set(&TokenKey::Window, "win-token");
 
-        assert_eq!(store.get(TokenKey::Monitor), Some("mon-token"));
-        assert_eq!(store.get(TokenKey::Window), Some("win-token"));
-        assert_eq!(store.get(TokenKey::AllDisplays), None);
+        assert_eq!(store.get(&TokenKey::Monitor), Some("mon-token"));
+        assert_eq!(store.get(&TokenKey::Window), Some("win-token"));
+        assert_eq!(store.get(&TokenKey::AllDisplays), None);
+    }
+
+    /// A token for one exact display must never silently restore another. The
+    /// encoded keys also keep arbitrary display names out of the tab-delimited
+    /// file syntax.
+    #[test]
+    fn display_tokens_are_scoped_to_one_encoded_identity() {
+        let left = TokenKey::display(&scrozz_core::DisplayId("x11:0:Left\tPanel".into()));
+        let right = TokenKey::display(&scrozz_core::DisplayId("x11:1:Right\nPanel".into()));
+        let mut store = TokenStore::new();
+        store.set(&left, "left-token");
+        store.set(&right, "right-token");
+
+        assert_eq!(store.get(&left), Some("left-token"));
+        assert_eq!(store.get(&right), Some("right-token"));
+        assert!(!left.as_str().contains(['\t', '\n']));
+        assert_eq!(TokenStore::parse(&store.serialise()), store);
+    }
+
+    /// Older builds stored one generic monitor token. It may be attempted only
+    /// as a migration candidate; the caller verifies the returned stream before
+    /// moving its rotation under the exact display key.
+    #[test]
+    fn an_exact_display_can_migrate_a_legacy_monitor_token() {
+        let display = TokenKey::display(&scrozz_core::DisplayId("x11:0:eDP-1".into()));
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, "legacy-token");
+
+        assert_eq!(
+            store.candidate(&display),
+            Some((TokenKey::Monitor, "legacy-token"))
+        );
+        store.set(&display, "rotated-token");
+        store.invalidate(&TokenKey::Monitor);
+        assert_eq!(store.candidate(&display), Some((display, "rotated-token")));
     }
 
     /// The portal returns an empty string when the user declined persistence.
@@ -1346,26 +1393,29 @@ mod restore_tokens {
     #[test]
     fn an_empty_token_removes_rather_than_stores() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::Monitor, "mon-token");
-        store.set(TokenKey::Monitor, "");
-        assert_eq!(store.get(TokenKey::Monitor), None);
+        store.set(&TokenKey::Monitor, "mon-token");
+        store.set(&TokenKey::Monitor, "");
+        assert_eq!(store.get(&TokenKey::Monitor), None);
         assert!(store.is_empty());
     }
 
     #[test]
     fn a_refused_token_can_be_discarded() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::AllDisplays, "stale");
-        store.invalidate(TokenKey::AllDisplays);
-        assert_eq!(store.get(TokenKey::AllDisplays), None);
-        store.invalidate(TokenKey::AllDisplays); // idempotent
+        store.set(&TokenKey::AllDisplays, "stale");
+        store.invalidate(&TokenKey::AllDisplays);
+        assert_eq!(store.get(&TokenKey::AllDisplays), None);
+        store.invalidate(&TokenKey::AllDisplays); // idempotent
     }
 
     #[test]
     fn the_store_round_trips_through_its_file_format() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::Monitor, "3fdd2d7e-8d54-4b5f-9d0f-1f7f2f0f4f8a");
-        store.set(TokenKey::AllDisplays, "kwin/42");
+        store.set(
+            &TokenKey::display(&scrozz_core::DisplayId("x11:0:eDP-1".into())),
+            "3fdd2d7e-8d54-4b5f-9d0f-1f7f2f0f4f8a",
+        );
+        store.set(&TokenKey::AllDisplays, "kwin/42");
 
         let text = store.serialise();
         assert!(text.starts_with('#'), "explains itself to whoever finds it");
@@ -1386,9 +1436,9 @@ window\t
    window \t  spaced-token  
 ";
         let store = TokenStore::parse(text);
-        assert_eq!(store.get(TokenKey::Monitor), Some("good-token"));
-        assert_eq!(store.get(TokenKey::Window), Some("spaced-token"));
-        assert_eq!(store.get(TokenKey::AllDisplays), None);
+        assert_eq!(store.get(&TokenKey::Monitor), Some("good-token"));
+        assert_eq!(store.get(&TokenKey::Window), Some("spaced-token"));
+        assert_eq!(store.get(&TokenKey::AllDisplays), None);
     }
 
     #[test]
@@ -1433,6 +1483,218 @@ window\t
         assert_eq!(token_path(None, None), None);
         assert_eq!(token_path(Some("  "), Some("  ")), None);
     }
+
+    #[test]
+    fn token_file_lock_excludes_another_process_descriptor() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-lock-{}-{nonce}", std::process::id()));
+        let path = directory.join("portal-tokens");
+        let first = TokenFileLock::acquire(&path).expect("first process lock");
+
+        let lock_path = directory.join("portal-tokens.lock");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&lock_path)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            TokenFileLock::try_acquire(&path)
+                .expect("second descriptor")
+                .is_none(),
+            "the second descriptor must observe the held advisory lock"
+        );
+
+        drop(first);
+        let second = TokenFileLock::try_acquire(&path)
+            .expect("second descriptor")
+            .expect("lock is released on drop");
+        drop(second);
+        std::fs::remove_file(lock_path).expect("remove lock fixture");
+        std::fs::remove_dir(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn token_persistence_is_atomic_and_reports_storage_failures() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-write-{}-{nonce}", std::process::id()));
+        let path = directory.join("state").join("portal-tokens");
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, "rotated");
+
+        persist(Some(&path), &store).expect("persist token");
+        assert_eq!(load(&path).expect("securely load token"), store);
+        let written = std::fs::read_to_string(&path).expect("read token");
+        assert_eq!(TokenStore::parse(&written), store);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("token metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("make an old store permissive");
+            let lock = TokenFileLock::acquire(&path).expect("lock and harden old store");
+            drop(lock);
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("hardened token metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::remove_file(path.with_file_name("portal-tokens.lock")).expect("remove lock");
+        }
+        assert!(
+            !path.with_file_name("portal-tokens.tmp").exists(),
+            "atomic temporary file is removed by rename"
+        );
+
+        std::fs::remove_file(&path).expect("remove token");
+        std::fs::remove_dir(directory.join("state")).expect("remove state directory");
+
+        let blocker = directory.join("not-a-directory");
+        std::fs::write(&blocker, b"file").expect("write blocker");
+        let error = persist(Some(&blocker.join("portal-tokens")), &store)
+            .expect_err("a file cannot be a parent directory");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected persistence failure: {error}"
+        );
+        std::fs::remove_file(blocker).expect("remove blocker");
+        std::fs::remove_dir(directory).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_paths_refuse_leaf_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-links-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).expect("create fixture");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"do not touch").expect("write victim");
+
+        let symlink_path = directory.join("portal-tokens");
+        symlink(&victim, &symlink_path).expect("create token symlink");
+        assert!(TokenFileLock::acquire(&symlink_path).is_err());
+        assert!(load(&symlink_path).is_err());
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"do not touch"
+        );
+        std::fs::remove_file(&symlink_path).expect("remove symlink");
+
+        let hardlink_path = directory.join("portal-tokens-hardlink");
+        std::fs::hard_link(&victim, &hardlink_path).expect("create token hardlink");
+        assert!(load(&hardlink_path).is_err());
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"do not touch"
+        );
+
+        std::fs::remove_file(hardlink_path).expect("remove hardlink");
+        std::fs::remove_file(victim).expect("remove victim");
+        std::fs::remove_dir(directory).expect("remove fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistence_unlinks_a_reserved_hardlinked_temp_without_truncating_its_target() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-token-temp-link-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create fixture");
+        let path = directory.join("portal-tokens");
+        let temporary = directory.join("portal-tokens.tmp");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"must survive").expect("write victim");
+        std::fs::hard_link(&victim, &temporary).expect("reserve temp as a hardlink");
+
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, "rotated");
+        persist(Some(&path), &store).expect("replace the reserved temporary name safely");
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"must survive",
+            "opening the temporary path must never truncate a preexisting inode"
+        );
+        assert_eq!(load(&path).expect("load replacement"), store);
+        assert!(!temporary.exists());
+
+        std::fs::remove_file(path).expect("remove token");
+        std::fs::remove_file(victim).expect("remove victim");
+        std::fs::remove_dir(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn token_files_and_rotations_have_a_bounded_size() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-size-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).expect("create fixture");
+        let path = directory.join("portal-tokens");
+        std::fs::write(&path, vec![b'x'; 70 * 1024]).expect("write oversized fixture");
+        assert_eq!(
+            load(&path)
+                .expect_err("an oversized token file must be refused")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_file(&path).expect("remove oversized fixture");
+
+        let mut old_store = TokenStore::new();
+        old_store.set(&TokenKey::Monitor, "consumed");
+        persist(Some(&path), &old_store).expect("persist consumed token");
+
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, &"x".repeat(70 * 1024));
+        assert_eq!(
+            persist_fail_closed(Some(&path), &store)
+                .expect_err("an oversized rotation must not reach disk")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(
+            !path.exists(),
+            "a failed rotation must remove the old consumed token"
+        );
+        assert!(!directory.join("portal-tokens.tmp").exists());
+        std::fs::remove_dir(directory).expect("remove fixture");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,7 +1703,8 @@ window\t
 
 mod portal_negotiation {
     use super::wayland::portal::{
-        PlanFailure, SessionPlan, StreamInfo, cursor_mode, path_from_uri, persist_mode, source_type,
+        PORTAL_PICKER_WINDOW_ID, PlanFailure, SessionPlan, StreamInfo, cursor_mode, path_from_uri,
+        persist_mode, source_type,
     };
     use super::wayland::restore::TokenKey;
     use scrozz_core::{CaptureTarget, DisplayId, LogicalPoint, LogicalRect, LogicalSize, WindowId};
@@ -1451,7 +1714,7 @@ mod portal_negotiation {
         let plan =
             SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false).unwrap();
         assert_eq!(plan.types, source_type::MONITOR);
-        assert_eq!(plan.restore_key, TokenKey::Monitor);
+        assert_eq!(plan.restore_key, TokenKey::display(&DisplayId("1".into())));
     }
 
     /// The portal has no concept of a sub-rectangle, and asking the user to
@@ -1465,12 +1728,36 @@ mod portal_negotiation {
         let plan = SessionPlan::for_target(&region, false).unwrap();
         assert_eq!(plan.types, source_type::MONITOR);
         assert_eq!(plan.restore_key, TokenKey::Monitor);
+        assert_eq!(
+            plan.bind_monitor(&DisplayId("x11:0:eDP-1".into()))
+                .restore_key,
+            TokenKey::display(&DisplayId("x11:0:eDP-1".into()))
+        );
     }
 
     #[test]
-    fn a_window_capture_asks_for_a_window() {
-        let plan =
-            SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false).unwrap();
+    fn a_requested_window_id_is_refused_before_the_picker() {
+        assert_eq!(
+            SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false),
+            Err(PlanFailure::WindowIdentityUnavailable)
+        );
+        let scrozz_core::Error::Unsupported { what, why } =
+            PlanFailure::WindowIdentityUnavailable.into_error()
+        else {
+            panic!("an unverifiable window id must be unsupported");
+        };
+        assert!(what.contains("window id"));
+        assert!(why.contains("before opening the picker"));
+        assert!(why.contains("cannot prove"));
+    }
+
+    #[test]
+    fn the_explicit_portal_window_sentinel_opens_only_a_window_picker() {
+        let plan = SessionPlan::for_target(
+            &CaptureTarget::Window(WindowId(PORTAL_PICKER_WINDOW_ID.into())),
+            false,
+        )
+        .expect("the explicit portal-owned target is honest");
         assert_eq!(plan.types, source_type::WINDOW);
         assert_eq!(plan.restore_key, TokenKey::Window);
     }
@@ -1524,13 +1811,13 @@ mod portal_negotiation {
     }
 
     #[test]
-    fn narrowing_to_nothing_is_a_refusal() {
+    fn narrowing_a_monitor_plan_to_nothing_is_a_refusal() {
         assert_eq!(
-            SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false)
+            SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false)
                 .unwrap()
-                .narrow(source_type::MONITOR, cursor_mode::EMBEDDED),
+                .narrow(source_type::WINDOW, cursor_mode::EMBEDDED),
             None,
-            "a portal with no window source cannot serve a window capture"
+            "a portal with no monitor source cannot serve a display capture"
         );
     }
 
@@ -1612,6 +1899,8 @@ mod portal_negotiation {
         assert!(
             StreamInfo {
                 node_id: 42,
+                pipewire_serial: Some(9001),
+                source_type: Some(source_type::MONITOR),
                 position: Some((0, 0)),
                 size: Some((1920, 1080)),
             }
@@ -1620,10 +1909,59 @@ mod portal_negotiation {
         assert!(
             !StreamInfo {
                 node_id: 42,
+                pipewire_serial: None,
+                source_type: None,
                 position: None,
                 size: Some((1920, 1080)),
             }
             .is_placeable()
+        );
+    }
+
+    #[test]
+    fn modern_portal_streams_require_exact_source_and_stable_serial() {
+        let valid = StreamInfo {
+            node_id: u32::MAX,
+            pipewire_serial: Some(9001),
+            source_type: Some(source_type::MONITOR),
+            position: Some((0, 0)),
+            size: Some((1920, 1080)),
+        };
+        assert!(valid.validate_contract(6, source_type::MONITOR).is_ok());
+
+        let mut missing_serial = valid;
+        missing_serial.pipewire_serial = None;
+        assert!(
+            missing_serial
+                .validate_contract(6, source_type::MONITOR)
+                .expect_err("v6 requires pipewire-serial")
+                .contains("pipewire-serial")
+        );
+
+        let mut wrong_source = valid;
+        wrong_source.source_type = Some(source_type::WINDOW);
+        assert!(
+            wrong_source
+                .validate_contract(6, source_type::MONITOR)
+                .expect_err("a window stream cannot satisfy a monitor plan")
+                .contains("source type")
+        );
+    }
+
+    #[test]
+    fn legacy_numeric_target_must_not_be_pipewire_wildcard() {
+        let stream = StreamInfo {
+            node_id: u32::MAX,
+            pipewire_serial: None,
+            source_type: None,
+            position: None,
+            size: None,
+        };
+        assert!(
+            stream
+                .validate_contract(2, source_type::WINDOW)
+                .expect_err("an unspecified legacy target must fail before opening PipeWire")
+                .contains("wildcard node id")
         );
     }
 }
@@ -1790,7 +2128,7 @@ mod spa_pod {
     /// is the difference between negotiating and hanging.
     #[test]
     fn a_fixated_value_is_read_through_its_choice_wrapper() {
-        let wrapped = Choice::enumerated(vec![Scalar::id(12)]);
+        let wrapped = Choice::fixed(Scalar::id(12));
         let object = Object {
             object_type: 0x0004_0003,
             id: 4,
@@ -1801,11 +2139,65 @@ mod spa_pod {
         let encoded = object.encode();
 
         let parsed = ObjectRef::parse(&encoded).expect("parseable");
+        assert!(parsed.property(0x0002_0001).expect("property").is_fixated());
         assert_eq!(
             parsed
                 .property(0x0002_0001)
                 .and_then(|property| property.as_id()),
             Some(12)
+        );
+    }
+
+    #[test]
+    fn a_fixated_choice_may_retain_ignored_alternatives() {
+        let mut wrapped = Choice::enumerated(vec![Scalar::id(12), Scalar::id(8)]);
+        wrapped.flavour = choice::NONE;
+        let encoded = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![Property::choice(1, &wrapped).expect("uniform choice encodes")],
+        }
+        .encode();
+
+        let property = ObjectRef::parse(&encoded)
+            .expect("parseable")
+            .property(1)
+            .expect("property");
+        assert!(property.is_fixated());
+        assert_eq!(
+            property.as_id(),
+            Some(12),
+            "SPA says values beyond the current one are ignored for Choice(None)"
+        );
+    }
+
+    #[test]
+    fn a_non_fixated_choice_and_wrong_width_scalar_are_not_agreements() {
+        let choices = Choice::enumerated(vec![Scalar::id(12), Scalar::id(8)]);
+        let single_choice = Choice::enumerated(vec![Scalar::id(12)]);
+        let oversized_id = Scalar {
+            kind: kind::ID,
+            body: [7u32.to_ne_bytes(), 99u32.to_ne_bytes()].concat(),
+        };
+        let encoded = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![
+                Property::choice(1, &choices).expect("uniform choice encodes"),
+                Property::scalar(2, &oversized_id),
+                Property::choice(3, &single_choice).expect("uniform choice encodes"),
+            ],
+        }
+        .encode();
+
+        let parsed = ObjectRef::parse(&encoded).expect("the outer object is well formed");
+        assert_eq!(parsed.property(1).and_then(|value| value.as_id()), None);
+        assert_eq!(parsed.property(2).and_then(|value| value.as_id()), None);
+        let single = parsed.property(3).expect("single enum");
+        assert_eq!(single.as_id(), Some(12), "the default remains inspectable");
+        assert!(
+            !single.is_fixated(),
+            "one offered alternative is not an explicit negotiation result"
         );
     }
 
@@ -1859,9 +2251,9 @@ mod format_negotiation {
     use scrozz_core::{ColorSpace, PixelFormat};
 
     use super::wayland::pipewire::format::{
-        self, FormatError, MAX_DIMENSION, MEDIA_SUBTYPE_RAW, MEDIA_TYPE_VIDEO, Negotiated,
-        OBJECT_FORMAT, OBJECT_PARAM_BUFFERS, PREFERRED_FORMATS, buffer_key, data_type, key, param,
-        primaries, video_format,
+        self, FormatError, MAX_DIMENSION, MAX_FRAME_BYTES, MEDIA_SUBTYPE_RAW, MEDIA_TYPE_VIDEO,
+        Negotiated, OBJECT_FORMAT, OBJECT_PARAM_BUFFERS, PREFERRED_FORMATS, PREFERRED_TRANSFERS,
+        buffer_key, data_type, key, param, primaries, transfer, video_format,
     };
     use super::wayland::pipewire::pod::{Object, ObjectRef, Property, Scalar, choice};
 
@@ -1906,6 +2298,7 @@ mod format_negotiation {
             Some(MEDIA_SUBTYPE_RAW)
         );
         assert!(parsed.property(key::VIDEO_FORMAT).is_some());
+        assert!(parsed.property(key::VIDEO_TRANSFER).is_some());
         assert!(parsed.property(key::VIDEO_SIZE).is_some());
         assert!(parsed.property(key::VIDEO_FRAMERATE).is_some());
     }
@@ -1961,19 +2354,22 @@ mod format_negotiation {
 
     /// BGRx first: it is what Mutter and KWin composite in, so matching it means
     /// the server hands over its own buffer rather than converting every frame.
+    /// Alpha-bearing alternatives are intentionally absent because raw SPA
+    /// negotiation cannot communicate their alpha association.
     #[test]
-    fn bgrx_is_offered_ahead_of_the_alternatives() {
+    fn only_opaque_formats_are_offered() {
         assert_eq!(PREFERRED_FORMATS[0], video_format::BGRX);
-        assert_eq!(PREFERRED_FORMATS.len(), 4);
+        assert_eq!(PREFERRED_FORMATS.len(), 2);
+        assert!(!PREFERRED_FORMATS.contains(&video_format::BGRA));
+        assert!(!PREFERRED_FORMATS.contains(&video_format::RGBA));
     }
 
-    /// Alpha honesty. SPA has no premultiplied video format, so `BGRA` means
-    /// straight alpha and must never be reported as premultiplied — doing so
-    /// black-fringes every antialiased edge downstream. The `x` variants have an
-    /// undefined fourth byte, which is a separate fact and is tracked
-    /// separately.
+    /// Alpha honesty. SPA defines a premultiplication flag but its raw-format POD
+    /// does not transport it, while portal producers conventionally hand out
+    /// premultiplied compositor pixels. Accepting BGRA/RGBA as straight would
+    /// black-fringe antialiased edges, so only opaque formats are nameable.
     #[test]
-    fn pixel_formats_map_without_inventing_premultiplication() {
+    fn alpha_bearing_formats_are_rejected_instead_of_mislabeled() {
         assert_eq!(
             format::pixel_format(video_format::BGRX),
             Some((PixelFormat::Bgra8, true))
@@ -1982,52 +2378,84 @@ mod format_negotiation {
             format::pixel_format(video_format::RGBX),
             Some((PixelFormat::Rgba8, true))
         );
-        assert_eq!(
-            format::pixel_format(video_format::BGRA),
-            Some((PixelFormat::Bgra8, false))
-        );
-        assert_eq!(
-            format::pixel_format(video_format::RGBA),
-            Some((PixelFormat::Rgba8, false))
-        );
+        assert_eq!(format::pixel_format(video_format::BGRA), None);
+        assert_eq!(format::pixel_format(video_format::RGBA), None);
         assert_eq!(format::pixel_format(0), None);
 
         for spa in PREFERRED_FORMATS {
-            let (mapped, _) = format::pixel_format(spa).expect("every offered format maps");
+            let (mapped, force_opaque) =
+                format::pixel_format(spa).expect("every offered format maps");
             assert!(
                 !mapped.is_premultiplied(),
-                "SPA has no premultiplied video format, so none may be reported"
+                "fully opaque output is represented by the ordinary RGBA/BGRA type"
+            );
+            assert!(
+                force_opaque,
+                "every negotiated format must erase alpha ambiguity"
             );
         }
     }
 
-    /// An unrecognised or absent colour space stays unknown rather than
-    /// defaulting to sRGB, so an encoder can decline to embed a profile instead
-    /// of embedding a wrong one on a wide-gamut display.
+    /// Primaries and transfer must agree before a named profile is attached.
+    /// Missing metadata stays unknown, while HDR transfer functions are refused
+    /// because this path negotiated only 8-bit SDR.
     #[test]
-    fn colour_primaries_map_conservatively() {
+    fn colour_metadata_maps_conservatively() {
         assert_eq!(
-            format::color_space(Some(primaries::BT709)),
-            ColorSpace::Srgb
+            format::color_space(Some(primaries::BT709), Some(transfer::SRGB)),
+            Ok(ColorSpace::Srgb)
         );
         assert_eq!(
-            format::color_space(Some(primaries::BT2020)),
-            ColorSpace::Rec2020
+            format::color_space(Some(primaries::BT2020), Some(transfer::BT2020_10)),
+            Ok(ColorSpace::Rec2020)
         );
         assert_eq!(
-            format::color_space(Some(primaries::SMPTE_RP431)),
-            ColorSpace::DisplayP3
+            format::color_space(Some(primaries::SMPTE_RP431), Some(transfer::SRGB)),
+            Ok(ColorSpace::Unknown),
+            "DCI-P3 uses a different white point from Display P3 and must not receive its ICC tag"
         );
         assert_eq!(
-            format::color_space(Some(primaries::SMPTE_EG432)),
-            ColorSpace::DisplayP3
+            format::color_space(Some(primaries::SMPTE_EG432), Some(transfer::SRGB)),
+            Ok(ColorSpace::DisplayP3)
         );
-        assert_eq!(format::color_space(None), ColorSpace::Unknown);
         assert_eq!(
-            format::color_space(Some(primaries::UNKNOWN)),
-            ColorSpace::Unknown
+            format::color_space(Some(primaries::BT709), Some(transfer::BT709)),
+            Ok(ColorSpace::Unknown),
+            "a representable SDR frame is kept but not given a false sRGB profile"
         );
-        assert_eq!(format::color_space(Some(4242)), ColorSpace::Unknown);
+        assert_eq!(
+            format::color_space(Some(primaries::BT709), Some(transfer::GAMMA22)),
+            Ok(ColorSpace::Unknown),
+            "Mutter's ordinary SDR transfer is accepted without a false ICC profile"
+        );
+        assert_eq!(
+            format::color_space(None, Some(transfer::SRGB)),
+            Ok(ColorSpace::Unknown)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT709), None),
+            Ok(ColorSpace::Unknown)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::UNKNOWN), Some(transfer::UNKNOWN)),
+            Ok(ColorSpace::Unknown)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT2020), Some(transfer::SMPTE2084)),
+            Err(FormatError::UnsupportedTransfer(transfer::SMPTE2084))
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT2020), Some(transfer::ARIB_STD_B67)),
+            Err(FormatError::UnsupportedTransfer(transfer::ARIB_STD_B67))
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::SMPTE_RP431), Some(99)),
+            Ok(ColorSpace::Unknown),
+            "an unnameable non-HDR pair remains usable without a false profile"
+        );
+        assert!(!PREFERRED_TRANSFERS.contains(&transfer::SMPTE2084));
+        assert!(!PREFERRED_TRANSFERS.contains(&transfer::ARIB_STD_B67));
+        assert!(PREFERRED_TRANSFERS.contains(&transfer::GAMMA22));
     }
 
     #[test]
@@ -2036,6 +2464,7 @@ mod format_negotiation {
             Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
             Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(2560, 1440)),
             Property::scalar(key::VIDEO_PRIMARIES, &Scalar::id(primaries::BT709)),
+            Property::scalar(key::VIDEO_TRANSFER, &Scalar::id(transfer::SRGB)),
         ]);
 
         assert_eq!(
@@ -2053,14 +2482,14 @@ mod format_negotiation {
     #[test]
     fn a_format_without_primaries_is_still_usable() {
         let bytes = raw_video(vec![
-            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::RGBA)),
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::RGBX)),
             Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(800, 600)),
         ]);
 
         let negotiated = format::parse_format(&bytes).expect("usable");
         assert_eq!(negotiated.color_space, ColorSpace::Unknown);
         assert_eq!(negotiated.pixel_format, PixelFormat::Rgba8);
-        assert!(!negotiated.opaque_padding);
+        assert!(negotiated.opaque_padding);
         assert_eq!(negotiated.packed_stride(), 3200);
         assert_eq!(negotiated.packed_len(), 3200 * 600);
     }
@@ -2090,6 +2519,20 @@ mod format_negotiation {
         assert_eq!(
             format::parse_format(&no_format),
             Err(FormatError::MissingFormat)
+        );
+
+        let offered_format = raw_video(vec![
+            Property::choice(
+                key::VIDEO_FORMAT,
+                &Choice::enumerated(vec![Scalar::id(video_format::BGRX)]),
+            )
+            .expect("uniform choice encodes"),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+        ]);
+        assert_eq!(
+            format::parse_format(&offered_format),
+            Err(FormatError::MissingFormat),
+            "an enum default is not an explicitly fixated format"
         );
 
         let no_size = raw_video(vec![Property::scalar(
@@ -2132,6 +2575,20 @@ mod format_negotiation {
             })
         );
 
+        let memory_oversized = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(8192, 8192)),
+        ]);
+        assert_eq!(
+            format::parse_format(&memory_oversized),
+            Err(FormatError::FrameTooLarge {
+                width: 8192,
+                height: 8192,
+                bytes: 8192 * 8192 * 4,
+            })
+        );
+        assert_eq!(MAX_FRAME_BYTES, 128 * 1024 * 1024);
+
         let modifier = raw_video(vec![
             Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
             Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
@@ -2141,6 +2598,19 @@ mod format_negotiation {
             format::parse_format(&modifier),
             Err(FormatError::UnexpectedModifier)
         );
+
+        for unsupported in [transfer::SMPTE2084, transfer::ARIB_STD_B67] {
+            let hdr = raw_video(vec![
+                Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+                Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+                Property::scalar(key::VIDEO_PRIMARIES, &Scalar::id(primaries::BT2020)),
+                Property::scalar(key::VIDEO_TRANSFER, &Scalar::id(unsupported)),
+            ]);
+            assert_eq!(
+                format::parse_format(&hdr),
+                Err(FormatError::UnsupportedTransfer(unsupported))
+            );
+        }
     }
 }
 
@@ -2148,7 +2618,11 @@ mod format_negotiation {
 mod stride_packing {
     use std::borrow::Cow;
 
-    use super::wayland::pipewire::format::{BufferError, linear_chunk, pack_rows};
+    use scrozz_core::{ColorSpace, PixelFormat};
+
+    use super::wayland::pipewire::format::{
+        BufferError, Negotiated, linear_chunk, pack_rows, validate_chunk_geometry,
+    };
 
     /// A padded buffer must be read row by row at the producer's stride and
     /// written at the packed one. Reading it linearly gives the classic
@@ -2222,6 +2696,56 @@ mod stride_packing {
         );
     }
 
+    #[test]
+    fn media_neutral_video_is_synthesized_as_opaque_black() {
+        let format = Negotiated {
+            width: 2,
+            height: 2,
+            pixel_format: PixelFormat::Bgra8,
+            opaque_padding: true,
+            color_space: ColorSpace::Unknown,
+        };
+        assert_eq!(
+            format.neutral_pixels().expect("small neutral frame"),
+            vec![
+                0, 0, 0, 0xff, 0, 0, 0, 0xff, //
+                0, 0, 0, 0xff, 0, 0, 0, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn pixel_chunks_require_complete_bounded_frame_geometry() {
+        assert_eq!(validate_chunk_geometry(32, 32, 16, 4, 2), Ok(32));
+        assert_eq!(
+            validate_chunk_geometry(1, 32, 16, 4, 2),
+            Err(BufferError::Short {
+                available: 1,
+                needed: 32,
+            })
+        );
+        assert_eq!(
+            validate_chunk_geometry(64, 32, 16, 4, 2),
+            Ok(32),
+            "SPA ring-buffer chunks are clamped to their backing mapping"
+        );
+        assert_eq!(
+            validate_chunk_geometry(64, 16, 16, 4, 2),
+            Err(BufferError::Short {
+                available: 16,
+                needed: 32,
+            }),
+            "clamping cannot invent bytes the mapping does not contain"
+        );
+        assert_eq!(
+            validate_chunk_geometry(32, (128 * 1024 * 1024) + 1, 16, 4, 2),
+            Err(BufferError::FrameTooLarge {
+                bytes: (128 * 1024 * 1024) + 1,
+                limit: 128 * 1024 * 1024,
+            })
+        );
+    }
+
     /// A stride narrower than the row, or a negative one, describes a buffer
     /// that cannot exist. Trusting it is an out-of-bounds read.
     #[test]
@@ -2264,6 +2788,13 @@ mod stride_packing {
             pack_rows(&[], i32::MAX, u32::MAX, u32::MAX, false),
             Err(BufferError::SizeOverflow { .. })
         ));
+        assert_eq!(
+            pack_rows(&[], 32_768, 8192, 8192, false),
+            Err(BufferError::FrameTooLarge {
+                bytes: 8192 * 8192 * 4,
+                limit: 128 * 1024 * 1024,
+            })
+        );
     }
 
     /// SPA defines a chunk offset modulo maxsize. Rejecting an offset at or past
@@ -2272,16 +2803,18 @@ mod stride_packing {
     fn chunk_offsets_wrap_and_wrapped_data_is_linearized() {
         let mapping = [0, 1, 2, 3, 4, 5, 6, 7];
 
-        let contiguous = linear_chunk(&mapping, 10, 3);
+        let contiguous = linear_chunk(&mapping, 10, 3).expect("small chunk");
         assert!(matches!(&contiguous, Cow::Borrowed(_)));
         assert_eq!(contiguous.as_ref(), &[2, 3, 4]);
 
-        let wrapped = linear_chunk(&mapping, 6, 5);
+        let wrapped = linear_chunk(&mapping, 6, 5).expect("small wrapped chunk");
         assert!(matches!(&wrapped, Cow::Owned(_)));
         assert_eq!(wrapped.as_ref(), &[6, 7, 0, 1, 2]);
 
         assert_eq!(
-            linear_chunk(&mapping, 0, u32::MAX).as_ref(),
+            linear_chunk(&mapping, 0, u32::MAX as usize)
+                .expect("size clamps to mapping")
+                .as_ref(),
             mapping.as_slice(),
             "chunk size is clamped to maxsize"
         );
@@ -2295,7 +2828,8 @@ mod stream_lifecycle {
 
     use super::wayland::pipewire::format::Negotiated;
     use super::wayland::pipewire::lifecycle::{
-        Action, Event, Failure, Lifecycle, Phase, StreamState, prefer_process_event,
+        Action, ChunkDisposition, Event, Failure, FrameTimeline, Lifecycle, Phase, StreamState,
+        classify_chunk, prefer_process_event, prefer_state_event,
     };
 
     fn negotiated() -> Negotiated {
@@ -2330,10 +2864,28 @@ mod stream_lifecycle {
     }
 
     #[test]
+    fn zero_byte_priming_and_media_neutral_black_are_distinct() {
+        assert_eq!(classify_chunk(0, false, false), ChunkDisposition::Priming);
+        assert_eq!(
+            classify_chunk(0, false, true),
+            ChunkDisposition::Neutral,
+            "the EMPTY flag itself authoritatively represents media-neutral black"
+        );
+        assert_eq!(classify_chunk(4096, false, true), ChunkDisposition::Neutral);
+        assert_eq!(classify_chunk(4096, false, false), ChunkDisposition::Pixels);
+        assert_eq!(
+            classify_chunk(4096, true, true),
+            ChunkDisposition::Corrupted,
+            "corruption outranks neutral content"
+        );
+    }
+
+    #[test]
     fn a_format_then_a_frame_is_a_successful_capture() {
         let mut lifecycle = started();
-        assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
+        assert_eq!(lifecycle.observe(Event::FrameReady(1)), Action::Stop);
         assert_eq!(*lifecycle.phase(), Phase::Captured);
+        assert_eq!(lifecycle.captured_sequence(), Some(1));
         assert_eq!(
             lifecycle.outcome().expect("a capture succeeds"),
             negotiated()
@@ -2351,23 +2903,26 @@ mod stream_lifecycle {
             assert_eq!(lifecycle.observe(Event::EmptyBuffer), Action::Wait);
             assert!(!lifecycle.is_settled());
         }
-        assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
+        assert_eq!(lifecycle.observe(Event::FrameReady(1)), Action::Stop);
         assert!(lifecycle.outcome().is_ok());
     }
 
     #[test]
     fn draining_buffers_preserves_frame_and_failure_precedence() {
         assert_eq!(
-            prefer_process_event(Event::FrameReady, Event::EmptyBuffer),
-            Event::FrameReady,
+            prefer_process_event(Event::FrameReady(1), Event::EmptyBuffer),
+            Event::FrameReady(1),
             "a later empty buffer cannot erase pixels already copied"
         );
         assert_eq!(
-            prefer_process_event(Event::EmptyBuffer, Event::FrameReady),
-            Event::FrameReady
+            prefer_process_event(Event::EmptyBuffer, Event::FrameReady(2)),
+            Event::FrameReady(2)
         );
         assert_eq!(
-            prefer_process_event(Event::FrameReady, Event::BufferRejected("bad plane".into())),
+            prefer_process_event(
+                Event::FrameReady(1),
+                Event::BufferRejected("bad plane".into())
+            ),
             Event::BufferRejected("bad plane".into()),
             "a structural rejection outranks a plausible frame"
         );
@@ -2378,6 +2933,34 @@ mod stream_lifecycle {
             ),
             Event::BufferRejected("first diagnosis".into())
         );
+        assert_eq!(
+            prefer_process_event(Event::FrameReady(1), Event::FrameReady(2)),
+            Event::FrameReady(2),
+            "the delivery sequence must follow the newest copied frame"
+        );
+        assert_eq!(
+            prefer_process_event(Event::FrameReady(2), Event::NoDamage(3)),
+            Event::NoDamage(3),
+            "a later no-damage observation reuses the pixels but advances freshness"
+        );
+    }
+
+    #[test]
+    fn terminal_stream_state_cannot_be_hidden_by_a_later_idle_transition() {
+        assert_eq!(
+            prefer_state_event(
+                Event::StateChanged(StreamState::Error, Some("first failure".into())),
+                Event::StateChanged(StreamState::Paused, None),
+            ),
+            Event::StateChanged(StreamState::Error, Some("first failure".into()))
+        );
+        assert_eq!(
+            prefer_state_event(
+                Event::StateChanged(StreamState::Paused, None),
+                Event::StateChanged(StreamState::Unconnected, None),
+            ),
+            Event::StateChanged(StreamState::Unconnected, None)
+        );
     }
 
     /// PipeWire keeps firing callbacks while a stream is torn down. A late
@@ -2386,7 +2969,7 @@ mod stream_lifecycle {
     #[test]
     fn events_after_a_capture_cannot_undo_it() {
         let mut lifecycle = started();
-        lifecycle.observe(Event::FrameReady);
+        lifecycle.observe(Event::FrameReady(1));
 
         assert_eq!(
             lifecycle.observe(Event::StateChanged(StreamState::Unconnected, None)),
@@ -2459,7 +3042,7 @@ mod stream_lifecycle {
     fn a_frame_before_any_agreed_format_is_a_failure() {
         let mut lifecycle = Lifecycle::new(10);
         lifecycle.observe(Event::StateChanged(StreamState::Streaming, None));
-        assert_eq!(lifecycle.observe(Event::FrameReady), Action::Stop);
+        assert_eq!(lifecycle.observe(Event::FrameReady(1)), Action::Stop);
         assert!(matches!(
             lifecycle.phase(),
             Phase::Failed(Failure::Format(_))
@@ -2534,6 +3117,38 @@ mod stream_lifecycle {
         assert!(!lifecycle.is_settled());
         assert_eq!(*lifecycle.phase(), Phase::Connecting);
     }
+
+    #[test]
+    fn reusable_frame_timeline_accepts_buffered_frames_and_post_call_no_damage() {
+        let mut timeline = FrameTimeline::default();
+        let first = timeline.publish();
+        assert!(timeline.is_fresh(first));
+        timeline.mark_delivered(first);
+        assert!(!timeline.is_fresh(first));
+
+        let boundary = timeline.boundary();
+        let buffered_after_scroll = timeline.publish();
+        assert!(timeline.is_fresh(buffered_after_scroll));
+        assert!(FrameTimeline::is_after(buffered_after_scroll, boundary));
+        timeline.mark_delivered(buffered_after_scroll);
+
+        let next_boundary = timeline.boundary();
+        assert!(!FrameTimeline::is_after(
+            buffered_after_scroll,
+            next_boundary
+        ));
+        let no_damage_after_call = timeline.publish();
+        assert!(FrameTimeline::is_after(no_damage_after_call, next_boundary));
+        timeline.mark_delivered(no_damage_after_call);
+        assert!(
+            !timeline.is_fresh(buffered_after_scroll),
+            "reusing unchanged content must not relabel the old complete frame as new"
+        );
+        assert!(
+            !timeline.is_fresh(no_damage_after_call),
+            "delivery must consume the newer no-damage observation"
+        );
+    }
 }
 
 /// Turning portal failures into things a person can act on.
@@ -2571,6 +3186,20 @@ mod portal_errors {
         assert!(why.contains("xdg-desktop-portal-gnome"));
         assert!(why.contains("xdg-desktop-portal-kde"));
         assert!(why.contains("no name owner"), "the detail survives: {why}");
+    }
+
+    #[test]
+    fn portal_policy_denial_is_an_actionable_permission_error() {
+        let Error::PermissionDenied { capability, remedy } =
+            PortalFailure::PermissionDenied("screen cast disabled by administrator".into())
+                .into_error("GNOME")
+        else {
+            panic!("NotAllowed must remain a permission denial");
+        };
+        assert!(capability.contains("screen capture"));
+        assert!(remedy.contains("GNOME"));
+        assert!(remedy.contains("privacy settings"));
+        assert!(remedy.contains("administrator"));
     }
 
     /// A portal that offers monitors but not windows is a limitation of that
@@ -2614,6 +3243,7 @@ mod portal_errors {
         for failure in [
             PortalFailure::Cancelled,
             PortalFailure::Missing("portal absent".into()),
+            PortalFailure::PermissionDenied("disabled".into()),
             PortalFailure::NoSources {
                 wanted: source_type::WINDOW,
                 available: source_type::MONITOR,
@@ -2627,8 +3257,18 @@ mod portal_errors {
             );
         }
 
-        assert!(is_restore_token_rejection("Restore token is not valid"));
+        for detail in [
+            "Restore token is not valid",
+            "restore_token is invalid",
+            "restore-token has expired",
+            "invalid RestoreToken",
+        ] {
+            assert!(is_restore_token_rejection(detail), "{detail}");
+        }
         assert!(!is_restore_token_rejection("Source type is not supported"));
+        assert!(!is_restore_token_rejection(
+            "restore permissions do not allow this token type"
+        ));
     }
 
     #[test]
@@ -2649,16 +3289,20 @@ mod portal_errors {
 /// Placing a user-drawn region inside a portal-supplied monitor stream.
 mod region_cropping {
     use scrozz_core::{
-        ColorSpace, Error, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
-        PixelFormat, ScaleFactor,
+        ColorSpace, Display, DisplayId, Error, Frame, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalSize, PixelFormat, ScaleFactor,
     };
 
     use super::wayland::portal::StreamInfo;
-    use super::wayland::region::{self, CropError, CropRect};
+    use super::wayland::region::{
+        self, CropError, CropRect, DisplayIdentityError, RegionDisplayError, StreamMatchError,
+    };
 
     fn stream(position: Option<(i32, i32)>, size: Option<(i32, i32)>) -> StreamInfo {
         StreamInfo {
             node_id: 7,
+            pipewire_serial: Some(70),
+            source_type: Some(super::wayland::portal::source_type::MONITOR),
             position,
             size,
         }
@@ -2668,6 +3312,18 @@ mod region_cropping {
         LogicalRect {
             origin: LogicalPoint::new(x, y),
             size: LogicalSize::new(width, height),
+        }
+    }
+
+    fn display(id: &str, x: f64, y: f64, width: f64, height: f64) -> Display {
+        let bounds = rect(x, y, width, height);
+        Display {
+            id: DisplayId(id.into()),
+            name: id.into(),
+            bounds,
+            work_area: bounds,
+            scale: ScaleFactor::IDENTITY,
+            is_primary: x == 0.0 && y == 0.0,
         }
     }
 
@@ -2762,38 +3418,186 @@ mod region_cropping {
         );
     }
 
-    /// A selection dragged past the edge of the screen is clamped to what exists
-    /// rather than becoming a negative origin or an over-long read.
     #[test]
-    fn a_region_overhanging_an_edge_is_clamped() {
+    fn a_contained_edge_survives_fractional_pixel_rounding() {
         let plan = region::plan_crop(
-            rect(-40.0, -40.0, 100.0, 100.0),
-            &stream(Some((0, 0)), Some((800, 600))),
-            (800, 600),
+            rect(0.0, 0.0, 11.0, 11.0),
+            &stream(Some((0, 0)), Some((11, 11))),
+            (25, 25),
         );
         assert_eq!(
             plan,
             Ok(CropRect {
                 x: 0,
                 y: 0,
-                width: 60,
-                height: 60,
-            })
+                width: 25,
+                height: 25,
+            }),
+            "pixel rounding is clamped only after logical containment is proven"
         );
+    }
+
+    /// Returning the monitor intersection would silently turn a cross-monitor
+    /// selection into a smaller capture. Both edge directions therefore fail
+    /// explicitly instead of clamping.
+    #[test]
+    fn a_region_overhanging_an_edge_is_refused() {
+        let plan = region::plan_crop(
+            rect(-40.0, -40.0, 100.0, 100.0),
+            &stream(Some((0, 0)), Some((800, 600))),
+            (800, 600),
+        );
+        assert_eq!(plan, Err(CropError::PartialOverlap));
 
         let bottom_right = region::plan_crop(
             rect(760.0, 560.0, 200.0, 200.0),
             &stream(Some((0, 0)), Some((800, 600))),
             (800, 600),
         );
+        assert_eq!(bottom_right, Err(CropError::PartialOverlap));
+
+        let Error::Unsupported { what, why } = CropError::PartialOverlap.into_error("GNOME") else {
+            panic!("a partial capture is an unsupported composition");
+        };
+        assert!(what.contains("spans displays"));
+        assert!(why.contains("smaller image"));
+    }
+
+    #[test]
+    fn preflight_assigns_a_region_to_exactly_one_display() {
+        let displays = [
+            display("left", 0.0, 0.0, 800.0, 600.0),
+            display("right", 800.0, 0.0, 1024.0, 768.0),
+        ];
+
         assert_eq!(
-            bottom_right,
-            Ok(CropRect {
-                x: 760,
-                y: 560,
-                width: 40,
-                height: 40,
-            })
+            region::display_for_region(rect(900.0, 100.0, 200.0, 100.0), &displays)
+                .map(|display| display.id.clone()),
+            Ok(DisplayId("right".into()))
+        );
+        assert_eq!(
+            region::display_for_region(rect(700.0, 100.0, 200.0, 100.0), &displays),
+            Err(RegionDisplayError::SpansDisplays)
+        );
+        assert_eq!(
+            region::display_for_region(rect(3000.0, 0.0, 20.0, 20.0), &displays),
+            Err(RegionDisplayError::Outside)
+        );
+        assert_eq!(
+            region::display_for_region(rect(-20.0, 0.0, 40.0, 20.0), &displays),
+            Err(RegionDisplayError::PartlyOutside)
+        );
+        assert_eq!(
+            region::display_for_region(rect(0.0, 0.0, 0.0, 20.0), &displays),
+            Err(RegionDisplayError::Empty)
+        );
+    }
+
+    #[test]
+    fn a_contained_region_is_rejected_when_another_display_partly_overlaps_it() {
+        let displays = [
+            display("base", 0.0, 0.0, 1000.0, 800.0),
+            display("overlap", 900.0, 200.0, 500.0, 500.0),
+        ];
+
+        assert_eq!(
+            region::display_for_region(rect(850.0, 250.0, 100.0, 100.0), &displays),
+            Err(RegionDisplayError::SpansDisplays)
+        );
+    }
+
+    #[test]
+    fn cross_monitor_regions_are_rejected_before_portal_prompting() {
+        let Error::Unsupported { what, why } = RegionDisplayError::SpansDisplays.into_error()
+        else {
+            panic!("cross-monitor capture must be unsupported");
+        };
+        assert!(what.contains("spans displays"));
+        assert!(why.contains("before opening the portal picker"));
+        assert!(why.contains("clamped, incomplete image"));
+    }
+
+    #[test]
+    fn a_monitor_stream_must_match_the_requested_display_exactly() {
+        let requested = display("right", 1920.0, -200.0, 2560.0, 1440.0);
+        assert_eq!(
+            region::verify_stream_matches_display(
+                &stream(Some((1920, -200)), Some((2560, 1440))),
+                &requested
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            region::verify_stream_matches_display(
+                &stream(Some((0, 0)), Some((1920, 1080))),
+                &requested
+            ),
+            Err(StreamMatchError::DifferentDisplay)
+        );
+        assert_eq!(
+            region::verify_stream_matches_display(&stream(None, Some((2560, 1440))), &requested),
+            Err(StreamMatchError::NoGeometry)
+        );
+    }
+
+    /// Portal geometry is integral compositor space. Fractional bounds are not
+    /// rounded into a plausible match because that would turn an approximation
+    /// back into a target-identity claim.
+    #[test]
+    fn incompatible_native_geometry_is_not_guessed() {
+        let requested = display("fractional", 0.0, 0.0, 1536.5, 864.0);
+        assert_eq!(
+            region::verify_stream_matches_display(
+                &stream(Some((0, 0)), Some((1537, 864))),
+                &requested
+            ),
+            Err(StreamMatchError::UnmappableDisplay)
+        );
+    }
+
+    #[test]
+    fn mirrored_displays_are_ambiguous_before_the_picker() {
+        let displays = [
+            display("projector", 0.0, 0.0, 1920.0, 1080.0),
+            display("panel", 0.0, 0.0, 1920.0, 1080.0),
+        ];
+        assert_eq!(
+            region::verify_display_identity(&displays[0], &displays),
+            Err(DisplayIdentityError::Ambiguous)
+        );
+        let Error::Unsupported { what, why } =
+            DisplayIdentityError::Ambiguous.into_error("KDE", &displays[0])
+        else {
+            panic!("mirrored identity must be unsupported");
+        };
+        assert!(what.contains("projector"));
+        assert!(why.contains("mirrored"));
+        assert!(why.contains("before opening the picker"));
+    }
+
+    #[test]
+    fn non_integral_native_output_geometry_cannot_prove_identity() {
+        let displays = [display("fractional", 0.0, 0.0, 1920.5, 1080.0)];
+        assert_eq!(
+            region::verify_display_identity(&displays[0], &displays),
+            Err(DisplayIdentityError::Unmappable)
+        );
+    }
+
+    #[test]
+    fn reusable_identity_detects_a_backing_output_replacement() {
+        let initial = display("panel", 0.0, 0.0, 1920.0, 1080.0);
+        let same_public_facts = initial.clone();
+
+        assert!(region::display_identity_unchanged(
+            &initial,
+            &17,
+            &same_public_facts,
+            &17
+        ));
+        assert!(
+            !region::display_identity_unchanged(&initial, &17, &same_public_facts, &23),
+            "a different wl_output global is a different physical capture target"
         );
     }
 
@@ -2926,6 +3730,29 @@ mod region_cropping {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_frame_geometry_is_refused_without_overflow_or_allocation() {
+        let mut frame = coordinate_frame(2, 2, 0);
+        frame.stride = usize::MAX;
+
+        assert_eq!(
+            region::crop(
+                &frame,
+                CropRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 2,
+                },
+            ),
+            Err(CropError::UnusableFrame)
+        );
+        assert!(matches!(
+            CropError::UnusableFrame.into_error("GNOME"),
+            Error::Platform(message) if message.contains("no pixels were returned")
+        ));
     }
 
     #[test]

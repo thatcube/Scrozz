@@ -19,8 +19,12 @@
 //!   shared memory, rather than failing to negotiate at all.
 //! - The portal dialog appears, and dismissing it produces
 //!   [`Error::Cancelled`] rather than a scary failure.
-//! - A restore token is issued, stored, and accepted on the next run, so the
-//!   second capture is not preceded by a second dialog.
+//! - A restore token is issued and loaded by a second process; the shell harness
+//!   requires the operator to confirm that process did not show another picker,
+//!   because the portal protocol does not report whether it ignored a token.
+//! - The portal stream's position and size match the requested display exactly,
+//!   and every output alpha byte is normalized opaque rather than guessed from
+//!   compositor convention.
 //!
 //! # Why it is an example and not a test
 //!
@@ -39,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use scrozz_core::{CaptureBackend, CaptureRequest, CaptureTarget, Error, Frame};
+use scrozz_core::{CaptureBackend, CaptureRequest, CaptureTarget, Display, Error, Frame};
 use tracing_subscriber::EnvFilter;
 
 /// The exit status for "this could not run here".
@@ -53,6 +57,8 @@ const EXIT_SKIP: u8 = 77;
 fn main() -> ExitCode {
     init_tracing();
     let require = env::args().any(|argument| argument == "--require");
+    let fresh_process_restore = env::args().any(|argument| argument == "--fresh-process-restore");
+    let print_restore_key = env::args().any(|argument| argument == "--print-restore-key");
 
     if let Some(reason) = unrunnable() {
         if require {
@@ -65,7 +71,17 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_SKIP);
     }
 
-    match run() {
+    if print_restore_key {
+        return match print_selected_restore_key() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(outcome) => {
+                eprintln!("wayland-smoke: FAIL: {outcome}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    match run(fresh_process_restore) {
         Ok(()) => {
             eprintln!("wayland-smoke: PASS");
             ExitCode::SUCCESS
@@ -149,7 +165,7 @@ impl std::fmt::Display for Outcome {
     }
 }
 
-fn run() -> Result<(), Outcome> {
+fn run(fresh_process_restore: bool) -> Result<(), Outcome> {
     let backend = scrozz_capture::backend().map_err(classify)?;
     eprintln!("wayland-smoke: backend is {}", backend.name());
 
@@ -166,19 +182,90 @@ fn run() -> Result<(), Outcome> {
 
     let displays = backend.displays().map_err(classify)?;
     eprintln!("wayland-smoke: {} display(s) reported", displays.len());
-    let Some(display) = displays.iter().find(|display| display.is_primary) else {
-        return Err(Outcome::Failed(
-            "no display was reported as primary, so there is nothing to capture".into(),
-        ));
-    };
+    let display = select_display(backend.as_ref(), &displays)?;
 
     eprintln!();
     eprintln!("  A screen-sharing dialog should appear now.");
-    eprintln!("  Pick a monitor and confirm. Dismissing it is also a valid result:");
+    eprintln!(
+        "  Pick exactly {:?} at {:?} with size {:?}.",
+        display.name, display.bounds.origin, display.bounds.size
+    );
+    eprintln!("  Picking another monitor fails closed rather than mislabeling its pixels.");
+    eprintln!("  Dismissing the dialog is also a valid result:");
     eprintln!("  this test checks that cancellation is reported as cancellation.");
     eprintln!();
 
     let request = CaptureRequest::new(CaptureTarget::Display(display.id.clone()));
+    if fresh_process_restore {
+        eprintln!(
+            "wayland-smoke: fresh process is presenting the token persisted by the previous \
+             process; no picker should appear"
+        );
+        let mut source = scrozz_capture::frame_session(request).map_err(classify_fresh_restore)?;
+        let frame = source.capture_frame().map_err(classify_fresh_restore)?;
+        report(&frame)?;
+        drop(source);
+        eprintln!(
+            "wayland-smoke: fresh-process restore succeeded and its session teardown completed"
+        );
+        return Ok(());
+    }
+
+    fn select_display<'a>(
+        backend: &(dyn CaptureBackend + 'static),
+        displays: &'a [Display],
+    ) -> Result<&'a Display, Outcome> {
+        if let Ok(requested) = env::var("SCROZZ_WAYLAND_DISPLAY_ID") {
+            return displays
+                .iter()
+                .find(|display| display.id.0 == requested)
+                .ok_or_else(|| {
+                    Outcome::Failed(format!(
+                        "SCROZZ_WAYLAND_DISPLAY_ID names {requested:?}, but the compositor reported: {}",
+                        displays
+                            .iter()
+                            .map(|display| display.id.0.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                });
+        }
+        if displays.len() == 1 {
+            return displays.first().ok_or_else(|| {
+                Outcome::Failed("the sole Wayland output disappeared during selection".into())
+            });
+        }
+        let active = backend.active_display().map_err(classify)?;
+        displays
+            .iter()
+            .find(|display| display.id == active.id)
+            .ok_or_else(|| {
+                Outcome::Failed(
+                    "the active Wayland output disappeared between discovery and selection".into(),
+                )
+            })
+    }
+
+    fn print_selected_restore_key() -> Result<(), Outcome> {
+        let backend = scrozz_capture::backend().map_err(classify)?;
+        if !backend.name().starts_with("xdg-desktop-portal") {
+            return Err(Outcome::Failed(format!(
+                "the selected backend is {}, not the Wayland portal",
+                backend.name()
+            )));
+        }
+        let displays = backend.displays().map_err(classify)?;
+        let display = select_display(backend.as_ref(), &displays)?;
+        let mut key = String::with_capacity("display:".len() + display.id.0.len() * 2);
+        key.push_str("display:");
+        for byte in display.id.0.bytes() {
+            use std::fmt::Write;
+            write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        println!("{key}");
+        Ok(())
+    }
+
     let capture = match backend.capture(&request) {
         Ok(capture) => capture,
         Err(Error::Cancelled) => {
@@ -389,7 +476,22 @@ fn report(frame: &Frame) -> Result<(), Outcome> {
         )));
     }
 
+    if frame
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|pixel| pixel[3] != 0xff)
+    {
+        return Err(Outcome::Failed(
+            "the captured frame contains non-opaque alpha even though Wayland negotiates only \
+             BGRx/RGBx and must normalize every undefined fourth byte to 255"
+                .into(),
+        ));
+    }
+
     eprintln!("wayland-smoke: pixels vary, so this is a real frame");
+    eprintln!("wayland-smoke: every alpha byte is normalized opaque");
     Ok(())
 }
 
@@ -410,4 +512,10 @@ fn classify(error: Error) -> Outcome {
         )),
         other => Outcome::Failed(other.to_string()),
     }
+}
+
+fn classify_fresh_restore(error: Error) -> Outcome {
+    Outcome::Failed(format!(
+        "fresh-process restore did not complete without another interactive grant: {error}"
+    ))
 }

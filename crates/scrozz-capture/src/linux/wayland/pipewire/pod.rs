@@ -191,6 +191,15 @@ pub struct Choice {
 }
 
 impl Choice {
+    /// One value that negotiation has already fixated.
+    #[must_use]
+    pub fn fixed(value: Scalar) -> Self {
+        Self {
+            flavour: choice::NONE,
+            values: vec![value],
+        }
+    }
+
     /// An enumeration of acceptable values, most-preferred first.
     ///
     /// The first entry doubles as the default, which is what a server that does
@@ -371,36 +380,45 @@ impl PropertyRef<'_> {
         (self.kind == kind::CHOICE && self.body.len() >= 4).then(|| read_u32(self.body, 0))
     }
 
+    /// Whether this is a scalar or a choice explicitly marked as fixated.
+    ///
+    /// A one-entry enum is still an offer, not an agreed value. Callers parsing
+    /// a negotiated parameter must check this before accepting the default.
+    #[must_use]
+    pub fn is_fixated(&self) -> bool {
+        self.kind != kind::CHOICE || self.choice_flavour() == Some(choice::NONE)
+    }
+
     /// Reads the value as an `Id`, unwrapping a single-value choice.
     #[must_use]
     pub fn as_id(&self) -> Option<u32> {
         let (ty, body) = self.unwrap_choice()?;
-        (ty == kind::ID && body.len() >= 4).then(|| read_u32(body, 0))
+        (ty == kind::ID && body.len() == 4).then(|| read_u32(body, 0))
     }
 
     /// Reads the value as an `Int`.
     #[must_use]
     pub fn as_int(&self) -> Option<i32> {
         let (ty, body) = self.unwrap_choice()?;
-        (ty == kind::INT && body.len() >= 4).then(|| read_u32(body, 0).cast_signed())
+        (ty == kind::INT && body.len() == 4).then(|| read_u32(body, 0).cast_signed())
     }
 
     /// Reads the value as a `Rectangle`.
     #[must_use]
     pub fn as_rectangle(&self) -> Option<(u32, u32)> {
         let (ty, body) = self.unwrap_choice()?;
-        (ty == kind::RECTANGLE && body.len() >= 8).then(|| (read_u32(body, 0), read_u32(body, 4)))
+        (ty == kind::RECTANGLE && body.len() == 8).then(|| (read_u32(body, 0), read_u32(body, 4)))
     }
 
     /// Reads the value as a `Fraction`.
     #[must_use]
     pub fn as_fraction(&self) -> Option<(u32, u32)> {
         let (ty, body) = self.unwrap_choice()?;
-        (ty == kind::FRACTION && body.len() >= 8).then(|| (read_u32(body, 0), read_u32(body, 4)))
+        (ty == kind::FRACTION && body.len() == 8).then(|| (read_u32(body, 0), read_u32(body, 4)))
     }
 
     /// The value's type and body, following one level of `Choice` to its
-    /// default.
+    /// current/default value.
     ///
     /// A fixated format normally arrives with bare values, but several
     /// compositors send `Choice(None)` wrappers instead. Treating those as
@@ -413,8 +431,23 @@ impl PropertyRef<'_> {
         if self.body.len() < 16 {
             return None;
         }
+        let flavour = read_u32(self.body, 0);
         let child_size = read_u32(self.body, 8) as usize;
         let child_kind = read_u32(self.body, 12);
+        if child_size == 0 {
+            return None;
+        }
+        let values_len = self.body.len().checked_sub(16)?;
+        let value_count = values_len.checked_div(child_size)?;
+        if value_count == 0 || values_len % child_size != 0 {
+            return None;
+        }
+        if value_count != 1 {
+            // Generic callers may inspect a one-option offer. Negotiated-format
+            // callers additionally require `is_fixated`, so its default cannot
+            // be mistaken for an agreement.
+            return None;
+        }
         let child_end = 16usize.checked_add(child_size)?;
         let default = self.body.get(16..child_end)?;
         Some((child_kind, default))

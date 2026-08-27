@@ -43,8 +43,30 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
+    dispatch_inner(command, None)
+}
+
+/// Runs a command while allowing an owner to cancel interactive capture.
+///
+/// Used by the GUI's forwarded-command worker so a portal picker cannot keep
+/// application shutdown waiting. The ordinary CLI remains synchronous through
+/// [`dispatch`].
+pub(crate) fn dispatch_with_cancellation(
+    command: &Command,
+    cancellation: &scrozz_capture::CaptureCancellation,
+) -> CliResult<Report> {
+    if cancellation.is_cancelled() {
+        return Err(CliError::Core(CoreError::Cancelled));
+    }
+    dispatch_inner(command, Some(cancellation))
+}
+
+fn dispatch_inner(
+    command: &Command,
+    cancellation: Option<&scrozz_capture::CaptureCancellation>,
+) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args),
+        Command::Capture(args) => capture(args, cancellation),
         Command::Record(args) => record(args),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -59,7 +81,10 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 // capture
 // ---------------------------------------------------------------------------
 
-fn capture(args: &CaptureArgs) -> CliResult<Report> {
+fn capture(
+    args: &CaptureArgs,
+    cancellation: Option<&scrozz_capture::CaptureCancellation>,
+) -> CliResult<Report> {
     args.validate()?;
     let target = args.target.resolve()?;
     let sinks = args.sinks();
@@ -96,11 +121,12 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         include_window_shadow: !args.no_window_shadow,
     };
 
-    if let Some(secs) = args.delay {
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-    }
+    wait_for_capture_delay(args.delay, cancellation)?;
 
-    let capture = backend.capture(&request)?;
+    let capture = match cancellation {
+        Some(cancellation) => platform::capture_with_cancellation(&request, cancellation)?,
+        None => backend.capture(&request)?,
+    };
     let frame = &capture.frame;
 
     let bytes = FrameEncoder::new()
@@ -172,6 +198,37 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     let mut report = Report::new(data, human);
     report.raw = raw;
     Ok(report)
+}
+
+fn wait_for_capture_delay(
+    seconds: Option<f64>,
+    cancellation: Option<&scrozz_capture::CaptureCancellation>,
+) -> CliResult<()> {
+    let Some(seconds) = seconds else {
+        return Ok(());
+    };
+    let mut remaining = std::time::Duration::try_from_secs_f64(seconds)
+        .map_err(|_| CliError::usage(format!("--delay is too large: {seconds} seconds")))?;
+    if cancellation.is_none() {
+        std::thread::sleep(remaining);
+        return Ok(());
+    }
+    const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    while !remaining.is_zero() {
+        if cancellation.is_some_and(scrozz_capture::CaptureCancellation::is_cancelled) {
+            return Err(CliError::Core(CoreError::Cancelled));
+        }
+        let step = remaining.min(POLL);
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+
+    if cancellation.is_some_and(scrozz_capture::CaptureCancellation::is_cancelled) {
+        Err(CliError::Core(CoreError::Cancelled))
+    } else {
+        Ok(())
+    }
 }
 
 /// Turns a resolved [`TargetSpec`] into the core request type.

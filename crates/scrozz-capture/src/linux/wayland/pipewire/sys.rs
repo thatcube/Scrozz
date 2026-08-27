@@ -44,6 +44,8 @@ use scrozz_core::Error;
 
 /// The `enum spa_direction` value for an input (consuming) stream.
 pub const DIRECTION_INPUT: u32 = 0;
+/// `PW_ID_ANY`, used when `target.object` names the stable object serial.
+pub const ID_ANY: u32 = u32::MAX;
 
 /// `PW_STREAM_FLAG_AUTOCONNECT`.
 pub const STREAM_FLAG_AUTOCONNECT: u32 = 1 << 0;
@@ -409,6 +411,7 @@ impl Library {
     }
 
     fn load() -> Result<Self, LoadFailure> {
+        validate_abi()?;
         // The versioned soname first: it is what a runtime package installs,
         // and the unversioned symlink exists only with the -dev package.
         let mut last = String::new();
@@ -418,7 +421,12 @@ impl Library {
                     let symbols =
                         unsafe { Symbols::resolve(&library) }.map_err(LoadFailure::TooOld)?;
                     let version = unsafe { optional_string((symbols.pw_get_library_version)()) }
-                        .unwrap_or_else(|| "<unknown>".into());
+                        .ok_or_else(|| {
+                            LoadFailure::TooOld(format!(
+                                "{name} returned no PipeWire library version"
+                            ))
+                        })?;
+                    validate_version(name, &version)?;
                     let loaded = Self {
                         symbols,
                         _library: library,
@@ -468,6 +476,7 @@ impl Library {
 enum LoadFailure {
     Missing(String),
     TooOld(String),
+    UnsupportedAbi(String),
 }
 
 impl LoadFailure {
@@ -485,11 +494,56 @@ impl LoadFailure {
                 "{detail}. This build needs PipeWire 0.3 or newer; the installed library is older \
                  than that"
             ),
+            Self::UnsupportedAbi(detail) => format!(
+                "{detail}. Scrozz refuses to call the handwritten PipeWire ABI on an unvalidated \
+                  layout"
+            ),
         };
         Error::Unsupported {
             what: "capturing on Wayland".into(),
             why,
         }
+    }
+}
+
+fn validate_abi() -> Result<(), LoadFailure> {
+    let actual = (
+        usize::BITS,
+        std::mem::size_of::<spa_hook>(),
+        std::mem::size_of::<spa_data>(),
+        std::mem::size_of::<spa_buffer>(),
+        std::mem::size_of::<pw_buffer>(),
+        std::mem::size_of::<pw_stream_events>(),
+        std::mem::offset_of!(spa_hook, cb),
+        std::mem::offset_of!(spa_data, data),
+        std::mem::offset_of!(spa_data, chunk),
+        std::mem::offset_of!(spa_buffer, datas),
+        std::mem::offset_of!(pw_buffer, buffer),
+        std::mem::offset_of!(pw_stream_events, state_changed),
+        std::mem::offset_of!(pw_stream_events, param_changed),
+        std::mem::offset_of!(pw_stream_events, process),
+    );
+    let expected = (64, 48, 40, 24, 8, 96, 16, 24, 32, 16, 0, 16, 40, 64);
+    if actual != expected {
+        return Err(LoadFailure::UnsupportedAbi(format!(
+            "this target's PipeWire ABI layout is {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_version(library: &str, version: &str) -> Result<(), LoadFailure> {
+    let mut fields = version.split('.');
+    let major = fields.next().and_then(|field| field.parse::<u32>().ok());
+    let minor = fields.next().and_then(|field| field.parse::<u32>().ok());
+    match (major, minor) {
+        (Some(0), Some(minor)) if minor < 3 => Err(LoadFailure::TooOld(format!(
+            "{library} reports PipeWire {version}"
+        ))),
+        (Some(0), Some(_)) | (Some(1..), Some(_)) => Ok(()),
+        _ => Err(LoadFailure::TooOld(format!(
+            "{library} reports an unparseable PipeWire version {version:?}"
+        ))),
     }
 }
 

@@ -7,10 +7,10 @@
 //!
 //! # What is offered, and what is deliberately not
 //!
-//! Scrozz offers exactly four `spa_video_format` values: `BGRx`, `RGBx`,
-//! `BGRA`, `RGBA`. Those are the four that map to a [`PixelFormat`] **without
-//! reordering bytes**, and reordering is the one thing a still-capture path
-//! should not be doing on a multi-megapixel buffer for no reason.
+//! Scrozz offers exactly two `spa_video_format` values: `BGRx` and `RGBx`.
+//! Both map to a [`PixelFormat`] **without reordering bytes**, and reordering is
+//! the one thing a still-capture path should not be doing on a multi-megapixel
+//! buffer for no reason.
 //!
 //! `xRGB`, `xBGR`, `ARGB` and `ABGR` are not offered. Scrozz has no pixel format
 //! with the alpha byte first, so accepting one would mean either a per-pixel
@@ -29,13 +29,20 @@
 //!
 //! # Alpha, told truthfully
 //!
-//! SPA has no premultiplied video format. `BGRA` from a screen-cast stream is
-//! straight alpha, so it maps to [`PixelFormat::Bgra8`] and never to
-//! [`PixelFormat::BgraPremultiplied8`]. The `x` variants carry an *undefined*
-//! fourth byte — not zero, not 255, whatever was in the compositor's scratch
-//! buffer — so [`pack_rows`] overwrites it with `0xFF`. Passing that byte
-//! through would produce a PNG that renders correctly in some viewers and as
-//! noise-speckled transparency in others.
+//! SPA defines `SPA_VIDEO_FLAG_PREMULTIPLIED_ALPHA`, but its raw-format POD has
+//! no property that carries the flag: PipeWire's own
+//! `spa_format_video_raw_parse`/`build` helpers do not parse or emit it. Portal
+//! producers consequently use compositor convention, and OBS has to treat
+//! alpha-bearing PipeWire frames as premultiplied regardless of that unset flag.
+//! Scrozz cannot label such bytes straight without guessing, so it does not
+//! negotiate `BGRA` or `RGBA` at all. The opaque `x` variants have an undefined
+//! fourth byte, which [`pack_rows`] overwrites with `0xFF`; opaque alpha has the
+//! same representation under straight and premultiplied association.
+//!
+//! The offer also constrains transfer functions to SDR values this 8-bit path can
+//! preserve. A peer that nevertheless fixates PQ or HLG is rejected. An
+//! unnameable non-HDR transfer remains usable as [`ColorSpace::Unknown`] rather
+//! than receiving a false sRGB, P3, or Rec. 2020 tag.
 
 use scrozz_core::{ColorSpace, PixelFormat};
 
@@ -54,6 +61,12 @@ pub const OBJECT_PARAM_BUFFERS: u32 = 0x0004_0004;
 /// all later stride and allocation arithmetic bounded even if the peer is
 /// buggy.
 pub const MAX_DIMENSION: u32 = 16_384;
+
+/// Largest packed frame or mapped frame extent accepted from a producer.
+///
+/// This still admits an 8K UHD frame while preventing peer-controlled metadata
+/// from driving gigabyte-scale allocations in the PipeWire callback.
+pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 /// Parameter ids from `enum spa_param_type`.
 pub mod param {
@@ -108,6 +121,12 @@ pub mod data_type {
     pub const SHARED_MEMORY_MASK: i32 = (1_i32 << MEM_PTR) | (1_i32 << MEM_FD);
 }
 
+/// `SPA_DATA_FLAG_*` values used before reading a mapped buffer.
+pub mod data_flag {
+    /// The producer permits the consumer to read this data block.
+    pub const READABLE: u32 = 1 << 0;
+}
+
 /// `SPA_MEDIA_TYPE_video`.
 pub const MEDIA_TYPE_VIDEO: u32 = 2;
 /// `SPA_MEDIA_SUBTYPE_raw`.
@@ -119,9 +138,11 @@ pub mod video_format {
     pub const RGBX: u32 = 7;
     /// `SPA_VIDEO_FORMAT_BGRx` — bytes B, G, R, undefined.
     pub const BGRX: u32 = 8;
-    /// `SPA_VIDEO_FORMAT_RGBA` — bytes R, G, B, A (straight, not premultiplied).
+    /// `SPA_VIDEO_FORMAT_RGBA` — not offered because alpha association is absent
+    /// from raw SPA format negotiation.
     pub const RGBA: u32 = 11;
-    /// `SPA_VIDEO_FORMAT_BGRA` — bytes B, G, R, A (straight, not premultiplied).
+    /// `SPA_VIDEO_FORMAT_BGRA` — not offered because alpha association is absent
+    /// from raw SPA format negotiation.
     pub const BGRA: u32 = 12;
 }
 
@@ -139,16 +160,44 @@ pub mod primaries {
     pub const SMPTE_EG432: u32 = 11;
 }
 
+/// `enum spa_video_transfer_function`, for the members this SDR path accepts.
+pub mod transfer {
+    /// `SPA_VIDEO_TRANSFER_UNKNOWN`.
+    pub const UNKNOWN: u32 = 0;
+    /// `SPA_VIDEO_TRANSFER_GAMMA22`.
+    pub const GAMMA22: u32 = 4;
+    /// `SPA_VIDEO_TRANSFER_BT709`.
+    pub const BT709: u32 = 5;
+    /// `SPA_VIDEO_TRANSFER_SRGB`.
+    pub const SRGB: u32 = 7;
+    /// `SPA_VIDEO_TRANSFER_BT2020_12`.
+    pub const BT2020_12: u32 = 11;
+    /// `SPA_VIDEO_TRANSFER_BT2020_10`.
+    pub const BT2020_10: u32 = 13;
+    /// `SPA_VIDEO_TRANSFER_SMPTE2084`, also known as PQ.
+    pub const SMPTE2084: u32 = 14;
+    /// `SPA_VIDEO_TRANSFER_ARIB_STD_B67`, also known as HLG.
+    pub const ARIB_STD_B67: u32 = 15;
+    /// `SPA_VIDEO_TRANSFER_BT601`.
+    pub const BT601: u32 = 16;
+}
+
 /// The accepted formats, most preferred first.
 ///
 /// `BGRx` leads because it is what Mutter and `KWin` produce natively — matching
 /// it means the server hands over its own composited buffer rather than running
 /// a conversion — and because an opaque screen has no alpha worth carrying.
-pub const PREFERRED_FORMATS: [u32; 4] = [
-    video_format::BGRX,
-    video_format::RGBX,
-    video_format::BGRA,
-    video_format::RGBA,
+pub const PREFERRED_FORMATS: [u32; 2] = [video_format::BGRX, video_format::RGBX];
+
+/// Transfer functions the 8-bit SDR capture path can preserve without HDR loss.
+pub const PREFERRED_TRANSFERS: [u32; 7] = [
+    transfer::SRGB,
+    transfer::GAMMA22,
+    transfer::BT709,
+    transfer::BT2020_10,
+    transfer::BT2020_12,
+    transfer::BT601,
+    transfer::UNKNOWN,
 ];
 
 /// Builds the `EnumFormat` parameter offered at `pw_stream_connect`.
@@ -173,6 +222,15 @@ pub fn enum_format_param() -> Vec<u8> {
     if let Some(property) =
         Property::choice(key::VIDEO_FORMAT, &Choice::enumerated(formats.clone()))
     {
+        properties.push(property);
+    }
+
+    let transfers = PREFERRED_TRANSFERS
+        .iter()
+        .copied()
+        .map(Scalar::id)
+        .collect();
+    if let Some(property) = Property::choice(key::VIDEO_TRANSFER, &Choice::enumerated(transfers)) {
         properties.push(property);
     }
 
@@ -248,6 +306,15 @@ pub enum FormatError {
         /// Height the server selected.
         height: u32,
     },
+    /// The dimensions are individually valid but exceed the memory budget.
+    FrameTooLarge {
+        /// Width the server selected.
+        width: u32,
+        /// Height the server selected.
+        height: u32,
+        /// Packed bytes the frame would require.
+        bytes: usize,
+    },
     /// The server selected a DMA-BUF modifier even though none was offered.
     UnexpectedModifier,
     /// The server fixated on a format outside [`PREFERRED_FORMATS`].
@@ -256,6 +323,8 @@ pub enum FormatError {
     /// offered — but a buggy or hostile one is not a reason to index off the
     /// end of a buffer.
     UnsupportedFormat(u32),
+    /// The server selected an HDR transfer function this 8-bit path cannot keep.
+    UnsupportedTransfer(u32),
 }
 
 impl std::fmt::Display for FormatError {
@@ -277,6 +346,15 @@ impl std::fmt::Display for FormatError {
                 "the server chose a {width}x{height} frame, outside the offered 1x1 to \
                  {MAX_DIMENSION}x{MAX_DIMENSION} range"
             ),
+            Self::FrameTooLarge {
+                width,
+                height,
+                bytes,
+            } => write!(
+                f,
+                "the server chose a {width}x{height} frame requiring {bytes} packed bytes; the \
+                 capture limit is {MAX_FRAME_BYTES} bytes"
+            ),
             Self::UnexpectedModifier => write!(
                 f,
                 "the server selected a DMA-BUF modifier even though the client offered only the \
@@ -285,6 +363,11 @@ impl std::fmt::Display for FormatError {
             Self::UnsupportedFormat(value) => write!(
                 f,
                 "the server chose spa_video_format {value}, which was never offered"
+            ),
+            Self::UnsupportedTransfer(value) => write!(
+                f,
+                "the server chose spa_video_transfer_function {value}, which this 8-bit SDR capture \
+                 path cannot preserve"
             ),
         }
     }
@@ -317,6 +400,22 @@ impl Negotiated {
     pub const fn packed_len(&self) -> usize {
         self.packed_stride() * self.height as usize
     }
+
+    /// Produces SPA's media-neutral value for this video format: opaque black.
+    pub fn neutral_pixels(&self) -> Result<Vec<u8>, BufferError> {
+        let len = packed_frame_len(self.width, self.height)?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(len)
+            .map_err(|_| BufferError::AllocationFailed { bytes: len })?;
+        pixels.resize(len, 0);
+        if self.opaque_padding {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel[3] = 0xff;
+            }
+        }
+        Ok(pixels)
+    }
 }
 
 /// Maps an `spa_video_format` to a Scrozz pixel format.
@@ -328,8 +427,6 @@ pub const fn pixel_format(spa_format: u32) -> Option<(PixelFormat, bool)> {
     match spa_format {
         video_format::BGRX => Some((PixelFormat::Bgra8, true)),
         video_format::RGBX => Some((PixelFormat::Rgba8, true)),
-        video_format::BGRA => Some((PixelFormat::Bgra8, false)),
-        video_format::RGBA => Some((PixelFormat::Rgba8, false)),
         _ => None,
     }
 }
@@ -341,14 +438,29 @@ pub const fn pixel_format(spa_format: u32) -> Option<(PixelFormat, bool)> {
 /// most of the time and silently wrong on a wide-gamut monitor, and an encoder
 /// that knows the space is unknown can decline to embed a profile instead of
 /// embedding a false one.
-#[must_use]
-pub const fn color_space(primaries: Option<u32>) -> ColorSpace {
-    match primaries {
-        Some(primaries::BT709) => ColorSpace::Srgb,
-        Some(primaries::BT2020) => ColorSpace::Rec2020,
-        Some(primaries::SMPTE_RP431 | primaries::SMPTE_EG432) => ColorSpace::DisplayP3,
-        _ => ColorSpace::Unknown,
+pub fn color_space(
+    primaries: Option<u32>,
+    transfer: Option<u32>,
+) -> Result<ColorSpace, FormatError> {
+    if let Some(transfer @ (transfer::SMPTE2084 | transfer::ARIB_STD_B67)) = transfer {
+        return Err(FormatError::UnsupportedTransfer(transfer));
     }
+
+    let color_space = match (primaries, transfer) {
+        (_, None | Some(transfer::UNKNOWN)) | (None, _) | (Some(primaries::UNKNOWN), _) => {
+            ColorSpace::Unknown
+        }
+        (Some(primaries::BT709), Some(transfer::SRGB)) => ColorSpace::Srgb,
+        (Some(primaries::SMPTE_EG432), Some(transfer::SRGB)) => ColorSpace::DisplayP3,
+        (
+            Some(primaries::BT2020),
+            Some(transfer::BT709 | transfer::BT2020_10 | transfer::BT2020_12 | transfer::BT601),
+        ) => ColorSpace::Rec2020,
+        // The samples remain usable, but this enum cannot name the exact
+        // primaries/transfer pair. Unknown prevents downstream false ICC tags.
+        _ => ColorSpace::Unknown,
+    };
+    Ok(color_space)
 }
 
 /// Reads a fixated `Format` parameter.
@@ -365,10 +477,12 @@ pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
 
     let media_type = object
         .property(key::MEDIA_TYPE)
+        .filter(|property| property.is_fixated())
         .and_then(|property| property.as_id())
         .unwrap_or(0);
     let media_subtype = object
         .property(key::MEDIA_SUBTYPE)
+        .filter(|property| property.is_fixated())
         .and_then(|property| property.as_id())
         .unwrap_or(0);
     if media_type != MEDIA_TYPE_VIDEO || media_subtype != MEDIA_SUBTYPE_RAW {
@@ -380,6 +494,7 @@ pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
 
     let spa_format = object
         .property(key::VIDEO_FORMAT)
+        .filter(|property| property.is_fixated())
         .and_then(|property| property.as_id())
         .ok_or(FormatError::MissingFormat)?;
     let (pixel_format, opaque_padding) =
@@ -391,12 +506,19 @@ pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
 
     let (width, height) = object
         .property(key::VIDEO_SIZE)
+        .filter(|property| property.is_fixated())
         .and_then(|property| property.as_rectangle())
         .filter(|(width, height)| *width > 0 && *height > 0)
         .ok_or(FormatError::MissingSize)?;
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(FormatError::UnsupportedSize { width, height });
     }
+    let bytes = packed_frame_len(width, height).map_err(|_| FormatError::FrameTooLarge {
+        width,
+        height,
+        bytes: width as usize * 4 * height as usize,
+    })?;
+    debug_assert!(bytes <= MAX_FRAME_BYTES);
 
     Ok(Negotiated {
         width,
@@ -406,8 +528,13 @@ pub fn parse_format(bytes: &[u8]) -> Result<Negotiated, FormatError> {
         color_space: color_space(
             object
                 .property(key::VIDEO_PRIMARIES)
+                .filter(|property| property.is_fixated())
                 .and_then(|property| property.as_id()),
-        ),
+            object
+                .property(key::VIDEO_TRANSFER)
+                .filter(|property| property.is_fixated())
+                .and_then(|property| property.as_id()),
+        )?,
     })
 }
 
@@ -446,6 +573,18 @@ pub enum BufferError {
         /// Bytes the declared geometry needs.
         needed: usize,
     },
+    /// The packed frame or addressed mapping extent exceeds the capture budget.
+    FrameTooLarge {
+        /// Bytes the frame or mapping would require.
+        bytes: usize,
+        /// Maximum accepted byte count.
+        limit: usize,
+    },
+    /// Reserving the bounded output buffer failed.
+    AllocationFailed {
+        /// Bytes that could not be reserved.
+        bytes: usize,
+    },
 }
 
 impl std::fmt::Display for BufferError {
@@ -467,8 +606,102 @@ impl std::fmt::Display for BufferError {
                 f,
                 "the buffer holds {available} bytes but the agreed frame size needs {needed}"
             ),
+            Self::FrameTooLarge { bytes, limit } => write!(
+                f,
+                "the frame addresses {bytes} bytes, exceeding the {limit}-byte capture limit"
+            ),
+            Self::AllocationFailed { bytes } => {
+                write!(f, "could not reserve {bytes} bytes for the captured frame")
+            }
         }
     }
+}
+
+fn packed_frame_len(width: u32, height: u32) -> Result<usize, BufferError> {
+    if width == 0 || height == 0 {
+        return Err(BufferError::InvalidDimensions { width, height });
+    }
+
+    let dimensions_overflow = || BufferError::SizeOverflow { width, height };
+    let len = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .and_then(|row| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| row.checked_mul(height))
+        })
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or_else(dimensions_overflow)?;
+    if len > MAX_FRAME_BYTES {
+        return Err(BufferError::FrameTooLarge {
+            bytes: len,
+            limit: MAX_FRAME_BYTES,
+        });
+    }
+    Ok(len)
+}
+
+fn frame_layout(
+    stride: i32,
+    width: u32,
+    height: u32,
+) -> Result<(usize, usize, usize), BufferError> {
+    let dimensions_overflow = || BufferError::SizeOverflow { width, height };
+    let row = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(dimensions_overflow)?;
+    let output_len = packed_frame_len(width, height)?;
+
+    let stride_usize = usize::try_from(stride).unwrap_or(0);
+    if stride_usize < row || stride_usize == 0 {
+        return Err(BufferError::BadStride {
+            stride,
+            needed: row,
+        });
+    }
+    let needed = stride_usize
+        .checked_mul(height.saturating_sub(1) as usize)
+        .and_then(|prefix| prefix.checked_add(row))
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or_else(dimensions_overflow)?;
+    if needed > MAX_FRAME_BYTES {
+        return Err(BufferError::FrameTooLarge {
+            bytes: needed,
+            limit: MAX_FRAME_BYTES,
+        });
+    }
+    Ok((row, output_len, needed))
+}
+
+/// Validates that a pixel-bearing SPA chunk can describe the negotiated frame.
+///
+/// Media-neutral `SPA_CHUNK_FLAG_EMPTY` buffers carry no bytes to inspect and
+/// are synthesized from the separately bounded negotiated dimensions instead.
+pub fn validate_chunk_geometry(
+    size: u32,
+    maxsize: u32,
+    stride: i32,
+    width: u32,
+    height: u32,
+) -> Result<usize, BufferError> {
+    let (_, _, needed) = frame_layout(stride, width, height)?;
+    let mapping_len = usize::try_from(maxsize).unwrap_or(usize::MAX);
+    if mapping_len > MAX_FRAME_BYTES {
+        return Err(BufferError::FrameTooLarge {
+            bytes: mapping_len,
+            limit: MAX_FRAME_BYTES,
+        });
+    }
+    // SPA permits a ring-buffer chunk's logical size to exceed the backing
+    // mapping and requires consumers to clamp it to maxsize. Offset wrapping is
+    // handled separately by `linear_chunk`.
+    let available = usize::try_from(size.min(maxsize)).unwrap_or(usize::MAX);
+    if available < needed {
+        return Err(BufferError::Short { available, needed });
+    }
+    Ok(needed)
 }
 
 /// Copies a strided buffer into tightly-packed rows.
@@ -493,36 +726,8 @@ pub fn pack_rows(
     height: u32,
     opaque_padding: bool,
 ) -> Result<Vec<u8>, BufferError> {
-    if width == 0 || height == 0 {
-        return Err(BufferError::InvalidDimensions { width, height });
-    }
-
-    let dimensions_overflow = || BufferError::SizeOverflow { width, height };
-    let row = usize::try_from(width)
-        .ok()
-        .and_then(|width| width.checked_mul(4))
-        .ok_or_else(dimensions_overflow)?;
-    let output_len = row
-        .checked_mul(usize::try_from(height).map_err(|_| dimensions_overflow())?)
-        .filter(|len| *len <= isize::MAX as usize)
-        .ok_or_else(dimensions_overflow)?;
-
+    let (row, output_len, needed) = frame_layout(stride, width, height)?;
     let stride_usize = usize::try_from(stride).unwrap_or(0);
-    if stride_usize < row || stride_usize == 0 {
-        return Err(BufferError::BadStride {
-            stride,
-            needed: row,
-        });
-    }
-
-    // The final row needs only `row` bytes, not a whole stride: a producer is
-    // entitled to end the mapping there, and demanding the padding would reject
-    // a perfectly good buffer.
-    let needed = stride_usize
-        .checked_mul(height.saturating_sub(1) as usize)
-        .and_then(|prefix| prefix.checked_add(row))
-        .filter(|len| *len <= isize::MAX as usize)
-        .ok_or_else(dimensions_overflow)?;
     if source.len() < needed {
         return Err(BufferError::Short {
             available: source.len(),
@@ -530,7 +735,9 @@ pub fn pack_rows(
         });
     }
 
-    let mut out = Vec::with_capacity(output_len);
+    let mut out = Vec::new();
+    out.try_reserve_exact(output_len)
+        .map_err(|_| BufferError::AllocationFailed { bytes: output_len })?;
     for index in 0..height as usize {
         let start = index * stride_usize;
         out.extend_from_slice(&source[start..start + row]);
@@ -551,21 +758,27 @@ pub fn pack_rows(
 /// wrap from the end of the mapping back to its beginning. The common
 /// contiguous case is borrowed without allocation; only a wrapped chunk is
 /// copied.
-#[must_use]
-pub fn linear_chunk(mapping: &[u8], offset: u32, size: u32) -> Cow<'_, [u8]> {
+pub fn linear_chunk(
+    mapping: &[u8],
+    offset: u32,
+    size: usize,
+) -> Result<Cow<'_, [u8]>, BufferError> {
     if mapping.is_empty() || size == 0 {
-        return Cow::Borrowed(&mapping[..0]);
+        return Ok(Cow::Borrowed(&mapping[..0]));
     }
 
-    let size = (size as usize).min(mapping.len());
+    let size = size.min(mapping.len());
     let offset = offset as usize % mapping.len();
     let tail = mapping.len() - offset;
     if size <= tail {
-        return Cow::Borrowed(&mapping[offset..offset + size]);
+        return Ok(Cow::Borrowed(&mapping[offset..offset + size]));
     }
 
-    let mut linear = Vec::with_capacity(size);
+    let mut linear = Vec::new();
+    linear
+        .try_reserve_exact(size)
+        .map_err(|_| BufferError::AllocationFailed { bytes: size })?;
     linear.extend_from_slice(&mapping[offset..]);
     linear.extend_from_slice(&mapping[..size - tail]);
-    Cow::Owned(linear)
+    Ok(Cow::Owned(linear))
 }

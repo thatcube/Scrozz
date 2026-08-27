@@ -3344,9 +3344,11 @@ name = "scrozz-capture"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "async-io",
  "block2 0.6.2",
  "dispatch2",
  "futures-lite",
+ "libc",
  "libloading 0.8.9",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -3355,6 +3357,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-screen-capture-kit",
  "scrozz-core",
+ "smithay-client-toolkit 0.20.0",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",

@@ -61,6 +61,28 @@ use scrozz_core::{Error, Frame, PhysicalSize, Result, ScaleFactor};
 /// machine, and a too-eager timeout turns a slow capture into a failed one.
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A successfully loaded and ABI-validated PipeWire runtime.
+///
+/// Construct this before opening a portal picker. It is intentionally opaque so
+/// stream construction cannot accidentally reload or bypass the validated
+/// mapping after the user has granted access.
+#[derive(Clone, Copy, Debug)]
+pub struct Runtime {
+    library: &'static sys::Library,
+}
+
+/// Loads and validates every PipeWire symbol and ABI assumption needed later.
+///
+/// # Errors
+///
+/// Returns an actionable unsupported error before portal permission when the
+/// runtime is missing, too old, or incompatible with the handwritten ABI.
+pub fn preflight() -> Result<Runtime> {
+    Ok(Runtime {
+        library: sys::Library::open()?,
+    })
+}
+
 /// A portal-provided PipeWire stream kept open across frame requests.
 #[derive(Debug)]
 pub struct FrameStream {
@@ -78,9 +100,20 @@ impl FrameStream {
     /// Returns [`Error::Unsupported`] if PipeWire is unavailable and
     /// [`Error::Platform`] if its loop, context, remote, or stream cannot be
     /// created.
-    pub fn connect(fd: OwnedFd, node_id: u32, scale: ScaleFactor) -> Result<Self> {
-        let library = sys::Library::open()?;
-        let stream = stream::FrameStream::connect(library, fd, node_id, FRAME_TIMEOUT)?;
+    pub fn connect(
+        runtime: Runtime,
+        fd: OwnedFd,
+        node_id: u32,
+        pipewire_serial: Option<u64>,
+        scale: ScaleFactor,
+    ) -> Result<Self> {
+        let stream = stream::FrameStream::connect(
+            runtime.library,
+            fd,
+            node_id,
+            pipewire_serial,
+            FRAME_TIMEOUT,
+        )?;
         Ok(Self { stream, scale })
     }
 
@@ -108,8 +141,14 @@ impl FrameStream {
 /// [`Error::Unsupported`] if PipeWire is not installed, [`Error::TargetGone`] if
 /// the node disappears, and [`Error::Platform`] for compositor and stream
 /// failures — each with enough text for the user to know what to do next.
-pub fn acquire_frame(fd: OwnedFd, node_id: u32, scale: ScaleFactor) -> Result<Frame> {
-    FrameStream::connect(fd, node_id, scale)?.capture_frame()
+pub fn acquire_frame(
+    runtime: Runtime,
+    fd: OwnedFd,
+    node_id: u32,
+    pipewire_serial: Option<u64>,
+    scale: ScaleFactor,
+) -> Result<Frame> {
+    FrameStream::connect(runtime, fd, node_id, pipewire_serial, scale)?.capture_frame()
 }
 
 fn raw_to_frame(raw: stream::RawFrame, scale: ScaleFactor) -> Result<Frame> {

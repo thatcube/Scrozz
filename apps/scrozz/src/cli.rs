@@ -162,6 +162,76 @@ impl Command {
 }
 
 impl Cli {
+    /// Resolves path arguments as the process that forwarded this invocation saw
+    /// them, without changing the GUI process's global working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::Ipc`] when the forwarded directory is relative,
+    /// missing, or no longer a directory.
+    pub(crate) fn resolve_forwarded_paths(
+        &mut self,
+        cwd: Option<&std::path::Path>,
+    ) -> CliResult<()> {
+        let Some(cwd) = cwd else {
+            return Ok(());
+        };
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(CliError::ipc(format!(
+                "the forwarding process supplied an unavailable working directory: {}",
+                cwd.display()
+            )));
+        }
+
+        let resolve = |path: &mut PathBuf| {
+            if path.is_relative() {
+                *path = cwd.join(&*path);
+            }
+        };
+
+        match self.command.as_mut() {
+            Some(Command::Capture(args)) => {
+                if let Some(path) = args.output.as_mut() {
+                    resolve(path);
+                }
+            }
+            Some(Command::Record(args)) => {
+                if let Some(path) = args.output.as_mut() {
+                    resolve(path);
+                }
+            }
+            Some(Command::History(HistoryArgs {
+                command: HistoryCommand::Get { output, .. },
+            })) => {
+                if let Some(path) = output.as_mut() {
+                    resolve(path);
+                }
+            }
+            Some(Command::Ocr(args)) => {
+                if let Some(path) = args.file.as_mut() {
+                    resolve(path);
+                }
+                if let Some(subject) = args.subject.as_mut() {
+                    let path = PathBuf::from(&*subject);
+                    let resolved = cwd.join(&path);
+                    if path.is_relative() && resolved.is_file() {
+                        *subject = resolved.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            Some(
+                Command::List(_)
+                | Command::History(_)
+                | Command::Settings(_)
+                | Command::Hotkey(_)
+                | Command::Gui,
+            )
+            | None => {}
+        }
+
+        Ok(())
+    }
+
     /// Checks the rules that span a global option and a subcommand.
     ///
     /// Per-subcommand rules live on the subcommand's own `validate`; this is only
@@ -1307,6 +1377,54 @@ mod tests {
         let err = cli.validate().unwrap_err();
         assert_eq!(err.exit(), crate::exit::Exit::Usage);
         assert!(err.to_string().contains("--stdout"), "{err}");
+    }
+
+    #[test]
+    fn forwarded_relative_paths_are_resolved_without_changing_process_cwd() {
+        let before = std::env::current_dir().expect("a working directory");
+        let cwd = std::env::temp_dir();
+
+        let mut cli = parse(&["scrozz", "capture", "-o", "shot.png"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture");
+        };
+        assert_eq!(args.output, Some(cwd.join("shot.png")));
+
+        let mut cli = parse(&["scrozz", "record", "-o", "clip.mp4"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::Record(args)) = cli.command else {
+            panic!("expected record");
+        };
+        assert_eq!(args.output, Some(cwd.join("clip.mp4")));
+
+        let mut cli = parse(&["scrozz", "history", "get", "id", "-o", "saved.png"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::History(HistoryArgs {
+            command: HistoryCommand::Get { output, .. },
+        })) = cli.command
+        else {
+            panic!("expected history get");
+        };
+        assert_eq!(output, Some(cwd.join("saved.png")));
+
+        let mut cli = parse(&["scrozz", "ocr", "--file", "source.png"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::Ocr(args)) = cli.command else {
+            panic!("expected OCR");
+        };
+        assert_eq!(args.file, Some(cwd.join("source.png")));
+        assert_eq!(std::env::current_dir().unwrap(), before);
+    }
+
+    #[test]
+    fn an_unavailable_forwarded_directory_is_rejected() {
+        let mut cli = parse(&["scrozz", "capture", "--dry-run"]);
+        let missing = std::env::temp_dir().join(format!(
+            "scrozz-missing-forwarded-cwd-{}",
+            std::process::id()
+        ));
+        assert!(cli.resolve_forwarded_paths(Some(&missing)).is_err());
     }
 
     #[test]

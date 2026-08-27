@@ -38,10 +38,10 @@ pub mod session;
 pub mod wayland;
 pub mod x11;
 
-use scrozz_core::{CaptureBackend, CaptureRequest, Error, Result};
+use scrozz_core::{Capture, CaptureBackend, CaptureRequest, Error, Result};
 
 use self::session::{SessionEnv, SessionKind};
-use crate::FrameSession;
+use crate::{CaptureCancellation, FrameSession};
 
 /// Chooses and constructs the backend for this session.
 ///
@@ -76,19 +76,54 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
     }
 }
 
+/// Captures once with cancellable Wayland portal acquisition.
+pub fn capture_with_cancellation(
+    request: &CaptureRequest,
+    cancellation: &CaptureCancellation,
+) -> Result<Capture> {
+    cancellation.check()?;
+    let env = SessionEnv::from_env();
+    let kind = session::detect_session(&env);
+
+    match kind {
+        SessionKind::Wayland | SessionKind::XWayland => {
+            wayland::WaylandBackend::new(&env)?.capture_with_cancellation(request, cancellation)
+        }
+        SessionKind::X11 | SessionKind::Headless => backend()?.capture(request),
+    }
+}
+
 /// Opens a repeated-frame source for the current Linux display server.
 ///
 /// Wayland gets a native long-lived portal/PipeWire session. X11 uses the
 /// ordinary backend adapter because its direct capture has no permission session
 /// to preserve.
 pub fn frame_session(request: CaptureRequest) -> Result<Box<dyn FrameSession>> {
+    frame_session_inner(request, None)
+}
+
+/// Opens a repeated-frame source with cancellable Wayland portal acquisition.
+pub fn frame_session_with_cancellation(
+    request: CaptureRequest,
+    cancellation: &CaptureCancellation,
+) -> Result<Box<dyn FrameSession>> {
+    cancellation.check()?;
+    frame_session_inner(request, Some(cancellation))
+}
+
+fn frame_session_inner(
+    request: CaptureRequest,
+    cancellation: Option<&CaptureCancellation>,
+) -> Result<Box<dyn FrameSession>> {
     let env = SessionEnv::from_env();
     let kind = session::detect_session(&env);
 
     match kind {
         SessionKind::Wayland | SessionKind::XWayland => {
             let backend = wayland::WaylandBackend::new(&env)?;
-            Ok(Box::new(backend.open_frame_session(&request)?))
+            Ok(Box::new(
+                backend.open_frame_session_inner(&request, cancellation)?,
+            ))
         }
         SessionKind::X11 | SessionKind::Headless => {
             Ok(crate::backend_frame_session(backend()?, request))

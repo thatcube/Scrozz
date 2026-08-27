@@ -48,7 +48,10 @@ use std::time::{Duration, Instant};
 use scrozz_core::Error;
 
 use super::format::{self, Negotiated};
-use super::lifecycle::{Action, Event, Lifecycle, StreamState, prefer_process_event};
+use super::lifecycle::{
+    Action, ChunkDisposition, Event, FrameTimeline, Lifecycle, StreamState, classify_chunk,
+    prefer_process_event, prefer_state_event,
+};
 use super::sys::{self, Library, Symbols, pw_stream_events, spa_hook, spa_pod};
 
 const MAX_PARAM_BODY_SIZE: usize = 64 * 1024;
@@ -57,7 +60,7 @@ const CHUNK_FLAG_EMPTY: u32 = 1 << 1;
 const ERRNO_TIMED_OUT: c_int = 110;
 
 /// One frame, packed and described.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawFrame {
     /// Tightly-packed pixels, `width * 4` bytes per row.
     pub pixels: Vec<u8>,
@@ -70,6 +73,8 @@ pub struct RawFrame {
 struct Shared {
     events: Vec<Event>,
     negotiated: Option<Negotiated>,
+    /// Continuous stream sequencing and delivery watermark.
+    timeline: FrameTimeline,
     /// Latest state, retained after its queued callback event is drained.
     state: Option<(StreamState, Option<String>)>,
     /// Stream history must survive the lifecycle created for each frame.
@@ -79,28 +84,99 @@ struct Shared {
     /// Keeping its format beside its pixels makes renegotiation safe: a later
     /// callback can replace both atomically rather than pair new pixels with an
     /// earlier `FormatAgreed` event.
-    frame: Option<RawFrame>,
+    frame: Option<SequencedFrame>,
+}
+
+#[derive(Debug, Clone)]
+struct SequencedFrame {
+    sequence: u64,
+    frame: RawFrame,
 }
 
 impl Shared {
     fn invalidate_frame(&mut self) {
         self.frame = None;
         self.events
-            .retain(|event| !matches!(event, Event::FrameReady));
+            .retain(|event| !matches!(event, Event::FrameReady(_) | Event::NoDamage(_)));
     }
 
     fn push(&mut self, event: Event) {
-        match &event {
-            Event::StateChanged(state, message) => {
+        if let Event::StateChanged(state, message) = &event {
+            if self
+                .state
+                .as_ref()
+                .is_none_or(|(current, _)| !current.is_terminal())
+            {
                 self.state = Some((*state, message.clone()));
-                self.ever_streamed |= *state == StreamState::Streaming;
             }
+            self.ever_streamed |= *state == StreamState::Streaming;
+
+            if let Some(position) = self
+                .events
+                .iter()
+                .position(|queued| matches!(queued, Event::StateChanged(_, _)))
+            {
+                let retained = prefer_state_event(self.events[position].clone(), event);
+                self.events[position] = retained;
+            } else {
+                self.events.push(event);
+            }
+            return;
+        }
+
+        match &event {
             Event::FormatRejected(_) => {
                 self.negotiated = None;
                 self.invalidate_frame();
             }
             Event::BufferRejected(_) => self.invalidate_frame(),
-            Event::FormatAgreed(_) | Event::FrameReady | Event::EmptyBuffer | Event::TimedOut => {}
+            Event::StateChanged(_, _)
+            | Event::FormatAgreed(_)
+            | Event::FrameReady(_)
+            | Event::NoDamage(_)
+            | Event::EmptyBuffer
+            | Event::TimedOut => {}
+        }
+
+        if matches!(
+            event,
+            Event::FrameReady(_)
+                | Event::NoDamage(_)
+                | Event::EmptyBuffer
+                | Event::BufferRejected(_)
+        ) {
+            if let Some(position) = self.events.iter().position(|queued| {
+                matches!(
+                    queued,
+                    Event::FrameReady(_)
+                        | Event::NoDamage(_)
+                        | Event::EmptyBuffer
+                        | Event::BufferRejected(_)
+                )
+            }) {
+                let retained = prefer_process_event(self.events[position].clone(), event);
+                self.events[position] = retained;
+            } else {
+                self.events.push(event);
+            }
+            return;
+        }
+
+        let kind = std::mem::discriminant(&event);
+        if matches!(event, Event::FormatAgreed(_)) {
+            // Only the latest nonterminal state of each kind can affect a new
+            // frame request. Coalescing keeps a hostile or broken producer from
+            // growing this queue while a reusable stream is idle.
+            self.events
+                .retain(|queued| std::mem::discriminant(queued) != kind);
+        } else if self
+            .events
+            .iter()
+            .any(|queued| std::mem::discriminant(queued) == kind)
+        {
+            // Preserve the first terminal diagnosis instead of letting a later
+            // callback hide it, while still bounding each failure kind to one.
+            return;
         }
         self.events.push(event);
     }
@@ -199,6 +275,12 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
             // held; those buffers must see the new layout, and the lifecycle
             // must observe FormatAgreed before FrameReady.
             if let Ok(mut shared) = listener.shared.lock() {
+                if shared
+                    .negotiated
+                    .is_some_and(|current| current != negotiated)
+                {
+                    shared.invalidate_frame();
+                }
                 shared.negotiated = Some(negotiated);
             }
             tracing::debug!(
@@ -295,19 +377,21 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             break;
         }
 
-        let mut event = unsafe { read_buffer(buffer, negotiated.as_ref(), listener) };
+        let mut event = Some(unsafe { read_buffer(buffer, negotiated.as_ref(), listener) });
         let queued = unsafe { (symbols.pw_stream_queue_buffer)(stream, buffer) };
         if queued < 0 {
-            event = Event::BufferRejected(format!(
+            event = Some(Event::BufferRejected(format!(
                 "PipeWire would not take a dequeued buffer back ({})",
                 errno_text(queued)
-            ));
+            )));
         }
 
-        outcome = Some(match outcome {
-            Some(current) => prefer_process_event(current, event),
-            None => event,
-        });
+        if let Some(event) = event {
+            outcome = Some(match outcome {
+                Some(current) => prefer_process_event(current, event),
+                None => event,
+            });
+        }
 
         if queued < 0 {
             break;
@@ -337,6 +421,12 @@ unsafe fn read_buffer(
     if spa.is_null() || unsafe { (*spa).n_datas } == 0 {
         return Event::EmptyBuffer;
     }
+    if unsafe { (*spa).n_datas } != 1 {
+        return Event::BufferRejected(format!(
+            "the packed BGRx/RGBx SPA buffer reported {} data planes; exactly one is required",
+            unsafe { (*spa).n_datas }
+        ));
+    }
     if unsafe { (*spa).datas }.is_null() {
         return Event::BufferRejected(
             "the SPA buffer reports data planes but its plane array is null".into(),
@@ -344,6 +434,40 @@ unsafe fn read_buffer(
     }
 
     let plane = unsafe { &*(*spa).datas };
+
+    if plane.chunk.is_null() {
+        return Event::EmptyBuffer;
+    }
+    let chunk = unsafe { *plane.chunk };
+    let flags = chunk.flags.cast_unsigned();
+    let disposition = classify_chunk(
+        chunk.size,
+        flags & CHUNK_FLAG_CORRUPTED != 0,
+        flags & CHUNK_FLAG_EMPTY != 0,
+    );
+    match disposition {
+        ChunkDisposition::Corrupted => {
+            return Event::BufferRejected(
+                "the compositor marked the PipeWire buffer as corrupted".into(),
+            );
+        }
+        ChunkDisposition::Priming => return record_no_damage(listener, *negotiated),
+        ChunkDisposition::Neutral => {
+            // EMPTY is authoritative media-neutral content. It carries no pixel
+            // bytes to validate or map; the negotiated format supplies the
+            // bounded dimensions needed to synthesize black.
+            tracing::debug!(
+                width = negotiated.width,
+                height = negotiated.height,
+                "received SPA media-neutral video; synthesizing opaque black"
+            );
+            return match negotiated.neutral_pixels() {
+                Ok(pixels) => store_frame(listener, pixels, *negotiated),
+                Err(why) => Event::BufferRejected(why.to_string()),
+            };
+        }
+        ChunkDisposition::Pixels => {}
+    }
 
     let memory_type = match plane.type_ {
         format::data_type::MEM_PTR => "MemPtr",
@@ -363,24 +487,21 @@ unsafe fn read_buffer(
             ));
         }
     };
-
-    if plane.chunk.is_null() {
-        return Event::EmptyBuffer;
+    if plane.flags & format::data_flag::READABLE == 0 {
+        return Event::BufferRejected(format!(
+            "the compositor delivered a {memory_type} buffer without SPA_DATA_FLAG_READABLE"
+        ));
     }
-    let chunk = unsafe { *plane.chunk };
-    let flags = chunk.flags.cast_unsigned();
-    if flags & CHUNK_FLAG_CORRUPTED != 0 {
-        return Event::BufferRejected(
-            "the compositor marked the PipeWire buffer as corrupted".into(),
-        );
-    }
-
-    // The idle case: a real buffer carrying no usable pixels. For a still
-    // capture, accepting SPA's neutral/black EMPTY value would be
-    // indistinguishable from the common empty priming-buffer failure.
-    if chunk.size == 0 || flags & CHUNK_FLAG_EMPTY != 0 {
-        return Event::EmptyBuffer;
-    }
+    let needed = match format::validate_chunk_geometry(
+        chunk.size,
+        plane.maxsize,
+        chunk.stride,
+        negotiated.width,
+        negotiated.height,
+    ) {
+        Ok(needed) => needed,
+        Err(why) => return Event::BufferRejected(why.to_string()),
+    };
     if plane.data.is_null() {
         return Event::BufferRejected(
             "the shared-memory buffer has bytes but PipeWire did not map them".into(),
@@ -401,7 +522,10 @@ unsafe fn read_buffer(
     }
 
     let mapping = unsafe { std::slice::from_raw_parts(plane.data.cast::<u8>(), maxsize) };
-    let source = format::linear_chunk(mapping, chunk.offset, chunk.size);
+    let source = match format::linear_chunk(mapping, chunk.offset, needed) {
+        Ok(source) => source,
+        Err(why) => return Event::BufferRejected(why.to_string()),
+    };
 
     match format::pack_rows(
         source.as_ref(),
@@ -410,27 +534,54 @@ unsafe fn read_buffer(
         negotiated.height,
         negotiated.opaque_padding,
     ) {
-        Ok(pixels) => match listener.shared.lock() {
-            Ok(mut shared) => {
-                tracing::debug!(
-                    memory_type,
-                    width = negotiated.width,
-                    height = negotiated.height,
-                    stride = chunk.stride,
-                    bytes = pixels.len(),
-                    "received a mapped shared-memory PipeWire frame"
-                );
-                shared.frame = Some(RawFrame {
-                    pixels,
-                    format: *negotiated,
-                });
-                Event::FrameReady
-            }
-            Err(_) => Event::BufferRejected(
-                "the captured pixels could not be stored because shared state was poisoned".into(),
-            ),
-        },
+        Ok(pixels) => {
+            tracing::debug!(
+                memory_type,
+                width = negotiated.width,
+                height = negotiated.height,
+                stride = chunk.stride,
+                bytes = pixels.len(),
+                "received a mapped shared-memory PipeWire frame"
+            );
+            store_frame(listener, pixels, *negotiated)
+        }
         Err(why) => Event::BufferRejected(why.to_string()),
+    }
+}
+
+fn store_frame(listener: &Listener, pixels: Vec<u8>, format: Negotiated) -> Event {
+    match listener.shared.lock() {
+        Ok(mut shared) => {
+            let sequence = shared.timeline.publish();
+            shared.frame = Some(SequencedFrame {
+                sequence,
+                frame: RawFrame { pixels, format },
+            });
+            Event::FrameReady(sequence)
+        }
+        Err(_) => Event::BufferRejected(
+            "the captured pixels could not be stored because shared state was poisoned".into(),
+        ),
+    }
+}
+
+fn record_no_damage(listener: &Listener, format: Negotiated) -> Event {
+    match listener.shared.lock() {
+        Ok(mut shared) => {
+            let reusable = shared
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.frame.format == format);
+            if reusable {
+                let sequence = shared.timeline.publish();
+                Event::NoDamage(sequence)
+            } else {
+                Event::EmptyBuffer
+            }
+        }
+        Err(_) => Event::BufferRejected(
+            "the no-damage buffer could not be sequenced because shared state was poisoned".into(),
+        ),
     }
 }
 
@@ -506,7 +657,6 @@ pub struct FrameStream {
     _hook: Box<spa_hook>,
     listener: Box<Listener>,
     timeout: Duration,
-    captured_once: bool,
 }
 
 impl std::fmt::Debug for FrameStream {
@@ -532,8 +682,16 @@ impl FrameStream {
         library: &'static Library,
         fd: OwnedFd,
         node_id: u32,
+        pipewire_serial: Option<u64>,
         timeout: Duration,
     ) -> Result<Self, Error> {
+        if pipewire_serial.is_none() && node_id == sys::ID_ANY {
+            return Err(Error::Platform(
+                "the ScreenCast portal returned PipeWire's wildcard node id without a stable \
+                 object serial; Scrozz refuses to auto-connect to an unspecified video source"
+                    .into(),
+            ));
+        }
         let symbols = &library.symbols;
 
         // Declared before `session` so construction failures drop the session
@@ -584,16 +742,26 @@ impl FrameStream {
 
         {
             let _lock = LoopLock::new(symbols, thread_loop);
-            connect_locked(&mut session, &mut listener, &mut hook, fd, node_id)?;
+            connect_locked(
+                &mut session,
+                &mut listener,
+                &mut hook,
+                fd,
+                node_id,
+                pipewire_serial,
+            )?;
         }
 
-        tracing::debug!(node_id, "connected the reusable PipeWire capture stream");
+        tracing::debug!(
+            node_id,
+            pipewire_serial,
+            "connected the reusable PipeWire capture stream"
+        );
         Ok(Self {
             session,
             _hook: hook,
             listener,
             timeout,
-            captured_once: false,
         })
     }
 
@@ -608,13 +776,7 @@ impl FrameStream {
     /// target disappearance, malformed buffers, and format rejection.
     pub fn capture_frame(&mut self) -> Result<RawFrame, Error> {
         let _lock = LoopLock::new(self.session.symbols, self.session.thread_loop);
-        let frame = wait_for_frame(
-            &self.session,
-            &self.listener,
-            self.timeout,
-            self.captured_once,
-        )?;
-        self.captured_once = true;
+        let frame = wait_for_frame(&self.session, &self.listener, self.timeout)?;
         Ok(frame)
     }
 }
@@ -631,9 +793,10 @@ pub fn capture_one(
     library: &'static Library,
     fd: OwnedFd,
     node_id: u32,
+    pipewire_serial: Option<u64>,
     timeout: Duration,
 ) -> Result<RawFrame, Error> {
-    FrameStream::connect(library, fd, node_id, timeout)?.capture_frame()
+    FrameStream::connect(library, fd, node_id, pipewire_serial, timeout)?.capture_frame()
 }
 
 /// Releases the recursive thread-loop lock on every return and unwind path.
@@ -665,6 +828,7 @@ fn connect_locked(
     hook: &mut spa_hook,
     fd: OwnedFd,
     node_id: u32,
+    pipewire_serial: Option<u64>,
 ) -> Result<(), Error> {
     let symbols = session.symbols;
 
@@ -682,7 +846,7 @@ fn connect_locked(
         ));
     }
 
-    let properties = stream_properties(symbols);
+    let properties = stream_properties(symbols, pipewire_serial)?;
     let stream_name = CString::new("scrozz").expect("literal has no interior NUL");
     let stream = unsafe { (symbols.pw_stream_new)(session.core, stream_name.as_ptr(), properties) };
     if stream.is_null() {
@@ -705,11 +869,16 @@ fn connect_locked(
     let offer = format::enum_format_param();
     let mut params: [*const spa_pod; 1] = [offer.as_ptr().cast::<spa_pod>()];
 
+    let target_id = if pipewire_serial.is_some() {
+        sys::ID_ANY
+    } else {
+        node_id
+    };
     let rc = unsafe {
         (symbols.pw_stream_connect)(
             stream,
             sys::DIRECTION_INPUT,
-            node_id,
+            target_id,
             sys::STREAM_FLAG_AUTOCONNECT
                 | sys::STREAM_FLAG_MAP_BUFFERS
                 | sys::STREAM_FLAG_DONT_RECONNECT,
@@ -719,8 +888,9 @@ fn connect_locked(
     };
     if rc < 0 {
         return Err(Error::Platform(format!(
-            "PipeWire refused to connect to node {node_id} ({}). The portal granted the session, \
-             so the node most likely vanished between being offered and being opened",
+            "PipeWire refused to connect to portal stream node {node_id} (serial \
+             {pipewire_serial:?}; {}). The portal granted the session, so the source most likely \
+             vanished between being offered and being opened",
             errno_text(rc)
         )));
     }
@@ -733,7 +903,6 @@ fn wait_for_frame(
     session: &Session<'_>,
     listener: &Listener,
     timeout: Duration,
-    discard_buffered_frame: bool,
 ) -> Result<RawFrame, Error> {
     let symbols = session.symbols;
     let seconds = u32::try_from(timeout.as_secs().max(1)).unwrap_or(u32::MAX);
@@ -743,31 +912,28 @@ fn wait_for_frame(
             .lock()
             .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))?;
 
-        if discard_buffered_frame {
-            // The caller may have scrolled only after the previous capture
-            // returned. A frame queued while it was preparing that input is
-            // older than this request and must never be stitched as the next
-            // viewport.
-            shared.invalidate_frame();
+        // Complete frames are copied continuously while a reusable stream is
+        // idle. Keep any frame newer than the previously delivered sequence:
+        // it may be exactly the post-scroll viewport produced during settle time.
+        let queued = std::mem::take(&mut shared.events);
+        let mut pending = normalize_events(&shared, queued);
+        if let Some(frame) = shared
+            .frame
+            .as_ref()
+            .filter(|frame| shared.timeline.is_fresh(frame.sequence))
+            && !pending
+                .iter()
+                .any(|event| matches!(event, Event::FrameReady(_)))
+        {
+            pending.push(Event::FrameReady(frame.sequence));
         }
-
-        let has_frame = shared.frame.is_some();
-        let mut pending = std::mem::take(&mut shared.events);
-        pending.retain(|event| match event {
-            Event::FrameReady => !discard_buffered_frame && has_frame,
-            Event::FormatRejected(_) | Event::BufferRejected(_) => true,
-            Event::StateChanged(_, _)
-            | Event::FormatAgreed(_)
-            | Event::EmptyBuffer
-            | Event::TimedOut => false,
-        });
 
         (
             pending,
             shared
                 .frame
                 .as_ref()
-                .map(|frame| frame.format)
+                .map(|frame| frame.frame.format)
                 .or(shared.negotiated),
             shared.state.clone(),
             shared.ever_streamed,
@@ -779,6 +945,13 @@ fn wait_for_frame(
     } else {
         Lifecycle::new(seconds)
     };
+    if let Some((state, message)) = state
+        .as_ref()
+        .filter(|(state, _)| state.is_terminal())
+        .cloned()
+    {
+        lifecycle.observe(Event::StateChanged(state, message));
+    }
     if !ever_streamed && let Some(format) = existing_format {
         lifecycle.observe(Event::FormatAgreed(format));
     }
@@ -800,11 +973,14 @@ fn wait_for_frame(
 
     loop {
         // Drain whatever the callbacks queued while the lock was released.
-        let batch = listener
-            .shared
-            .lock()
-            .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))
-            .map(|mut shared| std::mem::take(&mut shared.events))?;
+        let batch = {
+            let mut shared = listener
+                .shared
+                .lock()
+                .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))?;
+            let queued = std::mem::take(&mut shared.events);
+            normalize_events(&shared, queued)
+        };
 
         let mut stop = false;
         for event in batch {
@@ -825,45 +1001,97 @@ fn wait_for_frame(
 
         // Whole seconds only, rounded up so a sub-second remainder still waits
         // rather than spinning.
-        let wait_secs = remaining.as_secs().saturating_add(1).min(i32::MAX as u64) as c_int;
+        let wait_secs = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+            .max(1)
+            .min(i32::MAX as u64) as c_int;
         let rc = unsafe { (symbols.pw_thread_loop_timed_wait)(session.thread_loop, wait_secs) };
-        if rc < 0 {
-            if rc != -ERRNO_TIMED_OUT {
-                return Err(Error::Platform(format!(
-                    "waiting for the PipeWire event loop failed ({})",
-                    errno_text(rc)
-                )));
-            }
+        // The legacy whole-second API returns positive ETIMEDOUT, unlike the
+        // newer `_full` variant and most PipeWire calls, which return -errno.
+        if rc == ERRNO_TIMED_OUT {
             if Instant::now() >= deadline {
                 lifecycle.observe(Event::TimedOut);
                 break;
             }
+        } else if rc < 0 {
+            return Err(Error::Platform(format!(
+                "waiting for the PipeWire event loop failed ({})",
+                errno_text(rc)
+            )));
         }
     }
 
-    lifecycle.outcome()?;
-    let frame = listener
+    let captured_sequence = lifecycle.captured_sequence().ok_or_else(|| {
+        Error::Platform("the PipeWire lifecycle captured pixels without a media sequence".into())
+    })?;
+    let captured_format = lifecycle.outcome()?;
+    let mut shared = listener
         .shared
         .lock()
-        .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))?
+        .map_err(|_| Error::Platform("the PipeWire callback state was poisoned".into()))?;
+    let frame = shared
         .frame
-        .take()
+        .as_ref()
         .ok_or_else(|| {
             Error::Platform(
                 "the PipeWire stream reported a complete frame but produced no pixels".into(),
             )
-        })?;
+        })?
+        .clone();
+    if frame.frame.format != captured_format {
+        return Err(Error::Platform(
+            "the PipeWire format changed after the selected frame was sequenced".into(),
+        ));
+    }
+    shared.timeline.mark_delivered(captured_sequence);
 
-    Ok(frame)
+    Ok(frame.frame)
+}
+
+fn normalize_events(shared: &Shared, events: Vec<Event>) -> Vec<Event> {
+    let mut normalized = events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::FrameReady(sequence) if shared.timeline.is_fresh(sequence) => {
+                Some(Event::FrameReady(sequence))
+            }
+            Event::FrameReady(_) => None,
+            Event::NoDamage(sequence)
+                if shared.timeline.is_fresh(sequence)
+                    && shared.frame.as_ref().is_some_and(|frame| {
+                        shared
+                            .negotiated
+                            .is_some_and(|format| frame.frame.format == format)
+                    }) =>
+            {
+                shared.frame.as_ref().map(|_| Event::FrameReady(sequence))
+            }
+            Event::NoDamage(_) => None,
+            Event::EmptyBuffer | Event::TimedOut => None,
+            other => Some(other),
+        })
+        .collect::<Vec<_>>();
+    if let Some(position) = normalized
+        .iter()
+        .position(|event| matches!(event, Event::StateChanged(state, _) if state.is_terminal()))
+    {
+        normalized.swap(0, position);
+    }
+    normalized
 }
 
 /// Builds the stream's properties.
 ///
 /// These are advisory metadata: they put a recognisable name in `pw-top` and
 /// tell the session manager this is a screen capture rather than, say, a camera.
-/// A null return is survivable — `pw_stream_new` accepts it — so failure here is
-/// not worth an error path.
-fn stream_properties(symbols: &Symbols) -> *mut c_void {
+/// The serial-bearing path must retain `target.object`: falling back to null
+/// properties while passing `PW_ID_ANY` would turn an exact portal stream into
+/// an unconstrained auto-connect request.
+fn stream_properties(
+    symbols: &Symbols,
+    pipewire_serial: Option<u64>,
+) -> Result<*mut c_void, Error> {
     let pairs = [
         (c"media.type", c"Video"),
         (c"media.category", c"Capture"),
@@ -872,17 +1100,43 @@ fn stream_properties(symbols: &Symbols) -> *mut c_void {
     ];
 
     unsafe {
-        (symbols.pw_properties_new)(
-            pairs[0].0.as_ptr(),
-            pairs[0].1.as_ptr(),
-            pairs[1].0.as_ptr(),
-            pairs[1].1.as_ptr(),
-            pairs[2].0.as_ptr(),
-            pairs[2].1.as_ptr(),
-            pairs[3].0.as_ptr(),
-            pairs[3].1.as_ptr(),
-            ptr::null::<c_char>(),
-        )
+        let properties = if let Some(serial) = pipewire_serial {
+            let serial = CString::new(serial.to_string()).expect("an integer contains no NUL");
+            (symbols.pw_properties_new)(
+                pairs[0].0.as_ptr(),
+                pairs[0].1.as_ptr(),
+                pairs[1].0.as_ptr(),
+                pairs[1].1.as_ptr(),
+                pairs[2].0.as_ptr(),
+                pairs[2].1.as_ptr(),
+                pairs[3].0.as_ptr(),
+                pairs[3].1.as_ptr(),
+                c"target.object".as_ptr(),
+                serial.as_ptr(),
+                ptr::null::<c_char>(),
+            )
+        } else {
+            (symbols.pw_properties_new)(
+                pairs[0].0.as_ptr(),
+                pairs[0].1.as_ptr(),
+                pairs[1].0.as_ptr(),
+                pairs[1].1.as_ptr(),
+                pairs[2].0.as_ptr(),
+                pairs[2].1.as_ptr(),
+                pairs[3].0.as_ptr(),
+                pairs[3].1.as_ptr(),
+                ptr::null::<c_char>(),
+            )
+        };
+        if properties.is_null() {
+            Err(Error::Platform(
+                "PipeWire could not allocate the capture stream properties; target identity was \
+                 not relaxed"
+                    .into(),
+            ))
+        } else {
+            Ok(properties)
+        }
     }
 }
 
@@ -896,5 +1150,177 @@ fn errno_text(rc: c_int) -> String {
         32 => "the connection was closed".into(),
         110 => "timed out".into(),
         other => format!("errno {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scrozz_core::{ColorSpace, PixelFormat};
+
+    use super::*;
+
+    fn negotiated() -> Negotiated {
+        Negotiated {
+            width: 1,
+            height: 1,
+            pixel_format: PixelFormat::Bgra8,
+            opaque_padding: true,
+            color_space: ColorSpace::Unknown,
+        }
+    }
+
+    fn listener() -> Listener {
+        let mut shared = Shared::default();
+        shared.negotiated = Some(negotiated());
+        Listener {
+            symbols: ptr::null(),
+            thread_loop: ptr::null_mut(),
+            stream: Mutex::new(ptr::null_mut()),
+            shared: Mutex::new(shared),
+        }
+    }
+
+    #[test]
+    fn packed_video_rejects_multiple_data_planes_before_dereferencing_them() {
+        let listener = listener();
+        let mut spa = sys::spa_buffer {
+            n_metas: 0,
+            n_datas: 2,
+            metas: ptr::null_mut(),
+            datas: ptr::null_mut(),
+        };
+        let mut buffer = sys::pw_buffer {
+            buffer: ptr::from_mut(&mut spa),
+        };
+
+        let Event::BufferRejected(reason) =
+            (unsafe { read_buffer(&mut buffer, Some(&negotiated()), &listener) })
+        else {
+            panic!("a packed multi-plane buffer must be rejected");
+        };
+        assert!(reason.contains("exactly one"));
+    }
+
+    #[test]
+    fn pixel_data_must_explicitly_be_readable() {
+        let listener = listener();
+        let mut pixels = [0_u8; 4];
+        let mut chunk = sys::spa_chunk {
+            offset: 0,
+            size: 4,
+            stride: 4,
+            flags: 0,
+        };
+        let mut plane = sys::spa_data {
+            type_: format::data_type::MEM_PTR,
+            flags: 0,
+            fd: -1,
+            mapoffset: 0,
+            maxsize: 4,
+            data: pixels.as_mut_ptr().cast(),
+            chunk: ptr::from_mut(&mut chunk),
+        };
+        let mut spa = sys::spa_buffer {
+            n_metas: 0,
+            n_datas: 1,
+            metas: ptr::null_mut(),
+            datas: ptr::from_mut(&mut plane),
+        };
+        let mut buffer = sys::pw_buffer {
+            buffer: ptr::from_mut(&mut spa),
+        };
+
+        let Event::BufferRejected(reason) =
+            (unsafe { read_buffer(&mut buffer, Some(&negotiated()), &listener) })
+        else {
+            panic!("an unreadable pixel plane must be rejected");
+        };
+        assert!(reason.contains("SPA_DATA_FLAG_READABLE"));
+    }
+
+    #[test]
+    fn media_neutral_video_is_opaque_black_without_reading_plane_bytes() {
+        let listener = listener();
+        let mut chunk = sys::spa_chunk {
+            offset: 0,
+            size: 0,
+            stride: 0,
+            flags: CHUNK_FLAG_EMPTY.cast_signed(),
+        };
+        let mut plane = sys::spa_data {
+            type_: 0,
+            flags: 0,
+            fd: -1,
+            mapoffset: 0,
+            maxsize: 0,
+            data: ptr::null_mut(),
+            chunk: ptr::from_mut(&mut chunk),
+        };
+        let mut spa = sys::spa_buffer {
+            n_metas: 0,
+            n_datas: 1,
+            metas: ptr::null_mut(),
+            datas: ptr::from_mut(&mut plane),
+        };
+        let mut buffer = sys::pw_buffer {
+            buffer: ptr::from_mut(&mut spa),
+        };
+
+        assert_eq!(
+            unsafe { read_buffer(&mut buffer, Some(&negotiated()), &listener) },
+            Event::FrameReady(1)
+        );
+        let shared = listener.shared.lock().expect("shared frame");
+        assert_eq!(
+            shared.frame.as_ref().expect("neutral frame").frame.pixels,
+            [0, 0, 0, 0xff]
+        );
+    }
+
+    #[test]
+    fn queued_media_keeps_the_newest_observation_and_terminal_state() {
+        let mut shared = Shared::default();
+        shared.negotiated = Some(negotiated());
+        shared.push(Event::FrameReady(1));
+        shared.push(Event::NoDamage(2));
+        assert_eq!(shared.events, [Event::NoDamage(2)]);
+
+        shared.push(Event::StateChanged(
+            StreamState::Error,
+            Some("source failed".into()),
+        ));
+        shared.push(Event::StateChanged(StreamState::Paused, None));
+        assert!(matches!(
+            shared.state,
+            Some((StreamState::Error, Some(ref message))) if message == "source failed"
+        ));
+        let normalized = normalize_events(&shared, shared.events.clone());
+        assert!(matches!(
+            normalized.first(),
+            Some(Event::StateChanged(StreamState::Error, _))
+        ));
+    }
+
+    #[test]
+    fn no_damage_reuse_advances_the_delivery_watermark() {
+        let mut shared = Shared::default();
+        shared.negotiated = Some(negotiated());
+        let frame_sequence = shared.timeline.publish();
+        shared.frame = Some(SequencedFrame {
+            sequence: frame_sequence,
+            frame: RawFrame {
+                pixels: vec![0, 0, 0, 0xff],
+                format: negotiated(),
+            },
+        });
+        shared.timeline.mark_delivered(frame_sequence);
+        let observation = shared.timeline.publish();
+
+        assert_eq!(
+            normalize_events(&shared, vec![Event::NoDamage(observation)]),
+            [Event::FrameReady(observation)]
+        );
+        shared.timeline.mark_delivered(observation);
+        assert!(!shared.timeline.is_fresh(observation));
     }
 }

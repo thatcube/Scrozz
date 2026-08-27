@@ -25,9 +25,9 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     thread::JoinHandle,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use scrozz_annotate::Document;
@@ -40,9 +40,12 @@ use crate::{
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
+        server::Request,
     },
     platform,
 };
+
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
@@ -61,6 +64,8 @@ pub enum Job {
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Execute a command forwarded by another process and answer its socket.
+    Forward(Request),
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -91,6 +96,8 @@ pub enum Outcome {
         /// Why.
         error: CliError,
     },
+    /// A forwarded command finished and its caller has been answered.
+    Forwarded(Option<crate::cli::Command>),
 }
 
 /// A handle to the capture thread.
@@ -98,6 +105,8 @@ pub struct Pipeline {
     jobs: Sender<Job>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
+    worker_done: Receiver<()>,
+    cancellation: scrozz_capture::CaptureCancellation,
     next_card: u64,
 }
 
@@ -113,10 +122,16 @@ impl Pipeline {
     pub fn start() -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
+        let (worker_done_tx, worker_done) = channel();
+        let cancellation = scrozz_capture::CaptureCancellation::new();
+        let worker_cancellation = cancellation.clone();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx).run(&job_rx))
+            .spawn(move || {
+                Worker::new(outcome_tx, worker_cancellation).run(&job_rx);
+                let _ = worker_done_tx.send(());
+            })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -127,6 +142,8 @@ impl Pipeline {
             jobs,
             outcomes,
             worker: Some(worker),
+            worker_done,
+            cancellation,
             next_card: 1,
         })
     }
@@ -140,7 +157,18 @@ impl Pipeline {
 
     /// Posts a job. Returns `false` if the worker has gone.
     pub fn post(&self, job: Job) -> bool {
-        self.jobs.send(job).is_ok()
+        match self.jobs.send(job) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::SendError(Job::Forward(request))) => {
+                // Do not leave the forwarding client blocked on an unexplained
+                // EOF if the worker died between accept and enqueue.
+                let cancellation = scrozz_capture::CaptureCancellation::new();
+                cancellation.cancel();
+                let _ = request.serve_with_cancellation(&cancellation);
+                false
+            }
+            Err(std::sync::mpsc::SendError(_)) => false,
+        }
     }
 
     /// Takes one finished piece of work, if there is one. Never blocks.
@@ -148,14 +176,29 @@ impl Pipeline {
         self.outcomes.try_recv().ok()
     }
 
-    /// Stops the worker and waits for it.
+    /// Cancels interactive acquisition, then stops and joins the worker.
     ///
     /// Called from `Drop`, but exposed so a host can shut down deterministically
-    /// rather than at an unspecified point during teardown.
+    /// rather than at an unspecified point during teardown. Cancelling first
+    /// closes an active Wayland ScreenCast session and dismisses its picker.
     pub fn stop(&mut self) {
+        self.cancellation.cancel();
         let _ = self.jobs.send(Job::Stop);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            match self.worker_done.recv_timeout(WORKER_STOP_TIMEOUT) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    if worker.join().is_err() {
+                        tracing::warn!("capture worker panicked during shutdown");
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        timeout_ms = WORKER_STOP_TIMEOUT.as_millis(),
+                        "capture worker did not stop in time; detaching the in-flight operation"
+                    );
+                    drop(worker);
+                }
+            }
         }
     }
 }
@@ -176,10 +219,11 @@ struct Worker {
     outcomes: Sender<Outcome>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
+    cancellation: scrozz_capture::CaptureCancellation,
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>) -> Self {
+    fn new(outcomes: Sender<Outcome>, cancellation: scrozz_capture::CaptureCancellation) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -200,11 +244,24 @@ impl Worker {
             outcomes,
             store,
             cache: HashMap::new(),
+            cancellation,
         }
     }
 
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
+            if self.cancellation.is_cancelled() {
+                match job {
+                    // The caller is blocked waiting for a protocol response. Run
+                    // only the cheap parse/response path, which observes the
+                    // already-cancelled token before dispatching any command.
+                    Job::Forward(request) => self.forward(request),
+                    Job::Stop => break,
+                    Job::Capture { .. } | Job::Copy(_) | Job::Save(_) | Job::Release(_) => {}
+                }
+                continue;
+            }
+
             match job {
                 Job::Capture { kind, card } => self.capture(kind, card),
                 Job::Copy(card) => self.copy(card),
@@ -212,6 +269,7 @@ impl Worker {
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
+                Job::Forward(request) => self.forward(request),
                 Job::Stop => break,
             }
         }
@@ -228,6 +286,11 @@ impl Worker {
                 let _ = self.outcomes.send(Outcome::Failed { card, error });
             }
         }
+    }
+
+    fn forward(&self, request: Request) {
+        let command = request.serve_with_cancellation(&self.cancellation);
+        let _ = self.outcomes.send(Outcome::Forwarded(command));
     }
 
     fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
@@ -257,7 +320,7 @@ impl Worker {
             include_window_shadow: !kind.needs_selection(),
         };
 
-        let capture = backend.capture(&request)?;
+        let capture = platform::capture_with_cancellation(&request, &self.cancellation)?;
         let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
@@ -389,7 +452,9 @@ mod tests {
         // Drop also stops it, so the second call must be a no-op rather than a
         // join on an already-joined handle.
         let mut pipeline = Pipeline::start().expect("the worker should start");
+        assert!(!pipeline.cancellation.is_cancelled());
         pipeline.stop();
+        assert!(pipeline.cancellation.is_cancelled());
         pipeline.stop();
     }
 

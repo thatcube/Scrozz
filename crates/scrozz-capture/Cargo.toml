@@ -47,6 +47,11 @@ x11rb.workspace = true
 ashpd.workspace = true
 libloading.workspace = true
 futures-lite.workspace = true
+async-io.workspace = true
+smithay-client-toolkit.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

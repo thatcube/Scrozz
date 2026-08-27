@@ -350,7 +350,7 @@ impl App {
         // Collected before any is served: serving needs `&mut self`, and the
         // listener is borrowed for as long as it is being polled.
         let mut pending = Vec::new();
-        if let Some(server) = &self.server {
+        if let Some(server) = &mut self.server {
             while let Some(request) = server.poll() {
                 pending.push(request);
             }
@@ -358,18 +358,11 @@ impl App {
 
         for request in pending {
             tracing::debug!(?request, "a forwarded command arrived");
-            // The command runs to completion here, on the main thread, because
-            // it must produce byte-identical output to a local run and the
-            // command layer is synchronous. A capture is tens of milliseconds;
-            // a recording returns as soon as it has started.
-            if let Some(command) = request.serve() {
-                self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
-                if matches!(command, crate::cli::Command::Gui) {
-                    // A second `scrozz gui` means "show yourself", not "start
-                    // again". There is nothing to show yet, so it is a no-op
-                    // that has at least been answered rather than ignored.
-                    self.note("a second launch was answered by this instance");
-                }
+            // A forwarded capture may wait in the compositor's portal picker.
+            // Keep it on the same serial worker as hotkey captures so neither
+            // blocks the main thread or opens a second simultaneous picker.
+            if !self.pipeline.post(Job::Forward(request)) {
+                self.note("the capture worker cannot answer a forwarded command");
             }
         }
 
@@ -400,6 +393,18 @@ impl App {
                 }
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
+                }
+                Outcome::Forwarded(command) => {
+                    if let Some(command) = command {
+                        self.captures +=
+                            u64::from(matches!(command, crate::cli::Command::Capture(_)));
+                        if matches!(command, crate::cli::Command::Gui) {
+                            // A second `scrozz gui` means "show yourself", not
+                            // "start again". There is nothing to show yet, so it
+                            // is a no-op that was at least answered.
+                            self.note("a second launch was answered by this instance");
+                        }
+                    }
                 }
             }
         }

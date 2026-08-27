@@ -18,13 +18,93 @@
 //!
 //! Mutter's screen-cast source emits buffers whose `chunk->size` is zero when
 //! nothing on screen has changed. They are real buffers and `process` really
-//! fires for them. A capture that takes the first buffer it is offered will,
-//! on a still desktop, reliably produce a black PNG. So [`Event::EmptyBuffer`]
-//! is an explicit, expected event that keeps waiting rather than an error.
+//! fires for them, but they do not describe a complete frame, so
+//! [`Event::EmptyBuffer`] keeps waiting. That is distinct from
+//! `SPA_CHUNK_FLAG_EMPTY`: SPA defines the flag as valid media-neutral content,
+//! which means black for video and is synthesized as such by the stream reader.
 
 use scrozz_core::Error;
 
 use super::format::Negotiated;
+
+/// Monotonic media observations and the last complete frame a caller received.
+///
+/// A reusable stream keeps producing while no `capture_frame` call is active.
+/// Sequencing that continuous timeline lets the next call accept a complete
+/// post-scroll frame already buffered during settle time instead of flushing it.
+#[derive(Debug, Default)]
+pub struct FrameTimeline {
+    next: u64,
+    delivered: u64,
+}
+
+impl FrameTimeline {
+    /// Assigns the next observation sequence.
+    pub fn publish(&mut self) -> u64 {
+        self.next = self.next.wrapping_add(1);
+        if self.next == 0 {
+            self.next = 1;
+        }
+        self.next
+    }
+
+    /// The call boundary against which later no-damage events are judged.
+    #[must_use]
+    pub const fn boundary(&self) -> u64 {
+        self.delivered
+    }
+
+    /// Whether a complete buffered frame has not yet been delivered.
+    #[must_use]
+    pub const fn is_fresh(&self, sequence: u64) -> bool {
+        Self::is_after(sequence, self.delivered)
+    }
+
+    /// Records delivery without allowing an older callback to move time back.
+    pub fn mark_delivered(&mut self, sequence: u64) {
+        if Self::is_after(sequence, self.delivered) {
+            self.delivered = sequence;
+        }
+    }
+
+    /// Whether an observation occurred after a prior sequence, including wrap.
+    #[must_use]
+    pub const fn is_after(sequence: u64, boundary: u64) -> bool {
+        let distance = sequence.wrapping_sub(boundary);
+        distance != 0 && distance < (1_u64 << 63)
+    }
+}
+
+/// Meaning of one SPA chunk before any pointer arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkDisposition {
+    /// The producer marked the bytes unusable.
+    Corrupted,
+    /// No bytes were supplied yet; keep waiting for a complete frame.
+    Priming,
+    /// SPA explicitly represents media-neutral video, which is black.
+    Neutral,
+    /// Read and pack the supplied bytes.
+    Pixels,
+}
+
+/// Distinguishes zero-byte priming from SPA's valid neutral-black video.
+#[must_use]
+pub const fn classify_chunk(
+    size: u32,
+    is_corrupted: bool,
+    is_media_neutral: bool,
+) -> ChunkDisposition {
+    if is_corrupted {
+        ChunkDisposition::Corrupted
+    } else if is_media_neutral {
+        ChunkDisposition::Neutral
+    } else if size == 0 {
+        ChunkDisposition::Priming
+    } else {
+        ChunkDisposition::Pixels
+    }
+}
 
 /// `enum pw_stream_state`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +137,12 @@ impl StreamState {
             _ => Self::Error,
         }
     }
+
+    /// Whether this state permanently settles a stream.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Error | Self::Unconnected)
+    }
 }
 
 /// Something the stream told us.
@@ -68,9 +154,12 @@ pub enum Event {
     FormatAgreed(Negotiated),
     /// `param_changed` delivered a `Format` this client cannot use.
     FormatRejected(String),
-    /// `process` produced a buffer with pixels in it.
-    FrameReady,
-    /// `process` produced a buffer with no valid data; keep waiting.
+    /// `process` produced a complete frame at this media sequence.
+    FrameReady(u64),
+    /// A post-format zero-byte buffer says the previous complete frame is still
+    /// current; only a request that predates this sequence may reuse it.
+    NoDamage(u64),
+    /// `process` produced a priming buffer with no reusable frame; keep waiting.
     EmptyBuffer,
     /// `process` produced a buffer that could not be read at all.
     BufferRejected(String),
@@ -83,33 +172,64 @@ pub enum Event {
 ///
 /// A malformed buffer is structural and outranks everything, a usable frame
 /// outranks an empty priming buffer, and emptiness is retained only when no
-/// better result arrived. Equal-priority events keep the first diagnosis while
-/// the pixel slot itself is still updated to the newest good frame.
+/// better result arrived. Equal-priority media observations keep the newest
+/// sequence, while equal-priority failures preserve the first diagnosis.
 #[must_use]
 pub fn prefer_process_event(current: Event, next: Event) -> Event {
     debug_assert!(is_process_event(&current));
     debug_assert!(is_process_event(&next));
 
-    if process_priority(&next) > process_priority(&current) {
-        next
-    } else {
-        current
+    match process_priority(&next).cmp(&process_priority(&current)) {
+        std::cmp::Ordering::Greater => next,
+        std::cmp::Ordering::Less => current,
+        std::cmp::Ordering::Equal => match (event_sequence(&current), event_sequence(&next)) {
+            (Some(current_sequence), Some(next_sequence))
+                if FrameTimeline::is_after(next_sequence, current_sequence) =>
+            {
+                next
+            }
+            _ => current,
+        },
+    }
+}
+
+/// Coalesces state callbacks without allowing a terminal state to disappear.
+///
+/// A reusable stream can sit idle long enough to queue several transitions.
+/// Once `Error` or `Unconnected` arrives, a later nonterminal callback must not
+/// turn a dead source back into an apparently live one. The first terminal
+/// diagnosis is retained because it is closest to the cause.
+#[must_use]
+pub fn prefer_state_event(current: Event, next: Event) -> Event {
+    debug_assert!(matches!(current, Event::StateChanged(_, _)));
+    debug_assert!(matches!(next, Event::StateChanged(_, _)));
+
+    match &current {
+        Event::StateChanged(state, _) if state.is_terminal() => current,
+        _ => next,
     }
 }
 
 const fn is_process_event(event: &Event) -> bool {
     matches!(
         event,
-        Event::FrameReady | Event::EmptyBuffer | Event::BufferRejected(_)
+        Event::FrameReady(_) | Event::NoDamage(_) | Event::EmptyBuffer | Event::BufferRejected(_)
     )
 }
 
 const fn process_priority(event: &Event) -> u8 {
     match event {
-        Event::BufferRejected(_) => 3,
-        Event::FrameReady => 2,
+        Event::BufferRejected(_) => 4,
+        Event::FrameReady(_) | Event::NoDamage(_) => 3,
         Event::EmptyBuffer => 1,
         _ => 0,
+    }
+}
+
+const fn event_sequence(event: &Event) -> Option<u64> {
+    match event {
+        Event::FrameReady(sequence) | Event::NoDamage(sequence) => Some(*sequence),
+        _ => None,
     }
 }
 
@@ -172,6 +292,7 @@ impl Failure {
 pub struct Lifecycle {
     phase: Phase,
     format: Option<Negotiated>,
+    captured_sequence: Option<u64>,
     /// Whether the stream ever reached `Streaming`, used to tell "the node was
     /// never there" from "the node went away".
     ever_streamed: bool,
@@ -185,6 +306,7 @@ impl Lifecycle {
         Self {
             phase: Phase::Connecting,
             format: None,
+            captured_sequence: None,
             ever_streamed: false,
             timeout_seconds,
         }
@@ -205,6 +327,7 @@ impl Lifecycle {
                 Phase::Connecting
             },
             format,
+            captured_sequence: None,
             ever_streamed: true,
             timeout_seconds,
         }
@@ -220,6 +343,12 @@ impl Lifecycle {
     #[must_use]
     pub const fn format(&self) -> Option<Negotiated> {
         self.format
+    }
+
+    /// Media observation that satisfied this capture, once settled successfully.
+    #[must_use]
+    pub const fn captured_sequence(&self) -> Option<u64> {
+        self.captured_sequence
     }
 
     /// Whether the loop has finished, for good or ill.
@@ -249,7 +378,7 @@ impl Lifecycle {
                 Action::Wait
             }
             Event::FormatRejected(why) => self.fail(Failure::Format(why)),
-            Event::FrameReady => {
+            Event::FrameReady(sequence) => {
                 // A frame without an agreed format should be impossible, and if
                 // it happens the pixels cannot be interpreted, so it is a
                 // failure rather than a silent success.
@@ -260,10 +389,11 @@ impl Lifecycle {
                             .into(),
                     ));
                 }
+                self.captured_sequence = Some(sequence);
                 self.phase = Phase::Captured;
                 Action::Stop
             }
-            Event::EmptyBuffer => Action::Wait,
+            Event::NoDamage(_) | Event::EmptyBuffer => Action::Wait,
             Event::BufferRejected(why) => self.fail(Failure::Buffer(why)),
             Event::TimedOut => self.fail(Failure::Timeout(self.timeout_seconds)),
         }

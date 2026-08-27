@@ -24,7 +24,7 @@
 //! signatures means the compiler tells us the day a signature drifts, rather
 //! than the integration doing it months later.
 
-use scrozz_core::{CaptureBackend, TargetEnumerator};
+use scrozz_core::{Capture, CaptureBackend, CaptureRequest, TargetEnumerator};
 
 use crate::fault::{CliError, CliResult};
 
@@ -80,6 +80,18 @@ fn guard(what: &str, provider: &'static str) -> CliResult<()> {
 pub fn capture_backend() -> CliResult<Box<dyn CaptureBackend>> {
     capture_guard("taking a capture", "scrozz-capture")?;
     Ok(scrozz_capture::backend()?)
+}
+
+/// Takes a capture whose interactive acquisition can be cancelled during shutdown.
+pub fn capture_with_cancellation(
+    request: &CaptureRequest,
+    cancellation: &scrozz_capture::CaptureCancellation,
+) -> CliResult<Capture> {
+    capture_guard("taking a capture", "scrozz-capture")?;
+    Ok(scrozz_capture::capture_with_cancellation(
+        request,
+        cancellation,
+    )?)
 }
 
 /// The display and window enumerator.

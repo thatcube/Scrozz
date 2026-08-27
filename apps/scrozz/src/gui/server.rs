@@ -28,6 +28,8 @@
 //! there would freeze the menu bar until someone happened to run a command.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use crate::{
     cli::{Cli, Command},
@@ -67,7 +69,22 @@ impl Request {
     /// Returns what the command was, so the app can decide whether it also has
     /// local work to do — showing a card for a forwarded capture, or quitting.
     pub fn serve(self) -> Option<Command> {
-        let (command, response) = run(&self.argv, self.cwd.as_deref());
+        self.serve_inner(None)
+    }
+
+    /// Runs the command with cancellable interactive capture and answers the caller.
+    pub fn serve_with_cancellation(
+        self,
+        cancellation: &scrozz_capture::CaptureCancellation,
+    ) -> Option<Command> {
+        self.serve_inner(Some(cancellation))
+    }
+
+    fn serve_inner(
+        self,
+        cancellation: Option<&scrozz_capture::CaptureCancellation>,
+    ) -> Option<Command> {
+        let (command, response) = run(&self.argv, self.cwd.as_deref(), cancellation);
         self.reply(&response);
         command
     }
@@ -95,7 +112,11 @@ impl Request {
 /// Separated from [`Request`] so the fidelity rules can be tested without a
 /// socket, which is the part most likely to drift from
 /// [`crate::report::Reporter::emit`].
-fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+fn run(
+    argv: &[String],
+    cwd: Option<&Path>,
+    cancellation: Option<&scrozz_capture::CaptureCancellation>,
+) -> (Option<Command>, Response) {
     use clap::Parser as _;
 
     if argv.is_empty() {
@@ -117,7 +138,7 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     with_argv0.push("scrozz".to_owned());
     with_argv0.extend_from_slice(argv);
 
-    let cli = match Cli::try_parse_from(&with_argv0) {
+    let mut cli = match Cli::try_parse_from(&with_argv0) {
         Ok(cli) => cli,
         // clap's own rejection. There is no slug to report it under, because we
         // never got as far as knowing which subcommand was meant.
@@ -127,13 +148,19 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     let command = cli.command.clone().unwrap_or(Command::Gui);
     let slug = command.slug();
 
-    // Relative paths belong to the caller's directory, not the daemon's. The
-    // restore matters as much as the switch: this is the GUI's own process, and
-    // every later capture would otherwise inherit whatever directory the last
-    // forwarded command happened to run in.
-    let restore = enter(cwd);
-    let result = cli.validate().and_then(|()| commands::dispatch(&command));
-    restore();
+    // Relative paths belong to the caller's directory. Resolve the handful of
+    // path-valued arguments directly: changing current_dir here would mutate
+    // process-global state while the GUI and its other threads are still active.
+    let result = cli
+        .resolve_forwarded_paths(cwd)
+        .and_then(|()| cli.validate())
+        .and_then(|()| {
+            let command = cli.command.as_ref().unwrap_or(&command);
+            match cancellation {
+                Some(cancellation) => commands::dispatch_with_cancellation(command, cancellation),
+                None => commands::dispatch(command),
+            }
+        });
 
     let response = match result {
         Ok(report) => {
@@ -164,21 +191,6 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     (Some(command), response)
 }
 
-/// Switches to `target`, returning how to switch back.
-fn enter(target: Option<&Path>) -> impl FnOnce() {
-    let previous = target.and_then(|dir| {
-        let here = std::env::current_dir().ok()?;
-        std::env::set_current_dir(dir).ok()?;
-        Some(here)
-    });
-
-    move || {
-        if let Some(here) = previous {
-            let _ = std::env::set_current_dir(here);
-        }
-    }
-}
-
 fn text(code: u8, body: String) -> Response {
     Response {
         code,
@@ -200,6 +212,31 @@ pub struct Server {
     path: PathBuf,
     #[cfg(unix)]
     listener: std::os::unix::net::UnixListener,
+    #[cfg(unix)]
+    pending: Vec<PendingRequest>,
+}
+
+#[cfg(unix)]
+const MAX_PENDING_REQUESTS: usize = 32;
+#[cfg(unix)]
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+struct PendingRequest {
+    stream: std::os::unix::net::UnixStream,
+    raw: Vec<u8>,
+    accepted_at: Instant,
+}
+
+#[cfg(unix)]
+enum ReadState {
+    Pending,
+    Complete,
+    Rejected(String),
 }
 
 impl Server {
@@ -244,7 +281,11 @@ impl Server {
         })?;
 
         tracing::debug!(path = %path.display(), "listening for forwarded commands");
-        Ok(Self { path, listener })
+        Ok(Self {
+            path,
+            listener,
+            pending: Vec::new(),
+        })
     }
 
     /// Named-pipe support is not built yet, so there is nothing to listen on.
@@ -264,32 +305,112 @@ impl Server {
 
     /// Takes one pending request, if there is one. Never blocks.
     #[cfg(unix)]
-    pub fn poll(&self) -> Option<Request> {
+    pub fn poll(&mut self) -> Option<Request> {
         use std::io::{ErrorKind, Read};
 
-        let (mut stream, _) = match self.listener.accept() {
-            Ok(pair) => pair,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return None,
-            Err(e) => {
-                tracing::warn!("could not accept a forwarded command: {e}");
-                return None;
+        if self.pending.len() < MAX_PENDING_REQUESTS {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    if let Err(error) = stream.set_nonblocking(true) {
+                        tracing::warn!("could not make a forwarded command nonblocking: {error}");
+                    } else {
+                        self.pending.push(PendingRequest {
+                            stream,
+                            raw: Vec::new(),
+                            accepted_at: Instant::now(),
+                        });
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    tracing::warn!("could not accept a forwarded command: {error}");
+                }
             }
-        };
-
-        // An accepted socket does not inherit non-blocking on every platform,
-        // and the client half-closes after writing, so a blocking read to EOF is
-        // bounded and correct.
-        let _ = stream.set_nonblocking(false);
-        let mut raw = Vec::new();
-        if let Err(e) = stream.read_to_end(&mut raw) {
-            tracing::warn!("could not read a forwarded command: {e}");
-            return None;
         }
 
-        let line = String::from_utf8_lossy(&raw);
-        let argv = string_array(&line, "argv")?;
-        let cwd = string_field(&line, "cwd").map(PathBuf::from);
-        Some(Request { argv, cwd, stream })
+        let mut index = 0;
+        while index < self.pending.len() {
+            let read = {
+                let pending = &mut self.pending[index];
+                let mut chunk = [0; 8192];
+                loop {
+                    match pending.stream.read(&mut chunk) {
+                        Ok(0) => break ReadState::Complete,
+                        Ok(length) => {
+                            let Some(total) = pending.raw.len().checked_add(length) else {
+                                break ReadState::Rejected(
+                                    "forwarded command length overflowed".into(),
+                                );
+                            };
+                            if total > MAX_REQUEST_BYTES {
+                                break ReadState::Rejected(format!(
+                                    "forwarded command exceeded the {MAX_REQUEST_BYTES}-byte limit"
+                                ));
+                            }
+                            pending.raw.extend_from_slice(&chunk[..length]);
+                        }
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            break ReadState::Pending;
+                        }
+                        Err(error) => {
+                            break ReadState::Rejected(format!(
+                                "could not read a forwarded command: {error}"
+                            ));
+                        }
+                    }
+                }
+            };
+
+            match read {
+                ReadState::Pending
+                    if self.pending[index].accepted_at.elapsed() < REQUEST_READ_TIMEOUT =>
+                {
+                    index += 1;
+                }
+                ReadState::Pending => {
+                    tracing::warn!(
+                        timeout_ms = REQUEST_READ_TIMEOUT.as_millis(),
+                        "discarding an incomplete forwarded command"
+                    );
+                    self.pending.swap_remove(index);
+                }
+                ReadState::Rejected(reason) => {
+                    tracing::warn!("{reason}");
+                    self.pending.swap_remove(index);
+                }
+                ReadState::Complete => {
+                    let pending = self.pending.swap_remove(index);
+                    if let Err(error) = pending.stream.set_nonblocking(false) {
+                        tracing::warn!(
+                            "could not make a completed forwarded command blocking: {error}"
+                        );
+                        continue;
+                    }
+                    if let Err(error) = pending
+                        .stream
+                        .set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))
+                    {
+                        tracing::warn!(
+                            "could not bound a forwarded command response write: {error}"
+                        );
+                        continue;
+                    }
+                    let line = String::from_utf8_lossy(&pending.raw);
+                    let Some(argv) = string_array(&line, "argv") else {
+                        tracing::warn!("discarding a malformed forwarded command");
+                        continue;
+                    };
+                    let cwd = string_field(&line, "cwd").map(PathBuf::from);
+                    return Some(Request {
+                        argv,
+                        cwd,
+                        stream: pending.stream,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Nothing arrives without a listener.
@@ -488,7 +609,7 @@ mod tests {
 
     #[test]
     fn an_empty_argument_vector_is_answered_not_ignored() {
-        let (command, response) = run(&[], None);
+        let (command, response) = run(&[], None, None);
         assert!(command.is_none());
         assert_eq!(response.code, 2);
         assert!(!response.payload.is_empty());
@@ -496,7 +617,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_command_answers_with_claps_own_message() {
-        let (command, response) = run(&argv(&["nonsuch"]), None);
+        let (command, response) = run(&argv(&["nonsuch"]), None, None);
         assert!(command.is_none(), "there is no command to name");
         assert_eq!(response.code, 2);
         assert_eq!(response.stream, StreamKind::Text);
@@ -508,7 +629,7 @@ mod tests {
     fn a_forwarded_failure_carries_the_same_exit_code_as_a_local_one() {
         // `list displays` needs a backend, which is guarded off by default, so
         // this is a stable failure that does not touch the screen.
-        let (command, response) = run(&argv(&["list", "displays"]), None);
+        let (command, response) = run(&argv(&["list", "displays"]), None, None);
         assert!(matches!(command, Some(Command::List(_))));
         assert_ne!(
             response.code, 0,
@@ -518,7 +639,7 @@ mod tests {
 
     #[test]
     fn a_forwarded_json_failure_is_an_envelope_not_a_sentence() {
-        let (_, response) = run(&argv(&["--json", "list", "displays"]), None);
+        let (_, response) = run(&argv(&["--json", "list", "displays"]), None, None);
         assert_eq!(response.stream, StreamKind::Json);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.starts_with('{'), "{body}");
@@ -529,7 +650,7 @@ mod tests {
     #[test]
     fn a_forwarded_success_is_reported_verbatim() {
         // `capture --dry-run` reaches no backend, so it succeeds anywhere.
-        let (_, response) = run(&argv(&["capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["capture", "--dry-run"]), None, None);
         assert_eq!(response.code, 0);
         assert_eq!(response.stream, StreamKind::Text);
         let body = String::from_utf8_lossy(&response.payload);
@@ -542,14 +663,14 @@ mod tests {
 
     #[test]
     fn a_quiet_forwarded_command_says_nothing() {
-        let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None, None);
         assert_eq!(response.code, 0);
         assert!(response.payload.is_empty());
     }
 
     #[test]
     fn a_json_forwarded_success_is_an_envelope() {
-        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None, None);
         assert_eq!(response.stream, StreamKind::Json);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.contains("\"ok\":true"), "{body}");
@@ -557,11 +678,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_forwarded_command_gets_a_complete_response() {
+        let cancellation = scrozz_capture::CaptureCancellation::new();
+        cancellation.cancel();
+        let (command, response) = run(
+            &argv(&["--json", "capture", "--dry-run"]),
+            None,
+            Some(&cancellation),
+        );
+
+        assert!(matches!(command, Some(Command::Capture(_))));
+        assert_ne!(response.code, 0);
+        assert_eq!(response.stream, StreamKind::Json);
+        let body = String::from_utf8_lossy(&response.payload);
+        assert!(body.contains("\"cancelled\":true"), "{body}");
+    }
+
+    #[test]
     fn a_response_survives_the_round_trip_the_client_will_make() {
         // The real check: whatever we produce, `ipc::parse_response` must read
         // back unchanged, or the terminal shows something different from a
         // local run.
-        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None, None);
         let wire = ipc::encode_response(&response);
         let parsed = ipc::parse_response(&wire).expect("our own wire format must parse");
         assert_eq!(parsed.code, response.code);
@@ -570,11 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn the_working_directory_is_restored_afterwards() {
+    fn a_forwarded_command_does_not_change_the_process_working_directory() {
         let before = std::env::current_dir().expect("a working directory");
         let elsewhere = std::env::temp_dir();
-        let restore = enter(Some(&elsewhere));
-        restore();
+        let _ = run(
+            &argv(&["capture", "--dry-run", "--output", "relative.png"]),
+            Some(&elsewhere),
+            None,
+        );
         assert_eq!(
             std::env::current_dir().expect("a working directory"),
             before
@@ -624,7 +765,7 @@ mod tests {
     #[test]
     fn polling_an_idle_server_yields_nothing() {
         let dir = scratch("idle");
-        let server = Server::bind_at(dir.join("idle.sock")).expect("binding");
+        let mut server = Server::bind_at(dir.join("idle.sock")).expect("binding");
         assert!(server.poll().is_none());
         assert!(server.poll().is_none());
         drop(server);
@@ -653,7 +794,7 @@ mod tests {
         // server half here, over a real socket.
         let dir = scratch("round-trip");
         let path = dir.join("live.sock");
-        let server = Server::bind_at(path.clone()).expect("binding");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
 
         // No program name: `try_forward` sends `env::args().skip(1)`, and the
         // server is the side that has to know that.
@@ -687,6 +828,93 @@ mod tests {
             String::from_utf8_lossy(&response.payload).contains("Would capture"),
             "the forwarded output must match a local run"
         );
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_incomplete_client_cannot_block_the_server_or_a_complete_client() {
+        use std::io::Write as _;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
+        let dir = scratch("partial");
+        let path = dir.join("partial.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+
+        let mut partial = UnixStream::connect(&path).expect("connect partial client");
+        partial.write_all(b"{").expect("write incomplete body");
+        let started = std::time::Instant::now();
+        assert!(server.poll().is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "poll must not wait for an accepted client to finish its body"
+        );
+
+        let mut complete = UnixStream::connect(&path).expect("connect complete client");
+        complete
+            .write_all(ipc::encode_request(&argv(&["capture", "--dry-run"]), None).as_bytes())
+            .expect("write complete body");
+        complete
+            .shutdown(Shutdown::Write)
+            .expect("finish complete body");
+
+        let request = loop {
+            if let Some(request) = server.poll() {
+                break request;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(request.argv, argv(&["capture", "--dry-run"]));
+
+        drop(request);
+        drop(complete);
+        drop(partial);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_large_forwarded_response_is_written_completely() {
+        use std::io::{Read as _, Write as _};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
+        let dir = scratch("large-response");
+        let path = dir.join("large-response.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+        let mut client = UnixStream::connect(&path).expect("connect client");
+        client
+            .write_all(ipc::encode_request(&argv(&["capture", "--dry-run"]), None).as_bytes())
+            .expect("write request");
+        client.shutdown(Shutdown::Write).expect("finish request");
+
+        let request = loop {
+            if let Some(request) = server.poll() {
+                break request;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let payload = vec![0x5a; 4 * 1024 * 1024];
+        let expected = payload.clone();
+        let responder = std::thread::spawn(move || {
+            request.reply(&Response {
+                code: 0,
+                stream: StreamKind::Binary,
+                payload,
+            });
+        });
+
+        let mut wire = Vec::new();
+        client
+            .read_to_end(&mut wire)
+            .expect("read complete response");
+        responder.join().expect("response thread");
+        let response = ipc::parse_response(&wire).expect("parse complete response");
+        assert_eq!(response.payload, expected);
 
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);

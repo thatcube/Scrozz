@@ -123,25 +123,93 @@ unusually clean.
 ### How it is built, and why that decision is a platform-strategy decision
 
 Frames arrive over **PipeWire**, because `xdg-desktop-portal`'s `ScreenCast`
-interface hands back a *node id*, not pixels. The obvious way to consume that is
-the `pipewire` crate — and it is the wrong one here, for two reasons that are
-both about this document rather than about ergonomics:
+interface hands back a stream target, not pixels. Version 6 portals identify
+that target by a stable PipeWire object serial; older portals supply only a
+reusable numeric node id. Scrozz selects a v6 stream through
+`PW_KEY_TARGET_OBJECT` with `PW_ID_ANY`, falls back to the numeric node only for
+older portals, and rejects a wildcard numeric target. The obvious way to consume
+the stream is the `pipewire` crate — and it is the wrong one here, for two reasons
+that are both about this document rather than ergonomics:
 
 All-display capture is unavailable on Wayland for now. ScreenCast may return
 one stream per monitor, but stream positions are optional. Scrozz rejects the
 request before opening the portal picker rather than prompt and then compose
 guessed geometry—or quietly return only the first display. Single-display
-capture remains available.
+capture remains available only when the portal's selected-stream position and
+size exactly match geometry read from the compositor's native `wl_output` and
+`xdg-output` protocols before permission, again after `Start`, and around every
+frame delivered by a reusable session. The retained identity includes both the
+stable connector-style output name and the live registry-global identity, so
+hotplug replacement without a geometry change invalidates the session. Missing,
+duplicate, incomplete, changed, or mismatched output facts close the portal
+session without returning pixels or retaining its restore token. Regions must
+be wholly inside one such display and must not positively overlap another
+output; cross-display regions are rejected before the picker instead of being
+clamped into a smaller image. The compositor must report a current physical
+mode, logical position and size, and a uniform inferable per-output scale for
+every connected output. XWayland is used only as an optional pointer-based
+`active_display` hint when several outputs exist, never as target authority.
+
+An OS-id-bearing `CaptureTarget::Window` is unavailable on Wayland. ScreenCast
+can let the user choose a window, but it does not reveal the OS window id needed
+to prove that stream satisfies the requested target. Scrozz rejects every
+ordinary window id before permission rather than echoing one id over another
+window's pixels. Manual scrolling capture can deliberately request
+`CaptureTarget::Window(WindowId(scrozz_capture::WAYLAND_PORTAL_PICKER_WINDOW_ID.into()))`.
+That sentinel means exactly one portal-selected window viewport. It does not
+claim an enumerable OS id, title, owner, desktop position, crop, shadow, corner
+shape, or alpha association; consumers must not use it as evidence for any of
+those facts. The portal Screenshot interface is not an alternative exact-target
+route: its response is only a file URI and exposes no selected identity,
+coordinates, or scale.
+
+Restore tokens are keyed by the exact display id rather than by a generic
+"monitor" bucket. An old generic monitor token may be tried once for migration,
+but its replacement remains usable only after the restored stream passes the
+same geometry check. An accepted token that resolves to a different monitor is
+invalidated and retried exactly once without restoration. The
+load/use/rotate/write transaction is locked both process-wide and across Scrozz
+processes, and the replacement is atomically persisted immediately after a
+successful `Start` response, before fallible target validation or PipeWire work.
+A later identity failure invalidates and persists that result again before
+returning or retrying. This prevents a crash after `Start` from losing a rotated
+single-use token without allowing a grant for one monitor to satisfy another
+silently after display rearrangement or concurrent process startup.
+Persistence failure aborts capture while the cross-process transaction lock is
+still held. If rotation cannot be stored, Scrozz first removes and synchronizes
+the consumed old on-disk token where possible; proceeding while that stale
+single-use token survives would make the next process repeat invalid
+authorization state. First-time state-directory creation is synchronized through
+each parent directory before persistence reports success.
 
 Still captures use the ordinary `CaptureBackend` API. Scrolling capture opens
 `scrozz_capture::frame_session` instead: its Wayland implementation retains one
 portal grant and one connected PipeWire stream across viewport frames, then
 tears the stream down before closing the portal session when dropped. Every
-`capture_frame` after the first discards pixels buffered before that call, so a
-scrolling stitch cannot consume the previous viewport. Restore-token negotiation
-is serialised process-wide, but the gate is released before the long-lived
-PipeWire stream opens; independent frame sessions therefore cannot reuse one
-single-use token or block each other for their full lifetime.
+`capture_frame` returns the newest complete observation whose wrap-aware sequence
+is newer than the previously delivered observation. The stream continuously
+retains only its newest complete frame, so a post-scroll frame buffered during
+settling is accepted rather than flushed at call entry. A newer compositor
+no-damage buffer may reuse the last complete pixels and still advances the
+delivery watermark; a zero-byte priming buffer does neither. Terminal PipeWire
+states take priority over buffered media and cannot be overwritten by later
+nonterminal callbacks. Restore-token negotiation is serialised process-wide and
+across processes, but the gates are released before the long-lived PipeWire
+stream opens; independent frame sessions therefore cannot reuse one single-use
+token or block each other for their full lifetime.
+The unchanged synchronous traits have cancellable free-function counterparts for
+owners with a shutdown lifecycle. The GUI uses one so `Pipeline::stop` closes an
+active portal session and picker before joining its capture worker; capture and
+encoding never run on the GUI main thread. Non-interactive portal control calls
+and best-effort `Session.Close` are time-bounded as a final guard against a
+stalled portal daemon; the user-driven `Start` picker itself remains unbounded
+until completion or explicit cancellation. Each negotiation owns a dedicated
+D-Bus connection. This makes even `CreateSession` cancellable and bounded: if
+ashpd has not yet exposed the request/session handle when cancellation or the
+ten-second control timeout wins, dropping that connection revokes any
+late-created portal object for its unique sender instead of orphaning it on a
+process-global connection. Request, session, and connection cleanup calls are
+independently bounded to two seconds.
 
 1. **`pipewire-sys` needs `pkg-config` and `bindgen`.** Adding it would take
    `scrozz-capture` — one of the four crates that *must* stay cross-checkable —
@@ -159,14 +227,36 @@ nothing to call and the binary format is written out byte by byte. The benefits
 are that `cargo check --target x86_64-unknown-linux-gnu` still passes from
 macOS with no system packages installed, and that a missing PipeWire degrades to
 `Error::Unsupported` naming the package to install rather than to a binary that
-will not start.
+will not start. Scrozz loads the library, resolves every required symbol, and
+validates the handwritten 64-bit ABI layout **before** making a ScreenCast portal
+call, so a guaranteed local runtime failure cannot show a permission picker.
+
+Only opaque `BGRx` and `RGBx` are offered. SPA defines
+`SPA_VIDEO_FLAG_PREMULTIPLIED_ALPHA`, but the raw-format POD carries no property
+for it and PipeWire's own raw parse/build helpers do not round-trip it; portal
+producers therefore rely on compositor convention. Accepting `BGRA`/`RGBA` as
+straight alpha would be a guess. Scrozz instead forces the undefined fourth byte
+of every negotiated `x` pixel to 255, where straight and premultiplied
+representations are identical. Transfer-function negotiation offers supported
+SDR values, including Mutter's ordinary `GAMMA22`; a peer that nevertheless
+returns PQ or HLG is rejected. Unknown or otherwise unnameable non-HDR transfer
+and primaries pairs remain usable as `ColorSpace::Unknown` rather than receiving
+a false sRGB, P3, or Rec. 2020 tag. DCI-P3 primaries remain unknown rather than
+receiving the different D65 Display-P3 profile. Each buffer must expose exactly
+one readable pixel plane; multi-plane, unreadable, DMA-BUF, inconsistent, or
+short mappings fail closed. Negotiated dimensions, mapped stride extent, and
+fallible allocations are capped at 128 MiB while still admitting 8K UHD. A
+zero-byte priming buffer still waits for pixels, while `SPA_CHUNK_FLAG_EMPTY` is
+interpreted according to SPA as media-neutral video and produces opaque black
+from the separately bounded negotiated dimensions without reading absent pixel
+bytes.
 
 ### What each layer actually proves here
 
 | Layer | Covers | Does not cover |
 |---|---|---|
 | 1 — cross-check | The ashpd/zbus calls, every signature | Anything behind `dlopen`; symbols are resolved by name at runtime |
-| 2 — CI tests | POD encoding byte for byte, format negotiation, stride packing, crop arithmetic, error mapping, lifecycle | Whether a real server accepts any of it |
+| 2 — CI tests | POD encoding byte for byte, opaque-only format negotiation, stride packing, exact-display/token isolation, cross-display refusal, crop arithmetic, error mapping, lifecycle | Whether a real server accepts any of it |
 | 3 — golden images | Nothing; there is no UI in this path | — |
 | 4 — real session | Everything below | — |
 
@@ -201,10 +291,36 @@ XDG_STATE_HOME="$(mktemp -d)" \
   tools/wayland-smoke.sh --require --stale-token
 ```
 
-That mode fails unless the planted token is parsed, rejected by the portal, and
-retried exactly once. A successful run also retains one portal/PipeWire session
+Run both commands independently in clean native **GNOME**, **KDE Plasma**, and
+wlroots sessions; one compositor's pass is not evidence for another:
+
+| Native session | Required commands |
+|---|---|
+| GNOME Wayland | `tools/wayland-smoke.sh --require`; isolated-state `tools/wayland-smoke.sh --require --stale-token` |
+| KDE Plasma Wayland | `tools/wayland-smoke.sh --require`; isolated-state `tools/wayland-smoke.sh --require --stale-token` |
+| wlroots (`xdg-desktop-portal-wlr`) | `tools/wayland-smoke.sh --require`; isolated-state `tools/wayland-smoke.sh --require --stale-token` |
+
+The harness builds once from clean tracked source, prints the exact source SHA,
+binary path and SHA-256, `rustc`, and Cargo versions, then exercises those same
+bytes in every process. Preserve that complete provenance with each acceptance
+result. A successful older binary, a dirty-source build, an X11 run, or a
+different compositor does not qualify the current commit.
+
+Stale-token mode derives and plants the exact display-specific key selected by
+the example, then fails unless that token is parsed, rejected by the portal, and
+retried exactly once. Every successful run launches the example again in a fresh
+process and fails unless that process loads the persisted token without a
+classified rejection. Because the portal protocol does not reveal whether it
+silently ignored a token and opened a picker anyway, the harness also requires an
+interactive operator to type `no` after observing that no fresh-process picker
+appeared. The fresh process is bounded to 90 seconds; an unexpected picker,
+cancellation, or timeout is a failure rather than a skip. It does not turn
+`stored_token=true` into an acceptance claim by itself.
+The example also retains one portal/PipeWire session
 for repeated frames and requires changed pixels after the second request; keep
-the invoking terminal visible on the monitor selected in the picker.
+the invoking terminal visible on the exact native output named by the smoke
+test. The run also fails unless the portal stream geometry matches that output
+and every returned alpha byte is opaque.
 
 `tools/wayland-smoke.sh` exits **77** — the automake "skipped" convention — with
 the specific missing piece on stderr when there is no `WAYLAND_DISPLAY`, no
@@ -232,11 +348,21 @@ Honestly, and in order of risk:
 3. **That the modifier-less format offer plus the explicit
    `SPA_PARAM_BUFFERS_dataType = MemFd | MemPtr` response produces shared-memory
    buffers**, rather than failing to negotiate or returning DMA-BUF.
-4. **The portal dialog**, including that dismissing it produces
+4. **That GNOME and KDE accept the opaque-only `BGRx`/`RGBx` offer**, and that
+   their portal stream geometry agrees with XWayland closely enough to prove an
+   exact display identity without guessing.
+5. **The portal dialog**, including that dismissing it produces
    `Error::Cancelled` and not something alarming.
-5. **The restore-token round trip**, including the rejection-and-retry path. A
-   token that is stored but never accepted is invisible offline and shows up as
-   a permission dialog on every single capture.
+6. **The restore-token round trip**, including per-display isolation,
+   rejection-and-retry, rotation, cross-process locking, and picker-free
+   acceptance observed by the smoke harness operator in its fresh process. A
+   token that is stored but never accepted is invisible to protocol logs and
+   shows up as a permission dialog on every capture.
+
+There is currently no exact-commit native Wayland acceptance result for GNOME,
+KDE Plasma, or wlroots. Earlier Ubuntu evidence exercised X11 and does not close
+any item above. Until the clean-build matrix passes, Wayland remains implemented
+and statically validated but not runtime-accepted.
 
 ---
 
