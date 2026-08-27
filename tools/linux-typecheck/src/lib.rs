@@ -7,9 +7,9 @@
 //! sysroot for pkg-config.
 //!
 //! What that buys is the thing hardest to get right by reading: every x11rb and
-//! `wayland-client` call in `linux/x11.rs` and `linux/wayland.rs` is checked
-//! against the real bindings, on every platform, by anyone running
-//! `tools/check-all-platforms.sh`.
+//! `wayland-client` call in `linux/x11.rs`, `linux/wayland.rs`, and the native
+//! smoke driver is checked against the real bindings, on every platform, by
+//! anyone running `tools/check-all-platforms.sh`.
 //!
 //! What it does **not** buy, and must not be mistaken for: this proves the code
 //! compiles, not that a compositor accepts it. Anchors, exclusive zones and

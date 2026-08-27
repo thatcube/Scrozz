@@ -278,8 +278,8 @@ pub const WM_HINTS_WORDS: usize = 9;
 pub fn encode_wm_hints_input(existing: Option<&[u8]>, input: bool) -> Vec<u8> {
     let mut words = [0u32; WM_HINTS_WORDS];
     if let Some(bytes) = existing {
-        for (slot, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
-            *slot = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (slot, chunk) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *slot = u32::from_ne_bytes(*chunk);
         }
     }
 
@@ -297,11 +297,11 @@ pub fn encode_wm_hints_input(existing: Option<&[u8]>, input: bool) -> Vec<u8> {
 /// manager.
 #[must_use]
 pub fn decode_wm_hints_input(bytes: &[u8]) -> Option<bool> {
-    let mut words = bytes.chunks_exact(4).map(|c| {
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(c);
-        u32::from_ne_bytes(buf)
-    });
+    let mut words = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_ne_bytes(*chunk));
     let flags = words.next()?;
     let input = words.next()?;
     if flags & WM_HINTS_INPUT_FLAG == 0 {
@@ -345,12 +345,10 @@ pub struct WireRect {
 #[must_use]
 pub fn parse_work_area(bytes: &[u8], desktop: u32) -> Option<WireRect> {
     let values: Vec<i32> = bytes
-        .chunks_exact(4)
-        .map(|c| {
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(c);
-            i32::from_ne_bytes(buf)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| i32::from_ne_bytes(*chunk))
         .collect();
 
     let base = (desktop as usize).checked_mul(4)?;

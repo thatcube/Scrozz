@@ -13,7 +13,7 @@
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize, Result};
 
-use super::capability::{OverlayBackend, OverlayPlan, Placement};
+use super::capability::{OverlayPlan, Placement};
 use super::region::InputRegion;
 use super::wayland;
 use super::x11::X11Backend;
@@ -74,17 +74,23 @@ impl LinuxOverlay {
     /// Returns [`Error::Unsupported`] when this session has no backend that can
     /// host an overlay at all, and propagates a connection failure from X11.
     pub fn adopt(handle: LinuxWindowHandle, session: &Session) -> Result<Self> {
-        let plan = super::overlay_plan(session);
+        // The handle is stronger evidence than the environment. In particular,
+        // a Wayland desktop can ask winit to create an XWayland window; that
+        // numeric X11 window is fully retrofittable and must not be discarded
+        // merely because WAYLAND_DISPLAY is also set.
+        let actual = Session {
+            server: match handle {
+                LinuxWindowHandle::X11 { .. } => crate::hotkey::DisplayServer::X11,
+                LinuxWindowHandle::Wayland => crate::hotkey::DisplayServer::Wayland,
+            },
+            compositor: session.compositor,
+            desktop: session.desktop.clone(),
+        };
+        let plan = super::overlay_plan(&actual);
 
-        let x11 = match (plan.backend, handle) {
-            (OverlayBackend::X11Retrofit, LinuxWindowHandle::X11 { .. }) => {
-                Some(X11Backend::connect()?)
-            }
-            // A plan that says X11 with a Wayland handle means the session
-            // detection and the window disagree. Trusting the window is right:
-            // it is the thing that exists.
-            (OverlayBackend::X11Retrofit, LinuxWindowHandle::Wayland) => None,
-            _ => None,
+        let x11 = match handle {
+            LinuxWindowHandle::X11 { .. } => Some(X11Backend::connect()?),
+            LinuxWindowHandle::Wayland => None,
         };
 
         Ok(Self {
@@ -116,19 +122,22 @@ impl LinuxOverlay {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] on a Wayland session, where none of these
-    /// properties can be set by a client.
+    /// On a Wayland `xdg_toplevel`, returns a report that explicitly leaves
+    /// placement, stacking, and focus under compositor control.
     pub fn apply(&mut self, behavior: &OverlayBehavior) -> Result<OverlayReport> {
         self.behavior = Some(*behavior);
         match (&self.x11, self.handle) {
             (Some(backend), LinuxWindowHandle::X11 { window }) => backend.apply(window, behavior),
             _ => Ok(OverlayReport {
-                // Not a claim of success. On Wayland an ordinary toplevel does
-                // not activate the app on click the way an X11 window can, so
-                // "non-activating" is true by default rather than by request —
-                // and the detail says which it is.
-                non_activating: true,
-                detail: self.plan.detail.clone(),
+                // An ordinary xdg_toplevel follows compositor focus policy.
+                // Claiming it is non-activating would turn the D31 fallback into
+                // a silent D27 violation.
+                non_activating: false,
+                detail: format!(
+                    "{} The active surface is an ordinary xdg_toplevel; the compositor \
+                     controls its placement, stacking, and keyboard focus.",
+                    self.plan.detail
+                ),
             }),
         }
     }
@@ -247,6 +256,12 @@ impl LinuxOverlay {
 /// caller falls back to the display bounds the portal reported.
 #[must_use]
 pub fn work_area() -> Option<LogicalRect> {
+    // Most Wayland desktops also export DISPLAY for XWayland. Reading that
+    // server's root properties would make a native Wayland window look
+    // X11-positionable before it exists, so only consult EWMH in an X11 session.
+    if Session::detect().server != crate::hotkey::DisplayServer::X11 {
+        return None;
+    }
     let backend = X11Backend::connect().ok()?;
     let rect = backend.work_area()?;
     Some(LogicalRect::new(

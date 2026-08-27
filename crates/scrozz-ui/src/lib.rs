@@ -93,7 +93,8 @@ pub mod vibrancy;
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
-    CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
-    OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+    CaptureRequest, DismissReason, InputRegionHook, OverlayApp, OverlayEvent, OverlayGeometry,
+    OverlayHandle, OverlayOptions, PanelAttachment, PanelHook, PanelReport, Passthrough,
+    PointerProbe,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

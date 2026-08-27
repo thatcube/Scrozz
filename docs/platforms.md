@@ -12,40 +12,51 @@ different class of defect, and each one cheaper than the layer below it.
 
 ## Layer 1 — Cross-target type checking (local, seconds, free)
 
-`cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-Both targets check cleanly from macOS today for **every crate that contains
-platform-specific code** — including the real platform bindings: the `windows`
-crate, `x11rb`, and `ashpd` with its zbus stack.
+`cargo check` does not link, but it still runs build scripts. Windows Rust code
+therefore needs no Windows SDK, while Linux has one important complication:
+GTK's `*-sys` crates invoke `pkg-config`, which cannot describe target libraries
+without a Linux sysroot.
+
+The cross-platform checker handles both cases. Windows compiles directly
+against the real `windows` bindings. Linux overlay code compiles through
+`tools/linux-typecheck`, a non-shipping crate that `#[path]`-includes the real
+`scrozz-shell/src/linux` modules with their actual `x11rb` and Wayland
+dependencies but without the GTK packaging dependency chain.
 
 ```bash
 tools/check-all-platforms.sh
 ```
 
-This is the layer that changes the character of the work. Windows and Linux code
-is compiled against the genuine API surface, so a misremembered method name, a
-wrong argument type, a missing feature flag, or a bad trait bound is a **compile
-error on this machine** rather than a surprise days later. It is the difference
-between writing platform code blind and writing it with the type checker
-watching.
+This is the layer that changes the character of the work. Windows and Linux
+platform calls are compiled against the genuine API surface, so a misremembered
+method name, a wrong argument type, a missing feature flag, or a bad trait bound
+is a **compile error on this machine** rather than a surprise days later.
 
-### The one exception, and why it does not matter
+### Build-script limits, stated exactly
 
-**Crates whose dependencies compile C cannot be cross-checked without a cross C
-toolchain.** `cargo check` still runs build scripts, and `rusqlite`'s `bundled`
-feature compiles `sqlite3.c` *for the target*, which fails on this machine with
-`fatal error: 'stdlib.h' file not found`. `scrozz-store` and the `scrozz` binary
-that depends on it are therefore excluded, via `SCROZZ_XCHECK_EXCLUDE`.
+There are two limits, both about native build scripts rather than Rust:
 
-This costs nothing real. Only four crates are permitted to contain
-`cfg(target_os)` at all — `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and
-`scrozz-shell` — and **all four are still fully checked on all three targets**.
-`scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
-almost nothing, and CI compiles it natively on all three runners anyway (layer
-2), which is a strictly stronger check.
+1. `rusqlite`'s `bundled` feature compiles `sqlite3.c` *for the target*. Without
+   a foreign C toolchain and headers this fails with `fatal error: 'stdlib.h'
+   file not found`. `scrozz-store` and the `scrozz` binary are excluded from
+   foreign targets via `SCROZZ_XCHECK_EXCLUDE`.
+2. `tray-icon` reaches `gtk-sys`, `gdk-sys`, `pango-sys` and friends. Those
+   build scripts ask `pkg-config` for target libraries and deliberately refuse
+   cross-compilation unless `PKG_CONFIG_SYSROOT_DIR` and a target
+   `PKG_CONFIG_PATH` point at a real Linux sysroot. On a non-Linux host,
+   `check-all-platforms.sh` therefore checks `scrozz-shell` through
+   `tools/linux-typecheck` and excludes the GTK-packaged shell and app from the
+   ordinary workspace pass. On Linux, the full workspace compiles normally
+   against packages installed by `tools/ci-linux-deps.sh`.
 
-Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
-dependency, which matters far more than local cross-check coverage of a crate
-that has no platform code in it.
+No stub or copied implementation is involved: the shim includes the same
+`linux/*.rs` files the shipping crate uses, including the runtime X11 SHAPE and
+Wayland protocol calls. What it cannot check is GTK integration or linking.
+Real Linux CI does both in layer 2.
+
+Keeping bundled SQLite is deliberate: shipped builds carry no system SQLite
+dependency. Installing a Linux sysroot locally is also valid; it is simply not a
+prerequisite for checking Scrozz's Rust platform code.
 
 Its limit is exact: this layer proves the code is *well-formed*, never that it
 *works*.
@@ -89,6 +100,27 @@ These need a real desktop session: Windows 11 on ARM under UTM or Parallels, and
 a Linux VM running **both GNOME and KDE**, since the Wayland story differs sharply
 between them. This is the slowest and most manual layer, so it is reserved for
 behaviour the first three layers structurally cannot reach.
+
+The native overlay probes make those manual sessions repeatable and refuse to
+masquerade as coverage elsewhere:
+
+```bash
+tools/linux-smoke/x11.sh
+tools/linux-smoke/kde-wayland.sh
+tools/linux-smoke/gnome-wayland.sh
+tools/linux-smoke/wlroots.sh
+```
+
+Each script prints `SKIP` and exits successfully unless it detects its exact
+Linux session. In a matching session, X11 creates a real server-side window and
+verifies that two per-card SHAPE rectangles can be replaced by one and then by
+an empty input region. KDE and wlroots verify that the compositor accepts
+Scrozz's owned **protocol-only** layer surface, while also asserting that the
+active eframe renderer remains an ordinary compositor-positioned
+`xdg_toplevel`. GNOME asserts D31's compositor-positioned fallback and its
+portal explanation. The Wayland probes do not claim rendered layer-shell
+coverage; Scrozz still needs an owned renderer before that backend can become
+the active surface.
 
 ---
 

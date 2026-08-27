@@ -345,6 +345,8 @@ impl X11Backend {
             InputRegion::Everything => {
                 self.conn
                     .shape_mask(SO::SET, SK::INPUT, window, 0, 0, x11rb::NONE)
+                    .map_err(platform)?
+                    .check()
                     .map_err(platform)?;
                 self.conn.flush().map_err(platform)?;
                 return Ok(());
@@ -363,6 +365,8 @@ impl X11Backend {
                 0,
                 &rects,
             )
+            .map_err(platform)?
+            .check()
             .map_err(platform)?;
         self.conn.flush().map_err(platform)?;
         Ok(())

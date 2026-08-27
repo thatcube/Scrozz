@@ -5,9 +5,9 @@
 //!
 //! - **X11** — a client may set absolute window coordinates and may shape its
 //!   own input region. Everything Scrozz's design assumes is achievable.
-//! - **Wayland with `wlr-layer-shell`** — a client may not set coordinates, but
-//!   it may ask to be anchored to a screen edge with margins, which is enough.
-//!   KDE/KWin and the wlroots family implement this.
+//! - **Wayland with `wlr-layer-shell`** — a Scrozz-owned surface could ask to be
+//!   anchored to a screen edge with margins. KDE/KWin and the wlroots family
+//!   implement this, but eframe's existing `xdg_toplevel` cannot be promoted.
 //! - **Wayland without `wlr-layer-shell`** — a client can neither position nor
 //!   anchor. GNOME/Mutter is here *by choice*, not by omission (decision D31),
 //!   so there is no version to wait for and no flag to set.
@@ -99,8 +99,11 @@ pub enum OverlayBackend {
     /// shape. Includes XWayland, where it works exactly as it does on X11 but
     /// only relative to the X server's own coordinate space.
     X11Retrofit,
-    /// Wayland `zwlr_layer_shell_v1`: a Scrozz-owned surface anchored by the
-    /// compositor.
+    /// Wayland `zwlr_layer_shell_v1`: reserved for a Scrozz-owned rendered
+    /// surface anchored by the compositor.
+    ///
+    /// Merely discovering the global does not select this backend. A winit
+    /// window already has the `xdg_toplevel` role and cannot be promoted.
     LayerShell,
     /// Wayland `xdg_shell` only: an ordinary toplevel the compositor places
     /// wherever it likes. The D31 fallback.
@@ -196,8 +199,11 @@ impl OverlayPlan {
 
 /// Chooses the overlay backend for a session.
 ///
-/// `probe` is the result of a live registry enumeration and outranks everything
-/// else on Wayland. It is ignored on X11, where layer-shell is irrelevant.
+/// `probe` is the result of a live registry enumeration. It is ignored on X11,
+/// where layer-shell is irrelevant. On Wayland it changes the explanation, but
+/// does not select [`OverlayBackend::LayerShell`] until Scrozz owns both the
+/// surface and its renderer. The eframe/winit window is already an
+/// `xdg_toplevel` and cannot legally be promoted.
 ///
 /// # The GNOME case is a decision, not a defect
 ///
@@ -244,63 +250,39 @@ pub fn plan(server: DisplayServer, compositor: Compositor, probe: LayerShellProb
 
 /// The Wayland half of [`plan`], split out because it is the half with rules.
 fn wayland_plan(compositor: Compositor, probe: LayerShellProbe) -> OverlayPlan {
-    let layer_shell = OverlayPlan {
-        backend: OverlayBackend::LayerShell,
-        placement: Placement::Anchored,
-        input_shaping: true,
-        stays_above: true,
-        controls_focus: true,
-        detail: String::new(),
-    };
-
-    match probe {
-        LayerShellProbe::Present { version } => OverlayPlan {
-            detail: format!(
-                "Wayland: this compositor offers wlr-layer-shell v{version}, so overlays \
-                 are anchored to the screen edge and shaped for click-through."
-            ),
-            ..layer_shell
-        },
-        LayerShellProbe::Absent => compositor_placed(compositor, Probed::Yes),
-        LayerShellProbe::NotProbed => match layer_shell_expectation(compositor) {
-            // Expected to work, but unverified. Say so rather than implying the
-            // probe happened: the two are indistinguishable in a log otherwise.
-            Expectation::Implements => OverlayPlan {
-                detail: "Wayland: this compositor is expected to offer wlr-layer-shell, \
-                         but Scrozz has not asked it yet."
-                    .into(),
-                ..layer_shell
-            },
-            Expectation::Refuses | Expectation::Unknown => {
-                compositor_placed(compositor, Probed::No)
-            }
-        },
-    }
+    compositor_placed(compositor, probe)
 }
 
-/// Whether the fallback was chosen after asking, or without asking.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Probed {
-    Yes,
-    No,
-}
-
-/// The D31 fallback plan, with a reason that distinguishes the two ways of
-/// arriving at it.
-fn compositor_placed(compositor: Compositor, probed: Probed) -> OverlayPlan {
-    let detail = match (compositor, probed) {
-        (Compositor::Gnome, _) => {
+/// The current Wayland plan, with a reason that distinguishes compositor
+/// capability from the surface Scrozz actually owns.
+fn compositor_placed(compositor: Compositor, probe: LayerShellProbe) -> OverlayPlan {
+    let detail = match (compositor, probe) {
+        (_, LayerShellProbe::Present { version }) => format!(
+            "Wayland: this compositor offers wlr-layer-shell v{version}, but Scrozz's \
+             current eframe window already has the xdg_toplevel role and Scrozz does not \
+             yet own a layer-shell renderer. The capture stack is an ordinary window the \
+             compositor places."
+        ),
+        (Compositor::Gnome, LayerShellProbe::Absent | LayerShellProbe::NotProbed) => {
             "GNOME/Wayland: Mutter does not implement wlr-layer-shell, so no client can \
              anchor a window to the screen. Scrozz shows the capture stack as an ordinary \
              window the compositor places; region selection still uses the screenshot portal."
                 .to_string()
         }
-        (_, Probed::Yes) => {
+        (_, LayerShellProbe::Absent) => {
             "Wayland: this compositor does not offer wlr-layer-shell, so Scrozz cannot \
              anchor the capture stack. It is shown as an ordinary window the compositor places."
                 .to_string()
         }
-        (_, Probed::No) => {
+        (_, LayerShellProbe::NotProbed)
+            if layer_shell_expectation(compositor) == Expectation::Implements =>
+        {
+            "Wayland: this compositor is expected to offer wlr-layer-shell, but Scrozz has \
+             not asked it yet and does not yet own a layer-shell renderer. The capture stack \
+             is an ordinary window the compositor places."
+                .to_string()
+        }
+        (_, LayerShellProbe::NotProbed) => {
             "Wayland: Scrozz does not know whether this compositor offers wlr-layer-shell \
              and has not been able to ask. Falling back to an ordinary window the \
              compositor places."
@@ -311,9 +293,9 @@ fn compositor_placed(compositor: Compositor, probed: Probed) -> OverlayPlan {
     OverlayPlan {
         backend: OverlayBackend::CompositorPlaced,
         placement: Placement::CompositorChosen,
-        // An xdg_toplevel *can* still set an input region — that part of the
-        // core protocol is not layer-shell — so click-through survives the
-        // fallback even though placement does not.
+        // Winit can still toggle an xdg_toplevel's core input region, so the
+        // pointer-based click-through fallback survives even though stable
+        // per-card regions and controlled placement do not.
         input_shaping: true,
         // `xdg_shell` has no "always on top". Some compositors offer it as a
         // user-driven window rule, but no client can ask for it.

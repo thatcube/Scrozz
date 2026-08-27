@@ -6,16 +6,18 @@
 //! - **X11** lets a client do anything. Scrozz gets real anchoring, real
 //!   stacking and real click-through, via [`x11`].
 //! - **Wayland with `wlr-layer-shell`** (KDE, Sway, Hyprland, River, Niri,
-//!   Wayfire) has a protocol built for exactly this: anchor to an edge, respect
-//!   the panel's exclusive zone, choose a layer. See [`layer`].
+//!   Wayfire) has a protocol built for exactly this. [`wayland`] contains a
+//!   Scrozz-owned protocol surface, but it has no renderer yet. The active
+//!   eframe window remains an `xdg_toplevel`, so it uses the same honest
+//!   compositor-positioned fallback until Scrozz owns the rendered surface.
 //! - **Wayland without it** (GNOME/Mutter) has no mechanism at all. `xdg-shell`
 //!   deliberately omits absolute positioning, and Mutter has declined
 //!   `layer-shell` as a matter of policy, not backlog. Per decision D31 Scrozz
 //!   falls back to an ordinary toplevel the compositor places, and *says so*.
 //!
-//! The point of this module is that the third case is visible rather than
-//! silent. Every path produces an [`capability::OverlayPlan`] describing what
-//! will actually happen, and no backend reports success for work it did not do.
+//! The point of this module is that the fallback is visible rather than silent.
+//! Every path produces an [`capability::OverlayPlan`] describing what will
+//! actually happen, and advertising a protocol never counts as using it.
 //!
 //! # Layout
 //!
@@ -38,12 +40,17 @@ pub mod region;
 #[cfg(target_os = "linux")]
 mod overlay;
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod smoke;
+#[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "linux")]
 mod x11;
 
 #[cfg(target_os = "linux")]
 pub use overlay::{LinuxOverlay, LinuxWindowHandle, work_area};
+#[cfg(target_os = "linux")]
+pub use wayland::LayerShellSession;
 
 use crate::hotkey::Session;
 use capability::{LayerShellProbe, OverlayPlan};

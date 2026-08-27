@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Type-check every crate against all three platforms from one machine.
 #
-# `cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-# That makes Windows and Linux platform code genuinely verifiable from a Mac:
-# the compiler checks it against the real `windows`, `x11rb` and `ashpd`
-# bindings, so a misused API is a compile error here rather than a surprise in
-# CI. It proves nothing about runtime behaviour — see docs/platforms.md.
+# `cargo check` does not link, but build scripts still run. Windows Rust code can
+# be checked directly without a Windows SDK. Linux's GTK `-sys` crates invoke
+# pkg-config and need a Linux sysroot, so a small shim includes the real overlay
+# source files with only their protocol dependencies. See docs/platforms.md.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -65,6 +64,15 @@ if [[ -n "${SCROZZ_XCHECK_EXCLUDE:-}" ]]; then
   EXCLUDES=(${SCROZZ_XCHECK_EXCLUDE})
 fi
 
+append_unique() {
+  local candidate="$1"
+  local existing
+  for existing in ${TARGET_EXCLUDES[@]+"${TARGET_EXCLUDES[@]}"}; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  TARGET_EXCLUDES+=("$candidate")
+}
+
 LOG_DIR="target/xcheck-logs"
 mkdir -p "$LOG_DIR"
 
@@ -74,12 +82,40 @@ FAILED_TARGETS=()
 for target in "${TARGETS[@]}"; do
   echo "=== $target ==="
 
+  target_failed=0
+  TARGET_EXCLUDES=()
+  for crate in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+    TARGET_EXCLUDES+=("$crate")
+  done
+
+  # tray-icon's Linux dependency chain reaches gtk-sys, whose build scripts
+  # refuse cross-pkg-config without a target sysroot. Compile the real Linux
+  # overlay modules through the no-GTK shim, then exclude only the two workspace
+  # packages that would pull GTK back in. A native Linux run checks them whole.
+  if [[ "$target" == "x86_64-unknown-linux-gnu" && "$target" != "$HOST_TRIPLE" ]]; then
+    echo "  Linux overlay modules (real sources, no GTK packaging dependencies)"
+    shim_log="$LOG_DIR/$target-linux-overlay.log"
+    if CARGO_TARGET_DIR="target/xcheck-$target" \
+         cargo check \
+           --manifest-path tools/linux-typecheck/Cargo.toml \
+           --target "$target" 2>&1 | tee "$shim_log" | tail -n 15; then
+      echo "  Linux overlay shim: ok"
+    else
+      echo "  Linux overlay shim: FAILED"
+      echo "  full log: $shim_log"
+      target_failed=1
+    fi
+    append_unique "scrozz-shell"
+    append_unique "scrozz"
+    echo "  (cross target: scrozz-shell/scrozz use GTK pkg-config; the real overlay sources were checked above)"
+  fi
+
   args=(check --workspace --target "$target")
-  if [[ "$target" != "$HOST_TRIPLE" && "${#EXCLUDES[@]}" -gt 0 ]]; then
-    for crate in "${EXCLUDES[@]}"; do
+  if [[ "$target" != "$HOST_TRIPLE" && "${#TARGET_EXCLUDES[@]}" -gt 0 ]]; then
+    for crate in "${TARGET_EXCLUDES[@]}"; do
       args+=(--exclude "$crate")
     done
-    echo "  (cross target: excluding ${EXCLUDES[*]} — see the C build-script note in this script)"
+    echo "  (cross target: excluding ${TARGET_EXCLUDES[*]} — see the build-script notes in this script)"
   fi
 
   log="$LOG_DIR/$target.log"
@@ -87,9 +123,9 @@ for target in "${TARGETS[@]}"; do
   # A separate target dir per platform stops artifacts thrashing each other.
   if CARGO_TARGET_DIR="target/xcheck-$target" \
        cargo "${args[@]}" 2>&1 | tee "$log" | tail -n 15; then
-    echo "  ok"
+    echo "  workspace: ok"
   else
-    echo "  FAILED"
+    echo "  workspace: FAILED"
     echo "  full log: $log"
 
     # Name the failure mode rather than leaving somebody to infer it at 2am.
@@ -103,10 +139,21 @@ for target in "${TARGETS[@]}"; do
       echo
       echo "  The target's standard library is missing. Install it with:"
       echo "    rustup target add $target"
+    elif grep -q "pkg-config has not been configured to support cross-compilation" "$log" 2>/dev/null; then
+      echo
+      echo "  A native library build script reached pkg-config without a $target sysroot."
+      echo "  Scrozz's GTK-dependent Linux overlay is covered by tools/linux-typecheck;"
+      echo "  add any other package named above to SCROZZ_XCHECK_EXCLUDE."
     fi
 
+    target_failed=1
+  fi
+
+  if [[ "$target_failed" != "0" ]]; then
     failed=1
     FAILED_TARGETS+=("$target")
+  else
+    echo "  ok"
   fi
   echo
 done

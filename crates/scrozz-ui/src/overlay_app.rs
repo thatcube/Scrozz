@@ -32,10 +32,12 @@
 //! at the bottom-left. Everything between and around them must stay clickable,
 //! or the overlay is worse than no overlay at all.
 //!
-//! `mouse_passthrough` is per-window and all-or-nothing, so it is toggled every
-//! frame from whether the pointer is inside an interactive rectangle —
-//! [`passes_through`] is that decision, as a pure function, so it can be
-//! asserted without a window.
+//! A native backend that can express an input region receives every interactive
+//! rectangle through [`InputRegionHook`]. X11 uses that path to keep each card
+//! clickable while every gap stays permanently transparent to input. Backends
+//! without regions fall back to `mouse_passthrough`, which is per-window and
+//! all-or-nothing, toggled from whether the pointer is inside an interactive
+//! rectangle. [`passes_through`] is that fallback decision as a pure function.
 //!
 //! There is a platform trap here worth stating plainly. On macOS,
 //! `ignoresMouseEvents` means the window receives *no* mouse events at all, so
@@ -129,27 +131,34 @@ impl PanelReport {
 /// ```ignore
 /// use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 /// use scrozz_shell::overlay::{OverlayBehavior, NativeOverlay};
-/// use scrozz_ui::overlay_app::PanelReport;
+/// use scrozz_ui::overlay_app::{PanelAttachment, PanelReport};
 ///
 /// let hook = Box::new(|cc: &eframe::CreationContext<'_>| {
 ///     let Ok(handle) = cc.window_handle() else {
-///         return PanelReport::unsupported("no window handle");
+///         return PanelAttachment::report_only(
+///             PanelReport::unsupported("no window handle")
+///         );
 ///     };
 ///     let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-///         return PanelReport::unsupported("not an AppKit window");
+///         return PanelAttachment::report_only(
+///             PanelReport::unsupported("not an AppKit window")
+///         );
 ///     };
 ///     // SAFETY: the view is alive for as long as the `WindowHandle` borrow.
 ///     let mut overlay = match unsafe {
 ///         NativeOverlay::from_ns_view(appkit.ns_view.as_ptr())
 ///     } {
 ///         Ok(o) => o,
-///         Err(e) => return PanelReport::unsupported(e.to_string()),
+///         Err(e) => return PanelAttachment::report_only(
+///             PanelReport::unsupported(e.to_string())
+///         ),
 ///     };
-///     match overlay.apply(&OverlayBehavior::capture_card()) {
+///     let report = match overlay.apply(&OverlayBehavior::capture_card()) {
 ///         Ok(r) if r.non_activating => PanelReport::converted(r.detail),
 ///         Ok(r) => PanelReport::unsupported(r.detail),
 ///         Err(e) => PanelReport::unsupported(e.to_string()),
-///     }
+///     };
+///     PanelAttachment::report_only(report)
 /// });
 /// ```
 ///
@@ -157,9 +166,65 @@ impl PanelReport {
 /// `MacOverlay::from_ns_view` / `from_ns_window` on macOS but `adopt` on its
 /// stub platforms, so the hook is written per-target anyway.
 ///
-/// Returning [`PanelReport::unsupported`] is always safe: the overlay still
-/// works, it just takes focus when clicked.
-pub type PanelHook = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> PanelReport>;
+/// Returning a report-only [`PanelAttachment`] is always safe: the overlay still
+/// works, but platforms without native input regions use the pointer-based
+/// whole-window fallback described in the module documentation.
+pub type PanelHook = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> PanelAttachment>;
+
+/// Applies the interactive portion of the overlay to a native window.
+///
+/// `surface` and `hits` are window-local logical rectangles.
+/// `click_through == false` means the entire surface accepts input; `true`
+/// means only `hits` do. `pixels_per_point` is supplied on every update because
+/// an X11 window can move between outputs with different scale factors.
+///
+/// The hook lives for as long as [`OverlayApp`], which is what lets a native
+/// backend retain the connection and window handle it adopted during
+/// [`PanelHook`].
+pub type InputRegionHook = Box<dyn FnMut(Rect, &[Rect], bool, f32) -> scrozz_core::Result<()>>;
+
+/// Native state retained after a window is created.
+///
+/// A report is always present. The input-region hook is optional because some
+/// platforms expose only whole-window passthrough.
+pub struct PanelAttachment {
+    report: PanelReport,
+    input_region: Option<InputRegionHook>,
+    geometry: Option<OverlayGeometry>,
+}
+
+impl PanelAttachment {
+    /// Keeps only the conversion report and uses whole-window passthrough.
+    #[must_use]
+    pub fn report_only(report: PanelReport) -> Self {
+        Self {
+            report,
+            input_region: None,
+            geometry: None,
+        }
+    }
+
+    /// Retains a native per-rectangle input-region updater.
+    #[must_use]
+    pub fn with_input_region(
+        report: PanelReport,
+        input_region: impl FnMut(Rect, &[Rect], bool, f32) -> scrozz_core::Result<()> + 'static,
+    ) -> Self {
+        Self {
+            report,
+            input_region: Some(Box::new(input_region)),
+            geometry: None,
+        }
+    }
+
+    /// Replaces the pre-window geometry guess with geometry measured from the
+    /// native backend after the real handle exists.
+    #[must_use]
+    pub fn with_geometry(mut self, geometry: OverlayGeometry) -> Self {
+        self.geometry = Some(geometry);
+        self
+    }
+}
 
 /// Reports the pointer position in the overlay window's own logical
 /// coordinates, whether or not the window is currently accepting mouse events.
@@ -722,6 +787,14 @@ struct Entry {
     pending: Option<egui::ColorImage>,
 }
 
+#[derive(Clone, PartialEq)]
+struct InputRegionSnapshot {
+    surface: Rect,
+    hits: Vec<Rect>,
+    click_through: bool,
+    pixels_per_point: f32,
+}
+
 /// The `eframe` application that hosts the capture stack.
 pub struct OverlayApp {
     stack: CaptureStack,
@@ -735,7 +808,9 @@ pub struct OverlayApp {
     thumbnail_px: u32,
     /// The value most recently sent to the window, so the command is sent on
     /// change rather than every frame.
-    passthrough_now: bool,
+    passthrough_now: Option<bool>,
+    native_input: Option<InputRegionHook>,
+    native_input_now: Option<InputRegionSnapshot>,
     /// When the pointer was last actually known, for re-sampling.
     last_seen: f64,
     hovered: Option<CardId>,
@@ -763,10 +838,23 @@ impl OverlayApp {
             *slot = Some(ctx.clone());
         }
 
-        let report = options.panel.take().map_or_else(
-            || PanelReport::unsupported("no native panel hook supplied"),
+        let PanelAttachment {
+            report,
+            input_region,
+            geometry,
+        } = options.panel.take().map_or_else(
+            || {
+                PanelAttachment::report_only(PanelReport::unsupported(
+                    "no native panel hook supplied",
+                ))
+            },
             |hook| hook(cc),
         );
+        if let Some(geometry) = geometry {
+            options.geometry = geometry;
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+        }
         if !report.non_activating {
             tracing::warn!(detail = %report.detail, "overlay window is not non-activating");
         }
@@ -774,7 +862,10 @@ impl OverlayApp {
             *slot = Some(report);
         }
 
-        if options.passthrough == Passthrough::Auto && options.probe.is_none() {
+        if options.passthrough == Passthrough::Auto
+            && options.probe.is_none()
+            && input_region.is_none()
+        {
             tracing::warn!(
                 "no pointer probe: click-through will re-sample every {RESAMPLE_SECS}s, \
                  which is imprecise on platforms that stop delivering pointer events \
@@ -792,7 +883,9 @@ impl OverlayApp {
             passthrough: options.passthrough,
             probe: options.probe,
             thumbnail_px: options.thumbnail_px.max(1),
-            passthrough_now: false,
+            passthrough_now: None,
+            native_input: input_region,
+            native_input_now: None,
             last_seen: 0.0,
             hovered: None,
             dock_collapsed: false,
@@ -946,7 +1039,65 @@ impl OverlayApp {
         )
     }
 
-    fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], pointer: Option<Pos2>) {
+    fn apply_native_input_region(&mut self, ctx: &egui::Context, hits: &[Rect]) -> bool {
+        if self.native_input.is_none() {
+            return false;
+        }
+
+        let (click_through, hits) = match self.passthrough {
+            Passthrough::Never => (false, &[][..]),
+            Passthrough::Always => (true, &[][..]),
+            Passthrough::Auto => (true, hits),
+        };
+        let update = InputRegionSnapshot {
+            surface: self.geometry.local(),
+            hits: hits.to_vec(),
+            click_through,
+            pixels_per_point: ctx.pixels_per_point(),
+        };
+        if self.native_input_now.as_ref() == Some(&update) {
+            return true;
+        }
+
+        let Some(hook) = self.native_input.as_mut() else {
+            return false;
+        };
+        let result = hook(
+            update.surface,
+            &update.hits,
+            update.click_through,
+            update.pixels_per_point,
+        );
+        match result {
+            Ok(()) => {
+                self.native_input_now = Some(update);
+                true
+            }
+            Err(err) => {
+                let detail = format!(
+                    "native input-region update failed ({err}); using pointer-based \
+                     whole-window passthrough"
+                );
+                tracing::error!(error = %err, "native overlay input shaping failed");
+                if let Ok(mut report) = self.handle.shared.report.lock()
+                    && let Some(report) = report.as_mut()
+                {
+                    report.detail.push_str(" — ");
+                    report.detail.push_str(&detail);
+                }
+                self.native_input = None;
+                self.native_input_now = None;
+                false
+            }
+        }
+    }
+
+    fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect]) {
+        if self.apply_native_input_region(ctx, hits) {
+            return;
+        }
+
+        let pointer = self.pointer(ctx);
         let now = ctx.input(|i| i.time);
         let empty = hits.is_empty();
         let desired = match self.passthrough {
@@ -971,7 +1122,7 @@ impl OverlayApp {
                     self.last_seen = now;
                     false
                 } else {
-                    self.passthrough_now
+                    self.passthrough_now.unwrap_or(false)
                 }
             }
         };
@@ -979,8 +1130,8 @@ impl OverlayApp {
         if self.passthrough == Passthrough::Auto && self.probe.is_none() && desired && !empty {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(RESAMPLE_SECS));
         }
-        if desired != self.passthrough_now {
-            self.passthrough_now = desired;
+        if self.passthrough_now != Some(desired) {
+            self.passthrough_now = Some(desired);
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(desired));
         }
     }
@@ -1164,8 +1315,7 @@ impl eframe::App for OverlayApp {
             self.emit(OverlayEvent::Emptied);
         }
 
-        let pointer = self.pointer(&ctx);
-        self.apply_passthrough(&ctx, &hits, pointer);
+        self.apply_passthrough(&ctx, &hits);
 
         // The single place repainting is requested: idle costs nothing, an
         // animation gets a continuous repaint, and a pending wake gets a timer.
