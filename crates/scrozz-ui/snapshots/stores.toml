@@ -1,0 +1,135 @@
+# Scrozz store screenshot targets — decision D25, "sizes as data".
+#
+# Supporting a new store is an entry in this file, not a code change. Nothing in
+# `harness.rs` knows the name of any store; it only knows how to read this table.
+#
+# This file is BOTH the runtime data file and the compiled-in default: the
+# harness embeds it with `include_str!`, so tests never depend on the working
+# directory, and editing it here changes both at once. There is exactly one copy.
+#
+# Fields
+#   id       Stable slug. Becomes the output directory and the filename prefix.
+#            Never rename one — README and store listings link to the paths.
+#   store    Human name of the consumer, for the generated index and for logs.
+#   label    What this particular size is for, in the store's own words.
+#   width    FINAL pixel width of the delivered asset.
+#   height   FINAL pixel height of the delivered asset.
+#   scale    Pixels per logical point. The surface is laid out at
+#            width/scale x height/scale points and rasterised at `scale`.
+#            Must divide both `width` and `height` exactly.
+#   locales  Locales to render. Every entry produces its own file. Localisation
+#            is free precisely because it is a loop here, not a photo session.
+#   required Whether a release is allowed to ship without this asset.
+#   notes    Free text carried into the generated index.
+
+# ---------------------------------------------------------------------------
+# Mac App Store
+# Accepts exactly 1280x800, 1440x900, 2560x1600 or 2880x1800 (16:10). Anything
+# else is rejected at upload, which is why these are data and not eyeballed.
+# ---------------------------------------------------------------------------
+
+[[target]]
+id = "mac-app-store-2880"
+store = "Mac App Store"
+label = "Primary 16:10 @2x"
+width = 2880
+height = 1800
+scale = 2
+locales = ["en-US"]
+required = true
+notes = "The listing hero. First asset a reviewer sees."
+
+[[target]]
+id = "mac-app-store-2560"
+store = "Mac App Store"
+label = "Secondary 16:10 @2x"
+width = 2560
+height = 1600
+scale = 2
+locales = ["en-US"]
+required = false
+notes = "Alternate accepted size; kept so a listing can mix aspect crops."
+
+# ---------------------------------------------------------------------------
+# Microsoft Store
+# Requires PNG, at least 1366x768. 2160x1440 is the high-density variant.
+# ---------------------------------------------------------------------------
+
+[[target]]
+id = "microsoft-store-1366"
+store = "Microsoft Store"
+label = "Desktop minimum @1x"
+width = 1366
+height = 768
+scale = 1
+locales = ["en-US"]
+required = true
+notes = "Store minimum. Rendered at 1x deliberately: it is the size at which grayscale text AA is worst (D22 cost 4), so it is the one worth having a golden of."
+
+[[target]]
+id = "microsoft-store-2160"
+store = "Microsoft Store"
+label = "Desktop high density @2x"
+width = 2160
+height = 1440
+scale = 2
+locales = ["en-US"]
+required = false
+notes = "High-density variant."
+
+# ---------------------------------------------------------------------------
+# Flathub / AppStream
+# AppStream wants 16:9. Flathub's quality guidelines ask for at least 1000px
+# wide so its own thumbnailer has something to work with.
+# ---------------------------------------------------------------------------
+
+[[target]]
+id = "flathub-1600"
+store = "Flathub"
+label = "AppStream 16:9 @2x"
+width = 1600
+height = 900
+scale = 2
+locales = ["en-US"]
+required = true
+notes = "Referenced from the AppStream metainfo <screenshots> block."
+
+[[target]]
+id = "flathub-1280"
+store = "Flathub"
+label = "AppStream 16:9 @1x"
+width = 1280
+height = 720
+scale = 1
+locales = ["en-US"]
+required = false
+notes = "Fallback for clients that do not honour scaled screenshots."
+
+# ---------------------------------------------------------------------------
+# GitHub README
+# Not a store, but it has exactly the same shape of problem, so it lives in the
+# same table. GitHub's content column is ~1000 CSS px; 2x of 800pt lands crisp
+# without being downscaled into mush.
+# ---------------------------------------------------------------------------
+
+[[target]]
+id = "github-readme"
+store = "GitHub README"
+label = "README figure @2x"
+width = 1600
+height = 1000
+scale = 2
+locales = ["en-US"]
+required = true
+notes = "Embedded in README.md. Regenerated on every release so it cannot go stale."
+
+[[target]]
+id = "github-readme-narrow"
+store = "GitHub README"
+label = "README inline figure @2x"
+width = 1200
+height = 900
+scale = 2
+locales = ["en-US"]
+required = false
+notes = "For side-by-side pairs in docs/."
