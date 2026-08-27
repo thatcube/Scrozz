@@ -312,10 +312,27 @@ capture, annotation, or encoding logic of its own**.
 
 ## D12 — The capture stack is the primary interface; drag-out is the hero action
 
-**Decision.** The post-capture overlay is a **stack of captures**, not a single
-card. Its primary interaction is **dragging a capture directly into another
-application** — above copy, above save. Swipe-to-dismiss is a primary gesture.
-Clipboard remains essential but is no longer described as "first".
+**Decision.** The post-capture overlay is a **vertical list of captures**, not a
+single card. Its primary interaction is **dragging a capture directly into
+another application** — above copy, above save. Swipe-to-dismiss is a primary
+gesture. Clipboard remains essential but is no longer described as "first".
+
+**Layout.** Each capture is a **discrete, fully-visible card**, arranged
+vertically with consistent gaps. **No overlap, no depth, no scale or opacity
+falloff** — nothing is ever partially hidden behind anything else. Every card is
+independently hoverable, draggable and dismissable; hovering one reveals only its
+own chrome.
+
+> An earlier draft of this decision described a physical *card-stack* metaphor
+> with cards peeking out behind one another. That was a misreading of the
+> reference, which plainly shows two fully separate cards with a gap. The
+> corrected model is also better UX: every capture stays visible and directly
+> actionable instead of buried in a pile.
+
+**Motion (see D19).** A new capture slides in from the anchored screen edge and
+takes the slot nearest the anchor corner; existing cards shift away with a spring
+settle. Dismissing a card lets its neighbours close the gap. The list reflows —
+it never re-stacks.
 
 **Why.** Maintainer, on the behaviour that defines the app: *"you can swipe the
 screenshots that stack in the bottom right down, and also drag them into a chat
@@ -352,28 +369,52 @@ Motion lives in the shared token layer alongside colour, spacing and type —
 named duration tokens, named easing curves (including a spring), and per-element
 animation state — never ad-hoc interpolation scattered through drawing code.
 
-**Baseline set:** hover reveal (fade + slight rise, lightly staggered), button
-hover and press feedback, card press lift, swipe-to-dismiss following the pointer
-with rotation and momentum, new-capture entry into the stack, and menu row
-highlight.
+**The governing principle: motion belongs to objects that move through space;
+controls respond instantly.**
+
+- **Animate — the capture cards.** A new capture **slides in from the anchored
+  screen edge** and the list springs to make room. A card is **grabbable and
+  follows the pointer 1:1**, tilts while moving, and **flings off toward that
+  edge with real momentum** past a velocity or distance threshold — or **springs
+  back** below it. Neighbours settle when one leaves. Velocity tracking is
+  essential: a dismissal that ignores throw speed feels dead.
+- **Do not animate — buttons, pills, menu rows.** Hover and press are **instant**
+  state changes. No fade, no scale, no easing.
+
+**Why the split.** Maintainer: *"i think the button animations dont NEED to be
+anything, the instant background changes are GOOD actually. make it feel more
+responsive."* He is right, and it corrects an earlier draft of this decision that
+called for animated button feedback. Easing a control makes an app feel
+*sluggish*; instant feedback makes it feel *responsive*. Physical motion on
+spatial objects is what makes it feel *alive*. Spending motion budget on controls
+actively degrades the product.
 
 **Accessibility gate (per D13):** the OS reduce-motion setting collapses every
 duration to zero. Motion is never load-bearing — it must not be the only carrier
 of meaning.
 
-**Why.** Maintainer: *"things like micro-interactions and animations are also
-really essential IMO to building a great app."* This is the difference between
-an app that works and an app that feels good, and it is judged in the first ten
-seconds of use.
+**Why motion at all.** Maintainer: *"things like micro-interactions and
+animations are also really essential IMO to building a great app."* This is the
+difference between an app that works and an app that feels good, and it is judged
+in the first ten seconds of use.
 
 **Known cost, deliberately accepted.** egui has **no built-in animation system** —
 only `animate_bool_with_time` / `animate_value_with_time` primitives. Easing,
-springs and staggering must be built. That is precisely why it is being proven in
-the spike rather than assumed: a stack that cannot animate well fails a stated
-requirement, and better to learn that now than in month three.
+springs and staggering must be built. epaint also has **no rotation primitive**,
+so a tilting card is hand-built from rotated polygons. That is precisely why it is
+being proven in a spike rather than assumed: a stack that cannot animate well
+fails a stated requirement, and better to learn that now than in month three.
+
+**Implementation note.** egui is immediate-mode and only repaints on input, so an
+animation silently does nothing unless `ctx.request_repaint()` is called while it
+is in flight — and repainting unconditionally pins the CPU, which would undermine
+the native-performance argument that justified choosing egui. Animate, then go
+idle.
 
 **Consequence for review.** Still screenshots cannot convey feel. Any UI work
-that changes interaction must be reviewed as a **screen recording**, not stills.
+that changes interaction must be reviewed by **running it**, not by looking at
+stills — the first spike produced convincing static *depictions* of motion while
+containing no motion at all.
 
 ---
 
