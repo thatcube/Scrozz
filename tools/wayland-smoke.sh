@@ -81,7 +81,9 @@ fi
 
 # The library, not the daemon: the backend dlopens it, so its absence is a
 # skip with an install command rather than a crash.
-if ! ldconfig -p 2>/dev/null | grep -q 'libpipewire-0\.3\.so\.0'; then
+# Do not use grep -q here: under pipefail its early exit can give ldconfig
+# SIGPIPE and turn a successful lookup into pipeline status 141.
+if ! ldconfig -p 2>/dev/null | grep 'libpipewire-0\.3\.so\.0' >/dev/null; then
   skip "libpipewire-0.3.so.0 was not found by ldconfig. Install it with:
       sudo apt-get install libpipewire-0.3-0
   On Fedora the package is pipewire-libs; on Arch, pipewire."
