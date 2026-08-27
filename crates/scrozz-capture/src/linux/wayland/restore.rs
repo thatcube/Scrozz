@@ -67,8 +67,8 @@ fn harden_existing_token(path: &Path) -> std::io::Result<()> {
     options.read(true);
     match open_private(&mut options, path) {
         Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
