@@ -60,6 +60,17 @@ fn reference(frame: &Frame) -> Vec<u8> {
                         [straight(px[0]), straight(px[1]), straight(px[2]), a]
                     }
                 }
+                BgraPremultiplied8 => {
+                    let a = px[3];
+                    if a == 0 {
+                        [0, 0, 0, 0]
+                    } else {
+                        let straight =
+                            |c: u8| (f64::from(c) * 255.0 / f64::from(a)).round().min(255.0) as u8;
+                        // Source order is B, G, R — un-premultiply then swap.
+                        [straight(px[2]), straight(px[1]), straight(px[0]), a]
+                    }
+                }
             });
         }
     }

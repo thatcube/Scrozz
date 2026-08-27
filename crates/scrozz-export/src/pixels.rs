@@ -131,6 +131,15 @@ pub fn to_straight_rgba8(frame: &Frame) -> Result<RgbaImage> {
                     data.extend_from_slice(&[r, g, b, px[3]]);
                 }
             }
+            // What Windows.Graphics.Capture produces. Un-premultiply and swap
+            // channel order in the same pass, rather than making the caller do
+            // two full-image walks.
+            PixelFormat::BgraPremultiplied8 => {
+                for px in row.as_chunks::<4>().0 {
+                    let [b, g, r] = unpremultiply([px[0], px[1], px[2]], px[3]);
+                    data.extend_from_slice(&[r, g, b, px[3]]);
+                }
+            }
         }
     }
 

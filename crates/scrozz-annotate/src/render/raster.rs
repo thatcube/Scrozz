@@ -45,7 +45,9 @@ pub fn to_pixmap(frame: &Frame) -> Result<Pixmap> {
             let px = &row[x * bpp..x * bpp + 4];
             let (r, g, b, a) = match frame.format {
                 PixelFormat::Rgba8 | PixelFormat::RgbaPremultiplied8 => (px[0], px[1], px[2], px[3]),
-                PixelFormat::Bgra8 => (px[2], px[1], px[0], px[3]),
+                PixelFormat::Bgra8 | PixelFormat::BgraPremultiplied8 => {
+                    (px[2], px[1], px[0], px[3])
+                }
             };
             out[y * width as usize + x] = if frame.format.is_premultiplied() {
                 // Clamp rather than trust: a channel above alpha is invalid

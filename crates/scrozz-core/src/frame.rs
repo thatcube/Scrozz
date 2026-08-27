@@ -22,6 +22,15 @@ pub enum PixelFormat {
     /// edge with black, which is exactly the halo seen around rounded window
     /// corners when this distinction is dropped.
     RgbaPremultiplied8,
+    /// 8 bits per channel, blue-green-red-alpha byte order, **premultiplied**.
+    ///
+    /// What `Windows.Graphics.Capture` actually produces. It exists because the
+    /// alternative was worse in both directions: reporting it as [`Self::Bgra8`]
+    /// lies about premultiplication and black-fringes every antialiased window
+    /// corner, while swizzling to [`Self::RgbaPremultiplied8`] at the capture
+    /// boundary costs a full-image pass on every frame — unacceptable while
+    /// recording, which is the case the no-eager-conversion rule exists for.
+    BgraPremultiplied8,
 }
 
 impl PixelFormat {
@@ -29,14 +38,14 @@ impl PixelFormat {
     #[must_use]
     pub const fn bytes_per_pixel(self) -> usize {
         match self {
-            Self::Rgba8 | Self::Bgra8 | Self::RgbaPremultiplied8 => 4,
+            Self::Rgba8 | Self::Bgra8 | Self::RgbaPremultiplied8 | Self::BgraPremultiplied8 => 4,
         }
     }
 
     /// Whether colour channels are scaled by alpha.
     #[must_use]
     pub const fn is_premultiplied(self) -> bool {
-        matches!(self, Self::RgbaPremultiplied8)
+        matches!(self, Self::RgbaPremultiplied8 | Self::BgraPremultiplied8)
     }
 }
 

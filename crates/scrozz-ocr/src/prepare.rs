@@ -138,7 +138,7 @@ impl Rgba8Image {
         // Resolved once rather than per pixel.
         let (r_at, b_at) = match frame.format {
             PixelFormat::Rgba8 | PixelFormat::RgbaPremultiplied8 => (0, 2),
-            PixelFormat::Bgra8 => (2, 0),
+            PixelFormat::Bgra8 | PixelFormat::BgraPremultiplied8 => (2, 0),
         };
         let premultiplied = frame.format.is_premultiplied();
 
