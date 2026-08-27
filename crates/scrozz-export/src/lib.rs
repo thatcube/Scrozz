@@ -2,6 +2,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clipboard;
+pub mod destination;
+pub mod encode;
+pub mod icc;
+pub mod naming;
+pub mod pixels;
+
+pub use clipboard::{
+    ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,
+};
+pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader, UnimplementedS3Uploader};
+pub use encode::{EncodeOptions, FrameEncoder, PngEffort};
+pub use icc::profile_for;
+pub use naming::{FilenameRules, NamePolicy, NameTemplate, NamingContext, Timestamp};
+pub use pixels::{RgbaImage, to_straight_rgba8};
+
 use std::path::PathBuf;
 
 use scrozz_core::{Frame, Result};
@@ -15,6 +31,60 @@ pub enum ImageFormat {
     Jpeg,
     /// Lossy or lossless, alpha-capable, much smaller than PNG.
     WebP,
+}
+
+impl ImageFormat {
+    /// The conventional file extension, without a dot.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::WebP => "webp",
+        }
+    }
+
+    /// The IANA media type.
+    ///
+    /// Needed when uploading: an object stored without one is served as
+    /// `application/octet-stream`, and a shared link then downloads a file
+    /// instead of showing a picture, which defeats the point of sharing it.
+    #[must_use]
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::WebP => "image/webp",
+        }
+    }
+
+    /// Whether this format can carry transparency.
+    ///
+    /// JPEG cannot, which is why encoding to it composites over a background
+    /// colour rather than discarding alpha and letting the colour under a
+    /// transparent pixel show through as whatever noise the buffer held.
+    #[must_use]
+    pub const fn supports_alpha(self) -> bool {
+        matches!(self, Self::Png | Self::WebP)
+    }
+
+    /// Identifies a format from its leading bytes.
+    ///
+    /// The [`Exporter`] contract receives bytes with no accompanying format, but
+    /// a file still needs an extension and an upload still needs a media type.
+    /// Sniffing is how those are recovered without changing the contract.
+    #[must_use]
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+            Some(Self::Png)
+        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            Some(Self::Jpeg)
+        } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            Some(Self::WebP)
+        } else {
+            None
+        }
+    }
 }
 
 /// Writes frames to bytes.
@@ -45,6 +115,21 @@ pub trait Clipboard {
     ///
     /// Returns an error if the clipboard was unavailable.
     fn write_image(&self, frame: &Frame) -> Result<()>;
+
+    /// Writes a frame and reports which flavours were actually delivered.
+    ///
+    /// Separate from [`Clipboard::write_image`] and defaulted, because what a
+    /// backend manages to offer is genuinely backend-specific and worth
+    /// surfacing rather than assuming. The default answers "no report
+    /// available" instead of inventing an optimistic one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clipboard was unavailable.
+    fn write_image_with_report(&self, frame: &Frame) -> Result<Option<clipboard::ClipboardReport>> {
+        self.write_image(frame)?;
+        Ok(None)
+    }
 }
 
 /// Where an export is sent.
