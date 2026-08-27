@@ -45,6 +45,15 @@ pub struct Window {
     pub title: Option<String>,
     /// Owning application's display name.
     pub application: Option<String>,
+    /// Stable per-platform application identifier: bundle id, executable name,
+    /// or `WM_CLASS`.
+    ///
+    /// Separate from [`Self::application`] because display names are localised
+    /// and change between releases, so keying an icon lookup or a per-app rule
+    /// on one is a bug that only shows up in another language. Recorded into
+    /// [`crate::SourceApp`] at capture time, since the process may be gone by
+    /// the time history renders a badge for it.
+    pub application_id: Option<String>,
     /// Frame in the global logical desktop.
     pub bounds: LogicalRect,
     /// The display this window is predominantly on.
