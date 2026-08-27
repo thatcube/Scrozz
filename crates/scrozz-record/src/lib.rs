@@ -19,6 +19,21 @@ use std::path::PathBuf;
 
 use scrozz_core::{CaptureTarget, Result};
 
+#[cfg(target_os = "windows")]
+mod windows;
+
+/// Encoder quality for a recording.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    /// Prefer a smaller file over fine detail.
+    Low,
+    /// Keep desktop text crisp without excessive bitrate.
+    #[default]
+    Balanced,
+    /// Preserve detail for footage that will be edited or re-encoded.
+    High,
+}
+
 /// What a recording session should include.
 #[derive(Debug, Clone)]
 pub struct RecordingRequest {
@@ -36,6 +51,57 @@ pub struct RecordingRequest {
     pub fps: u32,
     /// Draw the pointer into the video.
     pub show_cursor: bool,
+    /// Explicit destination, or `None` for a unique file in the current
+    /// directory.
+    pub output: Option<PathBuf>,
+    /// Encoder quality.
+    pub quality: Quality,
+    /// Maximum encoded height in pixels, preserving aspect ratio.
+    pub max_height: Option<u32>,
+}
+
+impl RecordingRequest {
+    /// Builds a request with balanced quality at the target's native size.
+    #[must_use]
+    pub fn new(
+        target: CaptureTarget,
+        microphone: bool,
+        system_audio: bool,
+        fps: u32,
+        show_cursor: bool,
+    ) -> Self {
+        Self {
+            target,
+            microphone,
+            system_audio,
+            fps,
+            show_cursor,
+            output: None,
+            quality: Quality::Balanced,
+            max_height: None,
+        }
+    }
+
+    /// Overrides the output path.
+    #[must_use]
+    pub fn with_output(mut self, output: Option<PathBuf>) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// Overrides encoder quality.
+    #[must_use]
+    pub const fn with_quality(mut self, quality: Quality) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    /// Caps the encoded height while preserving aspect ratio.
+    #[must_use]
+    pub const fn with_max_height(mut self, max_height: Option<u32>) -> Self {
+        self.max_height = max_height;
+        self
+    }
 }
 
 /// A finished recording.
@@ -45,6 +111,30 @@ pub struct Recording {
     pub path: PathBuf,
     /// Duration in seconds.
     pub duration_secs: f64,
+    /// Why this is a playable partial file rather than a cleanly finalised one.
+    pub salvaged: Option<String>,
+}
+
+impl Recording {
+    /// A recording whose container finalised normally.
+    #[must_use]
+    pub fn complete(path: PathBuf, duration_secs: f64) -> Self {
+        Self {
+            path,
+            duration_secs,
+            salvaged: None,
+        }
+    }
+
+    /// A playable partial recording retained after finalisation failed.
+    #[must_use]
+    pub fn salvaged(path: PathBuf, duration_secs: f64, reason: impl Into<String>) -> Self {
+        Self {
+            path,
+            duration_secs,
+            salvaged: Some(reason.into()),
+        }
+    }
 }
 
 /// A recording session in progress.
@@ -85,5 +175,14 @@ pub trait RecordingSession: Send {
 /// was withheld, or [`scrozz_core::Error::Unsupported`] if no hardware encoder
 /// is available.
 pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
-    todo!("open the platform encoder and begin the capture loop")
+    #[cfg(target_os = "windows")]
+    {
+        windows::start(request)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = request;
+        todo!("open the platform encoder and begin the capture loop")
+    }
 }
