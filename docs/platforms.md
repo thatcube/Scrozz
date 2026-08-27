@@ -130,6 +130,8 @@ across Spaces and fullscreen apps still needs a native smoke run. On X11, both
 hosts retain their exact override-redirect window ID, take keyboard ownership
 with `SetInputFocus` after the window becomes viewable, and restore the prior
 focus before capture begins unless the user has already focused somewhere else.
+The selector consumes terminal key, modifier and pointer releases before
+restoring focus, so no half of the finishing gesture reaches the prior app.
 
 Shortcut settings and runtime actions are separate names:
 `hotkey.capture-region` persists the accelerator, while `capture.region` is the
