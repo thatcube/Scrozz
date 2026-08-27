@@ -130,8 +130,38 @@ These are the dangerous class: the call returns success and nothing works.
    desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
    Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
 
+### Testing platform code
+
+8. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
+   thread.** Anything needing the main run loop — `NSApplication`, windows, tray
+   items, hotkey managers — is unreachable from an ordinary test. Doctests run on
+   the main thread and are the workaround; failing that, test the
+   off-main-thread guard and verify real behaviour another way.
+
 ---
 
+## Resolved: overlay windows will not steal focus (macOS)
+
+The largest architectural risk in D27 was whether a capture card could be clicked
+without pulling focus out of whatever the user was typing in. A plain `NSWindow`
+activates its application on click, and eframe/winit creates exactly that.
+
+**It works.** An `NSWindow` converts in place to a non-activating `NSPanel`
+(`NSWindowStyleMaskNonactivatingPanel`), verified on this machine against a real
+window: `canBecomeKeyWindow == true`, `canBecomeMainWindow == false`. `winit
+0.30.13`'s window class declares no ivars, so it is convertible by the same path,
+and the conversion is guarded by an instance-size comparison that refuses cleanly
+rather than corrupting memory if that ever stops being true.
+
+Key-ness and activation are deliberately separate: the class always answers
+`canBecomeKeyWindow` so **Escape still works**, while capture cards additionally
+set `becomesKeyOnlyIfNeeded` so a click never takes the user's keystrokes. That
+combination is what makes the capture stack usable *while typing* — the normal
+case, not an edge case.
+
+---
+
+## Known asymmetry, stated honestly
 
 macOS is where interactive verification happens today, so macOS code will be
 better tested than Windows or Linux code until layer 4 exists. That is a real
