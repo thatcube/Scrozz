@@ -1,0 +1,64 @@
+# Dependency updates.
+#
+# Two ecosystems, both weekly, both grouped hard. An update bot that opens
+# fifteen pull requests a week gets muted, and a muted bot is worse than no bot
+# — it produces the *appearance* of dependency hygiene without any.
+version: 2
+
+updates:
+  # --- Rust ----------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    # Keep Cargo.lock honest for transitive dependencies too, not just the
+    # direct ones named in Cargo.toml.
+    versioning-strategy: auto
+    groups:
+      # One pull request for the routine noise. These are almost always safe
+      # and reviewing them individually is a waste of a human.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      # Majors get their own pull request each — they are the ones that
+      # actually need reading.
+    ignore:
+      # egui and eframe are pinned with `=` on purpose (D22). They are 0.x,
+      # they churn hard between releases, and egui / eframe / egui_kittest must
+      # move together or the golden-image harness breaks. That is a deliberate,
+      # coordinated change a person makes, not a bot.
+      #
+      # Security advisories against these still surface — cargo-deny reports
+      # them in the Supply chain workflow, which is the right channel for it.
+      - dependency-name: egui
+      - dependency-name: eframe
+      - dependency-name: egui_kittest
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
+  # --- GitHub Actions ------------------------------------------------------
+  # Actions are pinned to major tags (@v4, @v2), so this mostly catches the
+  # occasional major bump — and, more usefully, an action that has been
+  # deprecated or moved.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - ci

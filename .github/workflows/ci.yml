@@ -1,0 +1,306 @@
+# Scrozz continuous integration.
+#
+# This file implements layers 1–3 of docs/platforms.md:
+#
+#   Layer 1  cross-target type checking, one runner, seconds        -> job: gate
+#   Layer 2  real builds and tests on all three platforms           -> job: test
+#   Layer 3  headless golden images on all three platforms (D25)    -> job: golden
+#
+# Layer 4 (virtual machines, real desktop sessions) is deliberately absent —
+# it cannot be automated here, and pretending otherwise would be worse than
+# admitting the gap.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Deliberately no `paths-ignore`. A skipped required check never reports, and a
+# pull request then waits forever for a status that will never arrive. Paying a
+# few runner-minutes for a docs-only change is the cheaper mistake.
+
+concurrency:
+  # One in-flight run per branch. A second push supersedes the first, so review
+  # time is never spent reading results for code that no longer exists.
+  group: ci-${{ github.ref }}
+  # ...except on the default branch, where every commit's result is a record
+  # worth keeping intact.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # One place to bump the toolchain. If EVERY job suddenly fails while
+  # installing Rust, suspect this line first — the pinned version is either
+  # withdrawn or not yet published for a runner architecture.
+  #
+  # Pinned rather than `stable` on purpose: a new stable ships new clippy lints,
+  # and CI turning red on a Tuesday for code nobody touched is how teams learn
+  # to ignore CI. Bumping is a deliberate commit. Keep it >= the workspace's
+  # `rust-version` in Cargo.toml.
+  RUST_VERSION: "1.98.0"
+
+  CARGO_TERM_COLOR: always
+  # Backtraces cost nothing here and turn "thread panicked" into something
+  # actionable without a re-run.
+  RUST_BACKTRACE: 1
+  # CI caches whole target directories; incremental artefacts only bloat them.
+  CARGO_INCREMENTAL: 0
+  # crates.io and static.rust-lang.org both blip. Retry instead of failing a
+  # twenty-minute matrix on a five-second network problem.
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+defaults:
+  run:
+    # Force bash on Windows too, so tools/*.sh behave identically everywhere
+    # and there is exactly one shell dialect in this repository.
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # LAYER 1 — the fast gate.
+  #
+  # Formatting and a three-platform type check on a single cheap runner. Almost
+  # every platform mistake is caught here in a couple of minutes, before nine
+  # matrix jobs spend twenty. Everything downstream `needs:` this job.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Gate — fmt + cross-target check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }} with all three targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+          # `cargo check` needs each target's standard library, but no linker
+          # and no platform SDK — that is the whole trick behind layer 1.
+          targets: >-
+            aarch64-apple-darwin,
+            x86_64-pc-windows-msvc,
+            x86_64-unknown-linux-gnu
+
+      - name: Install Linux system packages
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The gate keeps four target directories (one per triple plus the
+          # host); a distinct key stops it fighting the matrix jobs for cache
+          # space and evicting them.
+          key: gate
+          # tools/check-all-platforms.sh writes to target/xcheck-*, which is
+          # outside the default cache path.
+          cache-directories: |
+            target/xcheck-aarch64-apple-darwin
+            target/xcheck-x86_64-pc-windows-msvc
+            target/xcheck-x86_64-unknown-linux-gnu
+
+      # Formatting is byte-identical on every platform, so it runs exactly once
+      # here rather than three times in the matrix.
+      - name: Check formatting
+        run: |
+          if ! cargo fmt --all -- --check; then
+            echo "::error title=Formatting::Run 'tools/dev.sh fmt' and commit the result."
+            exit 1
+          fi
+
+      - name: Type-check macOS, Windows and Linux
+        env:
+          # These two crates depend on rusqlite's bundled sqlite, whose build
+          # script compiles C for the *target*. Cross-compiling that needs a
+          # foreign C toolchain no runner has. The host target still checks
+          # them in full, and neither contains platform-conditional code.
+          SCROZZ_XCHECK_EXCLUDE: "scrozz-store scrozz"
+        run: |
+          if ! tools/check-all-platforms.sh; then
+            echo "::error title=Cross-target check failed::A platform target does not type-check. Reproduce on any machine, no Windows or Linux box needed: tools/dev.sh platforms"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # LAYER 2 — real builds, real tests, real linking, on real platforms.
+  #
+  # This is what type checking structurally cannot prove: that it links, that it
+  # runs, and that platform-specific logic is actually correct.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test — ${{ matrix.name }}
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # A Windows failure must not hide a Linux failure. Seeing all three
+      # results from one push is worth the extra runner minutes; discovering
+      # them one push at a time is not.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (arm64)
+          - os: ubuntu-latest
+            name: Linux (x86_64)
+          - os: windows-latest
+            name: Windows (x86_64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      # Clippy first. It type-checks every target including tests, so a plain
+      # mistake surfaces here in a fraction of the time a full codegen build
+      # takes — and clippy's own artefacts are not reusable by `cargo test`
+      # anyway, so the ordering costs nothing.
+      - name: Clippy (warnings denied)
+        run: |
+          if ! cargo clippy --workspace --all-targets -- -D warnings; then
+            echo "::error title=Clippy on ${{ matrix.name }}::Warnings are errors here. Reproduce with 'tools/dev.sh lint'. If a lint is genuinely wrong, silence it with a targeted #[allow] and a comment saying why."
+            exit 1
+          fi
+
+      # This is the build step as well as the test step: `cargo test` compiles
+      # the libraries, the binaries and the test harnesses for real, with real
+      # linking. A separate `cargo build` would only compile it all twice.
+      - name: Build and test
+        run: |
+          if ! cargo test --workspace; then
+            echo "::error title=Tests failed on ${{ matrix.name }}::If this passes on the other two platforms, the cause is platform-specific — that is precisely what this job exists to find."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # LAYER 3 — headless golden images (decision D25).
+  #
+  # The screenshot harness renders with no display server, which means it runs
+  # unchanged on runners nobody owns. So the UI is not merely *compiled* on
+  # Windows and Linux — it is rendered, and the pixels are diffed.
+  #
+  # Font metrics, DPI rounding and text antialiasing genuinely differ between
+  # the three platforms, so this is the only mechanism that answers "does the
+  # UI look right on Windows" without a Windows machine.
+  #
+  # When it fails it uploads the baseline, the new render and the diff, because
+  # a red X reading "images differ" tells a human nothing they can act on.
+  # ---------------------------------------------------------------------------
+  golden:
+    name: Golden images — ${{ matrix.name }}
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    # Baselines have to be recorded on some platform, and macOS is where the UI
+    # is authored. Until per-platform baselines exist, a Windows or Linux pixel
+    # diff is expected and is reported as a warning with artefacts attached
+    # rather than as a blocking failure.
+    #
+    # D25 is explicit that a permanently-red golden suite gets disabled within a
+    # week and the whole apparatus becomes worthless. This is how it stays
+    # honest in the meantime.
+    #
+    # >>> Flip `required: true` for a platform the moment its baselines are
+    # >>> committed. That is the single change that makes this job blocking.
+    continue-on-error: ${{ !matrix.required }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (arm64)
+            required: true
+          - os: ubuntu-latest
+            name: Linux (x86_64)
+            required: false
+          - os: windows-latest
+            name: Windows (x86_64)
+            required: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      # Includes mesa-vulkan-drivers (lavapipe) and libgl1-mesa-dri (llvmpipe).
+      # A CI runner has no GPU, and egui_kittest renders through wgpu, so
+      # without a software adapter every test fails with "no suitable adapter"
+      # — which looks like a code bug and is not one.
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: golden-${{ matrix.os }}
+
+      # tools/golden.sh exits 0 with an explanation when the harness does not
+      # exist yet. During Phase 0 that is the expected outcome: the harness in
+      # crates/scrozz-ui is still a todo!(). The job starts enforcing itself
+      # automatically once egui_kittest is a dev-dependency and there are tests
+      # in crates/scrozz-ui/tests/ — no edit to this file required.
+      - name: Render and diff golden images
+        run: tools/golden.sh
+
+      # The entire point. Without this a pixel diff is unreviewable.
+      - name: Upload baseline / actual / diff images
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ runner.os }}
+          path: target/golden-artifacts
+          if-no-files-found: ignore
+          # Long enough to survive a weekend; short enough not to accumulate.
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # One status check to require in branch protection.
+  #
+  # Matrix job names contain the platform, so they change whenever the matrix
+  # changes and any branch-protection rule naming them directly goes stale
+  # silently. Require "CI passed" instead and it keeps working.
+  # ---------------------------------------------------------------------------
+  ci-ok:
+    name: CI passed
+    if: always()
+    needs: [gate, test, golden]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify the required jobs succeeded
+        run: |
+          echo "gate:   ${{ needs.gate.result }}"
+          echo "test:   ${{ needs.test.result }}"
+          echo "golden: ${{ needs.golden.result }}"
+
+          failed=0
+          for pair in "gate:${{ needs.gate.result }}" \
+                      "test:${{ needs.test.result }}" \
+                      "golden:${{ needs.golden.result }}"; do
+            name="${pair%%:*}"
+            result="${pair#*:}"
+            # 'skipped' is a real outcome when an upstream job failed; treat it
+            # as a failure so a broken gate can never report green overall.
+            if [[ "$result" != "success" ]]; then
+              echo "::error title=$name did not pass::Result was '$result'. Open that job for the reason."
+              failed=1
+            fi
+          done
+          exit "$failed"

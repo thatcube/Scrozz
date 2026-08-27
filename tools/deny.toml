@@ -1,0 +1,173 @@
+# cargo-deny — supply-chain and licence policy for Scrozz.
+#
+# Run it with:  tools/dev.sh deny     (or: cargo deny --config tools/deny.toml check)
+#
+# Why this file is in tools/ and not the repository root: cargo-deny looks for
+# `deny.toml` beside the manifest by default, but `--config` overrides that, and
+# keeping it here groups it with the rest of the developer tooling.
+#
+# ---------------------------------------------------------------------------
+# The licence rule that actually matters
+# ---------------------------------------------------------------------------
+# Scrozz is GPL-3.0-or-later (decision D2). That is a promise about the whole
+# linked binary, not just about the files we wrote. Pulling in a dependency
+# under a GPL-incompatible licence would make the shipped artefact
+# undistributable — and it would happen silently, three levels down a
+# dependency tree, in a routine version bump.
+#
+# So the policy is default-deny: the `allow` list below is exhaustive, and any
+# licence not on it fails the build. Every entry is here because a crate in the
+# current graph uses it and it is GPL-3.0 compatible. Nothing is listed
+# speculatively; a new licence should require somebody to think.
+#
+# Deliberately NOT allowed, and each for a reason:
+#   GPL-2.0-only     v2-only cannot be combined with our v3-or-later code.
+#   AGPL-*           compatible in the other direction only; linking it would
+#                    force Scrozz itself to AGPL. That is a project decision,
+#                    not a dependency decision.
+#   SSPL, BUSL, Elastic, Commons Clause, "source available"
+#                    not free software; incompatible and undistributable.
+#   CDDL, EPL, MS-PL, MS-RL
+#                    recognised GPL-incompatible copyleft/weak-copyleft.
+#   LGPL-*           usable in principle, but it carries relinking obligations
+#                    for our packaged builds. If one ever becomes unavoidable,
+#                    add it here on purpose with a note, not by reflex.
+#
+# If cargo-deny fails on a licence, the fix is never to widen this list to make
+# the red go away. Read the licence, decide, and record the decision.
+
+[graph]
+# Evaluate the dependency graph for every platform we ship. Without this,
+# cargo-deny only sees the host's dependencies and a Windows-only or Linux-only
+# crate could carry an incompatible licence undetected.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[licenses]
+version = 2
+# A crate whose licence text scores below this is treated as unidentified and
+# fails, rather than being guessed at.
+confidence-threshold = 0.93
+
+allow = [
+    # --- Permissive, unambiguously GPL-3.0 compatible ---------------------
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unlicense",
+
+    # --- Weak copyleft, file-scoped, explicitly GPL-compatible ------------
+    # MPL-2.0 §3.3 permits distribution of a larger work under the GPL.
+    # Currently reached via `option-ext` (a `dirs` dependency).
+    "MPL-2.0",
+
+    # --- Data, not code ---------------------------------------------------
+    # Unicode character tables (`unicode-ident`).
+    "Unicode-3.0",
+    # Bundled default fonts inside egui's `epaint_default_fonts`. Both are
+    # redistributable font licences and neither restricts the code they ship
+    # alongside.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+
+    # --- Ours -------------------------------------------------------------
+    "GPL-3.0-or-later",
+]
+
+exceptions = []
+
+[advisories]
+version = 2
+# A yanked crate is a maintainer saying "do not use this version". Treat that
+# as an error so it surfaces at the next push rather than at the next release.
+yanked = "deny"
+# Advisories consciously accepted go here, each with the reason it was
+# accepted and a date it must be looked at again. An entry with no reason is
+# indistinguishable from someone silencing a warning to get a green tick.
+#
+# Everything below is an `unmaintained` notice. There is not one vulnerability
+# in the tree as of 2026-08-26 (verified with cargo-deny 0.20.2).
+ignore = [
+  # The gtk-rs GTK3 bindings were archived upstream in favour of GTK4. Seven
+  # advisories, one cause, one entry point: they reach us only through the
+  # Linux system-tray path,
+  #
+  #   scrozz-shell -> tray-icon -> libappindicator -> gtk -> {atk, gdk, ...}
+  #
+  # `tray-icon` is the cross-platform tray crate, and its Linux backend is
+  # GTK3. Until it grows a GTK4 or Ayatana-only backend there is nothing to
+  # move to, so this is not a decision we get to make. None of the seven is a
+  # vulnerability — the crates work, nobody is developing them further.
+  #
+  # Revisit when tray-icon changes its Linux backend, and in any case by
+  # 2027-02-01. If a real vulnerability is ever filed against GTK3 it will
+  # arrive under a new advisory ID and will still fail this check.
+  { id = "RUSTSEC-2024-0412", reason = "gdk: GTK3 bindings unmaintained; only path is tray-icon's Linux backend" },
+  { id = "RUSTSEC-2024-0413", reason = "atk: as RUSTSEC-2024-0412" },
+  { id = "RUSTSEC-2024-0415", reason = "gtk: as RUSTSEC-2024-0412" },
+  { id = "RUSTSEC-2024-0416", reason = "atk-sys: as RUSTSEC-2024-0412" },
+  { id = "RUSTSEC-2024-0418", reason = "gdk-sys: as RUSTSEC-2024-0412" },
+  { id = "RUSTSEC-2024-0419", reason = "gtk3-macros: as RUSTSEC-2024-0412" },
+  { id = "RUSTSEC-2024-0420", reason = "gtk-sys: as RUSTSEC-2024-0412" },
+
+  # Build-time only: a proc-macro helper crate, superseded by proc-macro-error2
+  # upstream. It never appears in the shipped binary — it runs at compile time
+  # and emits code. Will disappear on its own as the crates that use it bump.
+  # Revisit 2027-02-01.
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained, build-time only, not in the shipped binary" },
+]
+
+[bans]
+# Duplicate versions are normal and mostly harmless in a young Rust workspace
+# (`windows-sys` alone usually appears two or three times). Warn so the growth
+# is visible, but do not block a push on somebody else's dependency tree.
+multiple-versions = "warn"
+# A `*` version requirement on a crates.io dependency is unpinnable and
+# unreviewable, so this ought to be "deny". It is "warn" today for a reason
+# that is worth understanding before changing it back.
+#
+# Our internal crates depend on each other by path with no version:
+#
+#     scrozz-capture = { path = "../scrozz-capture" }
+#
+# which is a wildcard requirement. `allow-wildcard-paths` below is meant to
+# exempt exactly that — but cargo-deny only applies the exemption to *private*
+# crates, meaning ones that set `publish = false`. Ours do not set it, so all
+# ten workspace members are treated as publishable and every internal path
+# dependency is reported as a banned wildcard. Verified against cargo-deny
+# 0.20.2: ten `error[wildcard]` entries, none of them a real crates.io `*`.
+#
+# The fix belongs in the crate manifests, not here: add
+#
+#     [package]
+#     publish = false
+#
+# to each internal crate (correct regardless — none of them is destined for
+# crates.io). Once that lands, set this back to "deny" and the check becomes
+# meaningful again. Until then "warn" keeps the finding visible in the log
+# without failing CI for something that is not a supply-chain problem.
+wildcards = "warn"
+# See above — necessary but, on its own, not sufficient.
+allow-wildcard-paths = true
+
+[sources]
+# Everything must come from crates.io. A git dependency is a moving target that
+# cannot be audited or reproduced, and a private registry would be a licensing
+# blind spot. The UI spike under spikes/ does use a git dependency — which is
+# exactly why spikes/ is excluded from the workspace in the root Cargo.toml.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

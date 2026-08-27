@@ -1,0 +1,386 @@
+# Scrozz release build.
+#
+# Triggered by a version tag. Builds release binaries for macOS, Windows and
+# Linux, checksums them, and opens a **draft** GitHub release.
+#
+# It never publishes. Decision D5 is explicit that agents implement and validate
+# but the maintainer gates shipping, so the last step is always a human pressing
+# "Publish release" after looking at what is in it.
+#
+# ---------------------------------------------------------------------------
+# Signing is scaffolded, not wired up
+# ---------------------------------------------------------------------------
+# Every signing step below is gated on a secret being present and is skipped
+# with a notice when it is not. No credential is invented, committed, or
+# implied to exist. The repository secrets Brandon must create himself, if and
+# when he wants signed builds, are listed in each step's comment and summarised
+# in the `checksums-and-draft` job's final output.
+#
+# Until then this workflow produces working *unsigned* binaries, which macOS
+# Gatekeeper and Windows SmartScreen will both complain about. That is the
+# correct state for a project that has not yet decided to pay for certificates.
+name: Release
+
+on:
+  push:
+    tags:
+      # v1.2.3, v1.2.3-beta.1, and so on.
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.98.0"
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build one release artefact per platform.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build — ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Signing secrets are surfaced as job-level environment variables because
+    # the `secrets` context is NOT available in a step's `if:` condition, while
+    # `env` is. This indirection is what lets each signing step skip cleanly
+    # when the corresponding secret has never been created. An unset secret
+    # interpolates to the empty string; nothing here assumes one exists.
+    env:
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    strategy:
+      # Publish nothing rather than a partial set: if Windows fails we still
+      # want to see whether macOS and Linux succeeded, so the draft can be
+      # assembled once the cause is fixed.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (universal)
+            slug: macos-universal
+            archive: tar.gz
+          - os: ubuntu-latest
+            name: Linux (x86_64)
+            slug: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            name: Windows (x86_64)
+            slug: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          # An arm64 Linux runner (`ubuntu-24.04-arm`) is available to public
+          # repositories. Adding a `linux-aarch64` entry here is all it takes,
+          # once somebody can actually test the result — see docs/platforms.md
+          # on the difference between "it builds" and "it works".
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          # macOS builds both architectures and lipos them together; the others
+          # build for the host only.
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: tools/ci-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.slug }}
+
+      - name: Determine version
+        id: version
+        run: |
+          REF="${{ inputs.tag || github.ref_name }}"
+          # Strip a leading 'v' so the filename reads scrozz-0.1.0-... rather
+          # than scrozz-v0.1.0-...
+          VERSION="${REF#v}"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "Building version $VERSION from $REF"
+
+      # --- Compile ------------------------------------------------------------
+      - name: Build (macOS universal)
+        if: matrix.os == 'macos-latest'
+        run: |
+          # Two builds and a lipo, rather than one build, because a universal
+          # binary is the only kind that runs natively on both Apple Silicon
+          # and the Intel Macs still in use.
+          cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
+          cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
+          mkdir -p dist
+          lipo -create -output dist/scrozz \
+            target/aarch64-apple-darwin/release/scrozz \
+            target/x86_64-apple-darwin/release/scrozz
+          lipo -info dist/scrozz
+
+      - name: Build (single target)
+        if: matrix.os != 'macos-latest'
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/scrozz.exe" dist/
+          else
+            cp "target/${{ matrix.target }}/release/scrozz" dist/
+          fi
+
+      # --- macOS signing and notarisation (skipped unless secrets exist) ------
+      #
+      # Requires, all as repository secrets:
+      #   MACOS_CERTIFICATE_P12       base64 of a Developer ID Application .p12
+      #   MACOS_CERTIFICATE_PASSWORD  its export password
+      #   MACOS_SIGN_IDENTITY         e.g. "Developer ID Application: Name (TEAMID)"
+      #   MACOS_NOTARY_KEY            base64 of an App Store Connect .p8 API key
+      #   MACOS_NOTARY_KEY_ID         that key's ID
+      #   MACOS_NOTARY_ISSUER_ID      the issuer UUID
+      - name: Sign and notarise (macOS)
+        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 != ''
+        run: |
+          set -euo pipefail
+
+          # A throwaway keychain, so the certificate never touches the login
+          # keychain and dies with the runner.
+          KEYCHAIN="$RUNNER_TEMP/scrozz-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # --options runtime is the hardened runtime; notarisation rejects
+          # anything without it. --timestamp is likewise mandatory.
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" dist/scrozz
+          codesign --verify --strict --verbose=2 dist/scrozz
+
+          # Notarisation needs a container; a zip of the binary is enough for a
+          # bare executable. When Scrozz grows a .app bundle this should submit
+          # the bundle (or a .dmg) instead.
+          echo "$MACOS_NOTARY_KEY" | base64 --decode >"$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent dist/scrozz "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --wait
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+          # `stapler staple` only works on bundles and disk images, not bare
+          # executables, so it is intentionally not called here. Gatekeeper
+          # verifies a bare signed binary online instead.
+
+      - name: Note unsigned macOS build
+        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 == ''
+        run: |
+          echo "::notice title=macOS binary is unsigned::No MACOS_CERTIFICATE_P12 secret is set, so signing and notarisation were skipped. Gatekeeper will block this binary on other people's machines until a Developer ID certificate is configured."
+
+      # --- Windows signing (skipped unless secrets exist) ---------------------
+      #
+      # Requires, as repository secrets:
+      #   WINDOWS_CERTIFICATE_PFX       base64 of a code-signing .pfx
+      #   WINDOWS_CERTIFICATE_PASSWORD  its password
+      #
+      # A cheaper, keyless alternative worth considering before buying an EV
+      # certificate is Azure Trusted Signing, which swaps these two secrets for
+      # an Azure identity and a different action.
+      - name: Sign (Windows)
+        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE_PFX != ''
+        run: |
+          set -euo pipefail
+          echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$RUNNER_TEMP/cert.pfx"
+
+          # signtool lives in the Windows SDK, whose directory is versioned.
+          # Find the newest rather than hard-coding a version that a runner
+          # image update will silently remove.
+          SIGNTOOL="$(find '/c/Program Files (x86)/Windows Kits/10/bin' \
+            -name 'signtool.exe' -path '*x64*' 2>/dev/null | sort | tail -n 1)"
+          if [[ -z "$SIGNTOOL" ]]; then
+            echo "::error title=signtool not found::The Windows SDK layout on this runner image changed. Look under '/c/Program Files (x86)/Windows Kits/10/bin' (the Git-bash spelling of C:\\Program Files...) and update the find in this step."
+            exit 1
+          fi
+
+          "$SIGNTOOL" sign \
+            /f "$RUNNER_TEMP/cert.pfx" \
+            /p "$WINDOWS_CERTIFICATE_PASSWORD" \
+            /fd SHA256 \
+            /tr http://timestamp.digicert.com \
+            /td SHA256 \
+            dist/scrozz.exe
+          "$SIGNTOOL" verify /pa dist/scrozz.exe
+          rm -f "$RUNNER_TEMP/cert.pfx"
+
+      - name: Note unsigned Windows build
+        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE_PFX == ''
+        run: |
+          echo "::notice title=Windows binary is unsigned::No WINDOWS_CERTIFICATE_PFX secret is set, so signing was skipped. SmartScreen will warn on download until a code-signing certificate is configured."
+
+      # --- Package ------------------------------------------------------------
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          NAME="scrozz-${VERSION}-${{ matrix.slug }}"
+
+          # GPL-3.0 obliges us to ship the licence with the binary (D2), and
+          # the trademark terms travel with it.
+          cp LICENSE TRADEMARK.md README.md dist/
+
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "../${NAME}.zip" ./* >/dev/null
+            ASSET="${NAME}.zip"
+          else
+            tar -czf "../${NAME}.tar.gz" ./*
+            ASSET="${NAME}.tar.gz"
+          fi
+          cd ..
+
+          # Checksum per artefact now; the release job concatenates them into a
+          # single SHA256SUMS file people can actually verify against.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" >"${ASSET}.sha256"
+          else
+            shasum -a 256 "$ASSET" >"${ASSET}.sha256"
+          fi
+          cat "${ASSET}.sha256"
+          echo "asset=$ASSET" >>"$GITHUB_OUTPUT"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.slug }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Assemble the checksums and open a DRAFT release.
+  # ---------------------------------------------------------------------------
+  checksums-and-draft:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The one job that needs write access, and only for creating the release.
+      contents: write
+    # Job level, not step level — see the note on the `build` job.
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # One file, sorted, in the format `sha256sum -c` expects.
+          cat ./*.sha256 | sort -k2 >SHA256SUMS
+          rm -f ./*.sha256
+          {
+            echo "### Artefacts"
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # Optional detached signature over the checksum file — the customary way
+      # to make a Linux release verifiable without any platform certificate.
+      # Requires secrets GPG_PRIVATE_KEY (ASCII-armoured) and GPG_PASSPHRASE.
+      - name: Sign SHA256SUMS
+        if: env.GPG_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          cd artifacts
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --detach-sign --armor SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # --draft is the point of this whole job. Decision D5: agents build
+          # and validate, the maintainer decides what ships. Nothing here is
+          # ever visible to the public until a human presses Publish.
+          #
+          # --verify-tag refuses to invent a tag that does not exist, which
+          # turns a typo in workflow_dispatch into an error rather than a
+          # release built from the wrong commit.
+          gh release create "$TAG" \
+            --draft \
+            --verify-tag \
+            --title "Scrozz $TAG" \
+            --generate-notes \
+            artifacts/*
+
+          echo "::notice title=Draft release created::Review it, then publish by hand. Nothing has been made public."
+
+      - name: Summarise what is and is not signed
+        run: |
+          {
+            echo "### Signing status"
+            echo
+            echo "| Platform | Signed | Secret that enables it |"
+            echo "|---|---|---|"
+            echo "| macOS | ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'yes' || 'no' }} | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
+            echo "| Windows | ${{ secrets.WINDOWS_CERTIFICATE_PFX != '' && 'yes' || 'no' }} | \`WINDOWS_CERTIFICATE_PFX\` (+ password) |"
+            echo "| Checksums (GPG) | ${{ secrets.GPG_PRIVATE_KEY != '' && 'yes' || 'no' }} | \`GPG_PRIVATE_KEY\` (+ passphrase) |"
+            echo
+            echo "Unsigned binaries work, but Gatekeeper and SmartScreen will"
+            echo "warn users. Configure the secrets above in"
+            echo "**Settings → Secrets and variables → Actions** when signing"
+            echo "certificates exist. None are required for a draft release."
+            echo
+            echo "This release is a **draft**. Publishing it is a human decision (D5)."
+          } >>"$GITHUB_STEP_SUMMARY"

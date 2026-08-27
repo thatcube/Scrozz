@@ -1,0 +1,99 @@
+# Supply chain: vulnerabilities, and — more importantly here — licences.
+#
+# Split out from ci.yml because it answers a different question. CI asks "does
+# this change work?"; this asks "is what we are shipping still legal and safe?"
+# The answer to the second can change while the code does not, which is why
+# this also runs on a schedule rather than only on push.
+#
+# The licence half is not box-ticking. Scrozz is GPL-3.0-or-later (D2), and a
+# GPL-incompatible transitive dependency would make the shipped binary
+# undistributable — silently, three levels down, in a routine bump. The policy
+# lives in tools/deny.toml and is default-deny by design.
+name: Supply chain
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Mondays, 06:17 UTC. Deliberately not on the hour: GitHub drops scheduled
+    # runs when too many land in the same minute.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Keep in step with ci.yml. cargo-deny only reads Cargo.lock and the
+          # crate metadata, so the exact version matters little — but a single
+          # toolchain across workflows keeps the caches from multiplying.
+          toolchain: "1.98.0"
+
+      # Prebuilt binary rather than `cargo install`, which would spend three
+      # minutes compiling a tool on every run.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Two separate invocations, because a licence failure and a
+      # vulnerability failure need completely different responses and should
+      # never be reported under one heading.
+      - name: Check licences, bans and sources
+        run: |
+          if ! cargo deny --config tools/deny.toml check licenses bans sources; then
+            echo "::error title=Licence or supply-chain policy violation::A dependency licence is not on the allow-list in tools/deny.toml, or the crate came from an unapproved source. Read the job log for what to do."
+            echo
+            echo "Do NOT widen the allow-list to make this pass."
+            echo
+            echo "Scrozz is GPL-3.0-or-later. If the new licence is genuinely"
+            echo "GPL-compatible (MIT, Apache-2.0, BSD, ISC, Zlib, MPL-2.0 and"
+            echo "friends), add it to tools/deny.toml with a one-line note"
+            echo "saying what pulled it in."
+            echo
+            echo "If it is not — GPL-2.0-only, AGPL, SSPL, BUSL, CDDL, EPL,"
+            echo "MS-PL, or anything 'source available' — the dependency cannot"
+            echo "be used. Find an alternative."
+            echo
+            echo "Reproduce locally: tools/dev.sh deny"
+            exit 1
+          fi
+
+      - name: Check security advisories
+        run: |
+          if ! cargo deny --config tools/deny.toml check advisories; then
+            echo "::error title=Security advisory against a dependency::RustSec has published an advisory for a crate in the dependency tree. Read the job log for what to do."
+            echo
+            echo "In order of preference:"
+            echo "  1. Update the crate ('cargo update -p <crate>')."
+            echo "  2. Replace it."
+            echo "  3. If neither is possible today, add the advisory ID to"
+            echo "     [advisories].ignore in tools/deny.toml WITH a comment"
+            echo "     giving the reason and the date it must be revisited."
+            echo
+            echo "Note this job also runs weekly on a schedule, so it can fail"
+            echo "on a commit that changed nothing. That is not a mistake —"
+            echo "it means the outside world changed, not this repository."
+            echo
+            echo "Reproduce locally: tools/dev.sh deny"
+            exit 1
+          fi
