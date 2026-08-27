@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use scrozz_core::Error as CoreError;
-use scrozz_export::{Destination, FileExporter, NameTemplate, NamingContext};
+use scrozz_export::{Destination, FileExporter, NamePolicy, NameTemplate, NamingContext};
 
 use crate::fault::{CliError, CliResult};
 
@@ -29,6 +29,24 @@ pub fn default_directory() -> PathBuf {
     dirs::picture_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Chooses an unused path for a new recording in the default capture directory.
+///
+/// The recording engine itself opens this with `create_new`, so this function
+/// never reserves or truncates the candidate.
+pub fn default_recording_path() -> CliResult<PathBuf> {
+    let directory = default_directory();
+    std::fs::create_dir_all(&directory)?;
+    let template = NameTemplate::parse("Scrozz Recording {date} at {time}")?;
+    let policy = NamePolicy::default();
+    Ok(policy.unique_path(
+        &directory,
+        &template,
+        &NamingContext::now(),
+        "mp4",
+        &mut |path| path.exists(),
+    )?)
 }
 
 fn export_to_directory(

@@ -67,7 +67,14 @@ impl Request {
     /// Returns what the command was, so the app can decide whether it also has
     /// local work to do — showing a card for a forwarded capture, or quitting.
     pub fn serve(self) -> Option<Command> {
-        let (command, response) = run(&self.argv, self.cwd.as_deref());
+        let (command, response) = run(&self.argv, self.cwd.as_deref(), None);
+        self.reply(&response);
+        command
+    }
+
+    /// Runs the command against the recording session owned by this process.
+    pub fn serve_with(self, recording: &mut commands::RecordingManager) -> Option<Command> {
+        let (command, response) = run(&self.argv, self.cwd.as_deref(), Some(recording));
         self.reply(&response);
         command
     }
@@ -95,7 +102,11 @@ impl Request {
 /// Separated from [`Request`] so the fidelity rules can be tested without a
 /// socket, which is the part most likely to drift from
 /// [`crate::report::Reporter::emit`].
-fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+fn run(
+    argv: &[String],
+    cwd: Option<&Path>,
+    recording: Option<&mut commands::RecordingManager>,
+) -> (Option<Command>, Response) {
     use clap::Parser as _;
 
     if argv.is_empty() {
@@ -132,7 +143,10 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     // every later capture would otherwise inherit whatever directory the last
     // forwarded command happened to run in.
     let restore = enter(cwd);
-    let result = cli.validate().and_then(|()| commands::dispatch(&command));
+    let result = cli.validate().and_then(|()| match recording {
+        Some(recording) => commands::dispatch_with_recording(&command, recording),
+        None => commands::dispatch(&command),
+    });
     restore();
 
     let response = match result {
@@ -488,7 +502,7 @@ mod tests {
 
     #[test]
     fn an_empty_argument_vector_is_answered_not_ignored() {
-        let (command, response) = run(&[], None);
+        let (command, response) = run(&[], None, None);
         assert!(command.is_none());
         assert_eq!(response.code, 2);
         assert!(!response.payload.is_empty());
@@ -496,7 +510,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_command_answers_with_claps_own_message() {
-        let (command, response) = run(&argv(&["nonsuch"]), None);
+        let (command, response) = run(&argv(&["nonsuch"]), None, None);
         assert!(command.is_none(), "there is no command to name");
         assert_eq!(response.code, 2);
         assert_eq!(response.stream, StreamKind::Text);
@@ -508,7 +522,7 @@ mod tests {
     fn a_forwarded_failure_carries_the_same_exit_code_as_a_local_one() {
         // `list displays` needs a backend, which is guarded off by default, so
         // this is a stable failure that does not touch the screen.
-        let (command, response) = run(&argv(&["list", "displays"]), None);
+        let (command, response) = run(&argv(&["list", "displays"]), None, None);
         assert!(matches!(command, Some(Command::List(_))));
         assert_ne!(
             response.code, 0,
@@ -518,7 +532,7 @@ mod tests {
 
     #[test]
     fn a_forwarded_json_failure_is_an_envelope_not_a_sentence() {
-        let (_, response) = run(&argv(&["--json", "list", "displays"]), None);
+        let (_, response) = run(&argv(&["--json", "list", "displays"]), None, None);
         assert_eq!(response.stream, StreamKind::Json);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.starts_with('{'), "{body}");
@@ -529,7 +543,7 @@ mod tests {
     #[test]
     fn a_forwarded_success_is_reported_verbatim() {
         // `capture --dry-run` reaches no backend, so it succeeds anywhere.
-        let (_, response) = run(&argv(&["capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["capture", "--dry-run"]), None, None);
         assert_eq!(response.code, 0);
         assert_eq!(response.stream, StreamKind::Text);
         let body = String::from_utf8_lossy(&response.payload);
@@ -542,14 +556,14 @@ mod tests {
 
     #[test]
     fn a_quiet_forwarded_command_says_nothing() {
-        let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None, None);
         assert_eq!(response.code, 0);
         assert!(response.payload.is_empty());
     }
 
     #[test]
     fn a_json_forwarded_success_is_an_envelope() {
-        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None, None);
         assert_eq!(response.stream, StreamKind::Json);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.contains("\"ok\":true"), "{body}");
@@ -561,7 +575,7 @@ mod tests {
         // The real check: whatever we produce, `ipc::parse_response` must read
         // back unchanged, or the terminal shows something different from a
         // local run.
-        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None);
+        let (_, response) = run(&argv(&["--json", "capture", "--dry-run"]), None, None);
         let wire = ipc::encode_response(&response);
         let parsed = ipc::parse_response(&wire).expect("our own wire format must parse");
         assert_eq!(parsed.code, response.code);

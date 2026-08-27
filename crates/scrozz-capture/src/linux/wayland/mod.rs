@@ -25,11 +25,10 @@
 //!
 //! # Current state
 //!
-//! The negotiation is complete and tested; the D-Bus calls are not compiled.
-//! `ashpd`'s `screencast` and `screenshot` modules are behind Cargo features
-//! that this workspace's dependency declaration does not enable, and this crate
-//! is not permitted to change that declaration. See [`portal::acquire_frame`]
-//! for the second, larger gap: PipeWire.
+//! The portal model and Cargo features are complete and tested. Still capture
+//! does not yet consume the returned PipeWire node in this crate; continuous
+//! PipeWire acquisition is implemented by `scrozz-record`, whose native system
+//! libraries are deliberately optional so cross-host checks remain link-free.
 
 pub mod portal;
 pub mod restore;

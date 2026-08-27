@@ -8,11 +8,27 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Native Linux media libraries are deliberately opt-in. Their build scripts use
+# pkg-config, so enabling them during a macOS-hosted Linux cross-check would ask
+# a Darwin linker for Linux PipeWire/FFmpeg libraries before rustc sees our code.
+linux-native = [
+    "dep:ffmpeg-sys-next",
+    "dep:pipewire",
+    "dep:tokio",
+]
+# The only software video encoder Scrozz permits. This remains separate from the
+# native feature because hardware H.264 is the default and rav1e is a sizeable
+# optional fallback.
+rav1e-fallback = ["dep:rav1e"]
+
 [dependencies]
 scrozz-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-capture.workspace = true
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
@@ -29,6 +45,13 @@ windows = { workspace = true, features = [
     "Win32_Media_MediaFoundation",
     "Win32_Foundation",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+x11rb.workspace = true
+ffmpeg-sys-next = { version = "9.0.0", default-features = false, features = ["avcodec"], optional = true }
+pipewire = { version = "0.10.1", features = ["v0_3_44"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
 [lints]
 workspace = true

@@ -150,7 +150,14 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
         return gui::run(cli).map(Outcome::Local);
     }
 
-    commands::dispatch(command).map(Outcome::Local)
+    if matches!(
+        command,
+        Command::Record(args) if args.control().is_none() && !args.dry_run
+    ) {
+        commands::run_owned_recording(command, !cli.global.no_ipc).map(Outcome::Local)
+    } else {
+        commands::dispatch(command).map(Outcome::Local)
+    }
 }
 
 /// Hands the invocation to a running instance, if there is one.

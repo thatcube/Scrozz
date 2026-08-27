@@ -17,16 +17,26 @@
 //! is reported as a mistake in the command line even now, and the resolution
 //! logic is exercised by tests that never touch a screen.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
+use scrozz_record::{
+    Recording, RecordingCompletion, RecordingQuality, RecordingResolution, RecordingSession,
+    Salvageability, VideoCodec,
+};
 
 use crate::{
     cli::{
         CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand, HotkeyCommand,
-        InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
+        InteractiveMode, ListWhat, OcrSubject, RecordArgs, RecordControl, SettingsCommand, Sink,
+        TargetSpec,
     },
     fault::{CliError, CliResult},
     hotkey_config, ipc,
@@ -43,9 +53,22 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
+    let mut recording = RecordingManager::default();
+    dispatch_with_recording(command, &mut recording)
+}
+
+/// Runs a command with access to the recording owned by this process.
+///
+/// GUI IPC and the foreground recording host keep one manager alive across
+/// invocations. One-shot commands use [`dispatch`], whose empty manager makes a
+/// control request fail explicitly rather than touching another process's state.
+pub fn dispatch_with_recording(
+    command: &Command,
+    recording: &mut RecordingManager,
+) -> CliResult<Report> {
     match command {
         Command::Capture(args) => capture(args),
-        Command::Record(args) => record(args),
+        Command::Record(args) => record(args, recording),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
         Command::Ocr(args) => ocr(args),
@@ -53,6 +76,192 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
         Command::Hotkey(args) => hotkey(&args.command),
         Command::Gui => gui(),
     }
+}
+
+/// The recording session owned by one Scrozz process.
+#[derive(Default)]
+pub struct RecordingManager {
+    session: Option<Box<dyn RecordingSession>>,
+    phase: Option<ManagedRecordingPhase>,
+    destination: Option<PathBuf>,
+    completion: Option<Report>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedRecordingPhase {
+    Recording,
+    Paused,
+}
+
+impl RecordingManager {
+    /// Whether this process currently owns a recording.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn start(
+        &mut self,
+        session: Box<dyn RecordingSession>,
+        destination: PathBuf,
+    ) -> CliResult<Report> {
+        if self.is_active() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "a recording is already in progress; stop it before starting another".into(),
+            )));
+        }
+        self.session = Some(session);
+        self.phase = Some(ManagedRecordingPhase::Recording);
+        self.destination = Some(destination.clone());
+        self.completion = None;
+        Ok(Report::new(
+            Json::obj([
+                ("state", Json::str("recording")),
+                ("path", path_json(&destination)),
+            ]),
+            format!("Recording to {}.", destination.display()),
+        ))
+    }
+
+    fn pause(&mut self) -> CliResult<Report> {
+        match self.phase {
+            None => return Err(no_recording_error("pause")),
+            Some(ManagedRecordingPhase::Paused) => {
+                return Err(CliError::Core(CoreError::InvalidRequest(
+                    "the recording is already paused".into(),
+                )));
+            }
+            Some(ManagedRecordingPhase::Recording) => {}
+        }
+        self.session
+            .as_mut()
+            .expect("a managed recording phase always has a session")
+            .pause()?;
+        self.phase = Some(ManagedRecordingPhase::Paused);
+        Ok(Report::new(
+            Json::obj([
+                ("state", Json::str("paused")),
+                ("path", Json::opt(self.destination.as_deref(), path_json)),
+            ]),
+            "Recording paused.",
+        ))
+    }
+
+    fn resume(&mut self) -> CliResult<Report> {
+        match self.phase {
+            None => return Err(no_recording_error("resume")),
+            Some(ManagedRecordingPhase::Recording) => {
+                return Err(CliError::Core(CoreError::InvalidRequest(
+                    "the recording is not paused".into(),
+                )));
+            }
+            Some(ManagedRecordingPhase::Paused) => {}
+        }
+        self.session
+            .as_mut()
+            .expect("a managed recording phase always has a session")
+            .resume()?;
+        self.phase = Some(ManagedRecordingPhase::Recording);
+        Ok(Report::new(
+            Json::obj([
+                ("state", Json::str("recording")),
+                ("path", Json::opt(self.destination.as_deref(), path_json)),
+            ]),
+            "Recording resumed.",
+        ))
+    }
+
+    fn stop(&mut self) -> CliResult<Report> {
+        let session = self
+            .session
+            .take()
+            .ok_or_else(|| no_recording_error("stop"))?;
+        self.phase = None;
+        self.destination = None;
+        let report = recording_report(session.stop()?);
+        self.completion = Some(report.clone());
+        Ok(report)
+    }
+
+    /// Takes the final report after another invocation stopped the recording.
+    pub fn take_completion(&mut self) -> Option<Report> {
+        self.completion.take()
+    }
+
+    /// Stops a live session while its owner is shutting down.
+    pub fn shut_down(&mut self) -> Option<Report> {
+        if self.is_active() {
+            match self.stop() {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    tracing::error!("could not finalise the recording during shutdown: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RecordingManager {
+    fn drop(&mut self) {
+        let _ = self.shut_down();
+    }
+}
+
+/// Runs a foreground recording until this process receives a stop request or
+/// Ctrl-C.
+///
+/// A one-shot CLI invocation becomes the owner process for the live session.
+/// When IPC is enabled it listens on the ordinary single-instance endpoint, so
+/// `scrozz record --pause`, `--resume`, and `--stop` from another process reach
+/// the session rather than an empty fresh process.
+pub fn run_owned_recording(command: &Command, ipc_enabled: bool) -> CliResult<Report> {
+    let Command::Record(args) = command else {
+        return dispatch(command);
+    };
+    if args.control().is_some() || args.dry_run {
+        return dispatch(command);
+    }
+
+    let server = if ipc_enabled {
+        Some(crate::gui::server::Server::bind()?)
+    } else {
+        None
+    };
+    let interrupted = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let interrupted = Arc::clone(&interrupted);
+        move || interrupted.store(true, Ordering::Release)
+    })
+    .map_err(|error| {
+        CliError::Core(CoreError::Platform(format!(
+            "could not install the recording stop handler: {error}"
+        )))
+    })?;
+
+    let mut recording = RecordingManager::default();
+    let _started = dispatch_with_recording(command, &mut recording)?;
+
+    while recording.is_active() {
+        if interrupted.swap(false, Ordering::AcqRel) {
+            return recording.stop();
+        }
+
+        if let Some(server) = &server {
+            while let Some(request) = server.poll() {
+                request.serve_with(&mut recording);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    recording.take_completion().ok_or_else(|| {
+        CliError::Core(CoreError::Platform(
+            "the recording ended without a completion report".into(),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -225,21 +434,22 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
 // record
 // ---------------------------------------------------------------------------
 
-fn record(args: &RecordArgs) -> CliResult<Report> {
-    if args.stop {
-        // Reaching here means no instance was running, because a running one
-        // would have handled it. There is no session in this process to stop.
-        return Err(CliError::Core(CoreError::InvalidRequest(
-            "no recording is in progress; `record --stop` talks to the running \
-             Scrozz, and nothing is running"
-                .to_string(),
-        )));
+fn record(args: &RecordArgs, recording: &mut RecordingManager) -> CliResult<Report> {
+    if let Some(control) = args.control() {
+        return match control {
+            RecordControl::Stop => recording.stop(),
+            RecordControl::Pause => recording.pause(),
+            RecordControl::Resume => recording.resume(),
+        };
     }
 
     let target = args.target.resolve()?;
     let plan = Json::obj([
         ("target", target_json(&target)),
         ("fps", Json::Int(args.fps.into())),
+        ("quality", Json::Int(args.quality.into())),
+        ("resolution", Json::str(args.resolution.slug())),
+        ("codec", Json::str(args.codec.slug())),
         ("microphone", Json::Bool(args.microphone)),
         ("system_audio", Json::Bool(args.system_audio)),
         ("cursor", Json::Bool(args.cursor)),
@@ -257,19 +467,94 @@ fn record(args: &RecordArgs) -> CliResult<Report> {
         ));
     }
 
-    let request = scrozz_record::RecordingRequest {
-        target: capture_target(&target)?,
-        microphone: args.microphone,
-        system_audio: args.system_audio,
-        fps: args.fps,
-        show_cursor: args.cursor,
-    };
-    let _session = platform::start_recording(&request)?;
+    if recording.is_active() {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "a recording is already in progress; stop it before starting another".into(),
+        )));
+    }
 
-    Err(CliError::not_implemented(
-        "recording the screen",
-        "scrozz-record",
-    ))
+    let destination = match &args.output {
+        Some(path) => path.clone(),
+        None => crate::output::default_recording_path()?,
+    };
+    let quality = RecordingQuality::new(args.quality)?;
+    let mut request = scrozz_record::RecordingRequest::new(
+        capture_target(&target)?,
+        &destination,
+        quality,
+        args.resolution.to_recording(),
+        args.codec.to_recording(),
+    );
+    request.microphone = args.microphone;
+    request.system_audio = args.system_audio;
+    request.fps = args.fps;
+    request.show_cursor = args.cursor;
+
+    let session = platform::start_recording(&request)?;
+    recording.start(session, destination)
+}
+
+/// Starts the GUI's default full-desktop recording.
+pub fn start_default_recording(recording: &mut RecordingManager) -> CliResult<Report> {
+    let destination = crate::output::default_recording_path()?;
+    let request = scrozz_record::RecordingRequest::new(
+        CaptureTarget::AllDisplays,
+        &destination,
+        RecordingQuality::default(),
+        RecordingResolution::default(),
+        VideoCodec::default(),
+    );
+    let session = platform::start_recording(&request)?;
+    recording.start(session, destination)
+}
+
+/// Stops the recording owned by this process.
+pub fn stop_recording(recording: &mut RecordingManager) -> CliResult<Report> {
+    recording.stop()
+}
+
+fn no_recording_error(action: &str) -> CliError {
+    CliError::Core(CoreError::InvalidRequest(format!(
+        "no recording is in progress, so there is nothing to {action}"
+    )))
+}
+
+fn recording_report(recording: Recording) -> Report {
+    let (completion, salvageability, reason) = match &recording.completion {
+        RecordingCompletion::Complete => ("complete", Salvageability::Playable, None),
+        RecordingCompletion::Partial {
+            salvageability,
+            reason,
+        } => ("partial", *salvageability, Some(reason.as_str())),
+    };
+    let salvageability = match salvageability {
+        Salvageability::None => "none",
+        Salvageability::InitialisationOnly => "initialisation-only",
+        Salvageability::Playable => "playable",
+    };
+    let human = match &recording.completion {
+        RecordingCompletion::Complete => format!(
+            "Recorded {:.2} seconds to {}.",
+            recording.duration_secs,
+            recording.path.display()
+        ),
+        RecordingCompletion::Partial { reason, .. } => format!(
+            "Retained a {salvageability} partial recording ({:.2} seconds) at {}: {reason}",
+            recording.duration_secs,
+            recording.path.display()
+        ),
+    };
+    Report::new(
+        Json::obj([
+            ("state", Json::str("stopped")),
+            ("path", path_json(&recording.path)),
+            ("duration_secs", Json::Float(recording.duration_secs)),
+            ("completion", Json::str(completion)),
+            ("salvageability", Json::str(salvageability)),
+            ("reason", Json::opt(reason, Json::str)),
+        ]),
+        human,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -827,9 +1112,18 @@ mod tests {
             "--dry-run",
             "--fps",
             "60",
+            "--quality",
+            "82",
+            "--resolution",
+            "75%",
+            "--codec",
+            "av1",
             "--microphone",
         ]);
         assert!(rendered.contains(r#""fps":60"#), "{rendered}");
+        assert!(rendered.contains(r#""quality":82"#), "{rendered}");
+        assert!(rendered.contains(r#""resolution":"75%""#), "{rendered}");
+        assert!(rendered.contains(r#""codec":"av1""#), "{rendered}");
         assert!(rendered.contains(r#""microphone":true"#), "{rendered}");
         assert!(rendered.contains(r#""system_audio":false"#), "{rendered}");
     }
@@ -842,6 +1136,18 @@ mod tests {
             err.to_string().contains("no recording is in progress"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn pausing_or_resuming_with_nothing_running_explains_itself() {
+        for control in ["--pause", "--resume"] {
+            let err = run(&["scrozz", "record", control]).unwrap_err();
+            assert_eq!(err.exit(), Exit::InvalidRequest);
+            assert!(
+                err.to_string().contains("no recording is in progress"),
+                "{err}"
+            );
+        }
     }
 
     // -- unimplemented paths -----------------------------------------------

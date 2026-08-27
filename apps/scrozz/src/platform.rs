@@ -69,6 +69,12 @@ fn guard(what: &str, provider: &'static str) -> CliResult<()> {
     }
 }
 
+/// Whether this binary contains the native Linux recording dependencies.
+#[must_use]
+pub const fn recording_backend_is_stable() -> bool {
+    cfg!(all(target_os = "linux", feature = "linux-recording"))
+}
+
 /// The still-capture backend for this platform.
 ///
 /// # Errors
@@ -102,11 +108,14 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::NotImplemented`] unless [`UNSTABLE_ENV`] is set.
+/// Returns [`CliError::NotImplemented`] unless the native Linux recording
+/// feature is compiled or [`UNSTABLE_ENV`] is set.
 pub fn start_recording(
     request: &scrozz_record::RecordingRequest,
 ) -> CliResult<Box<dyn scrozz_record::RecordingSession>> {
-    guard("recording the screen", "scrozz-record")?;
+    if !recording_backend_is_stable() {
+        guard("recording the screen", "scrozz-record")?;
+    }
     Ok(scrozz_record::start(request)?)
 }
 

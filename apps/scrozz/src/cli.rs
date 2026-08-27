@@ -115,13 +115,12 @@ impl Command {
     pub fn slug(&self) -> String {
         match self {
             Self::Capture(_) => "capture".into(),
-            Self::Record(args) => {
-                if args.stop {
-                    "record.stop".into()
-                } else {
-                    "record.start".into()
-                }
-            }
+            Self::Record(args) => match args.control() {
+                Some(RecordControl::Stop) => "record.stop".into(),
+                Some(RecordControl::Pause) => "record.pause".into(),
+                Some(RecordControl::Resume) => "record.resume".into(),
+                None => "record.start".into(),
+            },
             Self::List(args) => match args.what {
                 ListWhat::Displays => "list.displays".into(),
                 ListWhat::Windows => "list.windows".into(),
@@ -581,8 +580,133 @@ impl CaptureArgs {
 // record
 // ---------------------------------------------------------------------------
 
+/// Video encoder requested by `scrozz record`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum RecordCodec {
+    /// Prefer VA-API H.264, then the optional rav1e AV1 fallback.
+    #[default]
+    Auto,
+    /// Require VA-API H.264. Scrozz never falls back to x264.
+    #[value(name = "h264")]
+    H264,
+    /// Require the optional rav1e AV1 encoder.
+    #[value(name = "av1")]
+    Av1,
+}
+
+impl RecordCodec {
+    /// The recording crate's codec policy.
+    #[must_use]
+    pub const fn to_recording(self) -> scrozz_record::VideoCodec {
+        match self {
+            Self::Auto => scrozz_record::VideoCodec::Auto,
+            Self::H264 => scrozz_record::VideoCodec::H264,
+            Self::Av1 => scrozz_record::VideoCodec::Av1,
+        }
+    }
+
+    /// Stable spelling used in JSON output.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::H264 => "h264",
+            Self::Av1 => "av1",
+        }
+    }
+}
+
+/// Output dimensions supplied as `source`, `PERCENT%`, or `WIDTHxHEIGHT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordResolution {
+    /// Preserve the source size.
+    Source,
+    /// Scale both dimensions by a percentage.
+    ScalePercent(u16),
+    /// Use an explicit pixel size.
+    Exact { width: u32, height: u32 },
+}
+
+impl RecordResolution {
+    /// The recording crate's resolution policy.
+    #[must_use]
+    pub const fn to_recording(self) -> scrozz_record::RecordingResolution {
+        match self {
+            Self::Source => scrozz_record::RecordingResolution::Source,
+            Self::ScalePercent(percent) => {
+                scrozz_record::RecordingResolution::ScalePercent(percent)
+            }
+            Self::Exact { width, height } => {
+                scrozz_record::RecordingResolution::Exact { width, height }
+            }
+        }
+    }
+
+    /// Stable spelling used in JSON output.
+    #[must_use]
+    pub fn slug(self) -> String {
+        match self {
+            Self::Source => "source".to_owned(),
+            Self::ScalePercent(percent) => format!("{percent}%"),
+            Self::Exact { width, height } => format!("{width}x{height}"),
+        }
+    }
+}
+
+impl FromStr for RecordResolution {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("source") {
+            return Ok(Self::Source);
+        }
+        if let Some(percent) = raw.strip_suffix('%') {
+            let percent = percent.parse::<u16>().map_err(|_| {
+                format!(
+                    "recording resolution {raw:?} is not `source`, `PERCENT%`, or `WIDTHxHEIGHT`"
+                )
+            })?;
+            if percent == 0 {
+                return Err("recording resolution percentage must be greater than zero".into());
+            }
+            return Ok(Self::ScalePercent(percent));
+        }
+
+        let (width, height) = raw.split_once(['x', 'X']).ok_or_else(|| {
+            format!("recording resolution {raw:?} is not `source`, `PERCENT%`, or `WIDTHxHEIGHT`")
+        })?;
+        let width = width
+            .parse::<u32>()
+            .map_err(|_| format!("recording width in {raw:?} is not a positive integer"))?;
+        let height = height
+            .parse::<u32>()
+            .map_err(|_| format!("recording height in {raw:?} is not a positive integer"))?;
+        if width == 0 || height == 0 {
+            return Err("recording width and height must both be greater than zero".into());
+        }
+        Ok(Self::Exact { width, height })
+    }
+}
+
+/// An operation on the recording owned by the running Scrozz process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordControl {
+    /// Finalise the recording.
+    Stop,
+    /// Suspend capture without closing the file.
+    Pause,
+    /// Continue a paused recording.
+    Resume,
+}
+
 /// Arguments to `scrozz record`.
 #[derive(Debug, Clone, Args)]
+#[group(
+    id = "record-control",
+    multiple = false,
+    args = ["stop", "pause", "resume"]
+)]
 pub struct RecordArgs {
     /// What to record.
     #[command(flatten)]
@@ -600,6 +724,18 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     pub fps: u32,
 
+    /// Encoder quality on a 1–100 scale.
+    #[arg(long, default_value_t = 70, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub quality: u8,
+
+    /// Output size: `source`, `PERCENT%`, or `WIDTHxHEIGHT`.
+    #[arg(long, default_value = "source", value_name = "SIZE")]
+    pub resolution: RecordResolution,
+
+    /// Video codec policy.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub codec: RecordCodec,
+
     /// Draw the pointer into the video.
     #[arg(long)]
     pub cursor: bool,
@@ -614,13 +750,76 @@ pub struct RecordArgs {
     /// running Scrozz instance; there is no session in a fresh process to stop.
     #[arg(
         long,
-        conflicts_with_all = ["target", "microphone", "system_audio", "fps", "cursor", "output"]
+        conflicts_with_all = [
+            "target",
+            "microphone",
+            "system_audio",
+            "fps",
+            "quality",
+            "resolution",
+            "codec",
+            "cursor",
+            "output",
+            "dry_run"
+        ]
     )]
     pub stop: bool,
 
+    /// Pause the recording already in progress.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "target",
+            "microphone",
+            "system_audio",
+            "fps",
+            "quality",
+            "resolution",
+            "codec",
+            "cursor",
+            "output",
+            "dry_run"
+        ]
+    )]
+    pub pause: bool,
+
+    /// Resume the recording already in progress.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "target",
+            "microphone",
+            "system_audio",
+            "fps",
+            "quality",
+            "resolution",
+            "codec",
+            "cursor",
+            "output",
+            "dry_run"
+        ]
+    )]
+    pub resume: bool,
+
     /// Resolve everything and report the plan without recording.
-    #[arg(long, conflicts_with = "stop")]
+    #[arg(long)]
     pub dry_run: bool,
+}
+
+impl RecordArgs {
+    /// The process-owned recording operation, if this is not a start request.
+    #[must_use]
+    pub const fn control(&self) -> Option<RecordControl> {
+        if self.stop {
+            Some(RecordControl::Stop)
+        } else if self.pause {
+            Some(RecordControl::Pause)
+        } else if self.resume {
+            Some(RecordControl::Resume)
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +1631,9 @@ mod tests {
             panic!("expected record")
         };
         assert_eq!(args.fps, 30);
+        assert_eq!(args.quality, 70);
+        assert_eq!(args.resolution, RecordResolution::Source);
+        assert_eq!(args.codec, RecordCodec::Auto);
         assert!(!args.stop);
     }
 
@@ -1446,6 +1648,12 @@ mod tests {
             "--system-audio",
             "--fps",
             "60",
+            "--quality",
+            "85",
+            "--resolution",
+            "1920x1080",
+            "--codec",
+            "h264",
             "--cursor",
         ])
         .command
@@ -1455,6 +1663,15 @@ mod tests {
         assert!(args.microphone);
         assert!(args.system_audio);
         assert_eq!(args.fps, 60);
+        assert_eq!(args.quality, 85);
+        assert_eq!(
+            args.resolution,
+            RecordResolution::Exact {
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(args.codec, RecordCodec::H264);
         assert!(args.cursor);
     }
 
@@ -1474,6 +1691,9 @@ mod tests {
         reject(&["scrozz", "record", "--stop", "--output", "a.mp4"]);
         reject(&["scrozz", "record", "--stop", "--cursor"]);
         reject(&["scrozz", "record", "--stop", "--system-audio"]);
+        reject(&["scrozz", "record", "--stop", "--quality", "80"]);
+        reject(&["scrozz", "record", "--stop", "--resolution", "50%"]);
+        reject(&["scrozz", "record", "--stop", "--codec", "av1"]);
     }
 
     #[test]
@@ -1489,6 +1709,38 @@ mod tests {
         // `--fps` has a default, and a default must not behave like a value the
         // user typed or `--stop` would be impossible to use.
         assert!(Cli::try_parse_from(["scrozz", "record", "--stop"]).is_ok());
+    }
+
+    #[test]
+    fn pause_and_resume_are_process_controls() {
+        let Some(Command::Record(pause)) = parse(&["scrozz", "record", "--pause"]).command else {
+            panic!("expected record")
+        };
+        let Some(Command::Record(resume)) = parse(&["scrozz", "record", "--resume"]).command else {
+            panic!("expected record")
+        };
+        assert_eq!(pause.control(), Some(RecordControl::Pause));
+        assert_eq!(resume.control(), Some(RecordControl::Resume));
+        reject(&["scrozz", "record", "--pause", "--resume"]);
+        reject(&["scrozz", "record", "--pause", "--output", "a.mp4"]);
+    }
+
+    #[test]
+    fn recording_resolution_forms_parse_and_validate() {
+        assert_eq!(
+            "50%".parse::<RecordResolution>().unwrap(),
+            RecordResolution::ScalePercent(50)
+        );
+        assert_eq!(
+            "3840X2160".parse::<RecordResolution>().unwrap(),
+            RecordResolution::Exact {
+                width: 3840,
+                height: 2160
+            }
+        );
+        assert!("0%".parse::<RecordResolution>().is_err());
+        assert!("1920x0".parse::<RecordResolution>().is_err());
+        reject(&["scrozz", "record", "--resolution", "large"]);
     }
 
     // -- list -------------------------------------------------------------

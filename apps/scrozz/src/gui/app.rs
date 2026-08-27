@@ -32,6 +32,7 @@ use scrozz_shell::{
 
 use crate::{
     cli::Cli,
+    commands::{self, RecordingManager},
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
@@ -187,6 +188,7 @@ pub struct App {
     tray: Option<Tray>,
     hotkeys: GlobalHotkeys,
     server: Option<Server>,
+    recording: RecordingManager,
     started: Instant,
     captures: u64,
     notes: Vec<String>,
@@ -267,6 +269,7 @@ impl App {
             tray,
             hotkeys,
             server,
+            recording: RecordingManager::default(),
             started: Instant::now(),
             captures: 0,
             notes,
@@ -362,7 +365,7 @@ impl App {
             // it must produce byte-identical output to a local run and the
             // command layer is synchronous. A capture is tens of milliseconds;
             // a recording returns as soon as it has started.
-            if let Some(command) = request.serve() {
+            if let Some(command) = request.serve_with(&mut self.recording) {
                 self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
@@ -446,10 +449,15 @@ impl App {
                 Tick::Continue
             }
             Action::ToggleRecording => {
-                // Recording is `scrozz-record`, which is behind the same guard
-                // and has no session to toggle yet. Saying so beats a menu item
-                // that does nothing.
-                self.note("recording is not wired up yet");
+                let outcome = if self.recording.is_active() {
+                    commands::stop_recording(&mut self.recording)
+                } else {
+                    commands::start_default_recording(&mut self.recording)
+                };
+                match outcome {
+                    Ok(report) => self.note(report.human),
+                    Err(error) => self.note(format!("recording unavailable: {error}")),
+                }
                 Tick::Continue
             }
             Action::OpenHistory => {
@@ -547,6 +555,9 @@ impl App {
             tray.close();
         }
         self.server = None;
+        if let Some(report) = self.recording.shut_down() {
+            self.note(report.human);
+        }
         self.pipeline.stop();
     }
 
@@ -628,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unwired_action_says_so_rather_than_doing_nothing() {
+    fn unavailable_actions_say_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
         for action in [
             Action::ToggleRecording,
@@ -638,7 +649,7 @@ mod tests {
             assert_eq!(app.perform(action), Tick::Continue);
         }
         let notes = app.notes().join("\n");
-        assert!(notes.contains("recording is not wired up yet"), "{notes}");
+        assert!(notes.contains("recording unavailable"), "{notes}");
         assert!(notes.contains("history window"), "{notes}");
         assert!(notes.contains("settings window"), "{notes}");
     }

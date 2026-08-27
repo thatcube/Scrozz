@@ -145,7 +145,7 @@ pub fn policy(command: &Command) -> Forwarding {
         // that can work — which is exactly the hotkey case on wlroots, where
         // `record --stop` is bound to a key and always arrives in a fresh
         // process.
-        Command::Record(args) if args.stop => Forwarding::Require,
+        Command::Record(args) if args.control().is_some() => Forwarding::Require,
 
         // These write to the store or put an overlay on screen. Two processes
         // doing either concurrently is the bug this whole module exists to

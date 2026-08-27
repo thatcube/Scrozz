@@ -28,7 +28,7 @@ error on this machine** rather than a surprise days later. It is the difference
 between writing platform code blind and writing it with the type checker
 watching.
 
-### The one exception, and why it does not matter
+### The exceptions, and why they do not weaken the check
 
 **Crates whose dependencies compile C cannot be cross-checked without a cross C
 toolchain.** `cargo check` still runs build scripts, and `rusqlite`'s `bundled`
@@ -38,7 +38,15 @@ that depends on it are therefore excluded, via `SCROZZ_XCHECK_EXCLUDE`.
 
 This costs nothing real. Only four crates are permitted to contain
 `cfg(target_os)` at all — `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and
-`scrozz-shell` — and **all four are still fully checked on all three targets**.
+`scrozz-shell` — and all four still have their portable/default surfaces checked
+on all three targets. The native Linux recording feature is the deliberate
+exception inside `scrozz-record`: its `pkg-config` build scripts require a real
+Linux sysroot for PipeWire, FFmpeg and VA-API, so it remains disabled during a
+macOS-hosted cross-check. The pure recording configuration, timing, audio mixing,
+format conversion, state and fragmented-MP4 code is still cross-checked
+everywhere, while the native feature is compiled, tested and run on Linux in its
+own CI lane.
+
 `scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
 almost nothing, and CI compiles it natively on all three runners anyway (layer
 2), which is a strictly stronger check.
@@ -57,6 +65,12 @@ repositories. Every push compiles and runs the test suite on all three. This
 catches what type checking cannot: linking, runtime panics, logic that is wrong
 in a platform-specific way, and dependency problems that only appear on a real
 sysroot.
+
+Linux recording has an additional native lane. It enables `linux-native` and
+`rav1e-fallback`, checks the native feature combinations, runs the recorder
+tests and clippy, links the complete CLI, records an Xvfb desktop through the X11
+backend, exercises pause/resume/stop from separate processes, and requires
+`ffprobe` to accept the resulting fragmented MP4.
 
 ## Layer 3 — Headless golden images per platform (every push, free)
 
@@ -84,6 +98,12 @@ Some things are behavioural and cannot be faked:
 - Do global hotkeys survive a UAC prompt, a lock screen, a Space switch?
 - Do the permission dialogs say something a real person can act on?
 - Does drag-and-drop out of the capture stack land correctly in a real app?
+- Does a real GNOME or KDE portal report multi-monitor positions in physical
+  pixels when fractional scaling is active?
+- Do compositor-negotiated DMA-BUF buffers need an import path on a given GPU,
+  rather than the directly mapped MemFd/MemPtr path?
+- Do the selected VA-API driver and PipeWire microphone/sink-monitor nodes behave
+  correctly on the user's hardware?
 
 These need a real desktop session: Windows 11 on ARM under UTM or Parallels, and
 a Linux VM running **both GNOME and KDE**, since the Wayland story differs sharply
@@ -158,6 +178,37 @@ These are the dangerous class: the call returns success and nothing works.
    items, hotkey managers — is unreachable from an ordinary test. Doctests run on
    the main thread and are the workaround; failing that, test the
    off-main-thread guard and verify real behaviour another way.
+
+### Native Linux recording
+
+9. **The native media dependencies must remain opt-in.** `linux-recording` on the
+   app enables `scrozz-record/linux-native`; `rav1e-fallback` separately enables
+   the software AV1 fallback. PipeWire, FFmpeg and VA-API all use `pkg-config`, so
+   putting them in the default feature set would break the macOS-hosted Linux
+   cross-check before rustc reached Scrozz. On Debian/Ubuntu,
+   `tools/ci-linux-deps.sh` is the dependency source of truth.
+10. **H.264 means the exact `h264_vaapi` encoder, never x264.** `auto` first opens
+    `h264_vaapi` against a usable `/dev/dri/renderD*` device. It may fall back only
+    to rav1e when `rav1e-fallback` was compiled; an explicit `h264` request fails
+    rather than silently selecting a software H.264 encoder.
+11. **Wayland recording is portal-owned.** Scrozz negotiates the ScreenCast portal,
+    reuses the capture capability probe and restore token, and receives video and
+    audio through PipeWire. A rejected restore token is retried once without it,
+    and user cancellation remains a cancellation rather than an encoder error.
+    X11 uses persistent direct capture and composites the XFIXES cursor itself.
+12. **The file is useful before a clean stop.** The muxer writes and syncs the
+    ISO-BMFF initialisation segment first, then each `moof`/`mdat` fragment.
+    Interrupted sessions report whether the file contains no media, only
+    initialisation, or playable fragments, and recovery can identify the valid
+    prefix after a torn final fragment.
+13. **Three native behaviours remain compositor or hardware validation gaps.**
+    PipeWire MemFd and MemPtr buffers are mapped; a compositor that supplies only
+    DMA-BUF currently produces an explicit unsupported-buffer error. Portal stream
+    positions are treated as physical pixels, so mixed/fractional-scale GNOME and
+    KDE layouts still need confirmation on real desktops. The X11/rav1e path is
+    exercised under Xvfb in CI, but real portal capture, PipeWire microphone and
+    sink-monitor audio, and VA-API encoding still need hands-on runs with the
+    relevant compositor, nodes, GPU and driver.
 
 ---
 

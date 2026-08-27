@@ -78,7 +78,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
-| Screen recording | ⬜ | ⬜ | ⬜ | Contracts only. Hardware encoders only, for licence reasons |
+| Screen recording | ⬜ | ⬜ | 🟡 | X11 and Wayland portal/PipeWire capture; VA-API H.264 or opt-in rav1e AV1, never x264 |
 | Scrolling capture | ⬜ | ⬜ | ⬜ | No clean implementation exists on any platform; deliberately deferred |
 
 **What 🟡 rests on, precisely.** Three automated layers, described in full in
@@ -144,6 +144,26 @@ window" apart from "not implemented" apart from "permission denied".
 Capture from a bare `cargo run` will be refused on macOS until you have built and
 approved the app bundle above, for the permission reason described there. That
 refusal is deliberate and tells you exactly which setting to change.
+
+## Native Linux recording
+
+PipeWire, FFmpeg and VA-API are optional, non-default build dependencies so the
+portable recording core can still be checked from macOS and Windows. On
+Debian/Ubuntu, `tools/ci-linux-deps.sh` installs the native development packages.
+Then build the recording path explicitly:
+
+```bash
+cargo build -p scrozz --features linux-recording,rav1e-fallback
+target/debug/scrozz record --display primary --cursor --codec auto -o capture.mp4
+```
+
+The recording command owns the session and stays in the foreground. From another
+terminal, `scrozz record --pause`, `--resume`, or `--stop` controls that same
+session. `auto` uses the exact FFmpeg `h264_vaapi` hardware encoder when a usable
+VA-API render device is present, then the opt-in rav1e AV1 fallback. It never
+selects x264. Wayland capture uses the desktop ScreenCast portal and its picker;
+X11 is captured directly. See [`docs/platforms.md`](docs/platforms.md) for the
+native dependency boundary and compositor/runtime gaps.
 
 ## Contributing & development
 
