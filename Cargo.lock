@@ -2205,6 +2205,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-image 0.3.2",
+ "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
  "objc2-image-io",
@@ -3286,9 +3287,13 @@ dependencies = [
 name = "scrozz-record"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "dispatch2",
  "objc2 0.6.4",
  "objc2-av-foundation",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-core-media",
  "objc2-foundation 0.3.2",
  "objc2-screen-capture-kit",

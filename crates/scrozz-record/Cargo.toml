@@ -15,11 +15,15 @@ tracing.workspace = true
 scrozz-capture.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
 objc2.workspace = true
-objc2-foundation.workspace = true
-objc2-av-foundation.workspace = true
-objc2-core-media.workspace = true
-objc2-screen-capture-kit.workspace = true
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL"] }
+objc2-av-foundation = { workspace = true, features = ["AVAssetWriter", "AVAssetWriterInput", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media"] }
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-core-media = { workspace = true, features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "objc2-core-audio-types", "objc2-core-video"] }
+objc2-screen-capture-kit = { workspace = true, features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 dispatch2.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
