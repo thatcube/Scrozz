@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod clipboard;
+pub mod decode;
 pub mod destination;
 pub mod encode;
 pub mod icc;
@@ -12,6 +13,7 @@ pub mod pixels;
 pub use clipboard::{
     ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,
 };
+pub use decode::{decode, decode_file};
 pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader, UnimplementedS3Uploader};
 pub use encode::{EncodeOptions, FrameEncoder, PngEffort};
 pub use icc::profile_for;
