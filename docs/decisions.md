@@ -934,6 +934,42 @@ survive arbitrary external mutation; and shapes distinguish `bounds()` from
 width on every resize — found by a failing test, which is the only way anyone
 ever finds it.
 
+## D30 — The database is a rebuildable cache, not the source of truth
+
+**Decision.** Every capture writes a **durable JSON sidecar** next to a
+content-addressed image blob on the filesystem. The SQLite database is an
+**index over those files** — a cache that can be deleted, truncated or corrupted
+and rebuilt from the sidecars with nothing lost. A file that fails to parse is
+**quarantined, never deleted.**
+
+**Why this matters more than it sounds.** D14 promises annotations are never
+permanent and D23 promises documents are kept forever. Both promises are only as
+strong as the weakest thing they depend on, and a single database is a single
+point of failure: one bad `fsync`, one full disk during a write, one power cut,
+and a user's entire annotation history is gone. "Kept forever" would then be a
+claim the architecture could not honour.
+
+Making the database disposable removes that failure mode entirely rather than
+mitigating it. The worst case degrades from *losing everything* to *a slow first
+launch while the index rebuilds*.
+
+**Supporting choices that follow from it:**
+
+- **Image blobs live on the filesystem, not in SQLite.** Eviction becomes one
+  `unlink`, identical captures deduplicate for free, and the database stays small
+  enough to rebuild quickly.
+- **`image_hash` is retained after eviction**, with `image_evicted_at` recording
+  the loss. An evicted capture still lists, still searches, still opens for
+  editing — exactly what D23 requires. The pixels are gone; nothing else is.
+- **Document state is a two-variant enum**, so failing to handle the evicted case
+  is a compile error rather than a black rectangle at runtime.
+- **The annotation document is stored as opaque JSON** and typed on demand, so
+  `scrozz-annotate` can keep evolving without invalidating existing history.
+- **WAL with `synchronous = FULL`, and `BEGIN IMMEDIATE` for every write**, since
+  the GUI and CLI genuinely run concurrently by design (D11).
+- **Pinned captures survive even when that makes the size cap unreachable**, and
+  the store reports that state rather than silently violating either promise.
+
 ---
 
 # Open questions
