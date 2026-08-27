@@ -47,6 +47,7 @@ mod gui;
 mod hotkey_config;
 mod ipc;
 mod json;
+mod output;
 mod platform;
 mod report;
 mod settings;

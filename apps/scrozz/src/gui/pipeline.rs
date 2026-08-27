@@ -24,7 +24,6 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::mpsc::{Receiver, Sender, channel},
     thread::JoinHandle,
     time::SystemTime,
@@ -169,7 +168,6 @@ impl Drop for Pipeline {
 /// What the worker remembers about a card it produced.
 struct Cached {
     bytes: Vec<u8>,
-    format: ImageFormat,
 }
 
 struct Worker {
@@ -262,13 +260,7 @@ impl Worker {
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
 
-        self.cache.insert(
-            card,
-            Cached {
-                bytes,
-                format: ImageFormat::Png,
-            },
-        );
+        self.cache.insert(card, Cached { bytes });
 
         Ok(Card {
             id: card,
@@ -315,8 +307,7 @@ impl Worker {
 
     fn save(&mut self, card: CardId) {
         let result = self.cached(card, "save").and_then(|cached| {
-            let path = default_path(cached.format)?;
-            std::fs::write(&path, &cached.bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
+            let path = crate::output::export_default(&cached.bytes)?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer(card, result);
@@ -335,34 +326,6 @@ impl Worker {
         };
         let _ = self.outcomes.send(message);
     }
-}
-
-/// Where a capture goes when the user presses Save.
-///
-/// Per D18 this is any folder the user picks, which is what lets a Dropbox or
-/// iCloud directory provide sync for free with no service on our side. Until
-/// that setting is wired this is the pictures folder — deliberately the same
-/// fallback chain `scrozz capture` uses, so the CLI and the GUI cannot disagree
-/// about where a capture went.
-///
-/// # Errors
-///
-/// Returns [`CliError::Core`] with [`CoreError::Storage`] if no writable
-/// directory could be found.
-pub fn default_path(format: ImageFormat) -> CliResult<PathBuf> {
-    let dir = dirs::picture_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(std::env::temp_dir);
-    if !dir.is_dir() {
-        return Err(CliError::Core(CoreError::Storage(format!(
-            "{} is not a directory to save captures in",
-            dir.display()
-        ))));
-    }
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    Ok(dir.join(format!("Scrozz {stamp}.{}", format.extension())))
 }
 
 #[cfg(test)]
@@ -423,20 +386,6 @@ mod tests {
         let pipeline = Pipeline::start().expect("the worker should start");
         assert!(pipeline.post(Job::Release(CardId(1))));
         assert!(pipeline.post(Job::Release(CardId(1))));
-    }
-
-    #[test]
-    fn the_default_path_names_the_format() {
-        for (format, suffix) in [
-            (ImageFormat::Png, "png"),
-            (ImageFormat::Jpeg, "jpg"),
-            (ImageFormat::WebP, "webp"),
-        ] {
-            let path = default_path(format).expect("a home directory should exist");
-            let shown = path.to_string_lossy().into_owned();
-            assert!(shown.ends_with(suffix), "{shown} should end with {suffix}");
-            assert!(shown.contains("Scrozz"), "{shown}");
-        }
     }
 
     /// Waits briefly for the worker, so the test does not depend on scheduling.

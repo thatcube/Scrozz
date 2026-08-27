@@ -125,19 +125,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
             // D18: any folder the user picks, which is what lets a Dropbox or
             // iCloud directory provide sync for free with no service on our side.
             Sink::DefaultFolder => {
-                let dir = dirs::picture_dir()
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_else(std::env::temp_dir);
-                let name = format!(
-                    "Scrozz {}.{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    args.format().slug()
-                );
-                let path = dir.join(name);
-                std::fs::write(&path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
+                let path = crate::output::export_default(&bytes)?;
                 written.push(path.display().to_string());
             }
         }
