@@ -271,12 +271,15 @@ missing-language-pack skip. `-TesseractDirectory` supplies the absolute override
 for source-built development artifacts; an extracted portable artifact is
 validated against its sibling `tesseract` directory instead. The script clears
 an inherited override when none is explicit, so an incomplete ZIP cannot pass
-by borrowing a developer installation. It deliberately does not claim to
-automate focus, Alt-Tab visibility, DWM alpha, Z-order or cross-application
-hit-testing. `-RequireWgc` turns a legitimate GDI downgrade into a failure for a
-Windows 11 WGC qualification run, while `-RequireNegativeCoordinates` requires
-the lab to arrange at least one monitor left of or above the primary and proves
-that its signed origin survived enumeration.
+by borrowing a developer installation. Before capture it starts the staged
+`tesseract.exe --version` with a ten-second timeout and a system-only `PATH`,
+which catches a payload whose dependent DLLs were accidentally supplied only by
+the packaging machine. It deliberately does not claim to automate focus,
+Alt-Tab visibility, DWM alpha, Z-order or cross-application hit-testing.
+`-RequireWgc` turns a legitimate GDI downgrade into a failure for a Windows 11
+WGC qualification run, while `-RequireNegativeCoordinates` requires the lab to
+arrange at least one monitor left of or above the primary and proves that its
+signed origin survived enumeration.
 
 ---
 

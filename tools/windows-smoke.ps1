@@ -256,6 +256,48 @@ exit 1
     }
 }
 
+function Assert-TesseractStarts {
+    param(
+        [Parameter(Mandatory)]
+        [string] $PayloadDirectory
+    )
+
+    $executable = Join-Path $PayloadDirectory "tesseract.exe"
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $executable
+    $start.Arguments = "--version"
+    $start.WorkingDirectory = $PayloadDirectory
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    # The Windows loader still searches the executable directory and System32,
+    # but cannot borrow a missing OCR DLL from a developer tool on ambient PATH.
+    $start.EnvironmentVariables["PATH"] = (
+        (Join-Path $env:SystemRoot "System32") + ";" + $env:SystemRoot
+    )
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        Assert-Smoke $process.Start() "could not start artifact-local tesseract.exe"
+        if (-not $process.WaitForExit(10000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw "Windows smoke test failed: artifact-local tesseract.exe timed out"
+        }
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $diagnostic = ($stdout + [Environment]::NewLine + $stderr).Trim()
+        Assert-Smoke ($process.ExitCode -eq 0) `
+            "artifact-local tesseract.exe exited $($process.ExitCode): $diagnostic"
+        Assert-Smoke ($diagnostic -match "(?i)tesseract") `
+            "artifact-local OCR probe did not identify itself as Tesseract: $diagnostic"
+    } finally {
+        $process.Dispose()
+    }
+}
+
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "tools/windows-smoke.ps1 must run natively on Windows"
 }
@@ -349,6 +391,7 @@ try {
             Assert-Smoke (Test-Path -LiteralPath $requiredPayloadFile -PathType Leaf) `
                 "portable OCR payload is missing '$requiredPayloadFile'"
         }
+        Assert-TesseractStarts -PayloadDirectory $payloadDirectory
     }
 
     Write-Host "[1/5] Enumerating native displays"

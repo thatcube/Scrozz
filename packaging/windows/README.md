@@ -69,7 +69,11 @@ tessdata/
 The complete directory is copied to `tesseract/` beside `scrozz.exe`. Packaging
 fails if the executable or English model is absent, if the source overlaps the
 output directory, or if the payload contains reparse points. Scrozz never uses
-an ambient `tesseract.exe` from `PATH`.
+an ambient `tesseract.exe` from `PATH`. Structural packaging cannot infer a
+native executable's complete DLL import closure, so `tools/windows-smoke.ps1`
+also starts the staged executable with ambient `PATH` removed and then performs
+a real recognition through Scrozz; that native smoke is the executable proof
+that the supplied payload is complete.
 
 On a Windows SDK host, `powershell -NoProfile -File tools/test-windows-packaging.ps1`
 runs MakeAppx against normalized inputs and checks both archive layouts,
