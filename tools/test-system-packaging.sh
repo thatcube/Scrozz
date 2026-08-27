@@ -130,6 +130,24 @@ grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no all-artifact determinism check"
 grep -q 'determinism-check.zip' "$WINDOWS_PACKAGE" ||
   fail "portable ZIP is excluded from reproducibility verification"
+grep -Fq 'function Normalize-MsixZipTimestamps' "$WINDOWS_PACKAGE" ||
+  fail "Windows package has no non-recompressing MSIX timestamp normalizer"
+grep -Fq '$CentralTimestampOffsets.Add($CentralHeaderOffset + 12)' \
+  "$WINDOWS_PACKAGE" ||
+  fail "MSIX normalizer does not derive central-header timestamp offsets"
+grep -Fq '$LocalTimestampOffsets.Add($LocalHeaderOffset + 10)' \
+  "$WINDOWS_PACKAGE" ||
+  fail "MSIX normalizer does not derive local-header timestamp offsets"
+grep -Fq '$DiskNumber -eq [UInt16]::MaxValue' "$WINDOWS_PACKAGE" ||
+  fail "MSIX normalizer does not recognize MakeAppx ZIP64 sentinels"
+grep -Fq '    Normalize-MsixZipTimestamps $MsixStaged' "$WINDOWS_PACKAGE" ||
+  fail "primary MSIX output is not normalized before validation"
+grep -Fq '        Normalize-MsixZipTimestamps $SecondMsix' "$WINDOWS_PACKAGE" ||
+  fail "comparison MSIX output is not normalized before determinism checking"
+grep -Fq 'Confirm-MakeAppxPackage' "$WINDOWS_PACKAGE" ||
+  fail "normalized MSIX output is not validated by MakeAppx"
+grep -Fq 'Assert-ArchiveTimestamps $Msix "MSIX"' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact test does not verify canonical MSIX timestamps"
 grep -q 'SCROZZ_TESSERACT_DIR' "$WINDOWS_PACKAGE" ||
   fail "portable packaging does not require an explicit Tesseract payload"
 grep -q 'Confirm-TesseractPayload' "$WINDOWS_PACKAGE" ||

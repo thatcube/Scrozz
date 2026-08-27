@@ -432,6 +432,295 @@ function Invoke-MakeAppx {
     }
 }
 
+function Find-ZipEndOfCentralDirectory {
+    param(
+        [IO.FileStream] $Stream,
+        [IO.BinaryReader] $Reader,
+        [string] $Path
+    )
+    if ($Stream.Length -lt 22) {
+        throw "MSIX is too short to contain a ZIP end record: $Path"
+    }
+
+    $SearchLength = [int] [Math]::Min([Int64] 65557, [Int64] $Stream.Length)
+    $TailStart = $Stream.Length - $SearchLength
+    $Stream.Position = $TailStart
+    [byte[]] $Tail = $Reader.ReadBytes($SearchLength)
+    if ($Tail.Length -ne $SearchLength) {
+        throw "Could not read the ZIP end record from $Path"
+    }
+
+    for ($Index = $Tail.Length - 22; $Index -ge 0; $Index--) {
+        if ([BitConverter]::ToUInt32($Tail, $Index) -ne [UInt32] 0x06054b50) {
+            continue
+        }
+        $CommentLength = [BitConverter]::ToUInt16($Tail, $Index + 20)
+        if ($Index + 22 + $CommentLength -eq $Tail.Length) {
+            return [Int64] ($TailStart + $Index)
+        }
+    }
+    throw "MSIX has no valid ZIP end record: $Path"
+}
+
+function Get-Zip64LocalHeaderOffset {
+    param(
+        [byte[]] $Extra,
+        [UInt32] $CompressedSize,
+        [UInt32] $UncompressedSize
+    )
+    $Cursor = 0
+    while ($Cursor -lt $Extra.Length) {
+        if ($Cursor + 4 -gt $Extra.Length) {
+            throw "MSIX contains a truncated ZIP extra-field header"
+        }
+        $HeaderId = [BitConverter]::ToUInt16($Extra, $Cursor)
+        $DataLength = [BitConverter]::ToUInt16($Extra, $Cursor + 2)
+        $DataStart = $Cursor + 4
+        $DataEnd = $DataStart + $DataLength
+        if ($DataEnd -gt $Extra.Length) {
+            throw "MSIX contains a truncated ZIP extra field"
+        }
+        if ($HeaderId -eq 0x0001) {
+            $ValueOffset = $DataStart
+            if ($UncompressedSize -eq [UInt32]::MaxValue) {
+                $ValueOffset += 8
+            }
+            if ($CompressedSize -eq [UInt32]::MaxValue) {
+                $ValueOffset += 8
+            }
+            if ($ValueOffset + 8 -gt $DataEnd) {
+                throw "MSIX ZIP64 extra field has no local-header offset"
+            }
+            return [BitConverter]::ToUInt64($Extra, $ValueOffset)
+        }
+        $Cursor = $DataEnd
+    }
+    throw "MSIX central entry has no required ZIP64 extra field"
+}
+
+function Normalize-MsixZipTimestamps {
+    param([string] $Path)
+    if (-not [BitConverter]::IsLittleEndian) {
+        throw "MSIX timestamp normalization requires a little-endian host"
+    }
+
+    $Stream = $null
+    $Reader = $null
+    try {
+        $Stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        $Reader = [IO.BinaryReader]::new(
+            $Stream,
+            [Text.Encoding]::UTF8,
+            $true
+        )
+        $EndOffset = Find-ZipEndOfCentralDirectory $Stream $Reader $Path
+        $Stream.Position = $EndOffset + 4
+        $DiskNumber = $Reader.ReadUInt16()
+        $CentralDisk = $Reader.ReadUInt16()
+        $EntriesOnDisk16 = $Reader.ReadUInt16()
+        $EntryCount16 = $Reader.ReadUInt16()
+        $CentralSize32 = $Reader.ReadUInt32()
+        $CentralOffset32 = $Reader.ReadUInt32()
+        $CommentLength = $Reader.ReadUInt16()
+        if ($EndOffset + 22 + $CommentLength -ne $Stream.Length) {
+            throw "MSIX ZIP end record has an inconsistent comment length"
+        }
+
+        [UInt64] $EntryCount = $EntryCount16
+        [UInt64] $EntriesOnDisk = $EntriesOnDisk16
+        [UInt64] $CentralSize = $CentralSize32
+        [UInt64] $CentralOffset = $CentralOffset32
+        # MakeAppx uses ZIP64 sentinels in the classic end record even for a
+        # single-disk package; the ZIP64 record below carries the real values.
+        $UsesZip64 = (
+            $DiskNumber -eq [UInt16]::MaxValue -or
+            $CentralDisk -eq [UInt16]::MaxValue -or
+            $EntriesOnDisk16 -eq [UInt16]::MaxValue -or
+            $EntryCount16 -eq [UInt16]::MaxValue -or
+            $CentralSize32 -eq [UInt32]::MaxValue -or
+            $CentralOffset32 -eq [UInt32]::MaxValue
+        )
+        if ($UsesZip64) {
+            if (($DiskNumber -ne 0 -and
+                    $DiskNumber -ne [UInt16]::MaxValue) -or
+                ($CentralDisk -ne 0 -and
+                    $CentralDisk -ne [UInt16]::MaxValue)) {
+                throw "Multi-disk ZIP archives cannot be normalized as MSIX"
+            }
+            if ($EndOffset -lt 20) {
+                throw "MSIX ZIP64 archive has no end-record locator"
+            }
+            $Stream.Position = $EndOffset - 20
+            if ($Reader.ReadUInt32() -ne [UInt32] 0x07064b50) {
+                throw "MSIX ZIP64 archive has no end-record locator"
+            }
+            $Zip64Disk = $Reader.ReadUInt32()
+            $Zip64EndOffset = $Reader.ReadUInt64()
+            $Zip64DiskCount = $Reader.ReadUInt32()
+            if ($Zip64Disk -ne 0 -or $Zip64DiskCount -ne 1) {
+                throw "Multi-disk ZIP64 archives cannot be normalized as MSIX"
+            }
+            if ($Zip64EndOffset -gt [UInt64] [Int64]::MaxValue) {
+                throw "MSIX ZIP64 end record is outside the supported file range"
+            }
+
+            $Stream.Position = [Int64] $Zip64EndOffset
+            if ($Reader.ReadUInt32() -ne [UInt32] 0x06064b50) {
+                throw "MSIX ZIP64 end-record signature is invalid"
+            }
+            $Zip64RecordSize = $Reader.ReadUInt64()
+            if ($Zip64RecordSize -lt 44) {
+                throw "MSIX ZIP64 end record is truncated"
+            }
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $Zip64DiskNumber = $Reader.ReadUInt32()
+            $Zip64CentralDisk = $Reader.ReadUInt32()
+            $EntriesOnDisk = $Reader.ReadUInt64()
+            $EntryCount = $Reader.ReadUInt64()
+            $CentralSize = $Reader.ReadUInt64()
+            $CentralOffset = $Reader.ReadUInt64()
+            if ($Zip64DiskNumber -ne 0 -or
+                $Zip64CentralDisk -ne 0 -or
+                $EntriesOnDisk -ne $EntryCount) {
+                throw "Multi-disk ZIP64 archives cannot be normalized as MSIX"
+            }
+        } else {
+            if ($DiskNumber -ne 0 -or
+                $CentralDisk -ne 0 -or
+                $EntriesOnDisk -ne $EntryCount) {
+                throw "Multi-disk ZIP archives cannot be normalized as MSIX"
+            }
+        }
+
+        $ArchiveLength = [UInt64] $Stream.Length
+        $MaximumStreamOffset = [UInt64] [Int64]::MaxValue
+        if ($CentralOffset -gt $MaximumStreamOffset -or
+            $CentralSize -gt $MaximumStreamOffset -or
+            $CentralOffset -gt ([UInt64]::MaxValue - $CentralSize)) {
+            throw "MSIX central-directory range is outside the supported file range"
+        }
+        [UInt64] $CentralEnd = $CentralOffset + $CentralSize
+        if ($CentralEnd -gt $ArchiveLength -or
+            $CentralEnd -gt [UInt64] $EndOffset) {
+            throw "MSIX central directory extends beyond the archive"
+        }
+
+        $CentralTimestampOffsets = [Collections.Generic.List[Int64]]::new()
+        $LocalHeaderOffsets = [Collections.Generic.List[Int64]]::new()
+        $Stream.Position = [Int64] $CentralOffset
+        for ([UInt64] $Index = 0; $Index -lt $EntryCount; $Index++) {
+            $CentralHeaderOffset = $Stream.Position
+            if ([UInt64] ($CentralHeaderOffset + 46) -gt $CentralEnd -or
+                $Reader.ReadUInt32() -ne [UInt32] 0x02014b50) {
+                throw "MSIX central-directory entry $Index is invalid"
+            }
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt32()
+            $CompressedSize = $Reader.ReadUInt32()
+            $UncompressedSize = $Reader.ReadUInt32()
+            $NameLength = $Reader.ReadUInt16()
+            $ExtraLength = $Reader.ReadUInt16()
+            $EntryCommentLength = $Reader.ReadUInt16()
+            $EntryDisk = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt16()
+            $null = $Reader.ReadUInt32()
+            $LocalOffset32 = $Reader.ReadUInt32()
+            if ($EntryDisk -ne 0) {
+                throw "Multi-disk ZIP entries cannot be normalized as MSIX"
+            }
+
+            $RecordEnd = (
+                $CentralHeaderOffset + 46 +
+                $NameLength + $ExtraLength + $EntryCommentLength
+            )
+            if ([UInt64] $RecordEnd -gt $CentralEnd) {
+                throw "MSIX central-directory entry $Index is truncated"
+            }
+            [byte[]] $NameBytes = $Reader.ReadBytes($NameLength)
+            [byte[]] $Extra = $Reader.ReadBytes($ExtraLength)
+            [byte[]] $EntryComment = $Reader.ReadBytes($EntryCommentLength)
+            if ($NameBytes.Length -ne $NameLength -or
+                $Extra.Length -ne $ExtraLength -or
+                $EntryComment.Length -ne $EntryCommentLength) {
+                throw "MSIX central-directory entry $Index is truncated"
+            }
+
+            [UInt64] $LocalOffset = $LocalOffset32
+            if ($LocalOffset32 -eq [UInt32]::MaxValue) {
+                $LocalOffset = Get-Zip64LocalHeaderOffset `
+                    $Extra $CompressedSize $UncompressedSize
+            }
+            if ($LocalOffset -gt $MaximumStreamOffset) {
+                throw "MSIX local-header offset is outside the supported file range"
+            }
+            $CentralTimestampOffsets.Add($CentralHeaderOffset + 12)
+            $LocalHeaderOffsets.Add([Int64] $LocalOffset)
+        }
+        if ([UInt64] $Stream.Position -ne $CentralEnd) {
+            throw "MSIX central-directory size does not match its entries"
+        }
+
+        $LocalTimestampOffsets = [Collections.Generic.List[Int64]]::new()
+        foreach ($LocalHeaderOffset in $LocalHeaderOffsets) {
+            if ($LocalHeaderOffset -lt 0 -or
+                $LocalHeaderOffset + 30 -gt $Stream.Length) {
+                throw "MSIX local-file header is outside the archive"
+            }
+            $Stream.Position = $LocalHeaderOffset
+            if ($Reader.ReadUInt32() -ne [UInt32] 0x04034b50) {
+                throw "MSIX local-file header signature is invalid"
+            }
+            $LocalTimestampOffsets.Add($LocalHeaderOffset + 10)
+        }
+
+        # 1980-01-01 00:00:00 is the earliest valid MS-DOS ZIP timestamp.
+        foreach ($TimestampOffset in @(
+            $CentralTimestampOffsets
+            $LocalTimestampOffsets
+        )) {
+            $Stream.Position = $TimestampOffset
+            $Stream.WriteByte([byte] 0x00)
+            $Stream.WriteByte([byte] 0x00)
+            $Stream.WriteByte([byte] 0x21)
+            $Stream.WriteByte([byte] 0x00)
+        }
+        $Stream.Flush($true)
+    } finally {
+        if ($null -ne $Reader) {
+            $Reader.Dispose()
+        }
+        if ($null -ne $Stream) {
+            $Stream.Dispose()
+        }
+    }
+}
+
+function Confirm-MakeAppxPackage {
+    param(
+        [string] $Tool,
+        [string] $Package,
+        [string] $Destination
+    )
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    & $Tool unpack /o /p $Package /d $Destination
+    if ($LASTEXITCODE -ne 0) {
+        throw "MakeAppx could not unpack the normalized MSIX (status $LASTEXITCODE)"
+    }
+}
+
 function Assert-IdenticalArtifact {
     param(
         [string] $First,
@@ -595,6 +884,11 @@ try {
     New-MappingFile -PackageRoot $MsixRoot -Destination $Mapping
     $MakeAppx = Resolve-WindowsSdkTool "makeappx" "SCROZZ_MAKEAPPX"
     Invoke-MakeAppx -Tool $MakeAppx -Mapping $Mapping -Destination $MsixStaged
+    Normalize-MsixZipTimestamps $MsixStaged
+    Confirm-MakeAppxPackage `
+        -Tool $MakeAppx `
+        -Package $MsixStaged `
+        -Destination (Join-Path $Scratch "msix-validation")
 
     $VerifyDeterminism = (
         [Environment]::GetEnvironmentVariable("SCROZZ_WINDOWS_VERIFY_DETERMINISM") -eq "1" -or
@@ -605,6 +899,7 @@ try {
         $SecondMsix = Join-Path $Scratch "determinism-check.msix"
         New-DeterministicZip -Source $PortableRoot -Destination $SecondZip
         Invoke-MakeAppx -Tool $MakeAppx -Mapping $Mapping -Destination $SecondMsix
+        Normalize-MsixZipTimestamps $SecondMsix
         Assert-IdenticalArtifact $PortableStaged $SecondZip "Portable ZIP output"
         Assert-IdenticalArtifact $MsixStaged $SecondMsix "MSIX output"
     }

@@ -72,6 +72,29 @@ function Read-ArchiveText {
     }
 }
 
+function Assert-ArchiveTimestamps {
+    param([string] $Path, [string] $Description)
+    $Archive = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        foreach ($Entry in $Archive.Entries) {
+            $Timestamp = $Entry.LastWriteTime
+            if ($Timestamp.Year -ne 1980 -or
+                $Timestamp.Month -ne 1 -or
+                $Timestamp.Day -ne 1 -or
+                $Timestamp.Hour -ne 0 -or
+                $Timestamp.Minute -ne 0 -or
+                $Timestamp.Second -ne 0) {
+                throw (
+                    "$Description entry $($Entry.FullName) has non-canonical " +
+                    "timestamp $Timestamp"
+                )
+            }
+        }
+    } finally {
+        $Archive.Dispose()
+    }
+}
+
 function Test-ArtifactMetadata {
     param(
         [string] $Artifact,
@@ -297,6 +320,7 @@ try {
         $Msix "msix" "windows-media-ocr" "2.515.65535.0" "com.thatcube.Scrozz"
 
     $PortableEntries = Get-ArchiveEntryNames $Portable
+    Assert-ArchiveTimestamps $Portable "portable ZIP"
     Assert-ArchiveEntry `
         $PortableEntries `
         "scrozz-1.2.3-artifact-test-windows-x86_64/scrozz.exe" `
@@ -315,6 +339,7 @@ try {
     }
 
     $MsixEntries = Get-ArchiveEntryNames $Msix
+    Assert-ArchiveTimestamps $Msix "MSIX"
     foreach ($Entry in @(
         "AppxManifest.xml",
         "AppxBlockMap.xml",

@@ -65,7 +65,12 @@ belongs in the repository.
 Set `SCROZZ_WINDOWS_VERIFY_DETERMINISM=1` to package the normalized staging
 trees twice and require byte-identical portable ZIP and unsigned MSIX output
 before signing. The legacy `SCROZZ_MSIX_VERIFY_DETERMINISM` name remains
-accepted.
+accepted. MakeAppx writes the current time into ZIP headers and offers no
+deterministic-time option, so the packager walks its central directory (including
+ZIP64 offsets) and replaces only the fixed-width local and central DOS timestamp
+fields with `1980-01-01 00:00:00`. It does not extract, recompress, reorder, or
+rewrite entries. MakeAppx must successfully unpack the normalized package before
+it can be compared or signed.
 
 Each artifact has an adjacent `.artifact.json` file. Its `package_kind` and
 `ocr_backend` fields make the distribution contract explicit: portable means
