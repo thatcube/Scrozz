@@ -27,6 +27,7 @@ scrozz-store = { path = "crates/scrozz-store" }
 scrozz-export = { path = "crates/scrozz-export" }
 scrozz-shell = { path = "crates/scrozz-shell" }
 scrozz-ui = { path = "crates/scrozz-ui" }
+scrozz-update = { path = "crates/scrozz-update" }
 
 # ---- external ----------------------------------------------------------
 # egui/eframe are 0.x and churn hard between releases; pin exactly. 0.36.1 is
@@ -52,6 +53,10 @@ raw-window-handle = "0.6"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+base64 = "0.23"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+semver = { version = "1", features = ["serde"] }
+sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
