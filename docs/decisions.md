@@ -896,13 +896,62 @@ which is the property that makes the pile safe to aim at.
 **Possible future setting.** Top-anchored may be offered as a preference later.
 It is not the default and is not built for v1.
 
+## D29 — Annotation semantics that users can observe
+
+**Decision.** Four rules emerged from implementing the annotation model. Each is
+recorded here rather than in the crate because each one is *visible to the user*,
+so changing it later would change behaviour people had come to rely on.
+
+1. **Redaction is destructive, and destroys what is beneath it in z-order.**
+   Blur, pixelate and solid burn into the pixels during the render pass. A
+   redaction placed above an arrow destroys that arrow's pixels too; annotations
+   placed *after* it still draw on top. This is the only correct reading — a
+   redaction that quietly spared some content beneath it would be a privacy
+   failure wearing the appearance of one.
+
+   The implementation goes further in one respect worth keeping: **blur samples
+   clamp-to-edge from the whole image**, not from the region in isolation. A
+   region blurred in isolation darkens at its edges, which visibly advertises
+   exactly where the redaction is and how big the hidden content was.
+
+2. **Counters renumber by creation order, never by z-order.** Raising a numbered
+   step marker must not resequence the steps. The number is the user's meaning;
+   z-order is presentation, and presentation must not rewrite meaning.
+
+3. **A solid redaction falls back to opaque black if its style would render it
+   invisible.** A see-through redaction is the worst possible outcome, so the
+   failure mode is deliberately biased toward hiding too much.
+
+4. **Rendered output is `RgbaPremultiplied8`.** Un-premultiplying would lose
+   precision in exactly the low-alpha edge pixels that D9 exists to protect.
+   Downstream encoders must handle this — `scrozz-export` un-premultiplies once,
+   at the point of encoding to a straight-alpha format, and nowhere else.
+
+**Also settled, and less contentious:** annotations live behind accessors rather
+than a public `Vec`, because unique IDs and gapless counter numbering cannot
+survive arbitrary external mutation; and shapes distinguish `bounds()` from
+`visual_bounds()`, because conflating them makes a shape grow by its own stroke
+width on every resize — found by a failing test, which is the only way anyone
+ever finds it.
+
 ---
 
 # Open questions
 
 - **The Scrozz design language.** Seeded by the spike's token layer; needs
   deliberate definition rather than inheritance from throwaway code. This is the
-  only open item, and it is the first task of Phase 0's UI crate.
+  first task of the UI crate.
+
+- **Text rendering in annotations.** `tiny-skia` has no text support, so the
+  annotation renderer currently ships a built-in single-stroke vector font:
+  lowercase renders as small caps, there is no kerning, and unknown glyphs are
+  tofu. It buys determinism and headless CI with zero font configuration, which
+  is genuinely useful for D25's golden images, but **it is not shippable as the
+  user-facing text tool.** Real shaping is needed — `cosmic-text` or `swash`,
+  both of which bring font discovery and complex-script support. The constraint
+  to preserve when replacing it: whatever is chosen must render *identically* in
+  headless CI on all three platforms, or D25's golden images become flaky and get
+  disabled.
 
 ## Closed since last revision
 
