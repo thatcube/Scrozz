@@ -15,6 +15,7 @@ pub mod hotkey;
 pub mod macos;
 pub mod overlay;
 pub mod permissions;
+pub mod selection;
 pub mod tray;
 
 pub use drag::{
@@ -31,6 +32,7 @@ pub use overlay::{
     anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
 pub use permissions::SystemPermissions;
+pub use selection::{SelectionIntegration, SelectionPlan, resolve_selection};
 pub use tray::{Tray, TrayAction, TrayEntry};
 
 use scrozz_core::{LogicalRect, Result};

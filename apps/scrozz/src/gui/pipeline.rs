@@ -24,13 +24,19 @@
 
 use std::{
     collections::HashMap,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender, channel},
+    },
     thread::JoinHandle,
     time::SystemTime,
 };
 
 use scrozz_annotate::Document;
-use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_core::{
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, SelectionMode,
+    SelectionOptions,
+};
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
@@ -39,6 +45,7 @@ use crate::{
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
+        selection::CaptureSelector,
     },
     platform,
 };
@@ -109,13 +116,13 @@ impl Pipeline {
     /// that will not open is *not* an error here: it is a degradation the worker
     /// reports and continues past, because a capture the user can see and copy
     /// is worth more than a capture refused because history was unavailable.
-    pub fn start() -> CliResult<Self> {
+    pub fn start(selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx).run(&job_rx))
+            .spawn(move || Worker::new(outcome_tx, selector).run(&job_rx))
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -172,12 +179,40 @@ struct Cached {
 
 struct Worker {
     outcomes: Sender<Outcome>,
+    selector: Arc<dyn CaptureSelector>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
 }
 
+struct CaptureLifecycle {
+    selector: Arc<dyn CaptureSelector>,
+    active: bool,
+}
+
+impl CaptureLifecycle {
+    fn new(selector: Arc<dyn CaptureSelector>) -> Self {
+        Self {
+            selector,
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.active {
+            self.selector.capture_finished();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for CaptureLifecycle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl Worker {
-    fn new(outcomes: Sender<Outcome>) -> Self {
+    fn new(outcomes: Sender<Outcome>, selector: Arc<dyn CaptureSelector>) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -196,6 +231,7 @@ impl Worker {
 
         Self {
             outcomes,
+            selector,
             store,
             cache: HashMap::new(),
         }
@@ -217,7 +253,16 @@ impl Worker {
     }
 
     fn capture(&mut self, kind: CaptureKind, card: CardId) {
-        match self.take(kind, card) {
+        let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
+        let result = if matches!(kind, CaptureKind::Fullscreen | CaptureKind::AllDisplays) {
+            self.selector
+                .begin_capture()
+                .map_err(CliError::Core)
+                .and_then(|()| self.take(kind, card, &mut lifecycle))
+        } else {
+            self.take(kind, card, &mut lifecycle)
+        };
+        match result {
             Ok(built) => {
                 let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
             }
@@ -228,34 +273,65 @@ impl Worker {
         }
     }
 
-    fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
+    fn take(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        lifecycle: &mut CaptureLifecycle,
+    ) -> CliResult<Card> {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
+        let mut selection_outcome = None;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
             CaptureKind::Fullscreen => CaptureTarget::Display(backend.active_display()?.id),
-            // Choosing a region or a window is the selection overlay's job, and
-            // per D8 a missing capability is explained rather than approximated.
-            // Silently capturing the whole display instead would be worse than
-            // refusing: the user would get a file they did not ask for.
-            CaptureKind::Region | CaptureKind::Window => {
-                return Err(CliError::not_implemented(
-                    format!("choosing a {} on screen", kind.label()),
-                    "scrozz-ui (the selection overlay); \
-                     `scrozz capture --region X,Y,W,H` takes one without it",
-                ));
+            CaptureKind::AllDisplays => CaptureTarget::AllDisplays,
+            CaptureKind::AllInOne | CaptureKind::Region | CaptureKind::Window => {
+                let options = Self::options_for(kind);
+                let capabilities = self.selector.capabilities();
+                if !capabilities.supports(options.mode) {
+                    return Err(CliError::Core(CoreError::Unsupported {
+                        what: format!("choosing a {} on screen", kind.label()),
+                        why: format!(
+                            "the {} selector does not support {} mode",
+                            self.selector.name(),
+                            options.mode.label()
+                        ),
+                    }));
+                }
+                let outcome = self
+                    .selector
+                    .select_for_capture(&capabilities.honour(&options), CursorMode::Hidden)?;
+                selection_outcome = Some(outcome.clone());
+                outcome.target
             }
         };
 
+        let include_window_shadow = target.is_window();
         let request = CaptureRequest {
             target,
             cursor: CursorMode::Hidden,
-            include_window_shadow: !kind.needs_selection(),
+            include_window_shadow,
         };
 
-        let capture = backend.capture(&request)?;
+        let capture = match self.selector.take_frozen_capture(&request) {
+            Some(capture) => capture,
+            None => crate::gui::selection::capture_selected(
+                backend.as_ref(),
+                &request,
+                selection_outcome.as_ref(),
+            )?,
+        };
+        lifecycle.finish();
+        if let Some(outcome) = selection_outcome.as_ref()
+            && outcome.mode == SelectionMode::Region
+            && let Some(rect) = outcome.rect
+            && let Err(error) = remember_region(backend.as_ref(), rect, outcome)
+        {
+            tracing::warn!("the capture succeeded but its region could not be remembered: {error}");
+        }
         let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
@@ -266,6 +342,7 @@ impl Worker {
             id: card,
             capture_id,
             kind,
+            provenance: capture.provenance,
             source_width: capture.frame.width(),
             source_height: capture.frame.height(),
             scale: capture.frame.scale.get(),
@@ -276,6 +353,23 @@ impl Worker {
             written: Vec::new(),
             taken_at: SystemTime::now(),
         })
+    }
+
+    fn options_for(kind: CaptureKind) -> SelectionOptions {
+        match kind {
+            CaptureKind::AllInOne => SelectionOptions::default(),
+            CaptureKind::Region => SelectionOptions {
+                hud: false,
+                ..SelectionOptions::for_mode(SelectionMode::Region)
+            },
+            CaptureKind::Window => SelectionOptions {
+                hud: false,
+                ..SelectionOptions::for_mode(SelectionMode::Window)
+            },
+            CaptureKind::Fullscreen | CaptureKind::AllDisplays => {
+                unreachable!("fixed targets never ask for selector options")
+            }
+        }
     }
 
     /// Persists a capture, or explains in the log why it was not.
@@ -328,13 +422,55 @@ impl Worker {
     }
 }
 
+fn remember_region(
+    backend: &dyn scrozz_core::CaptureBackend,
+    rect: scrozz_core::LogicalRect,
+    outcome: &scrozz_core::SelectionOutcome,
+) -> scrozz_core::Result<()> {
+    let displays = backend.displays()?;
+    let display = outcome
+        .display
+        .as_ref()
+        .and_then(|id| displays.iter().find(|display| display.id == *id));
+    crate::selection_store::RememberedRegionStore::default_location()?
+        .save(crate::selection_store::RememberedRegion::new(rect, display))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrozz_core::{
+        Error, RegionSelector, Result as CoreResult, SelectionCapabilities, SelectionOutcome,
+    };
+
+    struct RefusingSelector;
+
+    impl RegionSelector for RefusingSelector {
+        fn name(&self) -> &'static str {
+            "test-refusal"
+        }
+
+        fn capabilities(&self) -> SelectionCapabilities {
+            SelectionCapabilities::NONE
+        }
+
+        fn select(&self, _options: &SelectionOptions) -> CoreResult<SelectionOutcome> {
+            Err(Error::Unsupported {
+                what: "selection in a pipeline unit test".to_owned(),
+                why: "the unit test did not provide a selection".to_owned(),
+            })
+        }
+    }
+
+    impl CaptureSelector for RefusingSelector {}
+
+    fn start_pipeline() -> Pipeline {
+        Pipeline::start(Arc::new(RefusingSelector)).expect("the worker should start")
+    }
 
     #[test]
     fn a_pipeline_hands_out_distinct_card_identities() {
-        let mut pipeline = Pipeline::start().expect("the worker should start");
+        let mut pipeline = start_pipeline();
         let first = pipeline.allocate();
         let second = pipeline.allocate();
         assert_ne!(first, second);
@@ -343,7 +479,7 @@ mod tests {
 
     #[test]
     fn polling_an_idle_pipeline_does_not_block() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = start_pipeline();
         assert!(pipeline.poll().is_none());
     }
 
@@ -351,14 +487,14 @@ mod tests {
     fn a_pipeline_stops_cleanly_and_twice_is_harmless() {
         // Drop also stops it, so the second call must be a no-op rather than a
         // join on an already-joined handle.
-        let mut pipeline = Pipeline::start().expect("the worker should start");
+        let mut pipeline = start_pipeline();
         pipeline.stop();
         pipeline.stop();
     }
 
     #[test]
     fn copying_a_card_that_was_never_captured_is_refused_not_ignored() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = start_pipeline();
         assert!(pipeline.post(Job::Copy(CardId(404))));
 
         match wait_for(&pipeline) {
@@ -372,7 +508,7 @@ mod tests {
 
     #[test]
     fn saving_a_card_that_was_never_captured_is_refused_too() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = start_pipeline();
         assert!(pipeline.post(Job::Save(CardId(7))));
 
         match wait_for(&pipeline) {
@@ -383,7 +519,7 @@ mod tests {
 
     #[test]
     fn releasing_an_unknown_card_is_harmless() {
-        let pipeline = Pipeline::start().expect("the worker should start");
+        let pipeline = start_pipeline();
         assert!(pipeline.post(Job::Release(CardId(1))));
         assert!(pipeline.post(Job::Release(CardId(1))));
     }

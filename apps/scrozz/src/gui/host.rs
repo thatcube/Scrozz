@@ -9,16 +9,18 @@
 //! calls [`App::tick`] — everything that blocks is already on a worker.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc::channel},
     time::Duration,
 };
 
+use scrozz_core::{
+    Capture, CaptureRequest, CursorMode, Error as CoreError, RegionSelector, SelectionHost,
+    SelectionOptions, SelectionOutcome,
+};
 use scrozz_ui::{
     OverlayHandle,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
 };
-
-use scrozz_core::Error as CoreError;
 
 use crate::{
     fault::{CliError, CliResult},
@@ -26,6 +28,11 @@ use crate::{
         app::{App, Config, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
+        panel::BehaviorController,
+        selection::{
+            CaptureSelector, ClientOverlayController, ClientOverlaySelector, UnsupportedSelector,
+            current_plan, for_current_session,
+        },
     },
     report::Report,
 };
@@ -69,6 +76,9 @@ pub trait Host {
     /// decision: an overlay handle is useless without a window to draw it, and
     /// a window with no surface has nothing to show.
     fn surface(&self) -> Box<dyn CardSurface>;
+
+    /// The selector that shares this host's event loop.
+    fn selector(&self) -> Arc<dyn CaptureSelector>;
 }
 
 /// Drives the app from a plain sleep loop, with no window.
@@ -109,6 +119,10 @@ impl Host for Headless {
         // so a headless run still captures, stores, encodes and copies — the
         // card is simply written to the report instead of to the screen.
         Box::new(Recording::new())
+    }
+
+    fn selector(&self) -> Arc<dyn CaptureSelector> {
+        Arc::new(UnsupportedSelector::headless())
     }
 }
 
@@ -165,15 +179,34 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
 pub struct Windowed {
     handle: OverlayHandle,
     emit: Emit,
+    geometry: OverlayGeometry,
+    selector: Arc<dyn CaptureSelector>,
+    selection: ClientOverlayController,
+    native: BehaviorController,
 }
 
 impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
+        let geometry = work_area();
+        let native = BehaviorController::default();
+        let (client, selection) = ClientOverlaySelector::managed(geometry);
+        let client: Arc<dyn CaptureSelector> = client;
+        let (selector, plan) = for_current_session(client);
+        tracing::info!(
+            host = ?plan.host,
+            available = plan.is_available(),
+            detail = %plan.detail,
+            "resolved interactive selector"
+        );
         Self {
             handle: OverlayHandle::new(),
             emit,
+            geometry,
+            selector,
+            selection,
+            native,
         }
     }
 }
@@ -186,12 +219,19 @@ impl Default for Windowed {
 
 impl Host for Windowed {
     fn run(self: Box<Self>, app: App) -> CliResult<Report> {
-        let geometry = work_area();
+        let Self {
+            handle,
+            emit,
+            geometry,
+            selector: _,
+            selection,
+            native,
+        } = *self;
         tracing::info!(?geometry, "opening the overlay");
 
         let options = OverlayOptions {
             geometry,
-            panel: panel_hook(),
+            panel: panel_hook(native.clone()),
             probe: pointer_probe(),
             ..Default::default()
         };
@@ -201,9 +241,7 @@ impl Host for Windowed {
         // it before returning.
         let outcome: Arc<Mutex<Option<Report>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&outcome);
-        let handle = self.handle.clone();
-        let reporting = self.handle.clone();
-        let emit = self.emit;
+        let reporting = handle.clone();
 
         eframe::run_native(
             "Scrozz",
@@ -216,6 +254,8 @@ impl Host for Windowed {
                     sink,
                     handle: reporting,
                     emit: Some(emit),
+                    selection,
+                    native,
                     announced: false,
                     stopped: false,
                 }))
@@ -252,6 +292,113 @@ impl Host for Windowed {
         // taken before the window opens is already in the pile when it does.
         Box::new(OverlayCards::new(self.handle.clone()))
     }
+
+    fn selector(&self) -> Arc<dyn CaptureSelector> {
+        Arc::clone(&self.selector)
+    }
+}
+
+/// Runs one interactive selection in its own ordinary eframe window.
+///
+/// The long-running app reuses its card window instead. This path deliberately
+/// skips panel conversion: the current AppKit conversion cannot be dismantled
+/// safely after winit has installed KVO, while a one-shot window must return to
+/// the caller so the selected target can be captured.
+pub fn select_once(
+    options: &SelectionOptions,
+    cursor: CursorMode,
+    include_window_shadow: bool,
+) -> scrozz_core::Result<(SelectionOutcome, Option<Capture>)> {
+    let plan = current_plan();
+    if plan.host != SelectionHost::ClientOverlay || !plan.is_available() {
+        return UnsupportedSelector::from_plan(plan)
+            .select(options)
+            .map(|outcome| (outcome, None));
+    }
+
+    let (selector, selection) = ClientOverlaySelector::one_shot();
+    let worker_selector = Arc::clone(&selector);
+    let worker_options = options.clone();
+    let (result_tx, result_rx) = channel();
+    let worker = std::thread::Builder::new()
+        .name("scrozz-one-shot-selector".to_owned())
+        .spawn(move || {
+            let result = worker_selector
+                .select_for_capture(&worker_options, cursor)
+                .map(|outcome| {
+                    let request = CaptureRequest {
+                        target: outcome.target.clone(),
+                        cursor,
+                        include_window_shadow,
+                    };
+                    let frozen = worker_selector.take_frozen_capture(&request);
+                    (outcome, frozen)
+                });
+            worker_selector.capture_finished();
+            let _ = result_tx.send(result);
+        })
+        .map_err(|error| {
+            CoreError::Platform(format!("could not start the selector worker: {error}"))
+        })?;
+
+    let geometry = OverlayGeometry::default();
+    let mut native_options = scrozz_ui::overlay_app::native_options(geometry);
+    native_options.viewport = native_options
+        .viewport
+        .with_visible(false)
+        .with_active(false);
+    let driver_selector = Arc::clone(&selector);
+    let run_result = eframe::run_native(
+        "Scrozz Selector",
+        native_options,
+        Box::new(move |_cc| {
+            Ok(Box::new(OneShotDriver {
+                selection,
+                native: BehaviorController::default(),
+                selector: driver_selector,
+            }))
+        }),
+    );
+    if let Err(error) = &run_result {
+        selector.cancel();
+        let _ = worker.join();
+        return Err(CoreError::Platform(format!(
+            "the selector window could not open: {error}"
+        )));
+    }
+
+    let selected = result_rx.recv().map_err(|_| {
+        CoreError::Platform("the selector worker stopped without an outcome".to_owned())
+    })?;
+    let _ = worker.join();
+    selected
+}
+
+struct OneShotDriver {
+    selection: ClientOverlayController,
+    native: BehaviorController,
+    selector: Arc<ClientOverlaySelector>,
+}
+
+impl eframe::App for OneShotDriver {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.selection.logic(ctx, &self.native);
+        ctx.request_repaint_after(IDLE);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.selection.ui(ui);
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+impl Drop for OneShotDriver {
+    fn drop(&mut self) {
+        self.selector.cancel();
+    }
 }
 
 /// The `eframe::App` that services this app and draws the overlay.
@@ -261,6 +408,8 @@ struct Driver {
     sink: Arc<Mutex<Option<Report>>>,
     handle: OverlayHandle,
     emit: Option<Emit>,
+    selection: ClientOverlayController,
+    native: BehaviorController,
     announced: bool,
     stopped: bool,
 }
@@ -343,6 +492,7 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        self.selection.logic(ctx, &self.native);
 
         if !self.stopped && self.app.tick() == Tick::Stop {
             self.stopped = true;
@@ -372,7 +522,11 @@ impl eframe::App for Driver {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.overlay.ui(ui, frame);
+        if self.selection.owns_surface() {
+            self.selection.ui(ui);
+        } else {
+            self.overlay.ui(ui, frame);
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -391,7 +545,7 @@ impl eframe::App for Driver {
 pub const PANEL_ENV: &str = "SCROZZ_GUI_PANEL";
 
 /// The native panel conversion, unless it was switched off.
-fn panel_hook() -> Option<scrozz_ui::PanelHook> {
+fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
     let enabled =
         std::env::var(PANEL_ENV).map_or(true, |raw| !matches!(raw.as_str(), "0" | "false" | "no"));
     if !enabled {
@@ -400,7 +554,7 @@ fn panel_hook() -> Option<scrozz_ui::PanelHook> {
         );
         return None;
     }
-    Some(crate::gui::panel::hook())
+    Some(crate::gui::panel::hook_with_controller(controller))
 }
 
 /// Where the overlay window goes.
@@ -463,7 +617,12 @@ mod tests {
     fn a_headless_run_ends_by_itself() {
         // The property every automated run depends on. If this ever stops
         // holding, a test can leave a menu-bar item behind.
-        let app = App::new(Config::sealed(), Box::new(Recording::new())).expect("sealed app");
+        let app = App::new(
+            Config::sealed(),
+            Box::new(Recording::new()),
+            Arc::new(UnsupportedSelector::headless()),
+        )
+        .expect("sealed app");
         let started = std::time::Instant::now();
         let report = Box::new(Headless).run(app).expect("headless never fails");
 

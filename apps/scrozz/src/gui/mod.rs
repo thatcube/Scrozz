@@ -67,6 +67,7 @@ pub mod host;
 pub mod overlay;
 pub mod panel;
 pub mod pipeline;
+pub mod selection;
 pub mod server;
 
 // Re-exported so the rest of the binary — and anything that later lifts this
@@ -113,8 +114,17 @@ pub fn run(cli: &Cli) -> CliResult<Report> {
     });
 
     let host = host::for_platform(&config, emit)?;
-    let app = App::new(config, host.surface())?;
+    let app = App::new(config, host.surface(), host.selector())?;
     host.run(app)
+}
+
+/// Opens a one-shot selector for an interactive CLI capture.
+pub fn select_once(
+    options: &scrozz_core::SelectionOptions,
+    cursor: scrozz_core::CursorMode,
+    include_window_shadow: bool,
+) -> scrozz_core::Result<(scrozz_core::SelectionOutcome, Option<scrozz_core::Capture>)> {
+    host::select_once(options, cursor, include_window_shadow)
 }
 
 /// Whether a run of `scrozz gui` will put a card on screen.

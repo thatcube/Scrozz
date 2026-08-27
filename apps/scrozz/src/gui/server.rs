@@ -27,21 +27,20 @@
 //! between servicing the tray and the hotkey queue, and a blocking `accept()`
 //! there would freeze the menu bar until someone happened to run a command.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender, channel},
+    },
+    thread::JoinHandle,
+};
 
-// Every construction of a `CliError` in this module happens inside a
-// `cfg(unix)` body — the Windows half of each pair is an infallible stub,
-// because there is no named-pipe listener to fail yet. An unconditional import
-// is therefore an `unused_imports` error on Windows only, which `cargo check`
-// cannot catch here either: layer 1 excludes this crate from the cross targets
-// over rusqlite's bundled C. Gate the import with the code that uses it and the
-// Windows runner stays quiet without anybody silencing a lint.
-#[cfg(unix)]
-use crate::fault::CliError;
 use crate::{
     cli::{Cli, Command},
     commands,
-    fault::CliResult,
+    fault::{CliError, CliResult},
+    gui::selection::CaptureSelector,
     ipc::{self, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };
@@ -81,6 +80,13 @@ impl Request {
         command
     }
 
+    fn serve_with_selector(self, selector: &dyn CaptureSelector) -> Option<Command> {
+        let (command, response) =
+            run_with_selector(&self.argv, self.cwd.as_deref(), Some(selector));
+        self.reply(&response);
+        command
+    }
+
     #[cfg(unix)]
     fn reply(self, response: &Response) {
         use std::{io::Write, net::Shutdown};
@@ -105,6 +111,14 @@ impl Request {
 /// socket, which is the part most likely to drift from
 /// [`crate::report::Reporter::emit`].
 fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+    run_with_selector(argv, cwd, None)
+}
+
+fn run_with_selector(
+    argv: &[String],
+    cwd: Option<&Path>,
+    selector: Option<&dyn CaptureSelector>,
+) -> (Option<Command>, Response) {
     use clap::Parser as _;
 
     if argv.is_empty() {
@@ -126,26 +140,26 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     with_argv0.push("scrozz".to_owned());
     with_argv0.extend_from_slice(argv);
 
-    let cli = match Cli::try_parse_from(&with_argv0) {
+    let mut cli = match Cli::try_parse_from(&with_argv0) {
         Ok(cli) => cli,
         // clap's own rejection. There is no slug to report it under, because we
         // never got as far as knowing which subcommand was meant.
         Err(err) => return (None, text(2, err.to_string())),
     };
+    let aliases = cwd.map_or_else(Default::default, |cwd| cli.absolutize_paths(cwd));
 
     let command = cli.command.clone().unwrap_or(Command::Gui);
     let slug = command.slug();
 
-    // Relative paths belong to the caller's directory, not the daemon's. The
-    // restore matters as much as the switch: this is the GUI's own process, and
-    // every later capture would otherwise inherit whatever directory the last
-    // forwarded command happened to run in.
-    let restore = enter(cwd);
-    let result = cli.validate().and_then(|()| commands::dispatch(&command));
-    restore();
+    let result = cli.validate().and_then(|()| match selector {
+        Some(selector) => commands::dispatch_with_selector(&command, selector),
+        None => commands::dispatch(&command),
+    });
 
     let response = match result {
-        Ok(report) => {
+        Ok(mut report) => {
+            aliases.restore_json(&mut report.data);
+            report.human = aliases.restore_text(&report.human);
             if let Some(bytes) = report.raw {
                 Response {
                     code: 0,
@@ -163,9 +177,11 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
         Err(err) => {
             let code = err.exit().code();
             if cli.global.json {
-                json(code, error_envelope(&slug, &err).to_compact_string())
+                let mut document = error_envelope(&slug, &err);
+                aliases.restore_json(&mut document);
+                json(code, document.to_compact_string())
             } else {
-                text(code, err.to_string())
+                text(code, aliases.restore_text(&err.to_string()))
             }
         }
     };
@@ -173,18 +189,78 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     (Some(command), response)
 }
 
-/// Switches to `target`, returning how to switch back.
-fn enter(target: Option<&Path>) -> impl FnOnce() {
-    let previous = target.and_then(|dir| {
-        let here = std::env::current_dir().ok()?;
-        std::env::set_current_dir(dir).ok()?;
-        Some(here)
-    });
+enum ForwardJob {
+    Serve(Request),
+    Stop,
+}
 
-    move || {
-        if let Some(here) = previous {
-            let _ = std::env::set_current_dir(here);
+/// Serial command executor for requests accepted on the UI thread.
+///
+/// Interactive selection is synchronous by contract. Running it here lets the
+/// worker wait on the selector while eframe's main thread continues polling the
+/// selector bridge and painting the overlay.
+pub struct Forwarder {
+    jobs: Sender<ForwardJob>,
+    completed: Receiver<Option<Command>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Forwarder {
+    /// Starts the forwarded-command worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error if the thread cannot be created.
+    pub fn start(selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
+        let (jobs, requests) = channel();
+        let (finished, completed) = channel();
+        let worker = std::thread::Builder::new()
+            .name("scrozz-forwarded-command".to_owned())
+            .spawn(move || {
+                while let Ok(job) = requests.recv() {
+                    match job {
+                        ForwardJob::Serve(request) => {
+                            let command = request.serve_with_selector(selector.as_ref());
+                            let _ = finished.send(command);
+                        }
+                        ForwardJob::Stop => break,
+                    }
+                }
+            })
+            .map_err(|error| {
+                CliError::Core(scrozz_core::Error::Platform(format!(
+                    "could not start the forwarded-command worker: {error}"
+                )))
+            })?;
+        Ok(Self {
+            jobs,
+            completed,
+            worker: Some(worker),
+        })
+    }
+
+    /// Queues an accepted request without blocking the caller.
+    pub fn submit(&self, request: Request) -> bool {
+        self.jobs.send(ForwardJob::Serve(request)).is_ok()
+    }
+
+    /// Takes one completed command, if any.
+    pub fn poll(&self) -> Option<Option<Command>> {
+        self.completed.try_recv().ok()
+    }
+
+    /// Stops after any currently executing command has returned.
+    pub fn stop(&mut self) {
+        let _ = self.jobs.send(ForwardJob::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
+    }
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -582,15 +658,42 @@ mod tests {
     }
 
     #[test]
-    fn the_working_directory_is_restored_afterwards() {
+    fn a_forwarded_command_never_changes_the_process_working_directory() {
         let before = std::env::current_dir().expect("a working directory");
-        let elsewhere = std::env::temp_dir();
-        let restore = enter(Some(&elsewhere));
-        restore();
+        let _ = run(
+            &argv(&["capture", "--dry-run", "--output", "relative.png"]),
+            Some(&std::env::temp_dir()),
+        );
         assert_eq!(
             std::env::current_dir().expect("a working directory"),
             before
         );
+    }
+
+    #[test]
+    fn forwarded_relative_paths_are_reported_as_the_caller_typed_them() {
+        let cwd = std::env::temp_dir().join("scrozz-forwarded-caller");
+        let (_, response) = run(
+            &argv(&["capture", "--dry-run", "--output", "captures/shot.png"]),
+            Some(&cwd),
+        );
+        let body = String::from_utf8_lossy(&response.payload);
+        assert!(body.contains("captures/shot.png"), "{body}");
+        assert!(!body.contains(&cwd.display().to_string()), "{body}");
+
+        let (_, response) = run(
+            &argv(&[
+                "--json",
+                "capture",
+                "--dry-run",
+                "--output",
+                "captures/shot.png",
+            ]),
+            Some(&cwd),
+        );
+        let body = String::from_utf8_lossy(&response.payload);
+        assert!(body.contains("captures/shot.png"), "{body}");
+        assert!(!body.contains(&cwd.display().to_string()), "{body}");
     }
 
     #[cfg(unix)]

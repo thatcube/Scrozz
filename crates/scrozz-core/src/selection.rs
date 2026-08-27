@@ -129,9 +129,10 @@ impl SelectionMode {
 /// Free by default. Locking is a deliberate act — it makes some drags
 /// impossible to express — so it is never inferred from a modifier held during
 /// an unrelated gesture.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub enum AspectLock {
     /// Any shape.
+    #[default]
     Free,
     /// Width divided by height is held at this value.
     Ratio {
@@ -140,12 +141,6 @@ pub enum AspectLock {
         /// Denominator.
         height: f64,
     },
-}
-
-impl Default for AspectLock {
-    fn default() -> Self {
-        Self::Free
-    }
 }
 
 impl AspectLock {
@@ -160,6 +155,12 @@ impl AspectLock {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Err(Error::InvalidRequest(format!(
                 "an aspect ratio needs two positive numbers, not {width}:{height}"
+            )));
+        }
+        let ratio = width / height;
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return Err(Error::InvalidRequest(format!(
+                "an aspect ratio must resolve to a finite positive value, not {width}:{height}"
             )));
         }
         Ok(Self::Ratio { width, height })
@@ -270,6 +271,10 @@ impl SizeConstraint {
                 size.width, size.height
             )));
         }
+        self.minimum = LogicalSize::new(
+            self.minimum.width.min(size.width),
+            self.minimum.height.min(size.height),
+        );
         self.exact = Some(size);
         Ok(self)
     }
@@ -281,10 +286,27 @@ impl SizeConstraint {
         self
     }
 
-    /// Whether `rect` is large enough to be worth capturing.
+    /// Whether `rect` satisfies the minimum, exact-size and aspect requirements.
     #[must_use]
     pub fn is_satisfied_by(&self, rect: LogicalRect) -> bool {
-        rect.size.width >= self.minimum.width && rect.size.height >= self.minimum.height
+        let approximately = |actual: f64, expected: f64| {
+            (actual - expected).abs() <= 1e-9 * actual.abs().max(expected.abs()).max(1.0)
+        };
+        if rect.size.width < self.minimum.width || rect.size.height < self.minimum.height {
+            return false;
+        }
+        if let Some(exact) = self.exact
+            && (!approximately(rect.size.width, exact.width)
+                || !approximately(rect.size.height, exact.height))
+        {
+            return false;
+        }
+        if let Some(ratio) = self.aspect.value()
+            && !approximately(rect.size.width / rect.size.height, ratio)
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -298,15 +320,25 @@ pub struct SelectionOptions {
     /// Presented as an adjustable selection rather than committed silently: the
     /// user asked to *retake*, not to re-run blind.
     pub remembered: Option<LogicalRect>,
+    /// Display that owned `remembered`, when known.
+    ///
+    /// Mixed-DPI Windows desktops can have overlapping global logical
+    /// rectangles because each monitor's device origin is divided by its own
+    /// scale. The rectangle alone is therefore not always enough to recover its
+    /// owner.
+    #[serde(default)]
+    pub remembered_display: Option<DisplayId>,
     /// Commit `remembered` immediately, without showing the overlay at all.
     pub reuse_immediately: bool,
     /// Size and shape limits.
     pub constraint: SizeConstraint,
-    /// Freeze the screen behind the overlay.
+    /// Freeze pixel-addressed region and display choices behind the overlay.
     ///
     /// A frozen screen is what makes a menu, a tooltip or a drag state possible
     /// to capture, and it is what makes the magnifier honest — a live desktop
-    /// under a loupe shows pixels that will not be in the final image.
+    /// under a loupe shows pixels that will not be in the final image. Semantic
+    /// window capture and all-display composition stay live because their native
+    /// output cannot be reconstructed faithfully from display snapshots.
     pub freeze: bool,
     /// Draw full-width crosshair guides through the pointer.
     pub crosshair: bool,
@@ -325,6 +357,7 @@ impl Default for SelectionOptions {
         Self {
             mode: SelectionMode::Region,
             remembered: None,
+            remembered_display: None,
             reuse_immediately: false,
             constraint: SizeConstraint::default(),
             freeze: true,
@@ -349,6 +382,9 @@ impl SelectionOptions {
     pub fn for_mode(mode: SelectionMode) -> Self {
         Self {
             mode,
+            freeze: matches!(mode, SelectionMode::Region | SelectionMode::Display),
+            magnifier: mode == SelectionMode::Region,
+            crosshair: mode == SelectionMode::Region,
             ..Self::default()
         }
     }
@@ -551,6 +587,7 @@ impl SelectionCapabilities {
         }
         if !self.remembered_region {
             out.remembered = None;
+            out.remembered_display = None;
             out.reuse_immediately = false;
         }
         if !self.hud {
@@ -746,7 +783,11 @@ mod tests {
         let mut seen = Vec::new();
         for mode in SelectionMode::ALL {
             assert_eq!(SelectionMode::from_slug(mode.slug()), Some(mode));
-            assert!(!seen.contains(&mode.slug()), "duplicate slug {}", mode.slug());
+            assert!(
+                !seen.contains(&mode.slug()),
+                "duplicate slug {}",
+                mode.slug()
+            );
             seen.push(mode.slug());
         }
         assert_eq!(SelectionMode::from_slug("nonsense"), None);
@@ -776,7 +817,10 @@ mod tests {
     #[test]
     fn a_free_lock_leaves_a_rectangle_alone() {
         let r = rect(10.0, 20.0, 300.0, 17.0);
-        assert_eq!(AspectLock::Free.reshape(LogicalPoint::new(10.0, 20.0), r), r);
+        assert_eq!(
+            AspectLock::Free.reshape(LogicalPoint::new(10.0, 20.0), r),
+            r
+        );
     }
 
     #[test]
@@ -804,7 +848,10 @@ mod tests {
 
         assert!(fixed.origin.x < anchor.x, "{fixed:?}");
         assert!(fixed.origin.y < anchor.y, "{fixed:?}");
-        assert!((fixed.size.width - fixed.size.height).abs() < 1e-9, "{fixed:?}");
+        assert!(
+            (fixed.size.width - fixed.size.height).abs() < 1e-9,
+            "{fixed:?}"
+        );
         assert!((fixed.origin.x + fixed.size.width - anchor.x).abs() < 1e-9);
         assert!((fixed.origin.y + fixed.size.height - anchor.y).abs() < 1e-9);
     }
@@ -829,6 +876,10 @@ mod tests {
                 .with_exact(LogicalSize::new(1200.0, 630.0))
                 .is_ok()
         );
+        let one_pixel = SizeConstraint::free()
+            .with_exact(LogicalSize::new(1.0, 1.0))
+            .unwrap();
+        assert!(one_pixel.is_satisfied_by(rect(0.0, 0.0, 1.0, 1.0)));
     }
 
     #[test]
@@ -926,10 +977,7 @@ mod tests {
 
     #[test]
     fn native_sessions_draw_their_own_overlay() {
-        assert_eq!(
-            host_for(SessionFacts::NATIVE),
-            SelectionHost::ClientOverlay
-        );
+        assert_eq!(host_for(SessionFacts::NATIVE), SelectionHost::ClientOverlay);
     }
 
     #[test]
@@ -965,6 +1013,23 @@ mod tests {
         // width is 101 rather than 101 truncated to 100.
         assert_eq!(physical.pixel_width(), 101);
         assert_eq!(physical.pixel_height(), 41);
+    }
+
+    #[test]
+    fn size_constraints_validate_exact_size_and_aspect_at_commit() {
+        let constraint = SizeConstraint::free()
+            .with_exact(LogicalSize::new(160.0, 90.0))
+            .unwrap()
+            .with_aspect(AspectLock::ratio(16.0, 9.0).unwrap());
+        assert!(constraint.is_satisfied_by(rect(0.0, 0.0, 160.0, 90.0)));
+        assert!(!constraint.is_satisfied_by(rect(0.0, 0.0, 159.0, 90.0)));
+        assert!(!constraint.is_satisfied_by(rect(0.0, 0.0, 160.0, 91.0)));
+    }
+
+    #[test]
+    fn aspect_terms_must_not_overflow_or_underflow_the_resolved_ratio() {
+        assert!(AspectLock::ratio(f64::MAX, f64::MIN_POSITIVE).is_err());
+        assert!(AspectLock::ratio(f64::MIN_POSITIVE, f64::MAX).is_err());
     }
 
     #[test]
