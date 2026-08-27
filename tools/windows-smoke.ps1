@@ -2,11 +2,20 @@
 #
 # Run from a Windows desktop session:
 #
-#   pwsh -File tools/windows-smoke.ps1
+#   pwsh -File tools/windows-smoke.ps1 `
+#     -TesseractDirectory C:\path\to\tesseract
 #
 # Or point it at an already-built binary:
 #
-#   pwsh -File tools/windows-smoke.ps1 -Binary artifacts/scrozz.exe
+#   pwsh -File tools/windows-smoke.ps1 `
+#     -Binary artifacts/scrozz.exe `
+#     -ArtifactType portable
+#
+# A packaged/sparse-package artifact must be declared explicitly:
+#
+#   pwsh -File tools/windows-smoke.ps1 `
+#     -Binary C:\Program Files\WindowsApps\...\scrozz.exe `
+#     -ArtifactType packaged
 #
 # This is intentionally a CLI/headless probe. It does not automate egui or
 # claim that the overlay behaves correctly; a person still has to verify focus,
@@ -20,7 +29,20 @@ param(
 
     [Parameter()]
     [ValidateSet("debug", "release")]
-    [string] $Profile = "debug"
+    [string] $Profile = "debug",
+
+    [Parameter()]
+    [ValidateSet("portable", "packaged")]
+    [string] $ArtifactType = "portable",
+
+    [Parameter()]
+    [string] $TesseractDirectory,
+
+    [Parameter()]
+    [switch] $RequireWgc,
+
+    [Parameter()]
+    [switch] $RequireNegativeCoordinates
 )
 
 Set-StrictMode -Version Latest
@@ -237,6 +259,22 @@ exit 1
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "tools/windows-smoke.ps1 must run natively on Windows"
 }
+$buildingFromSource = [string]::IsNullOrWhiteSpace($Binary)
+if ($ArtifactType -eq "packaged" -and $buildingFromSource) {
+    throw "-ArtifactType packaged requires -Binary to name the installed MSIX/sparse-package executable"
+}
+if ($ArtifactType -eq "packaged" -and
+    -not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
+    throw "-TesseractDirectory applies only to -ArtifactType portable"
+}
+if ($buildingFromSource -and
+    $ArtifactType -eq "portable" -and
+    [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
+    throw (
+        "A source-built portable smoke run requires -TesseractDirectory. " +
+        "An extracted portable artifact instead discovers its sibling tesseract directory."
+    )
+}
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) `
@@ -249,6 +287,10 @@ $oldRustLog = [Environment]::GetEnvironmentVariable(
     "RUST_LOG",
     [EnvironmentVariableTarget]::Process
 )
+$oldTesseractDirectory = [Environment]::GetEnvironmentVariable(
+    "SCROZZ_TESSERACT_DIR",
+    [EnvironmentVariableTarget]::Process
+)
 $locationPushed = $false
 
 try {
@@ -256,7 +298,7 @@ try {
     Push-Location $repoRoot
     $locationPushed = $true
 
-    if ([string]::IsNullOrWhiteSpace($Binary)) {
+    if ($buildingFromSource) {
         $cargo = Get-Command cargo -ErrorAction Stop
         Write-Host "[build] Building the native Scrozz CLI ($Profile)"
         $buildArguments = @("build", "-p", "scrozz", "--bin", "scrozz")
@@ -278,6 +320,36 @@ try {
 
     $env:SCROZZ_UNSTABLE_BACKENDS = "1"
     $env:RUST_LOG = "scrozz=info,warn"
+    if (-not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
+        Assert-Smoke (
+            [System.IO.Path]::IsPathRooted($TesseractDirectory) -and
+            $TesseractDirectory -notmatch "^[A-Za-z]:[^\\/]"
+        ) "-TesseractDirectory must be an absolute path"
+        $resolvedTesseract = [System.IO.Path]::GetFullPath($TesseractDirectory)
+        Assert-Smoke (Test-Path -LiteralPath $resolvedTesseract -PathType Container) `
+            "Tesseract directory not found at '$resolvedTesseract'"
+        $env:SCROZZ_TESSERACT_DIR = $resolvedTesseract
+    } else {
+        # A default portable smoke run must prove the artifact's sibling payload,
+        # not accidentally inherit a developer override from the parent shell.
+        $env:SCROZZ_TESSERACT_DIR = $null
+    }
+    if ($ArtifactType -eq "portable") {
+        $payloadDirectory = if (-not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
+            $resolvedTesseract
+        } else {
+            Join-Path (Split-Path -Parent $Binary) "tesseract"
+        }
+        Assert-Smoke (Test-Path -LiteralPath $payloadDirectory -PathType Container) `
+            "portable Tesseract payload not found at '$payloadDirectory'"
+        foreach ($requiredPayloadFile in @(
+            (Join-Path $payloadDirectory "tesseract.exe"),
+            (Join-Path $payloadDirectory "tessdata\eng.traineddata")
+        )) {
+            Assert-Smoke (Test-Path -LiteralPath $requiredPayloadFile -PathType Leaf) `
+                "portable OCR payload is missing '$requiredPayloadFile'"
+        }
+    }
 
     Write-Host "[1/5] Enumerating native displays"
     $listed = Invoke-ScrozzJson `
@@ -294,10 +366,29 @@ try {
         Assert-Smoke ($display.width -gt 0) "display '$($display.id)' has zero width"
         Assert-Smoke ($display.height -gt 0) "display '$($display.id)' has zero height"
         Assert-Smoke ($display.scale -gt 0) "display '$($display.id)' has invalid scale"
+        Write-Host (
+            "      {0}: {1}x{2} at ({3}, {4}), scale {5}x{6}" -f
+            $display.id,
+            $display.width,
+            $display.height,
+            $display.x,
+            $display.y,
+            $display.scale,
+            $(if ($display.primary) { " [primary]" } else { "" })
+        )
     }
     $primary = @($displays | Where-Object { $_.primary })
     Assert-Smoke ($primary.Count -eq 1) `
         "expected exactly one primary display, found $($primary.Count)"
+    Assert-Smoke ($primary[0].x -eq 0 -and $primary[0].y -eq 0) `
+        "the Windows primary display must own virtual-desktop origin (0, 0)"
+    if ($RequireNegativeCoordinates) {
+        $negativeDisplays = @(
+            $displays | Where-Object { $_.x -lt 0 -or $_.y -lt 0 }
+        )
+        Assert-Smoke ($negativeDisplays.Count -gt 0) `
+            "-RequireNegativeCoordinates was set but no display has a negative origin"
+    }
 
     Write-Host "[2/5] Capturing the primary display to file and clipboard"
     $pngPath = [System.IO.Path]::GetFullPath((Join-Path $scratch "capture.png"))
@@ -320,10 +411,30 @@ try {
         $backend -eq "Windows.Graphics.Capture" -or
         $backend -eq "GDI BitBlt"
     ) "capture reported unknown backend '$backend'"
+    if ($RequireWgc) {
+        Assert-Smoke ($backend -eq "Windows.Graphics.Capture") `
+            "-RequireWgc was set but capture selected '$backend'"
+    }
     if ($backend -eq "GDI BitBlt") {
         Assert-Smoke (
             $captured.Stderr -match "GDI fallback"
         ) "capture used GDI without explaining the WGC downgrade"
+    }
+    $identity = $captured.Json.data.runtime.package_identity
+    Assert-Smoke ($null -ne $identity) "capture did not expose runtime package identity"
+    $expectedIdentity = if ($ArtifactType -eq "packaged") {
+        "packaged"
+    } else {
+        "unpackaged"
+    }
+    Assert-Smoke ($identity.state -eq $expectedIdentity) `
+        "artifact was declared '$ArtifactType' but runtime package identity is '$($identity.state)'"
+    if ($ArtifactType -eq "packaged") {
+        Assert-Smoke (-not [string]::IsNullOrWhiteSpace($identity.full_name)) `
+            "packaged runtime reported no package full name"
+    } else {
+        Assert-Smoke ($null -eq $identity.full_name) `
+            "portable runtime unexpectedly reported package '$($identity.full_name)'"
     }
     Assert-Smoke (Test-Path -LiteralPath $pngPath -PathType Leaf) `
         "capture reported success but did not create '$pngPath'"
@@ -363,24 +474,40 @@ try {
         $clipboard.Height -eq $png.Height
     ) "clipboard image $($clipboard.Width)x$($clipboard.Height) disagrees with the saved PNG"
 
-    Write-Host "[5/5] Exercising Windows.Media.Ocr on the calling thread"
+    Write-Host "[5/5] Exercising the artifact-selected OCR backend"
     $recognised = Invoke-ScrozzJson `
         -Executable $Binary `
         -Arguments @("ocr", "--file", $pngPath) `
         -Name "ocr" `
         -Scratch $scratch `
-        -AllowUnsupported
+        -AllowUnsupported:($ArtifactType -eq "packaged")
     Assert-Smoke ($recognised.Json.command -eq "ocr") `
         "OCR returned command '$($recognised.Json.command)'"
-    if (-not $recognised.Json.ok) {
+    if ($recognised.Json.ok) {
+        $expectedOcrBackend = if ($ArtifactType -eq "packaged") {
+            "windows-media-ocr"
+        } else {
+            "tesseract"
+        }
+        Assert-Smoke ($recognised.Json.data.engine -eq $expectedOcrBackend) `
+            "'$ArtifactType' artifact used OCR engine '$($recognised.Json.data.engine)', expected '$expectedOcrBackend'"
+        $ocrBackend = $recognised.Json.data.engine
+    } else {
         Assert-Smoke ($recognised.Json.error.kind -eq "unsupported") `
             "OCR failed with unexpected kind '$($recognised.Json.error.kind)'"
+        Assert-Smoke ($ArtifactType -eq "packaged") `
+            "portable OCR must use the artifact-local Tesseract payload, not report unsupported"
+        Assert-Smoke (
+            $recognised.Json.error.details.why -match "language pack"
+        ) "packaged OCR was unsupported for a reason other than a missing Windows language pack"
+        $ocrBackend = "windows-media-ocr (language pack unavailable)"
     }
 
     Write-Host ((
         "PASS: {0} display(s); captured {1}x{2}, saved one PNG, and " +
-        "round-tripped the same image through the Windows clipboard via {3}."
-    ) -f $displays.Count, $png.Width, $png.Height, $backend)
+        "round-tripped the same image through the Windows clipboard via {3}; " +
+        "{4} artifact identity selected {5}."
+    ) -f $displays.Count, $png.Width, $png.Height, $backend, $ArtifactType, $ocrBackend)
 } finally {
     if ($locationPushed) {
         Pop-Location
@@ -393,6 +520,11 @@ try {
     [Environment]::SetEnvironmentVariable(
         "RUST_LOG",
         $oldRustLog,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "SCROZZ_TESSERACT_DIR",
+        $oldTesseractDirectory,
         [EnvironmentVariableTarget]::Process
     )
     if (Test-Path -LiteralPath $scratch) {

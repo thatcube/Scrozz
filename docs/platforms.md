@@ -216,6 +216,24 @@ signal rather than success: when winit has already selected an STA, Scrozz
 retries `RoInitialize(RO_INIT_SINGLETHREADED)` and balances only that successful
 WinRT entry, leaving winit's own apartment reference intact.
 
+Package identity is likewise runtime state, not a Cargo feature or a property of
+the executable bytes. Scrozz probes `GetCurrentPackageFullName` and exposes the
+result as `data.runtime.package_identity` in capture JSON: `packaged` includes
+the full package name, `unpackaged` has none, and `unknown` retains the
+unexpected Win32 status and diagnostic. OCR reports its selected engine
+separately. An indeterminate answer does not block capture, but OCR fails closed
+rather than guessing which identity-sensitive API is safe.
+
+A packaged MSIX or sparse-package process selects `Windows.Media.Ocr`. The exact
+same executable launched without identity selects only the Tesseract payload in
+its portable artifact; it never searches `PATH`. The portable layout is
+`scrozz.exe`, `tesseract/tesseract.exe`, its dependent DLLs, and
+`tesseract/tessdata/eng.traineddata` (plus any additional language files the
+artifact promises). `SCROZZ_TESSERACT_DIR` is an absolute-path development and
+smoke-test override for that `tesseract` directory. A portable ZIP without this
+payload is incomplete and reports an actionable unsupported error instead of
+silently trying WinRT or returning no text.
+
 The capture backend no longer reads `CO_E_NOTINITIALIZED` or an arbitrary WGC
 probe failure as permission to use GDI. GDI is selected only for a genuine
 unsupported result or the explicit no-D3D-device case, that downgrade is logged,
@@ -237,10 +255,21 @@ Promised-file drag is still explicitly unsupported on Windows. The tested
 and retains the capture.
 
 `tools/windows-smoke.ps1` exercises native display enumeration, capture,
-encoding, save-once behavior, clipboard round-trip and Windows OCR while
-rejecting apartment failures and unexplained GDI downgrades. It deliberately
-does not claim to automate focus, Alt-Tab visibility, DWM alpha, Z-order or
-cross-application hit-testing.
+encoding, save-once behavior, clipboard round-trip and artifact-selected OCR
+while rejecting apartment failures and unexplained GDI downgrades.
+`-ArtifactType portable` (the default) asserts `unpackaged` and
+`tesseract`; `-ArtifactType packaged` requires `-Binary`, asserts a real
+package full name and `windows-media-ocr`, and permits only the documented
+missing-language-pack skip. `-TesseractDirectory` supplies the absolute override
+for source-built development artifacts; an extracted portable artifact is
+validated against its sibling `tesseract` directory instead. The script clears
+an inherited override when none is explicit, so an incomplete ZIP cannot pass
+by borrowing a developer installation. It deliberately does not claim to
+automate focus, Alt-Tab visibility, DWM alpha, Z-order or cross-application
+hit-testing. `-RequireWgc` turns a legitimate GDI downgrade into a failure for a
+Windows 11 WGC qualification run, while `-RequireNegativeCoordinates` requires
+the lab to arrange at least one monitor left of or above the primary and proves
+that its signed origin survived enumeration.
 
 ---
 

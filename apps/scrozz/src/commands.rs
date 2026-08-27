@@ -346,6 +346,8 @@ fn list(what: ListWhat) -> CliResult<Report> {
                 Json::obj([
                     ("id", Json::str(d.id.0.as_str())),
                     ("name", Json::str(d.name.as_str())),
+                    ("x", Json::Float(d.bounds.origin.x)),
+                    ("y", Json::Float(d.bounds.origin.y)),
                     ("width", Json::Float(d.bounds.size.width)),
                     ("height", Json::Float(d.bounds.size.height)),
                     ("scale", Json::Float(d.scale.get())),
@@ -356,10 +358,12 @@ fn list(what: ListWhat) -> CliResult<Report> {
                 .iter()
                 .map(|d| {
                     format!(
-                        "{}  {}×{} @{}×{}",
+                        "{}  {}×{} at ({}, {}) @{}×{}",
                         d.id.0,
                         d.bounds.size.width,
                         d.bounds.size.height,
+                        d.bounds.origin.x,
+                        d.bounds.origin.y,
                         d.scale.get(),
                         if d.is_primary { "  (primary)" } else { "" }
                     )
