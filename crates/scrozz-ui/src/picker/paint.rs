@@ -5,9 +5,10 @@
 //! radius. The estimate affects only picker chrome; capture output keeps the
 //! platform's native edge pixels and alpha untouched.
 
+use egui::epaint::Mesh;
 use egui::{
-    Align2, Color32, CornerRadius, Key, Painter, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2, pos2,
-    vec2,
+    Align2, Color32, CornerRadius, Key, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, Vec2,
+    pos2, vec2,
 };
 use scrozz_core::{LogicalPoint, LogicalRect};
 
@@ -24,12 +25,13 @@ const KEYBOARD_INNER_OUTLINE_WIDTH: f32 = 2.0;
 const LABEL_GAP: f32 = Space::SM;
 const LABEL_PADDING_X: f32 = 11.0;
 const LABEL_PADDING_Y: f32 = 6.0;
+const CORNER_SEGMENTS: u32 = 12;
 
 // Public window APIs do not expose the compositor's final per-window radius.
 // These logical-point estimates follow each platform's current window language;
 // Wayland uses its portal picker and never reaches this paint path.
 #[cfg(target_os = "macos")]
-const PLATFORM_WINDOW_RADIUS: f32 = 10.0;
+const PLATFORM_WINDOW_RADIUS: f32 = 16.0;
 #[cfg(target_os = "windows")]
 const PLATFORM_WINDOW_RADIUS: f32 = 8.0;
 #[cfg(target_os = "linux")]
@@ -124,6 +126,11 @@ pub fn draw(
             Color32::from_black_alpha(SCRIM_ALPHA),
         );
     }
+    painter.add(Shape::mesh(rounded_hole_corner_mesh(
+        layout.highlight,
+        PLATFORM_WINDOW_RADIUS,
+        Color32::from_black_alpha(SCRIM_ALPHA),
+    )));
 
     painter.rect_filled(
         layout.highlight,
@@ -157,6 +164,60 @@ pub fn draw(
         highlight.label()
     );
     paint_label(painter, viewport, layout.highlight, &text, theme);
+}
+
+fn rounded_hole_corner_mesh(rect: Rect, radius: f32, color: Color32) -> Mesh {
+    let radius = radius
+        .max(0.0)
+        .min(rect.width().min(rect.height()).max(0.0) / 2.0);
+    if radius <= f32::EPSILON {
+        return Mesh::default();
+    }
+
+    let corners = [
+        (
+            rect.left_top(),
+            pos2(rect.left() + radius, rect.top() + radius),
+            std::f32::consts::PI,
+        ),
+        (
+            rect.right_top(),
+            pos2(rect.right() - radius, rect.top() + radius),
+            std::f32::consts::PI * 1.5,
+        ),
+        (
+            rect.right_bottom(),
+            pos2(rect.right() - radius, rect.bottom() - radius),
+            0.0,
+        ),
+        (
+            rect.left_bottom(),
+            pos2(rect.left() + radius, rect.bottom() - radius),
+            std::f32::consts::FRAC_PI_2,
+        ),
+    ];
+
+    let mut mesh = Mesh::default();
+    for (outer, center, start_angle) in corners {
+        let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
+        mesh.colored_vertex(outer, color);
+        for step in 0..=CORNER_SEGMENTS {
+            #[allow(clippy::cast_precision_loss)]
+            let angle =
+                start_angle + std::f32::consts::FRAC_PI_2 * (step as f32 / CORNER_SEGMENTS as f32);
+            mesh.colored_vertex(
+                pos2(
+                    center.x + angle.cos() * radius,
+                    center.y + angle.sin() * radius,
+                ),
+                color,
+            );
+        }
+        for segment in 0..CORNER_SEGMENTS {
+            mesh.add_triangle(first, first + segment + 1, first + segment + 2);
+        }
+    }
+    mesh
 }
 
 /// Applies pointer and keyboard input to a picker and paints the resulting frame.
@@ -369,5 +430,18 @@ mod tests {
         assert!(pointer.outline_opacity < keyboard.outline_opacity);
         assert_eq!(pointer.inner_outline_width, None);
         assert!(keyboard.inner_outline_width.is_some());
+    }
+
+    #[test]
+    fn scrim_corner_mesh_rounds_the_selection_hole() {
+        let rect = Rect::from_min_size(pos2(10.0, 20.0), vec2(300.0, 200.0));
+        let mesh = rounded_hole_corner_mesh(rect, 16.0, Color32::BLACK);
+
+        assert!(mesh.is_valid());
+        assert_eq!(
+            mesh.triangles().count(),
+            usize::try_from(CORNER_SEGMENTS * 4).unwrap_or(usize::MAX)
+        );
+        assert_eq!(mesh.calc_bounds(), rect);
     }
 }
