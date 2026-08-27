@@ -17,17 +17,27 @@
 //! is reported as a mistake in the command line even now, and the resolution
 //! logic is exercised by tests that never touch a screen.
 
-use std::path::Path;
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read as _},
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
+    thread,
+    time::Duration,
+};
 
 use clap::Parser as _;
 use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
 use scrozz_shell::{
-    Notification, RegistrationStatus, autostart::AutostartTarget, url_scheme::SchemeTarget,
+    Notification, PackageKind, RegistrationStatus, SystemPlatform, autostart::AutostartTarget,
+    url_scheme::SchemeTarget,
 };
 use scrozz_update::{
-    CheckOutcome, InstallPlan, Phase, PinnedKeyRing, UpdateState, Updater, VerifiedUpdate,
+    ChannelEndpointStatus, CheckOutcome, InstallPlan, NativePlatformInstallAdapter, Phase,
+    PlatformHandoff, PlatformInstallPhase, PlatformInstallState, PlatformInstallTarget,
+    UpdateCheckRecord, UpdateChecker, UpdateState, Updater, VerifiedUpdate, inspect_state,
 };
 use semver::Version;
 
@@ -45,6 +55,7 @@ use crate::{
     settings,
     settings_store::SettingsStore,
     system_integration::SystemContext,
+    update_policy::{UpdateConfiguration, production_keys},
     url::UrlAction,
 };
 
@@ -739,36 +750,60 @@ fn set_url_enabled(
 
 fn update(command: &UpdateCommand) -> CliResult<Report> {
     let context = SystemContext::current()?;
-    let keys = PinnedKeyRing::production();
-
-    if matches!(command, UpdateCommand::Check { .. }) && keys.is_empty() {
-        return Err(CliError::not_implemented(
-            "checking release manifests until a human-controlled public key is pinned",
-            "the release signing process",
-        ));
-    }
-
-    let mut updater = Updater::open(context.update_state.clone(), keys).map_err(update_error)?;
     match command {
-        UpdateCommand::Status => Ok(update_state_report(
-            updater.state(),
-            &context.update_state,
-            PinnedKeyRing::production().len(),
-        )),
-        UpdateCommand::Check {
-            manifest_url,
-            signature_url,
-        } => {
+        UpdateCommand::Status => {
+            let configuration = UpdateConfiguration::production(&SettingsStore::open_default()?)?;
+            let state = inspect_state(&context.update_state).map_err(update_error)?;
+            let mut report = update_state_report(
+                &state,
+                &context.update_state,
+                configuration.trusted_key_count(),
+                Some(&configuration),
+            );
+            attach_platform_handoff_status(&mut report, &context.update_handoff)?;
+            Ok(report)
+        }
+        UpdateCommand::Check { channel } => {
+            let configuration = UpdateConfiguration::production(&SettingsStore::open_default()?)?;
+            let channel = (*channel)
+                .map(scrozz_update::UpdateChannel::from)
+                .unwrap_or_else(|| configuration.channel());
+            if let Some(reason) = configuration.blocked_reason(channel) {
+                return Err(CliError::not_implemented(
+                    format!("checking the {channel} update channel: {reason}"),
+                    "the release endpoint and signing configuration",
+                ));
+            }
+            let resolved = configuration.resolve(channel).map_err(update_error)?;
             let installed = Version::parse(scrozz_core::identity::VERSION).map_err(|error| {
                 CliError::Core(CoreError::Platform(format!(
                     "this build has an invalid semantic version: {error}"
                 )))
             })?;
-            let outcome = updater
-                .check(manifest_url.clone(), signature_url.clone(), &installed)
+            let mut checker = UpdateChecker::open(&context.update_state, production_keys())
                 .map_err(update_error)?;
-            Ok(check_outcome_report(&outcome))
+            let outcome = checker
+                .check_for_kind(&resolved, &installed, context.update_artifact_kind())
+                .map_err(update_error)?;
+            Ok(check_outcome_report(&outcome, channel))
         }
+        UpdateCommand::ApplyHandoff { path } => {
+            apply_platform_handoff(path, PlatformHandoffAction::Install)
+        }
+        UpdateCommand::ApplyRollbackHandoff { path } => {
+            apply_platform_handoff(path, PlatformHandoffAction::Rollback)
+        }
+        UpdateCommand::RollbackPlatform => queue_platform_rollback(&context),
+        UpdateCommand::AcceptPlatform => accept_platform_handoff(&context),
+        mutating => mutate_update(mutating, &context),
+    }
+}
+
+fn mutate_update(command: &UpdateCommand, context: &SystemContext) -> CliResult<Report> {
+    let keys = production_keys();
+    let trusted_key_count = keys.len();
+    let mut updater = Updater::open(context.update_state.clone(), keys).map_err(update_error)?;
+    match command {
         UpdateCommand::Download { output } => {
             let candidate = if updater.state().phase() == Phase::Failed {
                 updater.retry_available_update().map_err(update_error)?
@@ -845,12 +880,37 @@ fn update(command: &UpdateCommand) -> CliResult<Report> {
                 ),
             ))
         }
+        UpdateCommand::InstallPlatform { rollback_package } => {
+            require_no_running_instance()?;
+            let staged = updater.staged_artifact().map_err(update_error)?;
+            let target = platform_install_target(context, rollback_package.clone())?;
+            let handoff = PlatformHandoff::begin(&context.update_handoff, &staged, target)
+                .map_err(update_error)?;
+            let helper = queue_platform_helper(context, handoff.path(), "apply-handoff")?;
+            Ok(Report::new(
+                Json::obj([
+                    ("phase", Json::str("awaiting-restart")),
+                    (
+                        "handoff",
+                        Json::str(handoff.path().to_string_lossy().into_owned()),
+                    ),
+                    ("helper", Json::str(helper.to_string_lossy().into_owned())),
+                    (
+                        "artifact_kind",
+                        Json::str(staged.artifact().metadata().kind().as_str()),
+                    ),
+                    ("automatic_install", Json::Bool(false)),
+                ]),
+                "Queued the verified native update. Installation starts only after this process exits.",
+            ))
+        }
         UpdateCommand::Recover => {
             updater.recover().map_err(update_error)?;
             Ok(update_state_report(
                 updater.state(),
                 &context.update_state,
-                PinnedKeyRing::production().len(),
+                trusted_key_count,
+                None,
             ))
         }
         UpdateCommand::Rollback => {
@@ -858,7 +918,8 @@ fn update(command: &UpdateCommand) -> CliResult<Report> {
             Ok(update_state_report(
                 updater.state(),
                 &context.update_state,
-                PinnedKeyRing::production().len(),
+                trusted_key_count,
+                None,
             ))
         }
         UpdateCommand::Reset => {
@@ -866,10 +927,298 @@ fn update(command: &UpdateCommand) -> CliResult<Report> {
             Ok(update_state_report(
                 updater.state(),
                 &context.update_state,
-                PinnedKeyRing::production().len(),
+                trusted_key_count,
+                None,
             ))
         }
+        UpdateCommand::Status
+        | UpdateCommand::Check { .. }
+        | UpdateCommand::ApplyHandoff { .. }
+        | UpdateCommand::ApplyRollbackHandoff { .. }
+        | UpdateCommand::RollbackPlatform
+        | UpdateCommand::AcceptPlatform => Err(CliError::Core(CoreError::Platform(
+            "internal update dispatch mismatch".to_owned(),
+        ))),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlatformHandoffAction {
+    Install,
+    Rollback,
+}
+
+fn platform_install_target(
+    context: &SystemContext,
+    rollback_package: Option<PathBuf>,
+) -> CliResult<PlatformInstallTarget> {
+    let target = match (context.platform, context.package_kind) {
+        (SystemPlatform::MacOS, _) => {
+            if rollback_package.is_some() {
+                return Err(CliError::usage(
+                    "--rollback-package is only valid for an MSIX installation",
+                ));
+            }
+            PlatformInstallTarget::macos_app(
+                context
+                    .native_install_root()?
+                    .ok_or_else(|| CliError::usage("the macOS app bundle path is unavailable"))?,
+            )
+        }
+        (SystemPlatform::Windows, PackageKind::Msix) => {
+            PlatformInstallTarget::windows_msix(scrozz_core::identity::BUNDLE_ID, rollback_package)
+        }
+        (SystemPlatform::Windows, _) => {
+            if rollback_package.is_some() {
+                return Err(CliError::usage(
+                    "--rollback-package is only valid for an MSIX installation",
+                ));
+            }
+            PlatformInstallTarget::windows_portable(context.native_install_root()?.ok_or_else(
+                || CliError::usage("the portable installation directory is unavailable"),
+            )?)
+        }
+        (SystemPlatform::Linux, _) => {
+            if rollback_package.is_some() {
+                return Err(CliError::usage(
+                    "--rollback-package is only valid for an MSIX installation",
+                ));
+            }
+            PlatformInstallTarget::linux_appdir(
+                context
+                    .native_install_root()?
+                    .ok_or_else(|| CliError::usage("the Linux AppDir path is unavailable"))?,
+            )
+        }
+    };
+    target.map_err(update_error)
+}
+
+fn require_no_running_instance() -> CliResult<()> {
+    match ipc::probe() {
+        ipc::Status::NotRunning => Ok(()),
+        ipc::Status::Running => Err(CliError::usage(
+            "quit the running Scrozz app before installing or rolling back a native update",
+        )),
+        ipc::Status::Unusable(error) => Err(CliError::ipc(format!(
+            "cannot prove that Scrozz is stopped: {error}"
+        ))),
+    }
+}
+
+fn queue_platform_rollback(context: &SystemContext) -> CliResult<Report> {
+    require_no_running_instance()?;
+    let handoff = PlatformHandoff::open(&context.update_handoff).map_err(update_error)?;
+    if !matches!(
+        handoff.state().phase(),
+        PlatformInstallPhase::Installed
+            | PlatformInstallPhase::Failed
+            | PlatformInstallPhase::RollingBack
+    ) {
+        return Err(CliError::usage(format!(
+            "native update rollback is unavailable in phase {:?}",
+            handoff.state().phase()
+        )));
+    }
+    if !handoff.state().target().rollback_available() {
+        return Err(update_error(
+            scrozz_update::Error::PlatformRollbackUnavailable,
+        ));
+    }
+    let path = handoff.path().to_path_buf();
+    drop(handoff);
+    let helper = queue_platform_helper(context, &path, "apply-rollback-handoff")?;
+    Ok(Report::new(
+        Json::obj([
+            ("phase", Json::str("rollback-awaiting-restart")),
+            ("handoff", Json::str(path.to_string_lossy().into_owned())),
+            ("helper", Json::str(helper.to_string_lossy().into_owned())),
+        ]),
+        "Queued native update rollback. Restoration starts after this process exits.",
+    ))
+}
+
+fn accept_platform_handoff(context: &SystemContext) -> CliResult<Report> {
+    let mut handoff = PlatformHandoff::open(&context.update_handoff).map_err(update_error)?;
+    handoff
+        .accept(&NativePlatformInstallAdapter)
+        .map_err(update_error)?;
+    let data = platform_handoff_json(handoff.path(), handoff.state());
+    drop(handoff);
+    let mut updater =
+        Updater::open(&context.update_state, production_keys()).map_err(update_error)?;
+    if updater.state().phase() == Phase::Staged {
+        updater.reset_to_idle().map_err(update_error)?;
+    }
+    Ok(Report::new(
+        data,
+        "Accepted the native update result and removed its retained rollback payload.",
+    ))
+}
+
+fn apply_platform_handoff(path: &Path, action: PlatformHandoffAction) -> CliResult<Report> {
+    let mut input = io::stdin().lock();
+    let mut buffer = [0_u8; 64];
+    while input.read(&mut buffer).map_err(CoreError::Io)? != 0 {}
+
+    require_no_running_instance()?;
+    let mut handoff = PlatformHandoff::open(path).map_err(update_error)?;
+    match action {
+        PlatformHandoffAction::Install => handoff
+            .apply(&NativePlatformInstallAdapter)
+            .map_err(update_error)?,
+        PlatformHandoffAction::Rollback => handoff
+            .rollback(&NativePlatformInstallAdapter)
+            .map_err(update_error)?,
+    }
+    Ok(Report::new(
+        platform_handoff_json(handoff.path(), handoff.state()),
+        match action {
+            PlatformHandoffAction::Install => "Installed the verified native update.",
+            PlatformHandoffAction::Rollback => "Restored the retained native installation.",
+        },
+    ))
+}
+
+fn queue_platform_helper(
+    context: &SystemContext,
+    handoff: &Path,
+    subcommand: &str,
+) -> CliResult<PathBuf> {
+    let mut source = File::open(&context.executable).map_err(CoreError::Io)?;
+    let source_metadata = source.metadata().map_err(CoreError::Io)?;
+    if !source_metadata.file_type().is_file() {
+        return Err(CliError::Core(CoreError::Platform(format!(
+            "update helper source is not a regular file: {}",
+            context.executable.display()
+        ))));
+    }
+    let directory = context
+        .update_handoff
+        .parent()
+        .ok_or_else(|| CliError::usage("the native handoff path has no parent directory"))?;
+    fs::create_dir_all(directory).map_err(CoreError::Io)?;
+    let extension = if context.platform == SystemPlatform::Windows {
+        ".exe"
+    } else {
+        ""
+    };
+    let mut selected = None;
+    for attempt in 0..32 {
+        let helper = directory.join(format!(
+            ".scrozz-update-helper-{}-{subcommand}-{attempt}{extension}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&helper)
+        {
+            Ok(destination) => {
+                selected = Some((helper, destination));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(CliError::Core(CoreError::Io(error))),
+        }
+    }
+    let (helper, mut destination) = selected.ok_or_else(|| {
+        CliError::Core(CoreError::Platform(
+            "could not reserve a unique native update helper path".into(),
+        ))
+    })?;
+    if let Err(error) = (|| {
+        io::copy(&mut source, &mut destination)?;
+        destination.set_permissions(source_metadata.permissions())?;
+        destination.sync_all()
+    })() {
+        drop(destination);
+        let _ = fs::remove_file(&helper);
+        return Err(CliError::Core(CoreError::Io(error)));
+    }
+    drop(destination);
+
+    let child = ProcessCommand::new(&helper)
+        .arg("--no-ipc")
+        .arg("--quiet")
+        .arg("update")
+        .arg(subcommand)
+        .arg("--path")
+        .arg(handoff)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&helper);
+            return Err(CliError::Core(CoreError::Io(error)));
+        }
+    };
+    thread::sleep(Duration::from_millis(50));
+    if let Some(status) = child.try_wait().map_err(CoreError::Io)? {
+        let _ = fs::remove_file(&helper);
+        return Err(CliError::Core(CoreError::Platform(format!(
+            "native update helper exited before handoff with status {status}"
+        ))));
+    }
+    let guard = child.stdin.take().ok_or_else(|| {
+        CliError::Core(CoreError::Platform(
+            "native update helper did not retain its parent guard".into(),
+        ))
+    })?;
+    std::mem::forget(guard);
+    drop(child);
+    Ok(helper)
+}
+
+fn attach_platform_handoff_status(report: &mut Report, path: &Path) -> CliResult<()> {
+    let handoff = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Some(PlatformHandoff::open(path).map_err(update_error)?)
+        }
+        Ok(_) => {
+            return Err(CliError::Core(CoreError::Platform(format!(
+                "native update handoff is not a regular file: {}",
+                path.display()
+            ))));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(CliError::Core(CoreError::Io(error))),
+    };
+    let native = handoff.as_ref().map_or(Json::Null, |handoff| {
+        platform_handoff_json(handoff.path(), handoff.state())
+    });
+    if let Json::Obj(fields) = &mut report.data {
+        fields.push(("native_handoff".into(), native));
+    }
+    if let Some(handoff) = handoff {
+        report.human.push_str(&format!(
+            "\nNative handoff: {:?} ({})",
+            handoff.state().phase(),
+            handoff.path().display()
+        ));
+    }
+    Ok(())
+}
+
+fn platform_handoff_json(path: &Path, state: &PlatformInstallState) -> Json {
+    Json::obj([
+        ("path", Json::str(path.to_string_lossy().into_owned())),
+        ("phase", Json::str(state.phase().as_str())),
+        ("artifact_kind", Json::str(state.artifact().kind().as_str())),
+        ("target", Json::str(state.target().as_str())),
+        (
+            "archive",
+            Json::str(state.archive().to_string_lossy().into_owned()),
+        ),
+        (
+            "rollback_available",
+            Json::Bool(state.target().rollback_available()),
+        ),
+        ("failure", Json::opt(state.failure(), Json::str)),
+    ])
 }
 
 fn system(command: &SystemCommand) -> CliResult<Report> {
@@ -880,11 +1229,11 @@ fn system(command: &SystemCommand) -> CliResult<Report> {
             let scheme = context.url_scheme()?;
             let autostart_status = autostart.status()?;
             let scheme_status = scheme.status()?;
-            let url_enabled =
-                SettingsStore::open_default()?.boolean("system.url-scheme-enabled")?;
-            let updater = Updater::open_with_production_keys(context.update_state.clone())
-                .map_err(update_error)?;
-            let trusted_update_keys = PinnedKeyRing::production().len();
+            let settings = SettingsStore::open_default()?;
+            let url_enabled = settings.boolean("system.url-scheme-enabled")?;
+            let update_configuration = UpdateConfiguration::production(&settings)?;
+            let update_state = inspect_state(&context.update_state).map_err(update_error)?;
+            let trusted_update_keys = update_configuration.trusted_key_count();
             Ok(Report::new(
                 Json::obj([
                     ("product", Json::str(scrozz_core::identity::PRODUCT_NAME)),
@@ -903,14 +1252,18 @@ fn system(command: &SystemCommand) -> CliResult<Report> {
                         Json::str(registration_slug(scheme_status)),
                     ),
                     ("url_enabled", Json::Bool(url_enabled)),
-                    (
-                        "update_phase",
-                        Json::str(phase_slug(updater.state().phase())),
-                    ),
+                    ("update_phase", Json::str(phase_slug(update_state.phase()))),
                     ("trusted_update_keys", Json::Int(trusted_update_keys as i64)),
+                    (
+                        "update",
+                        update_runtime_json(&update_state, &update_configuration),
+                    ),
                 ]),
                 format!(
-                    "{} {} ({})\nPackage: {}\nAutostart: {}\nURL registration: {}\nURL automation: {}\nUpdate state: {}\nTrusted update keys: {}",
+                    "{} {} ({})\nPackage: {}\nAutostart: {}\nURL registration: {}\n\
+                     URL automation: {}\nUpdate state: {}\nUpdate channel: {}\n\
+                     Automatic checks: {}\nTrusted update keys: {}\n\
+                     Automatic checks never download or install updates.",
                     scrozz_core::identity::PRODUCT_NAME,
                     scrozz_core::identity::VERSION,
                     scrozz_core::identity::platform_key(),
@@ -918,7 +1271,9 @@ fn system(command: &SystemCommand) -> CliResult<Report> {
                     registration_slug(autostart_status),
                     registration_slug(scheme_status),
                     if url_enabled { "enabled" } else { "disabled" },
-                    phase_slug(updater.state().phase()),
+                    phase_slug(update_state.phase()),
+                    update_configuration.channel(),
+                    automatic_check_summary(&update_configuration),
                     trusted_update_keys_summary(trusted_update_keys),
                 ),
             ))
@@ -987,7 +1342,12 @@ fn scheme_target(target: &SchemeTarget) -> String {
     }
 }
 
-fn update_state_report(state: &UpdateState, state_path: &Path, trusted_keys: usize) -> Report {
+fn update_state_report(
+    state: &UpdateState,
+    state_path: &Path,
+    trusted_keys: usize,
+    configuration: Option<&UpdateConfiguration>,
+) -> Report {
     let candidate = state.candidate().map(|candidate| {
         Json::obj([
             ("version", Json::str(candidate.version().to_string())),
@@ -997,6 +1357,7 @@ fn update_state_report(state: &UpdateState, state_path: &Path, trusted_keys: usi
     let artifact = state.artifact().map(|artifact| {
         Json::obj([
             ("platform", Json::str(artifact.platform())),
+            ("kind", Json::str(artifact.kind().as_str())),
             ("url", Json::str(artifact.url().as_str())),
             ("sha256", Json::str(artifact.sha256().as_hex())),
             ("size", Json::str(artifact.size().to_string())),
@@ -1018,12 +1379,32 @@ fn update_state_report(state: &UpdateState, state_path: &Path, trusted_keys: usi
             ),
         ])
     });
+    let policy_human = configuration.map_or_else(String::new, |configuration| {
+        format!(
+            "\nUpdate channel: {}\nAutomatic checks: {}\n\
+             Automatic checks never download or install updates.",
+            configuration.channel(),
+            automatic_check_summary(configuration)
+        )
+    });
+    let last_check_human = state.last_check().map_or_else(String::new, |check| {
+        format!(
+            "\nLast check: {}{}",
+            check.result().as_str(),
+            check
+                .error()
+                .map_or_else(String::new, |error| format!(" ({error})"))
+        )
+    });
     let human = format!(
-        "Update state: {}\nGeneration watermark: {}\nState file: {}\nTrusted update keys: {}{}",
+        "Update state: {}\nGeneration watermark: {}\nState file: {}\n\
+         Trusted update keys: {}{}{}{}",
         phase_slug(state.phase()),
         state.highest_accepted_generation(),
         state_path.display(),
         trusted_keys,
+        policy_human,
+        last_check_human,
         state
             .failure()
             .map_or_else(String::new, |failure| format!("\nFailure: {failure}"))
@@ -1060,16 +1441,25 @@ fn update_state_report(state: &UpdateState, state_path: &Path, trusted_keys: usi
                 Json::str(state_path.to_string_lossy().into_owned()),
             ),
             ("trusted_keys", Json::Int(trusted_keys as i64)),
+            (
+                "policy",
+                Json::opt(configuration, update_configuration_json),
+            ),
+            (
+                "last_check",
+                Json::opt(state.last_check(), update_check_record_json),
+            ),
         ]),
         human,
     )
 }
 
-fn check_outcome_report(outcome: &CheckOutcome) -> Report {
+fn check_outcome_report(outcome: &CheckOutcome, channel: scrozz_update::UpdateChannel) -> Report {
     match outcome {
         CheckOutcome::Current { version, generated } => Report::new(
             Json::obj([
                 ("outcome", Json::str("current")),
+                ("channel", Json::str(channel.as_str())),
                 ("version", Json::str(version.to_string())),
                 ("generation", Json::str(generated.to_string())),
             ]),
@@ -1082,6 +1472,7 @@ fn check_outcome_report(outcome: &CheckOutcome) -> Report {
         } => Report::new(
             Json::obj([
                 ("outcome", Json::str("platform-unavailable")),
+                ("channel", Json::str(channel.as_str())),
                 ("version", Json::str(version.to_string())),
                 ("generation", Json::str(generated.to_string())),
                 ("platform", Json::str(platform)),
@@ -1091,6 +1482,7 @@ fn check_outcome_report(outcome: &CheckOutcome) -> Report {
         CheckOutcome::UpdateAvailable(candidate) => Report::new(
             Json::obj([
                 ("outcome", Json::str("update-available")),
+                ("channel", Json::str(channel.as_str())),
                 ("candidate", candidate_json(candidate)),
                 ("installed", Json::Bool(false)),
             ]),
@@ -1108,10 +1500,113 @@ fn candidate_json(candidate: &VerifiedUpdate) -> Json {
         ("version", Json::str(candidate.version().to_string())),
         ("generation", Json::str(candidate.generated().to_string())),
         ("platform", Json::str(artifact.platform())),
+        ("kind", Json::str(artifact.kind().as_str())),
         ("url", Json::str(artifact.url().as_str())),
         ("sha256", Json::str(artifact.sha256().as_hex())),
         ("size", Json::str(artifact.size().to_string())),
     ])
+}
+
+fn update_runtime_json(state: &UpdateState, configuration: &UpdateConfiguration) -> Json {
+    Json::obj([
+        ("phase", Json::str(phase_slug(state.phase()))),
+        ("policy", update_configuration_json(configuration)),
+        (
+            "last_check",
+            Json::opt(state.last_check(), update_check_record_json),
+        ),
+    ])
+}
+
+fn update_configuration_json(configuration: &UpdateConfiguration) -> Json {
+    let endpoint_status = configuration.endpoint_status(configuration.channel());
+    let (endpoint_state, endpoint_reason) = match &endpoint_status {
+        ChannelEndpointStatus::Available(_) => ("available", None),
+        ChannelEndpointStatus::Disabled { reason, .. } => ("disabled", Some(*reason)),
+    };
+    let automatic_state = if !configuration.automatic() {
+        "off"
+    } else if configuration
+        .blocked_reason(configuration.channel())
+        .is_some()
+    {
+        "blocked"
+    } else {
+        "scheduled"
+    };
+    Json::obj([
+        ("channel", Json::str(configuration.channel().as_str())),
+        ("endpoint_status", Json::str(endpoint_state)),
+        ("endpoint_reason", Json::opt(endpoint_reason, Json::str)),
+        (
+            "manifest_url",
+            Json::opt(endpoint_status.endpoints(), |endpoints| {
+                Json::str(endpoints.manifest().as_str())
+            }),
+        ),
+        (
+            "signature_url",
+            Json::opt(endpoint_status.endpoints(), |endpoints| {
+                Json::str(endpoints.signature().as_str())
+            }),
+        ),
+        ("check_automatically", Json::Bool(configuration.automatic())),
+        ("automatic_state", Json::str(automatic_state)),
+        (
+            "check_interval_hours",
+            Json::Int(configuration.interval_hours() as i64),
+        ),
+        (
+            "trusted_keys",
+            Json::Int(configuration.trusted_key_count() as i64),
+        ),
+        ("automatic_downloads", Json::Bool(false)),
+        ("automatic_installs", Json::Bool(false)),
+    ])
+}
+
+fn update_check_record_json(check: &UpdateCheckRecord) -> Json {
+    Json::obj([
+        (
+            "channel",
+            Json::opt(check.channel(), |channel| Json::str(channel.as_str())),
+        ),
+        (
+            "completed_at_unix_seconds",
+            Json::opt(check.completed_at_unix_seconds(), |timestamp| {
+                Json::Int(timestamp as i64)
+            }),
+        ),
+        ("result", Json::str(check.result().as_str())),
+        (
+            "version",
+            Json::opt(check.version(), |version| Json::str(version.to_string())),
+        ),
+        (
+            "generation",
+            Json::opt(check.generation(), |generation| {
+                Json::str(generation.to_string())
+            }),
+        ),
+        (
+            "platform",
+            Json::opt(check.platform(), |platform| Json::str(platform.to_owned())),
+        ),
+        (
+            "error",
+            Json::opt(check.error(), |error| Json::str(error.to_owned())),
+        ),
+    ])
+}
+
+fn automatic_check_summary(configuration: &UpdateConfiguration) -> String {
+    if !configuration.automatic() {
+        return "off".to_owned();
+    }
+    if let Some(reason) = configuration.blocked_reason(configuration.channel()) {
+        return format!("blocked ({reason})");
+    }
+    format!("every {} hours", configuration.interval_hours())
 }
 
 const fn phase_slug(phase: Phase) -> &'static str {
@@ -1640,18 +2135,32 @@ mod tests {
     #[test]
     fn update_check_is_gated_before_any_network_request() {
         with_empty_settings(|| {
-            let err = run(&[
-                "scrozz",
-                "update",
-                "check",
-                "--manifest-url",
-                "https://127.0.0.1/manifest.json",
-                "--signature-url",
-                "https://127.0.0.1/manifest.sig",
-            ])
-            .unwrap_err();
+            let err = run(&["scrozz", "update", "check"]).unwrap_err();
             assert_eq!(err.exit(), Exit::NotImplemented);
-            assert!(err.to_string().contains("public key"), "{err}");
+            assert!(err.to_string().contains("signing keys"), "{err}");
+            assert!(err.to_string().contains("endpoint"), "{err}");
+        });
+    }
+
+    #[test]
+    fn update_status_reports_default_off_check_only_policy() {
+        with_empty_settings(|| {
+            let report = run(&["scrozz", "update", "status"]).unwrap();
+            let rendered = report.data.to_compact_string();
+            assert!(
+                rendered.contains(r#""check_automatically":false"#),
+                "{rendered}"
+            );
+            assert!(rendered.contains(r#""channel":"stable""#), "{rendered}");
+            assert!(
+                rendered.contains(r#""automatic_downloads":false"#),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(r#""automatic_installs":false"#),
+                "{rendered}"
+            );
+            assert!(report.human.contains("never download or install"));
         });
     }
 

@@ -14,7 +14,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cli::Command,
+    cli::{Command, SystemCommand},
     fault::{CliError, CliResult},
     url::UrlAction,
 };
@@ -93,12 +93,16 @@ pub fn policy(command: &Command) -> Forwarding {
         Command::History(_) | Command::Ocr(_) => Forwarding::Prefer,
         Command::Settings(args) if args.is_write() => Forwarding::Prefer,
         Command::Url(args) if args.writes_settings() => Forwarding::Prefer,
-        Command::Update(_) | Command::System(_) => Forwarding::Prefer,
+        Command::System(args) if matches!(&args.command, SystemCommand::Notify { .. }) => {
+            Forwarding::Prefer
+        }
         Command::Settings(_)
         | Command::List(_)
         | Command::Hotkey(_)
         | Command::Autostart(_)
         | Command::Url(_)
+        | Command::Update(_)
+        | Command::System(_)
         | Command::Gui => Forwarding::Never,
     }
 }
@@ -1074,8 +1078,9 @@ mod tests {
             vec!["scrozz", "ocr"],
             vec!["scrozz", "settings", "set", "capture.format", "png"],
             vec!["scrozz", "url", "enable"],
-            vec!["scrozz", "update", "status"],
-            vec!["scrozz", "system", "status"],
+            vec![
+                "scrozz", "system", "notify", "--title", "Scrozz", "--body", "Ready",
+            ],
         ] {
             assert_eq!(policy(&command_of(&args)), Forwarding::Prefer, "{args:?}");
         }
@@ -1093,6 +1098,8 @@ mod tests {
                 "--compositor",
                 "sway",
             ],
+            vec!["scrozz", "update", "status"],
+            vec!["scrozz", "system", "status"],
             vec!["scrozz", "gui"],
         ] {
             assert_eq!(policy(&command_of(&args)), Forwarding::Never, "{args:?}");

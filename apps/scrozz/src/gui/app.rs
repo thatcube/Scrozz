@@ -41,6 +41,12 @@ use crate::{
     },
     json::Json,
     report::Report,
+    settings::{
+        UPDATE_CHANNEL_KEY, UPDATE_CHECK_AUTOMATICALLY_KEY, UPDATE_CHECK_INTERVAL_HOURS_KEY,
+    },
+    settings_store::SettingsStore,
+    system_integration::SystemContext,
+    update_policy::AutomaticUpdateScheduler,
 };
 
 /// What a hotkey is bound to unless the environment says otherwise.
@@ -86,6 +92,8 @@ pub struct Config {
     pub tray: bool,
     /// Whether to listen for forwarded commands.
     pub ipc: bool,
+    /// Whether this run may read settings and start the check-only update scheduler.
+    pub updates: bool,
     /// When to quit regardless of what anyone asked.
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
@@ -101,6 +109,7 @@ impl Default for Config {
                 .collect(),
             tray: true,
             ipc: true,
+            updates: true,
             deadline: None,
             capture_on_start: None,
         }
@@ -151,6 +160,7 @@ impl Config {
             bindings: Vec::new(),
             tray: false,
             ipc: false,
+            updates: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
         }
@@ -187,6 +197,8 @@ pub struct App {
     tray: Option<Tray>,
     hotkeys: GlobalHotkeys,
     server: Option<Server>,
+    updates: AutomaticUpdateScheduler,
+    updates_dirty: bool,
     started: Instant,
     captures: u64,
     notes: Vec<String>,
@@ -205,6 +217,11 @@ impl App {
     pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
         let pipeline = Pipeline::start()?;
         let mut notes = Vec::new();
+        let updates = if config.updates {
+            Self::build_update_scheduler(&mut notes)
+        } else {
+            AutomaticUpdateScheduler::unavailable("disabled by the sealed run configuration")
+        };
 
         let server = if config.ipc {
             // The one failure worth stopping for: another instance is live,
@@ -267,6 +284,8 @@ impl App {
             tray,
             hotkeys,
             server,
+            updates,
+            updates_dirty: false,
             started: Instant::now(),
             captures: 0,
             notes,
@@ -298,6 +317,7 @@ impl App {
             return Tick::Stop;
         }
         self.drain_pipeline();
+        self.drain_updates();
         self.drain_cards();
 
         Tick::Continue
@@ -363,6 +383,9 @@ impl App {
             // command layer is synchronous. A capture is tens of milliseconds;
             // a recording returns as soon as it has started.
             if let Some(command) = request.serve() {
+                if Self::command_changes_update_policy(&command) {
+                    self.updates_dirty = true;
+                }
                 self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
@@ -413,6 +436,20 @@ impl App {
                     self.note(format!("{card} refused: {error}"));
                 }
             }
+        }
+    }
+
+    fn drain_updates(&mut self) {
+        if self.updates_dirty && !self.updates.in_flight() {
+            self.updates = Self::build_update_scheduler(&mut self.notes);
+            self.updates_dirty = false;
+        }
+        if let Some(event) = self.updates.tick(Instant::now()) {
+            self.note(format!(
+                "automatic update check {}: {}",
+                event.result(),
+                event.detail()
+            ));
         }
     }
 
@@ -530,6 +567,7 @@ impl App {
             ),
             ("tray", Json::Bool(self.tray.is_some())),
             ("ipc", Json::Bool(self.server.is_some())),
+            ("updates", Self::update_scheduler_json(&self.updates)),
             (
                 "notes",
                 Json::arr(self.notes.iter().map(|n| Json::str(n.as_str()))),
@@ -545,6 +583,91 @@ impl App {
         };
 
         Report::new(data, human)
+    }
+
+    fn build_update_scheduler(notes: &mut Vec<String>) -> AutomaticUpdateScheduler {
+        let result = (|| {
+            let settings = SettingsStore::open_default()?;
+            let context = SystemContext::current()?;
+            AutomaticUpdateScheduler::production(&settings, &context, Instant::now())
+        })();
+        match result {
+            Ok(scheduler) => {
+                if let Some(configuration) = scheduler.configuration()
+                    && configuration.automatic()
+                    && let Some(reason) = scheduler.blocked_reason()
+                {
+                    notes.push(format!("automatic update checks are blocked: {reason}"));
+                }
+                scheduler
+            }
+            Err(error) => {
+                let reason = format!("automatic update checks are unavailable: {error}");
+                notes.push(reason.clone());
+                AutomaticUpdateScheduler::unavailable(reason)
+            }
+        }
+    }
+
+    fn command_changes_update_policy(command: &crate::cli::Command) -> bool {
+        let crate::cli::Command::Settings(args) = command else {
+            return false;
+        };
+        let crate::cli::SettingsCommand::Set { key, .. } = &args.command else {
+            return false;
+        };
+        matches!(
+            key.as_str(),
+            UPDATE_CHECK_AUTOMATICALLY_KEY | UPDATE_CHANNEL_KEY | UPDATE_CHECK_INTERVAL_HOURS_KEY
+        )
+    }
+
+    fn update_scheduler_json(scheduler: &AutomaticUpdateScheduler) -> Json {
+        let configuration = scheduler.configuration();
+        let latest = scheduler.latest();
+        Json::obj([
+            ("state", Json::str(scheduler.state())),
+            (
+                "check_automatically",
+                Json::opt(configuration, |configuration| {
+                    Json::Bool(configuration.automatic())
+                }),
+            ),
+            (
+                "channel",
+                Json::opt(configuration, |configuration| {
+                    Json::str(configuration.channel().as_str())
+                }),
+            ),
+            (
+                "check_interval_hours",
+                Json::opt(configuration, |configuration| {
+                    Json::Int(configuration.interval_hours() as i64)
+                }),
+            ),
+            ("in_flight", Json::Bool(scheduler.in_flight())),
+            (
+                "blocked_reason",
+                Json::opt(scheduler.blocked_reason(), Json::str),
+            ),
+            (
+                "latest",
+                Json::opt(latest, |event| {
+                    Json::obj([
+                        ("result", Json::str(event.result())),
+                        ("detail", Json::str(event.detail())),
+                        (
+                            "checked_at_unix_seconds",
+                            Json::opt(event.checked_at_unix_seconds(), |timestamp| {
+                                Json::Int(timestamp as i64)
+                            }),
+                        ),
+                    ])
+                }),
+            ),
+            ("automatic_downloads", Json::Bool(false)),
+            ("automatic_installs", Json::Bool(false)),
+        ])
     }
 
     /// Releases the menu-bar item, the hotkeys and the socket, now.
@@ -618,6 +741,7 @@ mod tests {
         assert!(app.tray.is_none(), "no menu-bar item");
         assert!(app.server.is_none(), "no socket");
         assert_eq!(app.config.bindings.len(), 0, "no keyboard registration");
+        assert!(!app.config.updates, "no settings or update worker");
     }
 
     #[test]

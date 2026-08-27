@@ -171,6 +171,13 @@ impl Command {
                 UpdateCommand::Download { .. } => "update.download".into(),
                 UpdateCommand::Stage { .. } => "update.stage".into(),
                 UpdateCommand::Install { .. } => "update.install".into(),
+                UpdateCommand::InstallPlatform { .. } => "update.install-platform".into(),
+                UpdateCommand::ApplyHandoff { .. } => "update.apply-handoff".into(),
+                UpdateCommand::ApplyRollbackHandoff { .. } => {
+                    "update.apply-rollback-handoff".into()
+                }
+                UpdateCommand::RollbackPlatform => "update.rollback-platform".into(),
+                UpdateCommand::AcceptPlatform => "update.accept-platform".into(),
                 UpdateCommand::Recover => "update.recover".into(),
                 UpdateCommand::Rollback => "update.rollback".into(),
                 UpdateCommand::Reset => "update.reset".into(),
@@ -1018,12 +1025,9 @@ pub enum UpdateCommand {
     Status,
     /// Fetch and verify a signed manifest without downloading an artifact.
     Check {
-        /// HTTPS JSON manifest URL.
-        #[arg(long)]
-        manifest_url: String,
-        /// HTTPS detached-signature envelope URL.
-        #[arg(long)]
-        signature_url: String,
+        /// Canonical release stream. Defaults to the persisted update.channel setting.
+        #[arg(long, value_enum)]
+        channel: Option<UpdateChannelArg>,
     },
     /// Download and verify the accepted platform artifact.
     Download {
@@ -1049,12 +1053,54 @@ pub enum UpdateCommand {
         #[arg(long)]
         failed_candidate: PathBuf,
     },
+    /// Queue the verified native package for installation after this process exits.
+    InstallPlatform {
+        /// Prior signed MSIX retained for an explicit downgrade, when available.
+        #[arg(long)]
+        rollback_package: Option<PathBuf>,
+    },
+    /// Apply a previously persisted native-package handoff.
+    #[command(hide = true)]
+    ApplyHandoff {
+        /// Handoff state path created by `install-platform`.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Apply a previously persisted native-package rollback handoff.
+    #[command(hide = true)]
+    ApplyRollbackHandoff {
+        /// Handoff state path created by `install-platform`.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Restore the retained previous native installation.
+    RollbackPlatform,
+    /// Accept the native update and remove its retained rollback payload.
+    AcceptPlatform,
     /// Reconcile an explicitly started install after a recoverable failure.
     Recover,
     /// Restore the retained previous installation.
     Rollback,
     /// Abandon pre-install or terminal state while preserving the anti-replay watermark.
     Reset,
+}
+
+/// Canonical release stream accepted by `scrozz update check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum UpdateChannelArg {
+    /// Production releases intended for general use.
+    Stable,
+    /// Opt-in releases that may change more frequently.
+    Preview,
+}
+
+impl From<UpdateChannelArg> for scrozz_update::UpdateChannel {
+    fn from(value: UpdateChannelArg) -> Self {
+        match value {
+            UpdateChannelArg::Stable => Self::Stable,
+            UpdateChannelArg::Preview => Self::Preview,
+        }
+    }
 }
 
 /// Arguments to `scrozz system`.
@@ -2020,15 +2066,7 @@ mod tests {
             ),
             (vec!["scrozz", "update", "status"], "update.status"),
             (
-                vec![
-                    "scrozz",
-                    "update",
-                    "check",
-                    "--manifest-url",
-                    "https://updates.example/manifest.json",
-                    "--signature-url",
-                    "https://updates.example/manifest.sig",
-                ],
+                vec!["scrozz", "update", "check", "--channel", "preview"],
                 "update.check",
             ),
             (

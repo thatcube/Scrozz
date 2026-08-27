@@ -55,6 +55,7 @@ mod settings_store;
 mod system_integration;
 #[cfg(test)]
 mod test_env;
+mod update_policy;
 mod url;
 
 use std::{io::Write, process::ExitCode};

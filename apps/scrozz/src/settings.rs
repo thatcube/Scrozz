@@ -18,6 +18,10 @@ use crate::{
     json::Json,
 };
 
+pub const UPDATE_CHECK_AUTOMATICALLY_KEY: &str = "update.check-automatically";
+pub const UPDATE_CHANNEL_KEY: &str = "update.channel";
+pub const UPDATE_CHECK_INTERVAL_HOURS_KEY: &str = "update.check-interval-hours";
+
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -231,6 +235,24 @@ pub const SETTINGS: &[Setting] = &[
         description: "Allow registered scrozz:// links to trigger fixed, allow-listed actions.",
     },
     Setting {
+        key: UPDATE_CHECK_AUTOMATICALLY_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Periodically check for updates without downloading or installing them.",
+    },
+    Setting {
+        key: UPDATE_CHANNEL_KEY,
+        kind: Kind::Choice(&["stable", "preview"]),
+        default: "stable",
+        description: "Release stream used for manual and automatic update checks.",
+    },
+    Setting {
+        key: UPDATE_CHECK_INTERVAL_HOURS_KEY,
+        kind: Kind::Int { min: 1, max: 168 },
+        default: "24",
+        description: "Hours between automatic update checks.",
+    },
+    Setting {
         key: "hotkey.capture-region",
         kind: Kind::Accelerator,
         default: "Super+Shift+4",
@@ -426,6 +448,21 @@ mod tests {
             panic!("capture.format should be a choice")
         };
         assert_eq!(options, ["png", "jpeg", "webp"]);
+    }
+
+    #[test]
+    fn automatic_update_checks_are_opt_in_and_bounded() {
+        assert_eq!(
+            lookup(UPDATE_CHECK_AUTOMATICALLY_KEY).unwrap().default,
+            "false"
+        );
+        assert_eq!(lookup(UPDATE_CHANNEL_KEY).unwrap().default, "stable");
+        let interval = lookup(UPDATE_CHECK_INTERVAL_HOURS_KEY).unwrap();
+        assert_eq!(interval.default, "24");
+        assert!(interval.validate("1").is_ok());
+        assert!(interval.validate("168").is_ok());
+        assert!(interval.validate("0").is_err());
+        assert!(interval.validate("169").is_err());
     }
 
     #[test]
