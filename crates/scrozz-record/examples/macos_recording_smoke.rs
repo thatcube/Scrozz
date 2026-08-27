@@ -96,7 +96,9 @@ fn smoke_window_disappearance() -> Result<(), Box<dyn Error>> {
         pump_app_events(&app, Duration::from_millis(100));
     }
 
+    window.orderOut(None);
     window.close();
+    app.updateWindows();
     let deadline = Instant::now() + Duration::from_secs(3);
     while session.state() != RecordingState::Stopped && Instant::now() < deadline {
         pump_app_events(&app, Duration::from_millis(20));

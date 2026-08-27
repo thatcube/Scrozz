@@ -50,7 +50,10 @@ pub const MIGRATIONS: &[Migration] = &[
             stored_at         INTEGER NOT NULL,
             pinned            INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
             app_name          TEXT,
+            app_identifier    TEXT,
             window_title      TEXT,
+            window_shadow     INTEGER
+                CHECK (window_shadow IS NULL OR window_shadow IN (0, 1)),
             provenance        TEXT    NOT NULL,
             target_json       TEXT    NOT NULL,
             frame_json        TEXT    NOT NULL,
@@ -102,11 +105,99 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "recording history",
         sql: r"
         ALTER TABLE captures
-            ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'
-            CHECK (media_kind IN ('image', 'video'));
+            ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'screenshot'
+            CHECK (media_kind IN ('screenshot', 'video', 'gif'));
         ALTER TABLE captures ADD COLUMN video_json TEXT;
-        CREATE INDEX IF NOT EXISTS captures_by_media_kind
+        CREATE INDEX IF NOT EXISTS captures_by_kind_recency
             ON captures (media_kind, created_at DESC, id DESC);
+    ",
+    },
+    Migration {
+        version: 3,
+        name: "repair recording history columns",
+        sql: r"
+        ALTER TABLE captures
+            ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'screenshot'
+            CHECK (media_kind IN ('screenshot', 'video', 'gif'));
+        ALTER TABLE captures ADD COLUMN video_json TEXT;
+        CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+            ON captures (media_kind, created_at DESC, id DESC);
+    ",
+    },
+    Migration {
+        version: 4,
+        name: "normalize recording media kinds",
+        sql: r"
+        CREATE TABLE captures_recording_v4 (
+            id                TEXT    NOT NULL PRIMARY KEY,
+            created_at        INTEGER NOT NULL,
+            stored_at         INTEGER NOT NULL,
+            pinned            INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+            app_name          TEXT,
+            app_identifier    TEXT,
+            window_title      TEXT,
+            window_shadow     INTEGER
+                CHECK (window_shadow IS NULL OR window_shadow IN (0, 1)),
+            provenance        TEXT    NOT NULL,
+            target_json       TEXT    NOT NULL,
+            frame_json        TEXT    NOT NULL,
+            image_hash        TEXT,
+            image_bytes       INTEGER NOT NULL DEFAULT 0,
+            image_evicted_at  INTEGER,
+            ocr_text          TEXT,
+            annotation_count  INTEGER NOT NULL DEFAULT 0,
+            search_fold       TEXT    NOT NULL DEFAULT '',
+            app_fold          TEXT,
+            title_fold        TEXT,
+            ocr_fold          TEXT,
+            media_kind        TEXT    NOT NULL DEFAULT 'screenshot'
+                CHECK (media_kind IN ('screenshot', 'video', 'gif')),
+            video_json        TEXT
+        ) STRICT;
+
+        INSERT INTO captures_recording_v4 (
+            id, created_at, stored_at, pinned, app_name, app_identifier,
+            window_title, window_shadow, provenance, target_json, frame_json,
+            image_hash, image_bytes, image_evicted_at, ocr_text,
+            annotation_count, search_fold, app_fold, title_fold, ocr_fold,
+            media_kind, video_json
+        )
+        SELECT
+            id, created_at, stored_at, pinned, app_name, app_identifier,
+            window_title, window_shadow, provenance, target_json, frame_json,
+            image_hash, image_bytes, image_evicted_at, ocr_text,
+            annotation_count, search_fold, app_fold, title_fold, ocr_fold,
+            CASE media_kind WHEN 'image' THEN 'screenshot' ELSE media_kind END,
+            video_json
+        FROM captures;
+
+        DROP TABLE captures;
+        ALTER TABLE captures_recording_v4 RENAME TO captures;
+
+        CREATE INDEX captures_by_recency
+            ON captures (created_at DESC, id DESC);
+        CREATE INDEX captures_evictable
+            ON captures (created_at ASC, id ASC)
+            WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0;
+        CREATE INDEX captures_by_app ON captures (app_fold);
+        CREATE INDEX captures_pinned ON captures (pinned) WHERE pinned = 1;
+        CREATE INDEX captures_by_hash ON captures (image_hash);
+        CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+            ON captures (media_kind, created_at DESC, id DESC);
+    ",
+    },
+    Migration {
+        version: 5,
+        name: "preserve capture source metadata",
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 6,
+        name: "backfill capture source metadata",
+        sql: r"
+        INSERT INTO store_meta (key, value)
+        VALUES ('source_metadata_backfill_pending', '1')
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value;
     ",
     },
 ];
@@ -197,26 +288,58 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32> {
 }
 
 fn apply_migration(tx: &rusqlite::Transaction<'_>, migration: &Migration) -> rusqlite::Result<()> {
-    if migration.name != "recording history" {
-        return tx.execute_batch(migration.sql);
+    match migration.name {
+        "recording history" => {
+            ensure_recording_columns(tx)?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+                 ON captures (media_kind, created_at DESC, id DESC);",
+            )
+        }
+        "repair recording history columns" => {
+            ensure_recording_columns(tx)?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+                 ON captures (media_kind, created_at DESC, id DESC);",
+            )
+        }
+        "normalize recording media kinds" => {
+            ensure_recording_columns(tx)?;
+            ensure_source_metadata_columns(tx)?;
+            tx.execute_batch(migration.sql)
+        }
+        "preserve capture source metadata" => ensure_source_metadata_columns(tx),
+        _ => tx.execute_batch(migration.sql),
     }
+}
 
+fn ensure_recording_columns(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     // SQLite has no portable `ADD COLUMN IF NOT EXISTS`. Inspecting first keeps
     // the rung safe when a filesystem persisted DDL but lost `user_version`.
     if !column_exists(tx, "captures", "media_kind")? {
         tx.execute_batch(
             "ALTER TABLE captures
-             ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'
-             CHECK (media_kind IN ('image', 'video'));",
+             ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'screenshot'
+             CHECK (media_kind IN ('screenshot', 'video', 'gif'));",
         )?;
     }
     if !column_exists(tx, "captures", "video_json")? {
         tx.execute_batch("ALTER TABLE captures ADD COLUMN video_json TEXT;")?;
     }
-    tx.execute_batch(
-        "CREATE INDEX IF NOT EXISTS captures_by_media_kind
-         ON captures (media_kind, created_at DESC, id DESC);",
-    )
+    Ok(())
+}
+
+fn ensure_source_metadata_columns(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !column_exists(tx, "captures", "app_identifier")? {
+        tx.execute_batch("ALTER TABLE captures ADD COLUMN app_identifier TEXT;")?;
+    }
+    if !column_exists(tx, "captures", "window_shadow")? {
+        tx.execute_batch(
+            "ALTER TABLE captures ADD COLUMN window_shadow INTEGER
+             CHECK (window_shadow IS NULL OR window_shadow IN (0, 1));",
+        )?;
+    }
+    Ok(())
 }
 
 fn column_exists(
@@ -394,6 +517,119 @@ mod tests {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
         assert_eq!(migrate(&mut conn, MIGRATIONS).expect("again"), version);
+    }
+
+    #[test]
+    fn recording_columns_are_repaired_when_version_two_was_already_claimed() {
+        let mut conn = memory();
+        migrate(&mut conn, &MIGRATIONS[..1]).expect("create legacy schema");
+        conn.pragma_update(None, "user_version", 2i64)
+            .expect("simulate a colliding version two");
+
+        assert_eq!(
+            migrate(&mut conn, MIGRATIONS).expect("repair"),
+            latest_version(MIGRATIONS)
+        );
+        conn.execute(
+            "INSERT INTO captures (
+                id, created_at, stored_at, provenance, target_json, frame_json,
+                media_kind, video_json
+             ) VALUES ('video', 0, 0, 'display', '{}', 'null', 'video', '{}')",
+            [],
+        )
+        .expect("recording columns exist after repair");
+    }
+
+    #[test]
+    fn legacy_version_three_media_constraint_is_rebuilt_without_losing_rows() {
+        let mut conn = memory();
+        migrate(&mut conn, &MIGRATIONS[..1]).expect("create legacy schema");
+        conn.execute_batch(
+            "ALTER TABLE captures
+                 ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'
+                 CHECK (media_kind IN ('image', 'video'));
+             ALTER TABLE captures ADD COLUMN video_json TEXT;
+             INSERT INTO captures (
+                 id, created_at, stored_at, provenance, target_json, frame_json,
+                 media_kind
+             ) VALUES ('legacy', 0, 0, 'display', '{}', 'null', 'image');
+             PRAGMA user_version = 3;",
+        )
+        .expect("create old recording schema");
+
+        assert_eq!(
+            migrate(&mut conn, MIGRATIONS).expect("repair"),
+            latest_version(MIGRATIONS)
+        );
+        let kind: String = conn
+            .query_row(
+                "SELECT media_kind FROM captures WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row survives");
+        assert_eq!(kind, "screenshot");
+        conn.execute(
+            "INSERT INTO captures (
+                id, created_at, stored_at, provenance, target_json, frame_json,
+                media_kind
+             ) VALUES ('gif', 0, 0, 'display', '{}', 'null', 'gif')",
+            [],
+        )
+        .expect("rebuilt constraint accepts every canonical media kind");
+    }
+
+    #[test]
+    fn recording_migration_preserves_colliding_source_metadata_columns() {
+        let mut conn = memory();
+        migrate(&mut conn, &MIGRATIONS[..1]).expect("create legacy schema");
+        conn.execute_batch(
+            "INSERT INTO captures (
+                 id, created_at, stored_at, app_name, app_identifier, window_title,
+                 window_shadow, provenance, target_json, frame_json
+             ) VALUES (
+                 'legacy-source', 0, 0, 'Preview', 'com.apple.Preview', 'Document',
+                 0, 'window', '{}', 'null'
+             );
+             PRAGMA user_version = 2;",
+        )
+        .expect("create colliding source-metadata schema");
+
+        assert_eq!(
+            migrate(&mut conn, MIGRATIONS).expect("repair"),
+            latest_version(MIGRATIONS)
+        );
+        let preserved: (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT app_identifier, window_shadow
+                 FROM captures WHERE id = 'legacy-source'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("preserved source metadata");
+        assert_eq!(preserved.0.as_deref(), Some("com.apple.Preview"));
+        assert_eq!(preserved.1, Some(0));
+    }
+
+    #[test]
+    fn version_five_repairs_source_columns_dropped_by_the_old_v4_rebuild() {
+        let mut conn = memory();
+        migrate(&mut conn, MIGRATIONS).expect("create current schema");
+        conn.execute_batch(
+            "ALTER TABLE captures DROP COLUMN app_identifier;
+             ALTER TABLE captures DROP COLUMN window_shadow;
+             PRAGMA user_version = 4;",
+        )
+        .expect("simulate the old version-four rebuild");
+
+        assert_eq!(
+            migrate(&mut conn, MIGRATIONS).expect("repair"),
+            latest_version(MIGRATIONS)
+        );
+        let tx = conn.transaction().expect("inspect repaired schema");
+        assert!(column_exists(&tx, "captures", "app_identifier").unwrap());
+        assert!(column_exists(&tx, "captures", "window_shadow").unwrap());
+        tx.rollback().expect("finish schema inspection");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use scrozz_store::{
     SqliteStore, Store as _, Timestamp,
     test_support::{ScratchDir, sample_document, scratch_dir},
 };
+use std::fs;
 
 /// Each capture is 16×16 RGBA, so exactly 1 KiB of pixels.
 const IMAGE_BYTES: u64 = 16 * 16 * 4;
@@ -61,6 +62,76 @@ fn a_history_under_the_cap_is_left_completely_alone() {
                 .is_present()
         );
     }
+}
+
+#[test]
+fn a_missing_blob_is_not_charged_or_compensated_for_by_evicting_valid_pixels() {
+    let (_dir, mut store) = store("missing-blob-accounting");
+    let ids = fill(&mut store, 2);
+    let missing_hash = match store.record(&ids[0]).expect("read").expect("present").image {
+        ImageState::Present { hash, .. } => hash,
+        other => panic!("expected stored pixels, got {other:?}"),
+    };
+    fs::remove_file(store.layout().blob_path(&missing_hash).expect("blob path"))
+        .expect("remove one blob");
+
+    assert_eq!(
+        store.stored_image_bytes().expect("physical size"),
+        IMAGE_BYTES,
+        "accounting must measure bytes that still exist"
+    );
+    let report = store
+        .evict(&RetentionPolicy {
+            max_image_bytes: IMAGE_BYTES,
+        })
+        .expect("retention");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert!(
+        store
+            .record(&ids[1])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present(),
+        "a valid image must not pay for a missing blob"
+    );
+    assert!(
+        matches!(
+            store.record(&ids[0]).expect("read").expect("present").image,
+            ImageState::Evicted { .. }
+        ),
+        "repair must make the missing blob explicit"
+    );
+}
+
+#[test]
+fn an_orphan_blob_is_swept_instead_of_evicting_a_valid_capture() {
+    let (_dir, mut store) = store("orphan-blob-accounting");
+    let ids = fill(&mut store, 1);
+    let orphan = "A".repeat(64);
+    store
+        .layout()
+        .write_blob(&orphan, &vec![7; IMAGE_BYTES as usize])
+        .expect("write orphan");
+
+    let report = store
+        .evict(&RetentionPolicy {
+            max_image_bytes: IMAGE_BYTES,
+        })
+        .expect("retention");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert!(
+        !store.layout().blob_exists(&orphan).expect("orphan state"),
+        "garbage must be reclaimed before choosing a user capture"
+    );
+    assert!(
+        store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
 }
 
 #[test]

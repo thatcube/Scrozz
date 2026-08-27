@@ -28,8 +28,8 @@ use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError,
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
 use scrozz_record::{
-    Recording, RecordingCompletion, RecordingRequest, RecordingSession, Salvageability,
-    SessionEvent,
+    Recording, RecordingCompletion, RecordingRequest, RecordingSession, RecordingState,
+    Salvageability, SessionEvent,
 };
 use scrozz_store::{
     CaptureId, History as _, NewRecording, VideoCompletion, VideoMetadata, VideoSalvageability,
@@ -95,7 +95,7 @@ enum ManagedRecordingPhase {
 
 enum ManagedCompletion {
     Finished(Report),
-    Failed(String),
+    Failed(CliError),
 }
 
 impl RecordingManager {
@@ -122,6 +122,11 @@ impl RecordingManager {
     ) -> CliResult<Report> {
         if self.is_active() {
             return Err(recording_already_active_error());
+        }
+        if self.completion.is_some() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "the previous recording outcome has not been delivered yet".to_owned(),
+            )));
         }
         self.session = Some(session);
         self.phase = Some(ManagedRecordingPhase::Recording);
@@ -185,14 +190,21 @@ impl RecordingManager {
         let target = self.target.clone();
         self.clear_live_state();
         match session.stop() {
-            Ok(recording) => {
-                let report = finish_recording_report(recording, target.as_ref())?;
-                self.completion = Some(ManagedCompletion::Finished(report.clone()));
-                Ok(report)
-            }
+            Ok(recording) => match finish_recording_report(recording, target.as_ref()) {
+                Ok(report) => {
+                    self.completion = Some(ManagedCompletion::Finished(report.clone()));
+                    Ok(report)
+                }
+                Err(error) => {
+                    let (stored, returned) = error.shared_pair();
+                    self.completion = Some(ManagedCompletion::Failed(stored));
+                    Err(returned)
+                }
+            },
             Err(error) => {
-                self.completion = Some(ManagedCompletion::Failed(error.to_string()));
-                Err(CliError::Core(error))
+                let (stored, returned) = CliError::Core(error).shared_pair();
+                self.completion = Some(ManagedCompletion::Failed(stored));
+                Err(returned)
             }
         }
     }
@@ -213,7 +225,7 @@ impl RecordingManager {
                 let target = self.target.clone();
                 let completion = match finish_recording_report(recording, target.as_ref()) {
                     Ok(report) => ManagedCompletion::Finished(report),
-                    Err(error) => ManagedCompletion::Failed(error.to_string()),
+                    Err(error) => ManagedCompletion::Failed(error),
                 };
                 self.session = None;
                 self.clear_live_state();
@@ -222,9 +234,17 @@ impl RecordingManager {
             Some(SessionEvent::Failed(error)) => {
                 self.session = None;
                 self.clear_live_state();
-                self.completion = Some(ManagedCompletion::Failed(error.to_string()));
+                self.completion = Some(ManagedCompletion::Failed(CliError::from(error)));
             }
-            None => {}
+            None => {
+                let stopped = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.state() == RecordingState::Stopped);
+                if stopped {
+                    let _ = self.stop();
+                }
+            }
         }
     }
 
@@ -232,7 +252,7 @@ impl RecordingManager {
     pub fn take_completion(&mut self) -> Option<CliResult<Report>> {
         self.completion.take().map(|completion| match completion {
             ManagedCompletion::Finished(report) => Ok(report),
-            ManagedCompletion::Failed(message) => Err(CliError::Core(CoreError::Platform(message))),
+            ManagedCompletion::Failed(error) => Err(error),
         })
     }
 
@@ -300,9 +320,15 @@ pub fn run_owned_recording(command: &Command, ipc_enabled: bool) -> CliResult<Re
             return recording.stop();
         }
         recording.poll();
+        if !recording.is_active() {
+            break;
+        }
         if let Some(server) = &server {
             while let Some(request) = server.poll() {
                 request.serve_with_recording(&mut recording);
+                if !recording.is_active() {
+                    break;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -1276,6 +1302,59 @@ mod tests {
         run(argv).expect("should succeed").data.to_compact_string()
     }
 
+    struct StoppedSession;
+
+    impl RecordingSession for StoppedSession {
+        fn state(&self) -> RecordingState {
+            RecordingState::Stopped
+        }
+
+        fn pause(&mut self) -> scrozz_core::Result<()> {
+            unreachable!("the stopped-session fixture is never paused")
+        }
+
+        fn resume(&mut self) -> scrozz_core::Result<()> {
+            unreachable!("the stopped-session fixture is never resumed")
+        }
+
+        fn stop(self: Box<Self>) -> scrozz_core::Result<Recording> {
+            Err(CoreError::Platform("native worker stopped".to_owned()))
+        }
+    }
+
+    struct FailedPollSession {
+        emitted: bool,
+    }
+
+    impl RecordingSession for FailedPollSession {
+        fn state(&self) -> RecordingState {
+            RecordingState::Recording
+        }
+
+        fn pause(&mut self) -> scrozz_core::Result<()> {
+            unreachable!("the failed-poll fixture is never paused")
+        }
+
+        fn resume(&mut self) -> scrozz_core::Result<()> {
+            unreachable!("the failed-poll fixture is never resumed")
+        }
+
+        fn poll(&mut self) -> Option<SessionEvent> {
+            if self.emitted {
+                None
+            } else {
+                self.emitted = true;
+                Some(SessionEvent::Failed(Arc::new(CoreError::TargetGone(
+                    "window 41".to_owned(),
+                ))))
+            }
+        }
+
+        fn stop(self: Box<Self>) -> scrozz_core::Result<Recording> {
+            unreachable!("a terminal poll event logically consumes the session")
+        }
+    }
+
     // -- dry-run capture ---------------------------------------------------
 
     #[test]
@@ -1423,13 +1502,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_stopped_native_session_is_finalised_without_a_terminal_poll_event() {
+        let mut manager = RecordingManager::default();
+        manager
+            .start(
+                Box::new(StoppedSession),
+                PathBuf::from("stopped.mp4"),
+                CaptureTarget::AllDisplays,
+                Json::Bool(false),
+            )
+            .unwrap();
+
+        manager.poll();
+
+        assert!(!manager.is_active());
+        let error = manager
+            .take_completion()
+            .expect("terminal completion")
+            .unwrap_err();
+        assert!(error.to_string().contains("native worker stopped"));
+    }
+
+    #[test]
+    fn an_asynchronous_failure_keeps_its_stable_error_classification() {
+        let mut manager = RecordingManager::default();
+        manager
+            .start(
+                Box::new(FailedPollSession { emitted: false }),
+                PathBuf::from("failed.mp4"),
+                CaptureTarget::Window(scrozz_core::WindowId("41".into())),
+                Json::Bool(false),
+            )
+            .unwrap();
+
+        manager.poll();
+
+        let error = manager
+            .take_completion()
+            .expect("terminal completion")
+            .unwrap_err();
+        assert_eq!(error.exit(), Exit::TargetGone);
+        assert_eq!(error.kind(), "target-gone");
+        assert!(error.to_json().to_compact_string().contains("window 41"));
+    }
+
+    #[test]
+    fn a_queued_start_cannot_replace_an_undelivered_terminal_outcome() {
+        let mut manager = RecordingManager::default();
+        manager
+            .start(
+                Box::new(StoppedSession),
+                PathBuf::from("first.mp4"),
+                CaptureTarget::AllDisplays,
+                Json::Bool(false),
+            )
+            .unwrap();
+        manager.poll();
+
+        let error = manager
+            .start(
+                Box::new(StoppedSession),
+                PathBuf::from("second.mp4"),
+                CaptureTarget::AllDisplays,
+                Json::Bool(false),
+            )
+            .expect_err("pending terminal outcome owns the manager");
+        assert!(error.to_string().contains("has not been delivered"));
+
+        let original = manager
+            .take_completion()
+            .expect("original terminal outcome")
+            .unwrap_err();
+        assert!(original.to_string().contains("native worker stopped"));
+    }
+
     // -- unimplemented paths -----------------------------------------------
 
     #[test]
     fn every_unimplemented_command_reports_rather_than_panics() {
         let cases = [
             vec!["scrozz", "capture", "--region", "0,0,10,10"],
-            vec!["scrozz", "record"],
             vec!["scrozz", "history", "list"],
             vec!["scrozz", "history", "get", "abc"],
             vec!["scrozz", "history", "delete", "abc"],

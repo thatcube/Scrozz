@@ -16,7 +16,7 @@ use scrozz_core::{
     PhysicalPoint, PhysicalSize, PixelFormat, ScaleFactor,
 };
 use scrozz_record::{
-    OverlayLayer, OverlaySource, RecordingRequest, RecordingResolution, VideoCodec,
+    OverlayLayer, OverlaySource, RecordingRequest, RecordingResolution, SessionEvent, VideoCodec,
 };
 
 struct TempRecording(PathBuf);
@@ -128,6 +128,11 @@ fn opt_in_smoke_records_and_rebases_a_short_pause() {
 
     let mut session = attempt!("recording start", scrozz_record::start(&request));
     std::thread::sleep(Duration::from_millis(350));
+    assert!(matches!(session.poll(), Some(SessionEvent::FirstFrame)));
+    assert!(
+        session.poll().is_none(),
+        "the native first-frame signal must be one-shot"
+    );
     let before_pause = session.engine_elapsed_secs().unwrap_or_default();
     session.pause().expect("pause recording");
     std::thread::sleep(Duration::from_millis(200));
@@ -168,6 +173,42 @@ fn opt_in_smoke_records_and_rebases_a_short_pause() {
             .unwrap_or(false),
         "recording file is missing or empty"
     );
+    assert_no_asset_writer_sidecars(&recording.path);
+}
+
+#[test]
+fn opt_in_smoke_rebases_video_only_frames_after_pause() {
+    if std::env::var_os("SCROZZ_RECORD_SMOKE").as_deref() != Some("1".as_ref()) {
+        println!("skipping video-only pause smoke: set SCROZZ_RECORD_SMOKE=1 to enable it");
+        return;
+    }
+
+    let backend = scrozz_capture::backend().expect("macOS capture backend");
+    let displays = attempt!("display enumeration", backend.displays());
+    let Some(display) = displays.first() else {
+        println!("skipping video-only pause smoke: no displays are attached");
+        return;
+    };
+    let output = TempRecording(smoke_path("scrozz-video-only-pause-smoke"));
+    let mut request = RecordingRequest::new(CaptureTarget::Display(display.id.clone()));
+    request.destination = Some(output.0.clone());
+    request.system_audio = false;
+    request.microphone = false;
+    request.video_codec = VideoCodec::H264;
+    request.resolution = RecordingResolution::ScalePercent(50);
+
+    let mut session = attempt!("video-only recording start", scrozz_record::start(&request));
+    std::thread::sleep(Duration::from_millis(350));
+    session.pause().expect("pause video-only recording");
+    std::thread::sleep(Duration::from_millis(200));
+    session.resume().expect("resume video-only recording");
+    std::thread::sleep(Duration::from_millis(350));
+    let recording = attempt!("video-only recording stop", session.stop());
+
+    assert!(recording.metadata.frames.is_some_and(|frames| frames > 0));
+    assert!(!recording.is_partial(), "{:?}", recording.completion);
+    assert!(recording.duration_secs > 0.0);
+    assert_no_asset_writer_sidecars(&recording.path);
 }
 
 #[test]
@@ -344,7 +385,10 @@ fn opt_in_smoke_composites_a_non_empty_overlay_into_native_frames() {
     std::thread::sleep(Duration::from_millis(450));
     let recording = attempt!("overlay recording stop", session.stop());
 
-    assert!(calls.load(Ordering::Relaxed) > 0);
+    assert!(
+        calls.load(Ordering::Relaxed) > 1,
+        "time-varying overlays must continue on ScreenCaptureKit idle frames"
+    );
     assert!(recording.metadata.frames.is_some_and(|frames| frames > 0));
     assert!(!recording.is_partial(), "{:?}", recording.completion);
 }
@@ -357,9 +401,25 @@ fn smoke_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{label}-{nonce}.mp4"))
 }
 
+fn assert_no_asset_writer_sidecars(path: &std::path::Path) {
+    let file_name = path.file_name().expect("recording file name");
+    let prefix = format!("{}.sb-", file_name.to_string_lossy());
+    let parent = path.parent().expect("recording parent");
+    let leaked = std::fs::read_dir(parent)
+        .expect("recording parent remains readable")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name())
+        .any(|name| name.to_string_lossy().starts_with(&prefix));
+    assert!(
+        !leaked,
+        "AVAssetWriter sidecar leaked for {}",
+        path.display()
+    );
+}
+
 fn inset_region(display: &Display) -> LogicalRect {
-    let width = display.bounds.size.width.min(320.0).max(80.0) - 40.0;
-    let height = display.bounds.size.height.min(200.0).max(80.0) - 40.0;
+    let width = display.bounds.size.width.clamp(80.0, 320.0) - 40.0;
+    let height = display.bounds.size.height.clamp(80.0, 200.0) - 40.0;
     LogicalRect::new(
         LogicalPoint::new(
             display.bounds.origin.x + 20.0,

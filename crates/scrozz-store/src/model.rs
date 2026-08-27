@@ -23,35 +23,52 @@ use serde::{Deserialize, Serialize};
 use crate::CaptureId;
 
 /// Durable media category for one history row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     /// A still capture with optional source pixels and annotations.
     #[default]
-    Image,
+    #[serde(alias = "image")]
+    Screenshot,
     /// An externally stored native recording.
     Video,
+    /// An animated GIF.
+    Gif,
 }
 
 impl MediaKind {
+    /// Every kind, in the order shown by history filters.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Screenshot, Self::Video, Self::Gif]
+    }
+
     /// Stable SQLite token.
     #[must_use]
     pub const fn as_token(self) -> &'static str {
         match self {
-            Self::Image => "image",
+            Self::Screenshot => "screenshot",
             Self::Video => "video",
+            Self::Gif => "gif",
         }
     }
 
     /// Parses a stable SQLite token.
     pub fn from_token(token: &str) -> Result<Self> {
-        match token {
-            "image" => Ok(Self::Image),
-            "video" => Ok(Self::Video),
+        match token.trim().to_lowercase().as_str() {
+            "screenshot" | "screenshots" | "image" | "images" => Ok(Self::Screenshot),
+            "video" | "videos" | "recording" | "recordings" => Ok(Self::Video),
+            "gif" | "gifs" => Ok(Self::Gif),
             other => Err(Error::Storage(format!(
                 "unknown history media kind {other:?}"
             ))),
         }
+    }
+
+    /// Whether this kind contains a time-varying image.
+    #[must_use]
+    pub const fn is_motion(self) -> bool {
+        matches!(self, Self::Video | Self::Gif)
     }
 }
 
@@ -286,7 +303,7 @@ pub struct CaptureRecord {
     pub created_at: Timestamp,
     /// Exempt from eviction. Decision D23: pinned captures are never evicted.
     pub pinned: bool,
-    /// Still image or video.
+    /// Screenshot, video, or animated GIF.
     pub media_kind: MediaKind,
     /// Owning application, where the platform reported one.
     pub app_name: Option<String>,
@@ -364,7 +381,7 @@ pub struct SearchQuery {
     pub created_before: Option<Timestamp>,
     /// Only pinned captures.
     pub pinned_only: bool,
-    /// Restrict results to stills or recordings.
+    /// Restrict results to screenshots, videos, or GIFs.
     pub media_kind: Option<MediaKind>,
     /// Exclude captures whose pixels have been evicted.
     ///
@@ -601,6 +618,22 @@ impl From<TargetRepr> for CaptureTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_kinds_write_canonical_tokens_and_read_legacy_images() {
+        assert_eq!(
+            serde_json::to_string(&MediaKind::Screenshot).unwrap(),
+            "\"screenshot\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MediaKind>("\"image\"").unwrap(),
+            MediaKind::Screenshot
+        );
+        assert_eq!(
+            MediaKind::from_token("images").unwrap(),
+            MediaKind::Screenshot
+        );
+    }
 
     #[test]
     fn timestamps_round_trip_through_system_time() {

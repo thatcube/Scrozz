@@ -68,7 +68,7 @@ struct FinalisedRecording {
 
 enum GuiRecordingCompletion {
     Finished(Report),
-    Failed(String),
+    Failed(CliError),
 }
 
 struct ActiveVideoEditor {
@@ -227,6 +227,7 @@ pub struct App {
     recording: Option<RecordingMachine>,
     recording_permission: fn() -> CliResult<()>,
     recording_target: fn() -> CliResult<CaptureTarget>,
+    recording_destination: fn() -> CliResult<std::path::PathBuf>,
     recording_tick: Instant,
     recording_finalisation: Option<Receiver<FinalisedRecording>>,
     recording_completion: Option<GuiRecordingCompletion>,
@@ -330,6 +331,7 @@ impl App {
             recording,
             recording_permission: Self::ensure_recording_permission,
             recording_target: Self::active_recording_target,
+            recording_destination: crate::output::default_recording_path,
             recording_tick: Instant::now(),
             recording_finalisation: None,
             recording_completion: None,
@@ -610,6 +612,15 @@ impl App {
                 return;
             }
         };
+        let destination = match (self.recording_destination)() {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.note(format!(
+                    "could not choose a durable recording destination: {error}"
+                ));
+                return;
+            }
+        };
 
         let needs_reset = self.recording.as_ref().is_some_and(|machine| {
             matches!(
@@ -636,7 +647,7 @@ impl App {
             .recording
             .as_mut()
             .expect("recording availability was checked before starting")
-            .begin(target);
+            .begin_with_destination(target, destination);
         self.finish_recording_action(result, "recording countdown started");
     }
 
@@ -661,6 +672,14 @@ impl App {
         let result = self.recording.as_mut().map(|machine| machine.tick(delta));
         if let Some(Err(error)) = result {
             self.note(format!("recording tick failed: {error}"));
+        }
+        let stopped_without_terminal_event = self
+            .recording
+            .as_ref()
+            .is_some_and(RecordingMachine::requires_finalisation);
+        if stopped_without_terminal_event && self.recording_finalisation.is_none() {
+            self.begin_recording_finalisation(None);
+            return;
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
@@ -799,9 +818,7 @@ impl App {
             let completion = self.recording_completion.take();
             request.serve_with(|_| match completion {
                 Some(GuiRecordingCompletion::Finished(report)) => Ok(report),
-                Some(GuiRecordingCompletion::Failed(message)) => {
-                    Err(CliError::Core(CoreError::Platform(message)))
-                }
+                Some(GuiRecordingCompletion::Failed(error)) => Err(error),
                 None => Err(CliError::Core(CoreError::Platform(
                     "recording ended without a completion report".into(),
                 ))),
@@ -848,8 +865,9 @@ impl App {
                     if let Some(output) = partial {
                         self.retain_recording_completion(output, fallback_target.as_ref());
                     } else {
-                        self.recording_completion =
-                            Some(GuiRecordingCompletion::Failed(failure.error.to_string()));
+                        self.recording_completion = Some(GuiRecordingCompletion::Failed(
+                            CliError::from(Arc::clone(&failure.error)),
+                        ));
                     }
                 }
             }
@@ -883,7 +901,7 @@ impl App {
                 self.note(format!(
                     "recording output was rejected at the real-output boundary: {error}"
                 ));
-                self.recording_completion = Some(GuiRecordingCompletion::Failed(error.to_string()));
+                self.recording_completion = Some(GuiRecordingCompletion::Failed(error));
             }
         }
     }
@@ -1374,6 +1392,9 @@ mod tests {
                 "fixture-display".to_owned(),
             )))
         }
+        fn destination() -> CliResult<std::path::PathBuf> {
+            Ok(std::env::temp_dir().join("scrozz-gui-recording-test.mp4"))
+        }
 
         let (mut app, _) = app();
         let mut settings = RecordingSettings::shipped();
@@ -1389,11 +1410,19 @@ mod tests {
         );
         app.recording_permission = || Ok(());
         app.recording_target = target;
+        app.recording_destination = destination;
 
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         assert_eq!(
             app.recording.as_ref().map(RecordingMachine::phase),
             Some(RecordingPhase::Recording)
+        );
+        assert_eq!(
+            app.recording
+                .as_ref()
+                .and_then(RecordingMachine::request)
+                .and_then(|request| request.destination.as_deref()),
+            Some(destination().unwrap().as_path())
         );
 
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
