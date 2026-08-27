@@ -23,8 +23,12 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCaptureKitBackend;
@@ -43,7 +47,17 @@ pub fn backend() -> Result<Box<dyn CaptureBackend>> {
         Ok(Box::new(macos::ScreenCaptureKitBackend::new()))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::backend()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::backend()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         todo!("select and construct the platform capture backend")
     }

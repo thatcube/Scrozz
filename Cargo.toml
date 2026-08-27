@@ -32,9 +32,17 @@ scrozz-ui = { path = "crates/scrozz-ui" }
 # egui/eframe are 0.x and churn hard between releases; pin exactly. 0.36.1 is
 # the current release and its `App` trait is `fn ui(&mut self, ui, frame)`.
 # That is upstream, not a patch — see docs/decisions.md D22.
+#
+# `x11` and `wayland` are not optional extras: without them winit refuses to
+# compile for Linux at all ("the platform you're compiling for is not supported
+# by winit"), because `default-features = false` strips its display backends.
+# Both are enabled so one binary serves X11 and Wayland sessions, which is what
+# D8 promises.
 eframe = { version = "=0.36.1", default-features = false, features = [
     "glow",
     "default_fonts",
+    "x11",
+    "wayland",
 ] }
 egui = "=0.36.1"
 

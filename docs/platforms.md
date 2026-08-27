@@ -13,8 +13,9 @@ different class of defect, and each one cheaper than the layer below it.
 ## Layer 1 — Cross-target type checking (local, seconds, free)
 
 `cargo check` does not link, so it needs no Windows SDK and no Linux sysroot.
-Both targets check cleanly from macOS today, **including the real platform
-bindings** — the `windows` crate, `x11rb`, and `ashpd` with its zbus stack.
+Both targets check cleanly from macOS today for **every crate that contains
+platform-specific code** — including the real platform bindings: the `windows`
+crate, `x11rb`, and `ashpd` with its zbus stack.
 
 ```bash
 tools/check-all-platforms.sh
@@ -27,7 +28,27 @@ error on this machine** rather than a surprise days later. It is the difference
 between writing platform code blind and writing it with the type checker
 watching.
 
-Its limit is exact: it proves the code is *well-formed*, never that it *works*.
+### The one exception, and why it does not matter
+
+**Crates whose dependencies compile C cannot be cross-checked without a cross C
+toolchain.** `cargo check` still runs build scripts, and `rusqlite`'s `bundled`
+feature compiles `sqlite3.c` *for the target*, which fails on this machine with
+`fatal error: 'stdlib.h' file not found`. `scrozz-store` and the `scrozz` binary
+that depends on it are therefore excluded, via `SCROZZ_XCHECK_EXCLUDE`.
+
+This costs nothing real. Only four crates are permitted to contain
+`cfg(target_os)` at all — `scrozz-capture`, `scrozz-record`, `scrozz-ocr` and
+`scrozz-shell` — and **all four are still fully checked on all three targets**.
+`scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
+almost nothing, and CI compiles it natively on all three runners anyway (layer
+2), which is a strictly stronger check.
+
+Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
+dependency, which matters far more than local cross-check coverage of a crate
+that has no platform code in it.
+
+Its limit is exact: this layer proves the code is *well-formed*, never that it
+*works*.
 
 ## Layer 2 — Real builds and tests in CI (every push, free)
 
