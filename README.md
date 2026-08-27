@@ -77,6 +77,8 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
 | Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
+| System integration | 🟡 | 🟡 | 🟡 | Launch-at-login and `scrozz://` registration have explicit status/apply/remove operations; URL automation is independently default-off and allow-listed |
+| Signed updates | 🟠 | 🟠 | 🟠 | Exact-byte Ed25519 manifests, SHA-256 artifacts, anti-rollback state, explicit install and rollback exist; production keys and archive installers remain human-gated |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
 | Screen recording | ⬜ | ⬜ | ⬜ | Contracts only. Hardware encoders only, for licence reasons |
 | Scrolling capture | ⬜ | ⬜ | ⬜ | No clean implementation exists on any platform; deliberately deferred |
@@ -114,8 +116,10 @@ open /Applications/Scrozz.app
 The bundle is not a convenience. macOS attaches a Screen Recording permission to
 a *bundle identity*, so a bare binary run from a terminal has the grant land on
 the terminal instead and capture is refused no matter how many times you approve
-it. Build the app, approve it once in **System Settings → Privacy & Security →
-Screen Recording**, and the grant sticks across rebuilds.
+it. Build the app and approve it in **System Settings → Privacy & Security →
+Screen Recording**. Local builds use an ad-hoc development signature, so macOS
+may request consent again when the bytes change; shipped builds need a stable
+Developer ID release identity for that approval to survive upgrades.
 
 Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.
@@ -133,8 +137,18 @@ cargo run -p scrozz -- capture --display primary -o shot.png
 cargo run -p scrozz -- capture --region 0,0,1200,800 --json
 cargo run -p scrozz -- ocr shot.png
 cargo run -p scrozz -- settings get
+cargo run -p scrozz -- autostart status
+cargo run -p scrozz -- url status
+cargo run -p scrozz -- update status
+cargo run -p scrozz -- system status
 cargo run -p scrozz -- --help
 ```
+
+Registering the `scrozz://` handler does not grant automation consent. The
+separate `scrozz url enable` master toggle defaults off, and the handler accepts
+only fixed capture and recording routes: URL query parameters, fragments, paths,
+and arbitrary command arguments are rejected. Update checks and downloads never
+install; `scrozz update install` is a separate explicit operation.
 
 Commands that are not built yet say so and exit with a distinct status rather
 than pretending — `history`, for instance, currently reports that it is not
@@ -190,14 +204,15 @@ That earns a direct answer rather than a marketing adjective, so:
 
 **Scrozz contains no AI.** No language model, no inference, nothing generated. It
 does not upload your captures anywhere, has no telemetry, no analytics, no
-account, no sign-in, and no server to talk to. There is nothing to monetise
-because nothing leaves your machine. Text recognition runs on device, using the
-recogniser already built into your operating system.
+account, no sign-in, and no server to talk to. Text recognition runs on device,
+using the recogniser already built into your operating system.
 
-You can check that rather than believe it: **there is no HTTP client anywhere in
-the dependency tree** — search `Cargo.lock` for `reqwest`, `hyper`, `ureq` or
-`curl` and you will come up empty. An application that cannot make a web request
-cannot phone home.
+You can check that rather than believe it: there is no embedded HTTP or telemetry
+client in the dependency tree. The one network-capable path is an explicit
+signed-update command, which invokes the system `curl` executable with HTTPS-only
+redirect rules. It sends a non-identifying product/version/platform user agent,
+verifies the detached Ed25519 signature over the exact manifest bytes, and then
+verifies artifact size and SHA-256 before anything can be staged.
 
 **Coding agents did assist with implementation.** Brandon Moore conceived Scrozz,
 researched it, designed the product and its visual identity, made every

@@ -64,8 +64,8 @@ These are properties of the shipped application, not promises about intent.
   integration, and none is planned.
 - **No telemetry, analytics, crash reporting, or usage tracking.**
 - **No account, no sign-in, no server.** There is no Scrozz backend to talk to.
-- **Your data is not monetised.** There is nothing to monetise, because none of
-  it leaves your machine.
+- **Your data is not monetised.** Captures and usage data do not leave your
+  machine.
 - **Text recognition is local.** Optical character recognition uses the
   recogniser already built into your operating system — Vision on macOS,
   `Windows.Media.Ocr` on Windows — running on device. Linux ships no comparable
@@ -77,9 +77,12 @@ These are properties of the shipped application, not promises about intent.
 
 You do not have to take any of it on trust:
 
-- **There is no HTTP client in the dependency tree.** Search `Cargo.lock` for
-  `reqwest`, `hyper`, `ureq`, or `curl` and you will find none. An application
-  that cannot make a web request cannot phone home.
+- **There is no embedded HTTP or telemetry client in the dependency tree.**
+  The only network-capable path is an explicit signed-update command. It invokes
+  the system `curl` executable without a shell, permits HTTPS redirects only,
+  sends a non-identifying product/version/platform user agent, and verifies an
+  exact-byte Ed25519 manifest signature plus artifact SHA-256 before staging.
+  Update checks and downloads never install.
 - **The source is GPL-3.0** (see [`LICENSE`](LICENSE)), so every line is
   readable, and any derivative must publish its own source too.
 - **The dependency set is audited in CI.** `cargo-deny` checks licences and
