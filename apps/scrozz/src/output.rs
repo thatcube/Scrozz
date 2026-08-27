@@ -36,7 +36,7 @@ pub fn default_directory() -> PathBuf {
 /// The native engine opens this path itself, so the candidate is not reserved or
 /// truncated here.
 pub fn default_recording_path() -> CliResult<PathBuf> {
-    let directory = default_directory();
+    let directory = recording_directory(dirs::video_dir(), dirs::home_dir())?;
     std::fs::create_dir_all(&directory)?;
     let template = NameTemplate::parse("Scrozz Recording {date} at {time}")?;
     let policy = NamePolicy::default();
@@ -47,6 +47,17 @@ pub fn default_recording_path() -> CliResult<PathBuf> {
         "mp4",
         &mut |path| path.exists(),
     )?)
+}
+
+fn recording_directory(video: Option<PathBuf>, home: Option<PathBuf>) -> CliResult<PathBuf> {
+    video
+        .or_else(|| home.map(|path| path.join("Movies")))
+        .map(|path| path.join("Scrozz"))
+        .ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "no durable video directory is available for this recording".to_owned(),
+            ))
+        })
 }
 
 fn export_to_directory(
@@ -103,5 +114,18 @@ mod tests {
         assert_eq!(std::fs::read(second).unwrap(), second_bytes);
 
         std::fs::remove_dir_all(directory).expect("clean scratch directory");
+    }
+
+    #[test]
+    fn recordings_use_a_dedicated_durable_video_directory() {
+        assert_eq!(
+            recording_directory(Some(PathBuf::from("/Videos")), None).unwrap(),
+            PathBuf::from("/Videos/Scrozz")
+        );
+        assert_eq!(
+            recording_directory(None, Some(PathBuf::from("/home/scrozz"))).unwrap(),
+            PathBuf::from("/home/scrozz/Movies/Scrozz")
+        );
+        assert!(recording_directory(None, None).is_err());
     }
 }

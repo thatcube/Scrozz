@@ -4,7 +4,7 @@
 //! this module, so countdown overshoot, pause exclusion, engine drift, and every
 //! terminal transition are deterministic.
 
-use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use scrozz_core::{CaptureTarget, Error, Result};
 
@@ -239,6 +239,26 @@ impl RecordingMachine {
         self.prepare_target(target)
     }
 
+    /// Begins countdown/recording to a caller-selected durable destination.
+    ///
+    /// This preserves the machine's interactive settings and countdown while
+    /// ensuring native engines never fall back to temporary storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transition, request, capability, or engine-start error.
+    pub fn begin_with_destination(
+        &mut self,
+        target: CaptureTarget,
+        destination: PathBuf,
+    ) -> Result<()> {
+        self.require_phase(RecordingPhase::Idle, "begin recording")?;
+        self.clear_run();
+        let mut request = RecordingRequest::from_settings(target, &self.settings);
+        request.destination = Some(destination);
+        self.prepare_request(request)
+    }
+
     /// Starts an already configured request without applying interactive
     /// settings or a countdown.
     ///
@@ -260,6 +280,11 @@ impl RecordingMachine {
 
     fn prepare_target(&mut self, target: CaptureTarget) -> Result<()> {
         let request = RecordingRequest::from_settings(target, &self.settings);
+        self.prepare_request(request)
+    }
+
+    fn prepare_request(&mut self, request: RecordingRequest) -> Result<()> {
+        request.validate()?;
         validate_capabilities(self.capabilities, &request, Some(&self.settings))?;
         self.stage_request(&request);
 
@@ -633,6 +658,22 @@ impl RecordingMachine {
         )
     }
 
+    /// Whether a native session stopped without yielding its terminal event.
+    ///
+    /// Older adapters may use the default no-op poll implementation. Hosts use
+    /// this signal to move their session into the same off-thread finaliser used
+    /// for an explicit stop rather than leaving a failed capture active forever.
+    #[must_use]
+    pub fn requires_finalisation(&self) -> bool {
+        matches!(
+            self.phase,
+            RecordingPhase::Recording | RecordingPhase::Paused
+        ) && self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.state() == crate::RecordingState::Stopped)
+    }
+
     /// Engine capabilities captured at machine creation.
     #[must_use]
     pub const fn capabilities(&self) -> EngineCapabilities {
@@ -827,6 +868,31 @@ mod tests {
         assert_eq!(machine.phase(), RecordingPhase::Recording);
         assert_eq!(machine.countdown_remaining(), Duration::ZERO);
         assert_eq!(machine.request(), Some(&request));
+    }
+
+    #[test]
+    fn configured_destination_keeps_interactive_countdown_and_settings() {
+        let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
+        let mut settings = RecordingSettings::shipped();
+        settings.countdown.enabled = true;
+        settings.countdown.seconds = 3;
+        settings.video.fps = 48;
+        let mut machine =
+            RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
+                .unwrap();
+
+        machine
+            .begin_with_destination(target(), PathBuf::from("durable.mp4"))
+            .unwrap();
+
+        assert_eq!(machine.phase(), RecordingPhase::Countdown);
+        assert_eq!(machine.countdown_remaining(), Duration::from_secs(3));
+        let request = machine.request().expect("staged request");
+        assert_eq!(
+            request.destination.as_deref(),
+            Some(std::path::Path::new("durable.mp4"))
+        );
+        assert_eq!(request.fps, 48);
     }
 
     #[test]

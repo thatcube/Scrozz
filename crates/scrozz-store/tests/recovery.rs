@@ -5,6 +5,7 @@
 //! the ways it actually gets destroyed — truncation, garbage, a half-finished
 //! write — and insist the history comes back.
 
+use rusqlite::Connection;
 use scrozz_core::{CaptureTarget, DisplayId, Provenance};
 use scrozz_store::{
     CaptureId, DocumentState, History as _, ImageState, MediaKind, NewCapture, NewRecording,
@@ -303,6 +304,71 @@ fn an_index_row_whose_record_vanished_is_dropped_instead_of_haunting_history() {
     assert_eq!(store.count().expect("count"), 1_u64);
     assert!(store.record(&lose).expect("read").is_none());
     assert!(store.record(&keep).expect("read").is_some());
+}
+
+#[test]
+fn ordinary_open_never_drops_an_index_row_whose_sidecar_is_missing() {
+    let dir = scratch_dir("missing-sidecar-open");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let keep = store
+        .insert(NewCapture::new(&sample_document(8, 8, 1, 1)))
+        .expect("insert kept capture");
+    let preserve = store
+        .insert(NewCapture::new(&sample_document(8, 8, 2, 1)))
+        .expect("insert DB-only capture");
+    fs::remove_file(store.layout().record_path(&preserve).expect("record path"))
+        .expect("remove sidecar");
+    drop(store);
+
+    let mut store = SqliteStore::open(dir.path()).expect("reopen additively");
+    assert!(store.record(&keep).expect("read kept row").is_some());
+    assert!(
+        store
+            .record(&preserve)
+            .expect("read preserved DB-only row")
+            .is_some(),
+        "ordinary startup repair must never turn a count mismatch into data loss"
+    );
+    let failure = store
+        .image(&preserve)
+        .expect_err("opening a DB-only item must report its missing durable record");
+    assert!(
+        failure.to_string().contains("durable sidecar is missing"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn adoption_compares_ids_when_db_only_and_unindexed_rows_keep_counts_equal() {
+    let dir = scratch_dir("equal-count-adoption");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let db_only = store
+        .insert(NewCapture::new(&sample_document(8, 8, 1, 1)))
+        .expect("insert DB-only capture");
+    let unindexed = store
+        .insert(NewCapture::new(&sample_document(8, 8, 2, 1)))
+        .expect("insert crash-written capture");
+    fs::remove_file(store.layout().record_path(&db_only).expect("record path"))
+        .expect("remove first sidecar");
+    let index = store.layout().index_path();
+    drop(store);
+    Connection::open(index)
+        .expect("open raw index")
+        .execute("DELETE FROM captures WHERE id = ?1", [&unindexed.0])
+        .expect("simulate crash before index commit");
+
+    let store = SqliteStore::open(dir.path()).expect("reopen additively");
+    assert!(
+        store.record(&db_only).expect("read DB-only row").is_some(),
+        "the indexed row must be preserved"
+    );
+    assert!(
+        store
+            .record(&unindexed)
+            .expect("read adopted row")
+            .is_some(),
+        "the sidecar absent from the index must be adopted despite equal counts"
+    );
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 #![allow(non_snake_case)]
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -14,6 +15,7 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
 use objc2_av_foundation::{
     AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureConnection, AVCaptureOutput,
 };
+use objc2_core_foundation::{CFRetained, Type};
 use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSDictionary, NSError, NSNumber, NSObject, NSString};
@@ -71,7 +73,7 @@ pub(crate) fn start(
     )?;
     let output_width = plan.size.width.round() as u32;
     let output_height = plan.size.height.round() as u32;
-    let compositor = if content.requires_composition() {
+    let compositor = if content.requires_composition() || has_overlays {
         Some(Compositor::new(
             output_width,
             output_height,
@@ -86,13 +88,19 @@ pub(crate) fn start(
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
         compositor: Mutex::new(compositor),
+        direct_frame: Mutex::new(None),
         clock: Mutex::new(SessionTimeline::new(Duration::ZERO)),
         overlays: Mutex::new(overlays),
         failure: Mutex::new(None),
         accepting: AtomicBool::new(false),
+        first_frame: AtomicBool::new(false),
         epoch: std::time::Instant::now(),
         size: plan.size,
     });
+    let window_id = match &request.target {
+        CaptureTarget::Window(id) => id.0.parse::<u32>().ok(),
+        _ => None,
+    };
     let queue = DispatchQueue::new("com.thatcube.scrozz.recording", None);
     let mut streams = Vec::with_capacity(content.sources.len());
     let mut delegates = Vec::with_capacity(content.sources.len());
@@ -148,8 +156,7 @@ pub(crate) fn start(
 
     *lock(&shared.clock) = SessionTimeline::new(shared.now());
     shared.accepting.store(true, Ordering::Release);
-    let mut started_streams = 0;
-    for stream in &streams {
+    for (started_streams, stream) in streams.iter().enumerate() {
         if let Err(failure) = wait_operation("starting screen capture", |handler| {
             // SAFETY: the completion block is retained by ScreenCaptureKit for
             // the asynchronous operation.
@@ -161,7 +168,6 @@ pub(crate) fn start(
             stop_started(&streams[..started_streams]);
             return Err(failure);
         }
-        started_streams += 1;
     }
     let startup_failure = lock(&shared.failure).clone();
     if let Some(reason) = startup_failure {
@@ -195,6 +201,9 @@ pub(crate) fn start(
         video_codec: plan.codec,
         _delegates: delegates,
         _queue: queue,
+        window_id,
+        next_window_check: Cell::new(std::time::Instant::now()),
+        first_frame_emitted: false,
         finalized: false,
     }))
 }
@@ -202,13 +211,21 @@ pub(crate) fn start(
 struct Shared {
     writer: Mutex<Writer>,
     compositor: Mutex<Option<Compositor>>,
+    direct_frame: Mutex<Option<DirectFrame>>,
     clock: Mutex<SessionTimeline>,
     overlays: Mutex<Option<Box<dyn OverlaySource>>>,
     failure: Mutex<Option<String>>,
     accepting: AtomicBool,
+    first_frame: AtomicBool,
     epoch: std::time::Instant,
     size: PhysicalSize,
 }
+
+struct DirectFrame(CFRetained<CMSampleBuffer>);
+
+// SAFETY: the retained sample is immutable after ScreenCaptureKit publishes it.
+// Every later read/append is serialized through Shared's mutexes.
+unsafe impl Send for DirectFrame {}
 
 impl Shared {
     fn now(&self) -> Duration {
@@ -229,7 +246,11 @@ impl Shared {
         sample: &CMSampleBuffer,
         output_type: SCStreamOutputType,
     ) -> Result<()> {
-        if !self.accepting.load(Ordering::Acquire) || self.state() != RecordingState::Recording {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let state = self.state();
+        if state == RecordingState::Stopped {
             return Ok(());
         }
         // SAFETY: immutable readiness read on a live sample from the callback.
@@ -239,12 +260,22 @@ impl Shared {
 
         if output_type == SCStreamOutputType::Screen {
             match screen_frame_status(sample) {
-                Some(SCFrameStatus::Complete | SCFrameStatus::Started) => {
-                    self.append_screen(source_index, sample, true)
-                }
-                Some(SCFrameStatus::Idle) => self.append_screen(source_index, sample, false),
+                Some(SCFrameStatus::Complete | SCFrameStatus::Started) => self.append_screen(
+                    source_index,
+                    sample,
+                    true,
+                    state == RecordingState::Recording,
+                ),
+                Some(SCFrameStatus::Idle) => self.append_screen(
+                    source_index,
+                    sample,
+                    false,
+                    state == RecordingState::Recording,
+                ),
                 _ => Ok(()),
             }
+        } else if state != RecordingState::Recording {
+            Ok(())
         } else if output_type == SCStreamOutputType::Audio {
             lock(&self.writer).append_audio(AudioTrack::System, sample)
         } else if output_type == SCStreamOutputType::Microphone {
@@ -259,19 +290,32 @@ impl Shared {
         source_index: usize,
         sample: &CMSampleBuffer,
         has_new_pixels: bool,
+        emit: bool,
     ) -> Result<()> {
         let composite = {
             let mut compositor = lock(&self.compositor);
             let Some(compositor) = compositor.as_mut() else {
-                if !has_new_pixels {
-                    return Ok(());
-                }
                 if source_index != 0 {
                     return Err(Error::Codec(format!(
                         "single-source recording received unexpected source {source_index}"
                     )));
                 }
-                return self.append_video_with_overlays(sample);
+                let mut direct_frame = lock(&self.direct_frame);
+                if !emit {
+                    if has_new_pixels {
+                        *direct_frame = Some(DirectFrame(sample.retain()));
+                    }
+                    return Ok(());
+                }
+                if has_new_pixels {
+                    if self.append_video_with_overlays(sample)? {
+                        *direct_frame = None;
+                    } else {
+                        *direct_frame = Some(DirectFrame(sample.retain()));
+                    }
+                    return Ok(());
+                }
+                return self.emit_direct_frame_locked(&mut direct_frame);
             };
             let all_sources_ready = if has_new_pixels {
                 compositor.update(source_index, sample)?
@@ -279,6 +323,7 @@ impl Shared {
                 compositor.sources_ready()
             };
             if !all_sources_ready
+                || !emit
                 || !lock(&self.writer).video_ready()
                 || !compositor.ready_to_emit(sample)?
             {
@@ -286,10 +331,24 @@ impl Shared {
             }
             compositor.compose(sample)?
         };
-        self.append_video_with_overlays(&composite)
+        self.append_video_with_overlays(&composite).map(|_| ())
     }
 
-    fn append_video_with_overlays(&self, sample: &CMSampleBuffer) -> Result<()> {
+    fn emit_direct_frame(&self) -> Result<()> {
+        self.emit_direct_frame_locked(&mut lock(&self.direct_frame))
+    }
+
+    fn emit_direct_frame_locked(&self, pending: &mut Option<DirectFrame>) -> Result<()> {
+        let Some(sample) = pending.take() else {
+            return Ok(());
+        };
+        if !self.append_video_with_overlays(&sample.0)? && pending.is_none() {
+            *pending = Some(sample);
+        }
+        Ok(())
+    }
+
+    fn append_video_with_overlays(&self, sample: &CMSampleBuffer) -> Result<bool> {
         let elapsed = self.elapsed();
         let layers = {
             let mut overlays = lock(&self.overlays);
@@ -300,11 +359,22 @@ impl Shared {
         if !layers.is_empty() {
             super::overlay::composite(sample, &layers)?;
         }
-        lock(&self.writer).append_video(sample)
+        if lock(&self.writer).append_video(sample)? {
+            self.first_frame.store(true, Ordering::Release);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn fail(&self, reason: String) {
-        self.accepting.store(false, Ordering::Release);
+        if self
+            .accepting
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let mut failure = lock(&self.failure);
         if failure.is_none() {
             *failure = Some(reason);
@@ -326,9 +396,7 @@ impl Shared {
 fn screen_frame_status(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
     // SAFETY: SCK owns the immutable attachment array for the duration of this
     // callback; its first element is the documented frame-info dictionary.
-    let Some(attachments) = (unsafe { sample.sample_attachments_array(false) }) else {
-        return None;
-    };
+    let attachments = (unsafe { sample.sample_attachments_array(false) })?;
     if attachments.count() < 1 {
         return None;
     }
@@ -362,6 +430,16 @@ define_class!(
             output_type: SCStreamOutputType,
         ) {
             let ivars = self.ivars();
+            if output_type == SCStreamOutputType::Screen
+                && ivars.terminal_inactivity
+                && screen_frame_status(sample_buffer) == Some(SCFrameStatus::Stopped)
+            {
+                ivars.shared.fail(format!(
+                    "recording target {} stopped producing frames",
+                    ivars.source_label
+                ));
+                return;
+            }
             if let Err(failure) =
                 ivars
                     .shared
@@ -452,6 +530,9 @@ struct MacRecordingSession {
     video_codec: VideoCodec,
     _delegates: Vec<Retained<StreamDelegate>>,
     _queue: DispatchRetained<DispatchQueue>,
+    window_id: Option<u32>,
+    next_window_check: Cell<std::time::Instant>,
+    first_frame_emitted: bool,
     finalized: bool,
 }
 
@@ -462,7 +543,20 @@ unsafe impl Send for MacRecordingSession {}
 
 impl RecordingSession for MacRecordingSession {
     fn state(&self) -> RecordingState {
-        self.shared.state()
+        let state = self.shared.state();
+        let now = std::time::Instant::now();
+        if state != RecordingState::Stopped
+            && let Some(window_id) = self.window_id
+            && now >= self.next_window_check.get()
+        {
+            self.next_window_check.set(now + Duration::from_millis(250));
+            if !super::content::window_exists(window_id) {
+                self.shared
+                    .fail(format!("recording target window {window_id} disappeared"));
+                return RecordingState::Stopped;
+            }
+        }
+        state
     }
 
     fn elapsed(&self) -> Duration {
@@ -481,10 +575,27 @@ impl RecordingSession for MacRecordingSession {
     }
 
     fn resume(&mut self) -> Result<()> {
-        lock(&self.shared.writer).resume();
-        lock(&self.shared.clock)
-            .resume(self.shared.now())
-            .map_err(|message| Error::InvalidRequest(message.to_owned()))
+        {
+            let mut clock = lock(&self.shared.clock);
+            let paused = clock
+                .resume(self.shared.now())
+                .map_err(|message| Error::InvalidRequest(message.to_owned()))?;
+            lock(&self.shared.writer).resume(paused);
+        }
+        if let Err(failure) = self.shared.emit_direct_frame() {
+            self.shared.fail(failure.to_string());
+            return Err(failure);
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<crate::SessionEvent> {
+        if !self.first_frame_emitted && self.shared.first_frame.load(Ordering::Acquire) {
+            self.first_frame_emitted = true;
+            Some(crate::SessionEvent::FirstFrame)
+        } else {
+            None
+        }
     }
 
     fn engine_elapsed_secs(&self) -> Option<f64> {
@@ -493,6 +604,7 @@ impl RecordingSession for MacRecordingSession {
 
     fn stop(mut self: Box<Self>) -> Result<Recording> {
         self.shared.accepting.store(false, Ordering::Release);
+        lock(&self.shared.clock).stop(self.shared.now());
         for stream in &self.streams {
             if let Err(failure) = wait_operation("stopping screen capture", |handler| {
                 // SAFETY: valid stream and completion block.
@@ -506,7 +618,6 @@ impl RecordingSession for MacRecordingSession {
         if let Some(microphone) = &self.microphone {
             microphone.stop();
         }
-        lock(&self.shared.clock).stop(self.shared.now());
         let elapsed = self.shared.elapsed();
         let interrupted = lock(&self.shared.failure).take();
         let summary = lock(&self.shared.writer).finish(interrupted, elapsed)?;
@@ -530,7 +641,12 @@ impl RecordingSession for MacRecordingSession {
         )?
         .with_native_details(self.target.clone(), metadata)?;
         if let Some(reason) = summary.partial {
-            recording = recording.into_partial(reason)?;
+            recording = recording.into_partial_with_salvageability(
+                summary
+                    .salvageability
+                    .expect("a partial writer summary always classifies retained output"),
+                reason,
+            )?;
         }
         Ok(recording)
     }
@@ -552,11 +668,9 @@ impl Drop for MacRecordingSession {
             microphone.stop();
         }
         lock(&self.shared.clock).stop(self.shared.now());
-        let mut interrupted = lock(&self.shared.failure).take();
-        if interrupted.is_none() {
-            interrupted = Some("recording session was dropped without an explicit stop".to_owned());
+        if let Err(failure) = lock(&self.shared.writer).discard() {
+            tracing::error!("abandoned macOS recording cleanup failed: {failure}");
         }
-        let _ = lock(&self.shared.writer).finish(interrupted, self.shared.elapsed());
         self.finalized = true;
     }
 }
@@ -592,8 +706,12 @@ fn configure(
                 || plan.size.width.round() as u32 != content.native_width
                 || plan.size.height.round() as u32 != content.native_height,
         );
-        configuration.setPreservesAspectRatio(!content.requires_composition());
-        configuration.setCaptureResolution(SCCaptureResolutionType::Best);
+        if configuration.respondsToSelector(sel!(setPreservesAspectRatio:)) {
+            configuration.setPreservesAspectRatio(!content.requires_composition());
+        }
+        if configuration.respondsToSelector(sel!(setCaptureResolution:)) {
+            configuration.setCaptureResolution(SCCaptureResolutionType::Best);
+        }
         if plan.pixel_format == CapturePixelFormat::Bgra {
             configuration.setColorSpaceName(kCGColorSpaceSRGB);
         }

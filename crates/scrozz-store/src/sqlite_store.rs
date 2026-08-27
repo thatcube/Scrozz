@@ -1,5 +1,6 @@
 //! The SQLite-backed history store.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{
@@ -10,7 +11,7 @@ use scrozz_core::{Capture, CaptureTarget, Error, Frame, Provenance, Result};
 
 use crate::{
     CaptureId, RetentionPolicy, Store, db, hash,
-    id::capture_id_at,
+    id::{capture_id_at, is_valid_id},
     layout::StoreLayout,
     model::{
         CaptureRecord, FrameHeader, ImageState, MediaKind, Page, ProvenanceRepr, RetentionReport,
@@ -152,7 +153,7 @@ pub enum DocumentState {
     /// The pixels are here; this is the full editable document.
     Complete(Document),
     /// The pixels were evicted under the size cap. Every edit is intact.
-    ImageEvicted(EvictedDocument),
+    ImageEvicted(Box<EvictedDocument>),
 }
 
 impl DocumentState {
@@ -399,10 +400,12 @@ impl SqliteStore {
         }
         schema::migrate(&mut conn, schema::MIGRATIONS)?;
 
-        Ok(Self {
+        let mut store = Self {
             layout: layout.clone(),
             conn,
-        })
+        };
+        store.backfill_source_metadata()?;
+        Ok(store)
     }
 
     fn rebuild_from_records(layout: &StoreLayout) -> Result<Self> {
@@ -417,6 +420,7 @@ impl SqliteStore {
             conn,
         };
         let mut report = store.reconcile()?;
+        store.backfill_source_metadata()?;
         report.quarantined = quarantined;
         tracing::warn!(
             recovered = report.records_recovered,
@@ -551,20 +555,120 @@ impl SqliteStore {
     /// Insert writes the durable record *before* the index row, so the only way
     /// the two can disagree after a crash is a record with no row — a capture
     /// the user took and would otherwise silently lose. Comparing counts is one
-    /// directory listing, cheap enough to do on every open.
+    /// directory listing, cheap enough to do on every open. A lower on-disk
+    /// count means a durable sidecar was removed; ordinary startup deliberately
+    /// preserves that indexed row and leaves destructive reconciliation to the
+    /// explicit recovery command.
     fn adopt_unindexed_records(&mut self) -> Result<()> {
-        let on_disk = count_record_files(&self.layout)?;
-        let indexed = self.count()? as usize;
-        if on_disk == indexed {
+        let on_disk = record_file_ids(&self.layout)?;
+        let indexed: HashSet<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM captures")
+                .map_err(store_err("cannot list indexed history ids"))?;
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(store_err("cannot list indexed history ids"))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(store_err("cannot list indexed history ids"))?
+        };
+        let missing: HashSet<&str> = on_disk.difference(&indexed).map(String::as_str).collect();
+        if missing.is_empty() {
             return Ok(());
         }
 
-        tracing::info!(
-            on_disk,
-            indexed,
-            "history index disagrees with durable records; reconciling"
-        );
-        self.reconcile().map(|_| ())
+        tracing::info!(count = missing.len(), "adopting unindexed history records");
+        let (mut records, failures) = self.layout.scan_records()?;
+        for (path, failure) in failures {
+            tracing::warn!(
+                path = %path.display(),
+                "could not read a durable history record during adoption: {failure}"
+            );
+        }
+        let blobs = self.layout.scan_blobs()?;
+        let now = Timestamp::now();
+        for record in &mut records {
+            if let Some(hash) = &record.image_hash
+                && record.image_evicted_at.is_none()
+                && !blobs.iter().any(|(candidate, _)| candidate == hash)
+            {
+                record.mark_evicted(now);
+                self.layout.write_record(record)?;
+            }
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin history adoption"))?;
+        for (hash, byte_len) in blobs {
+            tx.execute(
+                "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (hash) DO UPDATE SET byte_len = excluded.byte_len",
+                params![hash, i64::try_from(byte_len).unwrap_or(i64::MAX), now.0],
+            )
+            .map_err(store_err("cannot adopt history blob"))?;
+        }
+        for record in records {
+            if missing.contains(record.id.as_str()) {
+                upsert_record(&tx, &record)?;
+            }
+        }
+        tx.commit()
+            .map_err(store_err("cannot commit history adoption"))?;
+        Ok(())
+    }
+
+    fn backfill_source_metadata(&mut self) -> Result<()> {
+        let pending = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM store_meta WHERE key = 'source_metadata_backfill_pending'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(store_err("cannot inspect source metadata repair state"))?
+            .is_some();
+        if !pending {
+            return Ok(());
+        }
+
+        let (records, unreadable) = self.layout.scan_records()?;
+        let repair_complete = unreadable.is_empty();
+        for (path, failure) in unreadable {
+            tracing::warn!(
+                path = %path.display(),
+                "could not read source metadata while repairing the history index: {failure}"
+            );
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(store_err("cannot begin source metadata repair"))?;
+        for record in records {
+            tx.execute(
+                "UPDATE captures
+                 SET app_identifier = ?1, window_shadow = ?2
+                 WHERE id = ?3",
+                params![
+                    record.app_identifier,
+                    record.window_shadow.map(i64::from),
+                    record.id
+                ],
+            )
+            .map_err(store_err("cannot restore capture source metadata"))?;
+        }
+        if repair_complete {
+            tx.execute(
+                "DELETE FROM store_meta WHERE key = 'source_metadata_backfill_pending'",
+                [],
+            )
+            .map_err(store_err("cannot complete source metadata repair"))?;
+        }
+        tx.commit()
+            .map_err(store_err("cannot commit source metadata repair"))?;
+        Ok(())
     }
 
     /// Removes blobs no capture refers to any more.
@@ -609,7 +713,28 @@ impl SqliteStore {
 
     /// The durable record for `id`, or `None`.
     fn stored_record(&self, id: &CaptureId) -> Result<Option<StoredRecord>> {
-        self.layout.read_record(id)
+        let record = self.layout.read_record(id)?;
+        if record.is_some() {
+            return Ok(record);
+        }
+        let indexed = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM captures WHERE id = ?1",
+                params![id.0],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(store_err("cannot inspect missing durable record"))?
+            .is_some();
+        if indexed {
+            Err(Error::Storage(format!(
+                "history item {} is indexed, but its durable sidecar is missing",
+                id.0
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Reads a blob, repairing the index if the file has vanished.
@@ -810,12 +935,14 @@ impl History for SqliteStore {
         };
 
         let Some(pixels) = pixels else {
-            return Ok(Some(DocumentState::ImageEvicted(EvictedDocument {
-                record: self
-                    .record(id)?
-                    .unwrap_or_else(|| record.to_capture_record()),
-                data,
-            })));
+            return Ok(Some(DocumentState::ImageEvicted(Box::new(
+                EvictedDocument {
+                    record: self
+                        .record(id)?
+                        .unwrap_or_else(|| record.to_capture_record()),
+                    data,
+                },
+            ))));
         };
 
         let header = record.frame.as_ref().ok_or_else(|| {
@@ -882,14 +1009,23 @@ impl History for SqliteStore {
     }
 
     fn delete(&mut self, id: &CaptureId) -> Result<bool> {
-        let Some(record) = self.stored_record(id)? else {
-            // The record may be gone while a stale row survives; clear it too.
-            let removed = self
-                .conn
-                .execute("DELETE FROM captures WHERE id = ?1", params![id.0])
-                .map_err(store_err("cannot delete capture"))?;
-            return Ok(removed > 0);
-        };
+        let record = self.layout.read_record(id)?;
+        let indexed_hash = self
+            .conn
+            .query_row(
+                "SELECT image_hash FROM captures WHERE id = ?1",
+                params![id.0],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(store_err("cannot inspect capture before delete"))?;
+        if record.is_none() && indexed_hash.is_none() {
+            return Ok(false);
+        }
+        let hash = record
+            .as_ref()
+            .and_then(|value| value.image_hash.clone())
+            .or(indexed_hash.flatten());
 
         let tx = self
             .conn
@@ -898,7 +1034,7 @@ impl History for SqliteStore {
         tx.execute("DELETE FROM captures WHERE id = ?1", params![id.0])
             .map_err(store_err("cannot delete capture"))?;
 
-        if let Some(hash) = record.image_hash.as_deref()
+        if let Some(hash) = hash.as_deref()
             && !blob_still_referenced(&tx, hash)?
         {
             tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
@@ -955,34 +1091,23 @@ impl History for SqliteStore {
     }
 
     fn stored_image_bytes(&self) -> Result<u64> {
-        self.conn
-            .query_row("SELECT COALESCE(SUM(byte_len), 0) FROM blobs", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|n| u64::try_from(n).unwrap_or(0))
-            .map_err(store_err("cannot measure stored images"))
+        self.layout
+            .scan_blobs()
+            .map(|blobs| blobs.into_iter().map(|(_, byte_len)| byte_len).sum())
     }
 
     fn evict(&mut self, policy: &RetentionPolicy) -> Result<RetentionReport> {
+        self.collect_garbage()?;
         let now = Timestamp::now();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_err("cannot begin retention"))?;
 
-        let mut total = sum_blob_bytes(&tx)?;
-        let pinned_bytes: u64 = tx
-            .query_row(
-                "SELECT COALESCE(SUM(b.byte_len), 0) FROM blobs b
-                 WHERE EXISTS (
-                     SELECT 1 FROM captures c
-                     WHERE c.image_hash = b.hash AND c.image_evicted_at IS NULL AND c.pinned = 1
-                 )",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|n| u64::try_from(n).unwrap_or(0))
-            .map_err(store_err("cannot measure pinned images"))?;
+        let missing = mark_missing_blobs_evicted(&tx, &self.layout, now)?;
+        let mut total = referenced_blob_bytes(&tx, &self.layout, false)?;
+        let pinned_bytes = referenced_blob_bytes(&tx, &self.layout, true)?;
+        let mut rewritten = missing;
 
         let mut report = RetentionReport {
             bytes_remaining: total,
@@ -991,7 +1116,8 @@ impl History for SqliteStore {
         };
 
         if total <= policy.max_image_bytes {
-            tx.rollback().map_err(store_err("cannot end retention"))?;
+            tx.commit().map_err(store_err("cannot commit retention"))?;
+            rewrite_evicted_records(&self.layout, &rewritten, now)?;
             return Ok(report);
         }
 
@@ -1012,7 +1138,6 @@ impl History for SqliteStore {
                 .map_err(store_err("cannot find evictable captures"))?
         };
 
-        let mut rewritten = Vec::new();
         for (id, digest) in candidates {
             if total <= policy.max_image_bytes {
                 break;
@@ -1027,15 +1152,7 @@ impl History for SqliteStore {
             .map_err(store_err("cannot evict image"))?;
 
             if !blob_still_referenced(&tx, &digest)? {
-                let byte_len: u64 = tx
-                    .query_row(
-                        "SELECT byte_len FROM blobs WHERE hash = ?1",
-                        params![digest],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(store_err("cannot size blob"))?
-                    .map_or(0, |n| u64::try_from(n).unwrap_or(0));
+                let byte_len = self.layout.blob_len(&digest)?.unwrap_or(0);
 
                 tx.execute("DELETE FROM blobs WHERE hash = ?1", params![digest])
                     .map_err(store_err("cannot forget blob"))?;
@@ -1067,27 +1184,86 @@ impl History for SqliteStore {
         // Durable records last: if this is interrupted, the next open finds a
         // record claiming pixels that are not there and marks it evicted, which
         // is the same end state.
-        for id in rewritten {
-            if let Some(mut record) = self.stored_record(&id)? {
-                record.mark_evicted(now);
-                self.layout.write_record(&record)?;
-            }
-        }
+        rewrite_evicted_records(&self.layout, &rewritten, now)?;
 
         Ok(report)
     }
+}
+
+fn rewrite_evicted_records(layout: &StoreLayout, ids: &[CaptureId], now: Timestamp) -> Result<()> {
+    for id in ids {
+        if let Some(mut record) = layout.read_record(id)? {
+            record.mark_evicted(now);
+            layout.write_record(&record)?;
+        }
+    }
+    Ok(())
 }
 
 fn store_err(context: &'static str) -> impl Fn(rusqlite::Error) -> Error {
     move |err| Error::Storage(format!("{context}: {err}"))
 }
 
-fn sum_blob_bytes(conn: &Connection) -> Result<u64> {
-    conn.query_row("SELECT COALESCE(SUM(byte_len), 0) FROM blobs", [], |row| {
-        row.get::<_, i64>(0)
+fn mark_missing_blobs_evicted(
+    conn: &Connection,
+    layout: &StoreLayout,
+    now: Timestamp,
+) -> Result<Vec<CaptureId>> {
+    let indexed: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image_hash FROM captures
+                 WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL",
+            )
+            .map_err(store_err("cannot inspect indexed blobs"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(store_err("cannot inspect indexed blobs"))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(store_err("cannot inspect indexed blobs"))?
+    };
+    let mut missing = Vec::new();
+    for (id, hash) in indexed {
+        if layout.blob_exists(&hash)? {
+            continue;
+        }
+        conn.execute(
+            "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
+            params![id, now.0],
+        )
+        .map_err(store_err("cannot mark a missing blob evicted"))?;
+        missing.push(CaptureId(id));
+    }
+    Ok(missing)
+}
+
+fn referenced_blob_bytes(
+    conn: &Connection,
+    layout: &StoreLayout,
+    pinned_only: bool,
+) -> Result<u64> {
+    let sql = if pinned_only {
+        "SELECT DISTINCT image_hash FROM captures
+         WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 1"
+    } else {
+        "SELECT DISTINCT image_hash FROM captures
+         WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL"
+    };
+    let hashes: Vec<String> = {
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(store_err("cannot list referenced blobs"))?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(store_err("cannot list referenced blobs"))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(store_err("cannot list referenced blobs"))?
+    };
+    hashes.into_iter().try_fold(0_u64, |total, hash| {
+        layout
+            .blob_len(&hash)
+            .map(|size| total.saturating_add(size.unwrap_or(0)))
     })
-    .map(|n| u64::try_from(n).unwrap_or(0))
-    .map_err(store_err("cannot measure stored images"))
 }
 
 fn blob_still_referenced(conn: &Connection, hash: &str) -> Result<bool> {
@@ -1117,20 +1293,22 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
 
     conn.execute(
         "INSERT INTO captures (
-             id, created_at, stored_at, pinned, app_name, window_title, provenance,
-             target_json, frame_json, image_hash, image_bytes, image_evicted_at,
-            ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold,
-            media_kind, video_json
+             id, created_at, stored_at, pinned, app_name, app_identifier,
+             window_title, window_shadow, provenance, target_json, frame_json,
+             image_hash, image_bytes, image_evicted_at, ocr_text, annotation_count,
+             search_fold, app_fold, title_fold, ocr_fold, media_kind, video_json
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20
+            ?19, ?20, ?21, ?22
          )
          ON CONFLICT (id) DO UPDATE SET
              created_at = excluded.created_at,
              stored_at = excluded.stored_at,
              pinned = excluded.pinned,
              app_name = excluded.app_name,
+             app_identifier = excluded.app_identifier,
              window_title = excluded.window_title,
+             window_shadow = excluded.window_shadow,
              provenance = excluded.provenance,
              target_json = excluded.target_json,
              frame_json = excluded.frame_json,
@@ -1151,7 +1329,9 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
             record.stored_at,
             i64::from(record.pinned),
             record.app_name,
+            record.app_identifier,
             record.window_title,
+            record.window_shadow.map(i64::from),
             record.provenance.as_token(),
             target_json,
             frame_json,
@@ -1196,19 +1376,23 @@ fn drop_rows_without_records(conn: &Connection, keep: &[String]) -> Result<usize
     Ok(dropped)
 }
 
-fn count_record_files(layout: &StoreLayout) -> Result<usize> {
+fn record_file_ids(layout: &StoreLayout) -> Result<HashSet<String>> {
     let dir = layout.documents_dir();
     if !dir.is_dir() {
-        return Ok(0);
+        return Ok(HashSet::new());
     }
-    let mut count = 0;
+    let mut ids = HashSet::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if entry.path().extension().is_some_and(|ext| ext == "json") {
-            count += 1;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(id) = path.file_stem().and_then(|stem| stem.to_str())
+            && is_valid_id(id)
+        {
+            ids.insert(id.to_owned());
         }
     }
-    Ok(count)
+    Ok(ids)
 }
 
 /// Escapes a user's search text so `%` and `_` are literal.
@@ -1307,11 +1491,6 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         .transpose()
         .map_err(|e| Error::Storage(format!("cannot read video metadata for {id}: {e}")))?;
     let media_kind = MediaKind::from_token(&media_kind)?;
-    if media_kind == MediaKind::Video && video.is_none() {
-        return Err(Error::Storage(format!(
-            "video history item {id} has no video metadata"
-        )));
-    }
 
     let image = match (image_hash, image_evicted_at) {
         (Some(hash), None) => ImageState::Present {

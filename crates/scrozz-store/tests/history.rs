@@ -96,7 +96,7 @@ fn a_native_recording_round_trips_as_external_video_history() {
     assert_eq!(videos[0].id, id);
     assert_eq!(
         store
-            .search(&SearchQuery::all().media_kind(MediaKind::Image))
+            .search(&SearchQuery::all().media_kind(MediaKind::Screenshot))
             .expect("image search")
             .len(),
         0
@@ -108,6 +108,67 @@ fn a_native_recording_round_trips_as_external_video_history() {
             .id,
         id
     );
+}
+
+#[test]
+fn legacy_video_rows_without_summary_metadata_remain_listable() {
+    let (_dir, mut store) = store("legacy-video-without-summary");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 1, 0)))
+        .expect("insert legacy-shaped row");
+    let raw = rusqlite::Connection::open(store.layout().index_path()).expect("open raw index");
+    raw.execute(
+        "UPDATE captures SET media_kind = 'video', video_json = NULL WHERE id = ?1",
+        [&id.0],
+    )
+    .expect("simulate pre-summary video row");
+    drop(raw);
+
+    let record = store.record(&id).expect("read").expect("present");
+    assert_eq!(record.media_kind, MediaKind::Video);
+    assert!(record.video.is_none());
+    assert_eq!(store.page(Page::default()).expect("list history").len(), 1);
+}
+
+#[test]
+fn version_five_backfills_dropped_source_values_even_when_counts_match() {
+    let (dir, mut store) = store("source-metadata-backfill");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 1, 0)).from_app("Preview"))
+        .expect("insert source capture");
+    let layout = store.layout().clone();
+    let mut sidecar = layout
+        .read_record(&id)
+        .expect("read source sidecar")
+        .expect("source sidecar exists");
+    sidecar.app_identifier = Some("com.apple.Preview".into());
+    sidecar.window_shadow = Some(false);
+    layout
+        .write_record(&sidecar)
+        .expect("write source metadata");
+    let index = layout.index_path();
+    drop(store);
+
+    let raw = rusqlite::Connection::open(&index).expect("open version-four index");
+    raw.execute_batch(
+        "ALTER TABLE captures DROP COLUMN app_identifier;
+         ALTER TABLE captures DROP COLUMN window_shadow;
+         PRAGMA user_version = 4;",
+    )
+    .expect("simulate old version-four metadata loss");
+    drop(raw);
+
+    let _reopened = SqliteStore::open(dir.path()).expect("migrate and backfill");
+    let raw = rusqlite::Connection::open(index).expect("inspect repaired index");
+    let restored: (Option<String>, Option<i64>) = raw
+        .query_row(
+            "SELECT app_identifier, window_shadow FROM captures WHERE id = ?1",
+            [&id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("source row remains indexed");
+    assert_eq!(restored.0.as_deref(), Some("com.apple.Preview"));
+    assert_eq!(restored.1, Some(0));
 }
 
 #[test]

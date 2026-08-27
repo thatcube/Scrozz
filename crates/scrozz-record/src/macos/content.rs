@@ -6,8 +6,11 @@ use std::time::Duration;
 use block2::RcBlock;
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID};
+use objc2_core_foundation::{CFArray, CFNumber, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{
+    CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID,
+    CGWindowListCreateDescriptionFromArray,
+};
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{SCContentFilter, SCDisplay, SCShareableContent, SCWindow};
 use scrozz_core::{CaptureTarget, Error, LogicalPoint, LogicalRect, LogicalSize, Result};
@@ -86,6 +89,7 @@ pub(crate) fn resolve(target: &CaptureTarget) -> Result<CaptureContent> {
             let display = find_display(&content, display_id)?;
             whole_display(&display)
         }
+
         CaptureTarget::Window(id) => {
             let window_id = id.0.parse::<u32>().map_err(|_| {
                 Error::InvalidRequest(format!("{:?} is not a macOS window id", id.0))
@@ -96,6 +100,14 @@ pub(crate) fn resolve(target: &CaptureTarget) -> Result<CaptureContent> {
         CaptureTarget::Region(rect) => region_content(&content, *rect),
         CaptureTarget::AllDisplays => all_displays(&content),
     }
+}
+
+pub(crate) fn window_exists(id: u32) -> bool {
+    let id = CFNumber::new_i64(i64::from(id));
+    let ids = CFArray::<CFNumber>::from_objects(&[id.as_ref()]);
+    // SAFETY: CoreGraphics requires an array of CFNumber window identifiers.
+    unsafe { CGWindowListCreateDescriptionFromArray(Some(ids.as_ref())) }
+        .is_some_and(|windows| !windows.is_empty())
 }
 
 fn whole_display(display: &SCDisplay) -> Result<CaptureContent> {
@@ -466,13 +478,15 @@ fn map_rect(
         canvas.origin.x,
         canvas.size.width,
         output_width,
-    );
+    )
+    .min(output_width.saturating_sub(1));
     let y = mapped_edge(
         destination.origin.y,
         canvas.origin.y,
         canvas.size.height,
         output_height,
-    );
+    )
+    .min(output_height.saturating_sub(1));
     let right = mapped_edge(
         destination.origin.x + destination.size.width,
         canvas.origin.x,
@@ -662,6 +676,22 @@ mod tests {
                 y: 0,
                 width: 20,
                 height: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn a_thin_intersection_at_the_far_edge_keeps_one_output_pixel() {
+        let canvas = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(100.0, 100.0));
+        let edge = LogicalRect::new(LogicalPoint::new(99.9, 99.9), LogicalSize::new(0.1, 0.1));
+
+        assert_eq!(
+            map_rect(edge, canvas, 10, 10),
+            PixelRect {
+                x: 9,
+                y: 9,
+                width: 1,
+                height: 1,
             }
         );
     }

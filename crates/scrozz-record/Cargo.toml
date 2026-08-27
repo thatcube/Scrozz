@@ -33,7 +33,7 @@ rav1e = { version = "0.8.1", default-features = false, features = ["threading"],
 block2.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL"] }
-objc2-av-foundation = { workspace = true, features = ["AVAssetWriter", "AVAssetWriterInput", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media"] }
+objc2-av-foundation = { workspace = true, features = ["AVAsset", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media"] }
 objc2-core-audio-types = "0.3.2"
 objc2-core-foundation.workspace = true
 objc2-core-graphics.workspace = true

@@ -29,7 +29,7 @@
 //! prints **nothing at all**. Its own documentation says callers must not report
 //! it. Pressing Escape is a decision, not a mistake.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use scrozz_core::Error as CoreError;
 
@@ -40,6 +40,9 @@ use crate::{exit::Exit, json::Json};
 pub enum CliError {
     /// A failure originating in one of the Scrozz crates.
     Core(CoreError),
+
+    /// A shared core failure returned by an asynchronous native worker.
+    SharedCore(Arc<CoreError>),
 
     /// The arguments were well-formed but semantically wrong.
     ///
@@ -82,6 +85,31 @@ impl CliError {
         Self::Ipc(message.into())
     }
 
+    pub(crate) fn shared_pair(self) -> (Self, Self) {
+        match self {
+            Self::Core(error) => {
+                let error = Arc::new(error);
+                (
+                    Self::SharedCore(Arc::clone(&error)),
+                    Self::SharedCore(error),
+                )
+            }
+            Self::SharedCore(error) => (
+                Self::SharedCore(Arc::clone(&error)),
+                Self::SharedCore(error),
+            ),
+            Self::Usage(message) => (Self::Usage(message.clone()), Self::Usage(message)),
+            Self::NotImplemented { what, provider } => (
+                Self::NotImplemented {
+                    what: what.clone(),
+                    provider,
+                },
+                Self::NotImplemented { what, provider },
+            ),
+            Self::Ipc(message) => (Self::Ipc(message.clone()), Self::Ipc(message)),
+        }
+    }
+
     /// The exit status for this error.
     ///
     /// Total by construction. [`CoreError`] is `#[non_exhaustive]`, so the
@@ -89,11 +117,8 @@ impl CliError {
     /// defined status rather than break the build of a downstream consumer.
     #[must_use]
     pub fn exit(&self) -> Exit {
-        match self {
-            Self::Usage(_) => Exit::Usage,
-            Self::NotImplemented { .. } => Exit::NotImplemented,
-            Self::Ipc(_) => Exit::IpcFailed,
-            Self::Core(err) => match err {
+        if let Some(err) = self.core_error() {
+            return match err {
                 CoreError::PermissionDenied { .. } => Exit::PermissionDenied,
                 CoreError::Unsupported { .. } => Exit::Unsupported,
                 CoreError::TargetGone(_) => Exit::TargetGone,
@@ -104,7 +129,13 @@ impl CliError {
                 CoreError::Io(_) => Exit::Io,
                 CoreError::Platform(_) => Exit::Platform,
                 _ => Exit::Failure,
-            },
+            };
+        }
+        match self {
+            Self::Usage(_) => Exit::Usage,
+            Self::NotImplemented { .. } => Exit::NotImplemented,
+            Self::Ipc(_) => Exit::IpcFailed,
+            Self::Core(_) | Self::SharedCore(_) => unreachable!("handled above"),
         }
     }
 
@@ -117,13 +148,14 @@ impl CliError {
     /// Whether this is ordinary user cancellation rather than a fault.
     #[must_use]
     pub fn is_cancellation(&self) -> bool {
-        matches!(self, Self::Core(err) if err.is_cancellation())
+        self.core_error().is_some_and(CoreError::is_cancellation)
     }
 
     /// Whether the user could plausibly fix this themselves.
     #[must_use]
     pub fn is_actionable_by_user(&self) -> bool {
-        matches!(self, Self::Core(err) if err.is_actionable_by_user())
+        self.core_error()
+            .is_some_and(CoreError::is_actionable_by_user)
     }
 
     /// Variant-specific fields for the JSON `error.details` object.
@@ -133,15 +165,20 @@ impl CliError {
     /// unconditionally, and reaches into `details` only for a kind it knows.
     #[must_use]
     pub fn details(&self) -> Json {
+        if let Some(error) = self.core_error() {
+            return match error {
+                CoreError::PermissionDenied { capability, remedy } => Json::obj([
+                    ("capability", Json::str(capability)),
+                    ("remedy", Json::str(remedy)),
+                ]),
+                CoreError::Unsupported { what, why } => {
+                    Json::obj([("what", Json::str(what)), ("why", Json::str(why))])
+                }
+                CoreError::TargetGone(target) => Json::obj([("target", Json::str(target))]),
+                _ => Json::Obj(vec![]),
+            };
+        }
         match self {
-            Self::Core(CoreError::PermissionDenied { capability, remedy }) => Json::obj([
-                ("capability", Json::str(capability)),
-                ("remedy", Json::str(remedy)),
-            ]),
-            Self::Core(CoreError::Unsupported { what, why }) => {
-                Json::obj([("what", Json::str(what)), ("why", Json::str(why))])
-            }
-            Self::Core(CoreError::TargetGone(target)) => Json::obj([("target", Json::str(target))]),
             Self::NotImplemented { what, provider } => Json::obj([
                 ("what", Json::str(what)),
                 ("provider", Json::str(*provider)),
@@ -169,34 +206,30 @@ impl CliError {
     /// cancellation case and only the cancellation case.
     #[must_use]
     pub fn to_human(&self) -> String {
+        if let Some(error) = self.core_error() {
+            return match error {
+                CoreError::PermissionDenied { capability, remedy } => format!(
+                    "scrozz: {capability} access has not been granted.\n\
+                     \n\
+                     \x20 Grant it here:\n\
+                     \x20   {remedy}\n\
+                     \n\
+                     \x20 Then run the command again. Scrozz asks for a permission\n\
+                     \x20 only at the moment a feature needs it, so nothing else is\n\
+                     \x20 waiting on you.\n"
+                ),
+                CoreError::Unsupported { what, why } => format!(
+                    "scrozz: {what} is not available on this system.\n\
+                     \n\
+                     \x20 {why}\n\
+                     \n\
+                     \x20 This is a known platform limitation, not a fault in Scrozz.\n"
+                ),
+                CoreError::Cancelled => String::new(),
+                _ => format!("scrozz: {error}\n"),
+            };
+        }
         match self {
-            // D15's counterpart to "ask at first use": when the answer is no,
-            // say what to do about it. The remedy names the pane; repeating it
-            // as a bare error string would waste the one useful field we have.
-            Self::Core(CoreError::PermissionDenied { capability, remedy }) => format!(
-                "scrozz: {capability} access has not been granted.\n\
-                 \n\
-                 \x20 Grant it here:\n\
-                 \x20   {remedy}\n\
-                 \n\
-                 \x20 Then run the command again. Scrozz asks for a permission\n\
-                 \x20 only at the moment a feature needs it, so nothing else is\n\
-                 \x20 waiting on you.\n"
-            ),
-
-            // D8: a documented gap, stated plainly. `why` carries the reason and
-            // the alternative, so it is printed verbatim rather than summarised.
-            Self::Core(CoreError::Unsupported { what, why }) => format!(
-                "scrozz: {what} is not available on this system.\n\
-                 \n\
-                 \x20 {why}\n\
-                 \n\
-                 \x20 This is a known platform limitation, not a fault in Scrozz.\n"
-            ),
-
-            // Its own doc comment forbids reporting it. Silence is the feature.
-            Self::Core(CoreError::Cancelled) => String::new(),
-
             Self::NotImplemented { what, provider } => format!(
                 "scrozz: {what} is not wired up yet.\n\
                  \n\
@@ -219,7 +252,15 @@ impl CliError {
                  \x20 or tray and try again.\n"
             ),
 
-            other => format!("scrozz: {other}\n"),
+            Self::Core(_) | Self::SharedCore(_) => unreachable!("handled above"),
+        }
+    }
+
+    fn core_error(&self) -> Option<&CoreError> {
+        match self {
+            Self::Core(error) => Some(error),
+            Self::SharedCore(error) => Some(error),
+            Self::Usage(_) | Self::NotImplemented { .. } | Self::Ipc(_) => None,
         }
     }
 }
@@ -228,6 +269,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core(err) => write!(f, "{err}"),
+            Self::SharedCore(err) => write!(f, "{err}"),
             Self::Usage(message) => write!(f, "{message}"),
             Self::NotImplemented { what, provider } => {
                 write!(f, "{what} is not implemented yet ({provider})")
@@ -239,16 +281,20 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Core(err) => Some(err),
-            _ => None,
-        }
+        self.core_error()
+            .map(|error| error as &(dyn std::error::Error + 'static))
     }
 }
 
 impl From<CoreError> for CliError {
     fn from(value: CoreError) -> Self {
         Self::Core(value)
+    }
+}
+
+impl From<Arc<CoreError>> for CliError {
+    fn from(value: Arc<CoreError>) -> Self {
+        Self::SharedCore(value)
     }
 }
 
@@ -401,6 +447,24 @@ mod tests {
         assert!(err.to_human().is_empty());
         assert_eq!(err.exit(), Exit::Cancelled);
         assert!(err.is_cancellation());
+    }
+
+    #[test]
+    fn shared_core_errors_keep_the_same_public_contract() {
+        let error = Arc::new(CoreError::PermissionDenied {
+            capability: "screen recording".into(),
+            remedy: "System Settings".into(),
+        });
+        let owned = CliError::Core(CoreError::PermissionDenied {
+            capability: "screen recording".into(),
+            remedy: "System Settings".into(),
+        });
+        let shared = CliError::from(error);
+
+        assert_eq!(shared.exit(), owned.exit());
+        assert_eq!(shared.kind(), owned.kind());
+        assert_eq!(shared.to_json(), owned.to_json());
+        assert_eq!(shared.to_human(), owned.to_human());
     }
 
     #[test]

@@ -54,16 +54,18 @@ impl SessionTimeline {
         }
     }
 
-    pub(crate) fn resume(&mut self, now: Duration) -> Result<(), &'static str> {
+    pub(crate) fn resume(&mut self, now: Duration) -> Result<Duration, &'static str> {
         match self.state {
             RecordingState::Paused => {
-                if let Some(paused_at) = self.paused_at.take() {
-                    self.paused_total += now.saturating_sub(paused_at);
-                }
+                let paused = self
+                    .paused_at
+                    .take()
+                    .map_or(Duration::ZERO, |paused_at| now.saturating_sub(paused_at));
+                self.paused_total += paused;
                 self.state = RecordingState::Recording;
-                Ok(())
+                Ok(paused)
             }
-            RecordingState::Recording => Ok(()),
+            RecordingState::Recording => Ok(Duration::ZERO),
             RecordingState::Stopped => Err("recording has already stopped"),
         }
     }
@@ -79,32 +81,28 @@ impl SessionTimeline {
 
 #[derive(Debug, Default)]
 pub(crate) struct SampleTimeline {
-    last_source_end_ns: Option<i64>,
     last_output_end_ns: Option<i64>,
-    remove_gap_on_next_sample: bool,
     removed_ns: i64,
 }
 
 impl SampleTimeline {
-    pub(crate) fn pause(&mut self) {
-        self.remove_gap_on_next_sample = true;
+    pub(crate) fn remove_pause(&mut self, paused_ns: i64, session_started: bool) {
+        if session_started {
+            self.removed_ns = self.removed_ns.saturating_add(paused_ns.max(0));
+        }
     }
 
-    pub(crate) fn map(&mut self, source_ns: i64, duration_ns: i64) -> i64 {
-        if self.remove_gap_on_next_sample {
-            if let Some(last_end) = self.last_source_end_ns {
-                self.removed_ns = self
-                    .removed_ns
-                    .saturating_add(source_ns.saturating_sub(last_end).max(0));
-            }
-            self.remove_gap_on_next_sample = false;
-        }
-
+    pub(crate) fn map(
+        &mut self,
+        source_ns: i64,
+        duration_ns: i64,
+        minimum_output_ns: Option<i64>,
+    ) -> i64 {
         let output_ns = source_ns
             .saturating_sub(self.removed_ns)
-            .max(self.last_output_end_ns.unwrap_or(i64::MIN));
+            .max(self.last_output_end_ns.unwrap_or(i64::MIN))
+            .max(minimum_output_ns.unwrap_or(i64::MIN));
         let duration_ns = duration_ns.max(0);
-        self.last_source_end_ns = Some(source_ns.saturating_add(duration_ns));
         self.last_output_end_ns = Some(output_ns.saturating_add(duration_ns));
         output_ns
     }
@@ -150,18 +148,49 @@ mod tests {
     #[test]
     fn sample_timestamps_remove_the_discarded_pause_gap() {
         let mut timeline = SampleTimeline::default();
-        assert_eq!(timeline.map(1_000, 10), 1_000);
-        assert_eq!(timeline.map(1_010, 10), 1_010);
+        assert_eq!(timeline.map(1_000, 10, None), 1_000);
+        assert_eq!(timeline.map(1_010, 10, None), 1_010);
 
-        timeline.pause();
-        assert_eq!(timeline.map(5_000, 10), 1_020);
-        assert_eq!(timeline.map(5_010, 10), 1_030);
+        timeline.remove_pause(3_980, true);
+        assert_eq!(timeline.map(5_000, 10, None), 1_020);
+        assert_eq!(timeline.map(5_010, 10, None), 1_030);
+    }
+
+    #[test]
+    fn sample_timestamps_keep_static_time_before_a_pause() {
+        let mut timeline = SampleTimeline::default();
+        assert_eq!(timeline.map(1_000, 10, None), 1_000);
+
+        timeline.remove_pause(100, true);
+
+        assert_eq!(timeline.map(5_000, 10, None), 4_900);
+    }
+
+    #[test]
+    fn a_pause_before_the_first_sample_does_not_shift_the_session_origin() {
+        let mut timeline = SampleTimeline::default();
+        timeline.remove_pause(5_000, false);
+        assert_eq!(timeline.map(10_000, 10, None), 10_000);
+    }
+
+    #[test]
+    fn a_track_starting_after_pause_uses_the_shared_session_timeline() {
+        let mut timeline = SampleTimeline::default();
+        timeline.remove_pause(5_000, true);
+        assert_eq!(timeline.map(10_000, 10, None), 5_000);
+    }
+
+    #[test]
+    fn a_retained_pause_frame_cannot_precede_the_shared_session() {
+        let mut timeline = SampleTimeline::default();
+        timeline.remove_pause(2_000, true);
+        assert_eq!(timeline.map(100_200, 10, Some(100_000)), 100_000);
     }
 
     #[test]
     fn sample_timestamps_never_move_backwards() {
         let mut timeline = SampleTimeline::default();
-        assert_eq!(timeline.map(100, 20), 100);
-        assert_eq!(timeline.map(105, 20), 120);
+        assert_eq!(timeline.map(100, 20, None), 100);
+        assert_eq!(timeline.map(105, 20, None), 120);
     }
 }

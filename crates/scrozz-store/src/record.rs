@@ -23,7 +23,7 @@
 
 use scrozz_annotate::DocumentData;
 use scrozz_core::{CaptureTarget, Error, Provenance, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     CaptureId,
@@ -38,7 +38,7 @@ use crate::{
 pub const RECORD_FORMAT: u32 = 1;
 
 /// Everything persisted about one capture except its pixels.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StoredRecord {
     /// Sidecar format version.
     #[serde(default = "default_format")]
@@ -53,15 +53,21 @@ pub struct StoredRecord {
     /// Exempt from eviction.
     #[serde(default)]
     pub pinned: bool,
-    /// Still image or video. Missing in legacy sidecars means image.
+    /// Screenshot, video, or GIF. Missing in legacy sidecars means screenshot.
     #[serde(default)]
     pub media_kind: MediaKind,
     /// Owning application.
     #[serde(default)]
     pub app_name: Option<String>,
+    /// Stable application identifier retained for schema compatibility.
+    #[serde(default)]
+    pub app_identifier: Option<String>,
     /// Window title.
     #[serde(default)]
     pub window_title: Option<String>,
+    /// Whether the captured window included its native shadow.
+    #[serde(default)]
+    pub window_shadow: Option<bool>,
     /// How the capture was produced.
     pub provenance: ProvenanceRepr,
     /// What it was aimed at.
@@ -89,6 +95,86 @@ pub struct StoredRecord {
     /// decision D23 promises to keep forever.
     #[serde(default = "empty_document")]
     pub document: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct StoredRecordWire {
+    #[serde(default = "default_format")]
+    format: u32,
+    id: String,
+    created_at: i64,
+    #[serde(default)]
+    stored_at: i64,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    media_kind: MediaKind,
+    #[serde(default)]
+    source_app: Option<SourceAppWire>,
+    #[serde(default)]
+    app_name: Option<String>,
+    #[serde(default)]
+    app_identifier: Option<String>,
+    #[serde(default)]
+    window_title: Option<String>,
+    #[serde(default)]
+    window_shadow: Option<bool>,
+    provenance: ProvenanceRepr,
+    target: TargetRepr,
+    frame: Option<FrameHeader>,
+    #[serde(default)]
+    video: Option<VideoMetadata>,
+    #[serde(default)]
+    image_hash: Option<String>,
+    #[serde(default)]
+    image_bytes: u64,
+    #[serde(default)]
+    image_evicted_at: Option<i64>,
+    #[serde(default)]
+    ocr_text: Option<String>,
+    #[serde(default = "empty_document")]
+    document: serde_json::Value,
+}
+
+#[derive(Default, Deserialize)]
+struct SourceAppWire {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    identifier: Option<String>,
+    #[serde(default)]
+    window_title: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for StoredRecord {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StoredRecordWire::deserialize(deserializer)?;
+        let source = wire.source_app.unwrap_or_default();
+        Ok(Self {
+            format: wire.format,
+            id: wire.id,
+            created_at: wire.created_at,
+            stored_at: wire.stored_at,
+            pinned: wire.pinned,
+            media_kind: wire.media_kind,
+            app_name: source.name.or(wire.app_name),
+            app_identifier: source.identifier.or(wire.app_identifier),
+            window_title: source.window_title.or(wire.window_title),
+            window_shadow: wire.window_shadow,
+            provenance: wire.provenance,
+            target: wire.target,
+            frame: wire.frame,
+            video: wire.video,
+            image_hash: wire.image_hash,
+            image_bytes: wire.image_bytes,
+            image_evicted_at: wire.image_evicted_at,
+            ocr_text: wire.ocr_text,
+            document: wire.document,
+        })
+    }
 }
 
 const fn default_format() -> u32 {
@@ -127,9 +213,11 @@ impl StoredRecord {
             created_at: created_at.0,
             stored_at: stored_at.0,
             pinned,
-            media_kind: MediaKind::Image,
+            media_kind: MediaKind::Screenshot,
             app_name,
+            app_identifier: None,
             window_title,
+            window_shadow: None,
             provenance: provenance.into(),
             target: TargetRepr::from(target),
             frame: Some(frame),
@@ -162,7 +250,9 @@ impl StoredRecord {
             pinned,
             media_kind: MediaKind::Video,
             app_name: None,
+            app_identifier: None,
             window_title: None,
+            window_shadow: None,
             provenance: provenance.into(),
             target: TargetRepr::from(target),
             frame: None,
@@ -374,7 +464,9 @@ mod tests {
 
     #[test]
     fn records_round_trip_through_json() {
-        let original = record();
+        let mut original = record();
+        original.app_identifier = Some("com.apple.Safari".into());
+        original.window_shadow = Some(false);
         let bytes = original.to_json().expect("encode");
         let back = StoredRecord::from_json(&bytes).expect("decode");
         assert_eq!(original, back);
@@ -385,6 +477,34 @@ mod tests {
             data.beautification,
             Some(Beautification::padded(8.0, Background::default()))
         );
+    }
+
+    #[test]
+    fn nested_source_metadata_from_the_alternate_sidecar_schema_is_preserved() {
+        let original = record();
+        let mut value = serde_json::to_value(&original).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("app_name");
+        object.remove("app_identifier");
+        object.remove("window_title");
+        object.insert(
+            "source_app".into(),
+            serde_json::json!({
+                "name": "Preview",
+                "identifier": "com.apple.Preview",
+                "window_title": "Document"
+            }),
+        );
+
+        let decoded = StoredRecord::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.app_name.as_deref(), Some("Preview"));
+        assert_eq!(decoded.app_identifier.as_deref(), Some("com.apple.Preview"));
+        assert_eq!(decoded.window_title.as_deref(), Some("Document"));
+
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&decoded.to_json().unwrap()).unwrap();
+        assert!(canonical.get("source_app").is_none());
+        assert_eq!(canonical["app_identifier"], "com.apple.Preview");
     }
 
     #[test]

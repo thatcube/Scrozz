@@ -27,6 +27,10 @@ pub(crate) struct Compositor {
     color_space: CFRetained<CFType>,
 }
 
+// SAFETY: the retained CGColorSpace is immutable, and a Compositor is only
+// accessed while holding Shared's compositor mutex.
+unsafe impl Send for Compositor {}
+
 struct Tile {
     destination: PixelRect,
     pixels: Option<Vec<u8>>,
@@ -359,7 +363,7 @@ mod tests {
     fn blit_preserves_tile_positions_and_black_gaps() {
         let mut canvas = vec![0_u8; 4 * 3 * 4];
         let left = vec![1_u8; 2 * 2 * 4];
-        let right = vec![2_u8; 1 * 3 * 4];
+        let right = vec![2_u8; 3 * 4];
         blit(
             &left,
             PixelRect {
