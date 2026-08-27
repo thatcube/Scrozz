@@ -104,14 +104,14 @@ pub(crate) fn classify(text: &str) -> Option<LinkKind> {
 fn candidates(text: &str) -> Vec<&str> {
     let mut found: Vec<&str> = text
         .split_ascii_whitespace()
-        .map(trim_candidate)
+        .map(trim_url_or_email_candidate)
         .filter(|candidate| is_url(candidate) || is_email(candidate))
         .collect();
     let claimed = found.clone();
     found.extend(
         telephone_candidates(text)
             .into_iter()
-            .filter(|candidate| !claimed.iter().any(|span| contains_slice(span, candidate))),
+            .filter(|candidate| !claimed.iter().any(|span| overlaps_slice(span, candidate))),
     );
     found.sort_by_key(|candidate| candidate.as_ptr() as usize);
     found.dedup();
@@ -164,6 +164,17 @@ fn trim_candidate(text: &str) -> &str {
     })
 }
 
+fn trim_url_or_email_candidate(mut text: &str) -> &str {
+    text = trim_candidate(text);
+    while let Some(inner) = text
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        text = trim_candidate(inner);
+    }
+    text
+}
+
 fn is_url(text: &str) -> bool {
     let remainder = ["https://", "http://"]
         .iter()
@@ -194,7 +205,7 @@ fn is_email(text: &str) -> bool {
 fn is_telephone(text: &str) -> bool {
     let explicit = strip_ascii_case_insensitive(text, "tel:");
     let number = explicit.unwrap_or(text);
-    if explicit.is_none() && is_date(number) {
+    if explicit.is_none() && contains_date(number) {
         return false;
     }
     let digits = number
@@ -217,6 +228,14 @@ fn is_telephone(text: &str) -> bool {
                 .any(|character| matches!(character, '-' | '(' | ')' | ' ')))
 }
 
+fn contains_date(text: &str) -> bool {
+    text.split_ascii_whitespace().any(|part| {
+        is_date(
+            part.trim_matches(|character| matches!(character, '(' | ')' | ',' | ';')),
+        )
+    })
+}
+
 fn is_date(text: &str) -> bool {
     ['-', '.'].into_iter().any(|separator| {
         let parts = text.split(separator).collect::<Vec<_>>();
@@ -231,12 +250,12 @@ fn is_date(text: &str) -> bool {
     })
 }
 
-fn contains_slice(container: &str, candidate: &str) -> bool {
-    let container_start = container.as_ptr() as usize;
-    let container_end = container_start + container.len();
-    let candidate_start = candidate.as_ptr() as usize;
-    let candidate_end = candidate_start + candidate.len();
-    candidate_start >= container_start && candidate_end <= container_end
+fn overlaps_slice(left: &str, right: &str) -> bool {
+    let left_start = left.as_ptr() as usize;
+    let left_end = left_start + left.len();
+    let right_start = right.as_ptr() as usize;
+    let right_end = right_start + right.len();
+    left_start < right_end && right_start < left_end
 }
 
 fn starts_ascii_case_insensitive(text: &str, prefix: &str) -> bool {
@@ -270,16 +289,23 @@ mod tests {
         assert_eq!(classify("0123456789012"), None);
         assert_eq!(classify("2026-08-27"), None);
         assert_eq!(classify("27.08.2026"), None);
+        assert_eq!(classify("2026-08-27 12"), None);
+        assert_eq!(classify("2026-08-27)"), None);
     }
 
     #[test]
     fn dates_and_numbers_inside_urls_are_not_telephone_links() {
-        let found = links(&[block(
-            "Published 2026-08-27 at https://example.org/archive/2026-08-27",
-        )]);
+        let source = block(
+            "Published 2026-08-27 12:34 at (https://example.org/archive/2026-08-27) \
+             or (https://example.org/212-555-0199)",
+        );
+        let found = links(&[source]);
 
-        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found.len(), 2, "{found:#?}");
         assert_eq!(found[0].kind, LinkKind::Url);
+        assert_eq!(found[0].text, "https://example.org/archive/2026-08-27");
+        assert_eq!(found[1].kind, LinkKind::Url);
+        assert_eq!(found[1].text, "https://example.org/212-555-0199");
     }
 
     #[test]

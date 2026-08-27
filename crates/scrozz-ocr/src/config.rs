@@ -1,5 +1,6 @@
 //! Typed adaptation from persisted OCR settings to runtime behavior.
 
+use language_tags::LanguageTag;
 use scrozz_core::{Error, Result};
 
 use crate::{LineBreaks, Link, Options, TextBlock};
@@ -50,7 +51,7 @@ impl RuntimeConfig {
     /// # Errors
     ///
     /// Returns [`Error::InvalidRequest`] when automatic detection and configured
-    /// tags are both enabled.
+    /// tags are both enabled or when a configured tag is not valid BCP-47.
     pub fn from_settings(
         languages: &str,
         automatic_language_detection: bool,
@@ -63,6 +64,14 @@ impl RuntimeConfig {
             .filter(|tag| !tag.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        if let Some(tag) = languages
+            .iter()
+            .find(|tag| LanguageTag::parse(tag.as_str()).is_err())
+        {
+            return Err(Error::InvalidRequest(format!(
+                "{LANGUAGES_KEY} contains malformed BCP-47 language tag {tag:?}"
+            )));
+        }
         if automatic_language_detection && !languages.is_empty() {
             return Err(Error::InvalidRequest(format!(
                 "{AUTO_DETECT_LANGUAGE_KEY} cannot be true while {LANGUAGES_KEY} contains tags"
@@ -157,6 +166,13 @@ mod tests {
             RuntimeConfig::from_settings(" de-DE, en-US ,, fr-FR ", false, true, true).unwrap();
         assert_eq!(config.language_mode(), LanguageMode::Configured);
         assert_eq!(config.options().languages, ["de-DE", "en-US", "fr-FR"]);
+    }
+
+    #[test]
+    fn malformed_language_tags_are_rejected_at_the_settings_boundary() {
+        let error = RuntimeConfig::from_settings("de-DE, en--US", false, true, true).unwrap_err();
+        assert!(matches!(error, Error::InvalidRequest(message) if
+            message.contains(LANGUAGES_KEY) && message.contains("en--US")));
     }
 
     #[test]
