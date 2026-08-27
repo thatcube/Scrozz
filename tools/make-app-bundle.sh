@@ -7,14 +7,12 @@
 # A bundle with its own bundle id fixes that: the grant attaches to Scrozz
 # rather than to whatever launched it.
 #
-# How durable that grant is depends on how the bundle is signed, and the honest
-# answer is "not very, for an ad-hoc signature". TCC keys on the code-signing
-# identity, and for an ad-hoc signature that identity is effectively the cdhash,
-# which changes every time the binary changes. So an ad-hoc build is a
-# *development* convenience: it usually survives an unchanged rebuild and it
-# reliably does not survive a changed one, and macOS will ask again. A stable
-# identity across releases needs a real Developer ID signature — see the signing
-# step at the end of this script.
+# How durable that grant is depends on how the bundle is signed. This script
+# uses an installed Apple Development identity when one is available, giving
+# changed local builds one stable identity. Machines without one fall back to
+# an ad-hoc signature, whose effective identity is the binary's changing cdhash
+# and therefore requires Screen Recording approval after changed builds. Public
+# releases still need Developer ID signing and notarisation — see release.yml.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -234,33 +232,25 @@ if [[ "${SCROZZ_INCLUDE_LEGACY_ICON:-0}" == "1" ]]; then
     "$APP/Contents/Info.plist"
 fi
 
-echo "==> signing (ad-hoc, stable identifier)"
-# --identifier pins the bundle id into the signature so it does not vary with
-# the file name. That is worth doing, but it is not what makes a TCC grant
-# durable, and the difference matters:
-#
-#   ad-hoc (here)   No certificate. TCC effectively keys on the cdhash, which
-#                   changes with every rebuild that changes a byte, so Screen
-#                   Recording has to be re-approved after most rebuilds. Fine
-#                   for development; not an identity.
-#
-#   Developer ID    A real certificate. The identity is stable across builds
-#                   and versions, so the grant persists, and Gatekeeper accepts
-#                   the app on a machine that did not build it. This is what a
-#                   release needs — see .github/workflows/release.yml, where
-#                   signing and notarisation are gated on secrets that only
-#                   Brandon can create.
-#
-# Do not describe an ad-hoc build as preserving permissions. It does not.
-#
-# SCROZZ_SKIP_SIGN exists for the release path, which signs with a real
-# identity immediately afterwards. `codesign --force` would overwrite an ad-hoc
-# signature happily, but not doing pointless work makes the log honest about
-# which signature the shipped bundle actually carries.
 if [[ "${SCROZZ_SKIP_SIGN:-0}" == "1" ]]; then
-  echo "    skipped (SCROZZ_SKIP_SIGN=1); caller signs this bundle itself"
+  echo "==> signing skipped (SCROZZ_SKIP_SIGN=1); caller owns the signature"
 else
-  codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
+  SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
+  if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
+    SIGN_IDENTITY="$(
+      security find-identity -v -p codesigning 2>/dev/null |
+        awk '/"Apple Development:/ { print $2; exit }'
+    )"
+  fi
+
+  if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
+    echo "==> signing with a stable Apple Development identity"
+    codesign --force --sign "$SIGN_IDENTITY" --identifier com.thatcube.Scrozz \
+      --timestamp=none "$APP"
+  else
+    echo "==> signing ad-hoc (Screen Recording approval will not survive changed builds)"
+    codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
+  fi
 fi
 
 echo
