@@ -17,6 +17,8 @@
 mod theme;
 #[path = "../src/icons.rs"]
 mod icons;
+#[path = "../src/motion.rs"]
+mod motion;
 #[path = "../src/paint.rs"]
 mod paint;
 #[path = "../src/surfaces.rs"]

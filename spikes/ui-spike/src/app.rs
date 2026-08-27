@@ -57,6 +57,8 @@ pub struct SpikeApp {
     live_backdrop: bool,
     frame: u64,
     captured: bool,
+    stack: crate::stack::Stack,
+    tuner_open: bool,
 }
 
 impl SpikeApp {
@@ -73,7 +75,13 @@ impl SpikeApp {
 
         Self {
             live_surface: cfg.surface,
-            live_variant: cfg.quick_variant,
+            // Interactively we always open on the live, animated stack; a
+            // `--shot` run keeps whatever static variant was asked for.
+            live_variant: if cfg.interactive() && cfg.surface == Surface::Quick {
+                QuickVariant::Live
+            } else {
+                cfg.quick_variant
+            },
             live_dark: cfg.theme_dark,
             live_backdrop: cfg.backdrop,
             cfg,
@@ -81,6 +89,8 @@ impl SpikeApp {
             material,
             frame: 0,
             captured: false,
+            stack: crate::stack::Stack::new(),
+            tuner_open: false,
         }
     }
 
@@ -95,9 +105,13 @@ impl SpikeApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        let mut spawn = false;
+        let mut dismiss = false;
+        let mut replay = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Num1) {
                 self.live_surface = Surface::Quick;
+                self.live_variant = QuickVariant::Live;
             }
             if i.key_pressed(egui::Key::Num2) {
                 self.live_surface = Surface::Menu;
@@ -109,12 +123,14 @@ impl SpikeApp {
                 self.live_surface = Surface::Onboard;
             }
             if i.key_pressed(egui::Key::V) {
-                // Cycle the Quick overlay's drag-state variant.
+                // Cycle the Quick overlay's state: the live stack first, then
+                // the three approved stills.
                 self.live_surface = Surface::Quick;
                 self.live_variant = match self.live_variant {
+                    QuickVariant::Live => QuickVariant::Stack,
                     QuickVariant::Stack => QuickVariant::Swipe,
                     QuickVariant::Swipe => QuickVariant::Drag,
-                    QuickVariant::Drag => QuickVariant::Stack,
+                    QuickVariant::Drag => QuickVariant::Live,
                 };
             }
             if i.key_pressed(egui::Key::L) {
@@ -123,10 +139,29 @@ impl SpikeApp {
             if i.key_pressed(egui::Key::G) {
                 self.live_backdrop = !self.live_backdrop;
             }
+            if i.key_pressed(egui::Key::M) {
+                self.tuner_open = !self.tuner_open;
+            }
+            spawn = i.key_pressed(egui::Key::N);
+            dismiss = i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete);
+            replay = i.key_pressed(egui::Key::R);
             if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
+        // A new capture always yanks you to the surface that shows it, so `N`
+        // does something visible no matter where you are.
+        if spawn {
+            self.live_surface = Surface::Quick;
+            self.live_variant = QuickVariant::Live;
+            self.stack.spawn();
+        }
+        if dismiss {
+            self.stack.dismiss_top();
+        }
+        if replay {
+            self.stack.replay();
+        }
         // Re-install style when theme flips (selection colors etc.).
         let pal = if self.live_dark { Palette::dark() } else { Palette::light() };
         theme::install_style(ctx, &pal);
@@ -189,7 +224,18 @@ impl eframe::App for SpikeApp {
             screen.shrink(self.cfg.pad())
         };
 
+        // `busy` is the whole repaint-scheduling story for hand-rolled physics:
+        // egui's own `animate_*` helpers request their own repaints and stop
+        // when they settle, but springs and coasting cards do not. We ask for
+        // exactly one more frame while something is moving, and nothing at all
+        // once everything is at rest — so the app is genuinely idle on the
+        // desktop instead of pinning a core.
+        let mut busy = false;
+
         match self.live_surface {
+            Surface::Quick if self.live_variant == QuickVariant::Live => {
+                busy |= self.stack.show(ui, &self.icons, &pal, card);
+            }
             Surface::Quick => {
                 crate::surfaces::quick(ui, &self.icons, &pal, card, self.live_variant)
             }
@@ -198,6 +244,24 @@ impl eframe::App for SpikeApp {
 
         if self.cfg.interactive() {
             hint_bar(ui, &pal, screen);
+            if self.tuner_open {
+                let act = crate::tuner::show(&ctx, &mut self.tuner_open, &pal);
+                if act.replay {
+                    self.stack.replay();
+                }
+                if act.spawn {
+                    self.live_surface = Surface::Quick;
+                    self.live_variant = QuickVariant::Live;
+                    self.stack.spawn();
+                }
+                if act.dismiss {
+                    self.stack.dismiss_top();
+                }
+            }
+        }
+
+        if busy {
+            ctx.request_repaint();
         }
 
         // Shot mode: after the window has settled, grab it and quit.
@@ -216,7 +280,7 @@ impl eframe::App for SpikeApp {
 
 /// Small live legend so the interactive window explains its own hotkeys.
 fn hint_bar(ui: &mut egui::Ui, pal: &Palette, screen: Rect) {
-    let text = "1 Quick  2 Menu  3 Annotate  4 Onboard   V drag-state   L light/dark  G glass  Q quit";
+    let text = "1 Quick  2 Menu  3 Annotate  4 Onboard   V state   N new capture  ⌫ dismiss  R replay   M motion tuner   L light/dark  G glass  Q quit     ·  hover a card, drag it, flick to throw";
     let font = theme::ts_caption();
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, pal.text_muted);
     let size = galley.size() + egui::vec2(20.0, 12.0);

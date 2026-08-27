@@ -7,6 +7,7 @@
 //! buttons are all bespoke, driven entirely by the tokens in `theme`.
 
 use crate::icons::IconStore;
+use crate::motion;
 use crate::theme::{self, cr, Palette};
 use egui::{
     epaint::Shadow, pos2, vec2, Align2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke,
@@ -19,8 +20,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SCREENSHOT: AtomicBool = AtomicBool::new(false);
 pub fn set_screenshot(on: bool) {
     SCREENSHOT.store(on, Ordering::Relaxed);
+    // A deterministic still has no time axis, so every duration collapses too —
+    // otherwise the snapshot baseline would depend on which frame we grabbed.
+    motion::set_reduce(on);
 }
-fn shot_mode() -> bool {
+pub fn shot_mode() -> bool {
     SCREENSHOT.load(Ordering::Relaxed)
 }
 
@@ -136,6 +140,13 @@ fn interact(ui: &mut Ui, rect: Rect, salt: &str) -> Response {
     ui.interact(rect, id, Sense::click())
 }
 
+/// Same, but with a caller-supplied stable `Id`. **Animated widgets must use
+/// this**: the position-derived id above changes the moment a rect moves, which
+/// would reset the widget's animation state every frame it was in flight.
+fn interact_id(ui: &mut Ui, rect: Rect, id: egui::Id) -> Response {
+    ui.interact(rect, id, Sense::click())
+}
+
 /// Round-rect icon button. Muted by default, brightens on hover, accent-filled
 /// when selected — the affordance rhythm CleanShot uses on its action bars.
 pub fn icon_button(
@@ -147,33 +158,131 @@ pub fn icon_button(
     icon_px: f32,
     st: BtnState,
 ) -> Response {
-    let resp = interact(ui, rect, name);
+    let id = egui::Id::new(("scrozz", name, rect.min.x.to_bits(), rect.min.y.to_bits()));
+    icon_button_id(ui, icons, pal, rect, id, name, icon_px, st, 1.0, Vec2::ZERO)
+}
+
+/// Round-rect icon button with an explicit id, a reveal factor (for chrome that
+/// fades in) and a draw-only offset (so a "rise" never moves the hit target).
+///
+/// The hover wash **fades** (`FAST`) and the press **sinks** (`INSTANT`, a
+/// couple of points of scale). Two `motion::anim` calls; egui schedules the
+/// repaints for both and stops asking once they settle.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_button_id(
+    ui: &mut Ui,
+    icons: &IconStore,
+    pal: &Palette,
+    rect: Rect,
+    id: egui::Id,
+    name: &str,
+    icon_px: f32,
+    st: BtnState,
+    reveal: f32,
+    offset: Vec2,
+) -> Response {
+    let resp = interact_id(ui, rect, id);
+    let ctx = ui.ctx().clone();
+    let live = reveal > 0.85 && !shot_mode();
+    let hovered = (resp.hovered() && live) || st.force_hover;
+    let pressed = resp.is_pointer_button_down_on() && live;
+
+    let h = motion::anim(&ctx, id.with("hov"), hovered, motion::FAST, motion::ease_out_cubic);
+    let d = motion::anim(&ctx, id.with("prs"), pressed, motion::INSTANT, motion::ease_out_cubic);
+    // Press reads as the control physically sinking, not as a colour swap.
+    let rect = rect.translate(offset).shrink(1.6 * d);
     let painter = ui.painter();
-    let hovered = (resp.hovered() && !shot_mode()) || st.force_hover;
-    let pressed = resp.is_pointer_button_down_on() && !shot_mode();
 
     if st.selected {
-        soft_shadow(painter, rect.shrink(1.0), theme::R_BTN, pal, 0.5);
-        painter.rect_filled(rect, cr(theme::R_BTN), pal.accent);
+        soft_shadow(painter, rect.shrink(1.0), theme::R_BTN, pal, 0.5 * reveal);
+        painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.accent, reveal));
         painter.rect_filled(
             Rect::from_min_max(rect.left_top(), pos2(rect.right(), rect.center().y)),
             cr(theme::R_BTN),
-            pal.accent_hi.linear_multiply(0.10),
+            motion::fade(pal.accent_hi.linear_multiply(0.10), reveal),
         );
-    } else if pressed {
-        painter.rect_filled(rect, cr(theme::R_BTN), pal.active);
-    } else if hovered {
-        painter.rect_filled(rect, cr(theme::R_BTN), pal.hover);
+    } else {
+        // Hover wash and press wash are separate layers, so a press during a
+        // half-complete hover doesn't snap the background.
+        if h * reveal > 0.001 {
+            painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.hover, h * reveal));
+        }
+        if d * reveal > 0.001 {
+            painter.rect_filled(rect, cr(theme::R_BTN), motion::fade(pal.active, d * reveal));
+        }
     }
 
     let tint = if st.selected {
         pal.on_accent
-    } else if hovered {
-        pal.text
     } else {
-        pal.text_muted
+        lerp_col(pal.text_muted, pal.text, h)
     };
-    icons.draw(painter, name, rect.center(), icon_px, tint);
+    icons.draw(painter, name, rect.center(), icon_px * (1.0 - 0.04 * d), motion::fade(tint, reveal));
+    resp
+}
+
+/// A labelled pill button — the primary affordance in the hover-reveal chrome
+/// (Copy / Save). `accent` picks the filled treatment.
+#[allow(clippy::too_many_arguments)]
+pub fn pill_button(
+    ui: &mut Ui,
+    icons: &IconStore,
+    pal: &Palette,
+    rect: Rect,
+    id: egui::Id,
+    icon: &str,
+    label: &str,
+    accent: bool,
+    reveal: f32,
+    offset: Vec2,
+) -> Response {
+    let resp = interact_id(ui, rect, id);
+    let ctx = ui.ctx().clone();
+    let live = reveal > 0.85 && !shot_mode();
+    let hovered = resp.hovered() && live;
+    let pressed = resp.is_pointer_button_down_on() && live;
+
+    let h = motion::anim(&ctx, id.with("hov"), hovered, motion::FAST, motion::ease_out_cubic);
+    let d = motion::anim(&ctx, id.with("prs"), pressed, motion::INSTANT, motion::ease_out_cubic);
+    let rect = rect.translate(offset).shrink(1.8 * d);
+    let r = rect.height() / 2.0;
+    let painter = ui.painter();
+
+    let base = if accent { pal.accent } else { pal.card_fill_raised };
+    // Hover lifts the fill toward the highlight; press pushes it past it.
+    let fill = if accent {
+        lerp_col(lerp_col(base, pal.accent_hi, h), pal.accent_press, d)
+    } else {
+        lerp_col(base, pal.hover, h * 0.9 + d * 0.5)
+    };
+    soft_shadow(painter, rect, r, pal, (0.55 + 0.35 * h - 0.3 * d) * reveal);
+    painter.rect_filled(rect, cr(r), motion::fade(fill, reveal));
+    painter.rect_filled(
+        Rect::from_min_max(rect.left_top(), pos2(rect.right(), rect.center().y)),
+        cr(r),
+        motion::fade(Color32::from_white_alpha(if accent { 26 } else { 16 }), reveal),
+    );
+    painter.rect_stroke(
+        rect,
+        cr(r),
+        Stroke::new(
+            1.0,
+            motion::fade(Color32::from_white_alpha(if accent { 34 } else { 22 }), reveal),
+        ),
+        StrokeKind::Inside,
+    );
+
+    let fg = motion::fade(if accent { pal.on_accent } else { pal.text }, reveal);
+    let galley = painter.layout_no_wrap(label.to_owned(), theme::ts_label(), fg);
+    let icon_w = 15.0;
+    let total = icon_w + 6.0 + galley.size().x;
+    let x0 = rect.center().x - total / 2.0;
+    icons.draw(painter, icon, pos2(x0 + icon_w / 2.0, rect.center().y), icon_w, fg);
+    painter.galley(
+        pos2(x0 + icon_w + 6.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        fg,
+    );
     resp
 }
 
@@ -269,16 +378,20 @@ pub fn menu_row(
     st: BtnState,
 ) -> Response {
     let resp = interact(ui, rect, label);
-    let painter = ui.painter();
+    let ctx = ui.ctx().clone();
     let hovered = (resp.hovered() && !shot_mode()) || st.force_hover;
+    // Menu highlights are the fastest thing in the app: any perceptible ramp
+    // here reads as lag while the pointer sweeps down a list.
+    let h = motion::anim(&ctx, resp.id.with("hov"), hovered, motion::INSTANT, motion::ease_out_cubic);
+    let painter = ui.painter();
 
-    if hovered {
+    if h > 0.001 {
         let hl = rect.shrink2(vec2(6.0, 0.0));
-        painter.rect_filled(hl, cr(theme::R_BTN), pal.accent);
+        painter.rect_filled(hl, cr(theme::R_BTN), motion::fade(pal.accent, h));
     }
 
-    let content = if hovered { pal.on_accent } else { pal.text };
-    let icon_tint = if hovered { pal.on_accent } else { pal.text_muted };
+    let content = lerp_col(pal.text, pal.on_accent, h);
+    let icon_tint = lerp_col(pal.text_muted, pal.on_accent, h);
 
     let icon_cx = rect.left() + 6.0 + 15.0 + 9.0;
     icons.draw(painter, icon, pos2(icon_cx, rect.center().y), 17.0, icon_tint);
@@ -294,7 +407,7 @@ pub fn menu_row(
 
     if let Some(sc) = shortcut {
         let right = rect.right() - 16.0;
-        draw_shortcut(painter, pal, right, rect.center().y, sc, hovered);
+        draw_shortcut(painter, pal, right, rect.center().y, sc, h > 0.5);
     }
     resp
 }
@@ -488,7 +601,15 @@ pub fn face_photo(painter: &egui::Painter, rect: Rect, radius: f32) {
 fn lerp_col(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+    // Alpha has to be interpolated too — `from_rgb` would force 255 and quietly
+    // make every muted tint opaque. Color32 is premultiplied, so a component-wise
+    // lerp is the correct blend.
+    Color32::from_rgba_premultiplied(
+        f(a.r(), b.r()),
+        f(a.g(), b.g()),
+        f(a.b(), b.b()),
+        f(a.a(), b.a()),
+    )
 }
 
 /// A cheap "capture" card for the ones peeking out behind the hero — only their
@@ -675,6 +796,122 @@ pub fn flung_capture(painter: &egui::Painter, rect: Rect, radius: f32, angle: f3
             angle,
             Color32::from_rgba_unmultiplied(0xCE, 0xD2, 0xDE, alpha),
         );
+    }
+}
+
+/// A capture card face that can be **rotated and faded live** — the drawing
+/// primitive behind the interactive stack.
+///
+/// epaint has no rotation for images, rounded rects or text galleys, so every
+/// element here is a polygon pushed through [`rotate_pts`]. That is also why
+/// there is no text on the face: rotated glyphs are simply not achievable
+/// without a render-to-texture path (see FINDINGS §2).
+///
+/// `variant` picks one of four content layouts so a stack of captures doesn't
+/// look like four copies of the same screenshot.
+pub fn capture_face(
+    painter: &egui::Painter,
+    rect: Rect,
+    radius: f32,
+    angle: f32,
+    alpha: u8,
+    variant: usize,
+    lift: f32,
+) {
+    if alpha == 0 {
+        return;
+    }
+    let c = rect.center();
+    // Shadow: two offset rotated polys. `lift` scales both the offset and the
+    // opacity, so a pressed/dragged card visibly leaves the surface.
+    for (dy, a) in [(11.0 * lift, 34u8), (5.0 * lift, 22u8)] {
+        let mut sh = rounded_poly(rect.translate(vec2(0.0, dy)), radius);
+        rotate_pts(&mut sh, c + vec2(0.0, dy), angle);
+        painter.add(Shape::convex_polygon(
+            sh,
+            Color32::from_black_alpha(scale_a((a as f32 * lift.min(1.6)) as u8, alpha)),
+            Stroke::NONE,
+        ));
+    }
+
+    let pal4 = [
+        // (page, header, accent, line)
+        ([0xF3, 0xF5, 0xFA], [0xE4, 0xE7, 0xF0], [0x5B, 0x57, 0xF0], [0xCE, 0xD2, 0xDE]),
+        ([0x1C, 0x1F, 0x2A], [0x14, 0x17, 0x20], [0x3F, 0xC1, 0x8F], [0x39, 0x3F, 0x52]),
+        ([0xFA, 0xF4, 0xEE], [0xF0, 0xE6, 0xDA], [0xE0, 0x7A, 0x3C], [0xDC, 0xCE, 0xBE]),
+        ([0xEE, 0xF4, 0xFB], [0xDD, 0xE8, 0xF6], [0x2A, 0x7B, 0xE0], [0xC2, 0xD3, 0xE6]),
+    ];
+    let (page, head, acc, line) = pal4[variant % 4];
+    let rgba = |c: [u8; 3], a: u8| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], scale_a(a, alpha));
+
+    let mut face = rounded_poly(rect, radius);
+    rotate_pts(&mut face, c, angle);
+    painter.add(Shape::convex_polygon(
+        face,
+        rgba(page, 255),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, scale_a(46, alpha))),
+    ));
+
+    let header = Rect::from_min_max(rect.left_top(), pos2(rect.right(), rect.top() + 28.0));
+    fill_rot_rect(painter, header, c, angle, rgba(head, 255));
+    for i in 0..3 {
+        let mut d = [pos2(rect.left() + 16.0 + i as f32 * 13.0, rect.top() + 14.0)];
+        rotate_pts(&mut d, c, angle);
+        painter.circle_filled(d[0], 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, scale_a(46, alpha)));
+    }
+
+    let bar = |r: Rect, col: [u8; 3], a: u8| fill_rot_rect(painter, r, c, angle, rgba(col, a));
+    let l = rect.left() + 18.0;
+    let t = rect.top() + 46.0;
+    match variant % 4 {
+        // A document: accent heading over ragged body copy.
+        0 => {
+            bar(Rect::from_min_size(pos2(l, t), vec2(96.0, 9.0)), acc, 255);
+            for i in 0..3 {
+                bar(
+                    Rect::from_min_size(pos2(l, t + 20.0 + i as f32 * 13.0), vec2([150.0, 120.0, 92.0][i], 6.0)),
+                    line,
+                    255,
+                );
+            }
+        }
+        // A code editor: a gutter and indented syntax-coloured runs.
+        1 => {
+            bar(Rect::from_min_size(pos2(l - 6.0, t - 6.0), vec2(2.0, rect.height() - 62.0)), line, 160);
+            for i in 0..6 {
+                let indent = [0.0, 14.0, 28.0, 28.0, 14.0, 0.0][i];
+                let w = [82.0, 128.0, 96.0, 64.0, 110.0, 74.0][i];
+                bar(
+                    Rect::from_min_size(pos2(l + 6.0 + indent, t + i as f32 * 12.0), vec2(w, 5.0)),
+                    if i % 3 == 0 { acc } else { line },
+                    if i % 3 == 0 { 255 } else { 200 },
+                );
+            }
+        }
+        // A dashboard: a big accent block beside stacked metric rows.
+        2 => {
+            bar(Rect::from_min_size(pos2(l, t), vec2(74.0, 52.0)), acc, 235);
+            for i in 0..4 {
+                bar(
+                    Rect::from_min_size(pos2(l + 86.0, t + i as f32 * 14.0), vec2([104.0, 78.0, 118.0, 60.0][i], 7.0)),
+                    line,
+                    255,
+                );
+            }
+        }
+        // A chat transcript: alternating bubbles, one accent-filled.
+        _ => {
+            for i in 0..4 {
+                let mine = i % 2 == 1;
+                let w = [128.0, 92.0, 104.0, 70.0][i];
+                let x = if mine { rect.right() - 18.0 - w } else { l };
+                bar(
+                    Rect::from_min_size(pos2(x, t + i as f32 * 17.0), vec2(w, 12.0)),
+                    if mine { acc } else { line },
+                    if mine { 235 } else { 255 },
+                );
+            }
+        }
     }
 }
 

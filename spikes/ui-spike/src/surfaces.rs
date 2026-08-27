@@ -20,6 +20,10 @@ pub enum Surface {
 /// — so we render three moments of that story.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum QuickVariant {
+    /// **Live and interactive** — the animated stack in `stack.rs`. This is the
+    /// only variant that moves; the three below are the frozen depictions the
+    /// visual spike shipped with, kept so the approved stills still render.
+    Live,
     /// Resting deck of captures with the grab handle + secondary action pill.
     Stack,
     /// Top capture mid-swipe, flung away to dismiss.
@@ -33,11 +37,13 @@ impl QuickVariant {
         match s {
             "swipe" => Self::Swipe,
             "drag" => Self::Drag,
+            "live" => Self::Live,
             _ => Self::Stack,
         }
     }
     pub fn key(self) -> &'static str {
         match self {
+            Self::Live => "live",
             Self::Stack => "stack",
             Self::Swipe => "swipe",
             Self::Drag => "drag",
@@ -47,6 +53,9 @@ impl QuickVariant {
     /// room: swipe needs vertical travel, drag needs a drop target beside it.
     pub fn scene(self) -> Vec2 {
         match self {
+            // The live stack needs room above and to the left for the deck to
+            // spring into, and room to the right for a card to be thrown out.
+            Self::Live => vec2(560.0, 430.0),
             Self::Stack => vec2(384.0, 322.0),
             Self::Swipe => vec2(384.0, 392.0),
             Self::Drag => vec2(600.0, 340.0),
@@ -105,7 +114,9 @@ pub fn quick(ui: &mut Ui, icons: &IconStore, pal: &Palette, scene: Rect, variant
     let p = ui.painter().clone();
     let rt = theme::R_THUMB;
     match variant {
-        QuickVariant::Stack => {
+        // The live stack owns its own drawing (it is stateful); `app` routes to
+        // it directly, so reaching here means a static render was requested.
+        QuickVariant::Live | QuickVariant::Stack => {
             let pill_h = 46.0;
             let hero = Rect::from_min_size(
                 pos2(

@@ -13,7 +13,10 @@ decision is made. It is deliberately *not* a Cargo workspace member and touches
 nothing else in the repo.
 
 The verdict lives in **[`FINDINGS.md`](./FINDINGS.md)**. The pixels the decision
-rests on live in **[`screenshots/`](./screenshots/)**.
+rests on live in **[`screenshots/`](./screenshots/)**. Motion — the second
+question, *"can it be made to **feel** premium, not just look it?"* — is answered
+by running it and driving it by hand; see **[Run it](#run-it)** below and
+FINDINGS §5.
 
 ## What it draws
 
@@ -39,15 +42,57 @@ rasterised through `resvg` — no emoji/glyph substitutes):
 ## Run it
 
 ```sh
+cd spikes/ui-spike
+
 # Rust is user-local via rustup; each shell must source the env first.
 source "$HOME/.cargo/env"
 
-cargo run                     # interactive window, all three surfaces
+cargo run
 ```
 
-Interactive hotkeys: **1 / 2 / 3 / 4** switch surface · **V** cycle the Quick
-overlay state (stack → swipe → drag) · **L** toggle light/dark · **G** toggle the
-drawn backdrop · **Q / Esc** quit. A small legend is drawn in the window.
+That opens the interactive window on the **live capture stack** — a real,
+animated, hand-drivable surface. Everything below moves; grab a card and throw
+it.
+
+### Keys
+
+| Key | What it does |
+| --- | --- |
+| `1` `2` `3` `4` | Switch surface — quick access · menu · annotate · onboard |
+| `V` | Cycle the Quick surface: **live** → stack → swipe → drag (the last three are the original *static* depictions, kept for comparison) |
+| `N` | **Spawn a new capture** into the stack — plays the entry animation, and the cards beneath settle back on a spring |
+| `Backspace` / `Delete` | **Dismiss the top card** — flings it out with momentum and fades it |
+| `R` | **Replay** the current surface's entry animation (watch it as many times as you like) |
+| `M` | **Motion tuner** overlay — see below |
+| `L` | Light / dark |
+| `G` | Drawn backdrop on / off |
+| `Q` / `Esc` | Quit |
+
+The same legend is drawn along the bottom of the window, so none of this
+requires reading the source.
+
+### Gestures (this is the part worth judging)
+
+| Gesture | What should happen |
+| --- | --- |
+| **Hover a card** | The chrome reveals: scrim fades up, then Copy/Save pills and the four corner icons fade in *with a slight upward rise, staggered a few ms apart*. Mouse out reverses it. |
+| **Hover a button / pill / menu row** | Background washes in, icon tint warms. |
+| **Press a button / pill** | Snappy scale-down, released on mouse-up. |
+| **Press and hold a card** | Lift + scale — the grab cue that says *this is draggable*. |
+| **Drag a card** | It follows the pointer with a little lag and inertia, tilting into the direction of travel; the deck beneath reflows. |
+| **Flick a card away** | Velocity-based. A fast flick (> 520 px/s) throws it out with momentum, spin and a fade. A slow drag that never passes ~96 px springs back home. |
+
+### Motion tuner (`M`)
+
+A live overlay for dialling in the feel without a rebuild:
+
+- **Duration multiplier** slider, 0.25× – 3×, with presets and a live readout of
+  what `FAST` / `BASE` / `SLOW` currently resolve to in ms.
+- **Easing override** dropdown — force every timeline onto one curve and watch
+  the difference, with a preview graph and a dot sweeping the curve in real time.
+- **Reduce motion** checkbox — the accessibility path (D13). Every duration
+  collapses to zero; nothing animates, everything still works.
+- **Replay / New capture / Dismiss** buttons, so the overlay is self-sufficient.
 
 ### Reproduce a screenshot
 
@@ -66,10 +111,27 @@ cargo run -- --surface annotate             --theme dark  --backdrop on --shot s
 ```
 
 Flags: `--surface quick|menu|annotate|onboard` ·
-`--variant stack|swipe|drag` (Quick surface only) · `--theme dark|light` ·
+`--variant live|stack|swipe|drag` (Quick surface only; `--shot` renders the
+static variants — `live` is the interactive one) · `--theme dark|light` ·
 `--backdrop on|off` (the in-egui drawn wallpaper) ·
 `--material none|vibrancy|glass` (native macOS material — see FINDINGS) ·
 `--shot <path>` (render one frame to PNG and exit).
+
+### Headless motion tests (the "did it actually move?" proof)
+
+An agent cannot see the screen, so motion is verified mechanically: both suites
+drive real animations over a **simulated clock** and assert the values move,
+settle on target, and stop.
+
+```sh
+cargo test --test motion    # 8 tests on the motion primitives
+cargo test --test stack     # 5 tests driving the real live surface via egui_kittest
+```
+
+They catch the two failure modes that are otherwise invisible: *"the value never
+moves"* and *"you forgot `request_repaint`, so it silently froze."* They also
+assert the app **goes idle** once the animation lands, and that reduce-motion
+truly collapses to zero frames.
 
 ### Headless snapshot test (the CI-story proof)
 
@@ -86,15 +148,20 @@ Baseline: `tests/snapshots/quick_access.png`.
 
 ```
 src/theme.rs      design tokens (colour ramp, spacing, radii, elevation, type) + custom egui Style/Visuals
+src/motion.rs     motion tokens (durations, easings, springs, stagger, reduce-motion) — the D19 layer
 src/paint.rs      hand-drawn primitives via egui::Painter (glass panels, shadows, scrims, buttons, shortcuts)
 src/icons.rs      Tabler SVG -> resvg raster -> egui texture pipeline
-src/surfaces.rs   the four faked surfaces (+ the Quick overlay's stack/swipe/drag states)
-src/app.rs        eframe shell, CLI config, self-capture
+src/surfaces.rs   the four faked surfaces (+ the Quick overlay's static stack/swipe/drag depictions)
+src/stack.rs      the LIVE animated capture stack — hover reveal, grab, drag, fling, entry
+src/tuner.rs      the M overlay: duration multiplier, easing override, reduce-motion, replay
+src/app.rs        eframe shell, CLI config, key handling, repaint scheduling, self-capture
 src/vibrancy.rs   native macOS material (window-vibrancy) — Liquid Glass / HUD vibrancy
 src/main.rs       entry, arg parsing, transparent/borderless/on-top ViewportBuilder
 assets/fonts/     Inter TTFs + OFL license
 assets/icons/     the exact Tabler SVGs used + MIT license
 tests/snapshot.rs headless egui_kittest wgpu snapshot
+tests/motion.rs   headless frame-stepping tests for the motion primitives
+tests/stack.rs    headless frame-stepping tests for the live surface
 ```
 
 ## Licensing of vendored assets

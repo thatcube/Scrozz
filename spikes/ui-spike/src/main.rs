@@ -8,9 +8,12 @@
 
 mod app;
 mod icons;
+mod motion;
 mod paint;
+mod stack;
 mod surfaces;
 mod theme;
+mod tuner;
 mod vibrancy;
 
 use app::Config;

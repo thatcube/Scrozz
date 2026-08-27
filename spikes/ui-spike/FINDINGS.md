@@ -13,6 +13,13 @@ asked for — **real macOS Liquid Glass behind crisp content in a single window*
 *not* work out of the box and is the only thing that genuinely fought back. Details
 below, blunt.
 
+**Second question, answered in a later pass:** *can it be made to **feel** premium, not
+just look it?* Motion was originally left unproven — this document said so — and became
+the last risk that could have reopened the toolkit decision. It is now built and
+hand-drivable. **Short answer: yes, for ~382 lines of motion-token layer, with one real
+capability gap (epaint cannot rotate text or clipped images).** Full accounting with
+measurements in **§5**; run `cargo run` and drive it yourself.
+
 Look at the pixels first; this document is the argument, the screenshots are the evidence:
 
 | Screenshot | What it shows |
@@ -154,27 +161,228 @@ on Retina, very slightly behind native on a low-DPI external display. For Scrozz
 target (modern Macs, mostly Retina) this is a non-issue; it's worth knowing for a
 1080p Windows/Linux user.
 
-## 5. Animation / transitions — what did it cost to hand-roll?
+## 5. Motion — what it actually cost
 
-**Not proven for real motion, and I want to be upfront rather than bluff it.** The
-deliverable is static pixels, rendered deterministically for reproducible screenshots —
-I did *not* build animated transitions, so this spike does **not** demonstrate motion.
-What the drag-first surfaces *do* show is that gestures can be made to **read in a
-still**: the swipe is depicted with an opaque flung card plus fading ghost echoes along
-its path, and the drag with a lifted card, a drag-count badge, a grab cursor, and a
-motion trail. That's a static depiction of motion, not motion itself — worth being
-precise about.
+> **Status: now answered.** The previous pass of this spike shipped *static depictions*
+> of movement — a flung card with ghost echoes, a lifted card with a motion trail — and
+> said so plainly: *"I did not build animated transitions."* That gap has now been
+> closed. The spike animates for real, is driven by hand, and is tunable live. This
+> section replaces the earlier placeholder.
 
-What I can say from the primitives: egui is immediate-mode and repaints every frame, so
-value-based animation (egui ships `animate_bool`/`animate_value_with_time` easing
-helpers) is straightforward — hover fades, press sinks, a card slide-in are cheap to
-hand-roll and would be a few lines each. A swipe-to-dismiss fling or a drag follow is a
-position lerp, also cheap. The thing that would *cost* is anything gradient- or
-blur-based in motion, or **rotation in motion** (§1 — no gradient primitive, no real
-backdrop blur, no transform for images/text), which needs custom shaders or a
-render-to-texture path. Static polish: proven. Simple motion: plausible and cheap.
-Rotated/blurred motion: **unproven and not cheap** — if it matters, it deserves its own
-small spike.
+**Verdict up front: yes, egui can deliver premium micro-interactions, and the cost is
+lower than I expected — but only because you build a motion layer once and then never
+think about it again. Without that layer it would be miserable.** The gating risk was
+never "can egui hit 60fps" (it trivially can); it was "does the immediate-mode model
+fight you." It mostly doesn't. It fights you in exactly two places, both of which are
+one-time costs, both documented below. I would not reopen the toolkit decision over
+motion. There is one genuine capability gap — §5.6 — that constrains *what you can
+animate*, and it is worth reading before signing off.
+
+### 5.1 What animates now
+
+Run `cargo run` and drive it. Everything here is real motion, not a depiction:
+
+- **Hover reveal on a capture card** — the headline interaction, and the one that
+  decides whether this feels premium. At rest a card is a bare thumbnail (D12: chrome
+  is not permanently welded on). On hover: the scrim fades up, then the Copy/Save pills
+  and four corner icons fade in *with a slight upward rise, staggered ~30ms apart* so
+  they cascade instead of popping as a block. Mouse-out reverses on the same curve.
+  This is the single most convincing thing in the build.
+- **Icon-button hover** — background wash + icon tint warming over `FAST`.
+- **Button / pill press** — snappy scale-down over `INSTANT`, released on mouse-up.
+- **Card grab cue** — press-and-hold lifts and scales the card slightly, signalling
+  draggability before the drag starts.
+- **Drag** — the card follows the pointer through a spring, so it lags very slightly
+  and overshoots on direction changes. It tilts into its direction of travel. The deck
+  beneath reflows on a softer spring.
+- **Swipe-to-dismiss** — velocity-based. Release above ~520 px/s or past ~96 px and the
+  card is thrown: it coasts with drag and gravity, keeps spinning, and fades out.
+  Below threshold it springs home. A slow drag genuinely feels different from a flick,
+  which was the point.
+- **New capture entering the stack** (`N`) — the card animates in from below with a
+  tilt that unwinds as it lands, and the cards beneath settle back on a spring.
+- **Menu-row hover** highlight fade.
+
+Plus `R` to replay any entry animation on demand, and `M` for the tuning overlay.
+
+### 5.2 How much code it took
+
+| Piece | Lines | What it is |
+| --- | --- | --- |
+| `src/motion.rs` | **382** | The whole motion token layer. This is the reusable part. |
+| `src/stack.rs` | 529 | The live animated surface. Spike-specific; a real app writes this anyway. |
+| `src/tuner.rs` | 143 | The `M` tuning overlay. Dev tool, ships behind a flag or not at all. |
+| `paint.rs` / `app.rs` / `surfaces.rs` | +339 / −27 | Making existing widgets animated + key handling + repaint scheduling. |
+| `tests/motion.rs` + `tests/stack.rs` | 791 | Headless verification (§5.7). |
+
+**The number that matters is 382.** That is the entire cost of *"egui has no animation
+system"* — duration tokens, seven easing curves, two spring integrators, a stagger
+helper, an `Id`-keyed animation helper, a global duration multiplier, and the
+reduce-motion switch. It is small because egui already ships the hard part:
+`animate_bool_with_time` / `animate_value_with_time` handle per-`Id` state storage and
+frame-delta accumulation. You are writing the *token layer*, not an animation engine.
+
+Making an existing widget animated cost roughly **3–8 lines each** once the layer
+existed. `icon_button` went from a static tint lookup to a hover fade + press sink +
+tint lerp in about six lines. That is the real productivity signal.
+
+### 5.3 Where immediate mode **helped**
+
+This surprised me, and it's the strongest argument in egui's favour here.
+
+- **There is no view tree to diff, so there is no "animating a thing that is being
+  reconciled" problem.** In a retained-mode toolkit, animating an element that the
+  framework might destroy and recreate is a classic source of pain. Here, animation
+  state is a single float in a side table keyed by `Id`. Nothing can invalidate it.
+- **Interruption is free.** Mouse out halfway through a hover reveal and it just
+  reverses from wherever it is — no cancel/restart bookkeeping, no "animation in
+  progress" state machine. This is the thing that makes reversal feel as good as the
+  forward direction, and I got it for free.
+- **Staggering is arithmetic, not orchestration.** A stagger is one master timeline
+  plus an index offset. Twelve lines. No timeline objects, no keyframe graph.
+- **Physics and timelines coexist trivially.** I deliberately used both — timelines
+  (`motion::anim`) for hover/press, springs (`Spring1`/`Spring2`) for drag-follow, deck
+  depth and fling coast — because velocity-based gestures want physics and discrete
+  state changes want curves. In immediate mode both are just "compute a number this
+  frame." No impedance mismatch.
+
+### 5.4 Where immediate mode **hurt** — the two real costs
+
+**(1) Nothing repaints unless you ask, and the failure is silent.** This is the #1
+gotcha and it deserves the flag. egui repaints on input only; an animation with no
+`request_repaint()` doesn't error, it just… crawls. `elapsed` is clamped to
+`stable_dt`, so a missed repaint doesn't jump-cut, it *inches forward on the next
+mouse move* — which reads as "the animation is broken" rather than "the scheduler is
+wrong," and is genuinely hard to diagnose by eye.
+
+Worse, there are **two scheduling models to reconcile**. egui's `animate_*_with_time`
+helpers self-schedule (they call `request_repaint` internally and stop when they land).
+My springs do not — they're my own integrators, so the app has to schedule them. I
+resolved this by having `Stack::show` return a single `active: bool` that ORs together
+every in-flight spring, entry, fling and toast, and `app.rs` does `if busy {
+ctx.request_repaint() }`. That is the whole mechanism, and it is about six lines, but
+you must design for it from the start.
+
+Getting this right is itself part of what the spike proves, because "just repaint
+forever" would invalidate the native-performance argument that justified egui:
+
+> **Measured idle cost: 0.0% CPU, ~110 MB RSS** (release build, window open, nothing
+> moving, sampled over 10s). It animates smoothly and then genuinely goes to sleep.
+
+The one exception: the `M` tuner overlay requests repaint continuously while open,
+because it draws a live sweeping curve preview. That's a dev overlay and it's
+deliberate — but it is not free and shouldn't ship enabled.
+
+I also found a real bug this way, which is a good advert for the discipline: my toast
+confirmation held `active = true` for its entire 1.25s dwell, meaning ~75 identical
+repainted frames *even with reduce-motion on*. The fix is
+`ctx.request_repaint_after(remaining)` — sleep until it expires rather than busy-wait.
+Distinguishing "I am animating" from "I am waiting" is a real discipline egui imposes,
+and it's the correct discipline.
+
+**(2) Global motion state breaks parallel tests.** The duration multiplier and
+reduce-motion switch are process-wide atomics — that's what makes them settable from
+one tuner slider and readable from every call site without threading a context object
+through every function. But `cargo test` runs tests in parallel threads of one
+process, so tests that set them stomp each other. I had to serialise them behind a
+`Mutex` guard. That is a genuine, if minor, cost of the global-token design, and it's
+worth knowing before copying the pattern into production.
+
+### 5.5 What feels good
+
+- **The staggered hover reveal.** Cascade + rise reads as considered rather than
+  mechanical. This is the interaction that convinced me the quality bar is reachable.
+- **Reversal.** Because interruption is free, mousing out mid-reveal feels as good as
+  mousing in, which is usually where hand-rolled motion falls apart.
+- **The velocity-based fling.** A flick genuinely throws the card and a slow drag
+  genuinely doesn't. Spring-follow on drag adds just enough lag to feel physical
+  instead of glued to the cursor.
+- **Reduce-motion (D13) is one line at the choke point.** Every duration goes through
+  `motion::dur()`, which returns `0.0` when reduce is set; springs snap. That's the
+  whole implementation, and it's verified by test rather than by eye.
+
+### 5.6 What still feels wrong, or was not achievable
+
+Being blunt, because this is the part that's actually useful:
+
+- **epaint cannot rotate text. This is the real constraint, and it shapes the design.**
+  Confirmed again this pass: no transform for images, rounded rects, or text galleys. I
+  rotate cards by generating a rounded-rect outline as a point list, rotating the points
+  about a pivot, and filling with `convex_polygon`. That works for *shapes*. It cannot
+  work for text or images. Two concrete consequences:
+  1. **The live card can't show the rich photo art the static screenshots use** — those
+     compose clipped images, and clipping is axis-aligned only, so a rotated card can't
+     be clipped. The animated card uses a simpler drawn face. The static screenshots are
+     therefore slightly prettier than the live build, which is an artefact of this
+     limitation, not of taste.
+  2. **Chrome must fade out as the card tilts**, because the labels can't rotate with
+     it. I made this deliberate — chrome fades as `|angle|` grows — and it reads as
+     intentional. But it *is* a workaround, and if a future design needs a rotated label
+     the answer is render-to-texture, which is a real project.
+- **No gradient primitive**, so gradients are stacks of ~16 translucent rects. Animating
+  those means animating the whole stack's opacity, not recomposing per frame. Fine here;
+  a constraint to design around.
+- **Spring constants and thresholds are guesses.** I cannot see the screen, so I tuned
+  by reasoning, not by feel. This is exactly why the `M` overlay exists: the numbers are
+  live-adjustable so the maintainer can dial them in a minute rather than describe them
+  to an agent over three round-trips. **Expect to move them.**
+- **Not attempted:** motion blur, animated backdrop blur, cross-surface shared-element
+  transitions. All three are plausible-to-hard and none were needed to answer the
+  question.
+
+### 5.7 How motion was verified without eyes
+
+An agent cannot judge whether something looks smooth, so motion is verified
+**mechanically over a simulated clock** — 13 headless tests across two suites:
+
+- `tests/motion.rs` (8) — drives the primitives frame by frame and asserts the value
+  actually moves (≥6 distinct intermediate frames), is monotonic, lands *exactly* on
+  target, **schedules repaints while in flight and stops when done**, that reduce-motion
+  snaps on frame one, that the multiplier scales elapsed time, that stagger cascades in
+  index order, that every easing curve is anchored at 0/1 and overshoots only where
+  designed, and that springs converge and lose energy while coasting.
+- `tests/stack.rs` (5) — drives the *real* surface through `egui_kittest`, fingerprinting
+  every animated value per frame: entry animates then goes idle, dismiss travels >80px
+  then stops, reduce-motion produces zero animated frames, 3× multiplier measurably
+  lengthens the entry, replay restarts cleanly without leaking state.
+
+These catch the two failure modes invisible to inspection: *the value never moves*, and
+*you forgot `request_repaint` so it silently froze*. Both bit me during development and
+both were caught by test rather than by luck.
+
+Two findings worth recording for whoever writes the real tests:
+
+- **epaint panics on drop if `FullOutput.textures_delta` is never consumed** — any
+  headless driver must `clear()` it.
+- **`animate_bool` snaps to target on the first frame it sees an `Id`.** Good product
+  behaviour (a widget that appears already-hovered shows chrome immediately) but tests
+  must "prime" the `Id` in its resting state for one frame first, or every animation
+  test trivially passes with zero frames of motion.
+
+The existing snapshot test also still passes **byte-identical**, which is a useful
+proof in itself: the animated widget refactor changed no resting pixels. (It caught one
+real regression on the way — `Color32::from_rgb` forces alpha to 255, so my colour lerp
+was silently making muted icon tints opaque. 1132 drifted pixels, found by CI rather
+than by eye.)
+
+### 5.8 Bottom line for the toolkit decision
+
+**Motion is not a reason to reject egui.** The 382-line token layer is the entire tax
+for "egui has no animation system," and once paid, animating a widget costs a handful
+of lines. Immediate mode turns out to be an *asset* for interruptible, gesture-driven
+motion — free interruption and no reconciliation problem are exactly what you want for
+a drag-first UI like Scrozz's. The repaint-scheduling discipline is real but small, and
+getting it right yields genuinely 0% idle CPU.
+
+The honest caveat is **rotation**, not motion: egui will animate anything you can draw,
+but you cannot draw rotated text or rotated clipped images, so any interaction whose
+design depends on tilting rich content needs a render-to-texture path or a different
+design. For Scrozz's drag-and-fling capture card, designing around it was
+straightforward and arguably better. For something like a rotating annotation handle
+with a live label, it would be a genuine fight.
+
+Recommend proceeding with egui, with the motion layer promoted from this spike as a
+real module, and with the spring constants re-tuned by hand on day one.
 
 ## 6. Did egui_kittest headless snapshot testing work?
 
@@ -223,19 +431,27 @@ The costs to price in before committing the whole app:
 
 1. **You will hand-build the entire control library.** No premium components to lean
    on. Fine for Scrozz's size; recurring for large surfaces.
-2. **Real macOS Liquid Glass behind live content needs native `NSView` work** — an
+2. **You will hand-build the motion layer too** — but this is priced now, not
+   speculative: **382 lines**, once, and animating a widget afterwards costs 3–8 lines
+   (§5). Immediate mode turns out to *help* here: interruption and reversal are free.
+   The discipline it imposes is repaint scheduling — animate, then genuinely idle
+   (measured 0.0% CPU at rest).
+3. **Real macOS Liquid Glass behind live content needs native `NSView` work** — an
    eframe/winit patch or a custom view hierarchy. This is the one item that is *not*
    cheap and *not* a library call. If "true OS glass over the live desktop" is a
    must-have identity feature, budget a dedicated native spike for it; if a drawn
    glass card over the captured image is acceptable (it looks great — `quick_stack_dark.png`),
    you already have it.
-3. **This patched eframe fork diverges from upstream egui's API.** Understand and pin
+4. **This patched eframe fork diverges from upstream egui's API.** Understand and pin
    it deliberately; it affects every future upgrade and every third-party egui example.
-4. **No gradient primitive, grayscale text AA.** Neither blocks a premium look on
-   Retina; both are papercuts worth knowing.
+5. **No gradient primitive, grayscale text AA, and no rotation for text or clipped
+   images.** The first two are papercuts on Retina. The third is a genuine design
+   constraint once things move (§5.6): you can tilt shapes, not labels.
 
 If the maintainer's fear was "egui is inherently ugly," this spike **disproves it** —
-the pixels are premium. The honest amendment is: egui isn't ugly, it's *bare*. It ships
+the pixels are premium. If the follow-up fear was "but it'll feel dead," §5 disproves
+that too. The honest amendment is: egui isn't ugly, it's *bare*. It ships
 you a fast, cross-platform, headlessly-testable canvas and hands you the entire visual
-design as *your* job. Scrozz is small and opinionated enough that that trade is a
-**yes** — with the Liquid-Glass-behind-content caveat flagged in bright red.
+design — and the entire motion design — as *your* job. Scrozz is small and opinionated
+enough that that trade is a **yes** — with the Liquid-Glass-behind-content caveat
+flagged in bright red.
