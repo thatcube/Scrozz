@@ -9,6 +9,24 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod hotkey;
+#[cfg(target_os = "macos")]
+pub mod macos;
+pub mod overlay;
+pub mod permissions;
+pub mod tray;
+
+pub use hotkey::{
+    Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
+    ReservedShortcut, Session,
+};
+pub use overlay::{
+    anchor_bottom_left, appkit_to_logical, logical_to_appkit, AppKitRect, NativeOverlay,
+    OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
+};
+pub use permissions::SystemPermissions;
+pub use tray::{Tray, TrayAction, TrayEntry};
+
 use scrozz_core::{Display, LogicalRect, Result};
 
 /// A floating, chrome-less window that lives over the desktop.
