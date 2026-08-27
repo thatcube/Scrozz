@@ -1,7 +1,9 @@
 //! Recording worker, lifecycle commands, and orderly finalisation.
 
 use std::{
+    hash::{BuildHasher as _, Hasher as _, RandomState},
     os::windows::ffi::OsStrExt,
+    os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -9,12 +11,28 @@ use std::{
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 use windows::{
-    Graphics::Capture::GraphicsCaptureSession, Win32::Storage::FileSystem::MoveFileW, core::PCWSTR,
+    Graphics::Capture::GraphicsCaptureSession,
+    Win32::{
+        Foundation::{BOOL, HLOCAL, LocalFree},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::{
+            CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ID_INFO,
+            FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx,
+            OPEN_EXISTING, SetFileInformationByHandle,
+        },
+    },
+    core::PCWSTR,
 };
 
 use crate::{
@@ -32,7 +50,10 @@ use super::{
     salvage::{self, Outcome},
     target,
     terminal::{NativeRecording, SessionState, SharedSessionState, TerminalCache},
-    timing::{FramePacer, HNS_PER_SECOND, Timeline, audio_drain_limit, audio_frames_to_hns},
+    timing::{
+        FramePacer, HNS_PER_SECOND, Timeline, audio_drain_limit, audio_frames_to_hns,
+        native_timestamp_is_plausible,
+    },
     video::{Capture, FramePacket, Signal},
 };
 
@@ -40,7 +61,9 @@ const FRAME_QUEUE_CAPACITY: usize = 3;
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_CHUNK_FRAMES: u32 = 480;
 const AUDIO_SETTLE_HNS: i64 = HNS_PER_SECOND / 10;
+const MAX_AUDIO_DRAIN_SPAN_HNS: i64 = 5 * HNS_PER_SECOND;
 const IDLE_WAIT: Duration = Duration::from_millis(5);
+const TARGET_REVALIDATION_INTERVAL: Duration = Duration::from_millis(250);
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Starts a worker and waits until every native subsystem is live.
@@ -295,6 +318,8 @@ struct Worker {
     started: bool,
     first_frame_emitted: bool,
     min_raw_hns: i64,
+    target_validator: target::TargetValidator,
+    next_target_validation: Instant,
     _device: Device,
     _media_foundation: MediaFoundation,
     _apartment: Apartment,
@@ -335,7 +360,10 @@ impl Worker {
             });
         }
         let media_foundation = MediaFoundation::start()?;
+        let startup_qpc = qpc_now_hns()
+            .map_err(|error| Error::Platform(format!("could not timestamp startup: {error}")))?;
         let source = target::resolve(&request.target)?;
+        let target_validator = source.validator.clone();
         let encoder_plan = plan::build(
             source.crop.width,
             source.crop.height,
@@ -349,6 +377,10 @@ impl Worker {
         let wants_audio = request.system_audio || request.microphone;
         let encoder = Encoder::new(&output.temporary_path, &device, encoder_plan, wants_audio)?;
         output.mark_owned();
+        if let Err(error) = output.pin_identity() {
+            encoder.discard();
+            return Err(output.discard(error));
+        }
         let audio = match wants_audio
             .then(|| AudioCapture::start(request.system_audio, request.microphone))
             .transpose()
@@ -410,7 +442,9 @@ impl Worker {
             latest_video_hns: 0,
             started: false,
             first_frame_emitted: false,
-            min_raw_hns: i64::MIN,
+            min_raw_hns: startup_qpc.saturating_sub(AUDIO_SETTLE_HNS),
+            target_validator,
+            next_target_validation: Instant::now() + TARGET_REVALIDATION_INTERVAL,
             _device: device,
             _media_foundation: media_foundation,
             _apartment: apartment,
@@ -428,6 +462,9 @@ impl Worker {
             if let Some(error) = self.audio.as_ref().and_then(AudioCapture::try_failure) {
                 break EndCause::Failed(error);
             }
+            if let Err(error) = self.validate_target() {
+                break EndCause::Failed(error.to_string());
+            }
 
             match self.frames.recv_timeout(IDLE_WAIT) {
                 Ok(frame) => {
@@ -440,7 +477,7 @@ impl Worker {
                     break EndCause::Failed("WGC frame queue disconnected".into());
                 }
             }
-            if let Err(error) = self.drain_audio(false) {
+            if let Err(error) = self.drain_audio(None) {
                 break EndCause::Failed(error.to_string());
             }
         };
@@ -508,6 +545,7 @@ impl Worker {
         if frame.raw_hns < self.min_raw_hns || self.timeline.is_paused() {
             return Ok(());
         }
+        self.validate_native_timestamp(frame.raw_hns, "WGC frame")?;
         if !self.started {
             self.timeline.start(frame.raw_hns);
             self.min_raw_hns = frame.raw_hns;
@@ -536,10 +574,11 @@ impl Worker {
         Ok(())
     }
 
-    fn drain_audio(&mut self, include_partial: bool) -> Result<()> {
+    fn drain_audio(&mut self, final_horizon: Option<i64>) -> Result<()> {
         if !self.started {
             return Ok(());
         }
+        let include_partial = final_horizon.is_some();
         loop {
             let raw = match self.audio.as_ref().map(AudioCapture::try_packet) {
                 Some(Ok(raw)) => raw,
@@ -552,9 +591,19 @@ impl Worker {
             if raw.qpc_hns < self.min_raw_hns || self.timeline.is_paused() {
                 continue;
             }
+            self.validate_native_timestamp(raw.qpc_hns, "WASAPI packet")?;
             let Some(stream_hns) = self.timeline.map(raw.qpc_hns) else {
                 continue;
             };
+            if final_horizon
+                .is_some_and(|horizon| stream_hns > horizon.saturating_add(AUDIO_SETTLE_HNS))
+            {
+                return Err(Error::Platform(format!(
+                    "WASAPI packet timestamp {:.3}s exceeds the trusted stop horizon {:.3}s",
+                    stream_hns as f64 / HNS_PER_SECOND as f64,
+                    final_horizon.unwrap_or_default() as f64 / HNS_PER_SECOND as f64
+                )));
+            }
             let frames = raw.samples.len() / usize::from(raw.channels.max(1));
             let packet_duration = audio_frames_to_hns(frames as u64, raw.sample_rate);
             self.media_end_hns = self
@@ -569,7 +618,7 @@ impl Worker {
 
         if let Some(mixer) = self.mixer.as_mut() {
             let qpc_watermark_hns = if include_partial {
-                self.latest_video_hns
+                final_horizon.unwrap_or(self.latest_video_hns)
             } else {
                 let now = qpc_now_hns().map_err(|error| {
                     Error::Platform(format!("could not timestamp audio watermark: {error}"))
@@ -580,10 +629,17 @@ impl Worker {
                 self.media_end_hns,
                 self.latest_video_hns,
                 qpc_watermark_hns,
-                AUDIO_SETTLE_HNS,
+                AUDIO_SETTLE_HNS.max(HNS_PER_SECOND / i64::from(self.encoder_plan.fps.max(1))),
                 include_partial,
             );
-            for chunk in mixer.drain_through(through_hns, include_partial) {
+            let drain_span = through_hns.saturating_sub(mixer.cursor_hns());
+            if drain_span > MAX_AUDIO_DRAIN_SPAN_HNS {
+                return Err(Error::Platform(format!(
+                    "refusing to synthesize {:.3}s of audio in one drain",
+                    drain_span as f64 / HNS_PER_SECOND as f64
+                )));
+            }
+            while let Some(chunk) = mixer.drain_next(through_hns, include_partial) {
                 self.encoder
                     .as_mut()
                     .expect("encoder lives until finalisation")
@@ -595,6 +651,13 @@ impl Worker {
     }
 
     fn finish(mut self, cause: EndCause) -> Result<NativeRecording> {
+        let stop_qpc = qpc_now_hns();
+        let trusted_stop_hns = stop_qpc
+            .as_ref()
+            .ok()
+            .and_then(|raw| self.timeline.project_final(*raw))
+            .unwrap_or(self.latest_video_hns)
+            .max(self.latest_video_hns);
         if let Some(capture) = self.capture.take() {
             capture.close();
         }
@@ -603,6 +666,12 @@ impl Worker {
             EndCause::Requested | EndCause::TargetClosed => None,
             EndCause::Failed(error) => Some(error),
         };
+        if let Err(error) = stop_qpc {
+            append_error(
+                &mut runtime_error,
+                format!("could not timestamp recording stop: {error}"),
+            );
+        }
         if let Some(audio) = self.audio.as_mut()
             && let Err(error) = audio.shutdown()
         {
@@ -611,7 +680,7 @@ impl Worker {
         if let Some(error) = self.audio.as_ref().and_then(AudioCapture::try_failure) {
             append_error(&mut runtime_error, error);
         }
-        if let Err(error) = self.drain_audio(true) {
+        if let Err(error) = self.drain_audio(Some(trusted_stop_hns)) {
             append_error(&mut runtime_error, error.to_string());
         }
         self.audio.take();
@@ -743,6 +812,30 @@ impl Worker {
         self.elapsed_hns
             .store(self.current_elapsed_hns() as u64, Ordering::Release);
     }
+
+    fn validate_native_timestamp(&self, raw_hns: i64, source: &str) -> Result<()> {
+        let now = qpc_now_hns().map_err(|error| {
+            Error::Platform(format!("could not validate {source} time: {error}"))
+        })?;
+        if native_timestamp_is_plausible(raw_hns, self.min_raw_hns, now) {
+            Ok(())
+        } else {
+            Err(Error::Platform(format!(
+                "{source} timestamp {raw_hns} is outside the trusted QPC window {}..={}",
+                self.min_raw_hns,
+                now.saturating_add(super::timing::MAX_NATIVE_FUTURE_HNS)
+            )))
+        }
+    }
+
+    fn validate_target(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if now < self.next_target_validation {
+            return Ok(());
+        }
+        self.next_target_validation = now + TARGET_REVALIDATION_INTERVAL;
+        self.target_validator.validate()
+    }
 }
 
 enum EndCause {
@@ -754,6 +847,9 @@ enum EndCause {
 struct OutputPaths {
     final_path: PathBuf,
     temporary_path: PathBuf,
+    working_directory: PathBuf,
+    identity: Option<OwnedHandle>,
+    identity_info: Option<FILE_ID_INFO>,
     owns_output: bool,
     promoted: bool,
     reported: bool,
@@ -777,40 +873,57 @@ impl OutputPaths {
     }
 
     fn discard(&mut self, error: Error) -> Error {
-        if !self.owns_output {
-            self.reported = true;
-            return error;
-        }
+        self.identity.take();
         let path = self.owned_path().to_owned();
-        let cleanup = std::fs::remove_file(&path);
+        let cleanup = if self.owns_output {
+            std::fs::remove_file(&path)
+        } else {
+            Ok(())
+        };
+        let directory_cleanup = std::fs::remove_dir(&self.working_directory);
         self.reported = true;
-        match cleanup {
-            Ok(()) => error,
-            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
-            Err(cleanup) => Error::Platform(format!(
-                "{error}; could not remove incomplete output {}: {cleanup}",
-                path.display()
-            )),
+        if removal_succeeded(&cleanup) && removal_succeeded(&directory_cleanup) {
+            error
+        } else {
+            Error::Platform(format!(
+                "{error}; could not fully remove incomplete output {} ({}) or private working directory {} ({})",
+                path.display(),
+                io_result_detail(cleanup),
+                self.working_directory.display(),
+                io_result_detail(directory_cleanup)
+            ))
         }
     }
 }
 
 impl Drop for OutputPaths {
     fn drop(&mut self) {
-        if self.reported || !self.owns_output {
+        if self.reported {
             return;
         }
+        self.identity.take();
         let path = self.owned_path().to_owned();
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::error!(
-                    path = %path.display(),
-                    %error,
-                    "could not remove abandoned Windows recording output"
-                );
+        if self.owns_output {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        %error,
+                        "could not remove abandoned Windows recording output"
+                    );
+                }
             }
+        }
+        if let Err(error) = std::fs::remove_dir(&self.working_directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(
+                path = %self.working_directory.display(),
+                %error,
+                "could not remove abandoned private Windows recording directory"
+            );
         }
     }
 }
@@ -832,10 +945,13 @@ fn output_paths(explicit: Option<&Path>) -> Result<OutputPaths> {
     } else {
         reserve_default_output()?
     };
-    let temporary_path = reserve_temporary_output(&final_path)?;
+    let (working_directory, temporary_path) = reserve_temporary_output(&final_path)?;
     Ok(OutputPaths {
         final_path,
         temporary_path,
+        working_directory,
+        identity: None,
+        identity_info: None,
         owns_output: false,
         promoted: false,
         reported: false,
@@ -864,23 +980,34 @@ fn reserve_default_output() -> Result<PathBuf> {
     )))
 }
 
-fn reserve_temporary_output(final_path: &Path) -> Result<PathBuf> {
+fn reserve_temporary_output(final_path: &Path) -> Result<(PathBuf, PathBuf)> {
     let parent = final_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = final_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("recording.mp4");
     for _ in 0..1_000 {
         let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".{file_name}.scrozz-writing-{}-{sequence}.mp4",
-            std::process::id()
+        let mut entropy = RandomState::new().build_hasher();
+        entropy.write_u64(sequence);
+        entropy.write_u64(u64::from(std::process::id()));
+        entropy.write_u128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        let directory = parent.join(format!(
+            ".scrozz-recording-{}-{:016x}",
+            std::process::id(),
+            entropy.finish()
         ));
-        if candidate != final_path && !candidate.exists() {
-            return Ok(candidate);
+        if directory.exists() {
+            continue;
+        }
+        create_private_directory(&directory)?;
+        let candidate = directory.join("recording.mp4");
+        if candidate != final_path {
+            return Ok((directory, candidate));
         }
     }
     Err(Error::Io(std::io::Error::new(
@@ -915,6 +1042,7 @@ fn promote_output(paths: &mut OutputPaths) -> Result<()> {
             "cannot promote a recording output that this worker does not own".into(),
         ));
     }
+    paths.identity.take();
     let temporary: Vec<u16> = paths
         .temporary_path
         .as_os_str()
@@ -927,17 +1055,183 @@ fn promote_output(paths: &mut OutputPaths) -> Result<()> {
         .encode_wide()
         .chain(Some(0))
         .collect();
-    unsafe { MoveFileW(PCWSTR(temporary.as_ptr()), PCWSTR(final_path.as_ptr())) }.map_err(
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(temporary.as_ptr()),
+            (FILE_READ_ATTRIBUTES | DELETE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|error| {
+        Error::Storage(format!(
+            "could not reopen recording staging output for identity-bound promotion: {error}"
+        ))
+    })?;
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let actual = file_identity(&handle)?;
+    if paths.identity_info != Some(actual) {
+        return Err(Error::Storage(
+            "recording staging identity changed before promotion; refusing substituted output"
+                .into(),
+        ));
+    }
+    rename_handle_no_replace(&handle, &final_path).map_err(|error| {
+        Error::Storage(format!(
+            "could not atomically move recording without replacement from {} to {}: {error}",
+            paths.temporary_path.display(),
+            paths.final_path.display()
+        ))
+    })?;
+    paths.promoted = true;
+    if let Err(error) = std::fs::remove_dir(&paths.working_directory) {
+        tracing::error!(
+            path = %paths.working_directory.display(),
+            %error,
+            "recording was promoted but its empty private working directory remains"
+        );
+    }
+
+    impl OutputPaths {
+        fn pin_identity(&mut self) -> Result<()> {
+            let path: Vec<u16> = self
+                .temporary_path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let handle = unsafe {
+                CreateFileW(
+                    PCWSTR(path.as_ptr()),
+                    FILE_READ_ATTRIBUTES.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+            }
+            .map_err(|error| {
+                Error::Storage(format!(
+                    "could not pin recording staging identity {}: {error}",
+                    self.temporary_path.display()
+                ))
+            })?;
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+            self.identity_info = Some(file_identity(&handle)?);
+            self.identity = Some(handle);
+            Ok(())
+        }
+    }
+
+    fn file_identity(handle: &OwnedHandle) -> Result<FILE_ID_INFO> {
+        let mut identity = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                windows::Win32::Foundation::HANDLE(handle.as_raw_handle()),
+                FileIdInfo,
+                (&raw mut identity).cast(),
+                u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO fits u32"),
+            )
+        }
+        .map_err(|error| {
+            Error::Storage(format!("could not read recording file identity: {error}"))
+        })?;
+        Ok(identity)
+    }
+
+    fn rename_handle_no_replace(handle: &OwnedHandle, destination: &[u16]) -> Result<()> {
+        let name = destination.strip_suffix(&[0]).unwrap_or(destination);
+        let name_bytes = name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| Error::Storage("recording destination name is too long".into()))?;
+        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let allocation = offset
+            .checked_add(name_bytes)
+            .ok_or_else(|| Error::Storage("recording rename buffer is too large".into()))?;
+        let mut storage = vec![0_usize; allocation.div_ceil(std::mem::size_of::<usize>())];
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*rename).Anonymous.ReplaceIfExists = false;
+            (*rename).RootDirectory = windows::Win32::Foundation::HANDLE::default();
+            (*rename).FileNameLength = u32::try_from(name_bytes)
+                .map_err(|_| Error::Storage("recording destination name is too long".into()))?;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (*rename).FileName.as_mut_ptr(),
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                windows::Win32::Foundation::HANDLE(handle.as_raw_handle()),
+                FileRenameInfo,
+                rename.cast(),
+                u32::try_from(allocation)
+                    .map_err(|_| Error::Storage("recording rename buffer is too large".into()))?,
+            )
+            .map_err(|error| Error::Storage(format!("handle-based rename failed: {error}")))
+        }
+    }
+    Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::w!("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| {
+        Error::Storage(format!(
+            "could not construct private recording permissions: {error}"
+        ))
+    })?;
+    let descriptor_guard = SecurityDescriptorGuard(descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .expect("SECURITY_ATTRIBUTES fits u32"),
+        lpSecurityDescriptor: descriptor_guard.0.0,
+        bInheritHandle: BOOL(0),
+    };
+    unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&raw const attributes)) }.map_err(
         |error| {
             Error::Storage(format!(
-                "could not atomically move recording without replacement from {} to {}: {error}",
-                paths.temporary_path.display(),
-                paths.final_path.display()
+                "could not create private recording directory {}: {error}",
+                path.display()
             ))
         },
-    )?;
-    paths.promoted = true;
-    Ok(())
+    )
+}
+
+struct SecurityDescriptorGuard(PSECURITY_DESCRIPTOR);
+
+impl Drop for SecurityDescriptorGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0.0)));
+        }
+    }
+}
+
+fn io_result_detail(result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => "removed".to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "already absent".to_owned(),
+        Err(error) => error.to_string(),
+    }
+}
+
+fn removal_succeeded(result: &std::io::Result<()>) -> bool {
+    matches!(result, Ok(()))
+        || matches!(result, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {

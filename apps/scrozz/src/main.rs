@@ -165,13 +165,12 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
 /// Returns `Ok(None)` when nothing is listening, which is the ordinary case and
 /// not a failure.
 fn try_forward(command: &Command) -> CliResult<Option<u8>> {
-    let _ = command;
-    if !matches!(ipc::probe(), ipc::Status::Running) {
+    if !endpoint_is_forwardable(ipc::probe())? {
         return Ok(None);
     }
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let response = ipc::forward(&argv)?;
+    let response = forward_command(command, argv)?;
 
     // Relayed byte for byte. The whole point of the single-instance design is
     // that `scrozz capture --json` produces the same document whether or not the
@@ -190,6 +189,64 @@ fn try_forward(command: &Command) -> CliResult<Option<u8>> {
         "relayed from the running instance"
     );
     Ok(Some(response.code))
+}
+
+fn forward_command(command: &Command, argv: Vec<String>) -> CliResult<ipc::Response> {
+    let interruptible_recording = matches!(
+        command,
+        Command::Record(args) if args.control().is_none() && !args.dry_run
+    );
+    if !interruptible_recording {
+        return ipc::forward(&argv);
+    }
+
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    ctrlc::set_handler({
+        let interrupted = std::sync::Arc::clone(&interrupted);
+        move || interrupted.store(true, std::sync::atomic::Ordering::Release)
+    })
+    .map_err(|error| {
+        CliError::Core(scrozz_core::Error::Platform(format!(
+            "could not install the forwarded recording stop handler: {error}"
+        )))
+    })?;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("scrozz-forwarded-recording".into())
+        .spawn(move || {
+            let _ = send.send(ipc::forward(&argv));
+        })
+        .map_err(|error| CliError::ipc(format!("could not forward recording start: {error}")))?;
+
+    loop {
+        match receive.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CliError::ipc(
+                    "the forwarded recording request ended without a response",
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if interrupted.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let stop = vec!["record".to_owned(), "--stop".to_owned()];
+            ipc::forward(&stop).map_err(|error| {
+                CliError::ipc(format!(
+                    "could not stop the GUI-owned recording after Ctrl-C: {error}"
+                ))
+            })?;
+        }
+    }
+}
+
+fn endpoint_is_forwardable(status: ipc::Status) -> CliResult<bool> {
+    match status {
+        ipc::Status::Running => Ok(true),
+        ipc::Status::NotRunning => Ok(false),
+        ipc::Status::Unusable(reason) => Err(CliError::ipc(format!(
+            "a Scrozz endpoint exists but cannot be accessed; refusing to start a second state owner: {reason}"
+        ))),
+    }
 }
 
 /// Renders `--help`, `--version` and parse failures.
@@ -326,5 +383,15 @@ mod tests {
     fn initialising_tracing_twice_is_harmless() {
         init_tracing(0, false);
         init_tracing(3, false);
+    }
+
+    #[test]
+    fn an_unusable_endpoint_never_authorises_a_second_owner() {
+        let error = endpoint_is_forwardable(ipc::Status::Unusable("access denied".into()))
+            .expect_err("an existing inaccessible endpoint is not absence");
+        assert_eq!(error.exit(), crate::exit::Exit::IpcFailed);
+        assert!(error.to_string().contains("refusing to start a second"));
+        assert!(!endpoint_is_forwardable(ipc::Status::NotRunning).unwrap());
+        assert!(endpoint_is_forwardable(ipc::Status::Running).unwrap());
     }
 }

@@ -50,9 +50,12 @@ fn a_capture_survives_a_round_trip_through_history() {
 
 #[test]
 fn a_native_recording_round_trips_as_external_video_history() {
-    let (_dir, mut store) = store("video-round-trip");
+    let (dir, mut store) = store("video-round-trip");
+    let video_path = dir.path().join("demo.mp4");
+    std::fs::write(&video_path, vec![0xA5; 4_096]).expect("write recording");
+    let video_path = std::fs::canonicalize(video_path).expect("canonical recording path");
     let metadata = VideoMetadata {
-        path: "/tmp/scrozz-recordings/demo.mp4".into(),
+        path: video_path,
         duration_secs: 12.5,
         engine: "ScreenCaptureKit + AVFoundation".into(),
         completion: VideoCompletion::Complete,
@@ -107,6 +110,55 @@ fn a_native_recording_round_trips_as_external_video_history() {
             .expect("engine search")[0]
             .id,
         id
+    );
+}
+
+#[test]
+fn recording_history_rejects_missing_relative_and_empty_media() {
+    let (dir, mut store) = store("video-validation");
+    let target = CaptureTarget::Display(DisplayId("main".into()));
+    let metadata = |path| VideoMetadata {
+        path,
+        duration_secs: 1.0,
+        engine: "native-test".into(),
+        completion: VideoCompletion::Complete,
+        size: None,
+        frames: Some(1),
+        audio_channels: None,
+        file_size_bytes: None,
+        codec: Some("h264".into()),
+        quality: None,
+        resolution: None,
+    };
+
+    assert!(
+        store
+            .insert_recording(NewRecording::new(
+                target.clone(),
+                Provenance::Display,
+                metadata("relative.mp4".into()),
+            ))
+            .is_err()
+    );
+    assert!(
+        store
+            .insert_recording(NewRecording::new(
+                target.clone(),
+                Provenance::Display,
+                metadata(dir.path().join("missing.mp4")),
+            ))
+            .is_err()
+    );
+    let empty = dir.path().join("empty.mp4");
+    std::fs::File::create(&empty).expect("create empty media");
+    assert!(
+        store
+            .insert_recording(NewRecording::new(
+                target,
+                Provenance::Display,
+                metadata(empty),
+            ))
+            .is_err()
     );
 }
 

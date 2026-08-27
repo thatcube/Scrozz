@@ -29,7 +29,8 @@ use plan::{PlanError, build, output_dimensions};
 use salvage::{Outcome, classify, inspect};
 use terminal::{NativeRecording, SessionState, SharedSessionState, TerminalCache};
 use timing::{
-    Backpressure, FramePacer, HNS_PER_SECOND, Timeline, audio_drain_limit, backpressure, qpc_to_hns,
+    Backpressure, FramePacer, HNS_PER_SECOND, Timeline, audio_drain_limit, backpressure,
+    native_timestamp_is_plausible, qpc_to_hns,
 };
 
 fn windows_caps() -> EngineCapabilities {
@@ -259,6 +260,38 @@ fn qpc_projection_does_not_claim_unwritten_media_duration() {
 }
 
 #[test]
+fn final_projection_stops_at_the_pause_boundary() {
+    let mut timeline = Timeline::default();
+    timeline.start(10 * HNS_PER_SECOND);
+    timeline.pause(12 * HNS_PER_SECOND);
+
+    assert_eq!(
+        timeline.project_final(30 * HNS_PER_SECOND),
+        Some(2 * HNS_PER_SECOND)
+    );
+}
+
+#[test]
+fn native_timestamps_must_stay_inside_the_qpc_window() {
+    let now = 10 * HNS_PER_SECOND;
+    assert!(native_timestamp_is_plausible(
+        now,
+        now - HNS_PER_SECOND,
+        now
+    ));
+    assert!(!native_timestamp_is_plausible(
+        now + 2 * HNS_PER_SECOND,
+        now - HNS_PER_SECOND,
+        now
+    ));
+    assert!(!native_timestamp_is_plausible(
+        now - 2 * HNS_PER_SECOND,
+        now - HNS_PER_SECOND,
+        now
+    ));
+}
+
+#[test]
 fn frame_pacing_and_queue_backpressure_drop_newest_work() {
     let mut pacer = FramePacer::new(30);
     assert!(pacer.schedule(0).is_some());
@@ -308,6 +341,16 @@ fn audio_watermark_uses_qpc_when_video_stalls_and_finalisation_fills_the_tail() 
     assert_eq!(
         audio_drain_limit(frame_end, latest_video, qpc_watermark, settle, true),
         frame_end
+    );
+    assert_eq!(
+        audio_drain_limit(
+            100 * HNS_PER_SECOND,
+            latest_video,
+            qpc_watermark,
+            settle,
+            true
+        ),
+        qpc_watermark + settle
     );
 }
 

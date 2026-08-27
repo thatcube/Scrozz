@@ -2,6 +2,8 @@
 
 /// Media Foundation and WASAPI both express stream time in 100 ns units.
 pub const HNS_PER_SECOND: i64 = 10_000_000;
+/// Maximum amount a native timestamp may lead the current QPC reading.
+pub const MAX_NATIVE_FUTURE_HNS: i64 = HNS_PER_SECOND;
 
 /// Converts a QueryPerformanceCounter value to 100 ns units without overflow.
 #[must_use]
@@ -68,6 +70,19 @@ impl Timeline {
         Some(
             raw_hns
                 .saturating_sub(origin)
+                .saturating_sub(self.paused_total)
+                .max(0),
+        )
+    }
+
+    /// Projects the trusted stop instant, ending a paused session at its pause
+    /// boundary rather than extending it through shutdown.
+    #[must_use]
+    pub fn project_final(&self, stop_raw_hns: i64) -> Option<i64> {
+        let origin = self.origin?;
+        let end = self.pause_started.unwrap_or(stop_raw_hns).min(stop_raw_hns);
+        Some(
+            end.saturating_sub(origin)
                 .saturating_sub(self.paused_total)
                 .max(0),
         )
@@ -172,7 +187,9 @@ pub fn audio_drain_limit(
     finalising: bool,
 ) -> i64 {
     if finalising {
-        media_end_hns.max(0)
+        media_end_hns
+            .min(qpc_watermark_hns.saturating_add(settle_hns))
+            .max(0)
     } else {
         let settled_capture = latest_video_hns
             .max(qpc_watermark_hns)
@@ -180,6 +197,12 @@ pub fn audio_drain_limit(
             .max(0);
         media_end_hns.min(settled_capture).max(0)
     }
+}
+
+/// Whether a native QPC-domain timestamp is within the accepted capture window.
+#[must_use]
+pub fn native_timestamp_is_plausible(raw_hns: i64, minimum_hns: i64, now_hns: i64) -> bool {
+    raw_hns >= minimum_hns && raw_hns <= now_hns.saturating_add(MAX_NATIVE_FUTURE_HNS)
 }
 
 /// Converts stream time to an audio-frame index.

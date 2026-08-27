@@ -41,7 +41,10 @@ pub enum TranscodeView<'a> {
         failure: Option<&'a TranscodeFailure>,
     },
     /// Export cancellation completed.
-    Cancelled,
+    Cancelled {
+        /// Usable partial output retained before cancellation.
+        output: Option<&'a TranscodeOutput>,
+    },
 }
 
 impl<'a> TranscodeView<'a> {
@@ -57,7 +60,7 @@ impl<'a> TranscodeView<'a> {
             TranscodeStatus::Running { .. } => Self::Running { progress },
             TranscodeStatus::Finished => Self::Finished { output },
             TranscodeStatus::Failed => Self::Failed { failure },
-            TranscodeStatus::Cancelled => Self::Cancelled,
+            TranscodeStatus::Cancelled => Self::Cancelled { output },
         }
     }
 
@@ -201,7 +204,7 @@ impl<'a> VideoEditor<'a> {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if button(ui, self.theme, "Done", false, true).clicked() {
+                    if button(ui, self.theme, "Done", false, !running).clicked() {
                         actions.push(VideoEditorAction::Close);
                     }
                     ui.label(
@@ -654,8 +657,23 @@ fn draw_transcode_status(
                 }
             }
         }
-        TranscodeView::Cancelled => {
+        TranscodeView::Cancelled { output } => {
             caption(ui, theme, "Export cancelled.");
+            if let Some(output) = output {
+                body(
+                    ui,
+                    theme,
+                    format!(
+                        "A partial export is available at {}.",
+                        output.path.display()
+                    ),
+                );
+                let reveal = button(ui, theme, "Show partial", false, true);
+                if reveal.clicked() {
+                    actions.push(VideoEditorAction::RevealPartialOutput);
+                }
+                *reveal_response = Some(reveal);
+            }
         }
     }
 }
@@ -689,7 +707,7 @@ impl Scene for VideoEditorScene {
             EditorExportFixture::Failed(failure) => TranscodeView::Failed {
                 failure: Some(failure),
             },
-            EditorExportFixture::Cancelled => TranscodeView::Cancelled,
+            EditorExportFixture::Cancelled => TranscodeView::Cancelled { output: None },
         };
         ui.vertical_centered(|ui| {
             ui.add_space(Space::XXL);

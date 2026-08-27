@@ -89,6 +89,24 @@ impl Request {
         self.serve_with(|command| commands::dispatch_with_recording(command, recording))
     }
 
+    /// Runs a stateful command in the caller's working directory without
+    /// replying yet.
+    ///
+    /// Long-running recording starts use this to retain the request transport
+    /// until the terminal recording report is available.
+    pub fn dispatch_without_reply(
+        &self,
+        dispatch: impl FnOnce(&Command) -> CliResult<crate::report::Report>,
+    ) -> CliResult<crate::report::Report> {
+        let command = self.command().ok_or_else(|| {
+            CliError::usage("the forwarded command could not be parsed for deferred execution")
+        })?;
+        let restore = enter(self.cwd.as_deref());
+        let result = dispatch(&command);
+        restore();
+        result
+    }
+
     /// Runs the command with a state-aware dispatcher retained by the host.
     pub fn serve_with(
         self,
@@ -254,7 +272,12 @@ pub struct Server {
 struct WindowsListener {
     pipe: Option<std::fs::File>,
     connected: bool,
+    connected_at: Option<std::time::Instant>,
+    request: Vec<u8>,
 }
+
+const MAX_IPC_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_INCOMPLETE_REQUEST_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Server {
     /// Binds the endpoint, taking over a stale socket if one is left behind.
@@ -316,6 +339,8 @@ impl Server {
             listener: std::sync::Mutex::new(WindowsListener {
                 pipe: Some(pipe),
                 connected: false,
+                connected_at: None,
+                request: Vec::new(),
             }),
         })
     }
@@ -384,9 +409,15 @@ impl Server {
                 .as_raw_handle();
             let connected = unsafe { ConnectNamedPipe(HANDLE(raw), None) };
             match connected {
-                Ok(()) => listener.connected = true,
+                Ok(()) => {
+                    listener.connected = true;
+                    listener.connected_at = Some(std::time::Instant::now());
+                }
                 Err(error) => match win32_error_code(&error) {
-                    code if code == ERROR_PIPE_CONNECTED.0 => listener.connected = true,
+                    code if code == ERROR_PIPE_CONNECTED.0 => {
+                        listener.connected = true;
+                        listener.connected_at = Some(std::time::Instant::now());
+                    }
                     code if code == ERROR_PIPE_LISTENING.0 => return None,
                     code if code == ERROR_NO_DATA.0 => {
                         reset_windows_listener(&mut listener, &self.path);
@@ -400,32 +431,49 @@ impl Server {
                 },
             }
         }
+        if listener
+            .connected_at
+            .is_some_and(|connected| connected.elapsed() > MAX_INCOMPLETE_REQUEST_AGE)
+        {
+            tracing::warn!("dropping an incomplete forwarded command after its framing deadline");
+            reset_windows_listener(&mut listener, &self.path);
+            return None;
+        }
 
-        let mut raw = vec![0_u8; 64 * 1024];
-        let read = listener
-            .pipe
-            .as_mut()
-            .expect("a connected listener owns a pipe")
-            .read(&mut raw);
-        let count = match read {
-            Ok(0) => {
-                reset_windows_listener(&mut listener, &self.path);
-                return None;
-            }
-            Ok(count) => count,
-            Err(error)
-                if error.kind() == ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(ERROR_NO_DATA.0 as i32) =>
-            {
-                return None;
-            }
-            Err(error) => {
-                tracing::warn!("could not read a forwarded command: {error}");
-                reset_windows_listener(&mut listener, &self.path);
-                return None;
+        let raw = loop {
+            let mut chunk = [0_u8; 16 * 1024];
+            let read = listener
+                .pipe
+                .as_mut()
+                .expect("a connected listener owns a pipe")
+                .read(&mut chunk);
+            match read {
+                Ok(0) => {
+                    reset_windows_listener(&mut listener, &self.path);
+                    return None;
+                }
+                Ok(count) => match append_request_bytes(&mut listener.request, &chunk[..count]) {
+                    Ok(Some(raw)) => break raw,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!("refusing a forwarded command: {error}");
+                        reset_windows_listener(&mut listener, &self.path);
+                        return None;
+                    }
+                },
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(ERROR_NO_DATA.0 as i32) =>
+                {
+                    return None;
+                }
+                Err(error) => {
+                    tracing::warn!("could not read a forwarded command: {error}");
+                    reset_windows_listener(&mut listener, &self.path);
+                    return None;
+                }
             }
         };
-        raw.truncate(count);
         let line = String::from_utf8_lossy(&raw);
         let parsed = string_array(&line, "argv").map(|argv| {
             let cwd = string_field(&line, "cwd").map(PathBuf::from);
@@ -437,6 +485,8 @@ impl Server {
             .take()
             .expect("the connected named pipe still exists");
         listener.connected = false;
+        listener.connected_at = None;
+        listener.request.clear();
         listener.pipe = create_named_pipe(&self.path, false)
             .inspect_err(|error| {
                 tracing::warn!("could not create the next instance named pipe: {error}");
@@ -476,9 +526,16 @@ fn create_named_pipe(path: &Path, first: bool) -> std::io::Result<std::fs::File>
     };
     use windows::{
         Win32::{
+            Foundation::BOOL,
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                },
+                PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            },
             Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
             System::Pipes::{
-                CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+                CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
                 PIPE_UNLIMITED_INSTANCES,
             },
         },
@@ -489,12 +546,29 @@ fn create_named_pipe(path: &Path, first: bool) -> std::io::Result<std::fs::File>
     if first {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
-    let mode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT;
+    let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT;
     let wide = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::w!("D:P(A;;GA;;;OW)(A;;GA;;;SY)"),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| std::io::Error::other(format!("cannot secure named pipe: {error}")))?;
+    let descriptor_guard = PipeSecurityDescriptor(descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .expect("SECURITY_ATTRIBUTES fits u32"),
+        lpSecurityDescriptor: descriptor_guard.0.0,
+        bInheritHandle: BOOL(0),
+    };
     let handle = unsafe {
         CreateNamedPipeW(
             PCWSTR(wide.as_ptr()),
@@ -504,11 +578,25 @@ fn create_named_pipe(path: &Path, first: bool) -> std::io::Result<std::fs::File>
             64 * 1024,
             64 * 1024,
             0,
-            None,
+            Some(&raw const attributes),
         )
     };
     if handle.is_invalid() {
         return Err(std::io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "windows")]
+    struct PipeSecurityDescriptor(windows::Win32::Security::PSECURITY_DESCRIPTOR);
+
+    #[cfg(target_os = "windows")]
+    impl Drop for PipeSecurityDescriptor {
+        fn drop(&mut self) {
+            use windows::Win32::Foundation::{HLOCAL, LocalFree};
+
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.0)));
+            }
+        }
     }
 
     let owned = unsafe { OwnedHandle::from_raw_handle(handle.0) };
@@ -523,6 +611,28 @@ fn reset_windows_listener(listener: &mut WindowsListener, path: &Path) {
         })
         .ok();
     listener.connected = false;
+    listener.connected_at = None;
+    listener.request.clear();
+}
+
+fn append_request_bytes(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let new_len = buffer
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| "forwarded command length overflowed".to_owned())?;
+    if new_len > MAX_IPC_REQUEST_BYTES {
+        return Err(format!(
+            "forwarded command exceeds the {MAX_IPC_REQUEST_BYTES}-byte request limit"
+        ));
+    }
+    buffer.extend_from_slice(chunk);
+    let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+    if newline + 1 != buffer.len() {
+        return Err("forwarded command contains bytes after its request frame".to_owned());
+    }
+    Ok(Some(std::mem::take(buffer)))
 }
 
 #[cfg(target_os = "windows")]
@@ -795,6 +905,30 @@ mod tests {
             std::env::current_dir().expect("a working directory"),
             before
         );
+    }
+
+    #[test]
+    fn request_framing_accumulates_past_named_pipe_buffer_size() {
+        let mut buffer = Vec::new();
+        let first = vec![b'a'; 70 * 1024];
+        assert!(
+            append_request_bytes(&mut buffer, &first)
+                .expect("first chunk")
+                .is_none()
+        );
+        let framed = append_request_bytes(&mut buffer, b"\n")
+            .expect("final chunk")
+            .expect("complete frame");
+        assert_eq!(framed.len(), first.len() + 1);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn request_framing_is_bounded_and_rejects_trailing_bytes() {
+        let mut oversized = Vec::new();
+        assert!(append_request_bytes(&mut oversized, &vec![0; MAX_IPC_REQUEST_BYTES + 1]).is_err());
+        let mut trailing = Vec::new();
+        assert!(append_request_bytes(&mut trailing, b"{}\nextra").is_err());
     }
 
     #[cfg(unix)]

@@ -1,6 +1,9 @@
 //! Recording-engine contracts, capability negotiation, and deterministic mocks.
 
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use scrozz_core::{Error, Result};
 
@@ -446,7 +449,15 @@ impl RecordingSession for MockSession {
     fn poll(&mut self) -> Option<SessionEvent> {
         let poll = self.polls.pop_front()?;
         self.engine_elapsed_secs = poll.engine_elapsed_secs;
-        poll.event
+        poll.event.map(|event| match event {
+            SessionEvent::Finished(output) => {
+                match output.into_synthetic("deterministic mock engine") {
+                    Ok(output) => SessionEvent::Finished(output),
+                    Err(error) => SessionEvent::Failed(Arc::new(error)),
+                }
+            }
+            event => event,
+        })
     }
 
     fn engine_elapsed_secs(&self) -> Option<f64> {
@@ -528,5 +539,23 @@ mod tests {
         });
         let output = engine.start(&request()).unwrap().stop().unwrap();
         assert_eq!(output.partial_reason(), Some("flush failed"));
+    }
+
+    #[test]
+    fn mock_terminal_poll_cannot_publish_native_provenance() {
+        let native = Recording::native("native.mp4", 1.0, "forged native").unwrap();
+        let plan = MockSessionPlan::complete("stop.mp4", 1.0)
+            .unwrap()
+            .with_polls(vec![MockPoll::new(
+                Some(SessionEvent::Finished(native)),
+                Some(1.0),
+            )]);
+        let engine = MockEngine::fully_capable(plan);
+        let mut session = engine.start(&request()).unwrap();
+
+        let Some(SessionEvent::Finished(output)) = session.poll() else {
+            panic!("expected sanitized terminal output");
+        };
+        assert!(!output.provenance.is_native());
     }
 }

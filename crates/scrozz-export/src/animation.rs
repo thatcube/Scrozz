@@ -281,6 +281,27 @@ impl<W: Write> GifAnimationStream<W> {
         Ok(())
     }
 
+    /// Centiseconds the cumulative GIF clock would allocate to `additional`.
+    ///
+    /// This does not mutate the stream. Callers that buffer a final short frame
+    /// use it to decide whether the cumulative clock can represent two distinct
+    /// images rather than folding the tail away.
+    pub fn projected_centiseconds(&self, additional: Duration) -> Result<u128> {
+        const CENTISECOND_NANOS: u128 = 10_000_000;
+        const HALF_CENTISECOND_NANOS: u128 = CENTISECOND_NANOS / 2;
+        let elapsed = self
+            .elapsed_nanos
+            .checked_add(additional.as_nanos())
+            .ok_or_else(|| Error::InvalidRequest("GIF timeline duration overflowed".to_owned()))?;
+        let target = elapsed
+            .checked_add(HALF_CENTISECOND_NANOS)
+            .ok_or_else(|| Error::InvalidRequest("GIF timeline duration overflowed".to_owned()))?
+            / CENTISECOND_NANOS;
+        target
+            .checked_sub(self.emitted_centiseconds)
+            .ok_or_else(|| Error::InvalidRequest("GIF timeline regressed".to_owned()))
+    }
+
     /// Writes the GIF trailer and returns the underlying writer.
     ///
     /// # Errors
@@ -385,10 +406,9 @@ fn validate_image(image: &RgbaImage, index: usize) -> Result<()> {
 }
 
 fn validate_delay(delay: Duration, index: usize) -> Result<()> {
-    if delay < GIF_MIN_FRAME_DELAY || delay > GIF_MAX_FRAME_DELAY {
+    if delay.is_zero() || delay > GIF_MAX_FRAME_DELAY {
         return Err(Error::InvalidRequest(format!(
-            "GIF frame {index} delay must be between {} ms and {} ms",
-            GIF_MIN_FRAME_DELAY.as_millis(),
+            "GIF frame {index} delay must be positive and no more than {} ms",
             GIF_MAX_FRAME_DELAY.as_millis()
         )));
     }

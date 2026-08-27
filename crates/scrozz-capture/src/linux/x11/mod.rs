@@ -528,24 +528,19 @@ impl X11Backend {
         Ok(frame)
     }
 
-    fn composite_cursor(&self, frame: &mut Frame, origin: (i32, i32)) {
+    fn composite_cursor(&self, frame: &mut Frame, origin: (i32, i32)) -> Result<()> {
         if !self.xfixes_available {
-            tracing::warn!("the X server has no XFIXES extension; capturing without the pointer");
-            return;
+            return Err(Error::Unsupported {
+                what: "capturing the cursor on X11".into(),
+                why: "the X server does not provide the XFIXES cursor extension".into(),
+            });
         }
-        let reply = match xfixes::get_cursor_image(&self.conn) {
-            Ok(cookie) => match cookie.reply() {
-                Ok(reply) => reply,
-                Err(err) => {
-                    tracing::warn!(%err, "XFIXES could not read the cursor; capturing without it");
-                    return;
-                }
-            },
-            Err(err) => {
-                tracing::warn!(%err, "XFIXES cursor request failed; capturing without it");
-                return;
-            }
-        };
+        let reply = xfixes::get_cursor_image(&self.conn)
+            .map_err(|error| Error::Platform(format!("XFIXES cursor request failed: {error}")))?
+            .reply()
+            .map_err(|error| {
+                Error::Platform(format!("XFIXES could not read the cursor: {error}"))
+            })?;
 
         let left = i32::from(reply.x) - i32::from(reply.xhot) - origin.0;
         let top = i32::from(reply.y) - i32::from(reply.yhot) - origin.1;
@@ -588,6 +583,7 @@ impl X11Backend {
                 frame.data[offset + 3] = 255;
             }
         }
+        Ok(())
     }
 
     fn display_by_id(&self, id: &DisplayId) -> Result<Display> {
@@ -771,7 +767,7 @@ impl CaptureBackend for X11Backend {
             }
         };
         if request.cursor == scrozz_core::CursorMode::Visible {
-            self.composite_cursor(&mut frame, origin);
+            self.composite_cursor(&mut frame, origin)?;
         }
 
         Ok(Capture {

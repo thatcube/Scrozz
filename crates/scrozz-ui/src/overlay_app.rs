@@ -434,7 +434,13 @@ pub struct VideoEditorSnapshot {
     pub document: VideoDocument,
     /// Current non-destructive edit plan.
     pub plan: EditPlan,
-    /// Explicit export failure, including native-transcoder unavailability.
+    /// Current native export state, or `None` before the first export.
+    pub transcode_status: Option<scrozz_record::transcode::TranscodeStatus>,
+    /// Last normalized export progress.
+    pub transcode_progress: f32,
+    /// Complete exported artifact.
+    pub transcode_output: Option<scrozz_record::transcode::TranscodeOutput>,
+    /// Explicit export failure, including any retained partial.
     pub transcode_failure: Option<TranscodeFailure>,
 }
 
@@ -447,6 +453,8 @@ pub struct RecordingPresentation {
     pub countdown: CountdownSettings,
     /// Remaining virtual countdown time.
     pub countdown_remaining: Duration,
+    /// Hide every Scrozz overlay while a backend cannot exclude its windows.
+    pub suppress_all_overlays: bool,
     /// Editor state once playable output exists.
     pub editor: Option<VideoEditorSnapshot>,
 }
@@ -612,6 +620,7 @@ pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
         .with_transparent(true)
         .with_has_shadow(false)
         .with_taskbar(false)
+        .with_content_protected(true)
         .with_resizable(false)
         .with_drag_and_drop(true)
         .with_always_on_top()
@@ -1111,16 +1120,21 @@ impl OverlayApp {
                     .max_rect(rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
                 |ui| {
+                    let transcode = editor
+                        .transcode_status
+                        .map_or(TranscodeView::Idle, |status| {
+                            TranscodeView::from_status(
+                                status,
+                                editor.transcode_progress,
+                                editor.transcode_output.as_ref(),
+                                editor.transcode_failure.as_ref(),
+                            )
+                        });
                     VideoEditor::new(
                         VideoEditorModel {
                             document: &editor.document,
                             plan: editor.plan,
-                            transcode: editor.transcode_failure.as_ref().map_or(
-                                TranscodeView::Idle,
-                                |failure| TranscodeView::Failed {
-                                    failure: Some(failure),
-                                },
-                            ),
+                            transcode,
                         },
                         &self.theme,
                     )
@@ -1219,6 +1233,10 @@ impl eframe::App for OverlayApp {
 
         let surface = Surface::new(&self.theme, &self.icons, m);
         let frames = self.stack.frame(&m);
+        let recording = self.recording_presentation();
+        let suppress_all_overlays = recording
+            .as_ref()
+            .is_some_and(|presentation| presentation.suppress_all_overlays);
 
         let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 2);
         let mut hovered = None;
@@ -1227,39 +1245,45 @@ impl eframe::App for OverlayApp {
         let mut drag_to = None;
         let mut drag_end = false;
 
-        for f in &frames {
-            let Some(entry) = self.content.get(&f.id) else {
-                continue;
-            };
-            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
-            if let Some(tex) = &entry.texture {
-                content.texture = Some(tex.id());
-            }
-            let response = card::draw_card(ui, &surface, f, &content);
-            hits.push(response.hit);
+        if !suppress_all_overlays {
+            for f in &frames {
+                let Some(entry) = self.content.get(&f.id) else {
+                    continue;
+                };
+                let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
+                if let Some(tex) = &entry.texture {
+                    content.texture = Some(tex.id());
+                }
+                let response = card::draw_card(ui, &surface, f, &content);
+                hits.push(response.hit);
 
-            if response.body.hovered() {
-                hovered = Some(f.id);
-            }
-            if let Some(a) = response.action {
-                action = Some((f.id, a));
-            }
-            if response.body.drag_started() {
-                drag_start = response.body.interact_pointer_pos().map(|p| (f.id, p));
-            }
-            if response.body.dragged() {
-                drag_to = response.body.interact_pointer_pos();
-            }
-            if response.body.drag_stopped() {
-                drag_end = true;
+                if response.body.hovered() {
+                    hovered = Some(f.id);
+                }
+                if let Some(a) = response.action {
+                    action = Some((f.id, a));
+                }
+                if response.body.drag_started() {
+                    drag_start = response.body.interact_pointer_pos().map(|p| (f.id, p));
+                }
+                if response.body.dragged() {
+                    drag_to = response.body.interact_pointer_pos();
+                }
+                if response.body.drag_stopped() {
+                    drag_end = true;
+                }
             }
         }
 
-        let (dock_hit, dock_clicked) = self.draw_dock(ui, &surface, &m);
+        let (dock_hit, dock_clicked) = if suppress_all_overlays {
+            (None, false)
+        } else {
+            self.draw_dock(ui, &surface, &m)
+        };
         if let Some(rect) = dock_hit {
             hits.push(rect);
         }
-        if let Some(recording) = self.recording_presentation() {
+        if let Some(recording) = recording.filter(|_| !suppress_all_overlays) {
             self.draw_recording(ui, &recording, &mut hits);
         }
 
@@ -1433,6 +1457,7 @@ mod tests {
         assert_eq!(v.transparent, Some(true));
         assert_eq!(v.has_shadow, Some(false));
         assert_eq!(v.taskbar, Some(false));
+        assert_eq!(v.content_protected, Some(true));
         assert_eq!(v.resizable, Some(false));
         assert_eq!(v.active, Some(false));
         assert_eq!(v.window_level, Some(egui::WindowLevel::AlwaysOnTop));

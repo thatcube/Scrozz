@@ -32,7 +32,7 @@ impl RecordingEngine for MacEngine {
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
             video: true,
-            system_audio: true,
+            system_audio: stream::system_audio_available(),
             microphone: true,
             pause_resume: true,
             display: true,

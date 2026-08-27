@@ -2,6 +2,9 @@
 
 use scrozz_core::{Error, Result};
 
+/// Largest allocation one mixer call may request.
+pub const MAX_MIX_FRAMES: u64 = 48_000;
+
 /// One interleaved floating-point audio buffer.
 #[derive(Debug, Clone)]
 pub struct AudioBuffer {
@@ -119,7 +122,13 @@ impl AudioMixer {
             });
         }
 
-        let frames = usize::try_from(end - start)
+        let span = end - start;
+        if span > MAX_MIX_FRAMES {
+            return Err(Error::InvalidRequest(format!(
+                "mixed audio span {span} frames exceeds the {MAX_MIX_FRAMES}-frame bound"
+            )));
+        }
+        let frames = usize::try_from(span)
             .map_err(|_| Error::InvalidRequest("mixed audio duration exceeds memory".into()))?;
         let mut samples = vec![0.0_f32; frames.saturating_mul(2)];
         for (buffer, gain) in sources.into_iter().flatten() {
@@ -194,5 +203,26 @@ mod tests {
             .mix(Some(&first), Some(&second))
             .unwrap();
         assert_eq!(output.samples, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn refuses_an_unbounded_timestamp_span() {
+        let first = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            start_frame: 0,
+            samples: vec![0.25],
+        };
+        let distant = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            start_frame: super::MAX_MIX_FRAMES + 1,
+            samples: vec![0.25],
+        };
+        assert!(
+            AudioMixer::new(48_000)
+                .mix(Some(&first), Some(&distant))
+                .is_err()
+        );
     }
 }

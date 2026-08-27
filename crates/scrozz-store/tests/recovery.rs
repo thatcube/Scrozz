@@ -91,12 +91,14 @@ fn assert_history_intact(store: &mut SqliteStore, ids: &[CaptureId]) {
 fn a_video_sidecar_rebuilds_the_recording_index() {
     let dir = scratch_dir("video-recovery");
     let mut store = SqliteStore::open(dir.path()).expect("open");
+    let video_path = dir.path().join("retained-partial.mp4");
+    fs::write(&video_path, vec![0xA5; 512]).expect("write retained media");
     let id = store
         .insert_recording(NewRecording::new(
             CaptureTarget::Display(DisplayId("main".into())),
             Provenance::Display,
             VideoMetadata {
-                path: "/tmp/retained-partial.mp4".into(),
+                path: video_path,
                 duration_secs: 0.0,
                 engine: "native-test".into(),
                 completion: VideoCompletion::Partial {
@@ -285,6 +287,76 @@ fn a_record_written_before_the_commit_landed_is_adopted_on_the_next_open() {
         ImageState::Absent | ImageState::Evicted { .. }
     ));
     assert!(store.image(&orphan_id).expect("read").is_none());
+}
+
+#[test]
+fn an_existing_sidecar_update_is_replayed_after_an_interrupted_index_write() {
+    let dir = scratch_dir("stale-index-row");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 4, 1)))
+        .expect("insert");
+    let layout = store.layout().clone();
+    let mut sidecar = layout
+        .read_record(&id)
+        .expect("read sidecar")
+        .expect("sidecar exists");
+    sidecar.pinned = true;
+    sidecar.ocr_text = Some("durable sidecar wins".into());
+    layout.write_record(&sidecar).expect("write sidecar first");
+    drop(store);
+
+    let store = SqliteStore::open(dir.path()).expect("reopen");
+    let indexed = store
+        .record(&id)
+        .expect("read index")
+        .expect("capture remains");
+    assert!(indexed.pinned);
+    assert_eq!(indexed.ocr_text.as_deref(), Some("durable sidecar wins"));
+}
+
+#[test]
+fn a_pending_deletion_is_completed_before_sidecars_are_adopted() {
+    let dir = scratch_dir("pending-delete");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 9, 0)))
+        .expect("insert");
+    let layout = store.layout().clone();
+    layout.write_deletion(&id).expect("durable delete intent");
+    drop(store);
+
+    let store = SqliteStore::open(dir.path()).expect("resume deletion");
+    assert!(store.record(&id).expect("read").is_none());
+    assert!(layout.read_record(&id).expect("read sidecar").is_none());
+    assert!(layout.scan_deletions().expect("scan markers").is_empty());
+}
+
+#[test]
+fn a_delete_marker_survives_until_blob_cleanup_can_finish() {
+    let dir = scratch_dir("delete-cleanup-retry");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 7, 0)))
+        .expect("insert");
+    let layout = store.layout().clone();
+    let unreadable = layout.documents_dir().join("BROKEN.json");
+    fs::write(&unreadable, b"{").expect("plant unreadable sidecar");
+
+    let error = store
+        .delete(&id)
+        .expect_err("unsafe garbage collection must block deletion completion");
+    assert!(error.to_string().contains("unreadable"), "{error}");
+    assert_eq!(
+        layout.scan_deletions().expect("pending marker"),
+        [id.clone()]
+    );
+    fs::remove_file(unreadable).expect("remove damaged test record");
+    drop(store);
+
+    let store = SqliteStore::open(dir.path()).expect("resume cleanup");
+    assert!(store.record(&id).expect("read").is_none());
+    assert!(layout.scan_deletions().expect("markers cleared").is_empty());
 }
 
 #[test]
@@ -534,6 +606,29 @@ fn garbage_collection_removes_only_pixels_nothing_refers_to() {
     assert!(
         store.image(&id).expect("read").is_some(),
         "a referenced blob must never be collected"
+    );
+}
+
+#[test]
+fn garbage_collection_treats_unindexed_sidecars_as_authoritative_references() {
+    let dir = scratch_dir("collect-unindexed-sidecar");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let document = sample_document(8, 8, 6, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let hash = match store.record(&id).expect("read").expect("present").image {
+        ImageState::Present { hash, .. } => hash,
+        other => panic!("expected pixels, got {other:?}"),
+    };
+    Connection::open(store.layout().index_path())
+        .expect("open raw index")
+        .execute("DELETE FROM captures WHERE id = ?1", [&id.0])
+        .expect("simulate sidecar-first crash");
+
+    store.collect_garbage().expect("collect");
+
+    assert!(
+        store.layout().blob_exists(&hash).expect("blob state"),
+        "the durable sidecar still owns its image even before index adoption"
     );
 }
 

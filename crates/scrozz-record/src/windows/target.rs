@@ -6,15 +6,17 @@ use scrozz_core::{CaptureTarget, Error, Result};
 use windows::{
     Graphics::{Capture::GraphicsCaptureItem, SizeInt32},
     Win32::{
-        Foundation::{E_INVALIDARG, HWND, LPARAM, RECT},
+        Foundation::{CloseHandle, E_INVALIDARG, FILETIME, HWND, LPARAM, RECT},
         Graphics::Gdi::{
             EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
         },
+        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
         System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop,
         UI::HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForWindow,
             MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
         },
+        UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId, IsWindow},
     },
 };
 
@@ -35,6 +37,8 @@ pub struct Source {
     pub resize_with_content: bool,
     /// Physical pixels per logical point for this source.
     pub backing_scale: f64,
+    /// Native target identity revalidated while recording.
+    pub validator: TargetValidator,
 }
 
 #[derive(Clone)]
@@ -43,6 +47,82 @@ struct Monitor {
     name: String,
     bounds: RECT,
     scale: f64,
+    dpi_y: u32,
+}
+
+/// Cloneable native identity checked periodically by the recording worker.
+#[derive(Debug, Clone)]
+pub struct TargetValidator {
+    identity: TargetIdentity,
+}
+
+#[derive(Debug, Clone)]
+enum TargetIdentity {
+    Window(WindowFingerprint),
+    Monitor(MonitorFingerprint),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowFingerprint {
+    handle: isize,
+    process_id: u32,
+    thread_id: u32,
+    process_created: u64,
+    class_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MonitorFingerprint {
+    handle: isize,
+    name: String,
+    bounds: RECT,
+    scale: f64,
+    dpi_y: u32,
+}
+
+impl TargetValidator {
+    /// Verifies that the selected native object still has the same generation
+    /// and desktop geometry.
+    pub fn validate(&self) -> Result<()> {
+        match &self.identity {
+            TargetIdentity::Window(expected) => {
+                let current = window_fingerprint(HWND(expected.handle as *mut c_void))?;
+                if &current == expected {
+                    Ok(())
+                } else {
+                    Err(Error::TargetGone(
+                        "the selected window closed or its native handle was reused".into(),
+                    ))
+                }
+            }
+            TargetIdentity::Monitor(expected) => {
+                let handle = HMONITOR(expected.handle as *mut c_void);
+                let current = monitor_record(handle).ok_or_else(|| {
+                    Error::TargetGone(format!("display {} disconnected", expected.name))
+                })?;
+                if MonitorFingerprint::from(&current) == *expected {
+                    Ok(())
+                } else {
+                    Err(Error::TargetGone(format!(
+                        "display {} changed identity, position, size, or DPI during recording",
+                        expected.name
+                    )))
+                }
+            }
+        }
+    }
+}
+
+impl From<&Monitor> for MonitorFingerprint {
+    fn from(monitor: &Monitor) -> Self {
+        Self {
+            handle: monitor.handle.0 as isize,
+            name: monitor.name.clone(),
+            bounds: monitor.bounds,
+            scale: monitor.scale,
+            dpi_y: monitor.dpi_y,
+        }
+    }
 }
 
 struct EnumState {
@@ -81,7 +161,14 @@ pub fn resolve(target: &CaptureTarget) -> Result<Source> {
                 Error::TargetGone(format!("not a Windows window identifier: {}", id.0))
             })?;
             let hwnd = HWND(raw as *mut c_void);
+            let before = window_fingerprint(hwnd)?;
             let item = item_for_window(hwnd)?;
+            let after = window_fingerprint(hwnd)?;
+            if before != after {
+                return Err(Error::TargetGone(
+                    "window identity changed while recording started".into(),
+                ));
+            }
             let size = item
                 .Size()
                 .map_err(|_| Error::TargetGone("window closed before recording began".into()))?;
@@ -98,6 +185,9 @@ pub fn resolve(target: &CaptureTarget) -> Result<Source> {
                 },
                 resize_with_content: true,
                 backing_scale: if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 },
+                validator: TargetValidator {
+                    identity: TargetIdentity::Window(after),
+                },
             })
         }
         CaptureTarget::Region(region) => {
@@ -206,6 +296,9 @@ fn source_for_monitor(monitor: &Monitor, region: Option<RegionCrop>) -> Result<S
         crop,
         resize_with_content: region.is_none(),
         backing_scale: monitor.scale,
+        validator: TargetValidator {
+            identity: TargetIdentity::Monitor(MonitorFingerprint::from(monitor)),
+        },
     })
 }
 
@@ -289,14 +382,19 @@ fn monitor_record(handle: HMONITOR) -> Option<Monitor> {
         .unwrap_or(info.szDevice.len());
     let mut x = 96;
     let mut y = 96;
-    if unsafe { GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut x, &mut y) }.is_err() || x == 0 {
+    if unsafe { GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut x, &mut y) }.is_err()
+        || x == 0
+        || y == 0
+    {
         x = 96;
+        y = 96;
     }
     Some(Monitor {
         handle,
         name: String::from_utf16_lossy(&info.szDevice[..end]),
         bounds: info.monitorInfo.rcMonitor,
         scale: f64::from(x) / 96.0,
+        dpi_y: y,
     })
 }
 
@@ -307,6 +405,56 @@ fn same_monitor(a: &Monitor, b: &Monitor) -> bool {
         && a.bounds.right == b.bounds.right
         && a.bounds.bottom == b.bounds.bottom
         && a.scale == b.scale
+        && a.dpi_y == b.dpi_y
+}
+
+fn window_fingerprint(hwnd: HWND) -> Result<WindowFingerprint> {
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Err(Error::TargetGone(
+            "window closed before recording began".into(),
+        ));
+    }
+    let mut process_id = 0;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    if thread_id == 0 || process_id == 0 {
+        return Err(Error::TargetGone(
+            "window identity could not be read before recording".into(),
+        ));
+    }
+    let mut class = [0_u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class) };
+    if class_len == 0 {
+        return Err(Error::TargetGone(
+            "window class could not be read before recording".into(),
+        ));
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+        .map_err(|error| {
+            Error::TargetGone(format!(
+                "window process could not be opened for identity validation: {error}"
+            ))
+        })?;
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let times =
+        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    let _ = unsafe { CloseHandle(process) };
+    times.map_err(|error| {
+        Error::TargetGone(format!(
+            "window process creation time could not be read: {error}"
+        ))
+    })?;
+    let process_created =
+        u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime);
+    Ok(WindowFingerprint {
+        handle: hwnd.0 as isize,
+        process_id,
+        thread_id,
+        process_created,
+        class_name: String::from_utf16_lossy(&class[..class_len as usize]),
+    })
 }
 
 fn region_error(error: RegionError) -> Error {

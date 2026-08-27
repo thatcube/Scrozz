@@ -9,13 +9,17 @@ use std::{collections::VecDeque, fmt, path::PathBuf, sync::Arc, time::Duration};
 use scrozz_core::{CaptureTarget, Error, Result};
 
 use crate::{
-    Recording, RecordingEngine, RecordingRequest, RecordingSession, RecordingSettings,
-    SessionEvent,
+    OverlaySource, Recording, RecordingEngine, RecordingRequest, RecordingSession,
+    RecordingSettings, SessionEvent,
     engine::{EngineCapabilities, detect_native_engine, validate_capabilities},
 };
 
 /// Difference large enough to emit a drift event.
 pub const DRIFT_EVENT_THRESHOLD_SECS: f64 = 0.050;
+/// Maximum recoverable warnings retained for one run.
+pub const MAX_WARNING_HISTORY: usize = 64;
+/// Maximum undrained machine events retained across runs.
+pub const MAX_PENDING_EVENTS: usize = 256;
 
 /// Exact lifecycle phases of a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,12 +89,15 @@ pub struct RecordingMachine {
     settings: RecordingSettings,
     phase: RecordingPhase,
     request: Option<RecordingRequest>,
+    pending_overlays: Option<Box<dyn OverlaySource>>,
+    overlays_required: bool,
     session: Option<Box<dyn RecordingSession>>,
     countdown_remaining: Duration,
     elapsed: Duration,
     first_frame: bool,
     warnings: Vec<String>,
     latest_drift: Option<ClockDrift>,
+    last_emitted_drift: Option<ClockDrift>,
     output: Option<Recording>,
     failure: Option<MachineFailure>,
     events: VecDeque<MachineEvent>,
@@ -137,12 +144,15 @@ impl RecordingMachine {
             settings,
             phase: RecordingPhase::Idle,
             request: None,
+            pending_overlays: None,
+            overlays_required: false,
             session: None,
             countdown_remaining: Duration::ZERO,
             elapsed: Duration::ZERO,
             first_frame: false,
             warnings: Vec::new(),
             latest_drift: None,
+            last_emitted_drift: None,
             output: None,
             failure: None,
             events: VecDeque::new(),
@@ -212,6 +222,7 @@ impl RecordingMachine {
     pub fn cancel_countdown(&mut self) -> Result<()> {
         self.require_phase(RecordingPhase::Countdown, "cancel recording countdown")?;
         self.request = None;
+        self.pending_overlays = None;
         self.countdown_remaining = Duration::ZERO;
         self.elapsed = Duration::ZERO;
         self.set_phase(RecordingPhase::Idle);
@@ -259,6 +270,25 @@ impl RecordingMachine {
         self.prepare_request(request)
     }
 
+    /// Begins countdown/recording with an explicit pull-based overlay source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transition, request, capability, overlay, or engine-start error.
+    pub fn begin_with_destination_and_overlays(
+        &mut self,
+        target: CaptureTarget,
+        destination: PathBuf,
+        overlays: Box<dyn OverlaySource>,
+    ) -> Result<()> {
+        self.require_phase(RecordingPhase::Idle, "begin recording")?;
+        self.clear_run();
+        let mut request = RecordingRequest::from_settings(target, &self.settings);
+        request.destination = Some(destination);
+        self.pending_overlays = Some(overlays);
+        self.prepare_request(request)
+    }
+
     /// Starts an already configured request without applying interactive
     /// settings or a countdown.
     ///
@@ -274,6 +304,27 @@ impl RecordingMachine {
         request.validate()?;
         validate_capabilities(self.capabilities, &request, None)?;
         self.clear_run();
+        self.overlays_required = false;
+        self.stage_request(&request);
+        self.start_request(request)
+    }
+
+    /// Starts an explicit request with a pull-based overlay source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transition, request, capability, overlay, or engine-start error.
+    pub fn begin_request_with_overlays(
+        &mut self,
+        request: RecordingRequest,
+        overlays: Box<dyn OverlaySource>,
+    ) -> Result<()> {
+        self.require_phase(RecordingPhase::Idle, "begin configured recording")?;
+        request.validate()?;
+        validate_capabilities(self.capabilities, &request, None)?;
+        self.clear_run();
+        self.pending_overlays = Some(overlays);
+        self.overlays_required = true;
         self.stage_request(&request);
         self.start_request(request)
     }
@@ -286,6 +337,9 @@ impl RecordingMachine {
     fn prepare_request(&mut self, request: RecordingRequest) -> Result<()> {
         request.validate()?;
         validate_capabilities(self.capabilities, &request, Some(&self.settings))?;
+        self.overlays_required = self.settings.clicks.enabled
+            || self.settings.keystrokes.enabled
+            || self.settings.camera.enabled;
         self.stage_request(&request);
 
         let countdown = if self.settings.countdown.enabled {
@@ -307,13 +361,27 @@ impl RecordingMachine {
         self.elapsed = Duration::ZERO;
         self.first_frame = false;
         self.latest_drift = None;
+        self.last_emitted_drift = None;
         self.output = None;
         self.failure = None;
         self.warnings.clear();
     }
 
     fn start_request(&mut self, request: RecordingRequest) -> Result<()> {
-        match self.engine.start(&request) {
+        if self.overlays_required && self.pending_overlays.is_none() {
+            let error = Error::InvalidRequest(
+                "enabled recording overlays require an explicit native OverlaySource".into(),
+            );
+            let returned = error.clone();
+            self.enter_failed(error, None, None);
+            return Err(returned);
+        }
+        let started = if let Some(overlays) = self.pending_overlays.take() {
+            self.engine.start_with_overlays(&request, overlays)
+        } else {
+            self.engine.start(&request)
+        };
+        match started {
             Ok(session) => {
                 self.session = Some(session);
                 self.countdown_remaining = Duration::ZERO;
@@ -321,11 +389,9 @@ impl RecordingMachine {
                 Ok(())
             }
             Err(error) => {
-                let message = error.to_string();
+                let returned = error.clone();
                 self.enter_failed(error, None, None);
-                Err(Error::Platform(format!(
-                    "recording engine failed to start: {message}"
-                )))
+                Err(returned)
             }
         }
     }
@@ -393,7 +459,7 @@ impl RecordingMachine {
             Some(SessionEvent::FirstFrame) => {
                 if !self.first_frame {
                     self.first_frame = true;
-                    self.events.push_back(MachineEvent::FirstFrame);
+                    self.push_event(MachineEvent::FirstFrame);
                 }
             }
             Some(SessionEvent::Warning(message)) => {
@@ -425,10 +491,15 @@ impl RecordingMachine {
                     engine_secs,
                     delta_secs: engine_secs - self.elapsed.as_secs_f64(),
                 };
-                let changed = self.latest_drift != Some(drift);
+                let changed = self.last_emitted_drift.is_none_or(|previous| {
+                    (previous.delta_secs - drift.delta_secs).abs() >= DRIFT_EVENT_THRESHOLD_SECS
+                });
                 self.latest_drift = Some(drift);
                 if changed && drift.delta_secs.abs() >= DRIFT_EVENT_THRESHOLD_SECS {
-                    self.events.push_back(MachineEvent::ClockDrift(drift));
+                    self.push_event(MachineEvent::ClockDrift(drift));
+                    self.last_emitted_drift = Some(drift);
+                } else if drift.delta_secs.abs() < DRIFT_EVENT_THRESHOLD_SECS {
+                    self.last_emitted_drift = None;
                 }
             } else {
                 self.push_warning(format!(
@@ -439,8 +510,34 @@ impl RecordingMachine {
     }
 
     fn push_warning(&mut self, message: String) {
+        if self.warnings.last() == Some(&message) {
+            return;
+        }
+        if self.warnings.len() == MAX_WARNING_HISTORY {
+            self.warnings.remove(0);
+        }
         self.warnings.push(message.clone());
-        self.events.push_back(MachineEvent::Warning(message));
+        self.push_event(MachineEvent::Warning(message));
+    }
+
+    fn push_event(&mut self, event: MachineEvent) {
+        if self.events.len() == MAX_PENDING_EVENTS {
+            let incoming_is_terminal =
+                matches!(event, MachineEvent::Finished(_) | MachineEvent::Failed(_));
+            let removable = self.events.iter().position(|queued| {
+                !matches!(queued, MachineEvent::Finished(_) | MachineEvent::Failed(_))
+            });
+            match (incoming_is_terminal, removable) {
+                (_, Some(index)) => {
+                    self.events.remove(index);
+                }
+                (true, None) => {
+                    self.events.pop_front();
+                }
+                (false, None) => return,
+            }
+        }
+        self.events.push_back(event);
     }
 
     /// Pauses an active recording.
@@ -549,7 +646,7 @@ impl RecordingMachine {
         } else {
             self.output = Some(output.clone());
             self.set_phase(RecordingPhase::Finished);
-            self.events.push_back(MachineEvent::Finished(output));
+            self.push_event(MachineEvent::Finished(output));
         }
     }
 
@@ -576,7 +673,7 @@ impl RecordingMachine {
         };
         self.failure = Some(failure.clone());
         self.set_phase(RecordingPhase::Failed);
-        self.events.push_back(MachineEvent::Failed(failure));
+        self.push_event(MachineEvent::Failed(failure));
     }
 
     /// Resets a terminal machine for another recording.
@@ -598,12 +695,15 @@ impl RecordingMachine {
 
     fn clear_run(&mut self) {
         self.request = None;
+        self.pending_overlays = None;
+        self.overlays_required = false;
         self.session = None;
         self.countdown_remaining = Duration::ZERO;
         self.elapsed = Duration::ZERO;
         self.first_frame = false;
         self.warnings.clear();
         self.latest_drift = None;
+        self.last_emitted_drift = None;
         self.output = None;
         self.failure = None;
     }
@@ -635,7 +735,7 @@ impl RecordingMachine {
     fn set_phase(&mut self, phase: RecordingPhase) {
         if self.phase != phase {
             self.phase = phase;
-            self.events.push_back(MachineEvent::PhaseChanged(phase));
+            self.push_event(MachineEvent::PhaseChanged(phase));
         }
     }
 
@@ -811,6 +911,37 @@ mod tests {
         .unwrap()
     }
 
+    struct PermissionFailingEngine;
+
+    struct EmptyOverlays;
+
+    impl OverlaySource for EmptyOverlays {
+        fn layers(
+            &mut self,
+            _elapsed: Duration,
+            _canvas: scrozz_core::PhysicalSize,
+        ) -> Vec<crate::OverlayLayer> {
+            Vec::new()
+        }
+    }
+
+    impl RecordingEngine for PermissionFailingEngine {
+        fn name(&self) -> &'static str {
+            "permission-failure"
+        }
+
+        fn capabilities(&self) -> EngineCapabilities {
+            EngineCapabilities::ALL
+        }
+
+        fn start(&self, _request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
+            Err(Error::PermissionDenied {
+                capability: "Screen Recording".into(),
+                remedy: "open Privacy settings".into(),
+            })
+        }
+    }
+
     fn phases(machine: &mut RecordingMachine) -> Vec<RecordingPhase> {
         machine
             .drain_events()
@@ -893,6 +1024,95 @@ mod tests {
             Some(std::path::Path::new("durable.mp4"))
         );
         assert_eq!(request.fps, 48);
+    }
+
+    #[test]
+    fn start_failures_keep_their_actionable_error_category() {
+        let mut machine = RecordingMachine::with_engine(
+            Box::new(PermissionFailingEngine),
+            settings_without_countdown(),
+        )
+        .unwrap();
+
+        let error = machine.begin(target()).expect_err("permission is denied");
+
+        assert!(matches!(
+            error,
+            Error::PermissionDenied {
+                ref capability,
+                ref remedy
+            } if capability == "Screen Recording" && remedy == "open Privacy settings"
+        ));
+        assert_eq!(machine.phase(), RecordingPhase::Failed);
+        assert!(matches!(
+            machine.failure().map(|failure| failure.error.as_ref()),
+            Some(Error::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn enabled_overlays_require_and_use_an_explicit_source() {
+        let mut settings = settings_without_countdown();
+        settings.clicks.enabled = true;
+        let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
+        let mut missing =
+            RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
+                .unwrap();
+        assert!(
+            missing
+                .begin_with_destination(target(), PathBuf::from("missing.mp4"))
+                .expect_err("enabled click overlays cannot disappear")
+                .to_string()
+                .contains("OverlaySource")
+        );
+
+        let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
+        let mut supplied =
+            RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
+                .unwrap();
+        supplied
+            .begin_with_destination_and_overlays(
+                target(),
+                PathBuf::from("overlay.mp4"),
+                Box::new(EmptyOverlays),
+            )
+            .unwrap();
+        assert_eq!(supplied.phase(), RecordingPhase::Recording);
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_and_keep_the_terminal_event() {
+        let mut polls = (0..MAX_PENDING_EVENTS + 32)
+            .map(|index| {
+                MockPoll::new(
+                    Some(SessionEvent::Warning(format!("warning {index}"))),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        polls.push(MockPoll::new(
+            Some(SessionEvent::Finished(
+                Recording::synthetic("bounded.mp4", 1.0, "test").unwrap(),
+            )),
+            Some(1.0),
+        ));
+        let plan = MockSessionPlan::complete("unused.mp4", 1.0)
+            .unwrap()
+            .with_polls(polls);
+        let mut machine = make_machine(plan);
+        machine.begin(target()).unwrap();
+
+        for _ in 0..MAX_PENDING_EVENTS + 33 {
+            machine.tick(Duration::ZERO).unwrap();
+        }
+
+        assert_eq!(machine.warnings().len(), MAX_WARNING_HISTORY);
+        assert_eq!(machine.events.len(), MAX_PENDING_EVENTS);
+        assert!(
+            machine
+                .drain_events()
+                .any(|event| matches!(event, MachineEvent::Finished(_)))
+        );
     }
 
     #[test]

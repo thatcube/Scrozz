@@ -11,6 +11,7 @@ use ashpd::desktop::screencast::{
     CursorMode as PortalCursorMode, Screencast, SelectSourcesOptions, SourceType,
 };
 use ashpd::desktop::{PersistMode, Session};
+use futures_util::StreamExt as _;
 use pipewire as pw;
 use pw::properties::{PropertiesBox, properties};
 use pw::spa;
@@ -176,25 +177,77 @@ struct PortalResponse {
 }
 
 struct PortalLifetime {
-    runtime: tokio::runtime::Runtime,
-    session: Option<Session<Screencast>>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    terminal: std::sync::mpsc::Receiver<Error>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PortalLifetime {
-    fn new(runtime: tokio::runtime::Runtime, session: Session<Screencast>) -> Self {
-        Self {
-            runtime,
-            session: Some(session),
-        }
+    fn new(runtime: tokio::runtime::Runtime, session: Session<Screencast>) -> Result<Self> {
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
+        let (terminal_tx, terminal) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("scrozz-portal-session".into())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    let closed = match session.receive_closed().await {
+                        Ok(closed) => closed,
+                        Err(error) => {
+                            let _ = terminal_tx.send(Error::Platform(format!(
+                                "could not monitor the ScreenCast portal session: {error}"
+                            )));
+                            let _ = session.close().await;
+                            return;
+                        }
+                    };
+                    futures_util::pin_mut!(closed);
+                    loop {
+                        if shutdown_rx.try_recv().is_ok() {
+                            break;
+                        }
+                        match tokio::time::timeout(Duration::from_millis(20), closed.next()).await {
+                            Ok(Some(_)) => {
+                                let _ = terminal_tx.send(Error::TargetGone(
+                                    "the ScreenCast portal closed the recording session".into(),
+                                ));
+                                break;
+                            }
+                            Ok(None) => {
+                                let _ = terminal_tx.send(Error::Platform(
+                                    "the ScreenCast portal close monitor ended unexpectedly".into(),
+                                ));
+                                break;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    drop(closed);
+                    if let Err(error) = session.close().await {
+                        tracing::warn!(%error, "could not explicitly close the ScreenCast portal session");
+                    }
+                });
+            })
+            .map_err(Error::Io)?;
+        Ok(Self {
+            shutdown: Some(shutdown),
+            terminal,
+            worker: Some(worker),
+        })
     }
 
     fn close(&mut self) {
-        let Some(session) = self.session.take() else {
-            return;
-        };
-        if let Err(error) = self.runtime.block_on(session.close()) {
-            tracing::warn!(%error, "could not explicitly close the ScreenCast portal session");
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("the ScreenCast portal monitor thread panicked");
+        }
+    }
+
+    fn take_terminal(&self) -> Option<Error> {
+        self.terminal.try_recv().ok()
     }
 }
 
@@ -213,7 +266,8 @@ struct PortalGeometry {
 struct VideoUserData {
     format: spa::param::video::VideoInfoRaw,
     frames: Rc<RefCell<VecDeque<PackedFrame>>>,
-    error: Rc<RefCell<Option<String>>>,
+    error: Rc<RefCell<Option<Error>>>,
+    was_streaming: bool,
 }
 
 struct PortalVideoSource {
@@ -221,7 +275,7 @@ struct PortalVideoSource {
     _streams: Vec<pw::stream::StreamRc>,
     mainloop: pw::main_loop::MainLoopRc,
     frames: Vec<Rc<RefCell<VecDeque<PackedFrame>>>>,
-    errors: Vec<Rc<RefCell<Option<String>>>>,
+    errors: Vec<Rc<RefCell<Option<Error>>>>,
     geometries: Vec<PortalGeometry>,
     latest: Vec<Option<PackedFrame>>,
     target: CaptureTarget,
@@ -279,7 +333,7 @@ impl PortalVideoSource {
             restore_token,
             session,
         } = response;
-        let portal = PortalLifetime::new(runtime, session);
+        let portal = PortalLifetime::new(runtime, session)?;
         if let Some(token) = restore_token.as_deref() {
             tokens.set(plan.restore_key, token);
             persist_tokens(token_path.as_deref(), &tokens);
@@ -353,11 +407,19 @@ impl PortalVideoSource {
                     format: Default::default(),
                     frames: Rc::clone(&queue),
                     error: Rc::clone(&error),
+                    was_streaming: false,
                 })
-                .state_changed(|_, user_data, _, new| {
-                    if let pw::stream::StreamState::Error(message) = new {
-                        *user_data.error.borrow_mut() = Some(message);
+                .state_changed(|_, user_data, _, new| match new {
+                    pw::stream::StreamState::Streaming => user_data.was_streaming = true,
+                    pw::stream::StreamState::Unconnected if user_data.was_streaming => {
+                        *user_data.error.borrow_mut() = Some(Error::TargetGone(
+                            "a PipeWire portal video stream disconnected".into(),
+                        ));
                     }
+                    pw::stream::StreamState::Error(message) => {
+                        *user_data.error.borrow_mut() = Some(Error::Platform(message));
+                    }
+                    _ => {}
                 })
                 .param_changed(|_, user_data, id, param| {
                     let Some(param) = param else {
@@ -373,13 +435,15 @@ impl PortalVideoSource {
                             spa::param::format::MediaSubtype::Raw,
                         ))
                     {
-                        *user_data.error.borrow_mut() =
-                            Some("portal selected a non-raw video format".into());
+                        *user_data.error.borrow_mut() = Some(Error::Platform(
+                            "portal selected a non-raw video format".into(),
+                        ));
                         return;
                     }
                     if let Err(cause) = user_data.format.parse(param) {
-                        *user_data.error.borrow_mut() =
-                            Some(format!("could not parse portal video format: {cause:?}"));
+                        *user_data.error.borrow_mut() = Some(Error::Platform(format!(
+                            "could not parse portal video format: {cause:?}"
+                        )));
                     }
                 })
                 .process(copy_video_buffer)
@@ -479,12 +543,13 @@ impl VideoSource for PortalVideoSource {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<PackedFrame>> {
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(error) = self.portal.take_terminal() {
+                return Err(error);
+            }
             self.mainloop.loop_().iterate(pw::loop_::Timeout::None);
             for error in &self.errors {
-                if let Some(message) = error.borrow_mut().take() {
-                    return Err(Error::Platform(format!(
-                        "PipeWire portal stream failed: {message}"
-                    )));
+                if let Some(error) = error.borrow_mut().take() {
+                    return Err(error);
                 }
             }
             if let Some(frame) = self.take_composite()? {
@@ -543,6 +608,13 @@ async fn open_portal(
         .available_cursor_modes()
         .await
         .map_err(map_portal_error)?;
+    if show_cursor && !available_cursors.contains(PortalCursorMode::Embedded) {
+        return Err(Error::Unsupported {
+            what: "recording the cursor on Wayland".into(),
+            why: "the desktop portal does not provide embedded cursor capture for this session"
+                .into(),
+        });
+    }
     let plan = PortalSessionPlan::for_target(target, show_cursor)
         .narrow(available_sources.bits(), available_cursors.bits())
         .ok_or_else(|| Error::Unsupported {
@@ -693,11 +765,13 @@ fn portal_stream_identity(stream: &PortalStream) -> (Option<SourceType>, Option<
     (stream.source_type, portal_stream_id(stream))
 }
 
+type PortalPixelLayout = (Vec<(i32, i32)>, Option<f64>);
+
 fn portal_pixel_layout(
     frames: &[&PackedFrame],
     geometries: &[PortalGeometry],
     target: &CaptureTarget,
-) -> Result<(Vec<(i32, i32)>, Option<f64>)> {
+) -> Result<PortalPixelLayout> {
     if frames.len() != geometries.len() {
         return Err(Error::Platform(
             "portal stream geometry does not match its buffers".into(),
@@ -874,8 +948,10 @@ fn copy_video_buffer(stream: &pw::stream::Stream, user_data: &mut VideoUserData)
     } else if format == spa::param::video::VideoFormat::RGBA {
         PackedPixelFormat::Rgba
     } else {
-        *user_data.error.borrow_mut() =
-            Some(format!("PipeWire negotiated unsupported format {format:?}"));
+        *user_data.error.borrow_mut() = Some(Error::Unsupported {
+            what: "PipeWire video format".into(),
+            why: format!("the portal negotiated unsupported format {format:?}"),
+        });
         return;
     };
     if size.width == 0 || size.height == 0 {
@@ -888,17 +964,26 @@ fn copy_video_buffer(stream: &pw::stream::Stream, user_data: &mut VideoUserData)
         chunk_stride.unsigned_abs() as usize
     };
     let required = source_stride.saturating_mul(size.height as usize);
+    let storage = data.type_();
     let Some(raw) = data.data() else {
-        *user_data.error.borrow_mut() =
-            Some("PipeWire returned an unmapped DMA-BUF video frame".into());
+        *user_data.error.borrow_mut() = Some(if storage == spa::buffer::DataType::DmaBuf {
+            Error::Unsupported {
+                what: "PipeWire DMA-BUF video buffers".into(),
+                why: "this recorder currently accepts mapped MemPtr and MemFd buffers".into(),
+            }
+        } else {
+            Error::Platform(format!(
+                "PipeWire returned unmapped {storage:?} video storage"
+            ))
+        });
         return;
     };
     let available_end = chunk_offset.saturating_add(chunk_size).min(raw.len());
     if source_stride < row_bytes || chunk_offset.saturating_add(required) > available_end {
-        *user_data.error.borrow_mut() = Some(format!(
+        *user_data.error.borrow_mut() = Some(Error::Platform(format!(
             "PipeWire video buffer is short: need {required} bytes at offset {chunk_offset}, \
              received {chunk_size}"
-        ));
+        )));
         return;
     }
 
@@ -933,6 +1018,14 @@ pub(super) struct PipeWireAudio {
     system: Option<Rc<RefCell<VecDeque<AudioBuffer>>>>,
     errors: Vec<Rc<RefCell<Option<String>>>>,
 }
+
+pub(super) struct AudioBatch {
+    pub(super) microphone: Vec<AudioBuffer>,
+    pub(super) system: Vec<AudioBuffer>,
+}
+
+const MAX_QUEUED_AUDIO_FRAMES: u64 = 48_000;
+const MAX_AUDIO_DISCONTINUITY_FRAMES: u64 = 48_000;
 
 struct AudioUserData {
     format: spa::param::audio::AudioInfoRaw,
@@ -1045,7 +1138,7 @@ impl PipeWireAudio {
         }))
     }
 
-    pub(super) fn poll(&mut self) -> Result<(Option<AudioBuffer>, Option<AudioBuffer>)> {
+    pub(super) fn poll(&mut self) -> Result<AudioBatch> {
         self.mainloop.loop_().iterate(pw::loop_::Timeout::None);
         for error in &self.errors {
             if let Some(message) = error.borrow_mut().take() {
@@ -1058,15 +1151,13 @@ impl PipeWireAudio {
             .microphone
             .as_ref()
             .map(drain_audio_queue)
-            .transpose()?
-            .flatten();
+            .unwrap_or_default();
         let system = self
             .system
             .as_ref()
             .map(drain_audio_queue)
-            .transpose()?
-            .flatten();
-        Ok((microphone, system))
+            .unwrap_or_default();
+        Ok(AudioBatch { microphone, system })
     }
 }
 
@@ -1079,52 +1170,9 @@ impl Drop for PipeWireAudio {
     }
 }
 
-fn drain_audio_queue(queue: &Rc<RefCell<VecDeque<AudioBuffer>>>) -> Result<Option<AudioBuffer>> {
+fn drain_audio_queue(queue: &Rc<RefCell<VecDeque<AudioBuffer>>>) -> Vec<AudioBuffer> {
     let mut queue = queue.borrow_mut();
-    let Some(first) = queue.pop_front() else {
-        return Ok(None);
-    };
-    let sample_rate = first.sample_rate;
-    let channels = first.channels;
-    let start_frame = first.start_frame;
-    let mut samples = first.samples;
-    let mut expected = start_frame + samples.len() as u64 / u64::from(channels);
-    while let Some(mut next) = queue.pop_front() {
-        if next.sample_rate != sample_rate || next.channels != channels {
-            return Err(Error::Platform(
-                "PipeWire changed audio format without renegotiating the stream".into(),
-            ));
-        }
-        if next.start_frame > expected {
-            let silence_frames = next.start_frame - expected;
-            let silence_samples = usize::try_from(silence_frames)
-                .ok()
-                .and_then(|frames| frames.checked_mul(usize::from(channels)))
-                .ok_or_else(|| Error::Platform("PipeWire audio gap exceeds memory".into()))?;
-            samples
-                .try_reserve(silence_samples)
-                .map_err(|_| Error::Platform("PipeWire audio gap exceeds memory".into()))?;
-            samples.resize(samples.len() + silence_samples, 0.0);
-        } else if next.start_frame < expected {
-            let overlap_frames = expected - next.start_frame;
-            let overlap_samples = usize::try_from(overlap_frames)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(usize::from(channels));
-            if overlap_samples >= next.samples.len() {
-                continue;
-            }
-            next.samples.drain(..overlap_samples);
-            next.start_frame = expected;
-        }
-        samples.extend_from_slice(&next.samples);
-        expected = next.start_frame + next.samples.len() as u64 / u64::from(next.channels);
-    }
-    Ok(Some(AudioBuffer {
-        sample_rate,
-        channels,
-        start_frame,
-        samples,
-    }))
+    queue.drain(..).collect()
 }
 
 fn audio_format_parameter() -> Result<Vec<u8>> {
@@ -1208,6 +1256,12 @@ fn copy_audio_buffer(stream: &pw::stream::Stream, user_data: &mut AudioUserData)
     let mut samples = samples;
     if start_frame < user_data.end_frame {
         let overlap_frames = user_data.end_frame - start_frame;
+        if overlap_frames > MAX_AUDIO_DISCONTINUITY_FRAMES {
+            *user_data.error.borrow_mut() = Some(format!(
+                "PipeWire audio timestamp moved backwards by {overlap_frames} frames"
+            ));
+            return;
+        }
         let overlap_samples = usize::try_from(overlap_frames)
             .unwrap_or(usize::MAX)
             .saturating_mul(channels as usize);
@@ -1221,7 +1275,23 @@ fn copy_audio_buffer(stream: &pw::stream::Stream, user_data: &mut AudioUserData)
     if frames == 0 {
         return;
     }
+    if start_frame.saturating_sub(user_data.end_frame) > MAX_AUDIO_DISCONTINUITY_FRAMES {
+        *user_data.error.borrow_mut() = Some(format!(
+            "PipeWire audio timestamp jumped forward by {} frames",
+            start_frame.saturating_sub(user_data.end_frame)
+        ));
+        return;
+    }
     let mut queue = user_data.frames.borrow_mut();
+    let queued_frames = queue.iter().fold(0_u64, |total, buffer| {
+        total.saturating_add(buffer.samples.len() as u64 / u64::from(buffer.channels))
+    });
+    if queued_frames.saturating_add(frames) > MAX_QUEUED_AUDIO_FRAMES {
+        *user_data.error.borrow_mut() = Some(format!(
+            "PipeWire audio queue exceeded {MAX_QUEUED_AUDIO_FRAMES} frames"
+        ));
+        return;
+    }
     queue.push_back(AudioBuffer {
         sample_rate: rate,
         channels: channels as u8,

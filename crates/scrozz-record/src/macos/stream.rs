@@ -21,7 +21,7 @@ use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSDictionary, NSError, NSNumber, NSObject, NSString};
 use objc2_screen_capture_kit::{
     SCCaptureResolutionType, SCFrameStatus, SCStream, SCStreamConfiguration, SCStreamDelegate,
-    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
+    SCStreamErrorCode, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
 use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 
@@ -45,6 +45,13 @@ pub(crate) fn start(
     request: &RecordingRequest,
     overlays: Option<Box<dyn OverlaySource>>,
 ) -> Result<Box<dyn RecordingSession>> {
+    if request.system_audio && !system_audio_available() {
+        return Err(Error::Unsupported {
+            what: "macOS system-audio recording".to_owned(),
+            why: "ScreenCaptureKit system audio requires macOS 13 or newer; video-only recording remains available on macOS 12.3"
+                .to_owned(),
+        });
+    }
     let content = super::content::resolve(&request.target)?;
     if request.microphone {
         super::permission::ensure_microphone()?;
@@ -85,6 +92,7 @@ pub(crate) fn start(
     } else {
         None
     };
+    let queue = DispatchQueue::new("com.thatcube.scrozz.recording", None);
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
         compositor: Mutex::new(compositor),
@@ -93,6 +101,7 @@ pub(crate) fn start(
         overlays: Mutex::new(overlays),
         failure: Mutex::new(None),
         accepting: AtomicBool::new(false),
+        stop_requested: AtomicBool::new(false),
         first_frame: AtomicBool::new(false),
         epoch: std::time::Instant::now(),
         size: plan.size,
@@ -101,7 +110,6 @@ pub(crate) fn start(
         CaptureTarget::Window(id) => id.0.parse::<u32>().ok(),
         _ => None,
     };
-    let queue = DispatchQueue::new("com.thatcube.scrozz.recording", None);
     let mut streams = Vec::with_capacity(content.sources.len());
     let mut delegates = Vec::with_capacity(content.sources.len());
     let mut native_microphone = false;
@@ -123,6 +131,7 @@ pub(crate) fn start(
             source_index,
             source.label.clone(),
             source.terminal_inactivity,
+            queue.clone(),
         );
         let delegate_protocol: &ProtocolObject<dyn SCStreamDelegate> =
             ProtocolObject::from_ref(&*delegate);
@@ -200,7 +209,7 @@ pub(crate) fn start(
         resolution: request.resolution,
         video_codec: plan.codec,
         _delegates: delegates,
-        _queue: queue,
+        queue,
         window_id,
         next_window_check: Cell::new(std::time::Instant::now()),
         first_frame_emitted: false,
@@ -216,6 +225,7 @@ struct Shared {
     overlays: Mutex<Option<Box<dyn OverlaySource>>>,
     failure: Mutex<Option<String>>,
     accepting: AtomicBool,
+    stop_requested: AtomicBool,
     first_frame: AtomicBool,
     epoch: std::time::Instant,
     size: PhysicalSize,
@@ -368,13 +378,7 @@ impl Shared {
     }
 
     fn fail(&self, reason: String) {
-        if self
-            .accepting
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
+        self.accepting.store(false, Ordering::Release);
         let mut failure = lock(&self.failure);
         if failure.is_none() {
             *failure = Some(reason);
@@ -458,9 +462,16 @@ define_class!(
     unsafe impl SCStreamDelegate for StreamDelegate {
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn stream_didStopWithError(&self, _stream: &SCStream, failure: &NSError) {
-            self.ivars()
-                .shared
-                .fail(super::error::from_sck(failure, "screen capture stopped").to_string());
+            let ivars = self.ivars();
+            let expected_stop = ivars.shared.stop_requested.load(Ordering::Acquire);
+            let user_stopped = SCStreamErrorCode(failure.code()) == SCStreamErrorCode::UserStopped;
+            let reason = super::error::from_sck(failure, "screen capture stopped").to_string();
+            let shared = Arc::clone(&ivars.shared);
+            ivars.callback_queue.exec_async(move || {
+                if !(expected_stop && user_stopped) {
+                    shared.fail(reason);
+                }
+            });
         }
 
         #[unsafe(method(streamDidBecomeInactive:))]
@@ -499,6 +510,7 @@ struct StreamDelegateIvars {
     source_index: usize,
     source_label: String,
     terminal_inactivity: bool,
+    callback_queue: DispatchRetained<DispatchQueue>,
 }
 
 impl StreamDelegate {
@@ -507,12 +519,14 @@ impl StreamDelegate {
         source_index: usize,
         source_label: String,
         terminal_inactivity: bool,
+        callback_queue: DispatchRetained<DispatchQueue>,
     ) -> Retained<Self> {
         let allocated = Self::alloc().set_ivars(StreamDelegateIvars {
             shared,
             source_index,
             source_label,
             terminal_inactivity,
+            callback_queue,
         });
         // SAFETY: NSObject's initializer is valid for this direct subclass and
         // the Rust ivars were initialized above.
@@ -529,7 +543,7 @@ struct MacRecordingSession {
     resolution: RecordingResolution,
     video_codec: VideoCodec,
     _delegates: Vec<Retained<StreamDelegate>>,
-    _queue: DispatchRetained<DispatchQueue>,
+    queue: DispatchRetained<DispatchQueue>,
     window_id: Option<u32>,
     next_window_check: Cell<std::time::Instant>,
     first_frame_emitted: bool,
@@ -603,6 +617,8 @@ impl RecordingSession for MacRecordingSession {
     }
 
     fn stop(mut self: Box<Self>) -> Result<Recording> {
+        self.queue.exec_sync(|| {});
+        self.shared.stop_requested.store(true, Ordering::Release);
         self.shared.accepting.store(false, Ordering::Release);
         lock(&self.shared.clock).stop(self.shared.now());
         for stream in &self.streams {
@@ -618,6 +634,7 @@ impl RecordingSession for MacRecordingSession {
         if let Some(microphone) = &self.microphone {
             microphone.stop();
         }
+        self.queue.exec_sync(|| {});
         let elapsed = self.shared.elapsed();
         let interrupted = lock(&self.shared.failure).take();
         let summary = lock(&self.shared.writer).finish(interrupted, elapsed)?;
@@ -657,6 +674,7 @@ impl Drop for MacRecordingSession {
         if self.finalized {
             return;
         }
+        self.shared.stop_requested.store(true, Ordering::Release);
         self.shared.accepting.store(false, Ordering::Release);
         // SAFETY: best-effort asynchronous shutdown during an abandoned session.
         for stream in &self.streams {
@@ -726,6 +744,20 @@ fn configure(
         }
     }
     configuration
+}
+
+pub(super) fn system_audio_available() -> bool {
+    // SAFETY: ordinary configuration construction used only for selector
+    // availability checks against the running ScreenCaptureKit framework.
+    let configuration = unsafe { SCStreamConfiguration::new() };
+    configuration_supports_system_audio(&configuration)
+}
+
+fn configuration_supports_system_audio(configuration: &SCStreamConfiguration) -> bool {
+    configuration.respondsToSelector(sel!(setCapturesAudio:))
+        && configuration.respondsToSelector(sel!(setSampleRate:))
+        && configuration.respondsToSelector(sel!(setChannelCount:))
+        && configuration.respondsToSelector(sel!(setExcludesCurrentProcessAudio:))
 }
 
 fn stop_started(streams: &[Retained<SCStream>]) {

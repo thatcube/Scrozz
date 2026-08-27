@@ -155,37 +155,50 @@ impl Mixer {
     /// loopback capture: Windows sends no packet at all while the endpoint is
     /// quiet.
     pub fn drain_through(&mut self, through_hns: i64, include_partial: bool) -> Vec<MixedChunk> {
-        let end = hns_to_audio_frame(through_hns, self.sample_rate);
         let mut chunks = Vec::new();
-
-        while self.cursor < end {
-            let remaining = end - self.cursor;
-            if !include_partial && remaining < u64::from(self.chunk_frames) {
-                break;
-            }
-            let frames = remaining.min(u64::from(self.chunk_frames));
-            let start = self.cursor;
-            let mut pcm = Vec::with_capacity(frames as usize * 4);
-            let active = self.enabled.iter().filter(|enabled| **enabled).count();
-            let gain = if active > 1 { 0.5 } else { 1.0 };
-
-            for frame in start..start + frames {
-                let system = self.tracks[0].sample_at(frame);
-                let microphone = self.tracks[1].sample_at(frame);
-                let left = (system[0] + microphone[0]) * gain;
-                let right = (system[1] + microphone[1]) * gain;
-                pcm.extend_from_slice(&f32_to_i16(left).to_le_bytes());
-                pcm.extend_from_slice(&f32_to_i16(right).to_le_bytes());
-            }
-
-            self.cursor += frames;
-            chunks.push(MixedChunk {
-                time_hns: audio_frames_to_hns(start, self.sample_rate),
-                duration_hns: audio_frames_to_hns(frames, self.sample_rate),
-                pcm,
-            });
+        while let Some(chunk) = self.drain_next(through_hns, include_partial) {
+            chunks.push(chunk);
         }
         chunks
+    }
+
+    /// Emits at most one chunk before `through_hns`.
+    pub fn drain_next(&mut self, through_hns: i64, include_partial: bool) -> Option<MixedChunk> {
+        let end = hns_to_audio_frame(through_hns, self.sample_rate);
+        if self.cursor >= end {
+            return None;
+        }
+        let remaining = end - self.cursor;
+        if !include_partial && remaining < u64::from(self.chunk_frames) {
+            return None;
+        }
+        let frames = remaining.min(u64::from(self.chunk_frames));
+        let start = self.cursor;
+        let mut pcm = Vec::with_capacity(frames as usize * 4);
+        let active = self.enabled.iter().filter(|enabled| **enabled).count();
+        let gain = if active > 1 { 0.5 } else { 1.0 };
+
+        for frame in start..start + frames {
+            let system = self.tracks[0].sample_at(frame);
+            let microphone = self.tracks[1].sample_at(frame);
+            let left = (system[0] + microphone[0]) * gain;
+            let right = (system[1] + microphone[1]) * gain;
+            pcm.extend_from_slice(&f32_to_i16(left).to_le_bytes());
+            pcm.extend_from_slice(&f32_to_i16(right).to_le_bytes());
+        }
+
+        self.cursor += frames;
+        Some(MixedChunk {
+            time_hns: audio_frames_to_hns(start, self.sample_rate),
+            duration_hns: audio_frames_to_hns(frames, self.sample_rate),
+            pcm,
+        })
+    }
+
+    /// Current committed output time.
+    #[must_use]
+    pub fn cursor_hns(&self) -> i64 {
+        audio_frames_to_hns(self.cursor, self.sample_rate)
     }
 
     /// Number of source frames still retained across both input tracks.

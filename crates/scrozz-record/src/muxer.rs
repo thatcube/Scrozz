@@ -54,6 +54,8 @@ pub struct AudioTrackConfig {
     pub channels: u16,
     /// MPEG-4 AudioSpecificConfig bytes supplied by the AAC encoder.
     pub audio_specific_config: Vec<u8>,
+    /// Decoder preroll skipped from presentation at the start of the track.
+    pub priming_frames: u32,
 }
 
 /// One encoded media sample.
@@ -126,6 +128,17 @@ impl<W: Write> FragmentedMp4<W> {
     /// tracks, zero durations, missing configured audio, or oversized boxes.
     pub fn write_fragment(&mut self, fragment: &MediaFragment) -> io::Result<()> {
         validate_fragment(fragment, self.has_audio)?;
+        if self.fragments_written == 0
+            && !fragment
+                .video
+                .samples
+                .first()
+                .is_some_and(|sample| sample.keyframe)
+        {
+            return Err(invalid_input(
+                "the first media fragment must begin with a video keyframe",
+            ));
+        }
 
         let placeholder = movie_fragment_box(self.sequence_number, fragment, 0, 0)?;
         let video_offset = i32::try_from(placeholder.len().saturating_add(8))
@@ -248,11 +261,20 @@ pub fn inspect_recovery(bytes: &[u8]) -> RecoveryReport {
         match &kind {
             b"ftyp" => saw_ftyp = true,
             b"moov" => saw_moov = true,
-            b"moof" if saw_ftyp && saw_moov => pending_moof = Some(start),
-            b"mdat" if pending_moof.take().is_some() => {
-                complete_fragments = complete_fragments.saturating_add(1);
-                valid_prefix = cursor;
+            b"moof" if saw_ftyp && saw_moov => {
+                if pending_moof.is_some() {
+                    break;
+                }
+                pending_moof = Some((start, first_video_sample_is_sync(&bytes[start..cursor])));
             }
+            b"mdat" => match pending_moof.take() {
+                Some((_, sync)) if sync || complete_fragments > 0 => {
+                    complete_fragments = complete_fragments.saturating_add(1);
+                    valid_prefix = cursor;
+                }
+                Some((_, false)) => break,
+                None => {}
+            },
             _ => {
                 if pending_moof.take().is_some() {
                     break;
@@ -264,7 +286,7 @@ pub fn inspect_recovery(bytes: &[u8]) -> RecoveryReport {
         }
     }
 
-    if let Some(moof_start) = pending_moof {
+    if let Some((moof_start, _)) = pending_moof {
         valid_prefix = valid_prefix.min(moof_start);
     }
     let initialisation_complete = saw_ftyp && saw_moov;
@@ -282,6 +304,123 @@ pub fn inspect_recovery(bytes: &[u8]) -> RecoveryReport {
         valid_prefix_len: valid_prefix,
         salvageability,
     }
+}
+
+fn first_video_sample_is_sync(moof: &[u8]) -> bool {
+    let mut cursor = 0;
+    let Some((kind, payload)) = next_box(moof, &mut cursor) else {
+        return false;
+    };
+    if kind != *b"moof" || cursor != moof.len() {
+        return false;
+    }
+
+    let mut children = 0;
+    while children < payload.len() {
+        let Some((kind, traf)) = next_box(payload, &mut children) else {
+            return false;
+        };
+        if kind != *b"traf" {
+            continue;
+        }
+        let mut track_id = None;
+        let mut sample_flags = None;
+        let mut fields = 0;
+        while fields < traf.len() {
+            let Some((kind, field)) = next_box(traf, &mut fields) else {
+                return false;
+            };
+            match &kind {
+                b"tfhd" if field.len() >= 8 => {
+                    track_id = read_u32(field, 4);
+                }
+                b"trun" => {
+                    sample_flags = first_track_run_sample_flags(field);
+                }
+                _ => {}
+            }
+        }
+        if track_id == Some(VIDEO_TRACK_ID) {
+            return sample_flags.is_some_and(sample_is_sync);
+        }
+    }
+    false
+}
+
+fn first_track_run_sample_flags(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let flags = u32::from(payload[1]) << 16 | u32::from(payload[2]) << 8 | u32::from(payload[3]);
+    if read_u32(payload, 4)? == 0 {
+        return None;
+    }
+    let mut cursor = 8;
+    if flags & 0x0000_0001 != 0 {
+        cursor += 4;
+    }
+    let first_sample_flags = if flags & 0x0000_0004 != 0 {
+        let value = read_u32(payload, cursor)?;
+        cursor += 4;
+        Some(value)
+    } else {
+        None
+    };
+    if flags & 0x0000_0100 != 0 {
+        cursor += 4;
+    }
+    if flags & 0x0000_0200 != 0 {
+        cursor += 4;
+    }
+    if flags & 0x0000_0400 != 0 {
+        read_u32(payload, cursor)
+    } else {
+        first_sample_flags
+    }
+}
+
+fn sample_is_sync(flags: u32) -> bool {
+    flags & 0x0001_0000 == 0 && flags & 0x0300_0000 == 0x0200_0000
+}
+
+fn next_box<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<([u8; 4], &'a [u8])> {
+    let start = *cursor;
+    let size32 = read_u32(bytes, start)?;
+    let kind = bytes.get(start + 4..start + 8)?.try_into().ok()?;
+    let (header, size) = if size32 == 1 {
+        let size = usize::try_from(read_u64(bytes, start + 8)?).ok()?;
+        (16, size)
+    } else if size32 == 0 {
+        (8, bytes.len().checked_sub(start)?)
+    } else {
+        (8, usize::try_from(size32).ok()?)
+    };
+    if size < header {
+        return None;
+    }
+    let end = start.checked_add(size)?;
+    let payload_start = start.checked_add(header)?;
+    if end > bytes.len() {
+        return None;
+    }
+    *cursor = end;
+    Some((kind, &bytes[payload_start..end]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()
+        .map(u32::from_be_bytes)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    bytes
+        .get(offset..offset.checked_add(8)?)?
+        .try_into()
+        .ok()
+        .map(u64::from_be_bytes)
 }
 
 fn validate_track_config(
@@ -390,8 +529,23 @@ fn track_box_video(config: &VideoTrackConfig) -> io::Result<Vec<u8>> {
 
 fn track_box_audio(config: &AudioTrackConfig) -> io::Result<Vec<u8>> {
     let mut payload = track_header_box(AUDIO_TRACK_ID, 0, 0, true)?;
+    if config.priming_frames > 0 {
+        payload.extend_from_slice(&audio_edit_box(config.priming_frames)?);
+    }
     payload.extend_from_slice(&media_box_audio(config)?);
     mp4_box(*b"trak", payload)
+}
+
+fn audio_edit_box(priming_frames: u32) -> io::Result<Vec<u8>> {
+    let mut payload = full_box_header(1, 0);
+    push_u32(&mut payload, 1);
+    // Fragmented output has no final duration when the initialization segment
+    // is written. All ones is ISO-BMFF's unknown-duration sentinel.
+    push_u64(&mut payload, u64::MAX);
+    payload.extend_from_slice(&i64::from(priming_frames).to_be_bytes());
+    push_u16(&mut payload, 1);
+    push_u16(&mut payload, 0);
+    mp4_box(*b"edts", mp4_box(*b"elst", payload)?)
 }
 
 fn track_header_box(track_id: u32, width: u16, height: u16, audio: bool) -> io::Result<Vec<u8>> {
@@ -736,7 +890,7 @@ mod tests {
 
     use super::{
         EncodedSample, FragmentedMp4, MediaFragment, RecoverySalvageability, TrackFragment,
-        VideoCodecConfiguration, VideoTrackConfig, inspect_recovery,
+        VideoCodecConfiguration, VideoTrackConfig, inspect_recovery, movie_fragment_box, mp4_box,
     };
     use crate::Salvageability;
 
@@ -765,6 +919,13 @@ mod tests {
         }
     }
 
+    fn dependent_fragment(timestamp: u64) -> MediaFragment {
+        let mut fragment = fragment(timestamp);
+        fragment.video.samples[0].keyframe = false;
+        fragment.video.samples[0].data[4] = 0x41;
+        fragment
+    }
+
     #[test]
     fn initialisation_without_media_is_explicitly_non_playable() {
         let writer = FragmentedMp4::new(Cursor::new(Vec::new()), &video_config(), None).unwrap();
@@ -788,6 +949,55 @@ mod tests {
         writer.write_fragment(&fragment(1)).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let report = inspect_recovery(&bytes);
+        assert_eq!(report.complete_fragments, 2);
+        assert_eq!(report.salvageability, RecoverySalvageability::Playable);
+        assert_eq!(report.valid_prefix_len, bytes.len());
+    }
+
+    #[test]
+    fn the_first_live_fragment_must_begin_with_a_keyframe() {
+        let mut writer =
+            FragmentedMp4::new(Cursor::new(Vec::new()), &video_config(), None).unwrap();
+
+        let error = writer
+            .write_fragment(&dependent_fragment(0))
+            .expect_err("dependent first frame is not independently playable");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(writer.salvageability(), Salvageability::InitialisationOnly);
+    }
+
+    #[test]
+    fn recovery_does_not_call_a_dependent_first_fragment_playable() {
+        let writer = FragmentedMp4::new(Cursor::new(Vec::new()), &video_config(), None).unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let initialisation_len = bytes.len();
+        let fragment = dependent_fragment(0);
+        bytes.extend_from_slice(&movie_fragment_box(1, &fragment, 0, 0).unwrap());
+        bytes
+            .extend_from_slice(&mp4_box(*b"mdat", fragment.video.samples[0].data.clone()).unwrap());
+
+        let report = inspect_recovery(&bytes);
+
+        assert!(report.initialisation_complete);
+        assert_eq!(report.complete_fragments, 0);
+        assert_eq!(
+            report.salvageability,
+            RecoverySalvageability::InitialisationOnly
+        );
+        assert_eq!(report.valid_prefix_len, initialisation_len);
+    }
+
+    #[test]
+    fn dependent_fragments_after_the_first_keyframe_remain_recoverable() {
+        let mut writer =
+            FragmentedMp4::new(Cursor::new(Vec::new()), &video_config(), None).unwrap();
+        writer.write_fragment(&fragment(0)).unwrap();
+        writer.write_fragment(&dependent_fragment(1)).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let report = inspect_recovery(&bytes);
+
         assert_eq!(report.complete_fragments, 2);
         assert_eq!(report.salvageability, RecoverySalvageability::Playable);
         assert_eq!(report.valid_prefix_len, bytes.len());

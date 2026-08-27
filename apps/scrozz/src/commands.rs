@@ -24,15 +24,18 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Provenance};
-use scrozz_export::{Clipboard, Encoder, FrameEncoder};
+use scrozz_core::{
+    CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
+};
+use scrozz_export::{Clipboard, Encoder, FrameEncoder, ImageFormat};
 use scrozz_ocr::Ocr as _;
 use scrozz_record::{
     Recording, RecordingCompletion, RecordingRequest, RecordingSession, RecordingState,
     Salvageability, SessionEvent,
 };
 use scrozz_store::{
-    CaptureId, History as _, NewRecording, VideoCompletion, VideoMetadata, VideoSalvageability,
+    CaptureId, CaptureRecord, History as _, ImageState, NewRecording, Page, SearchQuery,
+    Store as _, VideoCompletion, VideoMetadata, VideoSalvageability,
 };
 
 use crate::{
@@ -797,7 +800,7 @@ fn recording_report(
             unreachable!("require_native rejects synthetic output before report construction")
         }
     };
-    Ok(Report::new(
+    let report = Report::new(
         Json::obj([
             ("state", Json::str("stopped")),
             ("media_kind", Json::str("video")),
@@ -855,7 +858,22 @@ fn recording_report(
             ),
         ]),
         human,
-    ))
+    );
+    if completion == "partial" {
+        return Err(CliError::partial_recording(
+            CoreError::Platform(reason.map_or_else(
+                || "recording did not finish cleanly".to_owned(),
+                str::to_owned,
+            )),
+            recording.path.to_string_lossy(),
+            recording.is_playable(),
+            salvageability,
+            recording.duration_secs,
+            history_id.map(|id| id.0.clone()),
+            history_error.map(str::to_owned),
+        ));
+    }
+    Ok(report)
 }
 
 fn capture_target_json(target: &CaptureTarget) -> Json {
@@ -970,30 +988,312 @@ fn is_wayland() -> bool {
 
 fn history(command: &HistoryCommand) -> CliResult<Report> {
     match command {
-        HistoryCommand::List { .. } => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "listing the capture history",
-                "scrozz-store",
+        HistoryCommand::List { limit, pinned } => {
+            let store = platform::store()?;
+            let limit = limit.unwrap_or(50);
+            if limit == 0 {
+                return Err(CliError::usage("history list limit must be at least one"));
+            }
+            let page_limit = u32::try_from(limit).map_err(|_| {
+                CliError::usage(format!("history list limit {limit} exceeds {}", u32::MAX))
+            })?;
+            let mut query = SearchQuery::all().paged(Page::new(page_limit, 0));
+            if *pinned {
+                query = query.pinned_only();
+            }
+            let records = store.search(&query)?;
+            let data = Json::arr(records.iter().map(history_record_json));
+            let human = if records.is_empty() {
+                "History is empty.".to_owned()
+            } else {
+                records
+                    .iter()
+                    .map(history_record_human)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(Report::new(data, human))
+        }
+        HistoryCommand::Get { id, output, stdout } => {
+            let id = history_id(id)?;
+            let mut store = platform::store()?;
+            let record = store.record(&id)?.ok_or_else(|| {
+                CliError::Core(CoreError::InvalidRequest(format!(
+                    "history contains no capture {}",
+                    id.0
+                )))
+            })?;
+            let mut report =
+                Report::new(history_record_json(&record), history_record_human(&record));
+            if *stdout {
+                if record.video.is_some() {
+                    return Err(CliError::Core(CoreError::InvalidRequest(
+                        "video history cannot be written to stdout without buffering the entire recording; use --output for streaming copy"
+                            .into(),
+                    )));
+                }
+                let bytes = history_media_bytes(&mut store, &record)?;
+                report = report.with_raw(bytes);
+            } else if let Some(path) = output {
+                if let Some(video) = &record.video {
+                    copy_new_file(&video.path, path)?;
+                } else {
+                    let bytes = history_media_bytes(&mut store, &record)?;
+                    write_new_file(path, &bytes)?;
+                }
+                report.human = format!("Wrote history item {} to {}.", id.0, path.display());
+            }
+            Ok(report)
+        }
+        HistoryCommand::Delete { ids } => {
+            let mut store = platform::store()?;
+            let ids = ids
+                .iter()
+                .map(|id| history_id(id))
+                .collect::<CliResult<Vec<_>>>()?;
+            let mut deleted = Vec::new();
+            let mut missing = Vec::new();
+            for id in ids {
+                if store.delete(&id)? {
+                    deleted.push(id.0);
+                } else {
+                    missing.push(id.0);
+                }
+            }
+            Ok(Report::new(
+                Json::obj([
+                    (
+                        "deleted",
+                        Json::arr(deleted.iter().map(|id| Json::str(id.as_str()))),
+                    ),
+                    (
+                        "missing",
+                        Json::arr(missing.iter().map(|id| Json::str(id.as_str()))),
+                    ),
+                ]),
+                format!(
+                    "Deleted {} history item{}; {} not found.",
+                    deleted.len(),
+                    if deleted.len() == 1 { "" } else { "s" },
+                    missing.len()
+                ),
             ))
         }
-        HistoryCommand::Get { .. } => Err(CliError::not_implemented(
-            "reading a stored capture",
-            "scrozz-store (the Store trait has list, set_pinned and \
-             enforce_retention, but no way to read a capture back)",
-        )),
-        HistoryCommand::Delete { .. } => Err(CliError::not_implemented(
-            "deleting a stored capture",
-            "scrozz-store (the Store trait exposes no delete)",
-        )),
-        HistoryCommand::Pin { .. } => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "pinning a capture",
-                "scrozz-store",
+        HistoryCommand::Pin { id, unpin } => {
+            let id = history_id(id)?;
+            let mut store = platform::store()?;
+            store.set_pinned(&id, !*unpin)?;
+            Ok(Report::new(
+                Json::obj([
+                    ("id", Json::str(id.0.as_str())),
+                    ("pinned", Json::Bool(!*unpin)),
+                ]),
+                format!(
+                    "{} history item {}.",
+                    if *unpin { "Unpinned" } else { "Pinned" },
+                    id.0
+                ),
             ))
         }
     }
+}
+
+fn history_id(value: &str) -> CliResult<CaptureId> {
+    if !scrozz_store::id::is_valid_id(value) {
+        return Err(CliError::usage(format!(
+            "{value:?} is not a valid capture id"
+        )));
+    }
+    Ok(CaptureId(value.to_owned()))
+}
+
+fn history_record_json(record: &CaptureRecord) -> Json {
+    let video = record.video.as_ref().map(|video| {
+        let (completion, salvageability, failure) = match &video.completion {
+            VideoCompletion::Complete => ("complete", None, None),
+            VideoCompletion::Partial {
+                salvageability,
+                reason,
+            } => (
+                "partial",
+                Some(match salvageability {
+                    VideoSalvageability::InitialisationOnly => "initialisation-only",
+                    VideoSalvageability::Playable => "playable",
+                }),
+                Some(reason.as_str()),
+            ),
+        };
+        Json::obj([
+            ("path", Json::str(video.path.to_string_lossy())),
+            ("duration_secs", Json::Float(video.duration_secs)),
+            ("engine", Json::str(video.engine.as_str())),
+            ("completion", Json::str(completion)),
+            ("salvageability", Json::opt(salvageability, Json::str)),
+            ("failure", Json::opt(failure, Json::str)),
+            (
+                "width",
+                Json::opt(video.size, |size| Json::Float(size.width)),
+            ),
+            (
+                "height",
+                Json::opt(video.size, |size| Json::Float(size.height)),
+            ),
+            (
+                "frames",
+                Json::opt(video.frames, |frames| {
+                    Json::Int(i64::try_from(frames).unwrap_or(i64::MAX))
+                }),
+            ),
+            (
+                "audio_channels",
+                Json::opt(video.audio_channels, |channels| {
+                    Json::Int(i64::from(channels))
+                }),
+            ),
+            (
+                "file_size_bytes",
+                Json::opt(video.file_size_bytes, |bytes| {
+                    Json::Int(i64::try_from(bytes).unwrap_or(i64::MAX))
+                }),
+            ),
+            ("codec", Json::opt(video.codec.as_deref(), Json::str)),
+        ])
+    });
+    let image = match &record.image {
+        ImageState::Present { byte_len, .. } => Json::obj([
+            ("state", Json::str("present")),
+            (
+                "bytes",
+                Json::Int(i64::try_from(*byte_len).unwrap_or(i64::MAX)),
+            ),
+        ]),
+        ImageState::Evicted { at, .. } => Json::obj([
+            ("state", Json::str("evicted")),
+            ("evicted_at", Json::Int(at.as_millis())),
+        ]),
+        ImageState::Absent => Json::obj([("state", Json::str("absent"))]),
+    };
+    Json::obj([
+        ("id", Json::str(record.id.0.as_str())),
+        ("created_at", Json::Int(record.created_at.as_millis())),
+        ("kind", Json::str(record.media_kind.as_token())),
+        ("pinned", Json::Bool(record.pinned)),
+        (
+            "application",
+            Json::opt(record.app_name.as_deref(), Json::str),
+        ),
+        (
+            "title",
+            Json::opt(record.window_title.as_deref(), Json::str),
+        ),
+        ("target", capture_target_json(&record.target)),
+        ("image", image),
+        ("video", Json::opt(video, |video| video)),
+    ])
+}
+
+fn history_record_human(record: &CaptureRecord) -> String {
+    let pinned = if record.pinned { " pinned" } else { "" };
+    let detail = record.video.as_ref().map_or_else(
+        || {
+            record
+                .window_title
+                .as_deref()
+                .or(record.app_name.as_deref())
+                .unwrap_or("screenshot")
+                .to_owned()
+        },
+        |video| match &video.completion {
+            VideoCompletion::Complete => {
+                format!("{:.2}s {}", video.duration_secs, video.path.display())
+            }
+            VideoCompletion::Partial {
+                salvageability,
+                reason,
+            } => format!(
+                "{:.2}s partial ({}) {} — {reason}",
+                video.duration_secs,
+                match salvageability {
+                    VideoSalvageability::InitialisationOnly => "initialisation only",
+                    VideoSalvageability::Playable => "playable",
+                },
+                video.path.display()
+            ),
+        },
+    );
+    format!(
+        "{}  {}{pinned}  {detail}",
+        record.id.0,
+        record.media_kind.as_token()
+    )
+}
+
+fn history_media_bytes(
+    store: &mut scrozz_store::SqliteStore,
+    record: &CaptureRecord,
+) -> CliResult<Vec<u8>> {
+    if let Some(video) = &record.video {
+        return std::fs::read(&video.path).map_err(|error| {
+            CliError::Core(CoreError::Storage(format!(
+                "history media {} is unavailable: {error}",
+                video.path.display()
+            )))
+        });
+    }
+    let header = record.frame.as_ref().ok_or_else(|| {
+        CliError::Core(CoreError::Storage(format!(
+            "history item {} has no frame metadata",
+            record.id.0
+        )))
+    })?;
+    let data = store.image(&record.id)?.ok_or_else(|| {
+        CliError::Core(CoreError::Storage(format!(
+            "history item {} no longer has source pixels",
+            record.id.0
+        )))
+    })?;
+    FrameEncoder::new()
+        .encode(
+            &Frame {
+                data,
+                size: header.size,
+                stride: header.stride,
+                format: header.format,
+                color_space: header.color_space,
+                scale: header.scale,
+            },
+            ImageFormat::Png,
+        )
+        .map_err(CliError::Core)
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> CliResult<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| CliError::Core(CoreError::Io(error)))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| CliError::Core(CoreError::Io(error)))
+}
+
+fn copy_new_file(source: &Path, destination: &Path) -> CliResult<()> {
+    use std::io::Write as _;
+
+    let mut source =
+        std::fs::File::open(source).map_err(|error| CliError::Core(CoreError::Io(error)))?;
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| CliError::Core(CoreError::Io(error)))?;
+    std::io::copy(&mut source, &mut destination)
+        .and_then(|_| destination.flush())
+        .and_then(|()| destination.sync_all())
+        .map(|_| ())
+        .map_err(|error| CliError::Core(CoreError::Io(error)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,10 +1883,6 @@ mod tests {
     fn every_unimplemented_command_reports_rather_than_panics() {
         let cases = [
             vec!["scrozz", "capture", "--region", "0,0,10,10"],
-            vec!["scrozz", "history", "list"],
-            vec!["scrozz", "history", "get", "abc"],
-            vec!["scrozz", "history", "delete", "abc"],
-            vec!["scrozz", "history", "pin", "abc"],
             vec!["scrozz", "gui"],
         ];
         for argv in cases {
@@ -1600,17 +1896,9 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_store_reads_are_named_precisely() {
-        // These are the two the Store trait genuinely cannot express today, as
-        // opposed to merely lacking an implementation.
-        let err = run(&["scrozz", "history", "get", "abc"]).unwrap_err();
-        assert!(
-            err.to_string().contains("no way to read a capture back"),
-            "{err}"
-        );
-
-        let err = run(&["scrozz", "history", "delete", "abc"]).unwrap_err();
-        assert!(err.to_string().contains("no delete"), "{err}");
+    fn malformed_history_ids_are_rejected_before_touching_the_store() {
+        let error = history_id("../not-an-id").expect_err("paths are not capture ids");
+        assert_eq!(error.exit(), Exit::Usage);
     }
 
     #[test]

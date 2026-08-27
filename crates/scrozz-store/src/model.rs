@@ -97,10 +97,10 @@ pub enum VideoCompletion {
     },
 }
 
-/// External recording path and native media summary.
+/// Externally owned recording path and native media summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VideoMetadata {
-    /// Native media file, kept outside the history sidecar directory.
+    /// Canonical native media file, owned by the caller rather than history.
     pub path: PathBuf,
     /// Pause-free media duration.
     pub duration_secs: f64,

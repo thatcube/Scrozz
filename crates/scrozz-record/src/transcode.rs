@@ -2,15 +2,19 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{BufWriter, Write},
+    hash::{BuildHasher as _, Hasher as _, RandomState},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
 use scrozz_core::{Error, Result};
 use scrozz_export::{
@@ -96,6 +100,12 @@ mod platform {
         }
     }
 }
+
+static TRANSCODE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const STAGING_DIRECTORY_PREFIX: &str = ".scrozz-transcode-";
+const PREPARING_DIRECTORY_PREFIX: &str = ".scrozz-transcode-preparing-";
+const ACTIVE_MANIFEST: &[u8] = b"SCROZZ-TRANSCODE/1 active\n";
+const RETAINED_MANIFEST: &[u8] = b"SCROZZ-TRANSCODE/1 retained\n";
 
 /// Whether a transcode result came from a real or synthetic implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,6 +434,7 @@ impl Transcoder for NativeTranscoder {
         let source = NativeMediaSource::open(document.recording().clone())?;
         validate_document_source(document, &source)?;
         validate_output_path(&source, &output_path)?;
+        let staged = StagedOutput::new(&output_path, plan.output)?;
         let output_channels = plan.output_audio_channels(source.metadata());
         if output_channels > 2 {
             return Err(Error::Unsupported {
@@ -441,13 +452,13 @@ impl Transcoder for NativeTranscoder {
         let worker_terminal_gate = Arc::clone(&terminal_gate);
         let worker_status = Arc::clone(&status);
         let plan = *plan;
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("scrozz-native-transcode".to_owned())
             .spawn(move || {
                 let terminal = run_native_transcode(
                     &source,
                     plan,
-                    &output_path,
+                    staged,
                     &worker_cancelled,
                     &events,
                     &worker_status,
@@ -470,6 +481,7 @@ impl Transcoder for NativeTranscoder {
             terminal_gate,
             status,
             terminal_reported: false,
+            worker: Some(worker),
         }))
     }
 }
@@ -480,6 +492,7 @@ struct NativeJob {
     terminal_gate: Arc<AtomicU8>,
     status: Arc<Mutex<TranscodeStatus>>,
     terminal_reported: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TranscodeJob for NativeJob {
@@ -495,6 +508,7 @@ impl TranscodeJob for NativeJob {
                 if let Some(status) = terminal_status {
                     set_status(&self.status, status);
                     self.terminal_reported = true;
+                    self.join_worker();
                 }
                 Some(event)
             }
@@ -502,6 +516,7 @@ impl TranscodeJob for NativeJob {
             Err(TryRecvError::Disconnected) if !self.terminal_reported => {
                 self.terminal_reported = true;
                 set_status(&self.status, TranscodeStatus::Failed);
+                self.join_worker();
                 Some(TranscodeEvent::Failed(TranscodeFailure {
                     error: Arc::new(Error::Platform(
                         "native transcode worker ended without a terminal event".to_owned(),
@@ -547,6 +562,40 @@ impl Drop for NativeJob {
             .is_ok()
         {
             self.cancelled.store(true, Ordering::Release);
+        }
+        self.join_worker();
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                TranscodeEvent::Finished(output) => tracing::warn!(
+                    path = %output.path.display(),
+                    "transcode owner dropped before collecting finished output"
+                ),
+                TranscodeEvent::Failed(failure) => {
+                    if let Some(partial) = failure.partial {
+                        tracing::warn!(
+                            path = %partial.path.display(),
+                            "transcode owner dropped before collecting retained partial output"
+                        );
+                    } else {
+                        tracing::error!(error = %failure.error, "transcode failed after its owner dropped");
+                    }
+                }
+                TranscodeEvent::Cancelled(Some(partial)) => tracing::warn!(
+                    path = %partial.path.display(),
+                    "cancelled transcode retained output after its owner dropped"
+                ),
+                TranscodeEvent::Cancelled(None) | TranscodeEvent::Progress(_) => {}
+            }
+        }
+    }
+}
+
+impl NativeJob {
+    fn join_worker(&mut self) {
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("native transcode worker panicked");
         }
     }
 }
@@ -601,7 +650,7 @@ enum ArtifactKind {
 fn run_native_transcode(
     source: &NativeMediaSource,
     plan: EditPlan,
-    output_path: &Path,
+    mut output: StagedOutput,
     cancelled: &AtomicBool,
     events: &Sender<TranscodeEvent>,
     status: &Arc<Mutex<TranscodeStatus>>,
@@ -610,12 +659,357 @@ fn run_native_transcode(
         return WorkerTerminal::Cancelled(None);
     }
     let mut progress = ProgressEmitter::new(events, status, plan.trim.duration());
-    match plan.output {
-        EditOutput::Video => run_video(source, plan, output_path, cancelled, &mut progress),
+    let terminal = match plan.output {
+        EditOutput::Video => run_video(source, plan, output.path(), cancelled, &mut progress),
         EditOutput::Animation(AnimationFormat::Gif) => {
-            run_gif(source, plan, output_path, cancelled, &mut progress)
+            run_gif(source, plan, output.path(), cancelled, &mut progress)
+        }
+    };
+    output.resolve(terminal)
+}
+
+struct StagedOutput {
+    final_path: PathBuf,
+    staging_path: PathBuf,
+    directory: PathBuf,
+    lock_path: PathBuf,
+    lock: Option<File>,
+    retained: bool,
+}
+
+struct PublishFailure {
+    error: Error,
+    retained_path: PathBuf,
+}
+
+impl StagedOutput {
+    fn new(final_path: &Path, output: EditOutput) -> Result<Self> {
+        let parent = final_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        cleanup_abandoned_transcodes(parent)?;
+        let (preparing, directory) = create_staging_directory(parent)?;
+        let mut preparation = PreparingDirectory(Some(preparing.clone()));
+        let preparing_lock = preparing.join("owner.lock");
+        let mut lock_options = OpenOptions::new();
+        lock_options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        lock_options.mode(0o600);
+        let mut lock = lock_options.open(&preparing_lock)?;
+        lock.lock()?;
+        lock.write_all(ACTIVE_MANIFEST)?;
+        lock.sync_all()?;
+        std::fs::rename(&preparing, &directory)?;
+        preparation.0 = Some(directory.clone());
+        sync_parent_directory(&directory)?;
+        preparation.0 = None;
+        let lock_path = directory.join("owner.lock");
+        let extension = match output {
+            EditOutput::Video => "mp4",
+            EditOutput::Animation(format) => format.extension(),
+        };
+        Ok(Self {
+            final_path: final_path.to_owned(),
+            staging_path: directory.join(format!("output.{extension}")),
+            directory,
+            lock_path,
+            lock: Some(lock),
+            retained: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.staging_path
+    }
+
+    fn resolve(&mut self, terminal: WorkerTerminal) -> WorkerTerminal {
+        match terminal {
+            WorkerTerminal::Finished(mut output) => match self.publish() {
+                Ok(()) => {
+                    output.path = self.final_path.clone();
+                    WorkerTerminal::Finished(output)
+                }
+                Err(publish) => {
+                    let reason = format!(
+                        "encoded output could not be durably published at {}: {error}; retained output at {}",
+                        self.final_path.display(),
+                        publish.retained_path.display(),
+                        error = publish.error
+                    );
+                    self.retain_if_staged(&publish.retained_path);
+                    match TranscodeOutput::native_partial(
+                        &publish.retained_path,
+                        output.bytes_written,
+                        NativeTranscoder::name(),
+                        &reason,
+                    ) {
+                        Ok(partial) => failed(Error::Storage(reason), Some(partial)),
+                        Err(partial_error) => {
+                            failed(combine_errors(Error::Storage(reason), partial_error), None)
+                        }
+                    }
+                }
+            },
+            WorkerTerminal::Failed(mut failure) => {
+                if let Some(partial) = failure.partial.as_mut() {
+                    match self.publish() {
+                        Ok(()) => partial.path = self.final_path.clone(),
+                        Err(publish) => {
+                            partial.path = publish.retained_path.clone();
+                            self.retain_if_staged(&publish.retained_path);
+                            failure.error = Arc::new(combine_errors(
+                                failure.error.as_ref().clone(),
+                                Error::Storage(format!(
+                                    "partial output remains at {} because publication at {} failed: {error}",
+                                    publish.retained_path.display(),
+                                    self.final_path.display(),
+                                    error = publish.error
+                                )),
+                            ));
+                        }
+                    }
+                }
+                WorkerTerminal::Failed(failure)
+            }
+            WorkerTerminal::Cancelled(mut partial) => {
+                if let Some(output) = partial.as_mut() {
+                    match self.publish() {
+                        Ok(()) => output.path = self.final_path.clone(),
+                        Err(publish) => {
+                            output.path = publish.retained_path.clone();
+                            self.retain_if_staged(&publish.retained_path);
+                            let prior = output
+                                .partial_reason()
+                                .unwrap_or("cancelled by user")
+                                .to_owned();
+                            output.completion = TranscodeCompletion::Partial {
+                                reason: format!(
+                                    "{}; retained output remains at {} because publication at {} failed: {error}",
+                                    prior,
+                                    publish.retained_path.display(),
+                                    self.final_path.display(),
+                                    error = publish.error
+                                ),
+                            };
+                        }
+                    }
+                }
+                WorkerTerminal::Cancelled(partial)
+            }
         }
     }
+
+    fn publish(&mut self) -> Result<(), PublishFailure> {
+        if let Err(error) = publish_no_replace(&self.staging_path, &self.final_path) {
+            return Err(PublishFailure {
+                error,
+                retained_path: self.staging_path.clone(),
+            });
+        }
+        let durability = sync_parent_directory(&self.final_path);
+        self.cleanup_directory();
+        durability.map_err(|error| PublishFailure {
+            error,
+            retained_path: self.final_path.clone(),
+        })
+    }
+
+    fn retain(&mut self) {
+        self.retained = true;
+        if let Some(lock) = self.lock.as_mut()
+            && let Err(error) = write_manifest(lock, RETAINED_MANIFEST)
+        {
+            tracing::error!(
+                path = %self.lock_path.display(),
+                %error,
+                "could not persist retained transcode ownership state"
+            );
+        }
+        self.release_lock();
+    }
+
+    fn retain_if_staged(&mut self, path: &Path) {
+        if path == self.staging_path {
+            self.retain();
+        }
+    }
+
+    fn release_lock(&mut self) {
+        self.lock.take();
+    }
+
+    fn cleanup_directory(&mut self) {
+        self.release_lock();
+        for path in [&self.lock_path, &self.staging_path] {
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::error!(path = %path.display(), %error, "could not clean transcode staging file");
+            }
+        }
+        if let Err(error) = std::fs::remove_dir(&self.directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(
+                path = %self.directory.display(),
+                %error,
+                "could not remove empty transcode staging directory"
+            );
+        }
+    }
+}
+
+struct PreparingDirectory(Option<PathBuf>);
+
+impl Drop for PreparingDirectory {
+    fn drop(&mut self) {
+        let Some(directory) = self.0.take() else {
+            return;
+        };
+        let _ = std::fs::remove_file(directory.join("owner.lock"));
+        let _ = std::fs::remove_dir(directory);
+    }
+}
+
+impl Drop for StagedOutput {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.cleanup_directory();
+        }
+    }
+}
+
+fn create_staging_directory(parent: &Path) -> Result<(PathBuf, PathBuf)> {
+    for _ in 0..1_000 {
+        let sequence = TRANSCODE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut entropy = RandomState::new().build_hasher();
+        entropy.write_u64(sequence);
+        entropy.write_u64(u64::from(std::process::id()));
+        entropy.write_u128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        let token = format!("{}-{:016x}", std::process::id(), entropy.finish());
+        let preparing = parent.join(format!("{PREPARING_DIRECTORY_PREFIX}{token}"));
+        let directory = parent.join(format!("{STAGING_DIRECTORY_PREFIX}{token}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&preparing) {
+            Ok(()) => return Ok((preparing, directory)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Err(Error::Storage(
+        "could not allocate a private transcode staging directory".into(),
+    ))
+}
+
+fn cleanup_abandoned_transcodes(parent: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir()
+            || !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_DIRECTORY_PREFIX)
+        {
+            continue;
+        }
+        let directory = entry.path();
+        let lock_path = directory.join("owner.lock");
+        let mut lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(Error::Io(error)),
+        };
+        match lock.try_lock() {
+            Ok(()) => {
+                let mut manifest = String::new();
+                lock.read_to_string(&mut manifest)?;
+                if manifest.as_bytes() != ACTIVE_MANIFEST {
+                    continue;
+                }
+                drop(lock);
+                for name in ["output.mp4", "output.gif", "owner.lock"] {
+                    let path = directory.join(name);
+                    if let Err(error) = std::fs::remove_file(&path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(Error::Io(error));
+                    }
+                }
+                if let Err(error) = std::fs::remove_dir(&directory)
+                    && !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    )
+                {
+                    return Err(Error::Io(error));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn write_manifest(file: &mut File, state: &[u8]) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(state)?;
+    file.sync_all()
+}
+
+#[cfg(target_os = "macos")]
+fn publish_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    const RENAME_EXCL: u32 = 0x0000_0004;
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidRequest("transcode staging path contains NUL".into()))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidRequest("transcode destination contains NUL".into()))?;
+    if unsafe { renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn publish_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::{Win32::Storage::FileSystem::MoveFileW, core::PCWSTR};
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe { MoveFileW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr())) }
+        .map_err(|error| Error::Storage(format!("could not publish transcode output: {error}")))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn publish_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::hard_link(source, destination)?;
+    std::fs::remove_file(source)?;
+    Ok(())
 }
 
 fn run_gif(
@@ -639,11 +1033,11 @@ fn run_gif(
         Ok(decoder) => decoder,
         Err(error) => return failed(error, None),
     };
-    let file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output_path)
-    {
+    let mut file_options = OpenOptions::new();
+    file_options.write(true).create_new(true);
+    #[cfg(unix)]
+    file_options.mode(0o600);
+    let file = match file_options.open(output_path) {
         Ok(file) => file,
         Err(error) => return failed(Error::Io(error), None),
     };
@@ -659,13 +1053,13 @@ fn run_gif(
     let mut stream = encoder.stream(BufWriter::new(file));
     let mut frame_count = 0_u64;
     let mut pending = None;
-    let mut deferred = None;
+    let mut queued = GifFrameQueue::default();
     let mut cursor = plan.trim.start;
 
     loop {
         if cancelled.load(Ordering::Acquire) {
             decoder.cancel();
-            if let Err(error) = flush_gif_frame(&mut stream, &mut deferred, &mut frame_count) {
+            if let Err(error) = flush_gif_frames(&mut stream, &mut queued, &mut frame_count) {
                 return finish_failed_gif(
                     error,
                     stream,
@@ -679,7 +1073,7 @@ fn run_gif(
         let sample = match decoder.next_sample() {
             Ok(sample) => sample,
             Err(error) => {
-                let error = match flush_gif_frame(&mut stream, &mut deferred, &mut frame_count) {
+                let error = match flush_gif_frames(&mut stream, &mut queued, &mut frame_count) {
                     Ok(()) => error,
                     Err(flush_error) => combine_errors(error, flush_error),
                 };
@@ -705,7 +1099,7 @@ fn run_gif(
             if boundary > cursor {
                 if let Err(error) = queue_gif_frame(
                     &mut stream,
-                    &mut deferred,
+                    &mut queued,
                     &mut frame_count,
                     TimedRgbaFrame::new(previous.image, boundary - cursor),
                 ) {
@@ -733,7 +1127,7 @@ fn run_gif(
     if cursor < plan.trim.end
         && let Err(error) = queue_gif_frame(
             &mut stream,
-            &mut deferred,
+            &mut queued,
             &mut frame_count,
             TimedRgbaFrame::new(last.image, plan.trim.end - cursor),
         )
@@ -746,7 +1140,7 @@ fn run_gif(
             plan.trim.duration(),
         );
     }
-    if let Err(error) = flush_gif_frame(&mut stream, &mut deferred, &mut frame_count) {
+    if let Err(error) = flush_gif_frames(&mut stream, &mut queued, &mut frame_count) {
         return finish_failed_gif(
             error,
             stream,
@@ -874,42 +1268,88 @@ fn run_video(
     }
 }
 
+#[derive(Default)]
+struct GifFrameQueue {
+    ready: Option<TimedRgbaFrame>,
+    pending: Option<TimedRgbaFrame>,
+}
+
 fn queue_gif_frame<W: Write>(
     stream: &mut GifAnimationStream<W>,
-    deferred: &mut Option<TimedRgbaFrame>,
+    queued: &mut GifFrameQueue,
     frame_count: &mut u64,
     mut frame: TimedRgbaFrame,
 ) -> Result<()> {
     if frame.delay.is_zero() {
         return Ok(());
     }
-    let Some(mut previous) = deferred.take() else {
-        *deferred = Some(frame);
+    let Some(mut previous) = queued.pending.take() else {
+        queued.pending = Some(frame);
         return Ok(());
     };
     if previous.delay >= GIF_MIN_FRAME_DELAY {
-        stream.write_frame(previous)?;
-        *frame_count = frame_count.saturating_add(1);
-        *deferred = Some(frame);
+        if let Some(ready) = queued.ready.replace(previous) {
+            stream.write_frame(ready)?;
+            *frame_count = frame_count.saturating_add(1);
+        }
+        queued.pending = Some(frame);
     } else if frame.delay < GIF_MIN_FRAME_DELAY {
         previous.delay = previous.delay.saturating_add(frame.delay);
-        *deferred = Some(previous);
+        queued.pending = Some(previous);
     } else {
         frame.delay = frame.delay.saturating_add(previous.delay);
-        *deferred = Some(frame);
+        queued.pending = Some(frame);
     }
     Ok(())
 }
 
-fn flush_gif_frame<W: Write>(
+fn flush_gif_frames<W: Write>(
     stream: &mut GifAnimationStream<W>,
-    deferred: &mut Option<TimedRgbaFrame>,
+    queued: &mut GifFrameQueue,
     frame_count: &mut u64,
 ) -> Result<()> {
-    if let Some(frame) = deferred.take() {
-        stream.write_frame(frame)?;
-        *frame_count = frame_count.saturating_add(1);
+    let ready = queued.ready.take();
+    let pending = queued.pending.take();
+    match (ready, pending) {
+        (Some(mut ready), Some(mut pending)) if pending.delay < GIF_MIN_FRAME_DELAY => {
+            let combined = ready.delay.saturating_add(pending.delay);
+            let available = stream.projected_centiseconds(combined)?;
+            let reserved_tail = GIF_MIN_FRAME_DELAY;
+            let ready_delay = combined.saturating_sub(reserved_tail);
+            let ready_ticks = stream.projected_centiseconds(ready_delay)?;
+            if available >= 2
+                && !ready_delay.is_zero()
+                && ready_ticks > 0
+                && ready_ticks < available
+            {
+                ready.delay = ready_delay;
+                pending.delay = reserved_tail;
+                write_queued_gif_frame(stream, frame_count, ready)?;
+                write_queued_gif_frame(stream, frame_count, pending)?;
+            } else {
+                ready.delay = combined;
+                write_queued_gif_frame(stream, frame_count, ready)?;
+            }
+        }
+        (Some(ready), Some(pending)) => {
+            write_queued_gif_frame(stream, frame_count, ready)?;
+            write_queued_gif_frame(stream, frame_count, pending)?;
+        }
+        (Some(frame), None) | (None, Some(frame)) => {
+            write_queued_gif_frame(stream, frame_count, frame)?;
+        }
+        (None, None) => {}
     }
+    Ok(())
+}
+
+fn write_queued_gif_frame<W: Write>(
+    stream: &mut GifAnimationStream<W>,
+    frame_count: &mut u64,
+    frame: TimedRgbaFrame,
+) -> Result<()> {
+    stream.write_frame(frame)?;
+    *frame_count = frame_count.saturating_add(1);
     Ok(())
 }
 
@@ -1594,12 +2034,12 @@ mod tests {
     fn gif_scheduler_keeps_motion_above_one_hundred_fps() {
         let encoder = GifAnimationEncoder::with_repeat(AnimationRepeat::Once);
         let mut stream = encoder.stream(Vec::new());
-        let mut deferred = None;
+        let mut queued = GifFrameQueue::default();
         let mut frame_count = 0;
         for index in 0..12_u8 {
             queue_gif_frame(
                 &mut stream,
-                &mut deferred,
+                &mut queued,
                 &mut frame_count,
                 TimedRgbaFrame::new(
                     RgbaImage {
@@ -1612,7 +2052,7 @@ mod tests {
             )
             .unwrap();
         }
-        flush_gif_frame(&mut stream, &mut deferred, &mut frame_count).unwrap();
+        flush_gif_frames(&mut stream, &mut queued, &mut frame_count).unwrap();
         let bytes = stream.finish().unwrap();
         let frames = GifDecoder::new(std::io::Cursor::new(bytes))
             .unwrap()
@@ -1633,12 +2073,155 @@ mod tests {
     }
 
     #[test]
+    fn gif_scheduler_preserves_a_short_tail_when_the_pair_is_representable() {
+        let encoder = GifAnimationEncoder::with_repeat(AnimationRepeat::Once);
+        let mut stream = encoder.stream(Vec::new());
+        let mut queued = GifFrameQueue::default();
+        let mut frame_count = 0;
+        for (index, delay) in [33, 33, 4].into_iter().enumerate() {
+            queue_gif_frame(
+                &mut stream,
+                &mut queued,
+                &mut frame_count,
+                TimedRgbaFrame::new(
+                    RgbaImage {
+                        width: 1,
+                        height: 1,
+                        data: vec![index as u8, 0, 0, 255],
+                    },
+                    Duration::from_millis(delay),
+                ),
+            )
+            .unwrap();
+        }
+        flush_gif_frames(&mut stream, &mut queued, &mut frame_count).unwrap();
+        let bytes = stream.finish().unwrap();
+        let frames = GifDecoder::new(std::io::Cursor::new(bytes))
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+
+        assert_eq!(frame_count, 3);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.delay().numer_denom_ms().0)
+                .sum::<u32>(),
+            70
+        );
+        assert_eq!(frames[2].buffer().get_pixel(0, 0).0, [2, 0, 0, 255]);
+    }
+
+    #[test]
+    fn gif_scheduler_handles_an_odd_short_frame_count() {
+        let encoder = GifAnimationEncoder::with_repeat(AnimationRepeat::Once);
+        let mut stream = encoder.stream(Vec::new());
+        let mut queued = GifFrameQueue::default();
+        let mut frame_count = 0;
+        for index in 0..5_u8 {
+            queue_gif_frame(
+                &mut stream,
+                &mut queued,
+                &mut frame_count,
+                TimedRgbaFrame::new(
+                    RgbaImage {
+                        width: 1,
+                        height: 1,
+                        data: vec![index, 0, 0, 255],
+                    },
+                    Duration::from_millis(4),
+                ),
+            )
+            .unwrap();
+        }
+        flush_gif_frames(&mut stream, &mut queued, &mut frame_count).unwrap();
+        let bytes = stream.finish().unwrap();
+        let frames = GifDecoder::new(std::io::Cursor::new(bytes))
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_ne!(frames[0].buffer(), frames[1].buffer());
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.delay().numer_denom_ms().0)
+                .sum::<u32>(),
+            20
+        );
+    }
+
+    #[test]
+    fn gif_scheduler_uses_cumulative_rounding_for_four_short_frames() {
+        let encoder = GifAnimationEncoder::with_repeat(AnimationRepeat::Once);
+        let mut stream = encoder.stream(Vec::new());
+        let mut queued = GifFrameQueue::default();
+        let mut frame_count = 0;
+        for index in 0..4_u8 {
+            queue_gif_frame(
+                &mut stream,
+                &mut queued,
+                &mut frame_count,
+                TimedRgbaFrame::new(
+                    RgbaImage {
+                        width: 1,
+                        height: 1,
+                        data: vec![index, 0, 0, 255],
+                    },
+                    Duration::from_millis(4),
+                ),
+            )
+            .unwrap();
+        }
+        flush_gif_frames(&mut stream, &mut queued, &mut frame_count).unwrap();
+        let frames = GifDecoder::new(std::io::Cursor::new(stream.finish().unwrap()))
+            .unwrap()
+            .into_frames()
+            .collect_frames()
+            .unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_ne!(frames[0].buffer(), frames[1].buffer());
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.delay().numer_denom_ms().0)
+                .sum::<u32>(),
+            20
+        );
+    }
+
+    #[test]
     fn source_plan_is_revalidated_at_start() {
         let (document, mut plan) = fixture();
         plan.trim.end = document.duration() + Duration::from_secs(1);
         let transcoder = MockTranscoder::success(vec![], 1).unwrap();
         let result = transcoder.start(&document, &plan, PathBuf::from("out.mp4"));
         assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_output_publishes_without_replacing_a_race_winner() {
+        let directory = TestDirectory::new("staged-publish");
+        let final_path = directory.path.join("edited.mp4");
+        let mut staged = StagedOutput::new(&final_path, EditOutput::Video).unwrap();
+        std::fs::write(staged.path(), b"encoded").unwrap();
+        std::fs::write(&final_path, b"race winner").unwrap();
+        let output = TranscodeOutput::native(staged.path(), 7, NativeTranscoder::name()).unwrap();
+
+        let WorkerTerminal::Failed(failure) = staged.resolve(WorkerTerminal::Finished(output))
+        else {
+            panic!("publication collision must fail with retained output");
+        };
+        let partial = failure.partial.expect("encoded staging file is retained");
+        assert!(partial.is_partial());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"race winner");
+        assert_eq!(std::fs::read(&partial.path).unwrap(), b"encoded");
     }
 
     #[cfg(target_os = "macos")]

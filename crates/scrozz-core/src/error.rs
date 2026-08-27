@@ -69,6 +69,31 @@ pub enum Error {
     Platform(String),
 }
 
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Self::PermissionDenied { capability, remedy } => Self::PermissionDenied {
+                capability: capability.clone(),
+                remedy: remedy.clone(),
+            },
+            Self::Unsupported { what, why } => Self::Unsupported {
+                what: what.clone(),
+                why: why.clone(),
+            },
+            Self::TargetGone(message) => Self::TargetGone(message.clone()),
+            Self::InvalidRequest(message) => Self::InvalidRequest(message.clone()),
+            Self::Codec(message) => Self::Codec(message.clone()),
+            Self::Storage(message) => Self::Storage(message.clone()),
+            Self::Cancelled => Self::Cancelled,
+            Self::Io(error) => Self::Io(error.raw_os_error().map_or_else(
+                || std::io::Error::new(error.kind(), error.to_string()),
+                std::io::Error::from_raw_os_error,
+            )),
+            Self::Platform(message) => Self::Platform(message.clone()),
+        }
+    }
+}
+
 impl Error {
     /// Whether this represents ordinary user cancellation rather than a fault.
     #[must_use]

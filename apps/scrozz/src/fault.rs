@@ -36,13 +36,31 @@ use scrozz_core::Error as CoreError;
 use crate::{exit::Exit, json::Json};
 
 /// Anything that can end a Scrozz invocation unsuccessfully.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CliError {
     /// A failure originating in one of the Scrozz crates.
     Core(CoreError),
 
     /// A shared core failure returned by an asynchronous native worker.
     SharedCore(Arc<CoreError>),
+
+    /// Native recording failed but retained output was persisted separately.
+    PartialRecording {
+        /// Terminal native failure category.
+        error: CoreError,
+        /// Retained media path.
+        path: String,
+        /// Whether playback/editing can consume the retained media.
+        playable: bool,
+        /// Container recovery classification.
+        salvageability: String,
+        /// Pause-free retained duration.
+        duration_secs: f64,
+        /// Durable history id, when persistence succeeded.
+        history_id: Option<String>,
+        /// Persistence failure, when the media survived but history did not.
+        history_error: Option<String>,
+    },
 
     /// The arguments were well-formed but semantically wrong.
     ///
@@ -85,6 +103,27 @@ impl CliError {
         Self::Ipc(message.into())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn partial_recording(
+        error: CoreError,
+        path: impl Into<String>,
+        playable: bool,
+        salvageability: impl Into<String>,
+        duration_secs: f64,
+        history_id: Option<String>,
+        history_error: Option<String>,
+    ) -> Self {
+        Self::PartialRecording {
+            error,
+            path: path.into(),
+            playable,
+            salvageability: salvageability.into(),
+            duration_secs,
+            history_id,
+            history_error,
+        }
+    }
+
     pub(crate) fn shared_pair(self) -> (Self, Self) {
         match self {
             Self::Core(error) => {
@@ -98,6 +137,37 @@ impl CliError {
                 Self::SharedCore(Arc::clone(&error)),
                 Self::SharedCore(error),
             ),
+            Self::PartialRecording {
+                error,
+                path,
+                playable,
+                salvageability,
+                duration_secs,
+                history_id,
+                history_error,
+            } => {
+                let clone = Self::PartialRecording {
+                    error: error.clone(),
+                    path: path.clone(),
+                    playable,
+                    salvageability: salvageability.clone(),
+                    duration_secs,
+                    history_id: history_id.clone(),
+                    history_error: history_error.clone(),
+                };
+                (
+                    clone,
+                    Self::PartialRecording {
+                        error,
+                        path,
+                        playable,
+                        salvageability,
+                        duration_secs,
+                        history_id,
+                        history_error,
+                    },
+                )
+            }
             Self::Usage(message) => (Self::Usage(message.clone()), Self::Usage(message)),
             Self::NotImplemented { what, provider } => (
                 Self::NotImplemented {
@@ -135,13 +205,18 @@ impl CliError {
             Self::Usage(_) => Exit::Usage,
             Self::NotImplemented { .. } => Exit::NotImplemented,
             Self::Ipc(_) => Exit::IpcFailed,
-            Self::Core(_) | Self::SharedCore(_) => unreachable!("handled above"),
+            Self::Core(_) | Self::SharedCore(_) | Self::PartialRecording { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
     /// The stable `kind` slug used in JSON output.
     #[must_use]
     pub fn kind(&self) -> &'static str {
+        if matches!(self, Self::PartialRecording { .. }) {
+            return "recording-partial";
+        }
         self.exit().slug()
     }
 
@@ -165,6 +240,28 @@ impl CliError {
     /// unconditionally, and reaches into `details` only for a kind it knows.
     #[must_use]
     pub fn details(&self) -> Json {
+        if let Self::PartialRecording {
+            path,
+            playable,
+            salvageability,
+            duration_secs,
+            history_id,
+            history_error,
+            ..
+        } = self
+        {
+            return Json::obj([
+                ("path", Json::str(path)),
+                ("playable", Json::Bool(*playable)),
+                ("salvageability", Json::str(salvageability)),
+                ("duration_secs", Json::Float(*duration_secs)),
+                ("history_id", Json::opt(history_id.as_deref(), Json::str)),
+                (
+                    "history_error",
+                    Json::opt(history_error.as_deref(), Json::str),
+                ),
+            ]);
+        }
         if let Some(error) = self.core_error() {
             return match error {
                 CoreError::PermissionDenied { capability, remedy } => Json::obj([
@@ -206,6 +303,28 @@ impl CliError {
     /// cancellation case and only the cancellation case.
     #[must_use]
     pub fn to_human(&self) -> String {
+        if let Self::PartialRecording {
+            error,
+            path,
+            playable,
+            salvageability,
+            history_id,
+            history_error,
+            ..
+        } = self
+        {
+            let history = history_id.as_ref().map_or_else(
+                || {
+                    history_error.as_ref().map_or_else(String::new, |failure| {
+                        format!("\n  History persistence also failed: {failure}")
+                    })
+                },
+                |id| format!("\n  History id: {id}"),
+            );
+            return format!(
+                "scrozz: recording failed, but retained {salvageability} output.\n\n  Path: {path}\n  Playable: {playable}\n  Failure: {error}{history}\n"
+            );
+        }
         if let Some(error) = self.core_error() {
             return match error {
                 CoreError::PermissionDenied { capability, remedy } => format!(
@@ -252,14 +371,17 @@ impl CliError {
                  \x20 or tray and try again.\n"
             ),
 
-            Self::Core(_) | Self::SharedCore(_) => unreachable!("handled above"),
+            Self::Core(_) | Self::SharedCore(_) | Self::PartialRecording { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
-    fn core_error(&self) -> Option<&CoreError> {
+    pub(crate) fn core_error(&self) -> Option<&CoreError> {
         match self {
             Self::Core(error) => Some(error),
             Self::SharedCore(error) => Some(error),
+            Self::PartialRecording { error, .. } => Some(error),
             Self::Usage(_) | Self::NotImplemented { .. } | Self::Ipc(_) => None,
         }
     }
@@ -270,6 +392,9 @@ impl fmt::Display for CliError {
         match self {
             Self::Core(err) => write!(f, "{err}"),
             Self::SharedCore(err) => write!(f, "{err}"),
+            Self::PartialRecording { error, path, .. } => {
+                write!(f, "{error}; retained recording at {path}")
+            }
             Self::Usage(message) => write!(f, "{message}"),
             Self::NotImplemented { what, provider } => {
                 write!(f, "{what} is not implemented yet ({provider})")
@@ -465,6 +590,26 @@ mod tests {
         assert_eq!(shared.kind(), owned.kind());
         assert_eq!(shared.to_json(), owned.to_json());
         assert_eq!(shared.to_human(), owned.to_human());
+    }
+
+    #[test]
+    fn partial_recording_is_nonzero_and_surfaces_salvage_details() {
+        let error = CliError::partial_recording(
+            CoreError::Platform("target disappeared".into()),
+            "/tmp/partial.mp4",
+            true,
+            "playable",
+            3.5,
+            Some("01HISTORY".into()),
+            None,
+        );
+
+        assert_eq!(error.kind(), "recording-partial");
+        assert!(error.exit().is_fault());
+        let json = error.to_json().to_compact_string();
+        assert!(json.contains("\"playable\":true"), "{json}");
+        assert!(json.contains("/tmp/partial.mp4"), "{json}");
+        assert!(error.to_human().contains("History id: 01HISTORY"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ default = []
 # pkg-config, so a macOS-hosted Linux cross-check remains link-free.
 linux-native = [
     "dep:ffmpeg-sys-next",
+    "dep:futures-util",
     "dep:pipewire",
     "dep:tokio",
 ]
@@ -52,6 +53,7 @@ image.workspace = true
 ashpd.workspace = true
 x11rb.workspace = true
 ffmpeg-sys-next = { version = "9.0.0", default-features = false, features = ["avcodec"], optional = true }
+futures-util = { workspace = true, optional = true }
 pipewire = { version = "0.10.1", features = ["v0_3_44"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
@@ -71,6 +73,7 @@ windows = { workspace = true, features = [
     "Win32_Media_MediaFoundation",
     "Win32_Media_Multimedia",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

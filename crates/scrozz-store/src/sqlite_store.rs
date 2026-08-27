@@ -11,7 +11,7 @@ use scrozz_core::{Capture, CaptureTarget, Error, Frame, Provenance, Result};
 
 use crate::{
     CaptureId, RetentionPolicy, Store, db, hash,
-    id::{capture_id_at, is_valid_id},
+    id::capture_id_at,
     layout::StoreLayout,
     model::{
         CaptureRecord, FrameHeader, ImageState, MediaKind, Page, ProvenanceRepr, RetentionReport,
@@ -107,7 +107,7 @@ pub struct NewRecording {
     pub target: CaptureTarget,
     /// Target-derived history provenance.
     pub provenance: Provenance,
-    /// External media path and native summary.
+    /// Caller-owned durable media path and native summary.
     pub video: VideoMetadata,
     /// Whether to exempt this row from user deletion workflows.
     pub pinned: bool,
@@ -228,10 +228,11 @@ pub trait History: Store {
     /// its buffer, or [`Error::Storage`] if the write fails.
     fn insert(&mut self, capture: NewCapture<'_>) -> Result<CaptureId>;
 
-    /// Adds an externally stored native recording.
+    /// Adds a verified, externally owned native recording.
     ///
-    /// The media file is not copied into the image blob store. Its path and
-    /// native metadata are persisted in the durable sidecar and query index.
+    /// The media file is not copied into the image blob store. The caller keeps
+    /// ownership, while history requires an existing non-empty regular file,
+    /// resolves its absolute canonical path, and records its observed size.
     fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId>;
 
     /// Everything known about one capture, without its pixels.
@@ -370,6 +371,7 @@ impl SqliteStore {
             Err(err) => return Err(err),
         };
 
+        store.complete_pending_deletions()?;
         store.adopt_unindexed_records()?;
         Ok(store)
     }
@@ -483,6 +485,10 @@ impl SqliteStore {
     ///
     /// Returns [`Error::Storage`] if the rebuild fails.
     pub fn reconcile(&mut self) -> Result<RecoveryReport> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin rebuild"))?;
         let (records, failures) = self.layout.scan_records()?;
         let blobs = self.layout.scan_blobs()?;
 
@@ -497,11 +503,6 @@ impl SqliteStore {
         }
 
         let now = Timestamp::now();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(store_err("cannot begin rebuild"))?;
-
         tx.execute("DELETE FROM blobs", [])
             .map_err(store_err("cannot reset blob table"))?;
         for (hash, byte_len) in &blobs {
@@ -550,39 +551,31 @@ impl SqliteStore {
         Ok(report)
     }
 
-    /// Adopts records written by a process that crashed before committing.
+    /// Re-indexes every durable record without dropping database-only rows.
     ///
-    /// Insert writes the durable record *before* the index row, so the only way
-    /// the two can disagree after a crash is a record with no row — a capture
-    /// the user took and would otherwise silently lose. Comparing counts is one
-    /// directory listing, cheap enough to do on every open. A lower on-disk
-    /// count means a durable sidecar was removed; ordinary startup deliberately
-    /// preserves that indexed row and leaves destructive reconciliation to the
-    /// explicit recovery command.
+    /// Every metadata mutation writes the sidecar before SQLite. Replaying all
+    /// readable sidecars on open closes both crash windows: a brand-new record
+    /// with no row and an existing row whose cached pin/edit/OCR values are
+    /// stale. Rows whose sidecars are missing remain untouched until explicit
+    /// reconciliation, preserving forensic evidence rather than deleting it.
     fn adopt_unindexed_records(&mut self) -> Result<()> {
-        let on_disk = record_file_ids(&self.layout)?;
-        let indexed: HashSet<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM captures")
-                .map_err(store_err("cannot list indexed history ids"))?;
-            let rows = stmt
-                .query_map([], |row| row.get(0))
-                .map_err(store_err("cannot list indexed history ids"))?;
-            rows.collect::<std::result::Result<_, _>>()
-                .map_err(store_err("cannot list indexed history ids"))?
-        };
-        let missing: HashSet<&str> = on_disk.difference(&indexed).map(String::as_str).collect();
-        if missing.is_empty() {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin history reconciliation"))?;
+        let (mut records, failures) = self.layout.scan_records()?;
+        if records.is_empty() && failures.is_empty() {
             return Ok(());
         }
 
-        tracing::info!(count = missing.len(), "adopting unindexed history records");
-        let (mut records, failures) = self.layout.scan_records()?;
+        tracing::info!(
+            count = records.len(),
+            "reconciling durable history records into the index"
+        );
         for (path, failure) in failures {
             tracing::warn!(
                 path = %path.display(),
-                "could not read a durable history record during adoption: {failure}"
+                "could not read a durable history record during startup reconciliation: {failure}"
             );
         }
         let blobs = self.layout.scan_blobs()?;
@@ -597,10 +590,6 @@ impl SqliteStore {
             }
         }
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(store_err("cannot begin history adoption"))?;
         for (hash, byte_len) in blobs {
             tx.execute(
                 "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
@@ -610,12 +599,36 @@ impl SqliteStore {
             .map_err(store_err("cannot adopt history blob"))?;
         }
         for record in records {
-            if missing.contains(record.id.as_str()) {
-                upsert_record(&tx, &record)?;
-            }
+            upsert_record(&tx, &record)?;
         }
         tx.commit()
-            .map_err(store_err("cannot commit history adoption"))?;
+            .map_err(store_err("cannot commit history reconciliation"))?;
+        Ok(())
+    }
+
+    fn complete_pending_deletions(&mut self) -> Result<()> {
+        let pending = self.layout.scan_deletions()?;
+        for id in &pending {
+            self.complete_deletion(id)?;
+        }
+        if !pending.is_empty() {
+            self.collect_garbage()?;
+            for id in &pending {
+                self.layout.delete_deletion(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_deletion(&mut self, id: &CaptureId) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot resume delete"))?;
+        tx.execute("DELETE FROM captures WHERE id = ?1", params![id.0])
+            .map_err(store_err("cannot delete capture"))?;
+        self.layout.delete_record(id)?;
+        tx.commit().map_err(store_err("cannot commit delete"))?;
         Ok(())
     }
 
@@ -681,9 +694,12 @@ impl SqliteStore {
     ///
     /// Returns [`Error::Storage`] if the sweep fails.
     pub fn collect_garbage(&mut self) -> Result<u64> {
-        let referenced: Vec<String> = {
-            let mut stmt = self
-                .conn
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin garbage collection"))?;
+        let mut referenced: HashSet<String> = {
+            let mut stmt = tx
                 .prepare(
                     "SELECT DISTINCT image_hash FROM captures
                      WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL",
@@ -695,19 +711,34 @@ impl SqliteStore {
             rows.collect::<std::result::Result<_, _>>()
                 .map_err(store_err("cannot list referenced blobs"))?
         };
+        let (sidecars, unreadable) = self.layout.scan_records()?;
+        if !unreadable.is_empty() {
+            return Err(Error::Storage(format!(
+                "refusing to collect image blobs while {} durable history record(s) are unreadable",
+                unreadable.len()
+            )));
+        }
+        referenced.extend(sidecars.into_iter().filter_map(|record| {
+            if record.image_evicted_at.is_none() {
+                record.image_hash
+            } else {
+                None
+            }
+        }));
 
         let mut reclaimed = 0u64;
         for (hash, byte_len) in self.layout.scan_blobs()? {
-            if referenced.iter().any(|h| h == &hash) {
+            if referenced.contains(&hash) {
                 continue;
             }
             if self.layout.delete_blob(&hash)? {
                 reclaimed += byte_len;
             }
-            self.conn
-                .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+            tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
                 .map_err(store_err("cannot forget blob"))?;
         }
+        tx.commit()
+            .map_err(store_err("cannot commit garbage collection"))?;
         Ok(reclaimed)
     }
 
@@ -746,6 +777,13 @@ impl SqliteStore {
         if let Some(bytes) = self.layout.read_blob(hash)? {
             return Ok(Some(bytes));
         }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin missing-image repair"))?;
+        if let Some(bytes) = self.layout.read_blob(hash)? {
+            return Ok(Some(bytes));
+        }
 
         tracing::warn!(
             capture = %id.0,
@@ -753,20 +791,19 @@ impl SqliteStore {
             "source image is missing from disk; recording it as evicted"
         );
         let now = Timestamp::now();
-        self.conn
-            .execute(
-                "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
-                params![id.0, now.0],
-            )
-            .map_err(store_err("cannot record missing image"))?;
-        self.conn
-            .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+        tx.execute(
+            "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
+            params![id.0, now.0],
+        )
+        .map_err(store_err("cannot record missing image"))?;
+        tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
             .map_err(store_err("cannot forget missing blob"))?;
 
-        if let Some(mut record) = self.stored_record(id)? {
-            record.mark_evicted(now);
-            self.layout.write_record(&record)?;
-        }
+        let mut record = require_record_for_update(&tx, &self.layout, id)?;
+        record.mark_evicted(now);
+        self.layout.write_record(&record)?;
+        tx.commit()
+            .map_err(store_err("cannot commit missing-image repair"))?;
         Ok(None)
     }
 
@@ -790,12 +827,15 @@ impl Store for SqliteStore {
     }
 
     fn set_pinned(&mut self, id: &CaptureId, pinned: bool) -> Result<()> {
-        let mut record = self.require_record(id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin pinned-state update"))?;
+        let mut record = require_record_for_update(&tx, &self.layout, id)?;
         record.pinned = pinned;
         self.layout.write_record(&record)?;
 
-        let changed = self
-            .conn
+        let changed = tx
             .execute(
                 "UPDATE captures SET pinned = ?2 WHERE id = ?1",
                 params![id.0, i64::from(pinned)],
@@ -804,6 +844,8 @@ impl Store for SqliteStore {
         if changed == 0 {
             return Err(Error::Storage(format!("no capture {} in history", id.0)));
         }
+        tx.commit()
+            .map_err(store_err("cannot commit pinned-state update"))?;
         Ok(())
     }
 
@@ -846,6 +888,11 @@ impl History for SqliteStore {
             &capture.document.data(),
         )?;
 
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin insert"))?;
+
         // Pixels, then the durable record, then the index row. Each step is
         // recoverable from the one before it: a blob with no record is swept as
         // garbage, and a record with no row is adopted on the next open. The
@@ -853,18 +900,6 @@ impl History for SqliteStore {
         self.layout.write_blob(&digest, &frame.data)?;
         self.layout.write_record(&record)?;
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(store_err("cannot begin insert"))?;
-
-        // Re-check inside the write lock. Another process may have evicted this
-        // exact blob between the write above and this transaction; eviction
-        // deletes inside its own write transaction, so holding the lock here is
-        // what makes the check conclusive.
-        if !self.layout.blob_exists(&digest)? {
-            self.layout.write_blob(&digest, &frame.data)?;
-        }
         tx.execute(
             "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (hash) DO UPDATE SET byte_len = excluded.byte_len",
@@ -878,8 +913,34 @@ impl History for SqliteStore {
         Ok(id)
     }
 
-    fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId> {
+    fn insert_recording(&mut self, mut recording: NewRecording) -> Result<CaptureId> {
         recording.video.validate()?;
+        if !recording.video.path.is_absolute() {
+            return Err(Error::InvalidRequest(format!(
+                "history recording path must be absolute: {}",
+                recording.video.path.display()
+            )));
+        }
+        let canonical = std::fs::canonicalize(&recording.video.path).map_err(|error| {
+            Error::Storage(format!(
+                "cannot register recording {} because its media file is unavailable: {error}",
+                recording.video.path.display()
+            ))
+        })?;
+        let metadata = std::fs::metadata(&canonical).map_err(|error| {
+            Error::Storage(format!(
+                "cannot inspect recording media {}: {error}",
+                canonical.display()
+            ))
+        })?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(Error::Storage(format!(
+                "cannot register recording {} because it is not a non-empty regular file",
+                canonical.display()
+            )));
+        }
+        recording.video.path = canonical;
+        recording.video.file_size_bytes = Some(metadata.len());
         let id = capture_id_at(recording.created_at.0);
         let now = Timestamp::now();
         let record = StoredRecord::from_video(
@@ -1010,40 +1071,23 @@ impl History for SqliteStore {
 
     fn delete(&mut self, id: &CaptureId) -> Result<bool> {
         let record = self.layout.read_record(id)?;
-        let indexed_hash = self
+        let indexed = self
             .conn
             .query_row(
-                "SELECT image_hash FROM captures WHERE id = ?1",
+                "SELECT 1 FROM captures WHERE id = ?1",
                 params![id.0],
-                |row| row.get::<_, Option<String>>(0),
+                |_| Ok(()),
             )
             .optional()
             .map_err(store_err("cannot inspect capture before delete"))?;
-        if record.is_none() && indexed_hash.is_none() {
+        if record.is_none() && indexed.is_none() {
             return Ok(false);
         }
-        let hash = record
-            .as_ref()
-            .and_then(|value| value.image_hash.clone())
-            .or(indexed_hash.flatten());
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(store_err("cannot begin delete"))?;
-        tx.execute("DELETE FROM captures WHERE id = ?1", params![id.0])
-            .map_err(store_err("cannot delete capture"))?;
-
-        if let Some(hash) = hash.as_deref()
-            && !blob_still_referenced(&tx, hash)?
-        {
-            tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
-                .map_err(store_err("cannot forget blob"))?;
-            self.layout.delete_blob(hash)?;
-        }
-        tx.commit().map_err(store_err("cannot commit delete"))?;
-
-        self.layout.delete_record(id)?;
+        self.layout.write_deletion(id)?;
+        self.complete_deletion(id)?;
+        self.collect_garbage()?;
+        self.layout.delete_deletion(id)?;
         Ok(true)
     }
 
@@ -1052,14 +1096,18 @@ impl History for SqliteStore {
     }
 
     fn save_edits(&mut self, id: &CaptureId, data: &DocumentData) -> Result<()> {
-        let mut record = self.require_record(id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin edit update"))?;
+        let mut record = require_record_for_update(&tx, &self.layout, id)?;
         record.set_document(data)?;
 
         // The durable record first, then the index. The index only caches the
         // count, so the worst a crash between them can do is show a stale
         // number until the next reconcile.
         self.layout.write_record(&record)?;
-        self.conn
+        let changed = tx
             .execute(
                 "UPDATE captures SET annotation_count = ?2 WHERE id = ?1",
                 params![
@@ -1068,15 +1116,24 @@ impl History for SqliteStore {
                 ],
             )
             .map_err(store_err("cannot record edit count"))?;
+        if changed == 0 {
+            return Err(Error::Storage(format!("no capture {} in history", id.0)));
+        }
+        tx.commit()
+            .map_err(store_err("cannot commit edit update"))?;
         Ok(())
     }
 
     fn set_ocr_text(&mut self, id: &CaptureId, text: Option<&str>) -> Result<()> {
-        let mut record = self.require_record(id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin OCR update"))?;
+        let mut record = require_record_for_update(&tx, &self.layout, id)?;
         record.ocr_text = text.map(ToOwned::to_owned);
         self.layout.write_record(&record)?;
 
-        self.conn
+        let changed = tx
             .execute(
                 "UPDATE captures SET ocr_text = ?2, ocr_fold = ?3, search_fold = ?4 WHERE id = ?1",
                 params![
@@ -1087,6 +1144,10 @@ impl History for SqliteStore {
                 ],
             )
             .map_err(store_err("cannot record recognised text"))?;
+        if changed == 0 {
+            return Err(Error::Storage(format!("no capture {} in history", id.0)));
+        }
+        tx.commit().map_err(store_err("cannot commit OCR update"))?;
         Ok(())
     }
 
@@ -1116,8 +1177,8 @@ impl History for SqliteStore {
         };
 
         if total <= policy.max_image_bytes {
-            tx.commit().map_err(store_err("cannot commit retention"))?;
             rewrite_evicted_records(&self.layout, &rewritten, now)?;
+            tx.commit().map_err(store_err("cannot commit retention"))?;
             return Ok(report);
         }
 
@@ -1179,12 +1240,8 @@ impl History for SqliteStore {
             );
         }
 
-        tx.commit().map_err(store_err("cannot commit retention"))?;
-
-        // Durable records last: if this is interrupted, the next open finds a
-        // record claiming pixels that are not there and marks it evicted, which
-        // is the same end state.
         rewrite_evicted_records(&self.layout, &rewritten, now)?;
+        tx.commit().map_err(store_err("cannot commit retention"))?;
 
         Ok(report)
     }
@@ -1352,6 +1409,31 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
     Ok(())
 }
 
+fn require_record_for_update(
+    conn: &Connection,
+    layout: &StoreLayout,
+    id: &CaptureId,
+) -> Result<StoredRecord> {
+    let indexed = conn
+        .query_row(
+            "SELECT 1 FROM captures WHERE id = ?1",
+            params![id.0],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(store_err("cannot inspect history item for update"))?
+        .is_some();
+    if !indexed {
+        return Err(Error::Storage(format!("no capture {} in history", id.0)));
+    }
+    layout.read_record(id)?.ok_or_else(|| {
+        Error::Storage(format!(
+            "history item {} is indexed, but its durable sidecar is missing",
+            id.0
+        ))
+    })
+}
+
 fn drop_rows_without_records(conn: &Connection, keep: &[String]) -> Result<usize> {
     let existing: Vec<String> = {
         let mut stmt = conn
@@ -1374,25 +1456,6 @@ fn drop_rows_without_records(conn: &Connection, keep: &[String]) -> Result<usize
         dropped += 1;
     }
     Ok(dropped)
-}
-
-fn record_file_ids(layout: &StoreLayout) -> Result<HashSet<String>> {
-    let dir = layout.documents_dir();
-    if !dir.is_dir() {
-        return Ok(HashSet::new());
-    }
-    let mut ids = HashSet::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json")
-            && let Some(id) = path.file_stem().and_then(|stem| stem.to_str())
-            && is_valid_id(id)
-        {
-            ids.insert(id.to_owned());
-        }
-    }
-    Ok(ids)
 }
 
 /// Escapes a user's search text so `%` and `_` are literal.

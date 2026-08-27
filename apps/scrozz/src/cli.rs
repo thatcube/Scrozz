@@ -904,11 +904,11 @@ pub enum HistoryCommand {
         id: String,
 
         /// Write the image to this path.
-        #[arg(long, short = 'o', value_name = "PATH")]
+        #[arg(long, short = 'o', value_name = "PATH", conflicts_with = "stdout")]
         output: Option<PathBuf>,
 
         /// Write raw image bytes to stdout.
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long, conflicts_with_all = ["json", "output"])]
         stdout: bool,
     },
 
@@ -1119,7 +1119,7 @@ pub enum HotkeyAction {
     CaptureDisplay,
     /// Capture every display at once.
     CaptureAllDisplays,
-    /// Start recording a region.
+    /// Start recording the active display.
     RecordStart,
     /// Stop the recording in progress.
     RecordStop,
@@ -1165,7 +1165,7 @@ impl HotkeyAction {
             Self::CaptureWindow => &["capture", "--interactive", "window"],
             Self::CaptureDisplay => &["capture", "--display", "active"],
             Self::CaptureAllDisplays => &["capture", "--all-displays"],
-            Self::RecordStart => &["record", "--interactive", "region"],
+            Self::RecordStart => &["record", "--display", "active"],
             Self::RecordStop => &["record", "--stop"],
         }
     }
@@ -1195,7 +1195,7 @@ impl HotkeyAction {
             Self::CaptureWindow => "Capture a window",
             Self::CaptureDisplay => "Capture the display under the pointer",
             Self::CaptureAllDisplays => "Capture every display",
-            Self::RecordStart => "Start recording a region",
+            Self::RecordStart => "Start recording the active display",
             Self::RecordStop => "Stop recording",
         }
     }

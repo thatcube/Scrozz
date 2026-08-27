@@ -23,6 +23,8 @@ pub(crate) struct AacEncoder {
     frame_size: usize,
     pending: Vec<f32>,
     next_input_frame: u64,
+    priming_frames: u32,
+    last_packet_end: Option<i64>,
 }
 
 // The context moves into and remains on one recording worker thread.
@@ -108,11 +110,17 @@ impl AacEncoder {
             frame_size,
             pending: Vec::new(),
             next_input_frame: 0,
+            priming_frames: u32::try_from(context_ref.initial_padding.max(0)).unwrap_or(0),
+            last_packet_end: None,
         })
     }
 
     pub(crate) fn decoder_configuration(&self) -> &[u8] {
         &self.decoder_configuration
+    }
+
+    pub(crate) const fn priming_frames(&self) -> u32 {
+        self.priming_frames
     }
 
     pub(crate) fn push_interleaved(&mut self, samples: &[f32]) -> Result<Vec<EncodedAudioPacket>> {
@@ -210,6 +218,44 @@ impl AacEncoder {
             if status == 0 {
                 // SAFETY: successful receive exposes size readable bytes.
                 let packet_ref = unsafe { &*packet };
+                if packet_ref.pts == ffi::AV_NOPTS_VALUE {
+                    unsafe { ffi::av_packet_free(&mut packet) };
+                    return Err(Error::Codec(
+                        "FFmpeg AAC encoder returned a packet without a timestamp".into(),
+                    ));
+                }
+                let duration_i64 = if packet_ref.duration > 0 {
+                    packet_ref.duration
+                } else {
+                    self.frame_size as i64
+                };
+                let packet_pts = packet_ref.pts;
+                let packet_end = packet_pts.saturating_add(duration_i64);
+                if self
+                    .last_packet_end
+                    .is_some_and(|expected| packet_pts != expected)
+                {
+                    let expected = self.last_packet_end.unwrap_or_default();
+                    unsafe { ffi::av_packet_free(&mut packet) };
+                    return Err(Error::Codec(format!(
+                        "AAC packet timeline is discontinuous: expected frame {expected}, got {packet_pts}"
+                    )));
+                }
+                let shifted_pts = packet_pts.saturating_add(i64::from(self.priming_frames));
+                let start_frame = match u64::try_from(shifted_pts) {
+                    Ok(start_frame) => start_frame,
+                    Err(_) => {
+                        unsafe { ffi::av_packet_free(&mut packet) };
+                        return Err(Error::Codec(format!(
+                            "AAC packet timestamp {packet_pts} precedes the declared {}-frame priming interval",
+                            self.priming_frames
+                        )));
+                    }
+                };
+                let duration = u32::try_from(duration_i64)
+                    .ok()
+                    .filter(|duration| *duration > 0)
+                    .unwrap_or(self.frame_size as u32);
                 let data = unsafe {
                     std::slice::from_raw_parts(
                         packet_ref.data,
@@ -218,13 +264,11 @@ impl AacEncoder {
                     .to_vec()
                 };
                 output.push(EncodedAudioPacket {
-                    start_frame: packet_ref.pts.max(0) as u64,
-                    duration: u32::try_from(packet_ref.duration)
-                        .ok()
-                        .filter(|duration| *duration > 0)
-                        .unwrap_or(self.frame_size as u32),
+                    start_frame,
+                    duration,
                     data,
                 });
+                self.last_packet_end = Some(packet_end);
                 // SAFETY: keeps packet allocation for reuse.
                 unsafe { ffi::av_packet_unref(packet) };
                 continue;

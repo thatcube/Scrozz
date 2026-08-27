@@ -34,9 +34,13 @@ use std::{
 
 use scrozz_core::{CaptureTarget, Error as CoreError};
 use scrozz_record::{
-    MachineEvent, Recording, RecordingMachine, RecordingPhase, RecordingSettings,
-    edit::{EditPlan, SourceMetadata, VideoDocument},
-    transcode::TranscodeFailure,
+    MachineEvent, MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
+    RecordingSettings,
+    edit::{EditOutput, EditPlan, VideoDocument},
+    transcode::{
+        NativeTranscoder, TranscodeEvent, TranscodeFailure, TranscodeJob, TranscodeOutput,
+        TranscodeStatus, Transcoder as _,
+    },
 };
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
@@ -63,9 +67,9 @@ use crate::{
 
 struct FinalisedRecording {
     result: scrozz_core::Result<Recording>,
-    reply: Option<Request>,
 }
 
+#[derive(Clone)]
 enum GuiRecordingCompletion {
     Finished(Report),
     Failed(CliError),
@@ -74,7 +78,24 @@ enum GuiRecordingCompletion {
 struct ActiveVideoEditor {
     document: VideoDocument,
     plan: EditPlan,
+    transcode_job: Option<Box<dyn TranscodeJob>>,
+    transcode_status: Option<TranscodeStatus>,
+    transcode_progress: f32,
+    transcode_output: Option<TranscodeOutput>,
     transcode_failure: Option<TranscodeFailure>,
+}
+
+enum PendingRecordingStart {
+    Settings {
+        target: CaptureTarget,
+        destination: std::path::PathBuf,
+    },
+    Request(RecordingRequest),
+}
+
+struct ArmedRecordingStart {
+    start: PendingRecordingStart,
+    armed_tick: u64,
 }
 
 /// What a hotkey is bound to unless the environment says otherwise.
@@ -231,7 +252,11 @@ pub struct App {
     recording_tick: Instant,
     recording_finalisation: Option<Receiver<FinalisedRecording>>,
     recording_completion: Option<GuiRecordingCompletion>,
+    recording_replies: Vec<Request>,
+    recording_preflight: Option<RecordingHudSnapshot>,
+    pending_recording_start: Option<ArmedRecordingStart>,
     recording_editor: Option<ActiveVideoEditor>,
+    tick_sequence: u64,
 }
 
 impl App {
@@ -335,7 +360,11 @@ impl App {
             recording_tick: Instant::now(),
             recording_finalisation: None,
             recording_completion: None,
+            recording_replies: Vec::new(),
+            recording_preflight: None,
+            pending_recording_start: None,
             recording_editor: None,
+            tick_sequence: 0,
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -351,6 +380,7 @@ impl App {
     /// is already in flight before outcomes are drained, and card events last,
     /// so a card presented on this tick can be acted on immediately.
     pub fn tick(&mut self) -> Tick {
+        self.tick_sequence = self.tick_sequence.saturating_add(1);
         if self.expired() {
             self.note("the run deadline passed");
             return Tick::Stop;
@@ -432,6 +462,24 @@ impl App {
                     if args.control() == Some(RecordControl::Stop)
             ) {
                 self.begin_recording_finalisation(Some(request));
+                continue;
+            }
+
+            if matches!(
+                parsed,
+                Some(Command::Record(ref args))
+                    if args.control().is_none() && !args.dry_run
+            ) {
+                match request.dispatch_without_reply(|command| self.dispatch_gui_recording(command))
+                {
+                    Ok(_) => {
+                        self.recording_replies.push(request);
+                        self.reply_recording_waiters();
+                    }
+                    Err(error) => {
+                        request.serve_with(|_| Err(error));
+                    }
+                }
                 continue;
             }
 
@@ -563,10 +611,15 @@ impl App {
     }
 
     fn toggle_recording(&mut self) {
+        if self.pending_recording_start.take().is_some() {
+            self.note("pending recording start cancelled");
+            return;
+        }
         let Some(phase) = self.recording.as_ref().map(RecordingMachine::phase) else {
-            self.note(
-                "screen recording is unavailable because no native engine advertised video capture",
-            );
+            self.present_recording_error(CliError::Core(CoreError::Unsupported {
+                what: "screen recording".into(),
+                why: "no native engine advertised video capture".into(),
+            }));
             return;
         };
 
@@ -599,25 +652,21 @@ impl App {
 
     fn begin_recording(&mut self) {
         if let Err(error) = (self.recording_permission)() {
-            self.note(format!("recording permission is required: {error}"));
+            self.present_recording_error(error);
             return;
         }
 
         let target = match (self.recording_target)() {
             Ok(target) => target,
             Err(error) => {
-                self.note(format!(
-                    "could not choose the active display to record: {error}"
-                ));
+                self.present_recording_error(error);
                 return;
             }
         };
         let destination = match (self.recording_destination)() {
             Ok(destination) => destination,
             Err(error) => {
-                self.note(format!(
-                    "could not choose a durable recording destination: {error}"
-                ));
+                self.present_recording_error(error);
                 return;
             }
         };
@@ -635,26 +684,31 @@ impl App {
                 .expect("recording availability was checked before resetting")
                 .reset();
             if let Err(error) = result {
-                self.note(format!("could not reset recording state: {error}"));
+                self.present_recording_error(CliError::Core(error));
                 return;
             }
         }
 
+        self.recording_preflight = None;
         self.recording_tick = Instant::now();
         self.recording_completion = None;
-        self.recording_editor = None;
-        let result = self
-            .recording
-            .as_mut()
-            .expect("recording availability was checked before starting")
-            .begin_with_destination(target, destination);
-        self.finish_recording_action(result, "recording countdown started");
+        self.pending_recording_start = Some(ArmedRecordingStart {
+            start: PendingRecordingStart::Settings {
+                target,
+                destination,
+            },
+            armed_tick: self.tick_sequence,
+        });
+        self.note("recording start armed after overlay suppression");
     }
 
     fn finish_recording_action(&mut self, result: scrozz_core::Result<()>, success: &str) {
         match result {
-            Ok(()) => self.note(success),
-            Err(error) => self.note(format!("recording action failed: {error}")),
+            Ok(()) => {
+                self.recording_preflight = None;
+                self.note(success);
+            }
+            Err(error) => self.present_recording_error(CliError::Core(error)),
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
@@ -662,12 +716,53 @@ impl App {
 
     fn advance_recording(&mut self) {
         self.finish_pending_recording();
+        self.advance_video_export();
+        self.start_pending_recording();
         let now = Instant::now();
         let delta = now.saturating_duration_since(self.recording_tick);
         self.recording_tick = now;
 
         if let Some(editor) = &mut self.recording_editor {
             editor.document.tick(delta);
+        }
+
+        fn start_pending_recording(&mut self) {
+            let ready = self
+                .pending_recording_start
+                .as_ref()
+                .is_some_and(|pending| pending.armed_tick < self.tick_sequence);
+            if !ready {
+                return;
+            }
+            let pending = self
+                .pending_recording_start
+                .take()
+                .expect("readiness came from the pending start");
+            let result = match pending.start {
+                PendingRecordingStart::Settings {
+                    target,
+                    destination,
+                } => self
+                    .recording
+                    .as_mut()
+                    .expect("a pending settings start requires a recording machine")
+                    .begin_with_destination(target, destination),
+                PendingRecordingStart::Request(request) => self
+                    .recording
+                    .as_mut()
+                    .expect("a pending configured start requires a recording machine")
+                    .begin_request(request),
+            };
+            if let Err(error) = result {
+                let error = CliError::Core(error);
+                self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
+                self.present_recording_error(error);
+            } else {
+                self.recording_preflight = None;
+                self.note("recording countdown started");
+            }
+            self.drain_recording_events();
+            self.refresh_recording_tray();
         }
         let result = self.recording.as_mut().map(|machine| machine.tick(delta));
         if let Some(Err(error)) = result {
@@ -683,6 +778,54 @@ impl App {
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
+    }
+
+    fn advance_video_export(&mut self) {
+        let Some(editor) = self.recording_editor.as_mut() else {
+            return;
+        };
+        let Some(job) = editor.transcode_job.as_mut() else {
+            return;
+        };
+        let mut terminal = false;
+        for _ in 0..64 {
+            let Some(event) = job.poll() else {
+                break;
+            };
+            match event {
+                TranscodeEvent::Progress(progress) => {
+                    editor.transcode_progress = progress;
+                    editor.transcode_status = Some(TranscodeStatus::Running { progress });
+                }
+                TranscodeEvent::Finished(output) => {
+                    editor.transcode_progress = 1.0;
+                    editor.transcode_output = Some(output);
+                    editor.transcode_failure = None;
+                    editor.transcode_status = Some(TranscodeStatus::Finished);
+                    terminal = true;
+                    break;
+                }
+                TranscodeEvent::Failed(failure) => {
+                    editor.transcode_output = None;
+                    editor.transcode_failure = Some(failure);
+                    editor.transcode_status = Some(TranscodeStatus::Failed);
+                    terminal = true;
+                    break;
+                }
+                TranscodeEvent::Cancelled(partial) => {
+                    editor.transcode_output = partial;
+                    editor.transcode_failure = None;
+                    editor.transcode_status = Some(TranscodeStatus::Cancelled);
+                    terminal = true;
+                    break;
+                }
+            }
+        }
+        if terminal {
+            editor.transcode_job = None;
+        } else {
+            editor.transcode_status = Some(job.status());
+        }
     }
 
     fn dispatch_gui_recording(&mut self, command: &Command) -> CliResult<Report> {
@@ -734,8 +877,25 @@ impl App {
                 }
                 let prepared = commands::prepare_recording_args(args)?;
                 let report = prepared.started_report();
+                if self
+                    .recording_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.transcode_job.is_some())
+                {
+                    return Err(CliError::Core(CoreError::InvalidRequest(
+                        "cancel the active export before starting another recording".into(),
+                    )));
+                }
                 self.recording_editor = None;
-                machine.begin_request(prepared.request)?;
+                if self.pending_recording_start.is_some() || machine.is_active() {
+                    return Err(CliError::Core(CoreError::InvalidRequest(
+                        "a recording start is already pending or active".into(),
+                    )));
+                }
+                self.pending_recording_start = Some(ArmedRecordingStart {
+                    start: PendingRecordingStart::Request(prepared.request),
+                    armed_tick: self.tick_sequence,
+                });
                 self.recording_tick = Instant::now();
                 self.recording_completion = None;
                 self.drain_recording_events();
@@ -746,6 +906,17 @@ impl App {
     }
 
     fn begin_recording_finalisation(&mut self, reply: Option<Request>) {
+        if self.pending_recording_start.take().is_some() {
+            if let Some(reply) = reply {
+                self.recording_replies.push(reply);
+            }
+            self.recording_completion = Some(GuiRecordingCompletion::Failed(CliError::Core(
+                CoreError::Cancelled,
+            )));
+            self.note("pending recording start cancelled before native capture");
+            self.reply_recording_waiters();
+            return;
+        }
         let result = self
             .recording
             .as_mut()
@@ -768,6 +939,9 @@ impl App {
 
         let (send, receive) = mpsc::channel();
         self.recording_finalisation = Some(receive);
+        if let Some(reply) = reply {
+            self.recording_replies.push(reply);
+        }
         self.note("recording finalisation started");
         std::thread::spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| session.stop())).unwrap_or_else(|_| {
@@ -775,7 +949,7 @@ impl App {
                     "the native recording finaliser panicked".into(),
                 ))
             });
-            let _ = send.send(FinalisedRecording { result, reply });
+            let _ = send.send(FinalisedRecording { result });
         });
         self.drain_recording_events();
         self.refresh_recording_tray();
@@ -814,16 +988,6 @@ impl App {
             self.note(format!("could not finish recording state: {error}"));
         }
         self.drain_recording_events();
-        if let Some(request) = message.reply {
-            let completion = self.recording_completion.take();
-            request.serve_with(|_| match completion {
-                Some(GuiRecordingCompletion::Finished(report)) => Ok(report),
-                Some(GuiRecordingCompletion::Failed(error)) => Err(error),
-                None => Err(CliError::Core(CoreError::Platform(
-                    "recording ended without a completion report".into(),
-                ))),
-            });
-        }
     }
 
     fn drain_recording_events(&mut self) {
@@ -871,6 +1035,24 @@ impl App {
                     }
                 }
             }
+        }
+        self.reply_recording_waiters();
+    }
+
+    fn reply_recording_waiters(&mut self) {
+        if self.recording_replies.is_empty() {
+            return;
+        }
+        let completion = match self.recording_completion.clone() {
+            Some(completion) => completion,
+            None => return,
+        };
+        for request in self.recording_replies.drain(..) {
+            let completion = completion.clone();
+            request.serve_with(|_| match completion {
+                GuiRecordingCompletion::Finished(report) => Ok(report),
+                GuiRecordingCompletion::Failed(error) => Err(error),
+            });
         }
     }
 
@@ -924,6 +1106,32 @@ impl App {
         self.notes.push(what);
     }
 
+    fn present_recording_error(&mut self, error: CliError) {
+        let core = error
+            .core_error()
+            .cloned()
+            .unwrap_or_else(|| CoreError::Platform(error.to_string()));
+        let capabilities = self
+            .recording
+            .as_ref()
+            .map(RecordingMachine::capabilities)
+            .unwrap_or_default();
+        self.recording_preflight = Some(RecordingHudSnapshot {
+            phase: RecordingPhase::Failed,
+            elapsed: Duration::ZERO,
+            capabilities,
+            warning: None,
+            drift: None,
+            output: None,
+            failure: Some(MachineFailure {
+                error: Arc::new(core),
+                partial: None,
+                recovery_error: None,
+            }),
+        });
+        self.note(format!("recording action failed: {error}"));
+    }
+
     fn ensure_recording_permission() -> CliResult<()> {
         let permissions = SystemPermissions::new();
         if !permissions.is_granted(Capability::ScreenRecording) {
@@ -941,20 +1149,51 @@ impl App {
     /// Recording state rendered by the shared overlay.
     #[must_use]
     pub fn recording_presentation(&self) -> Option<RecordingPresentation> {
+        if let Some(hud) = &self.recording_preflight {
+            let suppress_all_overlays = cfg!(any(target_os = "linux", target_os = "windows"))
+                && self.recording.as_ref().is_some_and(|machine| {
+                    matches!(
+                        machine.phase(),
+                        RecordingPhase::Recording
+                            | RecordingPhase::Paused
+                            | RecordingPhase::Finalising
+                    )
+                });
+            return Some(RecordingPresentation {
+                hud: hud.clone(),
+                countdown: RecordingSettings::shipped().countdown,
+                countdown_remaining: Duration::ZERO,
+                suppress_all_overlays,
+                editor: None,
+            });
+        }
         let machine = self.recording.as_ref()?;
-        if machine.phase() == RecordingPhase::Idle && self.recording_editor.is_none() {
+        if machine.phase() == RecordingPhase::Idle
+            && self.recording_editor.is_none()
+            && self.pending_recording_start.is_none()
+        {
             return None;
         }
+        let suppress_all_overlays = cfg!(any(target_os = "linux", target_os = "windows"))
+            && (self.pending_recording_start.is_some()
+                || matches!(
+                    machine.phase(),
+                    RecordingPhase::Recording | RecordingPhase::Paused | RecordingPhase::Finalising
+                ));
         Some(RecordingPresentation {
             hud: RecordingHudSnapshot::from_machine(machine),
             countdown: machine.settings().countdown,
             countdown_remaining: machine.countdown_remaining(),
+            suppress_all_overlays,
             editor: self
                 .recording_editor
                 .as_ref()
                 .map(|editor| VideoEditorSnapshot {
                     document: editor.document.clone(),
                     plan: editor.plan,
+                    transcode_status: editor.transcode_status,
+                    transcode_progress: editor.transcode_progress,
+                    transcode_output: editor.transcode_output.clone(),
                     transcode_failure: editor.transcode_failure.clone(),
                 }),
         })
@@ -973,6 +1212,22 @@ impl App {
     fn handle_recording_hud_action(&mut self, action: RecordingHudAction) {
         match action {
             RecordingHudAction::Dismiss => {
+                if self.recording_preflight.take().is_some() {
+                    let reset = self.recording.as_mut().and_then(|machine| {
+                        matches!(
+                            machine.phase(),
+                            RecordingPhase::Finished | RecordingPhase::Failed
+                        )
+                        .then(|| machine.reset())
+                    });
+                    if let Some(Err(error)) = reset {
+                        self.note(format!(
+                            "could not reset recording state after dismissing its error: {error}"
+                        ));
+                    }
+                    self.note("recording error dismissed");
+                    return;
+                }
                 self.recording_editor = None;
                 let result = self.recording.as_mut().ok_or_else(|| {
                     CoreError::InvalidRequest("no recording state is available".into())
@@ -1019,6 +1274,14 @@ impl App {
 
     fn handle_video_editor_action(&mut self, action: VideoEditorAction) {
         if action == VideoEditorAction::Close {
+            if self
+                .recording_editor
+                .as_ref()
+                .is_some_and(|editor| editor.transcode_job.is_some())
+            {
+                self.note("cancel the active export before closing the video editor");
+                return;
+            }
             self.recording_editor = None;
             if let Some(machine) = self.recording.as_mut()
                 && matches!(
@@ -1048,25 +1311,53 @@ impl App {
             }
             VideoEditorAction::PlanChanged(plan) => {
                 editor.plan = plan;
+                editor.transcode_status = None;
+                editor.transcode_progress = 0.0;
+                editor.transcode_output = None;
                 editor.transcode_failure = None;
             }
             VideoEditorAction::Export(plan) => {
                 editor.plan = plan;
-                let error = CoreError::Unsupported {
-                    what: "video export".into(),
-                    why: "this build has no native transcoder; the source recording was left unchanged"
-                        .into(),
-                };
-                editor.transcode_failure = Some(TranscodeFailure {
-                    error: Arc::new(error),
-                    partial: None,
-                });
+                editor.transcode_progress = 0.0;
+                editor.transcode_output = None;
+                editor.transcode_failure = None;
+                let output = edited_output_path(&editor.document, &plan);
+                match output
+                    .and_then(|path| NativeTranscoder::new().start(&editor.document, &plan, path))
+                {
+                    Ok(job) => {
+                        editor.transcode_status = Some(job.status());
+                        editor.transcode_job = Some(job);
+                    }
+                    Err(error) => {
+                        editor.transcode_status = Some(TranscodeStatus::Failed);
+                        editor.transcode_failure = Some(TranscodeFailure {
+                            error: Arc::new(error),
+                            partial: None,
+                        });
+                    }
+                }
             }
             VideoEditorAction::CancelExport => {
-                self.note("there is no native video export job to cancel");
+                if let Some(job) = editor.transcode_job.as_mut()
+                    && let Err(error) = job.cancel()
+                {
+                    self.note(format!("could not cancel video export: {error}"));
+                }
             }
             VideoEditorAction::RevealOutput | VideoEditorAction::RevealPartialOutput => {
-                let path = Some(editor.document.recording().path().to_path_buf());
+                let path = editor
+                    .transcode_output
+                    .as_ref()
+                    .map(|output| output.path.clone())
+                    .or_else(|| {
+                        editor
+                            .transcode_failure
+                            .as_ref()
+                            .and_then(|failure| failure.partial.as_ref())
+                            .map(|output| output.path.clone())
+                    })
+                    .or_else(|| Some(editor.document.recording().path().to_path_buf()));
                 self.reveal_recording_path(path);
             }
         }
@@ -1239,38 +1530,53 @@ fn reveal_with(command: &mut std::process::Command, application: &str) -> scrozz
 
 fn active_video_editor(
     output: &Recording,
-    requested_fps: Option<u32>,
+    _requested_fps: Option<u32>,
 ) -> scrozz_core::Result<Option<ActiveVideoEditor>> {
     output.require_native()?;
     if !output.is_playable() {
         return Ok(None);
     }
-    let size = output.metadata.size.ok_or_else(|| {
-        CoreError::Codec("the native engine did not report encoded dimensions".into())
-    })?;
-    let fps = output
-        .metadata
-        .frames
-        .filter(|frames| *frames > 0 && output.duration_secs > 0.0)
-        .map(|frames| frames as f64 / output.duration_secs)
-        .or_else(|| requested_fps.map(f64::from))
-        .ok_or_else(|| {
-            CoreError::Codec("the native engine did not report a usable frame rate".into())
-        })?;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let metadata = SourceMetadata {
-        width: size.width.round() as u32,
-        height: size.height.round() as u32,
-        fps,
-        audio_channels: output.metadata.audio_channels.unwrap_or(0),
-    };
-    let document = VideoDocument::open(output.clone(), metadata)?;
+    let document = VideoDocument::open_native(output.clone())?;
     let plan = EditPlan::video(&document)?;
     Ok(Some(ActiveVideoEditor {
         document,
         plan,
+        transcode_job: None,
+        transcode_status: None,
+        transcode_progress: 0.0,
+        transcode_output: None,
         transcode_failure: None,
     }))
+}
+
+fn edited_output_path(
+    document: &VideoDocument,
+    plan: &EditPlan,
+) -> scrozz_core::Result<std::path::PathBuf> {
+    let source = document.recording().path();
+    let parent = source.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("recording");
+    let extension = match plan.output {
+        EditOutput::Video => "mp4",
+        EditOutput::Animation(format) => format.extension(),
+    };
+    for suffix in 0..1_000 {
+        let name = if suffix == 0 {
+            format!("{stem}-edited.{extension}")
+        } else {
+            format!("{stem}-edited-{suffix}.{extension}")
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(CoreError::Storage(
+        "could not allocate a collision-free edited recording path".into(),
+    ))
 }
 
 fn recording_machine_report(
@@ -1480,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn native_playable_output_opens_an_editor_but_initialisation_only_does_not() {
+    fn editor_requires_real_decodable_media_and_rejects_initialisation_only_output() {
         let metadata = scrozz_record::RecordingMetadata {
             size: Some(scrozz_core::PhysicalSize::new(1920.0, 1080.0)),
             frames: Some(300),
@@ -1491,9 +1797,10 @@ mod tests {
             .unwrap()
             .with_native_details(CaptureTarget::AllDisplays, metadata.clone())
             .unwrap();
-        let editor = active_video_editor(&native, None).unwrap().unwrap();
-        assert_eq!(editor.document.metadata().fps, 30.0);
-        assert_eq!(editor.document.metadata().audio_channels, 2);
+        assert!(
+            active_video_editor(&native, None).is_err(),
+            "summary metadata must not make a nonexistent file look playable"
+        );
 
         let partial = scrozz_record::Recording::native_partial_with_salvageability(
             "header-only.mp4",
@@ -1509,8 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_reports_native_transcoder_unavailability_without_mocking_export() {
-        let (mut app, _) = app();
+    fn editor_never_falls_back_to_mock_media() {
         let native = scrozz_record::Recording::native("real.mp4", 4.0, "native-test")
             .unwrap()
             .with_native_details(
@@ -1523,20 +1829,7 @@ mod tests {
                 },
             )
             .unwrap();
-        app.recording_editor = active_video_editor(&native, None).unwrap();
-        let plan = app.recording_editor.as_ref().unwrap().plan;
-
-        app.handle_recording_surface_action(RecordingSurfaceAction::Editor(
-            VideoEditorAction::Export(plan),
-        ));
-
-        let failure = app
-            .recording_editor
-            .as_ref()
-            .and_then(|editor| editor.transcode_failure.as_ref())
-            .expect("export must report the missing native transcoder");
-        assert!(failure.error.to_string().contains("no native transcoder"));
-        assert!(failure.partial.is_none());
+        assert!(active_video_editor(&native, None).is_err());
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl RecordingEngine for LinuxEngine {
 
 #[cfg(feature = "linux-native")]
 mod native {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs::{DirBuilder, File, OpenOptions};
     use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -61,7 +61,7 @@ mod native {
 
     use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 
-    use super::source::{PipeWireAudio, VideoSource, open_video_source};
+    use super::source::{AudioBatch, PipeWireAudio, VideoSource, open_video_source};
     use crate::audio::{AudioBuffer, AudioMixer};
     use crate::config::{RecordingConfig, resolve_dimensions};
     use crate::encoder::aac::{AacEncoder, EncodedAudioPacket};
@@ -84,6 +84,10 @@ mod native {
     const SESSION_RECORDING: u8 = 0;
     const SESSION_PAUSED: u8 = 1;
     const SESSION_STOPPED: u8 = 2;
+    const MIX_LATENCY_FRAMES: u64 = 12_000;
+    const MIX_CHUNK_FRAMES: u64 = 4_800;
+    const MAX_MIX_CHUNKS_PER_POLL: usize = 16;
+    const MAX_AUDIO_TIMELINE_GAP_FRAMES: u64 = 48_000;
 
     enum Control {
         Pause(SyncSender<Result<()>>),
@@ -473,7 +477,7 @@ mod native {
         resolved_codec: VideoCodec,
         audio_source: Option<PipeWireAudio>,
         audio_encoder: Option<AacEncoder>,
-        audio_mixer: AudioMixer,
+        audio_watermark: AudioWatermarkMixer,
         audio_cursor: u64,
         audio_frame_offset: Option<i128>,
         microphone_samples: bool,
@@ -482,10 +486,184 @@ mod native {
         muxer: Option<FragmentedMp4<File>>,
         temporary_output: Option<TemporaryOutput>,
         state: RecordingStateMachine,
-        pending_video: Option<EncodedVideoPacket>,
+        pending_video: Option<TimedVideoPacket>,
+        submitted_video_times: BTreeMap<u64, u64>,
+        last_timeline_frame_end: u64,
         pending_audio: VecDeque<EncodedAudioPacket>,
         fragments_written: u64,
         frames_submitted: u64,
+    }
+
+    struct TimedVideoPacket {
+        packet: EncodedVideoPacket,
+        timeline_frame: u64,
+    }
+
+    struct AudioWatermarkMixer {
+        mixer: AudioMixer,
+        enabled: [bool; 2],
+        tracks: [VecDeque<AudioBuffer>; 2],
+        cursor: Option<u64>,
+        committed: bool,
+    }
+
+    impl AudioWatermarkMixer {
+        fn new(microphone: bool, system: bool) -> Self {
+            Self {
+                mixer: AudioMixer::new(AacEncoder::SAMPLE_RATE),
+                enabled: [microphone, system],
+                tracks: std::array::from_fn(|_| VecDeque::new()),
+                cursor: None,
+                committed: false,
+            }
+        }
+
+        fn push(&mut self, batch: AudioBatch) -> Result<()> {
+            self.push_track(0, batch.microphone)?;
+            self.push_track(1, batch.system)
+        }
+
+        fn push_track(&mut self, index: usize, buffers: Vec<AudioBuffer>) -> Result<()> {
+            if !self.enabled[index] {
+                return Ok(());
+            }
+            for buffer in buffers {
+                validate_linux_audio(&buffer)?;
+                if self.tracks[index]
+                    .back()
+                    .is_some_and(|previous| audio_buffer_end(previous) > buffer.start_frame)
+                {
+                    return Err(Error::Platform(
+                        "PipeWire delivered out-of-order audio buffers".into(),
+                    ));
+                }
+                if !self.committed {
+                    self.cursor = Some(
+                        self.cursor
+                            .map_or(buffer.start_frame, |cursor| cursor.min(buffer.start_frame)),
+                    );
+                }
+                self.tracks[index].push_back(buffer);
+            }
+            Ok(())
+        }
+
+        fn next(&mut self, finalising: bool) -> Result<Option<AudioBuffer>> {
+            let Some(cursor) = self.cursor else {
+                return Ok(None);
+            };
+            let ends: [Option<u64>; 2] = std::array::from_fn(|index| {
+                self.enabled[index]
+                    .then(|| self.tracks[index].back().map(audio_buffer_end))
+                    .flatten()
+            });
+            let Some(leader) = ends.iter().flatten().copied().max() else {
+                return Ok(None);
+            };
+            let every_source_ready = self
+                .enabled
+                .iter()
+                .enumerate()
+                .all(|(index, enabled)| !enabled || ends[index].is_some());
+            let natural = every_source_ready.then(|| {
+                ends.iter()
+                    .enumerate()
+                    .filter_map(|(index, end)| self.enabled[index].then_some(*end).flatten())
+                    .min()
+                    .unwrap_or(cursor)
+            });
+            let deadline = leader.saturating_sub(MIX_LATENCY_FRAMES);
+            let watermark = if finalising {
+                leader
+            } else {
+                natural.map_or(deadline, |natural| natural.max(deadline))
+            };
+            if watermark <= cursor {
+                return Ok(None);
+            }
+            let end = watermark.min(cursor.saturating_add(MIX_CHUNK_FRAMES));
+            let microphone = self.enabled[0]
+                .then(|| audio_window(&self.tracks[0], cursor, end))
+                .transpose()?;
+            let system = self.enabled[1]
+                .then(|| audio_window(&self.tracks[1], cursor, end))
+                .transpose()?;
+            let mixed = self.mixer.mix(microphone.as_ref(), system.as_ref())?;
+            self.cursor = Some(end);
+            self.committed = true;
+            for track in &mut self.tracks {
+                while track
+                    .front()
+                    .is_some_and(|buffer| audio_buffer_end(buffer) <= end)
+                {
+                    track.pop_front();
+                }
+            }
+            Ok(Some(mixed))
+        }
+
+        fn reset(&mut self) {
+            for track in &mut self.tracks {
+                track.clear();
+            }
+            self.cursor = None;
+            self.committed = false;
+        }
+    }
+
+    fn validate_linux_audio(buffer: &AudioBuffer) -> Result<()> {
+        if buffer.sample_rate != AacEncoder::SAMPLE_RATE
+            || !matches!(buffer.channels, 1 | 2)
+            || !buffer
+                .samples
+                .len()
+                .is_multiple_of(usize::from(buffer.channels))
+        {
+            return Err(Error::Platform(
+                "PipeWire delivered malformed or non-48kHz audio".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn audio_buffer_end(buffer: &AudioBuffer) -> u64 {
+        buffer
+            .start_frame
+            .saturating_add(buffer.samples.len() as u64 / u64::from(buffer.channels.max(1)))
+    }
+
+    fn audio_window(buffers: &VecDeque<AudioBuffer>, start: u64, end: u64) -> Result<AudioBuffer> {
+        let frames = usize::try_from(end.saturating_sub(start))
+            .map_err(|_| Error::Platform("PipeWire audio mix window exceeds memory".into()))?;
+        let mut samples = vec![0.0_f32; frames.saturating_mul(2)];
+        for buffer in buffers {
+            let buffer_end = audio_buffer_end(buffer);
+            let overlap_start = start.max(buffer.start_frame);
+            let overlap_end = end.min(buffer_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            for source_frame in overlap_start..overlap_end {
+                let source_index = usize::try_from(source_frame - buffer.start_frame)
+                    .map_err(|_| Error::Platform("PipeWire audio offset exceeds memory".into()))?;
+                let output_index = usize::try_from(source_frame - start)
+                    .map_err(|_| Error::Platform("PipeWire audio offset exceeds memory".into()))?;
+                if buffer.channels == 1 {
+                    let sample = buffer.samples[source_index];
+                    samples[output_index * 2] = sample;
+                    samples[output_index * 2 + 1] = sample;
+                } else {
+                    samples[output_index * 2] = buffer.samples[source_index * 2];
+                    samples[output_index * 2 + 1] = buffer.samples[source_index * 2 + 1];
+                }
+            }
+        }
+        Ok(AudioBuffer {
+            sample_rate: AacEncoder::SAMPLE_RATE,
+            channels: 2,
+            start_frame: start,
+            samples,
+        })
     }
 
     impl Worker {
@@ -538,6 +716,7 @@ mod native {
                 sample_rate: AacEncoder::SAMPLE_RATE,
                 channels: AacEncoder::CHANNELS,
                 audio_specific_config: encoder.decoder_configuration().to_vec(),
+                priming_frames: encoder.priming_frames(),
             });
             let OpenedDestination {
                 path: destination,
@@ -550,13 +729,19 @@ mod native {
                 Ok(muxer) => muxer,
                 Err(error) => {
                     return startup_write_failure(
-                        &config,
-                        destination,
-                        dimensions,
-                        resolved_codec,
-                        engine_name,
-                        resolved_target,
-                        u16::from(audio_encoder.is_some()) * 2,
+                        FinalReport {
+                            path: destination,
+                            duration_secs: 0.0,
+                            engine_name,
+                            target: resolved_target,
+                            dimensions,
+                            frames: 0,
+                            audio_channels: u16::from(audio_encoder.is_some()) * 2,
+                            codec: resolved_codec,
+                            quality: config.quality,
+                            resolution: config.resolution,
+                            partial: None,
+                        },
                         temporary,
                         Error::Io(error),
                     );
@@ -565,13 +750,19 @@ mod native {
             if let Err(error) = muxer.writer().sync_data() {
                 drop(muxer);
                 return startup_write_failure(
-                    &config,
-                    destination,
-                    dimensions,
-                    resolved_codec,
-                    engine_name,
-                    resolved_target,
-                    u16::from(audio_encoder.is_some()) * 2,
+                    FinalReport {
+                        path: destination,
+                        duration_secs: 0.0,
+                        engine_name,
+                        target: resolved_target,
+                        dimensions,
+                        frames: 0,
+                        audio_channels: u16::from(audio_encoder.is_some()) * 2,
+                        codec: resolved_codec,
+                        quality: config.quality,
+                        resolution: config.resolution,
+                        partial: None,
+                    },
                     temporary,
                     Error::Io(error),
                 );
@@ -589,6 +780,7 @@ mod native {
                 path = %destination.display(),
                 "Linux recording started"
             );
+            let audio_watermark = AudioWatermarkMixer::new(config.microphone, config.system_audio);
 
             Ok(WorkerStartup::Ready(Box::new(Self {
                 config,
@@ -601,7 +793,7 @@ mod native {
                 resolved_codec,
                 audio_source,
                 audio_encoder: audio_encoder.take(),
-                audio_mixer: AudioMixer::new(AacEncoder::SAMPLE_RATE),
+                audio_watermark,
                 audio_cursor: 0,
                 audio_frame_offset: None,
                 microphone_samples: false,
@@ -611,6 +803,8 @@ mod native {
                 temporary_output: temporary,
                 state,
                 pending_video: None,
+                submitted_video_times: BTreeMap::new(),
+                last_timeline_frame_end: 0,
                 pending_audio: VecDeque::new(),
                 fragments_written: 0,
                 frames_submitted: 0,
@@ -630,7 +824,6 @@ mod native {
             let interval =
                 Duration::from_nanos(1_000_000_000_u64 / u64::from(self.config.fps.get()));
             let mut next_capture = started;
-            let mut last_frame: Option<Nv12Frame> = None;
             let mut failure: Option<String> = None;
             let mut user_stopped = false;
             let mut first_frame_signalled = false;
@@ -743,7 +936,7 @@ mod native {
                     next_capture = Instant::now();
                 }
 
-                if let Err(error) = self.capture_audio() {
+                if let Err(error) = self.capture_audio(false) {
                     failure = Some(error.to_string());
                     break;
                 }
@@ -760,23 +953,13 @@ mod native {
                 publish_elapsed(elapsed_nanos, media_time);
                 match pacer.observe(media_time) {
                     PacingDecision::Drop => {}
-                    PacingDecision::Emit {
-                        repeat_previous, ..
-                    } => {
-                        if let Some(previous) = &last_frame {
-                            for _ in 0..repeat_previous {
-                                if let Err(error) = self.encode_video(previous) {
-                                    failure = Some(error.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        if failure.is_some() {
-                            break;
-                        }
+                    PacingDecision::Emit { frame_index, .. } => {
+                        self.last_timeline_frame_end = self
+                            .last_timeline_frame_end
+                            .max(frame_index.saturating_add(1));
                         match to_nv12(&captured, self.dimensions) {
                             Ok(frame) => {
-                                if let Err(error) = self.encode_video(&frame) {
+                                if let Err(error) = self.encode_video(&frame, frame_index) {
                                     failure = Some(error.to_string());
                                     break;
                                 }
@@ -784,7 +967,6 @@ mod native {
                                     let _ = signals.send(WorkerSignal::FirstFrame);
                                     first_frame_signalled = true;
                                 }
-                                last_frame = Some(frame);
                             }
                             Err(error) => {
                                 failure = Some(error.to_string());
@@ -843,6 +1025,7 @@ mod native {
                     if result.is_ok() {
                         self.audio_suspended = false;
                         self.audio_frame_offset = None;
+                        self.audio_watermark.reset();
                         session_state.store(SESSION_RECORDING, Ordering::Release);
                     }
                     let _ = reply.send(result);
@@ -855,48 +1038,78 @@ mod native {
             }
         }
 
-        fn capture_audio(&mut self) -> Result<()> {
+        fn capture_audio(&mut self, finalising: bool) -> Result<()> {
             let Some(source) = &mut self.audio_source else {
                 return Ok(());
             };
-            let (microphone, system) = source.poll()?;
-            self.microphone_samples |= microphone
-                .as_ref()
-                .is_some_and(|buffer| !buffer.samples.is_empty());
-            self.system_audio_samples |= system
-                .as_ref()
-                .is_some_and(|buffer| !buffer.samples.is_empty());
-            let mixed = self.audio_mixer.mix(microphone.as_ref(), system.as_ref())?;
-            if mixed.samples.is_empty() {
-                return Ok(());
-            }
-            let samples = align_audio_to_timeline(
-                mixed,
-                &mut self.audio_cursor,
-                &mut self.audio_frame_offset,
-            )?;
-            if samples.is_empty() {
-                return Ok(());
-            }
-            if let Some(encoder) = &mut self.audio_encoder {
-                self.pending_audio
-                    .extend(encoder.push_interleaved(&samples)?);
-            }
-            Ok(())
-        }
-
-        fn encode_video(&mut self, frame: &Nv12Frame) -> Result<()> {
-            let packets = self.video_encoder.encode(frame)?;
-            self.frames_submitted = self.frames_submitted.saturating_add(1);
-            for packet in packets {
-                if let Some(previous) = self.pending_video.replace(packet) {
-                    self.write_fragment(previous)?;
+            let batch = source.poll()?;
+            self.microphone_samples |= batch
+                .microphone
+                .iter()
+                .any(|buffer| !buffer.samples.is_empty());
+            self.system_audio_samples |=
+                batch.system.iter().any(|buffer| !buffer.samples.is_empty());
+            self.audio_watermark.push(batch)?;
+            let mut emitted = 0;
+            while let Some(mixed) = self.audio_watermark.next(finalising)? {
+                emitted += 1;
+                if emitted > MAX_MIX_CHUNKS_PER_POLL {
+                    return Err(Error::Platform(
+                        "PipeWire audio drain exceeded its per-poll work bound".into(),
+                    ));
+                }
+                let samples = align_audio_to_timeline(
+                    mixed,
+                    &mut self.audio_cursor,
+                    &mut self.audio_frame_offset,
+                )?;
+                if samples.is_empty() {
+                    continue;
+                }
+                if let Some(encoder) = &mut self.audio_encoder {
+                    self.pending_audio
+                        .extend(encoder.push_interleaved(&samples)?);
                 }
             }
             Ok(())
         }
 
-        fn write_fragment(&mut self, video: EncodedVideoPacket) -> Result<()> {
+        fn encode_video(&mut self, frame: &Nv12Frame, timeline_frame: u64) -> Result<()> {
+            let input_frame = self.frames_submitted;
+            self.submitted_video_times
+                .insert(input_frame, timeline_frame);
+            let packets = self.video_encoder.encode(frame)?;
+            self.frames_submitted = self.frames_submitted.saturating_add(1);
+            for packet in packets {
+                self.queue_video_packet(packet)?;
+            }
+            Ok(())
+        }
+
+        fn queue_video_packet(&mut self, packet: EncodedVideoPacket) -> Result<()> {
+            let timeline_frame = self
+                .submitted_video_times
+                .remove(&packet.frame_index)
+                .ok_or_else(|| {
+                    Error::Codec(format!(
+                        "video encoder returned unknown input frame {}",
+                        packet.frame_index
+                    ))
+                })?;
+            let current = TimedVideoPacket {
+                packet,
+                timeline_frame,
+            };
+            if let Some(previous) = self.pending_video.replace(current) {
+                let duration = timeline_frame
+                    .saturating_sub(previous.timeline_frame)
+                    .max(1);
+                self.write_fragment(previous, duration)?;
+            }
+            Ok(())
+        }
+
+        fn write_fragment(&mut self, video: TimedVideoPacket, duration: u64) -> Result<()> {
             let audio = if self.pending_audio.is_empty() {
                 None
             } else {
@@ -916,11 +1129,13 @@ mod native {
             };
             let fragment = MediaFragment {
                 video: TrackFragment {
-                    base_decode_time: video.frame_index,
+                    base_decode_time: video.timeline_frame,
                     samples: vec![EncodedSample {
-                        data: video.data,
-                        duration: 1,
-                        keyframe: video.keyframe,
+                        data: video.packet.data,
+                        duration: u32::try_from(duration).map_err(|_| {
+                            Error::Codec("video sample duration exceeds ISO-BMFF storage".into())
+                        })?,
+                        keyframe: video.packet.keyframe,
                     }],
                 },
                 audio,
@@ -942,7 +1157,7 @@ mod native {
             mut failure: Option<String>,
         ) -> Result<Recording> {
             if !self.audio_suspended {
-                match self.capture_audio() {
+                match self.capture_audio(true) {
                     Ok(()) => {}
                     Err(error) => append_failure(&mut failure, error),
                 }
@@ -953,9 +1168,7 @@ mod native {
             match self.video_encoder.finish() {
                 Ok(packets) => {
                     for packet in packets {
-                        if let Some(previous) = self.pending_video.replace(packet)
-                            && let Err(error) = self.write_fragment(previous)
-                        {
+                        if let Err(error) = self.queue_video_packet(packet) {
                             append_failure(&mut failure, error);
                             break;
                         }
@@ -969,10 +1182,14 @@ mod native {
                     Err(error) => append_failure(&mut failure, error),
                 }
             }
-            if let Some(video) = self.pending_video.take()
-                && let Err(error) = self.write_fragment(video)
-            {
-                append_failure(&mut failure, error);
+            if let Some(video) = self.pending_video.take() {
+                let duration = self
+                    .last_timeline_frame_end
+                    .saturating_sub(video.timeline_frame)
+                    .max(1);
+                if let Err(error) = self.write_fragment(video, duration) {
+                    append_failure(&mut failure, error);
+                }
             }
 
             if let Some(muxer) = self.muxer.take() {
@@ -1057,17 +1274,11 @@ mod native {
     }
 
     fn startup_write_failure(
-        config: &RecordingConfig,
-        path: PathBuf,
-        dimensions: crate::config::Dimensions,
-        codec: VideoCodec,
-        engine_name: String,
-        target: Option<CaptureTarget>,
-        audio_channels: u16,
+        mut report: FinalReport,
         temporary_output: Option<TemporaryOutput>,
         error: Error,
     ) -> Result<WorkerStartup> {
-        let salvageability = match recover_partial_output(&path) {
+        let salvageability = match recover_partial_output(&report.path) {
             Ok(salvageability) => salvageability,
             Err(recovery_error) => {
                 if let Some(output) = temporary_output.as_ref()
@@ -1081,22 +1292,11 @@ mod native {
                 )));
             }
         };
-        let recording = build_recording_report(FinalReport {
-            path,
-            duration_secs: 0.0,
-            engine_name,
-            target,
-            dimensions,
-            frames: 0,
-            audio_channels,
-            codec,
-            quality: config.quality,
-            resolution: config.resolution,
-            partial: Some((
-                salvageability,
-                format!("recording initialisation failed: {error}"),
-            )),
-        })?;
+        report.partial = Some((
+            salvageability,
+            format!("recording initialisation failed: {error}"),
+        ));
+        let recording = build_recording_report(report)?;
         Ok(WorkerStartup::Retained {
             recording: Box::new(recording),
             temporary_output,
@@ -1406,6 +1606,11 @@ mod native {
             mapped_start = *cursor;
         }
         let gap_frames = mapped_start - *cursor;
+        if gap_frames > MAX_AUDIO_TIMELINE_GAP_FRAMES {
+            return Err(Error::Platform(format!(
+                "PipeWire audio timeline jumped forward by {gap_frames} frames"
+            )));
+        }
         let gap_samples = usize::try_from(gap_frames)
             .ok()
             .and_then(|frames| frames.checked_mul(usize::from(buffer.channels)))
@@ -1471,9 +1676,10 @@ mod native {
 
         use scrozz_core::CaptureTarget;
 
+        use super::super::source::AudioBatch;
         use super::{
-            FinalReport, LinuxRecordingSession, OpenedDestination, SESSION_PAUSED,
-            SESSION_RECORDING, SESSION_STOPPED, TerminalOutcome, WorkerSignal,
+            AudioWatermarkMixer, FinalReport, LinuxRecordingSession, OpenedDestination,
+            SESSION_PAUSED, SESSION_RECORDING, SESSION_STOPPED, TerminalOutcome, WorkerSignal,
             align_audio_to_timeline, build_recording_report, open_destination,
             recover_partial_output, remove_temporary_output, requested_audio_missing,
         };
@@ -1734,6 +1940,60 @@ mod native {
             .unwrap();
             assert_eq!(resumed, vec![1.0, -1.0]);
             assert_eq!(cursor, 6);
+        }
+
+        #[test]
+        fn late_audio_within_the_watermark_window_is_mixed_instead_of_dropped() {
+            let mut mixer = AudioWatermarkMixer::new(true, true);
+            mixer
+                .push(AudioBatch {
+                    microphone: vec![AudioBuffer {
+                        sample_rate: 48_000,
+                        channels: 1,
+                        start_frame: 0,
+                        samples: vec![0.25; 4_800],
+                    }],
+                    system: Vec::new(),
+                })
+                .unwrap();
+            assert!(mixer.next(false).unwrap().is_none());
+
+            mixer
+                .push(AudioBatch {
+                    microphone: Vec::new(),
+                    system: vec![AudioBuffer {
+                        sample_rate: 48_000,
+                        channels: 1,
+                        start_frame: 0,
+                        samples: vec![0.5; 4_800],
+                    }],
+                })
+                .unwrap();
+            let mixed = mixer
+                .next(false)
+                .unwrap()
+                .expect("both sources reached watermark");
+            assert_eq!(mixed.start_frame, 0);
+            assert_eq!(mixed.samples.len(), 4_800 * 2);
+            assert!(mixed.samples.iter().all(|sample| *sample == 0.75));
+        }
+
+        #[test]
+        fn audio_timeline_refuses_unbounded_silence() {
+            let mut cursor = 0;
+            let mut offset = Some(0);
+            let error = align_audio_to_timeline(
+                AudioBuffer {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    start_frame: 48_001,
+                    samples: vec![0.25, -0.25],
+                },
+                &mut cursor,
+                &mut offset,
+            )
+            .expect_err("a discontinuity larger than one second must fail");
+            assert!(error.to_string().contains("jumped forward"));
         }
 
         #[test]

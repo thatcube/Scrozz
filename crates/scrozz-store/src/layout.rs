@@ -23,11 +23,16 @@
 //! retention cap then measures real disk usage rather than a sum of duplicates.
 
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 
 use scrozz_core::{Error, Result};
 
@@ -41,6 +46,8 @@ pub const INDEX_FILE: &str = "index.sqlite";
 pub const IMAGES_DIR: &str = "images";
 /// Subdirectory holding durable per-capture records.
 pub const DOCUMENTS_DIR: &str = "documents";
+/// Subdirectory holding durable in-progress deletion markers.
+pub const DELETIONS_DIR: &str = "deletions";
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -101,15 +108,22 @@ impl StoreLayout {
         self.root.join(DOCUMENTS_DIR)
     }
 
+    /// Directory holding durable deletion markers.
+    #[must_use]
+    pub fn deletions_dir(&self) -> PathBuf {
+        self.root.join(DELETIONS_DIR)
+    }
+
     /// Creates every directory the store needs.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if a directory cannot be created.
     pub fn ensure_dirs(&self) -> Result<()> {
-        fs::create_dir_all(&self.root)?;
-        fs::create_dir_all(self.images_dir())?;
-        fs::create_dir_all(self.documents_dir())?;
+        ensure_private_dir(&self.root)?;
+        ensure_private_dir(&self.images_dir())?;
+        ensure_private_dir(&self.documents_dir())?;
+        ensure_private_dir(&self.deletions_dir())?;
         Ok(())
     }
 
@@ -214,11 +228,7 @@ impl StoreLayout {
     ///
     /// Returns an I/O error for anything other than absence.
     pub fn delete_blob(&self, hash: &str) -> Result<bool> {
-        match fs::remove_file(self.blob_path(hash)?) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(err.into()),
-        }
+        remove_file_durable(&self.blob_path(hash)?)
     }
 
     /// Writes a capture's durable record.
@@ -253,11 +263,62 @@ impl StoreLayout {
     ///
     /// Returns an I/O error for anything other than absence.
     pub fn delete_record(&self, id: &CaptureId) -> Result<bool> {
-        match fs::remove_file(self.record_path(id)?) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(err.into()),
+        remove_file_durable(&self.record_path(id)?)
+    }
+
+    /// Writes a durable marker before deleting a capture.
+    ///
+    /// Startup completes every marked deletion before adopting sidecars, so a
+    /// crash can leave cleanup work but can never resurrect the capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the marker cannot be made durable.
+    pub fn write_deletion(&self, id: &CaptureId) -> Result<()> {
+        atomic_write(&self.deletion_path(id)?, b"delete\n")
+    }
+
+    /// Removes a completed deletion marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error for anything other than absence.
+    pub fn delete_deletion(&self, id: &CaptureId) -> Result<bool> {
+        remove_file_durable(&self.deletion_path(id)?)
+    }
+
+    /// Lists capture IDs whose durable deletion is incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the marker directory cannot be read or contains a
+    /// malformed marker name. A malformed marker is never ignored because doing
+    /// so could allow the matching sidecar to be adopted again.
+    pub fn scan_deletions(&self) -> Result<Vec<CaptureId>> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(self.deletions_dir())? {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "delete")
+            {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|id| is_valid_id(id))
+                .ok_or_else(|| {
+                    Error::Storage(format!(
+                        "refusing malformed deletion marker {}",
+                        path.display()
+                    ))
+                })?;
+            ids.push(CaptureId(id.to_owned()));
         }
+        ids.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(ids)
     }
 
     /// Every readable record on disk, with unreadable ones reported separately.
@@ -370,6 +431,56 @@ impl StoreLayout {
         }
         Ok(Some(quarantined))
     }
+
+    fn deletion_path(&self, id: &CaptureId) -> Result<PathBuf> {
+        if !is_valid_id(&id.0) {
+            return Err(Error::Storage(format!(
+                "refusing malformed capture id {:?}",
+                id.0
+            )));
+        }
+        Ok(self.deletions_dir().join(format!("{}.delete", id.0)))
+    }
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn remove_file_durable(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_directory(path.parent())?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            sync_directory(path.parent())?;
+            Ok(false)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn sync_directory(directory: Option<&Path>) -> Result<()> {
+    let Some(directory) = directory else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    File::open(directory)?.sync_all()?;
+    #[cfg(windows)]
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000)
+        .open(directory)?
+        .sync_all()?;
+    #[cfg(not(any(unix, windows)))]
+    if let Ok(directory) = File::open(directory) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to `path` so that a reader sees either the old file or the
@@ -394,7 +505,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     ));
 
     let write = (|| -> Result<()> {
-        let mut file = File::create(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -407,12 +522,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         return write;
     }
 
-    // Durability of the rename itself needs the directory flushed too. Windows
-    // has no directory handle to sync, so this is best-effort by design.
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    // Durability of the rename itself needs the directory flushed too.
+    sync_directory(Some(parent))
 }
 
 #[cfg(test)]
@@ -443,6 +554,24 @@ mod tests {
                 .record_path(&CaptureId("../../secrets".into()))
                 .is_err()
         );
+        assert!(
+            layout
+                .write_deletion(&CaptureId("../escape".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deletion_markers_are_durable_and_enumerable() {
+        let dir = scratch_dir("layout-deletions");
+        let layout = StoreLayout::new(dir.path());
+        layout.ensure_dirs().expect("dirs");
+        let id = CaptureId("0".repeat(crate::id::ID_LEN));
+
+        layout.write_deletion(&id).expect("write marker");
+        assert_eq!(layout.scan_deletions().expect("scan markers"), [id.clone()]);
+        assert!(layout.delete_deletion(&id).expect("delete marker"));
+        assert!(layout.scan_deletions().expect("scan empty").is_empty());
     }
 
     #[test]

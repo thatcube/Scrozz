@@ -62,6 +62,7 @@ gif = "0.14"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
 serde_json = "1"
 dirs = "6"
 ctrlc = "3"
