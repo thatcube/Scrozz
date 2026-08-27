@@ -318,16 +318,22 @@ another application** — above copy, above save. Swipe-to-dismiss is a primary
 gesture. Clipboard remains essential but is no longer described as "first".
 
 **Layout.** Each capture is a **discrete, fully-visible card**, arranged
-vertically with consistent gaps. **No overlap, no depth, no scale or opacity
-falloff** — nothing is ever partially hidden behind anything else. Every card is
-independently hoverable, draggable and dismissable; hovering one reveals only its
-own chrome.
+vertically with consistent gaps. **Nothing ever covers anything** — zero overlap,
+zero occlusion, full size and full opacity for every card. Each is independently
+hoverable, draggable and dismissable; hovering one reveals only its own chrome.
 
-> An earlier draft of this decision described a physical *card-stack* metaphor
-> with cards peeking out behind one another. That was a misreading of the
-> reference, which plainly shows two fully separate cards with a gap. The
-> corrected model is also better UX: every capture stays visible and directly
-> actionable instead of buried in a pile.
+**Direction.** A new capture enters at the **bottom** of the list — nearest the
+bottom-left corner, and therefore nearest the dock (D20). **Existing cards move
+up**; the newest is always closest to the corner. Removing a card lets the cards
+above it move **down** to close the gap.
+
+> Wherever these documents say a capture "stacks", it means **accumulates
+> vertically as a list** — never overlaps or occludes. An earlier draft described
+> a physical *card-stack* metaphor with cards peeking out behind one another;
+> that was a misreading of the reference, which plainly shows two fully separate
+> cards with a gap between them — older above, newer below. The corrected model
+> is also better UX: every capture stays visible and directly actionable instead
+> of buried in a pile.
 
 **Motion (see D19).** A new capture slides in from the anchored screen edge and
 takes the slot nearest the anchor corner; existing cards shift away with a spring
@@ -543,12 +549,12 @@ overlays" as a settings toggle, not a spatial, reversible, one-gesture affordanc
 
 **Decision.** The overlay animates in exactly five places, and nowhere else:
 
-1. **Card enters** — slides in from the left, off-screen, spring settle. Captures
-   accumulate one after another, vertically, still without overlap (D12).
-2. **Existing cards make room** — spring settle with a slight stagger.
+1. **Card enters** — slides in from the left, off-screen, into the **bottom** slot,
+   spring settle (D12).
+2. **Existing cards move up** — spring settle with a slight stagger.
 3. **Card leaves** — via **close, copy, save, or swipe-left**. All four dismiss
    the card and animate it away.
-4. **Neighbours close the gap** — spring settle.
+4. **Cards above move down** to close the gap — spring settle.
 5. **Dock collapse and expand** (D20).
 
 **Button press animation is explicitly optional** and lowest priority.
