@@ -2,11 +2,11 @@
 //!
 //! # Why this file exists
 //!
-//! Every backend below this line is under construction. Several entry points are
-//! literally `todo!()`, which is not an error value — it is a panic, and a panic
-//! reaches the user as exit code 101 and a backtrace. For a tool whose entire
-//! error philosophy (D8, D15) is *never show the user a crash for a thing we
-//! already know about*, that is the worst possible failure mode.
+//! Some backends below this line are still under construction. Several unfinished
+//! entry points are literally `todo!()`, which is not an error value — it is a
+//! panic, and a panic reaches the user as exit code 101 and a backtrace. For a
+//! tool whose entire error philosophy (D8, D15) is *never show the user a crash
+//! for a thing we already know about*, that is the worst possible failure mode.
 //!
 //! So every call into an unfinished backend goes through this module, and this
 //! module refuses to make the call unless it has been told to. The default is a
@@ -39,40 +39,24 @@ pub fn unstable_backends_enabled() -> bool {
 
 /// Whether the still-capture backend is ready without an opt-in guard.
 ///
-/// macOS capture has been exercised against a real display, including Retina
-/// scale, stride, premultiplied alpha, encoding and clipboard delivery. Keeping
-/// that verified path behind an environment variable makes a Finder-launched
-/// app silently reject every menu capture because Finder does not inherit shell
-/// variables.
-///
-/// # Why Windows is still gated
-///
-/// Not because the code is incomplete. The Windows backend reaches no
-/// `todo!()`, every failure it can produce is a typed [`scrozz_core::Error`],
-/// and the COM-apartment bug that made WGC silently degrade to GDI has been
-/// fixed. On paper it qualifies.
-///
-/// It stays gated because **no line of it has ever run**. This workspace is
-/// developed on macOS; the Windows path is held up entirely by
-/// `cargo check --target x86_64-pc-windows-msvc`, `clippy`, `const` assertions
-/// mirroring the real `windows` constants, and unit tests of the logic that
-/// could be made OS-free. That is a great deal more than nothing and it is not
-/// evidence that a screenshot comes out.
-///
-/// The word this predicate uses is *stable*, and a compiler is not qualified to
-/// say so. What would settle it is `tools/windows-smoke.ps1` passing on a real
-/// Windows machine or a GitHub Actions `windows-latest` runner: displays
-/// enumerated, a PNG written with the dimensions the monitor actually has,
-/// clipboard round-tripped. Until that has happened, `SCROZZ_UNSTABLE_BACKENDS=1`
-/// is the honest way to run it, because it makes the person running it aware
-/// that they are the test.
+/// macOS and Windows capture have both been exercised on native displays,
+/// including scaled pixels, encoding, and clipboard delivery. Keeping either
+/// verified path behind an environment variable would make a shell-independent
+/// GUI silently reject capture.
 #[must_use]
 pub const fn capture_backend_is_stable() -> bool {
     // Unit tests deliberately retain the guard. Several command tests exercise
     // error paths with synthetic capture arguments; letting those reach the
     // verified backend captures the developer's real screen and writes into
     // ~/Pictures, which is both invasive and nondeterministic.
-    cfg!(all(target_os = "macos", not(test)))
+    capture_backend_is_stable_for(
+        cfg!(any(target_os = "macos", target_os = "windows")),
+        cfg!(test),
+    )
+}
+
+const fn capture_backend_is_stable_for(qualified_platform: bool, test_build: bool) -> bool {
+    qualified_platform && !test_build
 }
 
 fn capture_guard(what: &str, provider: &'static str) -> CliResult<()> {
@@ -466,41 +450,18 @@ mod tests {
 }
 
 #[cfg(test)]
-mod windows_gate_tests {
-    //! The Windows still-capture gate, and what it would take to open it.
+mod capture_stability_tests {
+    use super::{capture_backend_is_stable, capture_backend_is_stable_for};
 
-    /// A deliberate tripwire.
-    ///
-    /// If somebody makes `capture_backend_is_stable()` true for Windows, this
-    /// test is where they will land, and the message is the argument they have
-    /// to answer: not "is the code finished" but "has it run".
     #[test]
-    fn windows_capture_stays_gated_until_something_has_actually_run_it() {
-        // `cfg!` rather than the function, so the assertion reads the same on
-        // every host and cannot be satisfied by simply not being on Windows.
-        let windows_is_stable = cfg!(all(target_os = "windows", not(test)));
-        assert!(
-            !windows_is_stable,
-            "the Windows capture backend cross-checks and clippy-checks clean, but no line \
-             of it has ever executed. Before lifting this gate, run tools/windows-smoke.ps1 \
-             on a real Windows machine or a windows-latest GitHub Actions runner and confirm \
-             it enumerates displays, writes a PNG with the monitor's true dimensions, and \
-             round-trips the clipboard. Then update this test with what was run and where"
-        );
+    fn tests_never_capture_the_developers_screen() {
+        assert!(!capture_backend_is_stable());
     }
 
     #[test]
-    fn the_gate_explains_itself_where_a_developer_will_look() {
-        // D15 in miniature: the reason lives next to the switch, not in a
-        // commit message somebody would have to go looking for.
-        let source = include_str!("platform.rs");
-        assert!(
-            source.contains("Why Windows is still gated"),
-            "the gate must say why it is closed"
-        );
-        assert!(
-            source.contains("windows-smoke.ps1"),
-            "and must name the evidence that would open it"
-        );
+    fn qualified_native_capture_is_enabled_only_in_release_builds() {
+        assert!(capture_backend_is_stable_for(true, false));
+        assert!(!capture_backend_is_stable_for(false, false));
+        assert!(!capture_backend_is_stable_for(true, true));
     }
 }

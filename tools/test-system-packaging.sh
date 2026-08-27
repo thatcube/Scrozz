@@ -77,10 +77,16 @@ grep -q '"signed_manifest": false' tools/package.sh ||
 MANIFEST="packaging/windows/AppxManifest.xml.in"
 WINDOWS_PACKAGE="tools/package-windows.ps1"
 WINDOWS_PACKAGE_TEST="tools/test-windows-packaging.ps1"
+NATIVE_SMOKE="tools/smoke.sh"
 RELEASE_WORKFLOW=".github/workflows/release.yml"
 [[ -f "$MANIFEST" ]] || fail "Windows AppxManifest template is absent"
 [[ -f "$WINDOWS_PACKAGE" ]] || fail "Windows package script is absent"
 [[ -f "$WINDOWS_PACKAGE_TEST" ]] || fail "Windows artifact test is absent"
+[[ -f "$NATIVE_SMOKE" ]] || fail "native artifact smoke script is absent"
+grep -Fq 'SCROZZ_IPC_SOCKET="\\\\.\\pipe\\scrozz-smoke-$$"' "$NATIVE_SMOKE" ||
+  fail "native smoke does not select an isolated named-pipe endpoint on Windows"
+grep -Fq "packaged smoke requires an installed app-execution alias" tools/windows-smoke.ps1 ||
+  fail "Windows smoke does not require the installed alias for packaged identity"
 if command -v xmllint >/dev/null 2>&1; then
   xmllint --noout "$MANIFEST" ||
     fail "Windows AppxManifest template is not well-formed XML"

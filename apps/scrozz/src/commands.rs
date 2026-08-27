@@ -17,7 +17,14 @@
 //! is reported as a mistake in the command line even now, and the resolution
 //! logic is exercised by tests that never touch a screen.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
@@ -36,14 +43,89 @@ use crate::{
     settings,
 };
 
+const CANCELLATION_POLL: Duration = Duration::from_millis(20);
+
+/// Deadline and cancellation state shared with a forwarded command's transport.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionControl {
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl ExecutionControl {
+    pub(crate) const fn local() -> Self {
+        Self {
+            deadline: None,
+            cancelled: None,
+        }
+    }
+
+    pub(crate) fn forwarded(deadline: Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+            cancelled: Some(Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        if let Some(cancelled) = &self.cancelled {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn check(&self) -> CliResult<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(CliError::ipc(
+                "the forwarded command expired before it could complete",
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait(&self, duration: Duration) -> CliResult<()> {
+        let now = Instant::now();
+        let wake = now
+            .checked_add(duration)
+            .ok_or_else(|| CliError::usage("the capture delay is too large"))?;
+        if self.deadline.is_some_and(|deadline| wake >= deadline) {
+            return Err(CliError::ipc(
+                "the capture delay exceeds the forwarded-command deadline",
+            ));
+        }
+        if self.deadline.is_none() {
+            std::thread::sleep(duration);
+            return Ok(());
+        }
+
+        loop {
+            self.check()?;
+            let remaining = wake.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(CANCELLATION_POLL));
+        }
+    }
+}
+
 /// Runs a command locally.
 ///
 /// # Errors
 ///
-/// Whatever the command produces. Cancellation arrives here as
-/// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
-pub fn dispatch(command: &Command) -> CliResult<Report> {
-    with_platform_apartment(|| dispatch_in_apartment(command))
+/// Whatever the command produces. A forwarded deadline is reported as an IPC
+/// failure before a late command can begin or commit capture output.
+pub(crate) fn dispatch(command: &Command, execution: &ExecutionControl) -> CliResult<Report> {
+    with_platform_apartment(|| {
+        execution.check()?;
+        dispatch_in_apartment(command, execution)
+    })
 }
 
 /// Runs a command after the calling thread has entered every apartment model
@@ -54,9 +136,9 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 /// OCR. Initialising immediately before one WinRT call and dropping immediately
 /// after it is not equivalent; objects returned by that call may keep using the
 /// apartment for the rest of the operation.
-fn dispatch_in_apartment(command: &Command) -> CliResult<Report> {
+fn dispatch_in_apartment(command: &Command, execution: &ExecutionControl) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args),
+        Command::Capture(args) => capture(args, execution),
         Command::Record(args) => record(args),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -99,7 +181,7 @@ fn with_platform_apartment<T>(body: impl FnOnce() -> CliResult<T>) -> CliResult<
 // capture
 // ---------------------------------------------------------------------------
 
-fn capture(args: &CaptureArgs) -> CliResult<Report> {
+fn capture(args: &CaptureArgs, execution: &ExecutionControl) -> CliResult<Report> {
     args.validate()?;
     let target = args.target.resolve()?;
     let sinks = args.sinks();
@@ -142,20 +224,25 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     };
 
     if let Some(secs) = args.delay {
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        let delay = Duration::try_from_secs_f64(secs)
+            .map_err(|_| CliError::usage("the capture delay is too large"))?;
+        execution.wait(delay)?;
     }
 
     let backend_name = backend.name().to_owned();
     let capture = backend.capture(&request)?;
+    execution.check()?;
     let frame = &capture.frame;
 
     let bytes = FrameEncoder::new()
         .encode(frame, args.format().to_export())
         .map_err(CliError::Core)?;
+    execution.check()?;
 
     let mut written = Vec::new();
     let mut raw = None;
     for sink in &sinks {
+        execution.check()?;
         match sink {
             Sink::File(path) => {
                 std::fs::write(path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
@@ -188,6 +275,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
             }
         }
     }
+    execution.check()?;
 
     let data = Json::obj([
         ("runtime", runtime),
@@ -808,7 +896,10 @@ mod tests {
     fn run(argv: &[&str]) -> CliResult<Report> {
         let cli = Cli::try_parse_from(argv).expect("should parse");
         cli.validate()?;
-        dispatch(&cli.command.clone().expect("should have a command"))
+        dispatch(
+            &cli.command.clone().expect("should have a command"),
+            &ExecutionControl::local(),
+        )
     }
 
     fn json_of(argv: &[&str]) -> String {
@@ -957,6 +1048,31 @@ mod tests {
     fn a_negative_delay_is_a_usage_error() {
         let err = run(&["scrozz", "capture", "--delay", "-1", "--dry-run"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Usage);
+    }
+
+    #[test]
+    fn a_forwarded_delay_cannot_outlive_its_deadline() {
+        let execution = ExecutionControl::forwarded(Instant::now() + Duration::from_millis(50));
+        let started = Instant::now();
+        let error = execution.wait(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.exit(), Exit::IpcFailed);
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn cancelling_a_forwarded_delay_wakes_it_promptly() {
+        let execution = ExecutionControl::forwarded(Instant::now() + Duration::from_secs(5));
+        let canceller = execution.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            canceller.cancel();
+        });
+
+        let started = Instant::now();
+        let error = execution.wait(Duration::from_secs(2)).unwrap_err();
+        thread.join().unwrap();
+        assert_eq!(error.exit(), Exit::IpcFailed);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     // -- dry-run record ----------------------------------------------------

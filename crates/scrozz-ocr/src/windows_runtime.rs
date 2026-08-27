@@ -2,28 +2,6 @@
 
 use crate::prepare::Rgba8Image;
 
-pub(crate) const WIN32_ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-pub(crate) const WIN32_ERROR_NO_PACKAGE_IDENTITY: u32 = 15_700;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PackageIdentityProbe {
-    Packaged,
-    Unpackaged,
-    Failed(u32),
-}
-
-/// Classifies the sizing probe from `GetCurrentPackageFullName`.
-pub(crate) const fn classify_package_identity_probe(
-    status: u32,
-    utf16_len: u32,
-) -> PackageIdentityProbe {
-    match status {
-        WIN32_ERROR_INSUFFICIENT_BUFFER if utf16_len > 1 => PackageIdentityProbe::Packaged,
-        WIN32_ERROR_NO_PACKAGE_IDENTITY => PackageIdentityProbe::Unpackaged,
-        other => PackageIdentityProbe::Failed(other),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Backend {
     WindowsMediaOcr,
@@ -105,26 +83,6 @@ mod tests {
         assert_eq!(packaged.engine_name(), "windows-media-ocr");
         assert_eq!(portable, Backend::Tesseract);
         assert_eq!(portable.engine_name(), "tesseract");
-    }
-
-    #[test]
-    fn only_no_package_identity_selects_the_portable_path() {
-        assert_eq!(
-            classify_package_identity_probe(WIN32_ERROR_NO_PACKAGE_IDENTITY, 0),
-            PackageIdentityProbe::Unpackaged
-        );
-        assert_eq!(
-            classify_package_identity_probe(WIN32_ERROR_INSUFFICIENT_BUFFER, 42),
-            PackageIdentityProbe::Packaged
-        );
-        assert_eq!(
-            classify_package_identity_probe(WIN32_ERROR_INSUFFICIENT_BUFFER, 0),
-            PackageIdentityProbe::Failed(WIN32_ERROR_INSUFFICIENT_BUFFER)
-        );
-        assert_eq!(
-            classify_package_identity_probe(5, 0),
-            PackageIdentityProbe::Failed(5)
-        );
     }
 
     #[test]

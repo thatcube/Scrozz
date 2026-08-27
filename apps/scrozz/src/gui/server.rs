@@ -30,6 +30,8 @@ pub struct Request {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     reply: SyncSender<Response>,
+    accepted: Receiver<()>,
+    execution: commands::ExecutionControl,
 }
 
 impl std::fmt::Debug for Request {
@@ -45,17 +47,35 @@ impl std::fmt::Debug for Request {
 impl Request {
     /// Executes the request and hands both output streams back to the worker.
     pub fn serve(self) -> Option<Command> {
-        let (command, response) = run(&self.argv, self.cwd.as_deref());
+        let (command, response) = run(&self.argv, self.cwd.as_deref(), &self.execution);
         if self.reply.send(response).is_err() {
             tracing::debug!("forwarded command client disconnected before the reply");
+            return None;
+        }
+        if self.accepted.recv().is_err() {
+            tracing::debug!("IPC worker did not accept the forwarded command result");
+            return None;
         }
         command
     }
 }
 
-fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+fn run(
+    argv: &[String],
+    cwd: Option<&Path>,
+    execution: &commands::ExecutionControl,
+) -> (Option<Command>, Response) {
     use clap::Parser as _;
 
+    if let Err(error) = execution.check() {
+        return (
+            None,
+            response_from_error(
+                error.exit().code(),
+                Reporter::new(false, false).render_error("ipc", &error),
+            ),
+        );
+    }
     if argv.is_empty() {
         let error = CliError::usage("the forwarded command had no arguments");
         return (
@@ -87,18 +107,28 @@ fn run(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
     let command = cli.command.clone().unwrap_or(Command::Gui);
     let slug = command.slug();
     let result = match WorkingDirectory::enter(cwd) {
-        Ok(_directory) => cli.validate().and_then(|()| commands::dispatch(&command)),
+        Ok(_directory) => cli
+            .validate()
+            .and_then(|()| commands::dispatch(&command, execution))
+            .and_then(|report| {
+                execution.check()?;
+                Ok(report)
+            }),
         Err(error) => Err(error),
     };
 
     let reporter = Reporter::from_global(&cli.global);
-    let response = match result {
-        Ok(report) => response_from_output(0, reporter.render(&slug, &report)),
-        Err(error) => {
-            response_from_error(error.exit().code(), reporter.render_error(&slug, &error))
-        }
+    let (command, response) = match result {
+        Ok(report) => (
+            Some(command),
+            response_from_output(0, reporter.render(&slug, &report)),
+        ),
+        Err(error) => (
+            None,
+            response_from_error(error.exit().code(), reporter.render_error(&slug, &error)),
+        ),
     };
-    (Some(command), response)
+    (command, response)
 }
 
 fn response_from_output(code: u8, output: crate::report::RenderedOutput) -> Response {
@@ -322,6 +352,22 @@ fn serve_connection(
     requests: &SyncSender<Request>,
     shutdown: &Arc<AtomicBool>,
 ) {
+    serve_connection_with_timeouts(
+        stream,
+        requests,
+        shutdown,
+        ipc::COMMAND_TIMEOUT,
+        ipc::TRANSFER_TIMEOUT,
+    );
+}
+
+fn serve_connection_with_timeouts(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    requests: &SyncSender<Request>,
+    shutdown: &Arc<AtomicBool>,
+    command_timeout: Duration,
+    cancellation_grace: Duration,
+) {
     let request =
         match ipc::receive_request(stream, Instant::now() + ipc::TRANSFER_TIMEOUT, shutdown) {
             Ok(request) => request,
@@ -330,11 +376,17 @@ fn serve_connection(
                 return;
             }
         };
+    let execution_deadline = Instant::now() + command_timeout;
+    let response_deadline = execution_deadline + cancellation_grace;
+    let execution = commands::ExecutionControl::forwarded(execution_deadline);
     let (reply, response) = sync_channel(1);
+    let (accepted, acceptance) = sync_channel(0);
     let request = Request {
         argv: request.argv,
         cwd: request.cwd,
         reply,
+        accepted: acceptance,
+        execution: execution.clone(),
     };
     if let Err(error) = requests.try_send(request) {
         let response = match error {
@@ -347,19 +399,28 @@ fn serve_connection(
         return;
     }
 
-    let deadline = Instant::now() + ipc::COMMAND_TIMEOUT;
     let response = loop {
         if shutdown.load(Ordering::Acquire) {
+            execution.cancel();
             break protocol_error("the running instance is shutting down");
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        if now >= execution_deadline {
+            execution.cancel();
+        }
+        let remaining = response_deadline.saturating_duration_since(now);
         if remaining.is_zero() {
+            execution.cancel();
             break protocol_error("the forwarded command timed out");
         }
         match response.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(response) => break response,
+            Ok(response) => {
+                let _ = accepted.send(());
+                break response;
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
+                execution.cancel();
                 break protocol_error("the forwarded command did not produce a response");
             }
         }
@@ -489,15 +550,19 @@ mod tests {
         parts.iter().map(|part| (*part).to_owned()).collect()
     }
 
+    fn run_local(argv: &[String], cwd: Option<&Path>) -> (Option<Command>, Response) {
+        run(argv, cwd, &commands::ExecutionControl::local())
+    }
+
     #[test]
     fn forwarded_output_uses_the_same_renderer_as_local_output() {
-        let (_, response) = run(&argv(&["capture", "--dry-run"]), None);
+        let (_, response) = run_local(&argv(&["capture", "--dry-run"]), None);
         assert_eq!(response.code, 0);
         assert!(response.stderr.is_empty());
         assert!(response.stdout.ends_with(b"\n"));
         assert!(String::from_utf8_lossy(&response.stdout).contains("Would capture"));
 
-        let (_, response) = run(&argv(&["--json", "list", "displays"]), None);
+        let (_, response) = run_local(&argv(&["--json", "list", "displays"]), None);
         assert_ne!(response.code, 0);
         assert!(response.stderr.is_empty());
         assert!(response.stdout.ends_with(b"\n"));
@@ -507,7 +572,7 @@ mod tests {
     #[test]
     fn invalid_and_empty_commands_are_answered_on_stderr() {
         for args in [argv(&[]), argv(&["nonsuch"])] {
-            let (command, response) = run(&args, None);
+            let (command, response) = run_local(&args, None);
             assert!(command.is_none());
             assert_eq!(response.code, 2);
             assert!(response.stdout.is_empty());
@@ -517,7 +582,7 @@ mod tests {
 
     #[test]
     fn quiet_success_and_human_cancellation_are_silent() {
-        let (_, response) = run(&argv(&["--quiet", "capture", "--dry-run"]), None);
+        let (_, response) = run_local(&argv(&["--quiet", "capture", "--dry-run"]), None);
         assert_eq!(response.code, 0);
         assert!(response.stdout.is_empty());
         assert!(response.stderr.is_empty());
@@ -529,6 +594,72 @@ mod tests {
         let temporary = std::env::temp_dir();
         drop(WorkingDirectory::enter(Some(&temporary)).unwrap());
         assert_eq!(std::env::current_dir().unwrap(), before);
+    }
+
+    #[test]
+    fn expired_or_cancelled_requests_are_never_dispatched() {
+        for execution in [commands::ExecutionControl::forwarded(Instant::now()), {
+            let execution =
+                commands::ExecutionControl::forwarded(Instant::now() + Duration::from_secs(1));
+            execution.cancel();
+            execution
+        }] {
+            let (reply, response) = sync_channel(1);
+            let (accepted, acceptance) = sync_channel(0);
+            drop(accepted);
+            let request = Request {
+                argv: argv(&["capture", "--dry-run"]),
+                cwd: None,
+                reply,
+                accepted: acceptance,
+                execution,
+            };
+            assert!(request.serve().is_none());
+            let response = response.recv().unwrap();
+            assert_eq!(response.code, crate::exit::Exit::IpcFailed.code());
+            assert!(response.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&response.stderr).contains("expired"),
+                "{response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_queued_past_the_server_deadline_cannot_run_later() {
+        let frame = ipc::encode_request(&argv(&["capture", "--dry-run"]), None).unwrap();
+        let mut stream = std::io::Cursor::new(frame);
+        let (requests, queued) = sync_channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        serve_connection_with_timeouts(
+            &mut stream,
+            &requests,
+            &shutdown,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        let request = queued.recv().unwrap();
+        assert!(request.serve().is_none());
+    }
+
+    #[test]
+    fn a_disconnected_worker_suppresses_a_successful_gui_action() {
+        let (reply, response) = sync_channel(1);
+        drop(response);
+        let (_accepted, acceptance) = sync_channel(0);
+        let request = Request {
+            argv: argv(&["capture", "--dry-run"]),
+            cwd: None,
+            reply,
+            accepted: acceptance,
+            execution: commands::ExecutionControl::forwarded(
+                Instant::now() + Duration::from_secs(1),
+            ),
+        };
+
+        assert!(request.serve().is_none());
     }
 
     #[cfg(unix)]
@@ -608,7 +739,7 @@ mod tests {
         let server = Server::bind_at(path.clone()).unwrap();
         crate::test_env::set(ipc::ENDPOINT_ENV, &path.to_string_lossy());
         let arguments = argv(&["capture", "--dry-run"]);
-        let expected = run(&arguments, None).1;
+        let expected = run_local(&arguments, None).1;
         let client = std::thread::spawn(move || ipc::forward(&arguments));
 
         let request = loop {
@@ -634,7 +765,7 @@ mod tests {
         let server = Server::bind_at(path.clone()).unwrap();
         crate::test_env::set(ipc::ENDPOINT_ENV, &path.to_string_lossy());
         let arguments = argv(&["nonsuch"]);
-        let expected = run(&arguments, None).1;
+        let expected = run_local(&arguments, None).1;
         let client = std::thread::spawn(move || ipc::forward(&arguments));
 
         let request = loop {

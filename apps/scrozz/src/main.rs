@@ -156,7 +156,7 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
         return gui::run(cli).map(Outcome::Local);
     }
 
-    commands::dispatch(command).map(Outcome::Local)
+    commands::dispatch(command, &commands::ExecutionControl::local()).map(Outcome::Local)
 }
 
 /// Hands the invocation to a running instance, if there is one.

@@ -15,9 +15,12 @@
 # A packaged/sparse-package artifact must be declared explicitly:
 #
 #   pwsh -File tools/windows-smoke.ps1 `
-#     -Binary C:\Program Files\WindowsApps\...\scrozz.exe `
+#     -Binary scrozz.exe `
 #     -ArtifactType packaged `
 #     -ExerciseIpc
+#
+# `scrozz.exe` above resolves the installed app-execution alias. Directly
+# launching bytes from the package directory does not prove process identity.
 #
 # By default this is a CLI/headless probe. -ExerciseIpc starts the real GUI
 # listener and runs capture and OCR through it, but still does not automate the
@@ -432,11 +435,44 @@ try {
         $Binary = Join-Path (Join-Path $metadata.target_directory $Profile) "scrozz.exe"
     }
 
-    $Binary = [System.IO.Path]::GetFullPath($Binary)
-    Assert-Smoke (Test-Path -LiteralPath $Binary -PathType Leaf) `
-        "Scrozz binary not found at '$Binary'"
+    if ($ArtifactType -eq "packaged") {
+        Assert-Smoke (
+            -not [System.IO.Path]::IsPathRooted($Binary) -and
+            [System.IO.Path]::GetFileName($Binary) -eq $Binary
+        ) `
+            "packaged smoke requires an installed app-execution alias such as 'scrozz.exe', not a physical executable path"
+        $resolvedCommand = Get-Command `
+            -Name $Binary `
+            -CommandType Application `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        Assert-Smoke ($null -ne $resolvedCommand) `
+            "installed app-execution alias '$Binary' was not found"
+        $aliasRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path (
+                [Environment]::GetFolderPath(
+                    [Environment+SpecialFolder]::LocalApplicationData
+                )
+            ) "Microsoft\WindowsApps")
+        )
+        $resolvedCommandPath = [System.IO.Path]::GetFullPath($resolvedCommand.Path)
+        Assert-Smoke (
+            [System.StringComparer]::OrdinalIgnoreCase.Equals(
+                [System.IO.Path]::GetDirectoryName($resolvedCommandPath),
+                $aliasRoot
+            )
+        ) `
+            "packaged command '$Binary' resolved outside the registered app-execution alias directory: '$resolvedCommandPath'"
+    }
+    else {
+        $Binary = [System.IO.Path]::GetFullPath($Binary)
+        Assert-Smoke (Test-Path -LiteralPath $Binary -PathType Leaf) `
+            "Scrozz binary not found at '$Binary'"
+    }
 
-    $env:SCROZZ_UNSTABLE_BACKENDS = "1"
+    # Exercise the artifact's release-default capture path, never a developer
+    # opt-in inherited from the calling shell.
+    $env:SCROZZ_UNSTABLE_BACKENDS = $null
     $env:RUST_LOG = "scrozz=info,warn"
     if (-not [string]::IsNullOrWhiteSpace($TesseractDirectory)) {
         Assert-Smoke (

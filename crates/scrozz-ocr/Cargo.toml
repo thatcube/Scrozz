@@ -23,6 +23,7 @@ objc2-vision.workspace = true
 objc2-core-graphics.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+scrozz-shell.workspace = true
 windows = { workspace = true, features = [
     "Media_Ocr",
     "Graphics_Imaging",
@@ -33,9 +34,6 @@ windows = { workspace = true, features = [
     "Storage_Streams",
     # TryCreateFromLanguage; without it, requested languages are only advisory.
     "Globalization",
-    # Runtime package identity selects the WinRT or portable backend.
-    "Win32_Foundation",
-    "Win32_Storage_Packaging_Appx",
     # Resolves the user's locale for portable Tesseract language selection.
     "Win32_Globalization",
 ] }

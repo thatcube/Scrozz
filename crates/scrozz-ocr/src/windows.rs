@@ -38,18 +38,17 @@ use std::time::{Duration, Instant};
 
 use crate::apartment;
 use scrozz_core::{Error, Frame, Result};
+use scrozz_shell::windows::identity::PackageIdentity;
 use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
-use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows::core::HSTRING;
 
 use crate::layout;
 use crate::prepare::{self, Prepared};
 use crate::windows_runtime::{
-    Backend, PackageIdentityProbe, backend_for_package_identity, bgra_premultiplied_on_white,
-    classify_package_identity_probe, dispatch,
+    Backend, backend_for_package_identity, bgra_premultiplied_on_white, dispatch,
 };
 use crate::{Options, TextBlock};
 
@@ -68,20 +67,14 @@ const ASYNC_CANCELED: i32 = 2;
 const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn active_backend() -> Result<Backend> {
-    let mut utf16_len = 0u32;
-    // SAFETY: the documented sizing probe writes only to `utf16_len` and accepts
-    // a null output buffer.
-    let status = unsafe { GetCurrentPackageFullName(&mut utf16_len, None) };
-    let has_identity = match classify_package_identity_probe(status.0, utf16_len) {
-        PackageIdentityProbe::Packaged => true,
-        PackageIdentityProbe::Unpackaged => false,
-        PackageIdentityProbe::Failed(status) => {
-            return Err(Error::Platform(format!(
-                "GetCurrentPackageFullName failed with Win32 status {status}"
-            )));
-        }
-    };
-    Ok(backend_for_package_identity(has_identity))
+    match scrozz_shell::windows::identity::current() {
+        PackageIdentity::Packaged { .. } => Ok(backend_for_package_identity(true)),
+        PackageIdentity::Unpackaged => Ok(backend_for_package_identity(false)),
+        PackageIdentity::Unknown { status, detail } => Err(Error::Platform(format!(
+            "cannot select the Windows OCR backend because package identity is unknown \
+             (Win32 status {status}): {detail}"
+        ))),
+    }
 }
 
 /// Name of the backend selected for this process artifact.

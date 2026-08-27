@@ -25,9 +25,19 @@ export SCROZZ_CONFIG_DIR="$root/config"
 export SCROZZ_CONFIG_HOME="$root/config-home"
 export SCROZZ_DATA_HOME="$root/data"
 export SCROZZ_HOME="$root/home"
-export SCROZZ_IPC_SOCKET="$root/scrozz.sock"
 export USER="scrozz-smoke-$$"
 mkdir -p "$SCROZZ_CONFIG_DIR" "$SCROZZ_CONFIG_HOME" "$SCROZZ_DATA_HOME" "$SCROZZ_HOME"
+
+platform="${RUNNER_OS:-${OS:-$(uname -s)}}"
+case "$platform" in
+  Windows | Windows_NT | MINGW* | MSYS* | CYGWIN*)
+    # A filesystem path is not a valid Windows named-pipe endpoint.
+    export SCROZZ_IPC_SOCKET="\\\\.\\pipe\\scrozz-smoke-$$"
+    ;;
+  *)
+    export SCROZZ_IPC_SOCKET="$root/scrozz.sock"
+    ;;
+esac
 
 "$binary" --help >/dev/null
 "$binary" --version >/dev/null

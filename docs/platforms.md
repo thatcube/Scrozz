@@ -260,7 +260,14 @@ limited to 1 MiB, combined response output to 512 MiB, transfers to ten seconds,
 and command execution to five minutes. Responses preserve exact stdout bytes,
 exact stderr bytes and the `u8` exit status, and the server waits for an exact
 acknowledgement before disconnecting. Socket/pipe I/O runs on one bounded worker
-while the GUI polls a bounded request channel. Only `Status::NotRunning` permits
+while the GUI polls a bounded request channel. A forwarded request carries its
+deadline and cancellation state into the shared command dispatcher: an expired
+queued request is rejected before dispatch, capture delay is interruptible, and
+capture output is checked before every side effect. The server cancels execution
+at five minutes, then reserves one transfer window for the worker to return that
+error; the client additionally reserves the response-transfer window. GUI-only
+actions run only after the IPC worker acknowledges that it accepted the command
+result. Only `Status::NotRunning` permits
 the normal local fallback; an unusable endpoint, framing error or transfer
 failure is surfaced rather than silently running the command twice.
 `--no-ipc` remains the explicit local-execution override.
@@ -281,7 +288,10 @@ its portable artifact; it never searches `PATH`. The portable layout is
 artifact promises). `SCROZZ_TESSERACT_DIR` is an absolute-path development and
 smoke-test override for that `tesseract` directory. A portable ZIP without this
 payload is incomplete and reports an actionable unsupported error instead of
-silently trying WinRT or returning no text.
+silently trying WinRT or returning no text. With no explicit OCR language,
+portable Scrozz first tries the Windows locale and then selects the guaranteed
+exact `eng` model when no installed traineddata matches it. Explicit language
+requests remain authoritative and never silently fall back to English.
 
 The capture backend no longer reads `CO_E_NOTINITIALIZED` or an arbitrary WGC
 probe failure as permission to use GDI. GDI is selected only for a genuine
@@ -307,19 +317,25 @@ and retains the capture.
 encoding, save-once behavior, clipboard round-trip and artifact-selected OCR
 while rejecting apartment failures and unexplained GDI downgrades.
 `-ArtifactType portable` (the default) asserts `unpackaged` and
-`tesseract`; `-ArtifactType packaged` requires `-Binary`, asserts a real
-package full name and `windows-media-ocr`, and permits only the documented
-missing-language-pack skip. `-TesseractDirectory` supplies the absolute override
-for source-built development artifacts; an extracted portable artifact is
-validated against its sibling `tesseract` directory instead. The script clears
-an inherited override when none is explicit, so an incomplete ZIP cannot pass
-by borrowing a developer installation. Before capture it starts the staged
-`tesseract.exe --version` with a ten-second timeout and a system-only `PATH`,
-which catches a payload whose dependent DLLs were accidentally supplied only by
-the packaging machine. `-ExerciseIpc` first refuses an already-running instance,
-starts that exact artifact's GUI with a hard timeout, waits for the default
-SID-scoped named pipe, and then runs the real capture, clipboard and OCR work
-through the GUI command handler. Running that mode once for the portable
+`tesseract`; `-ArtifactType packaged` requires `-Binary scrozz.exe`, resolves
+that command only as the installed `%LOCALAPPDATA%\Microsoft\WindowsApps`
+app-execution alias, invokes the alias token rather than package-directory
+bytes, asserts a real package full name and `windows-media-ocr`, and permits
+only the documented missing-language-pack skip. Run packaged smoke from a
+directory without a portable `scrozz.exe`; a PATH hijack is rejected before
+launch and the child-side identity assertion fails closed as a second guard.
+`-TesseractDirectory` supplies the absolute override for source-built
+development artifacts; an extracted portable artifact is validated against its
+sibling `tesseract` directory instead. The script clears
+both an inherited Tesseract override when none is explicit and the unstable
+backend opt-in, so an incomplete ZIP cannot borrow a developer installation and
+capture must work with release-default policy. Before capture it starts the
+staged `tesseract.exe --version` with a ten-second timeout and a system-only
+`PATH`, which catches a payload whose dependent DLLs were accidentally supplied
+only by the packaging machine. `-ExerciseIpc` first refuses an already-running
+instance, starts that exact artifact's GUI with a hard timeout, waits for the
+default SID-scoped named pipe, and then runs the real capture, clipboard and OCR
+work through the GUI command handler. Running that mode once for the portable
 artifact and once for the installed package verifies that both package contexts
 derive the same per-user endpoint and that forwarded WinRT work enters its COM
 apartment. The script deliberately does not claim to automate focus, Alt-Tab

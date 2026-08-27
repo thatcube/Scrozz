@@ -546,7 +546,12 @@ fn exchange(stream: &mut (impl Read + Write), argv: &[String]) -> CliResult<Resp
         Instant::now() + TRANSFER_TIMEOUT,
         None,
     )?;
-    let response = read_response(stream, Instant::now() + COMMAND_TIMEOUT)?;
+    // The server owns the command deadline. Keep one window for its cancellation
+    // grace and another for transferring the resulting response.
+    let response = read_response(
+        stream,
+        Instant::now() + COMMAND_TIMEOUT + TRANSFER_TIMEOUT + TRANSFER_TIMEOUT,
+    )?;
     send_ack(stream, Instant::now() + TRANSFER_TIMEOUT)?;
     Ok(response)
 }
