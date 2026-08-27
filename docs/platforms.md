@@ -126,7 +126,10 @@ shows the desktop-sized selector, hides it after commit, captures, then restores
 the cards. Only one selector may own that lifecycle at a time. CLI one-shot
 selection uses the same bridge in an ordinary temporary window. That one-shot
 window intentionally skips reversible AppKit panel conversion, so its shielding
-across Spaces and fullscreen apps still needs a native smoke run.
+across Spaces and fullscreen apps still needs a native smoke run. On X11, both
+hosts retain their exact override-redirect window ID, take keyboard ownership
+with `SetInputFocus` after the window becomes viewable, and restore the prior
+focus before capture begins unless the user has already focused somewhere else.
 
 Shortcut settings and runtime actions are separate names:
 `hotkey.capture-region` persists the accelerator, while `capture.region` is the
@@ -140,7 +143,7 @@ command.
 |---|---|---|
 | macOS | Client overlay | Implemented; the long-running window switches between non-activating card and selection behavior |
 | Windows | Client overlay | Implemented and type-checked; native focus, z-order and mixed-DPI behavior still need a real Windows session |
-| Linux/X11 | Client overlay | Implemented and type-checked; native input/focus behavior still needs an X11 smoke run |
+| Linux/X11 | Client overlay | Implemented and type-checked, including direct focus ownership/restoration; native keyboard behavior still needs an X11 smoke run |
 | KDE/wlroots Wayland | Layer shell | Unavailable: layer-shell may be advertised, but Scrozz does not yet own a mapped layer-shell rendering surface |
 | GNOME/Mutter Wayland | Compositor-owned | Unavailable through `RegionSelector`: the Screenshot portal returns an image URI, not target geometry |
 | Headless | None | Refused with `Error::Unsupported` |
