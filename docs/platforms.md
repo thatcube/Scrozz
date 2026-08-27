@@ -333,8 +333,9 @@ signed origin survived enumeration.
 
 ## Known asymmetry, stated honestly
 
-macOS is where interactive verification happens today, so macOS code will be
-better tested than Windows or Linux code until layer 4 exists. That is a real
-risk, not a solved problem. Layers 1–3 keep it from becoming *rot* — the code
-compiles, runs, and renders on all three — but they do not substitute for someone
-using the app on Windows.
+macOS remains the daily development host, so its behavior still receives more
+continuous use. The Windows first slice now has native interactive VM evidence
+for capture and layered-window behavior, but that qualification is periodic,
+not daily use; Linux still lacks equivalent interactive evidence. Layers 1–3
+keep platform code from becoming *rot*, but they do not replace recurring
+hands-on qualification on every desktop.
