@@ -68,8 +68,21 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use scrozz_core::{Error, Result};
+use scrozz_core::{CaptureTarget, Error, LogicalPoint, LogicalRect, LogicalSize, Result};
+use scrozz_record::{
+    Recording,
+    edit::{ChannelBehavior, EditPlan, SourceMetadata, TrimRange, VideoDocument},
+    engine::EngineCapabilities,
+    machine::{ClockDrift, MachineFailure, RecordingPhase},
+    selection::{AspectRatio, LastSelectionMemory, SelectionConstraints, SelectionMode},
+    settings::{CountdownSettings, Quality, ResolutionCap},
+    transcode::{TranscodeFailure, TranscodeOutput},
+};
+
+use crate::recording_overlay::RecordingSelectionState;
 
 // ===========================================================================
 // Frozen time and seeded randomness
@@ -259,23 +272,53 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// Recording is ready, before target selection begins.
+    RecordingIdle,
+    /// The All-in-One recording target and region selector.
+    RecordingSelecting,
+    /// The focused pre-recording countdown.
+    RecordingCountdown,
+    /// An active recording with live timing diagnostics.
+    RecordingActive,
+    /// A paused recording with resumable transport.
+    RecordingPaused,
+    /// A failed recording with salvageable partial output.
+    RecordingFailedPartial,
+    /// A loaded recording with transport, trim, and export controls.
+    VideoEditing,
+    /// A GIF export in progress.
+    VideoExporting,
+    /// A failed transcode with salvageable partial output.
+    VideoExportFailedPartial,
 }
 
 impl Scenario {
     /// Every scenario, in a stable order.
+    pub const ALL: &'static [Self] = &[
+        Self::StackSingle,
+        Self::StackEntering,
+        Self::StackFull,
+        Self::StackOverflowEvicting,
+        Self::StackDismissing,
+        Self::StackDragging,
+        Self::DockCollapsing,
+        Self::DockCollapsed,
+        Self::EditorAnnotating,
+        Self::RecordingIdle,
+        Self::RecordingSelecting,
+        Self::RecordingCountdown,
+        Self::RecordingActive,
+        Self::RecordingPaused,
+        Self::RecordingFailedPartial,
+        Self::VideoEditing,
+        Self::VideoExporting,
+        Self::VideoExportFailedPartial,
+    ];
+
+    /// Every scenario, in stable declaration order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
-        &[
-            Self::StackSingle,
-            Self::StackEntering,
-            Self::StackFull,
-            Self::StackOverflowEvicting,
-            Self::StackDismissing,
-            Self::StackDragging,
-            Self::DockCollapsing,
-            Self::DockCollapsed,
-            Self::EditorAnnotating,
-        ]
+        Self::ALL
     }
 
     /// The stable slug used in filenames, CLI arguments and baseline names.
@@ -294,6 +337,15 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::RecordingIdle => "recording-idle",
+            Self::RecordingSelecting => "recording-selecting",
+            Self::RecordingCountdown => "recording-countdown",
+            Self::RecordingActive => "recording-active",
+            Self::RecordingPaused => "recording-paused",
+            Self::RecordingFailedPartial => "recording-failed-partial",
+            Self::VideoEditing => "video-editing",
+            Self::VideoExporting => "video-exporting",
+            Self::VideoExportFailedPartial => "video-export-failed-partial",
         }
     }
 
@@ -479,6 +531,91 @@ pub enum Gesture {
     Expanding,
 }
 
+/// Recording-specific value fixture carried by [`Fixture`].
+#[derive(Debug, Clone)]
+pub enum RecordingFixture {
+    /// Compact recording status and controls.
+    Hud(RecordingHudFixture),
+    /// Focused countdown overlay.
+    Countdown(RecordingCountdownFixture),
+    /// All-in-One target and region selector.
+    Selection(RecordingSelectionFixture),
+    /// Video transport, edits, and export state.
+    Editor(VideoEditorFixture),
+}
+
+/// Deterministic values shown by the recording HUD.
+#[derive(Debug, Clone)]
+pub struct RecordingHudFixture {
+    /// Exact recording phase.
+    pub phase: RecordingPhase,
+    /// Authoritative virtual elapsed time.
+    pub elapsed: Duration,
+    /// Recording engine capabilities.
+    pub capabilities: EngineCapabilities,
+    /// Most recent live warning.
+    pub warning: Option<String>,
+    /// Most recent engine drift sample.
+    pub drift: Option<ClockDrift>,
+    /// Complete output, for a finished fixture.
+    pub output: Option<Recording>,
+    /// Failure and any salvageable recording.
+    pub failure: Option<MachineFailure>,
+}
+
+/// Deterministic countdown values.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordingCountdownFixture {
+    /// Countdown setting.
+    pub settings: CountdownSettings,
+    /// Remaining virtual time.
+    pub remaining: Duration,
+}
+
+/// Deterministic selection-overlay values.
+#[derive(Debug, Clone)]
+pub struct RecordingSelectionFixture {
+    /// Editable selector state.
+    pub state: RecordingSelectionState,
+    /// Available logical desktop.
+    pub desktop_bounds: LogicalRect,
+    /// Current real drag rectangle.
+    pub drag_preview: Option<LogicalRect>,
+    /// Hint derived from target enumeration.
+    pub target_hint: Option<String>,
+    /// Remembered concrete region.
+    pub last_selection: LastSelectionMemory,
+}
+
+/// Deterministic video-editor values.
+#[derive(Debug, Clone)]
+pub struct VideoEditorFixture {
+    /// Loaded recording document.
+    pub document: VideoDocument,
+    /// Non-destructive edit plan.
+    pub plan: EditPlan,
+    /// Export state.
+    pub export: EditorExportFixture,
+}
+
+/// Deterministic transcoder state for editor scenes.
+#[derive(Debug, Clone)]
+pub enum EditorExportFixture {
+    /// No export has begun.
+    Idle,
+    /// Export in progress.
+    Running {
+        /// Normalized progress.
+        progress: f32,
+    },
+    /// Complete export.
+    Finished(TranscodeOutput),
+    /// Failed export and any salvageable output.
+    Failed(TranscodeFailure),
+    /// Cancelled export.
+    Cancelled,
+}
+
 /// The frozen, seeded state a [`Scene`] draws.
 ///
 /// A fixture is the *entire* world the surface may observe. If a surface needs
@@ -504,6 +641,8 @@ pub struct Fixture {
     pub docked: bool,
     /// Whether the annotation toolbar is open.
     pub annotating: bool,
+    /// Recording-specific values for recording and editor scenarios.
+    pub recording: Option<RecordingFixture>,
     /// Seed for anything else the scene needs.
     pub seed: u64,
     /// Logical size of the surface, in points, before profile scaling.
@@ -632,7 +771,7 @@ impl Fixture {
         let size_pt = (420.0, 620.0);
         let seed = DEFAULT_SEED ^ (scenario as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
-        let (cards, gesture, docked, annotating, title, intent, key_instants, sequence) =
+        let (cards, gesture, docked, annotating, title, intent, key_instants, sequence, recording) =
             match scenario {
                 Scenario::StackSingle => (
                     Self::cards(seed, 1),
@@ -642,6 +781,7 @@ impl Fixture {
                     "A capture, waiting",
                     "The resting state after one capture: a single card at the bottom slot, no chrome, nothing else on screen (D27).",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::StackEntering => (
@@ -657,6 +797,7 @@ impl Fixture {
                         end_ms: 560,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::StackFull => (
                     Self::cards(seed, 6),
@@ -666,6 +807,7 @@ impl Fixture {
                     "Six captures, stacked",
                     "A full pile, bottom-anchored and grown upward, newest on top (D28). The hero shot.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::StackOverflowEvicting => (
@@ -681,6 +823,7 @@ impl Fixture {
                         end_ms: 560,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::StackDismissing => (
                     Self::cards(seed, 4),
@@ -695,6 +838,7 @@ impl Fixture {
                         end_ms: 560,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::StackDragging => (
                     Self::cards(seed, 3),
@@ -712,6 +856,7 @@ impl Fixture {
                         end_ms: 400,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::DockCollapsing => (
                     Self::cards(seed, 5),
@@ -726,6 +871,7 @@ impl Fixture {
                         end_ms: 520,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::DockCollapsed => (
                     Self::cards(seed, 5),
@@ -735,6 +881,7 @@ impl Fixture {
                     "Out of the way, not gone",
                     "The dock: same width as a card, roughly one-sixth the height, upward chevron. Clicking or swiping up brings the captures back (D20).",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::EditorAnnotating => (
@@ -746,10 +893,127 @@ impl Fixture {
                     "The annotation toolbar open over a capture. Annotations stay editable forever with no user-facing project file (D14).",
                     instants::REST,
                     None,
+                    None,
+                ),
+                Scenario::RecordingIdle => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Ready to record",
+                    "The recording HUD is idle with transport disabled until a real target and session exist.",
+                    instants::REST,
+                    None,
+                    Some(Self::hud_fixture(RecordingPhase::Idle)),
+                ),
+                Scenario::RecordingSelecting => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Choose a recording target",
+                    "All-in-One selection shows an enumerated target, precise dimensions, aspect lock, a real drag preview, and last-region reuse.",
+                    instants::REST,
+                    None,
+                    Some(Self::selection_fixture()),
+                ),
+                Scenario::RecordingCountdown => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Recording starts in three",
+                    "A focused, accessible countdown is driven by supplied virtual remaining time and never reads a wall clock.",
+                    instants::REST,
+                    None,
+                    Some(RecordingFixture::Countdown(RecordingCountdownFixture {
+                        settings: CountdownSettings {
+                            enabled: true,
+                            seconds: 3,
+                        },
+                        remaining: Duration::from_millis(2_450),
+                    })),
+                ),
+                Scenario::RecordingActive => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Recording in progress",
+                    "The compact HUD exposes virtual elapsed time, pause, stop, a live warning, and encoder-clock drift.",
+                    instants::REST,
+                    None,
+                    Some(Self::hud_fixture(RecordingPhase::Recording)),
+                ),
+                Scenario::RecordingPaused => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Recording paused",
+                    "Paused time is frozen and the HUD replaces pause with the semantic resume action while keeping stop available.",
+                    instants::REST,
+                    None,
+                    Some(Self::hud_fixture(RecordingPhase::Paused)),
+                ),
+                Scenario::RecordingFailedPartial => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Partial recording recovered",
+                    "A terminal capture failure keeps its salvageable output visible and actionable instead of reporting total loss.",
+                    instants::REST,
+                    None,
+                    Some(Self::hud_fixture(RecordingPhase::Failed)),
+                ),
+                Scenario::VideoEditing => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Trim and export a recording",
+                    "The real video editor exposes transport, seek, trim, quality, resolution, and audio edits as values.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
+                ),
+                Scenario::VideoExporting => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Exporting a GIF",
+                    "A GIF export reports deterministic progress while editing and audio controls are correctly disabled.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
+                ),
+                Scenario::VideoExportFailedPartial => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Partial export recovered",
+                    "A transcoder failure reports its error and exposes the salvageable partial artifact.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
                 ),
             };
 
-        let size_pt = if annotating { (900.0, 620.0) } else { size_pt };
+        let size_pt = match scenario {
+            Scenario::EditorAnnotating => (900.0, 620.0),
+            Scenario::RecordingIdle
+            | Scenario::RecordingActive
+            | Scenario::RecordingPaused
+            | Scenario::RecordingFailedPartial => (460.0, 420.0),
+            Scenario::RecordingSelecting => (680.0, 760.0),
+            Scenario::RecordingCountdown => (720.0, 480.0),
+            Scenario::VideoEditing | Scenario::VideoExporting => (940.0, 820.0),
+            Scenario::VideoExportFailedPartial => (940.0, 940.0),
+            _ => size_pt,
+        };
 
         Self {
             scenario,
@@ -760,6 +1024,7 @@ impl Fixture {
             gesture,
             docked,
             annotating,
+            recording,
             seed,
             size_pt,
             key_instants,
@@ -775,6 +1040,147 @@ impl Fixture {
             .copied()
             .map(Self::for_scenario)
             .collect()
+    }
+
+    fn hud_fixture(phase: RecordingPhase) -> RecordingFixture {
+        let elapsed = match phase {
+            RecordingPhase::Idle => Duration::ZERO,
+            RecordingPhase::Paused => Duration::from_secs(71),
+            RecordingPhase::Failed => Duration::from_secs(83),
+            _ => Duration::from_secs(67),
+        };
+        let warning = (phase == RecordingPhase::Recording)
+            .then(|| "Frame delivery is briefly behind.".to_owned());
+        let drift = (phase == RecordingPhase::Recording).then_some(ClockDrift {
+            authoritative_secs: elapsed.as_secs_f64(),
+            engine_secs: elapsed.as_secs_f64() + 0.084,
+            delta_secs: 0.084,
+        });
+        let failure = (phase == RecordingPhase::Failed).then(|| {
+            let partial = Recording::synthetic_partial(
+                "Scrozz partial 2025-01-01.mp4",
+                elapsed.as_secs_f64(),
+                "deterministic UI fixture",
+                "the container trailer could not be written",
+            )
+            .expect("the fixed partial-recording fixture is valid");
+            MachineFailure {
+                error: Arc::new(Error::Codec(
+                    "encoder disconnected while finalising".to_owned(),
+                )),
+                partial: Some(partial),
+                recovery_error: None,
+            }
+        });
+        RecordingFixture::Hud(RecordingHudFixture {
+            phase,
+            elapsed,
+            capabilities: EngineCapabilities::ALL,
+            warning,
+            drift,
+            output: None,
+            failure,
+        })
+    }
+
+    fn selection_fixture() -> RecordingFixture {
+        let desktop_bounds = LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            LogicalSize::new(2560.0, 1440.0),
+        );
+        let drag_preview = LogicalRect::new(
+            LogicalPoint::new(320.0, 180.0),
+            LogicalSize::new(1280.0, 720.0),
+        );
+        let remembered = LogicalRect::new(
+            LogicalPoint::new(144.0, 96.0),
+            LogicalSize::new(960.0, 540.0),
+        );
+        let mut last_selection = LastSelectionMemory::new();
+        let _ = last_selection.remember(&CaptureTarget::Region(remembered));
+        RecordingFixture::Selection(RecordingSelectionFixture {
+            state: RecordingSelectionState {
+                mode: SelectionMode::AllInOne,
+                constraints: SelectionConstraints {
+                    exact_size: Some(drag_preview.size),
+                    aspect_ratio: AspectRatio::new(16.0, 9.0).ok(),
+                },
+                candidate: Some(CaptureTarget::Region(drag_preview)),
+            },
+            desktop_bounds,
+            drag_preview: Some(drag_preview),
+            target_hint: Some("1280 × 720 region".to_owned()),
+            last_selection,
+        })
+    }
+
+    fn editor_fixture(scenario: Scenario) -> RecordingFixture {
+        let recording =
+            Recording::synthetic("Scrozz walkthrough.mp4", 94.0, "deterministic UI fixture")
+                .expect("the fixed editor recording is valid");
+        let mut document = VideoDocument::open_fixture(
+            recording,
+            SourceMetadata {
+                width: 2560,
+                height: 1440,
+                fps: 60.0,
+                audio_channels: 2,
+            },
+        )
+        .expect("the fixed editor source metadata is valid");
+        document
+            .seek(Duration::from_secs(37))
+            .expect("the fixed editor cursor is in range");
+
+        let mut plan = EditPlan::video(&document).expect("the fixed editor duration is non-zero");
+        plan.trim = TrimRange::new(
+            Duration::from_secs(4),
+            Duration::from_secs(86),
+            document.duration(),
+        )
+        .expect("the fixed editor trim is in range");
+        plan.quality = Quality::High;
+        plan.resolution = ResolutionCap::Fhd1080;
+        plan.audio.volume = 0.82;
+        plan.audio.channels = ChannelBehavior::StereoToMono;
+
+        let export = match scenario {
+            Scenario::VideoEditing => EditorExportFixture::Idle,
+            Scenario::VideoExporting => {
+                plan = EditPlan::gif(&document).expect("the fixed GIF plan is valid");
+                plan.trim = TrimRange::new(
+                    Duration::from_secs(4),
+                    Duration::from_secs(18),
+                    document.duration(),
+                )
+                .expect("the fixed GIF trim is in range");
+                plan.quality = Quality::Balanced;
+                plan.resolution = ResolutionCap::Hd720;
+                EditorExportFixture::Running { progress: 0.62 }
+            }
+            Scenario::VideoExportFailedPartial => {
+                let partial = TranscodeOutput::synthetic_partial(
+                    "Scrozz walkthrough partial.mp4",
+                    8_294_400,
+                    "deterministic UI fixture",
+                    "the output trailer could not be written",
+                )
+                .expect("the fixed partial export is valid");
+                EditorExportFixture::Failed(TranscodeFailure {
+                    error: Arc::new(Error::Codec(
+                        "hardware encoder stopped before finalisation".to_owned(),
+                    )),
+                    partial: Some(partial),
+                })
+            }
+            _ => EditorExportFixture::Idle,
+        };
+
+        RecordingFixture::Editor(VideoEditorFixture {
+            document,
+            plan,
+            export,
+        })
     }
 
     /// Builds `n` cards deterministically from `seed`.
@@ -1870,7 +2276,7 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
@@ -1878,6 +2284,29 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        for scenario in [
+            Scenario::RecordingIdle,
+            Scenario::RecordingActive,
+            Scenario::RecordingPaused,
+            Scenario::RecordingFailedPartial,
+        ] {
+            me.register(scenario, Box::new(crate::recording_hud::RecordingHudScene));
+        }
+        me.register(
+            Scenario::RecordingSelecting,
+            Box::new(crate::recording_overlay::RecordingOverlayScene),
+        );
+        me.register(
+            Scenario::RecordingCountdown,
+            Box::new(crate::countdown::CountdownScene),
+        );
+        for scenario in [
+            Scenario::VideoEditing,
+            Scenario::VideoExporting,
+            Scenario::VideoExportFailedPartial,
+        ] {
+            me.register(scenario, Box::new(crate::video_editor::VideoEditorScene));
+        }
         me
     }
 

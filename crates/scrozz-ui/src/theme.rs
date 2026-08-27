@@ -413,6 +413,13 @@ pub struct Palette {
     /// The keyboard focus ring (D13 — focus is always visible).
     pub focus_ring: Color32,
 
+    /// Live recording and destructive failure status.
+    pub recording: Color32,
+    /// Recoverable warning and partial-output status.
+    pub warning: Color32,
+    /// Successful terminal status.
+    pub success: Color32,
+
     /// The wide, soft cast shadow.
     pub key_shadow: Color32,
     /// The tight contact shadow.
@@ -462,6 +469,10 @@ impl Palette {
             active: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 36),
             focus_ring: Color32::from_rgb(0xA8, 0xA4, 0xFF),
 
+            recording: Color32::from_rgb(0xFF, 0x68, 0x75),
+            warning: Color32::from_rgb(0xFF, 0xC4, 0x5C),
+            success: Color32::from_rgb(0x63, 0xD6, 0x9A),
+
             key_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 120),
             ambient_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 66),
 
@@ -496,6 +507,10 @@ impl Palette {
             hover: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 16),
             active: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 30),
             focus_ring: Color32::from_rgb(0x3B, 0x37, 0xC4),
+
+            recording: Color32::from_rgb(0xB8, 0x1F, 0x38),
+            warning: Color32::from_rgb(0x8A, 0x51, 0x00),
+            success: Color32::from_rgb(0x0E, 0x6B, 0x42),
 
             key_shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x28, 60),
             ambient_shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x28, 30),

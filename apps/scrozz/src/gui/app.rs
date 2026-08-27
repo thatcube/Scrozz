@@ -25,6 +25,8 @@
 
 use std::time::{Duration, Instant};
 
+use scrozz_core::CaptureTarget;
+use scrozz_record::{MachineEvent, RecordingMachine, RecordingPhase, RecordingSettings};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
@@ -190,6 +192,10 @@ pub struct App {
     started: Instant,
     captures: u64,
     notes: Vec<String>,
+    recording: Option<RecordingMachine>,
+    recording_permission: fn() -> CliResult<()>,
+    recording_target: fn() -> CliResult<CaptureTarget>,
+    recording_tick: Instant,
 }
 
 impl App {
@@ -205,6 +211,22 @@ impl App {
     pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
         let pipeline = Pipeline::start()?;
         let mut notes = Vec::new();
+        let recording = match RecordingMachine::native(RecordingSettings::shipped()) {
+            Ok(machine) => {
+                notes.push(format!(
+                    "recording engine ready with capabilities {:?}",
+                    machine.capabilities()
+                ));
+                Some(machine)
+            }
+            Err(error) => {
+                notes.push(format!("screen recording unavailable: {error}"));
+                None
+            }
+        };
+        let recording_available = recording
+            .as_ref()
+            .is_some_and(|machine| machine.capabilities().video);
 
         let server = if config.ipc {
             // The one failure worth stopping for: another instance is live,
@@ -218,7 +240,7 @@ impl App {
         };
 
         let tray = if config.tray {
-            match Tray::with_tooltip("Scrozz") {
+            match Tray::with_tooltip_and_recording("Scrozz", recording_available) {
                 Ok(tray) => {
                     notes.push("menu-bar item shown".to_owned());
                     Some(tray)
@@ -270,6 +292,10 @@ impl App {
             started: Instant::now(),
             captures: 0,
             notes,
+            recording,
+            recording_permission: Self::ensure_recording_permission,
+            recording_target: Self::active_recording_target,
+            recording_tick: Instant::now(),
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -299,6 +325,7 @@ impl App {
         }
         self.drain_pipeline();
         self.drain_cards();
+        self.advance_recording();
 
         Tick::Continue
     }
@@ -446,10 +473,7 @@ impl App {
                 Tick::Continue
             }
             Action::ToggleRecording => {
-                // Recording is `scrozz-record`, which is behind the same guard
-                // and has no session to toggle yet. Saying so beats a menu item
-                // that does nothing.
-                self.note("recording is not wired up yet");
+                self.toggle_recording();
                 Tick::Continue
             }
             Action::OpenHistory => {
@@ -487,10 +511,183 @@ impl App {
         }
     }
 
+    fn toggle_recording(&mut self) {
+        let Some(phase) = self.recording.as_ref().map(RecordingMachine::phase) else {
+            self.note(
+                "screen recording is unavailable because no native engine advertised video capture",
+            );
+            return;
+        };
+
+        match phase {
+            RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed => {
+                self.begin_recording()
+            }
+            RecordingPhase::Selecting => {
+                let result = self
+                    .recording
+                    .as_mut()
+                    .expect("recording phase came from this machine")
+                    .cancel_selection();
+                self.finish_recording_action(result, "recording selection cancelled");
+            }
+            RecordingPhase::Countdown => {
+                let result = self
+                    .recording
+                    .as_mut()
+                    .expect("recording phase came from this machine")
+                    .cancel_countdown();
+                self.finish_recording_action(result, "recording countdown cancelled");
+            }
+            RecordingPhase::Recording | RecordingPhase::Paused => {
+                let result = self
+                    .recording
+                    .as_mut()
+                    .expect("recording phase came from this machine")
+                    .stop();
+                self.finish_recording_action(result, "recording stopped");
+            }
+            RecordingPhase::Finalising => self.note("recording is already finalising"),
+        }
+    }
+
+    fn begin_recording(&mut self) {
+        if let Err(error) = (self.recording_permission)() {
+            self.note(format!("recording permission is required: {error}"));
+            return;
+        }
+
+        let target = match (self.recording_target)() {
+            Ok(target) => target,
+            Err(error) => {
+                self.note(format!(
+                    "could not choose the active display to record: {error}"
+                ));
+                return;
+            }
+        };
+
+        let needs_reset = self.recording.as_ref().is_some_and(|machine| {
+            matches!(
+                machine.phase(),
+                RecordingPhase::Finished | RecordingPhase::Failed
+            )
+        });
+        if needs_reset {
+            let result = self
+                .recording
+                .as_mut()
+                .expect("recording availability was checked before resetting")
+                .reset();
+            if let Err(error) = result {
+                self.note(format!("could not reset recording state: {error}"));
+                return;
+            }
+        }
+
+        self.recording_tick = Instant::now();
+        let result = self
+            .recording
+            .as_mut()
+            .expect("recording availability was checked before starting")
+            .begin(target);
+        self.finish_recording_action(result, "recording countdown started");
+    }
+
+    fn finish_recording_action(&mut self, result: scrozz_core::Result<()>, success: &str) {
+        match result {
+            Ok(()) => self.note(success),
+            Err(error) => self.note(format!("recording action failed: {error}")),
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn advance_recording(&mut self) {
+        let now = Instant::now();
+        let delta = now.saturating_duration_since(self.recording_tick);
+        self.recording_tick = now;
+
+        let result = self.recording.as_mut().map(|machine| machine.tick(delta));
+        if let Some(Err(error)) = result {
+            self.note(format!("recording tick failed: {error}"));
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn drain_recording_events(&mut self) {
+        let events = self
+            .recording
+            .as_mut()
+            .map(|machine| machine.drain_events().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for event in events {
+            match event {
+                MachineEvent::PhaseChanged(_) => {}
+                MachineEvent::FirstFrame => self.note("recording captured its first frame"),
+                MachineEvent::Warning(message) => {
+                    self.note(format!("recording warning: {message}"));
+                }
+                MachineEvent::ClockDrift(drift) => self.note(format!(
+                    "recording clock drift: engine is {:+.3}s from the authoritative clock",
+                    drift.delta_secs
+                )),
+                MachineEvent::Finished(output) => match output.require_native() {
+                    Ok(output) => {
+                        self.note(format!("recording saved to {}", output.path().display()));
+                    }
+                    Err(error) => self.note(format!(
+                        "recording output was rejected at the real-output boundary: {error}"
+                    )),
+                },
+                MachineEvent::Failed(failure) => {
+                    let partial = failure.partial.as_ref().and_then(|output| {
+                        output.require_native().ok().map(|output| {
+                            format!("; partial output is at {}", output.path().display())
+                        })
+                    });
+                    self.note(format!(
+                        "recording failed: {}{}",
+                        failure.error,
+                        partial.unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+
+    fn refresh_recording_tray(&self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        let Some(machine) = &self.recording else {
+            tray.set_recording_available(false);
+            return;
+        };
+        tray.set_recording_available(machine.capabilities().video);
+        tray.set_recording(machine.is_active(), machine.elapsed());
+    }
+
     fn note(&mut self, what: impl Into<String>) {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);
+    }
+
+    fn ensure_recording_permission() -> CliResult<()> {
+        let permissions = SystemPermissions::new();
+        if !permissions.is_granted(Capability::ScreenRecording) {
+            permissions.request(Capability::ScreenRecording)?;
+        }
+        Ok(())
+    }
+
+    fn active_recording_target() -> CliResult<CaptureTarget> {
+        let backend = scrozz_capture::backend()?;
+        let display = backend.active_display()?;
+        Ok(CaptureTarget::Display(display.id))
     }
 
     /// How many cards are on screen.
@@ -628,19 +825,57 @@ mod tests {
     }
 
     #[test]
-    fn an_unwired_action_says_so_rather_than_doing_nothing() {
+    fn unavailable_and_unwired_actions_say_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
-        for action in [
-            Action::ToggleRecording,
-            Action::OpenHistory,
-            Action::OpenSettings,
-        ] {
+        for action in [Action::OpenHistory, Action::OpenSettings] {
             assert_eq!(app.perform(action), Tick::Continue);
         }
+        assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
-        assert!(notes.contains("recording is not wired up yet"), "{notes}");
+        assert!(notes.contains("no native engine"), "{notes}");
         assert!(notes.contains("history window"), "{notes}");
         assert!(notes.contains("settings window"), "{notes}");
+    }
+
+    #[test]
+    fn injected_mock_drives_the_toggle_path_but_is_rejected_as_real_output() {
+        fn target() -> CliResult<CaptureTarget> {
+            Ok(CaptureTarget::Display(scrozz_core::DisplayId(
+                "fixture-display".to_owned(),
+            )))
+        }
+
+        let (mut app, _) = app();
+        let mut settings = RecordingSettings::shipped();
+        settings.countdown.enabled = false;
+        app.recording = Some(
+            RecordingMachine::with_engine(
+                Box::new(scrozz_record::engine::MockEngine::fully_capable(
+                    scrozz_record::engine::MockSessionPlan::complete("mock.mp4", 2.0).unwrap(),
+                )),
+                settings,
+            )
+            .unwrap(),
+        );
+        app.recording_permission = || Ok(());
+        app.recording_target = target;
+
+        assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
+        assert_eq!(
+            app.recording.as_ref().map(RecordingMachine::phase),
+            Some(RecordingPhase::Recording)
+        );
+
+        assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
+        assert_eq!(
+            app.recording.as_ref().map(RecordingMachine::phase),
+            Some(RecordingPhase::Finished)
+        );
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("rejected at the real-output boundary"))
+        );
     }
 
     #[test]

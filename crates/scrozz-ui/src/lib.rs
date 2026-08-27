@@ -81,19 +81,36 @@
 #![forbid(unsafe_code)]
 
 pub mod card;
+pub mod countdown;
 pub mod harness;
 pub mod icons;
 pub mod motion;
 pub mod overlay_app;
 pub mod paint;
+mod recording_controls;
+pub mod recording_hud;
+pub mod recording_overlay;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
+pub mod video_editor;
 
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
+pub use countdown::{Countdown, CountdownResponse};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
 };
+pub use recording_hud::{
+    RecordingHud, RecordingHudAction, RecordingHudControls, RecordingHudModel, RecordingHudResponse,
+};
+pub use recording_overlay::{
+    RecordingOverlay, RecordingOverlayAction, RecordingOverlayControls, RecordingOverlayModel,
+    RecordingOverlayResponse, RecordingSelectionState,
+};
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
+pub use video_editor::{
+    TranscodeView, VideoEditor, VideoEditorAction, VideoEditorControls, VideoEditorModel,
+    VideoEditorResponse,
+};

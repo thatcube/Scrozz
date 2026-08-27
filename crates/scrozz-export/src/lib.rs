@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod animation;
 pub mod clipboard;
 pub mod decode;
 pub mod destination;
@@ -10,6 +11,10 @@ pub mod icc;
 pub mod naming;
 pub mod pixels;
 
+pub use animation::{
+    AnimationFormat, AnimationRepeat, GIF_MAX_FRAME_DELAY, GIF_MIN_FRAME_DELAY,
+    GifAnimationEncoder, TimedRgbaFrame,
+};
 pub use clipboard::{
     ClipboardPlatform, ClipboardReport, Flavour, FlavourGap, FlavourKind, SystemClipboard,
 };

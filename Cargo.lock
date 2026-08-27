@@ -1622,6 +1622,8 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
  "image-webp",
  "moxcms",
  "num-traits",
@@ -3294,6 +3296,7 @@ dependencies = [
  "objc2-screen-capture-kit",
  "scrozz-capture",
  "scrozz-core",
+ "scrozz-export",
  "thiserror 2.0.20",
  "tracing",
  "windows",
@@ -3350,6 +3353,7 @@ dependencies = [
  "resvg",
  "scrozz-annotate",
  "scrozz-core",
+ "scrozz-record",
  "thiserror 2.0.20",
  "tracing",
 ]

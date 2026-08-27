@@ -652,11 +652,12 @@ fn menu_ids_are_unique_and_round_trip() {
 fn enabled_menu_items_are_never_clickable_no_ops() {
     assert!(TrayAction::CaptureFullscreen.is_available());
     assert!(TrayAction::Quit.is_available());
+    assert!(!TrayAction::ToggleRecording.is_available_with(false));
+    assert!(TrayAction::ToggleRecording.is_available_with(true));
 
     for unfinished in [
         TrayAction::CaptureRegion,
         TrayAction::CaptureWindow,
-        TrayAction::ToggleRecording,
         TrayAction::OpenHistory,
         TrayAction::OpenSettings,
     ] {
@@ -670,9 +671,18 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
 
 #[test]
 fn the_recording_entry_says_what_the_click_will_do() {
-    assert_eq!(recording_label(false), "Start Recording");
-    assert_eq!(recording_label(true), "Stop Recording");
-    assert_eq!(TrayAction::ToggleRecording.label(), recording_label(false));
+    assert_eq!(
+        recording_label(false, std::time::Duration::from_secs(99)),
+        "Start Recording"
+    );
+    assert_eq!(
+        recording_label(true, std::time::Duration::from_secs(65)),
+        "Stop Recording • 01:05"
+    );
+    assert_eq!(
+        TrayAction::ToggleRecording.label(),
+        recording_label(false, std::time::Duration::ZERO)
+    );
 }
 
 #[test]

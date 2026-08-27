@@ -120,10 +120,7 @@ impl Rgba8 {
         if self.a == 255 {
             format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
         } else {
-            format!(
-                "#{:02x}{:02x}{:02x}{:02x}",
-                self.r, self.g, self.b, self.a
-            )
+            format!("#{:02x}{:02x}{:02x}{:02x}", self.r, self.g, self.b, self.a)
         }
     }
 }
@@ -1244,7 +1241,10 @@ mod tests {
     #[test]
     fn shipped_defaults_show_the_pointer_and_ask_for_no_permissions() {
         let s = RecordingSettings::shipped();
-        assert!(s.shows_cursor(), "a recording without a pointer is unusable");
+        assert!(
+            s.shows_cursor(),
+            "a recording without a pointer is unusable"
+        );
         assert!(!s.needs_input_monitoring());
         assert!(!s.needs_camera());
         assert!(!s.needs_microphone());

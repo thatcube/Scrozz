@@ -19,6 +19,8 @@
 //! A shipped `.app` should *also* set `LSUIElement` in its `Info.plist`; the
 //! runtime call covers `cargo run`, the CLI and tests, where there is no bundle.
 
+use std::time::Duration;
+
 use scrozz_core::{Error, Result};
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -108,6 +110,16 @@ impl TrayAction {
     #[must_use]
     pub const fn is_available(self) -> bool {
         matches!(self, Self::CaptureFullscreen | Self::Quit)
+    }
+
+    /// Whether this action is available with the queried recording capability.
+    #[must_use]
+    pub const fn is_available_with(self, recording_available: bool) -> bool {
+        if matches!(self, Self::ToggleRecording) {
+            recording_available
+        } else {
+            self.is_available()
+        }
     }
 }
 
@@ -260,6 +272,16 @@ impl Tray {
     ///
     /// As [`Tray::new`].
     pub fn with_tooltip(tooltip: &str) -> Result<Self> {
+        Self::with_tooltip_and_recording(tooltip, false)
+    }
+
+    /// Creates the tray item with recording enabled only when a real engine
+    /// advertised video capture.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tray::new`].
+    pub fn with_tooltip_and_recording(tooltip: &str, recording_available: bool) -> Result<Self> {
         let menu = Menu::new();
         let mut record_item = None;
 
@@ -270,8 +292,12 @@ impl Tray {
                     append(&menu, &separator)?;
                 }
                 TrayEntry::Item(action) => {
-                    let item =
-                        MenuItem::with_id(action.id(), action.label(), action.is_available(), None);
+                    let item = MenuItem::with_id(
+                        action.id(),
+                        action.label(),
+                        action.is_available_with(recording_available),
+                        None,
+                    );
                     append(&menu, &item)?;
                     if action == TrayAction::ToggleRecording {
                         record_item = Some(item);
@@ -337,9 +363,16 @@ impl Tray {
         }
     }
 
-    /// Switches the recording entry between "Start" and "Stop Recording".
-    pub fn set_recording(&self, recording: bool) {
-        self.record_item.set_text(recording_label(recording));
+    /// Switches the recording entry and includes authoritative active elapsed
+    /// time in its stop label.
+    pub fn set_recording(&self, recording: bool, elapsed: Duration) {
+        self.record_item
+            .set_text(recording_label(recording, elapsed));
+    }
+
+    /// Enables recording only after the app queries a real engine capability.
+    pub fn set_recording_available(&self, available: bool) {
+        self.record_item.set_enabled(available);
     }
 
     /// Shows or hides the item without destroying it.
@@ -361,11 +394,23 @@ impl Tray {
 
 /// The label the recording entry carries in each state.
 #[must_use]
-pub const fn recording_label(recording: bool) -> &'static str {
+pub fn recording_label(recording: bool, elapsed: Duration) -> String {
     if recording {
-        "Stop Recording"
+        format!("Stop Recording • {}", format_elapsed(elapsed))
     } else {
-        "Start Recording"
+        "Start Recording".to_owned()
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    let hours = total / 3_600;
+    let minutes = total % 3_600 / 60;
+    let seconds = total % 60;
+    if hours == 0 {
+        format!("{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
     }
 }
 
