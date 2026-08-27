@@ -16,8 +16,10 @@ use crate::theme::{Radius, Space, Text, Theme, corner};
 use super::Highlight;
 use super::WindowPicker;
 
-const SCRIM_ALPHA: u8 = 116;
-const OUTLINE_WIDTH: f32 = 3.0;
+const SCRIM_ALPHA: u8 = 88;
+const SELECTION_TINT: f32 = 0.16;
+const OUTLINE_WIDTH: f32 = 5.0;
+const INNER_OUTLINE_WIDTH: f32 = 2.0;
 const LABEL_GAP: f32 = Space::SM;
 const LABEL_PADDING_X: f32 = 11.0;
 const LABEL_PADDING_Y: f32 = 6.0;
@@ -84,6 +86,11 @@ pub fn draw(
         );
     }
 
+    painter.rect_filled(
+        layout.highlight.intersect(viewport),
+        CornerRadius::ZERO,
+        theme.palette.accent.linear_multiply(SELECTION_TINT),
+    );
     painter.rect_stroke(
         layout.highlight,
         CornerRadius::ZERO,
@@ -93,12 +100,15 @@ pub fn draw(
     painter.rect_stroke(
         layout.highlight.shrink(OUTLINE_WIDTH),
         CornerRadius::ZERO,
-        Stroke::new(1.0, Color32::from_white_alpha(130)),
+        Stroke::new(INNER_OUTLINE_WIDTH, Color32::WHITE),
         StrokeKind::Inside,
     );
 
     let (width, height) = highlight.pixel_size();
-    let text = format!("{}  {width} x {height}", highlight.label());
+    let text = format!(
+        "{}  {width} x {height}  -  Return to capture",
+        highlight.label()
+    );
     paint_label(painter, viewport, layout.highlight, &text, theme);
 }
 
@@ -200,7 +210,7 @@ fn interact_inner(
 fn paint_label(painter: &Painter, viewport: Rect, highlight: Rect, text: &str, theme: &Theme) {
     let galley = painter.layout_no_wrap(
         text.to_owned(),
-        theme.font(Text::Caption),
+        theme.font(Text::Body),
         theme.palette.on_accent,
     );
     let size = galley.size() + vec2(LABEL_PADDING_X * 2.0, LABEL_PADDING_Y * 2.0);
