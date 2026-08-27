@@ -43,9 +43,7 @@ pub mod identity;
 pub mod selection;
 pub mod target;
 
-pub use capture::{
-    Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance, WindowPicking,
-};
+pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance, WindowPicking};
 pub use error::{Error, Result};
 pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
