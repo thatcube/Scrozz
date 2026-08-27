@@ -30,6 +30,17 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(target_os = "linux")]
+pub use linux::session::{
+    Compositor, PortalCapabilities, SessionEnv as LinuxSessionEnv, SessionKind as LinuxSessionKind,
+    capabilities as portal_capabilities, detect_compositor, detect_session,
+};
+#[cfg(target_os = "linux")]
+pub use linux::wayland::portal::SessionPlan as PortalSessionPlan;
+#[cfg(target_os = "linux")]
+pub use linux::wayland::restore::{
+    TokenKey as PortalTokenKey, TokenStore as PortalTokenStore, token_path as portal_token_path,
+};
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCaptureKitBackend;
 

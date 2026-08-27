@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+linux-recording = ["scrozz-record/linux-native"]
+rav1e-fallback = ["scrozz-record/rav1e-fallback"]
+
 [[bin]]
 name = "scrozz"
 path = "src/main.rs"

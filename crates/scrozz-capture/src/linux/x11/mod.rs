@@ -12,12 +12,11 @@
 //!
 //! # MIT-SHM
 //!
-//! The shared-memory path is detected and reported but not used. It needs both
-//! `x11rb`'s `shm` feature and a way to call `shmget`/`shmat` or `memfd_create`
-//! — that is, `libc` or `rustix` — and this crate's manifest grants neither.
-//! `GetImage` is used instead, which is correct everywhere and slower on large
-//! captures. [`X11Backend::shm_available`] records what was found so the report
-//! is honest about which path ran.
+//! The workspace enables `x11rb`'s `shm` and `libc` features. The shared-memory
+//! fast path is nevertheless not used yet: `GetImage` remains the portable
+//! baseline and is slower on large captures. [`X11Backend::shm_available`]
+//! records what the server offers so diagnostics distinguish an unimplemented
+//! optimisation from a server without MIT-SHM.
 
 pub mod ewmh;
 pub mod layout;
@@ -32,6 +31,7 @@ use scrozz_core::{
     WindowId,
 };
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::xfixes;
 use x11rb::protocol::xproto::{
     self, AtomEnum, ImageFormat, ImageOrder, MapState, Screen, Visualtype,
 };
@@ -107,6 +107,7 @@ pub struct X11Backend {
     randr: Option<RandrExtension>,
     scale: ScaleFactor,
     shm_available: bool,
+    xfixes_available: bool,
     image_lsb_first: bool,
     name: String,
 }
@@ -154,17 +155,27 @@ impl X11Backend {
             .ok()
             .flatten()
             .is_some();
+        let xfixes_available = conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)
+            .ok()
+            .flatten()
+            .is_some();
 
         let scale = read_scale(&conn, root);
 
         let name = format!(
-            "X11 (GetImage{}{})",
+            "X11 (GetImage{}{}{})",
             if randr.is_some() { ", RandR 1.5" } else { "" },
             if shm_available {
                 ", MIT-SHM present but unused"
             } else {
                 ""
-            }
+            },
+            if xfixes_available {
+                ", XFIXES cursor"
+            } else {
+                ""
+            },
         );
 
         Ok(Self {
@@ -175,6 +186,7 @@ impl X11Backend {
             randr,
             scale,
             shm_available,
+            xfixes_available,
             image_lsb_first,
             name,
         })
@@ -516,6 +528,68 @@ impl X11Backend {
         Ok(frame)
     }
 
+    fn composite_cursor(&self, frame: &mut Frame, origin: (i32, i32)) {
+        if !self.xfixes_available {
+            tracing::warn!("the X server has no XFIXES extension; capturing without the pointer");
+            return;
+        }
+        let reply = match xfixes::get_cursor_image(&self.conn) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => reply,
+                Err(err) => {
+                    tracing::warn!(%err, "XFIXES could not read the cursor; capturing without it");
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(%err, "XFIXES cursor request failed; capturing without it");
+                return;
+            }
+        };
+
+        let left = i32::from(reply.x) - i32::from(reply.xhot) - origin.0;
+        let top = i32::from(reply.y) - i32::from(reply.yhot) - origin.1;
+        let frame_width = frame.width() as i32;
+        let frame_height = frame.height() as i32;
+        let cursor_width = i32::from(reply.width);
+        let cursor_height = i32::from(reply.height);
+
+        for cursor_y in 0..cursor_height {
+            let frame_y = top + cursor_y;
+            if !(0..frame_height).contains(&frame_y) {
+                continue;
+            }
+            for cursor_x in 0..cursor_width {
+                let frame_x = left + cursor_x;
+                if !(0..frame_width).contains(&frame_x) {
+                    continue;
+                }
+                let cursor_index = cursor_y as usize * cursor_width as usize + cursor_x as usize;
+                let argb = reply.cursor_image[cursor_index];
+                let alpha = (argb >> 24) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                let red = ((argb >> 16) & 0xff) as u8;
+                let green = ((argb >> 8) & 0xff) as u8;
+                let blue = (argb & 0xff) as u8;
+                let offset = frame_y as usize * frame.stride + frame_x as usize * 4;
+                let (red_index, blue_index) = match frame.format {
+                    scrozz_core::PixelFormat::Rgba8
+                    | scrozz_core::PixelFormat::RgbaPremultiplied8 => (offset, offset + 2),
+                    scrozz_core::PixelFormat::Bgra8
+                    | scrozz_core::PixelFormat::BgraPremultiplied8 => (offset + 2, offset),
+                };
+                let inverse = u16::from(255 - alpha);
+                frame.data[red_index] = blend_premultiplied(red, frame.data[red_index], inverse);
+                frame.data[offset + 1] =
+                    blend_premultiplied(green, frame.data[offset + 1], inverse);
+                frame.data[blue_index] = blend_premultiplied(blue, frame.data[blue_index], inverse);
+                frame.data[offset + 3] = 255;
+            }
+        }
+    }
+
     fn display_by_id(&self, id: &DisplayId) -> Result<Display> {
         self.displays()?
             .into_iter()
@@ -628,22 +702,14 @@ impl TargetEnumerator for X11Backend {
 
 impl CaptureBackend for X11Backend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
-        if request.cursor == scrozz_core::CursorMode::Visible {
-            // Compositing the pointer needs XFIXES for the cursor image, which
-            // is another feature-gated extension. Failing here would make the
-            // whole capture unavailable over an optional decoration, so the
-            // capture proceeds and the omission is logged.
-            tracing::warn!(
-                "cursor capture needs the XFIXES extension, which is not compiled in; \
-                 capturing without the pointer"
-            );
-        }
-
-        let frame = match &request.target {
+        let (mut frame, origin) = match &request.target {
             CaptureTarget::Display(id) => {
                 let display = self.display_by_id(id)?;
                 let region = physical_rect(display.bounds, display.scale);
-                self.grab(self.root, region, display.scale)?
+                (
+                    self.grab(self.root, region, display.scale)?,
+                    (region.x, region.y),
+                )
             }
 
             CaptureTarget::AllDisplays => {
@@ -654,7 +720,10 @@ impl CaptureBackend for X11Backend {
                     .collect();
                 let region = layout::bounding_box(&rects)
                     .ok_or_else(|| Error::Platform("no displays are connected".into()))?;
-                self.grab(self.root, region, self.scale)?
+                (
+                    self.grab(self.root, region, self.scale)?,
+                    (region.x, region.y),
+                )
             }
 
             CaptureTarget::Region(rect) => {
@@ -669,7 +738,10 @@ impl CaptureBackend for X11Backend {
                     .ok_or_else(|| {
                         Error::InvalidRequest("the selected region lies entirely off-screen".into())
                     })?;
-                self.grab(self.root, region, self.scale)?
+                (
+                    self.grab(self.root, region, self.scale)?,
+                    (region.x, region.y),
+                )
             }
 
             CaptureTarget::Window(id) => {
@@ -688,13 +760,19 @@ impl CaptureBackend for X11Backend {
                 // compositing manager is redirecting the window's contents.
                 // Without one, X has no stored pixels for obscured areas and
                 // the server returns whatever is on screen there.
-                self.grab(
-                    drawable,
-                    PixelRect::new(0, 0, bounds.width, bounds.height),
-                    self.scale,
-                )?
+                (
+                    self.grab(
+                        drawable,
+                        PixelRect::new(0, 0, bounds.width, bounds.height),
+                        self.scale,
+                    )?,
+                    (bounds.x, bounds.y),
+                )
             }
         };
+        if request.cursor == scrozz_core::CursorMode::Visible {
+            self.composite_cursor(&mut frame, origin);
+        }
 
         Ok(Capture {
             frame,
@@ -711,6 +789,10 @@ impl CaptureBackend for X11Backend {
     fn name(&self) -> &str {
         &self.name
     }
+}
+
+fn blend_premultiplied(source: u8, destination: u8, inverse_alpha: u16) -> u8 {
+    (u16::from(source) + (u16::from(destination) * inverse_alpha + 127) / 255).min(255) as u8
 }
 
 /// A stable-for-a-session display identifier.

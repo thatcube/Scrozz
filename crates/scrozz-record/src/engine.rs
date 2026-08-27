@@ -144,7 +144,16 @@ pub fn detect_native_engine() -> Option<Box<dyn RecordingEngine>> {
         Some(Box::new(crate::macos::MacEngine))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", feature = "linux-native"))]
+    {
+        Some(Box::new(crate::linux::LinuxEngine))
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "linux", not(feature = "linux-native")),
+        not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+    ))]
     {
         None
     }

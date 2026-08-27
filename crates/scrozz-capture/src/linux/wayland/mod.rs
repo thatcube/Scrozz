@@ -25,11 +25,10 @@
 //!
 //! # Current state
 //!
-//! The negotiation is complete and tested; the D-Bus calls are not compiled.
-//! `ashpd`'s `screencast` and `screenshot` modules are behind Cargo features
-//! that this workspace's dependency declaration does not enable, and this crate
-//! is not permitted to change that declaration. See [`portal::acquire_frame`]
-//! for the second, larger gap: PipeWire.
+//! The portal model and Cargo features are complete and tested. Still capture
+//! does not yet consume the returned PipeWire node in this crate; continuous
+//! PipeWire acquisition is implemented by `scrozz-record`, whose native system
+//! libraries are deliberately optional so cross-host checks remain link-free.
 
 pub mod portal;
 pub mod restore;
@@ -195,9 +194,9 @@ impl WaylandBackend {
 
     /// Negotiates a ScreenCast session for a request.
     ///
-    /// Fully specified and currently unreachable. The plan it builds is exactly
-    /// what the D-Bus call would carry, which is why it is worth computing and
-    /// testing even while the call itself cannot be made.
+    /// The ashpd ScreenCast feature is enabled. This still-capture crate has not
+    /// yet adopted the PipeWire consumer used by `scrozz-record`, so it reports
+    /// that implementation boundary without claiming the portal API is absent.
     fn open_session(&self, plan: &SessionPlan) -> Result<portal::StreamInfo> {
         let _restore = self
             .capabilities
@@ -209,10 +208,9 @@ impl WaylandBackend {
             what: "capturing on Wayland".into(),
             why: format!(
                 "the ScreenCast portal is the only route to pixels on {compositor}, and this \
-                 build cannot call it: the `ashpd` dependency is declared without its \
-                 `screencast` and `screenshot` features, so those modules are not compiled in. \
-                 Adding `features = [\"screencast\", \"screenshot\"]` to the workspace's ashpd \
-                 dependency, plus a PipeWire client for frame acquisition, is what remains",
+                 still-capture backend has not wired its enabled ashpd negotiation to a PipeWire \
+                 frame consumer yet; continuous capture is implemented by scrozz-record's \
+                 optional linux-native engine",
                 compositor = self.compositor
             ),
         })

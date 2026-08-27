@@ -892,7 +892,7 @@ impl ResolutionCap {
         let (w, h) = (width.max(1), height.max(1));
         let scaled = match self {
             Self::Native => (w, h),
-            Self::Half => ((w + 1) / 2, (h + 1) / 2),
+            Self::Half => (w.div_ceil(2), h.div_ceil(2)),
             _ => {
                 let Some(limit) = self.shortest_edge() else {
                     return even(w, h);

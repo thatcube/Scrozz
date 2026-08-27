@@ -8,12 +8,26 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Native Linux media libraries are deliberately opt-in. Their build scripts use
+# pkg-config, so a macOS-hosted Linux cross-check remains link-free.
+linux-native = [
+    "dep:ffmpeg-sys-next",
+    "dep:pipewire",
+    "dep:tokio",
+]
+# The only software video encoder Scrozz permits. Hardware H.264 remains the
+# default, and this sizeable fallback stays independently optional.
+rav1e-fallback = ["dep:rav1e"]
+
 [dependencies]
 scrozz-core.workspace = true
 scrozz-export.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-capture.workspace = true
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
@@ -26,6 +40,13 @@ objc2-core-graphics.workspace = true
 objc2-core-media = { workspace = true, features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "objc2-core-audio-types", "objc2-core-video"] }
 objc2-screen-capture-kit = { workspace = true, features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 dispatch2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+x11rb.workspace = true
+ffmpeg-sys-next = { version = "9.0.0", default-features = false, features = ["avcodec"], optional = true }
+pipewire = { version = "0.10.1", features = ["v0_3_44"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [

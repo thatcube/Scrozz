@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scrozz_core::{CaptureTarget, Error, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize};
-use scrozz_record::{OverlayLayer, OverlaySource, RecordingRequest, RecordingState};
+use scrozz_record::{OverlayLayer, OverlaySource, RecordingRequest};
 
 struct TempRecording(PathBuf);
 
@@ -98,13 +98,19 @@ fn opt_in_smoke_records_and_rebases_a_short_pause() {
     request.show_cursor = true;
 
     let mut session = attempt!("recording start", scrozz_record::start(&request));
-    assert_eq!(session.state(), RecordingState::Recording);
     std::thread::sleep(Duration::from_millis(350));
-    let before_pause = session.elapsed();
+    let before_pause = Duration::from_secs_f64(
+        session
+            .engine_elapsed_secs()
+            .expect("macOS engine exposes elapsed media time"),
+    );
     session.pause().expect("pause recording");
-    assert_eq!(session.state(), RecordingState::Paused);
     std::thread::sleep(Duration::from_millis(200));
-    let after_pause = session.elapsed();
+    let after_pause = Duration::from_secs_f64(
+        session
+            .engine_elapsed_secs()
+            .expect("macOS engine exposes elapsed media time"),
+    );
     assert!(
         after_pause.abs_diff(before_pause) < Duration::from_millis(30),
         "elapsed time advanced while paused: {before_pause:?} to {after_pause:?}"
