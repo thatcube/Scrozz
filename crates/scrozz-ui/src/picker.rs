@@ -665,11 +665,20 @@ struct PickerApp {
     notice: Option<String>,
 }
 
-impl PickerApp {
-    fn finish(&self, ctx: &egui::Context, outcome: scrozz_core::Result<Outcome>) {
-        if let Ok(mut slot) = self.result.lock() {
+fn store_terminal_result(
+    result: &Mutex<Option<scrozz_core::Result<Outcome>>>,
+    outcome: scrozz_core::Result<Outcome>,
+) {
+    if let Ok(mut slot) = result.lock() {
+        if slot.is_none() {
             *slot = Some(outcome);
         }
+    }
+}
+
+impl PickerApp {
+    fn finish(&self, ctx: &egui::Context, outcome: scrozz_core::Result<Outcome>) {
+        store_terminal_result(self.result.as_ref(), outcome);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
@@ -953,6 +962,22 @@ mod tests {
     fn committing_with_nothing_focused_is_a_cancellation_not_a_vanishing() {
         let picker = fixtures::overlapping().into_picker();
         assert_eq!(picker.commit(&[]), Outcome::Cancelled);
+    }
+
+    #[test]
+    fn a_programmatic_close_cannot_overwrite_a_committed_selection() {
+        let result = Mutex::new(None);
+        let selected = WindowId("front".to_owned());
+
+        store_terminal_result(&result, Ok(Outcome::Selected(selected.clone())));
+        store_terminal_result(&result, Ok(Outcome::Cancelled));
+
+        let outcome = result
+            .into_inner()
+            .expect("result lock")
+            .expect("terminal result")
+            .expect("successful picker result");
+        assert_eq!(outcome, Outcome::Selected(selected));
     }
 
     #[test]
