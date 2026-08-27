@@ -299,11 +299,9 @@ fn an_unsupported_operation_gives_the_why_and_the_alternative() {
 }
 
 #[test]
-fn an_unfinished_backend_is_a_clean_refusal_rather_than_a_panic() {
-    // Most of the workspace is `todo!()` today. A user who reaches one must get
-    // a code and a sentence, not exit 101 and a backtrace.
-    let out = scrozz(["capture", "--region", "0,0,10,10", "--no-ipc"]);
-    assert_ne!(code(&out), 101, "a todo!() escaped: {}", stderr(&out));
+fn capture_validation_is_clean_without_touching_the_screen() {
+    let out = scrozz(["capture", "--region", "0,0,10,10", "--no-ipc", "--dry-run"]);
+    assert_eq!(code(&out), 0, "capture planning failed: {}", stderr(&out));
     assert!(!stderr(&out).contains("panicked"), "{}", stderr(&out));
 }
 

@@ -420,24 +420,34 @@ fn installed_language<'a>(requested: &str, installed: &'a [String]) -> Option<&'
 
 fn resolve_system_languages(installed: &[String]) -> Result<Vec<String>> {
     let requested = system_language_tags()?;
-    if requested.is_empty() {
-        return Err(Error::Unsupported {
-            what: "text recognition in the system language".to_string(),
-            why: format!(
-                "the Windows locale does not name a language Tesseract can select. Installed \
-                 models: {}. Pass an explicit BCP-47 language tag",
-                installed_description(installed)
-            ),
-        });
+    resolve_implicit_languages(&requested, installed)
+}
+
+fn resolve_implicit_languages(requested: &[String], installed: &[String]) -> Result<Vec<String>> {
+    if !requested.is_empty()
+        && let Ok(selected) = resolve_languages(requested, installed)
+    {
+        return Ok(selected);
     }
-    resolve_languages(&requested, installed).map_err(|_| Error::Unsupported {
-        what: format!(
-            "text recognition in the Windows locale ({})",
-            requested.join(", ")
-        ),
+
+    // The portable artifact guarantees English. Empty Options.languages means
+    // "best available default", not an explicit request for the Windows locale.
+    if let Some(english) = installed.iter().find(|language| language.as_str() == "eng") {
+        return Ok(vec![english.clone()]);
+    }
+
+    Err(Error::Unsupported {
+        what: if requested.is_empty() {
+            "text recognition in the system language".to_string()
+        } else {
+            format!(
+                "text recognition in the Windows locale ({})",
+                requested.join(", ")
+            )
+        },
         why: format!(
-            "no installed Tesseract traineddata matches the Windows locale. Installed models: {}. \
-             {}",
+            "no installed Tesseract traineddata matches the Windows locale and the required \
+             English model is unavailable. Installed models: {}. {}",
             installed_description(installed),
             install_guidance()
         ),
@@ -850,6 +860,38 @@ mod tests {
             resolve_languages(&["nn-NO".to_string()], &["nor".to_string()]).unwrap(),
             ["nor"]
         );
+    }
+
+    #[test]
+    fn implicit_languages_prefer_the_windows_locale_then_exact_english() {
+        assert_eq!(
+            resolve_implicit_languages(
+                &["fr-FR".to_string()],
+                &["eng".to_string(), "fra".to_string()]
+            )
+            .unwrap(),
+            ["fra"]
+        );
+        assert_eq!(
+            resolve_implicit_languages(&["fr-FR".to_string()], &["eng".to_string()]).unwrap(),
+            ["eng"]
+        );
+        assert_eq!(
+            resolve_implicit_languages(&[], &["eng".to_string()]).unwrap(),
+            ["eng"]
+        );
+        assert!(matches!(
+            resolve_implicit_languages(&["fr-FR".to_string()], &["ENG".to_string()]),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_languages_never_fall_back_to_english() {
+        assert!(matches!(
+            resolve_languages(&["fr-FR".to_string()], &["eng".to_string()]),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]

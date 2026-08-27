@@ -39,18 +39,24 @@ pub fn unstable_backends_enabled() -> bool {
 
 /// Whether the still-capture backend is ready without an opt-in guard.
 ///
-/// macOS capture has been exercised against a real display, including Retina
-/// scale, stride, premultiplied alpha, encoding and clipboard delivery. Keeping
-/// that verified path behind an environment variable makes a Finder-launched
-/// app silently reject every menu capture because Finder does not inherit shell
-/// variables.
+/// macOS and Windows capture have both been exercised on native displays,
+/// including scaled pixels, encoding, and clipboard delivery. Keeping either
+/// verified path behind an environment variable would make a shell-independent
+/// GUI silently reject capture.
 #[must_use]
 pub const fn capture_backend_is_stable() -> bool {
     // Unit tests deliberately retain the guard. Several command tests exercise
     // error paths with synthetic capture arguments; letting those reach the
     // verified backend captures the developer's real screen and writes into
     // ~/Pictures, which is both invasive and nondeterministic.
-    cfg!(all(target_os = "macos", not(test)))
+    capture_backend_is_stable_for(
+        cfg!(any(target_os = "macos", target_os = "windows")),
+        cfg!(test),
+    )
+}
+
+const fn capture_backend_is_stable_for(qualified_platform: bool, test_build: bool) -> bool {
+    qualified_platform && !test_build
 }
 
 /// Whether still capture can be offered to a live UI in this process.
@@ -456,5 +462,22 @@ mod tests {
                 "gui"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_stability_tests {
+    use super::{capture_backend_is_stable, capture_backend_is_stable_for};
+
+    #[test]
+    fn tests_never_capture_the_developers_screen() {
+        assert!(!capture_backend_is_stable());
+    }
+
+    #[test]
+    fn qualified_native_capture_is_enabled_only_in_release_builds() {
+        assert!(capture_backend_is_stable_for(true, false));
+        assert!(!capture_backend_is_stable_for(false, false));
+        assert!(!capture_backend_is_stable_for(true, true));
     }
 }

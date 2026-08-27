@@ -56,7 +56,7 @@ use crate::{
 
 const CANCELLATION_POLL: Duration = Duration::from_millis(20);
 
-/// Deadline and cooperative cancellation shared with a forwarded command.
+/// Deadline and cancellation state shared with a forwarded command's transport.
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionControl {
     deadline: Option<Instant>,
@@ -575,6 +575,7 @@ fn capture(
         selector.begin_capture()?;
     }
 
+    let backend_name = backend.name().to_owned();
     let capture = match frozen_capture {
         Some(capture) => capture,
         None => crate::gui::selection::capture_selected(
@@ -631,6 +632,7 @@ fn capture(
         ("height", Json::Int(i64::from(frame.height()))),
         ("scale", Json::Float(frame.scale.get())),
         ("bytes", Json::Int(bytes.len() as i64)),
+        ("backend", Json::str(backend_name)),
         ("provenance", Json::str(format!("{:?}", capture.provenance))),
         (
             "written",
@@ -2338,6 +2340,16 @@ mod tests {
     fn a_negative_delay_is_a_usage_error() {
         let err = run(&["scrozz", "capture", "--delay", "-1", "--dry-run"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Usage);
+    }
+
+    #[test]
+    fn a_forwarded_delay_cannot_outlive_its_deadline() {
+        let execution =
+            ExecutionControl::forwarded(Some(Instant::now() + Duration::from_millis(50)));
+        let started = Instant::now();
+        let error = execution.wait(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.exit(), Exit::IpcFailed);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     // -- dry-run record ----------------------------------------------------

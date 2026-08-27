@@ -903,8 +903,8 @@ impl CaptureArgs {
     ///
     /// # Errors
     ///
-    /// Returns [`CliError::Usage`] for a negative or non-finite delay, or for
-    /// `--quality` on a format that has no quality setting.
+    /// Returns [`CliError::Usage`] for a negative, non-finite, or unrepresentable
+    /// delay, or for `--quality` on a format that has no quality setting.
     pub fn validate(&self) -> CliResult<()> {
         if let Some(delay) = self.delay {
             let _ = checked_delay(delay)?;
@@ -2002,6 +2002,16 @@ mod tests {
         };
         assert_eq!(args.delay, Some(1.5));
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unrepresentable_delay_is_a_usage_error() {
+        let Some(Command::Capture(args)) =
+            parse(&["scrozz", "capture", "--delay", "1.7976931348623157e308"]).command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
     }
 
     #[test]

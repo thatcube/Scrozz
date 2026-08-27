@@ -36,7 +36,6 @@
 
 use std::time::{Duration, Instant};
 
-use crate::apartment;
 use scrozz_core::{Error, Frame, Result};
 use scrozz_shell::windows::identity::PackageIdentity;
 use windows::Globalization::Language;
@@ -98,7 +97,7 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
 }
 
 fn recognize_native(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
-    let apartment = apartment::Apartment::enter_multithreaded()?;
+    let apartment = scrozz_shell::windows::apartment::Apartment::enter_multithreaded()?;
     tracing::debug!(
         owned = apartment.owns(),
         "Windows OCR caller has a COM apartment"
