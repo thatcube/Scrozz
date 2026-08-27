@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt,
 };
 
@@ -17,7 +17,51 @@ const MANIFEST_SCHEMA: u32 = 1;
 const SIGNATURE_SCHEMA: u32 = 1;
 const MAX_URL_LEN: usize = 2_048;
 const MAX_PLATFORM_LEN: usize = 64;
+const MAX_ARTIFACT_ID_LEN: usize = 96;
 const MAX_KEY_ID_LEN: usize = 64;
+
+/// The installation semantics attached to one signed artifact.
+///
+/// This is part of the exact-byte signed manifest. A download cannot be
+/// reinterpreted as another package kind after verification.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactKind {
+    /// Legacy schema-1 payload containing one replacement executable.
+    #[default]
+    RawExecutable,
+    /// ZIP containing a signed and notarized `Scrozz.app`.
+    MacosAppZip,
+    /// Windows package installed through package deployment APIs.
+    WindowsMsix,
+    /// ZIP containing the signed portable Windows executable and runtime files.
+    WindowsPortableZip,
+    /// Gzip-compressed tar archive containing `Scrozz.AppDir`.
+    LinuxAppdirTarGz,
+}
+
+impl ArtifactKind {
+    /// The stable signed-manifest and status token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RawExecutable => "raw-executable",
+            Self::MacosAppZip => "macos-app-zip",
+            Self::WindowsMsix => "windows-msix",
+            Self::WindowsPortableZip => "windows-portable-zip",
+            Self::LinuxAppdirTarGz => "linux-appdir-tar-gz",
+        }
+    }
+
+    fn supports_platform(self, platform: &str) -> bool {
+        match self {
+            Self::RawExecutable => true,
+            Self::MacosAppZip => platform.starts_with("macos-"),
+            Self::WindowsMsix | Self::WindowsPortableZip => platform.starts_with("windows-"),
+            Self::LinuxAppdirTarGz => platform.starts_with("linux-"),
+        }
+    }
+}
 
 /// A URL that has passed the updater's HTTPS-only validation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -159,27 +203,40 @@ impl<'de> Deserialize<'de> for Sha256Digest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactMetadata {
-    #[serde(deserialize_with = "deserialize_platform")]
+    // Older updater state predates explicit distribution kinds; signed manifests use WireArtifact.
+    #[serde(default, deserialize_with = "deserialize_platform")]
     platform: String,
     url: HttpsUrl,
     sha256: Sha256Digest,
     #[serde(deserialize_with = "deserialize_positive_size")]
     size: u64,
+    #[serde(default)]
+    kind: ArtifactKind,
 }
 
 impl ArtifactMetadata {
-    fn new(platform: String, wire: WireArtifact) -> Result<Self> {
+    fn new(entry_key: String, wire: WireArtifact) -> Result<Self> {
+        validate_artifact_id(&entry_key)?;
+        let platform = wire.platform.unwrap_or(entry_key);
         validate_platform_key(&platform)?;
         if wire.size == 0 {
             return Err(Error::InvalidManifest(
                 "artifact size must be greater than zero".into(),
             ));
         }
+        let kind = wire.kind.unwrap_or_default();
+        if !kind.supports_platform(&platform) {
+            return Err(Error::InvalidManifest(format!(
+                "artifact kind `{}` is incompatible with platform `{platform}`",
+                kind.as_str()
+            )));
+        }
         Ok(Self {
             platform,
             url: HttpsUrl::parse(wire.url)?,
             sha256: Sha256Digest::parse(wire.sha256)?,
             size: wire.size,
+            kind,
         })
     }
 
@@ -205,6 +262,12 @@ impl ArtifactMetadata {
     #[must_use]
     pub const fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Returns the signed installation semantics.
+    #[must_use]
+    pub const fn kind(&self) -> ArtifactKind {
+        self.kind
     }
 }
 
@@ -256,6 +319,20 @@ impl VerifiedManifest {
     pub fn artifact_for(&self, platform: &str) -> Option<VerifiedArtifact> {
         self.artifacts
             .get(platform)
+            .cloned()
+            .map(VerifiedArtifact::from_persisted)
+    }
+
+    /// Returns the signed artifact matching both platform and distribution kind.
+    #[must_use]
+    pub fn artifact_for_kind(
+        &self,
+        platform: &str,
+        kind: ArtifactKind,
+    ) -> Option<VerifiedArtifact> {
+        self.artifacts
+            .values()
+            .find(|artifact| artifact.platform() == platform && artifact.kind() == kind)
             .cloned()
             .map(VerifiedArtifact::from_persisted)
     }
@@ -439,9 +516,17 @@ pub fn verify_manifest(
     }
 
     let mut artifacts = BTreeMap::new();
-    for (platform, wire_artifact) in wire.artifacts.0 {
-        let artifact = ArtifactMetadata::new(platform.clone(), wire_artifact)?;
-        artifacts.insert(platform, artifact);
+    let mut distributions = BTreeSet::new();
+    for (entry_key, wire_artifact) in wire.artifacts.0 {
+        let artifact = ArtifactMetadata::new(entry_key.clone(), wire_artifact)?;
+        if !distributions.insert((artifact.platform.clone(), artifact.kind)) {
+            return Err(Error::InvalidManifest(format!(
+                "platform `{}` contains duplicate `{}` artifacts",
+                artifact.platform(),
+                artifact.kind().as_str()
+            )));
+        }
+        artifacts.insert(entry_key, artifact);
     }
 
     match wire.version.cmp(installed_version) {
@@ -487,6 +572,10 @@ struct WireManifest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireArtifact {
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    kind: Option<ArtifactKind>,
     url: String,
     sha256: String,
     size: u64,
@@ -616,6 +705,23 @@ fn validate_platform_key(platform: &str) -> Result<()> {
             "artifact platform key `{platform}` must have lowercase os-arch form"
         )));
     }
+
+    Ok(())
+}
+
+fn validate_artifact_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > MAX_ARTIFACT_ID_LEN
+        || !id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+        || !id.as_bytes()[0].is_ascii_alphanumeric()
+        || !id.as_bytes()[id.len() - 1].is_ascii_alphanumeric()
+    {
+        return Err(Error::InvalidManifest(format!(
+            "artifact id `{id}` must contain only lowercase letters, digits, hyphens, and underscores"
+        )));
+    }
     Ok(())
 }
 
@@ -702,6 +808,114 @@ mod tests {
         assert!(matches!(
             verify_manifest(&equivalent, &envelope, &keys, &Version::new(1, 0, 0), 0),
             Err(Error::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn distribution_kinds_select_dual_windows_artifacts_without_reinterpretation() {
+        let bytes = CANDIDATE_BYTES;
+        let value = json!({
+            "schema": 1,
+            "generated": 8,
+            "version": "2.0.0",
+            "artifacts": {
+                "windows-x86_64-msix": {
+                    "platform": "windows-x86_64",
+                    "kind": "windows-msix",
+                    "url": "https://updates.example.test/scrozz.msix",
+                    "sha256": sha256_hex(bytes),
+                    "size": bytes.len(),
+                },
+                "windows-x86_64-portable": {
+                    "platform": "windows-x86_64",
+                    "kind": "windows-portable-zip",
+                    "url": "https://updates.example.test/scrozz.zip",
+                    "sha256": sha256_hex(bytes),
+                    "size": bytes.len(),
+                }
+            }
+        });
+        let ManifestVerification::Update(manifest) = verify_value(&value).unwrap() else {
+            panic!("newer manifest must produce an update");
+        };
+
+        let msix = manifest
+            .artifact_for_kind("windows-x86_64", ArtifactKind::WindowsMsix)
+            .unwrap();
+        let portable = manifest
+            .artifact_for_kind("windows-x86_64", ArtifactKind::WindowsPortableZip)
+            .unwrap();
+        assert_eq!(msix.metadata().kind(), ArtifactKind::WindowsMsix);
+        assert_eq!(portable.metadata().kind(), ArtifactKind::WindowsPortableZip);
+        assert_eq!(
+            msix.metadata().url().as_str(),
+            "https://updates.example.test/scrozz.msix"
+        );
+        assert_eq!(
+            portable.metadata().url().as_str(),
+            "https://updates.example.test/scrozz.zip"
+        );
+    }
+
+    #[test]
+    fn legacy_persisted_artifact_metadata_remains_readable() {
+        let metadata: ArtifactMetadata = serde_json::from_value(json!({
+            "url": ARTIFACT_URL,
+            "sha256": sha256_hex(CANDIDATE_BYTES),
+            "size": CANDIDATE_BYTES.len(),
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.platform(), "");
+        assert_eq!(metadata.kind(), ArtifactKind::RawExecutable);
+    }
+
+    #[test]
+    fn duplicate_or_cross_platform_distribution_kinds_are_rejected() {
+        let digest = sha256_hex(CANDIDATE_BYTES);
+        let duplicate = json!({
+            "schema": 1,
+            "generated": 8,
+            "version": "2.0.0",
+            "artifacts": {
+                "first": {
+                    "platform": "windows-x86_64",
+                    "kind": "windows-msix",
+                    "url": ARTIFACT_URL,
+                    "sha256": digest,
+                    "size": CANDIDATE_BYTES.len(),
+                },
+                "second": {
+                    "platform": "windows-x86_64",
+                    "kind": "windows-msix",
+                    "url": ARTIFACT_URL,
+                    "sha256": sha256_hex(CANDIDATE_BYTES),
+                    "size": CANDIDATE_BYTES.len(),
+                }
+            }
+        });
+        assert!(matches!(
+            verify_value(&duplicate),
+            Err(Error::InvalidManifest(message)) if message.contains("duplicate")
+        ));
+
+        let incompatible = json!({
+            "schema": 1,
+            "generated": 8,
+            "version": "2.0.0",
+            "artifacts": {
+                "linux-app": {
+                    "platform": "linux-x86_64",
+                    "kind": "macos-app-zip",
+                    "url": ARTIFACT_URL,
+                    "sha256": sha256_hex(CANDIDATE_BYTES),
+                    "size": CANDIDATE_BYTES.len(),
+                }
+            }
+        });
+        assert!(matches!(
+            verify_value(&incompatible),
+            Err(Error::InvalidManifest(message)) if message.contains("incompatible")
         ));
     }
 

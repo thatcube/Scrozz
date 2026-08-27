@@ -175,7 +175,7 @@ pub(crate) fn ensure_distinct_siblings(paths: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-fn backup_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn backup_path(path: &Path) -> Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         Error::InvalidState(format!("`{}` has no state file name", path.display()))
     })?;

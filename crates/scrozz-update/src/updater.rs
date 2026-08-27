@@ -7,10 +7,11 @@ use std::{
 use semver::Version;
 
 use crate::{
-    ArtifactMetadata, CandidateMetadata, CurlFetcher, Error, FetchRequest, Fetcher, HttpsUrl,
-    InstallPlan, ManifestVerification, Phase, PinnedKeyRing, ResolvedChannel, Result,
-    StagedArtifact, UpdateChannel, UpdateState, VerifiedArtifact, VerifiedDownload,
-    VerifiedManifest, fsutil, state::StateFile, verify_artifact_file, verify_manifest,
+    ArtifactKind, ArtifactMetadata, CandidateMetadata, CurlFetcher, Error, FetchRequest, Fetcher,
+    HttpsUrl, InstallPlan, ManifestVerification, Phase, PinnedKeyRing, ResolvedChannel, Result,
+    StagedArtifact, UpdateChannel, UpdateCheckRecord, UpdateCheckResult, UpdateState,
+    VerifiedArtifact, VerifiedDownload, VerifiedManifest, fsutil, state::StateFile,
+    verify_artifact_file, verify_manifest,
 };
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -193,8 +194,40 @@ impl<F: Fetcher> UpdateChecker<F> {
         channel: &ResolvedChannel,
         installed_version: &Version,
     ) -> Result<CheckOutcome> {
+        self.check_for_kind(channel, installed_version, ArtifactKind::RawExecutable)
+    }
+
+    /// Checks one resolved channel for an explicit native distribution kind.
+    ///
+    /// This is the selection boundary for manifests that publish both portable
+    /// and package-identity artifacts for the same OS and architecture.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded fetch, verification, and persistence errors as
+    /// [`Self::check`].
+    pub fn check_for_kind(
+        &mut self,
+        channel: &ResolvedChannel,
+        installed_version: &Version,
+        kind: ArtifactKind,
+    ) -> Result<CheckOutcome> {
+        let platform = scrozz_core::identity::platform_key();
         if let Some(update) = self.updater.available_update() {
-            if update.channel() == Some(channel.channel()) && update.version() > installed_version {
+            if update.channel() == Some(channel.channel())
+                && update.version() > installed_version
+                && update.artifact().metadata().kind() == kind
+                && update.artifact().metadata().platform() == platform.as_str()
+            {
+                let mut checked = self.updater.state.clone();
+                checked.last_check = Some(UpdateCheckRecord::success(
+                    Some(channel.channel()),
+                    UpdateCheckResult::UpdateAvailable,
+                    update.version().clone(),
+                    update.generated(),
+                    Some(platform),
+                ));
+                self.updater.commit(checked)?;
                 return Ok(CheckOutcome::UpdateAvailable(update));
             }
             self.updater.reset_to_idle()?;
@@ -210,6 +243,7 @@ impl<F: Fetcher> UpdateChecker<F> {
             channel.endpoints().signature().as_str(),
             installed_version,
             Some(channel.channel()),
+            kind,
         )
     }
 }
@@ -400,7 +434,28 @@ impl<F: Fetcher> Updater<F> {
         signature_url: impl Into<String>,
         installed_version: &Version,
     ) -> Result<CheckOutcome> {
-        self.check_inner(manifest_url, signature_url, installed_version, None)
+        self.check_for_kind(
+            manifest_url,
+            signature_url,
+            installed_version,
+            ArtifactKind::RawExecutable,
+        )
+    }
+
+    /// Checks raw endpoints for an explicit native distribution kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded fetch, signature, manifest, anti-rollback, and
+    /// persistence errors as [`Self::check`].
+    pub fn check_for_kind(
+        &mut self,
+        manifest_url: impl Into<String>,
+        signature_url: impl Into<String>,
+        installed_version: &Version,
+        kind: ArtifactKind,
+    ) -> Result<CheckOutcome> {
+        self.check_inner(manifest_url, signature_url, installed_version, None, kind)
     }
 
     fn check_inner(
@@ -409,6 +464,7 @@ impl<F: Fetcher> Updater<F> {
         signature_url: impl Into<String>,
         installed_version: &Version,
         channel: Option<UpdateChannel>,
+        kind: ArtifactKind,
     ) -> Result<CheckOutcome> {
         self.require_transition(Phase::Checking)?;
         if self.keys.is_empty() {
@@ -466,8 +522,10 @@ impl<F: Fetcher> Updater<F> {
         let cleanup_error = cleanup_files([&manifest_temp, &signature_temp]);
         let (manifest_bytes, signature_bytes) = match fetched {
             Ok(bytes) if cleanup_error.is_none() => bytes,
-            Ok(_) => return self.record_failure(cleanup_error.expect("checked above")),
-            Err(error) => return self.record_failure(error),
+            Ok(_) => {
+                return self.record_check_failure(cleanup_error.expect("checked above"), channel);
+            }
+            Err(error) => return self.record_check_failure(error, channel),
         };
 
         let highest_accepted_generation = channel
@@ -482,7 +540,7 @@ impl<F: Fetcher> Updater<F> {
             highest_accepted_generation,
         ) {
             Ok(verification) => verification,
-            Err(error) => return self.record_failure(error),
+            Err(error) => return self.record_check_failure(error, channel),
         };
 
         match verification {
@@ -491,12 +549,19 @@ impl<F: Fetcher> Updater<F> {
                 idle.phase = Phase::Idle;
                 clear_active_lifecycle(&mut idle);
                 accept_generation(&mut idle, channel, generated);
+                idle.last_check = Some(UpdateCheckRecord::success(
+                    channel,
+                    UpdateCheckResult::Current,
+                    version.clone(),
+                    generated,
+                    None,
+                ));
                 self.commit(idle)?;
                 Ok(CheckOutcome::Current { version, generated })
             }
             ManifestVerification::Update(manifest) => {
                 let platform = scrozz_core::identity::platform_key();
-                let artifact = manifest.artifact_for(&platform);
+                let artifact = manifest.artifact_for_kind(&platform, kind);
                 let mut next = self.state.clone();
                 accept_generation(&mut next, channel, manifest.generated());
                 next.transient_paths.clear();
@@ -508,6 +573,13 @@ impl<F: Fetcher> Updater<F> {
                         next.phase = Phase::UpdateAvailable;
                         next.candidate = Some(update.candidate.clone());
                         next.artifact = Some(artifact.metadata().clone());
+                        next.last_check = Some(UpdateCheckRecord::success(
+                            channel,
+                            UpdateCheckResult::UpdateAvailable,
+                            manifest.version().clone(),
+                            manifest.generated(),
+                            Some(artifact.metadata().platform().to_owned()),
+                        ));
                         self.commit(next)?;
                         Ok(CheckOutcome::UpdateAvailable(update))
                     }
@@ -517,8 +589,15 @@ impl<F: Fetcher> Updater<F> {
                         let outcome = CheckOutcome::PlatformUnavailable {
                             version: manifest.version().clone(),
                             generated: manifest.generated(),
-                            platform,
+                            platform: platform.clone(),
                         };
+                        next.last_check = Some(UpdateCheckRecord::success(
+                            channel,
+                            UpdateCheckResult::PlatformUnavailable,
+                            manifest.version().clone(),
+                            manifest.generated(),
+                            Some(platform),
+                        ));
                         self.commit(next)?;
                         Ok(outcome)
                     }
@@ -1216,6 +1295,23 @@ impl<F: Fetcher> Updater<F> {
     }
 
     fn record_failure<T>(&mut self, error: Error) -> Result<T> {
+        self.record_failure_with_check(error, None)
+    }
+
+    fn record_check_failure<T>(
+        &mut self,
+        error: Error,
+        channel: Option<UpdateChannel>,
+    ) -> Result<T> {
+        let record = UpdateCheckRecord::failed(channel, error.to_string());
+        self.record_failure_with_check(error, Some(record))
+    }
+
+    fn record_failure_with_check<T>(
+        &mut self,
+        error: Error,
+        check: Option<UpdateCheckRecord>,
+    ) -> Result<T> {
         let mut failed = self.state.clone();
         if failed.phase != Phase::Failed {
             if !failed.phase.can_transition_to(Phase::Failed) {
@@ -1225,6 +1321,9 @@ impl<F: Fetcher> Updater<F> {
         }
         failed.failure = Some(error.to_string());
         failed.transient_paths.clear();
+        if let Some(check) = check {
+            failed.last_check = Some(check);
+        }
         match self.commit(failed) {
             Ok(()) => Err(error),
             Err(persistence_error) => Err(persistence_error),
@@ -1439,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn check_only_open_never_recovers_an_awaiting_installation() {
+    fn passive_state_reads_and_check_only_open_never_recover_an_awaiting_installation() {
         let (scratch, keys, mut updater, staged) = staged_updater("passive-no-recovery");
         let live = scratch.path().join("scrozz");
         let previous = scratch.path().join("scrozz.previous");
@@ -1452,6 +1551,13 @@ mod tests {
             )
             .unwrap();
         drop(updater);
+
+        let inspected = crate::inspect_state(scratch.path().join("state.json")).unwrap();
+        assert_eq!(inspected.phase(), Phase::AwaitingRestart);
+        assert_eq!(fs::read(&live).unwrap(), b"installed version");
+        assert!(staged.path().is_file());
+        assert!(!previous.exists());
+        assert!(!failed.exists());
 
         let checker = UpdateChecker::with_fetcher(
             scratch.path().join("state.json"),
@@ -1493,6 +1599,10 @@ mod tests {
         assert!(checker.check(&channel, &Version::new(1, 0, 0)).is_err());
         assert_eq!(checker.state().phase(), Phase::Failed);
         assert!(check_failure_is_safe(checker.state()));
+        let failed_check = checker.state().last_check().unwrap();
+        assert_eq!(failed_check.channel(), Some(UpdateChannel::Stable));
+        assert_eq!(failed_check.result(), UpdateCheckResult::Failed);
+        assert!(failed_check.error().is_some());
 
         let manifest = serde_json::to_vec_pretty(&manifest_value(
             "2.0.0",
@@ -1511,6 +1621,14 @@ mod tests {
             checker.check(&channel, &Version::new(1, 0, 0)).unwrap(),
             CheckOutcome::UpdateAvailable(_)
         ));
+        let successful_check = checker.state().last_check().unwrap();
+        assert_eq!(successful_check.channel(), Some(UpdateChannel::Stable));
+        assert_eq!(
+            successful_check.result(),
+            UpdateCheckResult::UpdateAvailable
+        );
+        assert_eq!(successful_check.version(), Some(&Version::new(2, 0, 0)));
+        assert_eq!(successful_check.generation(), Some(32));
     }
 
     #[test]
@@ -1591,6 +1709,132 @@ mod tests {
                 .highest_accepted_generation_for(UpdateChannel::Preview),
             100
         );
+    }
+
+    #[test]
+    fn returning_a_cached_candidate_persists_a_fresh_completion_time() {
+        let scratch = ScratchDir::new("passive-cached-completion");
+        let state_path = scratch.path().join("state.json");
+        let key = signing_key(35);
+        let keys = ring(&[("fixture", &key)]);
+        let channel = crate::EndpointCatalog::new(
+            Some(crate::UpdateEndpoints::new(MANIFEST_URL, SIGNATURE_URL).unwrap()),
+            None,
+        )
+        .resolve(UpdateChannel::Stable)
+        .unwrap();
+        let manifest = serde_json::to_vec(&manifest_value(
+            "2.0.0",
+            1,
+            &scrozz_core::identity::platform_key(),
+            CANDIDATE_BYTES,
+        ))
+        .unwrap();
+        let signature = signed_envelope(&manifest, "fixture", &key);
+        let mut checker = UpdateChecker::with_fetcher(
+            &state_path,
+            keys.clone(),
+            FakeFetcher::from_responses([
+                (MANIFEST_URL, FakeResponse::Bytes(manifest)),
+                (SIGNATURE_URL, FakeResponse::Bytes(signature)),
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(
+            checker.check(&channel, &Version::new(1, 0, 0)).unwrap(),
+            CheckOutcome::UpdateAvailable(_)
+        ));
+        drop(checker);
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        persisted["last_check"]["completed_at_unix_seconds"] = serde_json::json!(1);
+        fs::write(&state_path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+        let mut checker = UpdateChecker::with_fetcher(
+            &state_path,
+            keys,
+            FakeFetcher::from_responses(std::iter::empty()),
+        )
+        .unwrap();
+        assert!(matches!(
+            checker.check(&channel, &Version::new(1, 0, 0)).unwrap(),
+            CheckOutcome::UpdateAvailable(_)
+        ));
+        assert!(
+            checker
+                .state()
+                .last_check()
+                .unwrap()
+                .completed_at_unix_seconds()
+                .is_some_and(|completed| completed > 1)
+        );
+    }
+
+    #[test]
+    fn check_only_does_not_reuse_a_candidate_for_another_platform() {
+        let scratch = ScratchDir::new("passive-platform-switch");
+        let state_path = scratch.path().join("state.json");
+        let key = signing_key(34);
+        let keys = ring(&[("fixture", &key)]);
+        let channel = crate::EndpointCatalog::new(
+            Some(crate::UpdateEndpoints::new(MANIFEST_URL, SIGNATURE_URL).unwrap()),
+            None,
+        )
+        .resolve(UpdateChannel::Stable)
+        .unwrap();
+        let first_manifest = serde_json::to_vec(&manifest_value(
+            "2.0.0",
+            1,
+            &scrozz_core::identity::platform_key(),
+            CANDIDATE_BYTES,
+        ))
+        .unwrap();
+        let first_signature = signed_envelope(&first_manifest, "fixture", &key);
+        let mut checker = UpdateChecker::with_fetcher(
+            &state_path,
+            keys.clone(),
+            FakeFetcher::from_responses([
+                (MANIFEST_URL, FakeResponse::Bytes(first_manifest)),
+                (SIGNATURE_URL, FakeResponse::Bytes(first_signature)),
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(
+            checker.check(&channel, &Version::new(1, 0, 0)).unwrap(),
+            CheckOutcome::UpdateAvailable(_)
+        ));
+        drop(checker);
+
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["artifact"]["platform"] = serde_json::Value::String("other-platform".into());
+        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+        let next_manifest = serde_json::to_vec(&manifest_value(
+            "3.0.0",
+            2,
+            &scrozz_core::identity::platform_key(),
+            CANDIDATE_BYTES,
+        ))
+        .unwrap();
+        let next_signature = signed_envelope(&next_manifest, "fixture", &key);
+        let mut checker = UpdateChecker::with_fetcher(
+            state_path,
+            keys,
+            FakeFetcher::from_responses([
+                (MANIFEST_URL, FakeResponse::Bytes(next_manifest)),
+                (SIGNATURE_URL, FakeResponse::Bytes(next_signature)),
+            ]),
+        )
+        .unwrap();
+
+        let CheckOutcome::UpdateAvailable(update) =
+            checker.check(&channel, &Version::new(1, 0, 0)).unwrap()
+        else {
+            panic!("a fresh platform candidate was expected");
+        };
+        assert_eq!(update.version(), &Version::new(3, 0, 0));
     }
 
     #[test]
@@ -1815,6 +2059,10 @@ mod tests {
             CheckOutcome::Current { generated: 100, .. }
         ));
         assert_eq!(updater.state().highest_accepted_generation(), 100);
+        let check = updater.state().last_check().unwrap();
+        assert_eq!(check.result(), UpdateCheckResult::Current);
+        assert_eq!(check.version(), Some(&Version::new(1, 0, 0)));
+        assert_eq!(check.generation(), Some(100));
     }
 
     #[test]
@@ -2103,5 +2351,13 @@ mod tests {
         ));
         assert_eq!(updater.state().phase(), Phase::Idle);
         assert_eq!(updater.state().highest_accepted_generation(), 41);
+        let check = updater.state().last_check().unwrap();
+        assert_eq!(check.result(), UpdateCheckResult::PlatformUnavailable);
+        assert_eq!(check.version(), Some(&Version::new(2, 0, 0)));
+        assert_eq!(check.generation(), Some(41));
+        assert_eq!(
+            check.platform(),
+            Some(scrozz_core::identity::platform_key().as_str())
+        );
     }
 }

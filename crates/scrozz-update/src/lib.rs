@@ -24,7 +24,9 @@
 //!   "generated": 42,
 //!   "version": "1.2.3",
 //!   "artifacts": {
-//!     "linux-x86_64": {
+//!     "linux-x86_64-appdir": {
+//!       "platform": "linux-x86_64",
+//!       "kind": "linux-appdir-tar-gz",
 //!       "url": "https://updates.example.invalid/scrozz",
 //!       "sha256": "<64 lowercase hexadecimal characters>",
 //!       "size": 123456
@@ -45,9 +47,10 @@
 //! HTTPS-only argument plan. Callers can provide another [`Fetcher`] without
 //! changing the verification or state-machine code.
 //!
-//! Artifact unpacking, code signing, and executable permission changes remain
-//! packaging responsibilities. This crate preserves permissions when copying a
-//! downloaded file, but does not invent platform-specific metadata.
+//! Generic download and staging remain regular-file-only. Native package
+//! extraction, trust validation, post-exit swaps, MSIX deployment, and explicit
+//! rollback are isolated behind [`PlatformHandoff`]; merely checking or staging
+//! an update never creates or applies one.
 
 #![forbid(unsafe_code)]
 
@@ -57,6 +60,7 @@ mod error;
 mod fetch;
 mod fsutil;
 mod manifest;
+mod platform_install;
 mod state;
 mod updater;
 
@@ -70,8 +74,15 @@ pub use channel::{
 pub use error::{Error, Result};
 pub use fetch::{CurlFetcher, FetchRequest, Fetcher};
 pub use manifest::{
-    ArtifactMetadata, HttpsUrl, ManifestVerification, PinnedKey, PinnedKeyRing, Sha256Digest,
-    VerifiedArtifact, VerifiedManifest, verify_manifest,
+    ArtifactKind, ArtifactMetadata, HttpsUrl, ManifestVerification, PinnedKey, PinnedKeyRing,
+    Sha256Digest, VerifiedArtifact, VerifiedManifest, verify_manifest,
 };
-pub use state::{CandidateMetadata, InstallPlan, Phase, UpdateState};
+pub use platform_install::{
+    NativePlatformInstallAdapter, PlatformHandoff, PlatformInstallAdapter, PlatformInstallPhase,
+    PlatformInstallState, PlatformInstallTarget, SwapInstallPlan,
+};
+pub use state::{
+    CandidateMetadata, InstallPlan, Phase, UpdateCheckRecord, UpdateCheckResult, UpdateState,
+    inspect_state,
+};
 pub use updater::{CheckOutcome, UpdateChecker, Updater, VerifiedUpdate};

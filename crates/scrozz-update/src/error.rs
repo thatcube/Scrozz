@@ -148,6 +148,23 @@ pub enum Error {
     #[error("could not write fetched response: {0}")]
     FetchOutput(#[source] io::Error),
 
+    /// A signed artifact kind does not match the requested installation path.
+    #[error("artifact kind {artifact} cannot use installation target {target}")]
+    ArtifactInstallMismatch {
+        /// Stable artifact-kind token.
+        artifact: &'static str,
+        /// Stable target-kind token.
+        target: &'static str,
+    },
+
+    /// A native package validation or installation command failed.
+    #[error("native update installation failed: {0}")]
+    PlatformInstall(String),
+
+    /// This installation kind has no retained package it can restore.
+    #[error("rollback is unavailable for this platform installation")]
+    PlatformRollbackUnavailable,
+
     /// The requested phase transition is not part of the update state machine.
     #[error("invalid update transition from {from:?} to {to:?}")]
     InvalidTransition {

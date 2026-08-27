@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use semver::Version;
@@ -14,6 +15,7 @@ use crate::{
 };
 
 const STATE_SCHEMA: u32 = 1;
+const MAX_CHECK_ERROR_BYTES: usize = 8192;
 
 /// Durable phases in one update lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +118,154 @@ impl CandidateMetadata {
     }
 }
 
+/// Durable result category for the most recently completed signed check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateCheckResult {
+    /// The installed and signed versions matched.
+    Current,
+    /// A newer signed release omitted this platform.
+    PlatformUnavailable,
+    /// A newer signed artifact was accepted for this platform.
+    UpdateAvailable,
+    /// Fetching or verification failed without accepting a candidate.
+    Failed,
+}
+
+impl UpdateCheckResult {
+    /// Returns the stable JSON and status token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::PlatformUnavailable => "platform-unavailable",
+            Self::UpdateAvailable => "update-available",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Durable summary of the most recently completed signed update check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateCheckRecord {
+    channel: Option<UpdateChannel>,
+    completed_at_unix_seconds: Option<u64>,
+    result: UpdateCheckResult,
+    version: Option<Version>,
+    generation: Option<u64>,
+    platform: Option<String>,
+    error: Option<String>,
+}
+
+impl UpdateCheckRecord {
+    pub(crate) fn success(
+        channel: Option<UpdateChannel>,
+        result: UpdateCheckResult,
+        version: Version,
+        generation: u64,
+        platform: Option<String>,
+    ) -> Self {
+        Self {
+            channel,
+            completed_at_unix_seconds: unix_time_now(),
+            result,
+            version: Some(version),
+            generation: Some(generation),
+            platform,
+            error: None,
+        }
+    }
+
+    pub(crate) fn failed(channel: Option<UpdateChannel>, mut error: String) -> Self {
+        truncate_check_error(&mut error);
+        Self {
+            channel,
+            completed_at_unix_seconds: unix_time_now(),
+            result: UpdateCheckResult::Failed,
+            version: None,
+            generation: None,
+            platform: None,
+            error: Some(error),
+        }
+    }
+
+    /// Returns the channel used by an endpoint-catalog check.
+    ///
+    /// `None` identifies a raw-URL check.
+    #[must_use]
+    pub const fn channel(&self) -> Option<UpdateChannel> {
+        self.channel
+    }
+
+    /// Returns the completion time as Unix seconds when the host clock allows it.
+    #[must_use]
+    pub const fn completed_at_unix_seconds(&self) -> Option<u64> {
+        self.completed_at_unix_seconds
+    }
+
+    /// Returns the stable result category.
+    #[must_use]
+    pub const fn result(&self) -> UpdateCheckResult {
+        self.result
+    }
+
+    /// Returns the signed release version for a successful check.
+    #[must_use]
+    pub const fn version(&self) -> Option<&Version> {
+        self.version.as_ref()
+    }
+
+    /// Returns the signed generation for a successful check.
+    #[must_use]
+    pub const fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    /// Returns the platform key relevant to the successful outcome.
+    #[must_use]
+    pub fn platform(&self) -> Option<&str> {
+        self.platform.as_deref()
+    }
+
+    /// Returns the transport or verification error from a failed check.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let successful = self.version.is_some()
+            && self.generation.is_some_and(|generation| generation > 0)
+            && self.error.is_none();
+        let valid = match self.result {
+            UpdateCheckResult::Current => successful && self.platform.is_none(),
+            UpdateCheckResult::PlatformUnavailable | UpdateCheckResult::UpdateAvailable => {
+                successful
+                    && self
+                        .platform
+                        .as_ref()
+                        .is_some_and(|platform| !platform.is_empty())
+            }
+            UpdateCheckResult::Failed => {
+                self.version.is_none()
+                    && self.generation.is_none()
+                    && self.platform.is_none()
+                    && self.error.as_ref().is_some_and(|error| {
+                        !error.is_empty() && error.len() <= MAX_CHECK_ERROR_BYTES
+                    })
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidState(
+                "the latest update-check record is inconsistent".into(),
+            ))
+        }
+    }
+}
+
 /// Three distinct sibling paths used by an installation swap.
 ///
 /// `installed` is the live file, `previous` retains the old live file, and
@@ -198,6 +348,8 @@ pub struct UpdateState {
     pub(crate) transient_paths: Vec<PathBuf>,
     pub(crate) rollback_requested: bool,
     pub(crate) failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_check: Option<UpdateCheckRecord>,
 }
 
 impl Default for UpdateState {
@@ -215,6 +367,7 @@ impl Default for UpdateState {
             transient_paths: Vec::new(),
             rollback_requested: false,
             failure: None,
+            last_check: None,
         }
     }
 }
@@ -280,6 +433,12 @@ impl UpdateState {
         self.failure.as_deref()
     }
 
+    /// Returns the most recently completed signed update check.
+    #[must_use]
+    pub const fn last_check(&self) -> Option<&UpdateCheckRecord> {
+        self.last_check.as_ref()
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if self.schema != STATE_SCHEMA {
             return Err(Error::UnsupportedStateSchema(self.schema));
@@ -298,12 +457,16 @@ impl UpdateState {
                 "accepted channel generations must be greater than zero".into(),
             ));
         }
+        if let Some(last_check) = &self.last_check {
+            last_check.validate()?;
+        }
         let mut unique = BTreeSet::new();
         if self.transient_paths.iter().any(|path| !unique.insert(path)) {
             return Err(Error::InvalidState(
                 "the same temporary path is recorded more than once".into(),
             ));
         }
+
         if self
             .downloaded_path
             .iter()
@@ -440,6 +603,40 @@ impl UpdateState {
             )))
         }
     }
+}
+
+/// Reads a coherent durable state snapshot without running recovery.
+///
+/// This acquires the ordinary state lock and may create a missing idle state
+/// document, but it never downloads, stages, installs, rolls back, or reconciles
+/// a previously interrupted operation.
+///
+/// # Errors
+///
+/// Returns an I/O, validation, or lock error.
+pub fn inspect_state(path: impl Into<PathBuf>) -> Result<UpdateState> {
+    let (_state_file, state) = StateFile::open(path)?;
+    Ok(state)
+}
+
+fn unix_time_now() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn truncate_check_error(error: &mut String) {
+    const SUFFIX: &str = "...[truncated]";
+    if error.len() <= MAX_CHECK_ERROR_BYTES {
+        return;
+    }
+    let mut end = MAX_CHECK_ERROR_BYTES - SUFFIX.len();
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error.truncate(end);
+    error.push_str(SUFFIX);
 }
 
 pub(crate) struct StateFile {
@@ -638,5 +835,18 @@ mod tests {
         assert!(InstallPlan::new("/one/live", "/one/old", "/one/failed").is_ok());
         assert!(InstallPlan::new("/one/live", "/two/old", "/one/failed").is_err());
         assert!(InstallPlan::new("/one/live", "/one/live", "/one/failed").is_err());
+    }
+
+    #[test]
+    fn failed_check_details_are_bounded_without_breaking_utf8() {
+        let record = UpdateCheckRecord::failed(
+            Some(UpdateChannel::Stable),
+            "failure \u{1f4a5}".repeat(MAX_CHECK_ERROR_BYTES),
+        );
+        let error = record.error().unwrap();
+
+        assert!(error.len() <= MAX_CHECK_ERROR_BYTES);
+        assert!(error.ends_with("...[truncated]"));
+        record.validate().unwrap();
     }
 }
