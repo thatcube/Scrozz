@@ -507,23 +507,56 @@ impl LoadFailure {
 }
 
 fn validate_abi() -> Result<(), LoadFailure> {
-    let actual = (
-        usize::BITS,
-        std::mem::size_of::<spa_hook>(),
-        std::mem::size_of::<spa_data>(),
-        std::mem::size_of::<spa_buffer>(),
-        std::mem::size_of::<pw_buffer>(),
-        std::mem::size_of::<pw_stream_events>(),
-        std::mem::offset_of!(spa_hook, cb),
-        std::mem::offset_of!(spa_data, data),
-        std::mem::offset_of!(spa_data, chunk),
-        std::mem::offset_of!(spa_buffer, datas),
-        std::mem::offset_of!(pw_buffer, buffer),
-        std::mem::offset_of!(pw_stream_events, state_changed),
-        std::mem::offset_of!(pw_stream_events, param_changed),
-        std::mem::offset_of!(pw_stream_events, process),
-    );
-    let expected = (64, 48, 40, 24, 8, 96, 16, 24, 32, 16, 0, 16, 40, 64);
+    #[derive(Debug, PartialEq, Eq)]
+    struct AbiLayout {
+        pointer_bits: u32,
+        spa_hook_size: usize,
+        spa_data_size: usize,
+        spa_buffer_size: usize,
+        pw_buffer_size: usize,
+        pw_stream_events_size: usize,
+        spa_hook_callbacks_offset: usize,
+        spa_data_pointer_offset: usize,
+        spa_data_chunk_offset: usize,
+        spa_buffer_datas_offset: usize,
+        pw_buffer_pointer_offset: usize,
+        stream_state_callback_offset: usize,
+        stream_format_callback_offset: usize,
+        stream_process_callback_offset: usize,
+    }
+
+    let actual = AbiLayout {
+        pointer_bits: usize::BITS,
+        spa_hook_size: std::mem::size_of::<spa_hook>(),
+        spa_data_size: std::mem::size_of::<spa_data>(),
+        spa_buffer_size: std::mem::size_of::<spa_buffer>(),
+        pw_buffer_size: std::mem::size_of::<pw_buffer>(),
+        pw_stream_events_size: std::mem::size_of::<pw_stream_events>(),
+        spa_hook_callbacks_offset: std::mem::offset_of!(spa_hook, cb),
+        spa_data_pointer_offset: std::mem::offset_of!(spa_data, data),
+        spa_data_chunk_offset: std::mem::offset_of!(spa_data, chunk),
+        spa_buffer_datas_offset: std::mem::offset_of!(spa_buffer, datas),
+        pw_buffer_pointer_offset: std::mem::offset_of!(pw_buffer, buffer),
+        stream_state_callback_offset: std::mem::offset_of!(pw_stream_events, state_changed),
+        stream_format_callback_offset: std::mem::offset_of!(pw_stream_events, param_changed),
+        stream_process_callback_offset: std::mem::offset_of!(pw_stream_events, process),
+    };
+    let expected = AbiLayout {
+        pointer_bits: 64,
+        spa_hook_size: 48,
+        spa_data_size: 40,
+        spa_buffer_size: 24,
+        pw_buffer_size: 8,
+        pw_stream_events_size: 96,
+        spa_hook_callbacks_offset: 16,
+        spa_data_pointer_offset: 24,
+        spa_data_chunk_offset: 32,
+        spa_buffer_datas_offset: 16,
+        pw_buffer_pointer_offset: 0,
+        stream_state_callback_offset: 16,
+        stream_format_callback_offset: 40,
+        stream_process_callback_offset: 64,
+    };
     if actual != expected {
         return Err(LoadFailure::UnsupportedAbi(format!(
             "this target's PipeWire ABI layout is {actual:?}, expected {expected:?}"

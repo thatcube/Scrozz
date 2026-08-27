@@ -238,12 +238,9 @@ fn snapshot_from_info(compositor: &str, info: &OutputInfo) -> Result<OutputSnaps
                 ),
             )
         })?;
-    let scale = ScaleFactor::new(scale).ok_or_else(|| {
-        incomplete_output(
-            compositor,
-            &format!("output {protocol_name:?} produced an invalid scale factor {scale}"),
-        )
-    })?;
+    // `infer_scale` returns only finite positive factors, which is exactly
+    // ScaleFactor's invariant.
+    let scale = ScaleFactor::new(scale);
 
     let bounds = LogicalRect::new(
         LogicalPoint::new(f64::from(x), f64::from(y)),

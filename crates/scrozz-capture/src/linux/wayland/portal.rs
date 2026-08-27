@@ -374,6 +374,37 @@ pub enum PortalFailure {
     Bus(String),
 }
 
+impl std::fmt::Display for PortalFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("the portal request was cancelled"),
+            Self::Missing(detail) => {
+                write!(formatter, "the ScreenCast portal is missing: {detail}")
+            }
+            Self::PermissionDenied(detail) => {
+                write!(
+                    formatter,
+                    "the ScreenCast portal denied permission: {detail}"
+                )
+            }
+            Self::NoSources { wanted, available } => write!(
+                formatter,
+                "the ScreenCast portal offers {} but the request needs {}",
+                describe_sources(*available),
+                describe_sources(*wanted)
+            ),
+            Self::NoStreams => formatter.write_str("the ScreenCast portal returned no streams"),
+            Self::RestoreRejected(detail) => {
+                write!(
+                    formatter,
+                    "the ScreenCast portal rejected its restore token: {detail}"
+                )
+            }
+            Self::Bus(detail) => write!(formatter, "the ScreenCast portal failed: {detail}"),
+        }
+    }
+}
+
 impl PortalFailure {
     /// Whether retrying once without the stored token can change this outcome.
     #[must_use]
