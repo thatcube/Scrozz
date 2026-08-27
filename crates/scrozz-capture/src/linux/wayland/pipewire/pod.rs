@@ -389,7 +389,7 @@ impl PropertyRef<'_> {
         self.kind != kind::CHOICE || self.choice_flavour() == Some(choice::NONE)
     }
 
-    /// Reads the value as an `Id`, unwrapping a single-value choice.
+    /// Reads the value as an `Id`, unwrapping a well-formed choice default.
     #[must_use]
     pub fn as_id(&self) -> Option<u32> {
         let (ty, body) = self.unwrap_choice()?;
@@ -442,10 +442,19 @@ impl PropertyRef<'_> {
         if value_count == 0 || values_len % child_size != 0 {
             return None;
         }
-        if value_count != 1 {
-            // Generic callers may inspect a one-option offer. Negotiated-format
-            // callers additionally require `is_fixated`, so its default cannot
-            // be mistaken for an agreement.
+        let valid_cardinality = match flavour {
+            // SPA permits ignored values after the current value for None.
+            choice::NONE => true,
+            choice::RANGE => value_count == 3,
+            choice::STEP => value_count == 4,
+            choice::ENUM => value_count == 1,
+            choice::FLAGS => value_count == 1,
+            _ => false,
+        };
+        if !valid_cardinality {
+            // A multi-option enum has no single value to report. Negotiated
+            // format callers also require `is_fixated`, so defaults from Range,
+            // Step, and Flags cannot be mistaken for agreements.
             return None;
         }
         let child_end = 16usize.checked_add(child_size)?;
