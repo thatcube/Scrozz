@@ -19,6 +19,10 @@ use std::path::PathBuf;
 
 use scrozz_core::{CaptureTarget, Result};
 
+pub mod settings;
+
+pub use settings::RecordingSettings;
+
 /// What a recording session should include.
 #[derive(Debug, Clone)]
 pub struct RecordingRequest {
