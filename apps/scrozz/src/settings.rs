@@ -494,10 +494,10 @@ pub const SETTINGS: &[Setting] = &[
     Setting::new(
         "history.max-age-days",
         History,
-        "Keep unpinned captures",
+        "Keep unpinned source images",
         Kind::Choice(&["0", "1", "3", "7", "30"]),
         "0",
-        "Remove unpinned captures after this many days, or never when set to zero.",
+        "Evict unpinned source images after this many days, or never when set to zero. Records, metadata, OCR, and edits remain available.",
     ),
     Setting::new(
         "ocr.languages",
@@ -792,6 +792,22 @@ mod tests {
         assert_eq!(
             setting.default.parse::<u64>().unwrap(),
             scrozz_store::RetentionPolicy::default().max_image_bytes
+        );
+
+        let age = lookup("history.max-image-age").unwrap();
+        assert_eq!(
+            scrozz_store::RetentionWindow::from_token(age.default).unwrap(),
+            scrozz_store::RetentionPolicy::default().max_image_age
+        );
+        let Kind::Choice(options) = age.kind else {
+            panic!("history.max-image-age should be a choice")
+        };
+        assert_eq!(
+            options,
+            scrozz_store::RetentionWindow::all()
+                .iter()
+                .map(|window| window.as_token())
+                .collect::<Vec<_>>()
         );
     }
 
