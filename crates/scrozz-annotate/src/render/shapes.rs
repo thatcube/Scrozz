@@ -96,13 +96,7 @@ pub fn stroke_path(pixmap: &mut Pixmap, path: &Path, paint: &Paint<'_>, width: f
 
 /// Fills a path.
 pub fn fill_path(pixmap: &mut Pixmap, path: &Path, paint: &Paint<'_>) {
-    pixmap.fill_path(
-        path,
-        paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    pixmap.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
 }
 
 /// The shaft and head of an arrow, as two paths.
@@ -112,7 +106,12 @@ pub fn fill_path(pixmap: &mut Pixmap, path: &Path, paint: &Paint<'_>) {
 /// not end in a blob. The shaft stops short of the head's base rather than
 /// running through it, which would show as a bump on a translucent arrow.
 #[must_use]
-pub fn arrow(object: &AnnotationObject, from: LogicalPoint, to: LogicalPoint, xf: Scaled) -> Option<(Path, Path)> {
+pub fn arrow(
+    object: &AnnotationObject,
+    from: LogicalPoint,
+    to: LogicalPoint,
+    xf: Scaled,
+) -> Option<(Path, Path)> {
     let (x0, y0) = xf.point(from);
     let (x1, y1) = xf.point(to);
     let (dx, dy) = (x1 - x0, y1 - y0);
@@ -274,7 +273,12 @@ pub fn text(content: &str, at: LogicalPoint, style: &Style, xf: Scaled) -> Optio
 
 /// The circle and the numeral of a counter marker.
 #[must_use]
-pub fn counter(object: &AnnotationObject, at: LogicalPoint, index: u32, xf: Scaled) -> Option<(Path, Option<Path>)> {
+pub fn counter(
+    object: &AnnotationObject,
+    at: LogicalPoint,
+    index: u32,
+    xf: Scaled,
+) -> Option<(Path, Option<Path>)> {
     let (cx, cy) = xf.point(at);
     let radius = xf.length(object.counter_radius());
     let disc = PathBuilder::from_circle(cx, cy, radius)?;

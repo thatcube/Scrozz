@@ -2,21 +2,28 @@
 
 mod common;
 
-use common::{document, rect, every_annotation};
-use scrozz_annotate::{
-    Annotation, AnnotationKind, Color, Document, RedactStyle, Style,
-};
+use common::{document, every_annotation, rect};
+use scrozz_annotate::{Annotation, AnnotationKind, Color, Document, RedactStyle, Style};
 use scrozz_core::LogicalPoint;
 
 #[test]
 fn add_returns_stable_unique_ids() {
     let mut doc = document(200, 120);
-    let a = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)), Style::stroked());
-    let b = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)), Style::stroked());
+    let a = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+        Style::stroked(),
+    );
+    let b = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+        Style::stroked(),
+    );
     assert_ne!(a, b);
 
     doc.remove(a);
-    let c = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)), Style::stroked());
+    let c = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 10.0, 10.0)),
+        Style::stroked(),
+    );
     assert_ne!(
         c, a,
         "an id must never be reused: a stale reference would silently address a different object"
@@ -209,7 +216,10 @@ fn counters_ignore_non_counter_annotations() {
         },
         Style::stroked(),
     );
-    doc.add(Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)), Style::stroked());
+    doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
     let third = doc.add(
         Annotation::Counter {
             at: LogicalPoint::new(60.0, 10.0),
@@ -259,7 +269,10 @@ fn visual_bounds_covers_the_stroke_and_geometric_bounds_does_not() {
 #[test]
 fn translate_and_set_bounds_move_and_resize() {
     let mut doc = document(300, 300);
-    let id = doc.add(Annotation::Rectangle(rect(10.0, 10.0, 20.0, 20.0)), Style::stroked());
+    let id = doc.add(
+        Annotation::Rectangle(rect(10.0, 10.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
 
     doc.translate(id, 15.0, -5.0);
     let moved = doc.get(id).unwrap().bounds();
@@ -291,7 +304,10 @@ fn resizing_freehand_remaps_every_point_proportionally() {
     };
     assert_eq!(points.len(), 3);
     assert!((points[0].x - 100.0).abs() < 1e-6);
-    assert!((points[1].x - 120.0).abs() < 1e-6, "the midpoint stays the midpoint");
+    assert!(
+        (points[1].x - 120.0).abs() < 1e-6,
+        "the midpoint stays the midpoint"
+    );
     assert!((points[2].x - 140.0).abs() < 1e-6);
     assert!((points[2].y - 120.0).abs() < 1e-6);
 }
@@ -344,7 +360,10 @@ fn get_mut_renumbers_when_an_edit_changes_the_kind_balance() {
 #[test]
 fn set_style_replaces_only_the_style() {
     let mut doc = document(300, 300);
-    let id = doc.add(Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)), Style::stroked());
+    let id = doc.add(
+        Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)),
+        Style::stroked(),
+    );
     doc.set_style(id, Style::stroked().with_stroke(Color::rgb(1, 2, 3)));
 
     let object = doc.get(id).unwrap();
@@ -356,10 +375,16 @@ fn set_style_replaces_only_the_style() {
 #[test]
 fn clear_removes_everything_but_keeps_ids_unique() {
     let mut doc = document(100, 100);
-    let a = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)), Style::stroked());
+    let a = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
     doc.clear();
     assert!(doc.is_empty());
-    let b = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)), Style::stroked());
+    let b = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
     assert_ne!(a, b);
 }
 

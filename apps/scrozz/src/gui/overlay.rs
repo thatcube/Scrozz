@@ -24,7 +24,7 @@ use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
 use scrozz_ui::{
-    overlay_app::THUMBNAIL_PX, CaptureRequest, DismissReason, OverlayEvent, OverlayHandle,
+    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
 };
 
 use crate::gui::{
@@ -97,9 +97,7 @@ impl CardSurface for OverlayCards {
                 // guarantee about texture size rather than assuming ours.
                 THUMBNAIL_PX,
             )
-            .unwrap_or_else(|| {
-                CaptureRequest::new(name.clone(), provenance, card.source_px())
-            }),
+            .unwrap_or_else(|| CaptureRequest::new(name.clone(), provenance, card.source_px())),
             // No pixels yet: the card still appears, with a holding fill. A
             // capture that happened should be visible even if thumbnailing
             // failed, because the file on disk is fine.

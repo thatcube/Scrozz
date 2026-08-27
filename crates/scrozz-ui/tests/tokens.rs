@@ -1223,7 +1223,7 @@ fn a_shortcut_has_both_a_glyph_form_and_a_spoken_form() {
     assert!(spoken.contains("Shift"), "{spoken}");
     assert!(spoken.contains('4'), "{spoken}");
     assert!(
-        spoken.chars().all(|c| c.is_ascii()),
+        spoken.is_ascii(),
         "a screen reader cannot pronounce a symbol: {spoken}"
     );
 }

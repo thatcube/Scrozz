@@ -154,7 +154,11 @@ impl Rgba8Image {
                 let a = s[3];
                 let (r, g, b) = (s[r_at], s[1], s[b_at]);
                 let (r, g, b) = if premultiplied {
-                    (unpremultiply(r, a), unpremultiply(g, a), unpremultiply(b, a))
+                    (
+                        unpremultiply(r, a),
+                        unpremultiply(g, a),
+                        unpremultiply(b, a),
+                    )
                 } else {
                     (r, g, b)
                 };
@@ -326,12 +330,13 @@ pub fn upscale_factor(
 
     // Then the engine's own ceiling, which may shrink us below 1.0.
     if let Some(max) = max_dimension
-        && max > 0 {
-            let limit = f64::from(max) / w.max(h);
-            if factor > limit {
-                factor = limit;
-            }
+        && max > 0
+    {
+        let limit = f64::from(max) / w.max(h);
+        if factor > limit {
+            factor = limit;
         }
+    }
 
     // Snap near-identity back to exactly 1.0 so callers can skip resampling.
     if (factor - 1.0).abs() < 1e-9 {

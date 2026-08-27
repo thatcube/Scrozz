@@ -211,9 +211,18 @@ fn annotations_land_where_they_were_authored() {
     );
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
-    assert!(near(pixel(&out, 40, 40), [255, 0, 0, 255], 2), "inside the fill");
-    assert!(near(pixel(&out, 5, 5), [255, 255, 255, 255], 2), "outside it");
-    assert!(near(pixel(&out, 90, 90), [255, 255, 255, 255], 2), "outside it");
+    assert!(
+        near(pixel(&out, 40, 40), [255, 0, 0, 255], 2),
+        "inside the fill"
+    );
+    assert!(
+        near(pixel(&out, 5, 5), [255, 255, 255, 255], 2),
+        "outside it"
+    );
+    assert!(
+        near(pixel(&out, 90, 90), [255, 255, 255, 255], 2),
+        "outside it"
+    );
 }
 
 #[test]
@@ -267,7 +276,10 @@ fn beautification_is_refused_by_the_renderer_for_window_captures() {
     // so reaching this state needs a hand-built sidecar — which is exactly the
     // route a future importer or a corrupted file would take.
     let data = scrozz_annotate::DocumentData {
-        beautification: Some(Beautification::padded(40.0, Background::Solid(Color::WHITE))),
+        beautification: Some(Beautification::padded(
+            40.0,
+            Background::Solid(Color::WHITE),
+        )),
         ..Default::default()
     };
 
@@ -288,7 +300,9 @@ fn a_window_capture_renders_fine_without_beautification() {
         Annotation::Rectangle(rect(5.0, 5.0, 20.0, 20.0)),
         Style::stroked(),
     );
-    let out = SkiaRenderer::new().render(&doc).expect("annotations are always allowed");
+    let out = SkiaRenderer::new()
+        .render(&doc)
+        .expect("annotations are always allowed");
     assert_eq!(out.width(), 50);
 }
 
@@ -446,8 +460,14 @@ fn degenerate_annotations_are_survivable() {
         },
         Style::stroked(),
     );
-    doc.add(Annotation::Rectangle(rect(10.0, 10.0, 0.0, 0.0)), Style::stroked());
-    doc.add(Annotation::Ellipse(rect(10.0, 10.0, 0.0, 30.0)), Style::stroked());
+    doc.add(
+        Annotation::Rectangle(rect(10.0, 10.0, 0.0, 0.0)),
+        Style::stroked(),
+    );
+    doc.add(
+        Annotation::Ellipse(rect(10.0, 10.0, 0.0, 30.0)),
+        Style::stroked(),
+    );
     doc.add(Annotation::Freehand(vec![]), Style::stroked());
     doc.add(
         Annotation::Freehand(vec![LogicalPoint::new(5.0, 5.0)]),
@@ -468,7 +488,9 @@ fn degenerate_annotations_are_survivable() {
         Style::redaction(),
     );
 
-    let out = SkiaRenderer::new().render(&doc).expect("no panics, no errors");
+    let out = SkiaRenderer::new()
+        .render(&doc)
+        .expect("no panics, no errors");
     assert!(out.is_well_formed());
 }
 

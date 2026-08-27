@@ -111,7 +111,12 @@ mod tests {
     fn later_ids_sort_after_earlier_ones() {
         let early = capture_id_at(1_000_000_000_000);
         let late = capture_id_at(1_700_000_000_000);
-        assert!(early.0 < late.0, "{} should sort before {}", early.0, late.0);
+        assert!(
+            early.0 < late.0,
+            "{} should sort before {}",
+            early.0,
+            late.0
+        );
     }
 
     #[test]

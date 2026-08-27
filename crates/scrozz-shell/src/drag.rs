@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex};
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize, Result};
 
-use crate::overlay::{logical_to_appkit, AppKitRect};
+use crate::overlay::{AppKitRect, logical_to_appkit};
 
 // ---------------------------------------------------------------------------
 // What is being dragged
@@ -141,7 +141,10 @@ impl DragFormat {
     /// naturally types.
     #[must_use]
     pub fn from_extension(extension: &str) -> Option<Self> {
-        let trimmed = extension.trim().trim_start_matches('.').to_ascii_lowercase();
+        let trimmed = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
         match trimmed.as_str() {
             "png" => Some(Self::Png),
             "jpg" | "jpeg" => Some(Self::Jpeg),
@@ -217,9 +220,7 @@ pub fn sanitise_stem(raw: &str) -> String {
     let replaced: String = raw
         .chars()
         .map(|c| {
-            if c.is_control()
-                || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
-            {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*') {
                 ' '
             } else {
                 c
@@ -593,7 +594,12 @@ impl DragOrigin {
 #[must_use]
 pub fn card_rect_in_view(card: LogicalRect, view_height: f64, flipped: bool) -> AppKitRect {
     if flipped {
-        AppKitRect::new(card.origin.x, card.origin.y, card.size.width, card.size.height)
+        AppKitRect::new(
+            card.origin.x,
+            card.origin.y,
+            card.size.width,
+            card.size.height,
+        )
     } else {
         logical_to_appkit(card, view_height)
     }
@@ -942,9 +948,7 @@ pub fn native_drag_source() -> Result<NativeDragSource> {
 /// [`Intent::DragOut`]: https://docs.rs/scrozz-ui
 #[cfg(not(target_os = "macos"))]
 pub mod unimplemented_platform {
-    use super::{
-        check_origin, DragCapability, DragOrigin, DragPayload, DragSession, DragSource,
-    };
+    use super::{DragCapability, DragOrigin, DragPayload, DragSession, DragSource, check_origin};
     use scrozz_core::{Error, Result};
 
     /// The drag backend on a platform whose FFI is designed but not written.

@@ -57,7 +57,10 @@ fn a_short_buffer_never_panics() {
     let mut frame = blank(64, 64, 1.0);
     frame.data.truncate(16);
     let result = SystemOcr::new().recognize(&frame);
-    assert!(result.is_err(), "a short buffer must be an error, not a crash");
+    assert!(
+        result.is_err(),
+        "a short buffer must be an error, not a crash"
+    );
 }
 
 #[test]
@@ -68,7 +71,7 @@ fn a_zero_sized_frame_never_panics() {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod no_system_engine {
-    use super::{blank, Ocr, SystemOcr};
+    use super::{Ocr, SystemOcr, blank};
     use scrozz_core::Error;
 
     /// Decision D8: say what is missing and what to install. An empty `Vec`
@@ -129,7 +132,10 @@ mod vision {
         canvas.fill_white();
         canvas.draw_text(TOP_WORD, 40.0, 300.0, 64.0);
         canvas.draw_text(BOTTOM_WORD, 40.0, 60.0, 64.0);
-        assert!(canvas.ink() > 200, "nothing was drawn; the test would be vacuous");
+        assert!(
+            canvas.ink() > 200,
+            "nothing was drawn; the test would be vacuous"
+        );
 
         Frame {
             data: canvas.into_rgba8(),
@@ -163,7 +169,10 @@ mod vision {
             "expected {TOP_WORD:?} in {text:?} ({} blocks)",
             blocks.len()
         );
-        assert!(text.contains(BOTTOM_WORD), "expected {BOTTOM_WORD:?} in {text:?}");
+        assert!(
+            text.contains(BOTTOM_WORD),
+            "expected {BOTTOM_WORD:?} in {text:?}"
+        );
     }
 
     /// End-to-end proof that the bottom-left flip is not inverted: the word
@@ -256,7 +265,10 @@ mod vision {
             );
         }
         let best = blocks.iter().map(|b| b.confidence).fold(0.0_f32, f32::max);
-        assert!(best > 0.3, "clean rendered text should read confidently, got {best}");
+        assert!(
+            best > 0.3,
+            "clean rendered text should read confidently, got {best}"
+        );
     }
 
     /// Reading order must survive the round trip, or copying pastes a bag of
@@ -268,8 +280,14 @@ mod vision {
         let text = plain_text(&blocks).to_uppercase();
         let top = text.find(TOP_WORD).expect("top word");
         let bottom = text.find(BOTTOM_WORD).expect("bottom word");
-        assert!(top < bottom, "expected {TOP_WORD} before {BOTTOM_WORD} in {text:?}");
-        assert!(text.contains('\n'), "two rows should be two lines: {text:?}");
+        assert!(
+            top < bottom,
+            "expected {TOP_WORD} before {BOTTOM_WORD} in {text:?}"
+        );
+        assert!(
+            text.contains('\n'),
+            "two rows should be two lines: {text:?}"
+        );
     }
 
     /// Small text in a tall capture — a menu bar, a breadcrumb, a status line —
@@ -303,9 +321,15 @@ mod vision {
 
     /// An empty screenshot is not an error — it is a screenshot with no text.
     #[test]
-    fn a_blank_image_yields_no_blocks_and_no_error() {        let frame = super::blank(300, 200, 1.0);
-        let blocks = SystemOcr::new().recognize(&frame).expect("blank is not a failure");
-        assert!(blocks.is_empty(), "found text in a blank image: {blocks:#?}");
+    fn a_blank_image_yields_no_blocks_and_no_error() {
+        let frame = super::blank(300, 200, 1.0);
+        let blocks = SystemOcr::new()
+            .recognize(&frame)
+            .expect("blank is not a failure");
+        assert!(
+            blocks.is_empty(),
+            "found text in a blank image: {blocks:#?}"
+        );
     }
 
     /// Requesting a language the installed system does not have must degrade to
@@ -316,7 +340,9 @@ mod vision {
         let ocr = SystemOcr::with_options(
             Options::new().with_languages(["zz-ZZ".to_string(), "en-US".to_string()]),
         );
-        let blocks = ocr.recognize(&frame).expect("unknown tags must be filtered, not fatal");
+        let blocks = ocr
+            .recognize(&frame)
+            .expect("unknown tags must be filtered, not fatal");
         let text = plain_text(&blocks).to_uppercase();
         assert!(text.contains(TOP_WORD), "got {text:?}");
     }
@@ -327,7 +353,10 @@ mod vision {
         let ocr = SystemOcr::with_options(Options::new().with_accuracy(scrozz_ocr::Accuracy::Fast));
         let blocks = ocr.recognize(&frame).expect("fast recognition");
         let text = plain_text(&blocks).to_uppercase();
-        assert!(text.contains(TOP_WORD) || text.contains(BOTTOM_WORD), "got {text:?}");
+        assert!(
+            text.contains(TOP_WORD) || text.contains(BOTTOM_WORD),
+            "got {text:?}"
+        );
     }
 
     /// The convenience wrapper must agree with the block-level API.
@@ -336,6 +365,9 @@ mod vision {
         let frame = two_line_frame();
         let ocr = SystemOcr::new();
         let blocks = ocr.recognize(&frame).expect("recognition");
-        assert_eq!(ocr.recognize_text(&frame).expect("text"), plain_text(&blocks));
+        assert_eq!(
+            ocr.recognize_text(&frame).expect("text"),
+            plain_text(&blocks)
+        );
     }
 }

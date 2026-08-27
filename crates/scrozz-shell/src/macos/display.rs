@@ -35,7 +35,7 @@ use objc2_foundation::{MainThreadMarker, NSRect};
 use scrozz_core::{Display, DisplayId, Error, LogicalPoint, LogicalRect, Result, ScaleFactor};
 
 use crate::macos::main_thread;
-use crate::overlay::{appkit_to_logical, AppKitRect};
+use crate::overlay::{AppKitRect, appkit_to_logical};
 
 /// Converts an `NSRect` in screen coordinates to [`AppKitRect`].
 ///

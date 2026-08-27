@@ -20,9 +20,7 @@
 //! output and paste it somewhere. Text that pastes as a bag of words is a
 //! failure even when every character is correct.
 
-use scrozz_core::{
-    LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize, ScaleFactor,
-};
+use scrozz_core::{LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize, ScaleFactor};
 
 use crate::TextBlock;
 
@@ -270,14 +268,7 @@ pub fn plain_text(blocks: &[TextBlock]) -> String {
 }
 
 /// Builds a physical rectangle from edges, clamped to the image.
-fn clamped(
-    left: f64,
-    top: f64,
-    right: f64,
-    bottom: f64,
-    width: f64,
-    height: f64,
-) -> PhysicalRect {
+fn clamped(left: f64, top: f64, right: f64, bottom: f64, width: f64, height: f64) -> PhysicalRect {
     let left = left.clamp(0.0, width);
     let top = top.clamp(0.0, height);
     let right = right.clamp(left, width);

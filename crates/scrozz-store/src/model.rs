@@ -40,10 +40,9 @@ impl Timestamp {
     pub fn from_system_time(time: SystemTime) -> Self {
         match time.duration_since(UNIX_EPOCH) {
             Ok(delta) => Self(i64::try_from(delta.as_millis()).unwrap_or(i64::MAX)),
-            Err(err) => Self(
-                i64::try_from(err.duration().as_millis())
-                    .map_or(i64::MIN, |millis| -millis),
-            ),
+            Err(err) => {
+                Self(i64::try_from(err.duration().as_millis()).map_or(i64::MIN, |millis| -millis))
+            }
         }
     }
 
@@ -100,7 +99,8 @@ impl FrameHeader {
     /// Bytes a well-formed blob for this header occupies.
     #[must_use]
     pub fn expected_len(&self) -> usize {
-        self.stride.saturating_mul(self.size.height.round().max(0.0) as usize)
+        self.stride
+            .saturating_mul(self.size.height.round().max(0.0) as usize)
     }
 }
 

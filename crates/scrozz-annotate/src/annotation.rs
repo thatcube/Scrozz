@@ -134,7 +134,10 @@ impl Annotation {
     pub fn bounds(&self) -> LogicalRect {
         match self {
             Self::Arrow { from, to } => LogicalRect::from_corners(*from, *to),
-            Self::Rectangle(r) | Self::Ellipse(r) | Self::Highlight(r) | Self::Redact { area: r, .. } => *r,
+            Self::Rectangle(r)
+            | Self::Ellipse(r)
+            | Self::Highlight(r)
+            | Self::Redact { area: r, .. } => *r,
             Self::Freehand(points) => geom::bounding_box(points),
             Self::Text { at, .. } | Self::Counter { at, .. } => {
                 LogicalRect::new(*at, LogicalSize::new(0.0, 0.0))
@@ -153,7 +156,10 @@ impl Annotation {
                 shift(from);
                 shift(to);
             }
-            Self::Rectangle(r) | Self::Ellipse(r) | Self::Highlight(r) | Self::Redact { area: r, .. } => {
+            Self::Rectangle(r)
+            | Self::Ellipse(r)
+            | Self::Highlight(r)
+            | Self::Redact { area: r, .. } => {
                 shift(&mut r.origin);
             }
             Self::Freehand(points) => points.iter_mut().for_each(shift),
@@ -174,7 +180,10 @@ impl Annotation {
                 *a = geom::remap(*a, &from, &to);
                 *b = geom::remap(*b, &from, &to);
             }
-            Self::Rectangle(r) | Self::Ellipse(r) | Self::Highlight(r) | Self::Redact { area: r, .. } => {
+            Self::Rectangle(r)
+            | Self::Ellipse(r)
+            | Self::Highlight(r)
+            | Self::Redact { area: r, .. } => {
                 *r = to;
             }
             Self::Freehand(points) => {
@@ -244,9 +253,10 @@ impl AnnotationObject {
     #[must_use]
     pub fn bounds(&self) -> LogicalRect {
         match &self.annotation {
-            Annotation::Text { at, content } => {
-                LogicalRect::new(*at, font::measure(content, self.style.effective_font_size()))
-            }
+            Annotation::Text { at, content } => LogicalRect::new(
+                *at,
+                font::measure(content, self.style.effective_font_size()),
+            ),
             Annotation::Counter { at, .. } => {
                 let r = self.counter_radius();
                 geom::from_edges(at.x - r, at.y - r, at.x + r, at.y + r)
@@ -303,9 +313,7 @@ impl AnnotationObject {
         }
         let slack = self.style.effective_stroke_width() / 2.0 + Self::HIT_TOLERANCE;
         match &self.annotation {
-            Annotation::Arrow { from, to } => {
-                geom::distance_to_segment(point, *from, *to) <= slack
-            }
+            Annotation::Arrow { from, to } => geom::distance_to_segment(point, *from, *to) <= slack,
             Annotation::Rectangle(r) => {
                 if self.style.fill.is_some_and(|f| !f.is_invisible()) {
                     geom::contains(&geom::inflate(r, slack), point)
@@ -321,10 +329,14 @@ impl AnnotationObject {
                         && !geom::contains_ellipse(&geom::inflate(r, -slack), point)
                 }
             }
-            Annotation::Freehand(points) => points
-                .windows(2)
-                .any(|w| geom::distance_to_segment(point, w[0], w[1]) <= slack)
-                || points.first().is_some_and(|p| geom::distance(point, *p) <= slack),
+            Annotation::Freehand(points) => {
+                points
+                    .windows(2)
+                    .any(|w| geom::distance_to_segment(point, w[0], w[1]) <= slack)
+                    || points
+                        .first()
+                        .is_some_and(|p| geom::distance(point, *p) <= slack)
+            }
             Annotation::Highlight(r) | Annotation::Redact { area: r, .. } => {
                 geom::contains(&geom::inflate(r, Self::HIT_TOLERANCE), point)
             }

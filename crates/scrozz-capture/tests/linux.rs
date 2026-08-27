@@ -114,7 +114,10 @@ mod session_detection {
 
     #[test]
     fn nothing_at_all_is_headless() {
-        assert_eq!(detect_session(&SessionEnv::default()), SessionKind::Headless);
+        assert_eq!(
+            detect_session(&SessionEnv::default()),
+            SessionKind::Headless
+        );
     }
 
     #[test]
@@ -360,10 +363,7 @@ mod ewmh_properties {
 
     #[test]
     fn utf8_titles_drop_trailing_nuls() {
-        assert_eq!(
-            parse_utf8_name(b"Firefox\0\0").as_deref(),
-            Some("Firefox")
-        );
+        assert_eq!(parse_utf8_name(b"Firefox\0\0").as_deref(), Some("Firefox"));
         assert_eq!(parse_utf8_name(b"").as_deref(), None);
         assert_eq!(parse_utf8_name(b"\0\0").as_deref(), None);
     }
@@ -378,7 +378,10 @@ mod ewmh_properties {
     /// accented character; the widening is the whole point of the function.
     #[test]
     fn legacy_titles_are_latin1() {
-        assert_eq!(parse_latin1_name(&[0xe9, b'c', b'h']).as_deref(), Some("éch"));
+        assert_eq!(
+            parse_latin1_name(&[0xe9, b'c', b'h']).as_deref(),
+            Some("éch")
+        );
     }
 
     #[test]
@@ -387,7 +390,10 @@ mod ewmh_properties {
             parse_wm_class(b"Navigator\0Firefox\0"),
             Some(("Navigator".to_owned(), "Firefox".to_owned()))
         );
-        assert_eq!(application_name(b"Navigator\0Firefox\0").as_deref(), Some("Firefox"));
+        assert_eq!(
+            application_name(b"Navigator\0Firefox\0").as_deref(),
+            Some("Firefox")
+        );
     }
 
     #[test]
@@ -476,10 +482,7 @@ mod ewmh_properties {
     /// first choice in the picker.
     #[test]
     fn stacking_order_is_reversed_for_the_contract() {
-        assert_eq!(
-            stacking_to_front_first(vec![10, 20, 30]),
-            vec![30, 20, 10]
-        );
+        assert_eq!(stacking_to_front_first(vec![10, 20, 30]), vec![30, 20, 10]);
         assert!(stacking_to_front_first(Vec::new()).is_empty());
     }
 }
@@ -543,8 +546,8 @@ mod pixel_layout {
     /// Depth 32 is where the fourth byte actually means something.
     #[test]
     fn depth_32_bgra_has_alpha() {
-        let layout = byte_layout(0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 32, 32, true)
-            .expect("ARGB visual");
+        let layout =
+            byte_layout(0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 32, 32, true).expect("ARGB visual");
         assert_eq!(layout.alpha, Some(3));
     }
 
@@ -562,8 +565,8 @@ mod pixel_layout {
 
     #[test]
     fn rgbx_visuals_are_recognised_directly() {
-        let layout = byte_layout(0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 24, 32, true)
-            .expect("RGBX visual");
+        let layout =
+            byte_layout(0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 24, 32, true).expect("RGBX visual");
         assert_eq!(direct_format(&layout), Some(PixelFormat::Rgba8));
     }
 
@@ -574,18 +577,27 @@ mod pixel_layout {
             None,
             "16-bit 5-6-5 has no byte-aligned channels"
         );
-        assert_eq!(byte_layout(0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 24, 24, true), None);
+        assert_eq!(
+            byte_layout(0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 24, 24, true),
+            None
+        );
     }
 
     #[test]
     fn masks_that_are_not_byte_aligned_are_declined() {
-        assert_eq!(byte_layout(0x0000_0ff0, 0x0000_ff00, 0x0000_00ff, 24, 32, true), None);
+        assert_eq!(
+            byte_layout(0x0000_0ff0, 0x0000_ff00, 0x0000_00ff, 24, 32, true),
+            None
+        );
         assert_eq!(byte_layout(0, 0x0000_ff00, 0x0000_00ff, 24, 32, true), None);
     }
 
     #[test]
     fn overlapping_channels_are_declined() {
-        assert_eq!(byte_layout(0x0000_00ff, 0x0000_00ff, 0x0000_ff00, 24, 32, true), None);
+        assert_eq!(
+            byte_layout(0x0000_00ff, 0x0000_00ff, 0x0000_ff00, 24, 32, true),
+            None
+        );
     }
 
     fn bgrx_layout() -> ByteLayout {
@@ -1083,7 +1095,7 @@ mod randr_wire {
     #[test]
     fn a_truncated_or_non_reply_is_refused() {
         assert!(parse_query_version(&[]).is_err());
-        assert!(parse_query_version(&vec![0u8; 31]).is_err());
+        assert!(parse_query_version(&[0u8; 31]).is_err());
         let mut error = version_reply(1, 5);
         error[0] = 0; // an X error, not a reply
         assert!(parse_query_version(&error).is_err());

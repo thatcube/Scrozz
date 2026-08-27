@@ -38,6 +38,4 @@ pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
-pub use target::{
-    CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId,
-};
+pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};

@@ -28,9 +28,9 @@
 use std::path::{Path, PathBuf};
 
 use scrozz_ui::harness::{
-    default_snapshot_dir, diff, docs_plan, golden_plan, store_plan, Background, GoldenOutcome,
-    GoldenStore, Image, Profile, RenderSpec, Rng, Scenario, SceneRegistry, SequenceSpec,
-    SoftwareRenderer, StoreManifest, Tolerance, VirtualClock, DEFAULT_SEED,
+    Background, DEFAULT_SEED, GoldenOutcome, GoldenStore, Image, Profile, RenderSpec, Rng,
+    Scenario, SceneRegistry, SequenceSpec, SoftwareRenderer, StoreManifest, Tolerance,
+    VirtualClock, default_snapshot_dir, diff, docs_plan, golden_plan, store_plan,
 };
 
 // ---------------------------------------------------------------------------
@@ -364,8 +364,14 @@ fn the_reporter_agrees_with_itself() {
     let b = r.render(&spec).expect("b");
 
     let report = diff(&a, &b);
-    assert!(report.is_identical(), "identical images reported as different");
-    assert!(report.passes(Tolerance::EXACT), "identical images failed EXACT");
+    assert!(
+        report.is_identical(),
+        "identical images reported as different"
+    );
+    assert!(
+        report.passes(Tolerance::EXACT),
+        "identical images failed EXACT"
+    );
     assert_eq!(report.changed_pixels, 0);
 }
 
@@ -386,7 +392,10 @@ fn a_single_changed_pixel_is_caught() {
 
     let report = diff(&a, &b);
     assert_eq!(report.changed_pixels, 1, "one changed pixel was miscounted");
-    assert!(!report.passes(Tolerance::EXACT), "EXACT let a changed pixel through");
+    assert!(
+        !report.passes(Tolerance::EXACT),
+        "EXACT let a changed pixel through"
+    );
     assert_eq!(
         report.bounding_box,
         Some((x, y, 1, 1)),
@@ -445,7 +454,11 @@ fn a_mismatch_writes_a_legible_triptych() {
         &failure.diff_path,
         &failure.triptych_path,
     ] {
-        assert!(path.exists(), "failure artefact missing: {}", path.display());
+        assert!(
+            path.exists(),
+            "failure artefact missing: {}",
+            path.display()
+        );
     }
 
     let triptych = Image::read_png(&failure.triptych_path).expect("read triptych");
@@ -475,7 +488,10 @@ fn mismatched_sizes_fail_rather_than_panic() {
     let a = Image::transparent(10, 10);
     let b = Image::transparent(12, 10);
     let report = diff(&a, &b);
-    assert!(!report.is_identical(), "different sizes reported as identical");
+    assert!(
+        !report.is_identical(),
+        "different sizes reported as identical"
+    );
     assert!(!report.passes(Tolerance::EXACT));
 }
 

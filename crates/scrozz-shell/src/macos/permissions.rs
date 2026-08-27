@@ -25,19 +25,19 @@
 //! carry the key. The same applies to `NSCameraUsageDescription` if a camera
 //! overlay is ever added.
 
-use std::ffi::{c_void, CStr, c_char, c_int, c_ulong};
+use std::ffi::{CStr, c_char, c_int, c_ulong, c_void};
 use std::sync::OnceLock;
 
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, Bool};
-use objc2::msg_send;
 use objc2_app_kit::NSWorkspace;
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 use scrozz_core::{Error, Result};
 
-use crate::permissions::{capability_name, settings_pane_url};
 use crate::Capability;
+use crate::permissions::{capability_name, settings_pane_url};
 
 // AVFoundation is linked here rather than declared in Cargo.toml because the
 // only thing Scrozz needs from it is the authorisation API, which is two

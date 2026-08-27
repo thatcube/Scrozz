@@ -188,7 +188,9 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
             // Type weight is a fraction of cap height, not the shape stroke
             // width: an 18pt label drawn with a 12pt shape stroke is a blob.
-            let weight = xf.length(object.style.effective_font_size() * 0.12).max(1.0);
+            let weight = xf
+                .length(object.style.effective_font_size() * 0.12)
+                .max(1.0);
             shapes::stroke_path(canvas, &path, &paint, weight);
         }
         Annotation::Counter { at, index } => {

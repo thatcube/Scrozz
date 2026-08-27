@@ -39,14 +39,14 @@
 //! a human looked at it.
 
 use egui::epaint::{Mesh, Vertex};
-use egui::{pos2, vec2, Align2, Color32, Id, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui};
+use egui::{Align2, Color32, Id, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use scrozz_core::Provenance;
 
 use crate::icons::Icon;
 use crate::motion::fade;
 use crate::paint::{self, ControlState, Reveal, Surface};
 use crate::stack::{CardFrame, CardId, MAX_LEAN};
-use crate::theme::{corner, Radius, Space, Text};
+use crate::theme::{Radius, Space, Text, corner};
 
 /// Height of a revealed pill button.
 const PILL_H: f32 = 30.0;

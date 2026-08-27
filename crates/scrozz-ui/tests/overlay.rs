@@ -27,14 +27,12 @@ use scrozz_ui::harness::{
 };
 use scrozz_ui::icons::IconStore;
 use scrozz_ui::motion::Motion;
-use scrozz_ui::overlay_app::{
-    self, OverlayGeometry, OverlayHandle, OverlayOptions, Passthrough,
-};
+use scrozz_ui::overlay_app::{self, OverlayGeometry, OverlayHandle, OverlayOptions, Passthrough};
 use scrozz_ui::paint::Surface;
 use scrozz_ui::stack::{CardFrame, CardId, CardState};
 use scrozz_ui::theme::{self, Appearance, Theme};
 
-use egui::{pos2, vec2, Rect};
+use egui::{Rect, pos2, vec2};
 
 // ---------------------------------------------------------------------------
 // Geometry shared by every render in this file
@@ -55,7 +53,10 @@ const CARD_ORIGIN: (f32, f32) = (34.0, 34.0);
 const CARD_SIZE: (f32, f32) = (232.0, 145.0);
 
 fn card_rect() -> Rect {
-    Rect::from_min_size(pos2(CARD_ORIGIN.0, CARD_ORIGIN.1), vec2(CARD_SIZE.0, CARD_SIZE.1))
+    Rect::from_min_size(
+        pos2(CARD_ORIGIN.0, CARD_ORIGIN.1),
+        vec2(CARD_SIZE.0, CARD_SIZE.1),
+    )
 }
 
 /// A logical point converted to a pixel in the rendered image.
@@ -497,13 +498,11 @@ fn native_options_carry_the_viewport_and_never_persist_geometry() {
 #[test]
 fn the_handle_accepts_captures_before_the_window_exists() {
     let handle = OverlayHandle::new();
-    handle.push(
-        scrozz_ui::overlay_app::CaptureRequest::new(
-            "early.png",
-            Provenance::Display,
-            (1920, 1080),
-        ),
-    );
+    handle.push(scrozz_ui::overlay_app::CaptureRequest::new(
+        "early.png",
+        Provenance::Display,
+        (1920, 1080),
+    ));
     assert!(
         !handle.is_attached(),
         "no app has taken this handle yet, and pushing still has to work: the \

@@ -32,7 +32,10 @@ fn fractional_scaling_rounds_outward_never_inward() {
     // pixel short is visible, including one extra is not.
     let physical = rect(10.5, 10.5, 100.0, 100.0).to_physical(ScaleFactor::new(1.5));
 
-    assert_eq!(physical.origin.x, 15.0, "origin floors: 10.5 * 1.5 = 15.75 -> 15");
+    assert_eq!(
+        physical.origin.x, 15.0,
+        "origin floors: 10.5 * 1.5 = 15.75 -> 15"
+    );
     assert_eq!(physical.origin.y, 15.0, "origin floors");
     // Far edge is 110.5 * 1.5 = 165.75, which must reach 166 rather than
     // truncate to 165. Width is therefore 166 - 15 = 151, one pixel wider than

@@ -64,10 +64,10 @@ use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
 
 use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
-use crate::motion::{fade, Motion};
+use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
-use crate::stack::{dock, CaptureStack, CardId, Intent};
-use crate::theme::{corner, Appearance, Radius, Theme};
+use crate::stack::{CaptureStack, CardId, Intent, dock};
+use crate::theme::{Appearance, Radius, Theme, corner};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
 /// single frame to re-sample the pointer, when no [`PointerProbe`] is supplied.
@@ -501,11 +501,7 @@ impl OverlayHandle {
     /// Whether a window has bound itself to this handle yet.
     #[must_use]
     pub fn is_attached(&self) -> bool {
-        self.shared
-            .ctx
-            .lock()
-            .map(|c| c.is_some())
-            .unwrap_or(false)
+        self.shared.ctx.lock().map(|c| c.is_some()).unwrap_or(false)
     }
 
     /// Ask the overlay to draw a frame, if it is running.
@@ -1098,10 +1094,7 @@ impl eframe::App for OverlayApp {
                 action = Some((f.id, a));
             }
             if response.body.drag_started() {
-                drag_start = response
-                    .body
-                    .interact_pointer_pos()
-                    .map(|p| (f.id, p));
+                drag_start = response.body.interact_pointer_pos().map(|p| (f.id, p));
             }
             if response.body.dragged() {
                 drag_to = response.body.interact_pointer_pos();
@@ -1143,10 +1136,7 @@ impl eframe::App for OverlayApp {
                         reason: DismissReason::Swipe,
                     }),
                     Intent::DragOut => {
-                        self.emit(OverlayEvent::DragOut {
-                            id: release.id,
-                            at,
-                        });
+                        self.emit(OverlayEvent::DragOut { id: release.id, at });
                         self.emit(OverlayEvent::Dismissed {
                             id: release.id,
                             reason: DismissReason::DragOut,
@@ -1188,10 +1178,8 @@ impl eframe::App for OverlayApp {
 /// overlay exists.
 #[must_use]
 pub fn dock_rect(geometry: OverlayGeometry) -> Rect {
-    let layout = crate::stack::StackLayout::new(
-        geometry.local(),
-        crate::stack::CardMetrics::default(),
-    );
+    let layout =
+        crate::stack::StackLayout::new(geometry.local(), crate::stack::CardMetrics::default());
     dock::rect_for_slot0(layout.slot_rect(0))
 }
 

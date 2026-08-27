@@ -25,8 +25,8 @@
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 
-use objc2::rc::Retained;
 use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_core_graphics::{
     CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
 };
@@ -93,12 +93,7 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
 
         // SAFETY: `observation` is a live VNRecognizedTextObservation.
         let bb = unsafe { observation.boundingBox() };
-        let rect = NormalizedRect::new(
-            bb.origin.x,
-            bb.origin.y,
-            bb.size.width,
-            bb.size.height,
-        );
+        let rect = NormalizedRect::new(bb.origin.x, bb.origin.y, bb.size.width, bb.size.height);
         let bounds = layout::bottom_left_normalized_to_physical(rect, source);
         if bounds.is_empty() {
             continue;
@@ -141,7 +136,8 @@ fn configure(request: &VNRecognizeTextRequest, options: &Options) {
         return;
     }
 
-    let strings: Vec<Retained<NSString>> = languages.iter().map(|s| NSString::from_str(s)).collect();
+    let strings: Vec<Retained<NSString>> =
+        languages.iter().map(|s| NSString::from_str(s)).collect();
     request.setRecognitionLanguages(&NSArray::from_retained_slice(&strings));
     request.setAutomaticallyDetectsLanguage(false);
 }
@@ -189,9 +185,10 @@ fn supported_languages(request: &VNRecognizeTextRequest, requested: &[String]) -
                 })
             });
         if let Some(hit) = hit
-            && !out.iter().any(|existing: &String| existing == hit) {
-                out.push(hit.clone());
-            }
+            && !out.iter().any(|existing: &String| existing == hit)
+        {
+            out.push(hit.clone());
+        }
     }
     out
 }
@@ -202,7 +199,10 @@ fn supported_languages(request: &VNRecognizeTextRequest, requested: &[String]) -
 /// reference-counted through `CFRetained`, and `objc2-core-foundation` is not a
 /// declared dependency of this crate, so the type is deliberately not spelled.
 fn cg_image(prepared: &Prepared) -> Result<impl std::ops::Deref<Target = CGImage>> {
-    let (width, height) = (prepared.image.width as usize, prepared.image.height as usize);
+    let (width, height) = (
+        prepared.image.width as usize,
+        prepared.image.height as usize,
+    );
     let bytes_per_row = width * 4;
     let data = prepared.image.data.clone();
     let len = data.len();
@@ -265,7 +265,11 @@ fn cg_image(prepared: &Prepared) -> Result<impl std::ops::Deref<Target = CGImage
 ///
 /// `data` must be the pointer produced by `Box::into_raw` on a `Box<[u8]>`, and
 /// `info` must be that slice's length in bytes.
-unsafe extern "C-unwind" fn release_boxed_slice(info: *mut c_void, data: NonNull<c_void>, _size: usize) {
+unsafe extern "C-unwind" fn release_boxed_slice(
+    info: *mut c_void,
+    data: NonNull<c_void>,
+    _size: usize,
+) {
     let len = info as usize;
     let slice = ptr::slice_from_raw_parts_mut(data.as_ptr().cast::<u8>(), len);
     // SAFETY: by this function's contract `slice` is the original boxed slice,

@@ -218,7 +218,9 @@ mod tests {
         first
             .execute("CREATE TABLE t (x INTEGER) STRICT", [])
             .expect("create");
-        first.execute("INSERT INTO t VALUES (1)", []).expect("write");
+        first
+            .execute("INSERT INTO t VALUES (1)", [])
+            .expect("write");
 
         let second = open(&path).expect("second");
         let seen: i64 = second

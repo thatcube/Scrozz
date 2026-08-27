@@ -11,9 +11,7 @@
 //! annotate.
 
 use image::ImageReader;
-use scrozz_core::{
-    ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, ScaleFactor,
-};
+use scrozz_core::{ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, ScaleFactor};
 
 /// Decodes encoded image bytes into a frame.
 ///
@@ -85,8 +83,8 @@ pub fn decode_file(path: &std::path::Path) -> Result<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encode::FrameEncoder, ImageFormat};
     use crate::Encoder as _;
+    use crate::{ImageFormat, encode::FrameEncoder};
 
     fn solid_frame(w: u32, h: u32) -> Frame {
         let stride = w as usize * 4;

@@ -378,8 +378,15 @@ mod tests {
         let (mut data, stride, width, height) = padded_bgra(false);
         let before = data.clone();
 
-        let format = normalise(&mut data, stride, width, height, CGImageAlphaInfo::First, true)
-            .expect("supported layout");
+        let format = normalise(
+            &mut data,
+            stride,
+            width,
+            height,
+            CGImageAlphaInfo::First,
+            true,
+        )
+        .expect("supported layout");
 
         assert_eq!(format, PixelFormat::Bgra8);
         assert_eq!(data, before, "no swizzle needed, so no bytes should move");
@@ -467,8 +474,15 @@ mod tests {
     #[test]
     fn an_alpha_only_mask_is_refused_rather_than_misread() {
         let (mut data, stride, width, height) = padded_bgra(true);
-        let error = normalise(&mut data, stride, width, height, CGImageAlphaInfo::Only, true)
-            .expect_err("alpha masks are not captures");
+        let error = normalise(
+            &mut data,
+            stride,
+            width,
+            height,
+            CGImageAlphaInfo::Only,
+            true,
+        )
+        .expect_err("alpha masks are not captures");
         assert!(matches!(error, Error::Unsupported { .. }));
     }
 

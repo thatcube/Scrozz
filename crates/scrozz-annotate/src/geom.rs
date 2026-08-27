@@ -87,7 +87,10 @@ pub fn distance_to_segment(point: LogicalPoint, a: LogicalPoint, b: LogicalPoint
     }
     let t = (((point.x - a.x) * vx) + ((point.y - a.y) * vy)) / len_sq;
     let t = t.clamp(0.0, 1.0);
-    distance(point, LogicalPoint::new(vx.mul_add(t, a.x), vy.mul_add(t, a.y)))
+    distance(
+        point,
+        LogicalPoint::new(vx.mul_add(t, a.x), vy.mul_add(t, a.y)),
+    )
 }
 
 /// Distance from `point` to the outline of `rect`.

@@ -107,8 +107,7 @@ pub fn hook() -> scrozz_ui::PanelHook {
         };
 
         #[cfg(target_os = "macos")]
-        let RawWindowHandle::AppKit(appkit) = handle.as_raw()
-        else {
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
             return PanelReport::unsupported(
                 "the overlay window is not an AppKit window, so it has no NSView to convert",
             );

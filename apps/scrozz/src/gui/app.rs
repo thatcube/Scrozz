@@ -207,16 +207,12 @@ impl App {
         let mut notes = Vec::new();
 
         let server = if config.ipc {
-            match Server::bind() {
-                Ok(server) => {
-                    notes.push(format!("listening at {}", server.path().display()));
-                    Some(server)
-                }
-                // The one failure worth stopping for: another instance is live,
-                // and a second menu-bar item is exactly what single-instance
-                // exists to prevent.
-                Err(err) => return Err(err),
-            }
+            // The one failure worth stopping for: another instance is live,
+            // and a second menu-bar item is exactly what single-instance exists
+            // to prevent.
+            let server = Server::bind()?;
+            notes.push(format!("listening at {}", server.path().display()));
+            Some(server)
         } else {
             None
         };

@@ -3,8 +3,8 @@
 use scrozz_annotate::{Annotation, Style};
 use scrozz_core::LogicalPoint;
 use scrozz_store::{
-    DocumentState, History as _, ImageState, NewCapture, Page, SearchQuery, SqliteStore, Store as _,
-    Timestamp,
+    DocumentState, History as _, ImageState, NewCapture, Page, SearchQuery, SqliteStore,
+    Store as _, Timestamp,
     test_support::{ScratchDir, richly_annotated_document, sample_document, scratch_dir},
 };
 
@@ -241,8 +241,7 @@ fn editing_a_capture_persists_and_never_touches_its_pixels() {
     let pixels = document.source.frame.data.clone();
     let id = store.insert(NewCapture::new(&document)).expect("insert");
 
-    let DocumentState::Complete(mut live) =
-        store.document(&id).expect("read").expect("present")
+    let DocumentState::Complete(mut live) = store.document(&id).expect("read").expect("present")
     else {
         panic!("pixels must be present");
     };
@@ -255,8 +254,7 @@ fn editing_a_capture_persists_and_never_touches_its_pixels() {
     );
     store.save_document(&id, &live).expect("save");
 
-    let DocumentState::Complete(reloaded) =
-        store.document(&id).expect("read").expect("present")
+    let DocumentState::Complete(reloaded) = store.document(&id).expect("read").expect("present")
     else {
         panic!("pixels must still be present");
     };
@@ -266,7 +264,11 @@ fn editing_a_capture_persists_and_never_touches_its_pixels() {
         "D14: annotations are an overlay; the capture underneath is untouched"
     );
     assert_eq!(
-        store.record(&id).expect("read").expect("present").annotation_count,
+        store
+            .record(&id)
+            .expect("read")
+            .expect("present")
+            .annotation_count,
         1,
         "the index must reflect the edit without a reconcile"
     );
@@ -312,7 +314,10 @@ fn deleting_a_capture_removes_its_record_and_its_pixels() {
     let kept = store.insert(NewCapture::new(&b)).expect("insert");
 
     assert!(store.delete(&doomed).expect("delete"));
-    assert!(!store.delete(&doomed).expect("delete"), "deleting twice is not an error");
+    assert!(
+        !store.delete(&doomed).expect("delete"),
+        "deleting twice is not an error"
+    );
 
     assert!(store.record(&doomed).expect("read").is_none());
     assert!(store.record(&kept).expect("read").is_some());

@@ -264,8 +264,8 @@ impl StoredRecord {
 mod tests {
     use scrozz_annotate::{Annotation, Background, Beautification, Document, Style};
     use scrozz_core::{
-        Capture, ColorSpace, DisplayId, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
-        PixelFormat, ScaleFactor,
+        Capture, ColorSpace, DisplayId, Frame, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalSize, PixelFormat, ScaleFactor,
     };
 
     use super::*;
@@ -400,7 +400,11 @@ mod tests {
             "D23: evicting pixels must not touch the document"
         );
         assert!(
-            record.document_data().expect("document").beautification.is_some(),
+            record
+                .document_data()
+                .expect("document")
+                .beautification
+                .is_some(),
             "D23: eviction must not touch framing either"
         );
     }
@@ -427,8 +431,8 @@ mod tests {
                 "scale": 1.0
             }
         });
-        let record =
-            StoredRecord::from_json(&serde_json::to_vec(&minimal).expect("encode")).expect("decode");
+        let record = StoredRecord::from_json(&serde_json::to_vec(&minimal).expect("encode"))
+            .expect("decode");
         assert_eq!(record.annotation_count(), 0);
         assert_eq!(record.image_state(), ImageState::Absent);
         assert!(!record.pinned);

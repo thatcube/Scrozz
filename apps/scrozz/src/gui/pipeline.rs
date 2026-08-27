@@ -25,7 +25,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::mpsc::{Receiver, Sender, TryRecvError, channel},
+    sync::mpsc::{Receiver, Sender, channel},
     thread::JoinHandle,
     time::SystemTime,
 };
@@ -145,10 +145,7 @@ impl Pipeline {
 
     /// Takes one finished piece of work, if there is one. Never blocks.
     pub fn poll(&self) -> Option<Outcome> {
-        match self.outcomes.try_recv() {
-            Ok(outcome) => Some(outcome),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.outcomes.try_recv().ok()
     }
 
     /// Stops the worker and waits for it.

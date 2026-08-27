@@ -7,8 +7,8 @@
 //! display, where the factor is always 1.
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
-use scrozz_ocr::prepare::{prepare, upscale_factor, Rgba8Image};
 use scrozz_ocr::UpscalePolicy;
+use scrozz_ocr::prepare::{Rgba8Image, prepare, upscale_factor};
 
 /// Builds a frame whose rows are padded, because real capture buffers are.
 fn frame(
@@ -49,7 +49,12 @@ fn stride_padding_is_dropped() {
     assert_eq!(image.height, 3);
     assert_eq!(image.data.len(), 4 * 3 * 4);
     assert!(
-        image.data.as_chunks::<4>().0.iter().all(|p| *p == [10, 20, 30, 255]),
+        image
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [10, 20, 30, 255]),
         "padding bytes leaked into the image"
     );
 }
@@ -66,7 +71,14 @@ fn bgra_is_swizzled_to_rgba() {
 fn premultiplied_alpha_is_undone() {
     // Half-transparent white is stored as 128,128,128,128; straight alpha is
     // 255,255,255,128. Getting this wrong makes light-on-dark UI text mushy.
-    let f = frame(1, 1, PixelFormat::RgbaPremultiplied8, 1.0, 0, [128, 128, 128, 128]);
+    let f = frame(
+        1,
+        1,
+        PixelFormat::RgbaPremultiplied8,
+        1.0,
+        0,
+        [128, 128, 128, 128],
+    );
     let image = Rgba8Image::from_frame(&f).expect("well-formed frame");
     assert_eq!(image.data[3], 128);
     for channel in &image.data[..3] {
@@ -92,7 +104,10 @@ fn bgra_premultiplied_is_both_swizzled_and_unpremultiplied() {
         [64, 128, 192, 128],
     );
     let image = Rgba8Image::from_frame(&f).expect("well-formed frame");
-    assert_eq!(image.data[3], 128, "alpha must survive un-premultiplication");
+    assert_eq!(
+        image.data[3], 128,
+        "alpha must survive un-premultiplication"
+    );
     // Stored BGR 64,128,192 is RGB 192,128,64 premultiplied by 0.5, so straight
     // alpha doubles each back to 255 (clamped), 255, 128.
     assert_eq!(image.data[0], 255, "R: 192/0.5 clamps to 255");
@@ -127,7 +142,14 @@ fn fully_transparent_pixels_do_not_divide_by_zero() {
 
 #[test]
 fn opaque_premultiplied_pixels_are_untouched() {
-    let f = frame(1, 1, PixelFormat::RgbaPremultiplied8, 1.0, 0, [77, 88, 99, 255]);
+    let f = frame(
+        1,
+        1,
+        PixelFormat::RgbaPremultiplied8,
+        1.0,
+        0,
+        [77, 88, 99, 255],
+    );
     let image = Rgba8Image::from_frame(&f).expect("well-formed frame");
     assert_eq!(&image.data[..], &[77, 88, 99, 255]);
 }
@@ -137,21 +159,33 @@ fn a_short_buffer_is_rejected_rather_than_panicking() {
     let mut f = frame(4, 4, PixelFormat::Rgba8, 1.0, 0, [0, 0, 0, 255]);
     f.data.truncate(8);
     let err = Rgba8Image::from_frame(&f).expect_err("short buffer must be refused");
-    assert!(matches!(err, scrozz_core::Error::InvalidRequest(_)), "got {err:?}");
+    assert!(
+        matches!(err, scrozz_core::Error::InvalidRequest(_)),
+        "got {err:?}"
+    );
 }
 
 #[test]
 fn a_zero_sized_frame_is_rejected() {
     let f = frame(0, 0, PixelFormat::Rgba8, 1.0, 0, [0, 0, 0, 255]);
     let err = Rgba8Image::from_frame(&f).expect_err("empty frame must be refused");
-    assert!(matches!(err, scrozz_core::Error::InvalidRequest(_)), "got {err:?}");
+    assert!(
+        matches!(err, scrozz_core::Error::InvalidRequest(_)),
+        "got {err:?}"
+    );
 }
 
 /// A 1× capture is the case that matters. 2× effective resolution is the
 /// target, so the factor must be at least 2.
 #[test]
 fn one_x_captures_are_upscaled() {
-    let factor = upscale_factor(1200, 800, ScaleFactor::new(1.0), UpscalePolicy::Automatic, None);
+    let factor = upscale_factor(
+        1200,
+        800,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
     assert!(factor >= 2.0, "1x capture must be upscaled, got {factor}");
 }
 
@@ -159,7 +193,13 @@ fn one_x_captures_are_upscaled() {
 /// resampling artefacts for nothing.
 #[test]
 fn two_x_captures_are_left_alone() {
-    let factor = upscale_factor(2400, 1600, ScaleFactor::new(2.0), UpscalePolicy::Automatic, None);
+    let factor = upscale_factor(
+        2400,
+        1600,
+        ScaleFactor::new(2.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
     assert_eq!(factor, 1.0);
 }
 
@@ -167,16 +207,37 @@ fn two_x_captures_are_left_alone() {
 /// gives it, because absolute size matters to a recogniser, not just density.
 #[test]
 fn small_crops_get_extra_help() {
-    let by_scale = upscale_factor(2000, 1400, ScaleFactor::new(2.0), UpscalePolicy::Automatic, None);
-    let tiny = upscale_factor(200, 60, ScaleFactor::new(2.0), UpscalePolicy::Automatic, None);
+    let by_scale = upscale_factor(
+        2000,
+        1400,
+        ScaleFactor::new(2.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
+    let tiny = upscale_factor(
+        200,
+        60,
+        ScaleFactor::new(2.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
     assert_eq!(by_scale, 1.0);
-    assert!(tiny > 1.0, "a 200x60 crop needs upscaling even at 2x, got {tiny}");
+    assert!(
+        tiny > 1.0,
+        "a 200x60 crop needs upscaling even at 2x, got {tiny}"
+    );
 }
 
 #[test]
 fn the_factor_is_a_whole_number() {
     for (w, h, scale) in [(1200u32, 800u32, 1.0), (300, 120, 1.0), (640, 480, 1.5)] {
-        let factor = upscale_factor(w, h, ScaleFactor::new(scale), UpscalePolicy::Automatic, None);
+        let factor = upscale_factor(
+            w,
+            h,
+            ScaleFactor::new(scale),
+            UpscalePolicy::Automatic,
+            None,
+        );
         assert_eq!(
             factor.fract(),
             0.0,
@@ -187,12 +248,21 @@ fn the_factor_is_a_whole_number() {
 
 #[test]
 fn policy_off_disables_upscaling_entirely() {
-    assert_eq!(upscale_factor(100, 40, ScaleFactor::new(1.0), UpscalePolicy::Off, None), 1.0);
+    assert_eq!(
+        upscale_factor(100, 40, ScaleFactor::new(1.0), UpscalePolicy::Off, None),
+        1.0
+    );
 }
 
 #[test]
 fn a_fixed_policy_is_still_clamped() {
-    let factor = upscale_factor(100, 100, ScaleFactor::new(1.0), UpscalePolicy::Fixed(99), None);
+    let factor = upscale_factor(
+        100,
+        100,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Fixed(99),
+        None,
+    );
     assert!(
         (1.0..=4.0).contains(&factor),
         "an absurd fixed factor must be clamped, got {factor}"
@@ -201,7 +271,16 @@ fn a_fixed_policy_is_still_clamped() {
 
 #[test]
 fn fixed_one_means_no_resampling() {
-    assert_eq!(upscale_factor(100, 40, ScaleFactor::new(1.0), UpscalePolicy::Fixed(1), None), 1.0);
+    assert_eq!(
+        upscale_factor(
+            100,
+            40,
+            ScaleFactor::new(1.0),
+            UpscalePolicy::Fixed(1),
+            None
+        ),
+        1.0
+    );
 }
 
 /// A 6K display capture upscaled 2× would be 80 megapixels. The budget holds
@@ -209,14 +288,29 @@ fn fixed_one_means_no_resampling() {
 /// has, which would throw away real detail to satisfy a memory rule.
 #[test]
 fn huge_frames_are_not_upscaled_into_oblivion() {
-    let factor = upscale_factor(6016, 3384, ScaleFactor::new(1.0), UpscalePolicy::Automatic, None);
-    assert_eq!(factor, 1.0, "a 20MP capture must be passed through, not resampled");
+    let factor = upscale_factor(
+        6016,
+        3384,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
+    assert_eq!(
+        factor, 1.0,
+        "a 20MP capture must be passed through, not resampled"
+    );
 }
 
 #[test]
 fn the_budget_caps_enlargement_of_middling_frames() {
     // 3000x2000 = 6MP; 2x would be 24MP, over the 16MP budget.
-    let factor = upscale_factor(3000, 2000, ScaleFactor::new(1.0), UpscalePolicy::Automatic, None);
+    let factor = upscale_factor(
+        3000,
+        2000,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
     let pixels = 3000.0 * factor * 2000.0 * factor;
     assert!(factor >= 1.0, "the budget must never shrink, got {factor}");
     assert!(pixels <= 16_000_001.0, "{factor}x gives {pixels} pixels");
@@ -226,15 +320,33 @@ fn the_budget_caps_enlargement_of_middling_frames() {
 /// erroring, shrink — a downscaled read beats no read.
 #[test]
 fn a_max_dimension_can_push_the_factor_below_one() {
-    let factor = upscale_factor(4000, 2000, ScaleFactor::new(1.0), UpscalePolicy::Automatic, Some(1000));
+    let factor = upscale_factor(
+        4000,
+        2000,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Automatic,
+        Some(1000),
+    );
     assert!(factor < 1.0, "must shrink to fit 1000px, got {factor}");
     assert!(4000.0 * factor <= 1000.0);
 }
 
 #[test]
 fn a_generous_max_dimension_does_not_interfere() {
-    let unbounded = upscale_factor(1200, 800, ScaleFactor::new(1.0), UpscalePolicy::Automatic, None);
-    let bounded = upscale_factor(1200, 800, ScaleFactor::new(1.0), UpscalePolicy::Automatic, Some(100_000));
+    let unbounded = upscale_factor(
+        1200,
+        800,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Automatic,
+        None,
+    );
+    let bounded = upscale_factor(
+        1200,
+        800,
+        ScaleFactor::new(1.0),
+        UpscalePolicy::Automatic,
+        Some(100_000),
+    );
     assert_eq!(unbounded, bounded);
 }
 
@@ -256,7 +368,10 @@ fn preparing_a_one_x_frame_grows_it_by_the_reported_factor() {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let expected_w = (400.0 * prepared.upscale).round() as u32;
     assert_eq!(prepared.image.width, expected_w);
-    assert_eq!(prepared.image.data.len(), (prepared.image.width * prepared.image.height * 4) as usize);
+    assert_eq!(
+        prepared.image.data.len(),
+        (prepared.image.width * prepared.image.height * 4) as usize
+    );
 }
 
 /// Resampling a flat colour must give back that colour. Catmull-Rom overshoots
@@ -276,12 +391,20 @@ fn resampling_a_flat_colour_preserves_it() {
     let up = image.resample(192, 144);
     assert_eq!(up.width, 192);
     for pixel in up.data.as_chunks::<4>().0.iter() {
-        assert_eq!(*pixel, [173u8, 91, 42, 255], "flat colour drifted under upscale");
+        assert_eq!(
+            *pixel,
+            [173u8, 91, 42, 255],
+            "flat colour drifted under upscale"
+        );
     }
 
     let down = up.resample(32, 24);
     for pixel in down.data.as_chunks::<4>().0.iter() {
-        assert_eq!(*pixel, [173u8, 91, 42, 255], "flat colour drifted under downscale");
+        assert_eq!(
+            *pixel,
+            [173u8, 91, 42, 255],
+            "flat colour drifted under downscale"
+        );
     }
 }
 

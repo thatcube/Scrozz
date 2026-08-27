@@ -16,12 +16,12 @@
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_shell::drag::{
-    byte_source, card_rect_in_view, check_origin, sanitise_stem, DragFormat, DragOrigin,
-    DragOutcome, DragPayload, DragPreview, DragSession, NativeSurface, PromisedFile,
-    FALLBACK_STEM, MAX_FILE_NAME_BYTES,
+    DragFormat, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, FALLBACK_STEM,
+    MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source, card_rect_in_view, check_origin,
+    sanitise_stem,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Height of the view in every geometry fixture.
 ///
@@ -60,8 +60,14 @@ fn window_title_separators_do_not_become_directories() {
     // "Finder — /Users/brandon" would ask the drop target to write into a
     // directory that is not theirs to write into.
     let stem = sanitise_stem("Finder — /Users/brandon/Desktop");
-    assert!(!stem.contains('/'), "{stem} still contains a path separator");
-    assert!(!stem.contains('\\'), "{stem} still contains a path separator");
+    assert!(
+        !stem.contains('/'),
+        "{stem} still contains a path separator"
+    );
+    assert!(
+        !stem.contains('\\'),
+        "{stem} still contains a path separator"
+    );
     assert_eq!(stem, "Finder — Users brandon Desktop");
 }
 
@@ -126,7 +132,10 @@ fn nothing_usable_falls_back_rather_than_producing_an_empty_name() {
 fn unicode_survives_intact() {
     // Emoji and CJK are legal in filenames everywhere Scrozz runs. Mangling
     // them would be a bug, not a safety measure.
-    assert_eq!(sanitise_stem("スクリーンショット 📸"), "スクリーンショット 📸");
+    assert_eq!(
+        sanitise_stem("スクリーンショット 📸"),
+        "スクリーンショット 📸"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +165,10 @@ fn an_absurd_title_is_truncated_to_a_legal_length() {
         "{} bytes exceeds the {MAX_FILE_NAME_BYTES}-byte limit",
         name.len()
     );
-    assert!(name.ends_with(".png"), "extension was truncated away: {name}");
+    assert!(
+        name.ends_with(".png"),
+        "extension was truncated away: {name}"
+    );
 }
 
 #[test]
@@ -287,7 +299,10 @@ fn nothing_is_produced_until_the_receiver_asks() {
         "the payload encoded eagerly; the file would be written before the drop"
     );
 
-    let bytes = payload.file().produce().expect("promise should be keepable");
+    let bytes = payload
+        .file()
+        .produce()
+        .expect("promise should be keepable");
     assert_eq!(bytes, png_bytes());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -580,9 +595,9 @@ fn a_backend_reports_what_it_can_do_without_being_asked_to_do_it() {
 
 #[cfg(target_os = "macos")]
 mod appkit {
-    use super::{byte_source, png_bytes, DragPayload};
+    use super::{DragPayload, byte_source, png_bytes};
     use scrozz_core::Error;
-    use scrozz_shell::macos::drag::test_support::{view_can_begin_drags, PromiseHarness};
+    use scrozz_shell::macos::drag::test_support::{PromiseHarness, view_can_begin_drags};
 
     /// A scratch path inside cargo's own target directory.
     ///
@@ -606,8 +621,8 @@ mod appkit {
     #[test]
     #[ignore = "needs the main thread and a running AppKit"]
     fn the_promise_writes_the_promised_bytes_and_not_before() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);

@@ -79,7 +79,11 @@ pub(crate) fn from_ns_error(error: &NSError, context: &str) -> Error {
 /// Same, for the `Option<Retained<NSError>>` shape the bridge produces.
 pub(crate) fn from_optional_ns_error(error: Option<Retained<NSError>>, context: &str) -> Error {
     error.map_or_else(
-        || Error::Platform(format!("{context}: ScreenCaptureKit returned neither a result nor an error")),
+        || {
+            Error::Platform(format!(
+                "{context}: ScreenCaptureKit returned neither a result nor an error"
+            ))
+        },
         |error| from_ns_error(&error, context),
     )
 }

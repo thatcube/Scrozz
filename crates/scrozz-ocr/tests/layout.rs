@@ -5,12 +5,14 @@
 //! to test. A Linux CI runner with no recogniser at all still catches a
 //! regression here.
 
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, PhysicalPoint, PhysicalSize, ScaleFactor};
-use scrozz_ocr::layout::{
-    bottom_left_normalized_to_physical, group_lines, pixels_to_physical, plain_text,
-    sort_reading_order, union, NormalizedRect,
+use scrozz_core::{
+    LogicalPoint, LogicalRect, LogicalSize, PhysicalPoint, PhysicalSize, ScaleFactor,
 };
 use scrozz_ocr::TextBlock;
+use scrozz_ocr::layout::{
+    NormalizedRect, bottom_left_normalized_to_physical, group_lines, pixels_to_physical,
+    plain_text, sort_reading_order, union,
+};
 
 fn image(width: f64, height: f64) -> PhysicalSize {
     PhysicalSize::new(width, height)
@@ -112,15 +114,24 @@ fn pixel_rects_are_divided_by_the_upscale_factor() {
 fn pixel_rects_survive_a_nonsense_upscale_factor() {
     for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         let rect = pixels_to_physical(10.0, 10.0, 5.0, 5.0, factor, image(100.0, 100.0));
-        assert_eq!(rect.origin.x, 10.0, "factor {factor} should fall back to 1.0");
+        assert_eq!(
+            rect.origin.x, 10.0,
+            "factor {factor} should fall back to 1.0"
+        );
         assert_eq!(rect.size.width, 5.0);
     }
 }
 
 #[test]
 fn union_grows_to_cover_both_and_ignores_empties() {
-    let a = scrozz_core::PhysicalRect::new(PhysicalPoint::new(10.0, 10.0), PhysicalSize::new(20.0, 5.0));
-    let b = scrozz_core::PhysicalRect::new(PhysicalPoint::new(40.0, 8.0), PhysicalSize::new(10.0, 10.0));
+    let a = scrozz_core::PhysicalRect::new(
+        PhysicalPoint::new(10.0, 10.0),
+        PhysicalSize::new(20.0, 5.0),
+    );
+    let b = scrozz_core::PhysicalRect::new(
+        PhysicalPoint::new(40.0, 8.0),
+        PhysicalSize::new(10.0, 10.0),
+    );
     let u = union(a, b);
     assert_eq!(u.origin.x, 10.0);
     assert_eq!(u.origin.y, 8.0);
@@ -183,7 +194,11 @@ fn mixed_heights_on_one_row_still_group() {
         block("NEW", 120.0, 18.0, 30.0, 10.0),
     ];
     let lines = group_lines(blocks);
-    assert_eq!(lines.len(), 1, "a small badge sits on the same line as a heading");
+    assert_eq!(
+        lines.len(),
+        1,
+        "a small badge sits on the same line as a heading"
+    );
 }
 
 #[test]
@@ -199,7 +214,10 @@ fn adjacent_rows_do_not_merge() {
 
 #[test]
 fn empty_blocks_are_dropped() {
-    let blocks = vec![block("", 0.0, 0.0, 10.0, 10.0), block("kept", 0.0, 0.0, 10.0, 10.0)];
+    let blocks = vec![
+        block("", 0.0, 0.0, 10.0, 10.0),
+        block("kept", 0.0, 0.0, 10.0, 10.0),
+    ];
     let lines = group_lines(blocks);
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].len(), 1);

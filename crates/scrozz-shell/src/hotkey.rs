@@ -157,13 +157,29 @@ impl fmt::Display for Accelerator {
             write!(f, "Ctrl+")?;
         }
         if self.mods.contains(Modifiers::ALT) {
-            write!(f, "{}+", if cfg!(target_os = "macos") { "Opt" } else { "Alt" })?;
+            write!(
+                f,
+                "{}+",
+                if cfg!(target_os = "macos") {
+                    "Opt"
+                } else {
+                    "Alt"
+                }
+            )?;
         }
         if self.mods.contains(Modifiers::SHIFT) {
             write!(f, "Shift+")?;
         }
         if self.mods.contains(Modifiers::SUPER) {
-            write!(f, "{}+", if cfg!(target_os = "macos") { "Cmd" } else { "Win" })?;
+            write!(
+                f,
+                "{}+",
+                if cfg!(target_os = "macos") {
+                    "Cmd"
+                } else {
+                    "Win"
+                }
+            )?;
         }
         write!(f, "{}", display_for(self.code))
     }
@@ -180,8 +196,8 @@ fn parse_modifier(token: &str) -> Option<Modifiers> {
     match token.to_ascii_uppercase().as_str() {
         // Interchangeable spellings of the primary modifier. `Cmd` maps to
         // Control off macOS, which is what a cross-platform default means.
-        "CMD" | "COMMAND" | "SUPER" | "META" | "CMDORCTRL" | "CMDORCONTROL"
-        | "COMMANDORCTRL" | "COMMANDORCONTROL" => Some(PRIMARY),
+        "CMD" | "COMMAND" | "SUPER" | "META" | "CMDORCTRL" | "CMDORCONTROL" | "COMMANDORCTRL"
+        | "COMMANDORCONTROL" => Some(PRIMARY),
         "CTRL" | "CONTROL" => Some(Modifiers::CONTROL),
         "ALT" | "OPT" | "OPTION" => Some(Modifiers::ALT),
         "SHIFT" => Some(Modifiers::SHIFT),
@@ -296,7 +312,10 @@ fn parse_code(token: &str) -> Option<Code> {
 fn display_for(code: Code) -> String {
     KEYS.iter()
         .find(|(candidate, _, _)| *candidate == code)
-        .map_or_else(|| format!("{code}"), |(_, display, _)| (*display).to_owned())
+        .map_or_else(
+            || format!("{code}"),
+            |(_, display, _)| (*display).to_owned(),
+        )
 }
 
 fn keysym_for(code: Code) -> Option<&'static str> {
@@ -425,8 +444,7 @@ pub const fn reserved_shortcuts() -> &'static [ReservedShortcut] {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        const SETTINGS: &str =
-            "your desktop's keyboard settings, or pick another combination";
+        const SETTINGS: &str = "your desktop's keyboard settings, or pick another combination";
         &[
             ReservedShortcut {
                 accelerator: "PrintScreen",
@@ -640,10 +658,7 @@ impl Compositor {
                     parts.push("Mod");
                 }
                 parts.push(key);
-                format!(
-                    "{} {{ spawn-sh \"{command}\"; }}",
-                    parts.join("+")
-                )
+                format!("{} {{ spawn-sh \"{command}\"; }}", parts.join("+"))
             }
             Self::Wayfire | Self::Gnome | Self::Kde | Self::Other => return None,
         };
@@ -769,7 +784,10 @@ impl Session {
                 },
             )
         } else if let Some(line) = self.compositor.binding_for(accelerator, command) {
-            let path = self.compositor.config_path().unwrap_or("your compositor config");
+            let path = self
+                .compositor
+                .config_path()
+                .unwrap_or("your compositor config");
             format!(
                 "wlroots compositors implement no global shortcut portal, so no application \
                  can register a system-wide hotkey. Bind it in the compositor instead — add \
@@ -945,9 +963,11 @@ impl GlobalHotkeys {
                 action: existing.action.clone(),
             });
         }
-        accelerator.system_owner().map(|reserved| Conflict::SystemReserved {
-            reserved: *reserved,
-        })
+        accelerator
+            .system_owner()
+            .map(|reserved| Conflict::SystemReserved {
+                reserved: *reserved,
+            })
     }
 
     /// The action bound to a combination, if any.
@@ -1110,9 +1130,9 @@ impl HotkeyManager for GlobalHotkeys {
         self.by_id.remove(&accelerator.id());
 
         if let Backend::Os(manager) = &self.backend {
-            manager
-                .unregister(accelerator.to_hotkey())
-                .map_err(|err| Error::Platform(format!("could not release {accelerator}: {err}")))?;
+            manager.unregister(accelerator.to_hotkey()).map_err(|err| {
+                Error::Platform(format!("could not release {accelerator}: {err}"))
+            })?;
         }
         Ok(())
     }

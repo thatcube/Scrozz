@@ -2037,10 +2037,8 @@ impl Scene for PlaceholderScene {
         // and an unreadable one — and an overlapping label is exactly the class
         // of defect a golden corpus exists to make visible.
         let header_h = 46.0_f32;
-        let frame = egui::Rect::from_min_max(
-            egui::pos2(full.left(), full.top() + header_h),
-            full.max,
-        );
+        let frame =
+            egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + header_h), full.max);
 
         // --- D28 geometry ---------------------------------------------------
         // Bottom-anchored, growing upward. Slot 0 is at the bottom. Nothing here

@@ -228,7 +228,9 @@ impl ScrozzDragPromise {
         image_bytes: Option<ByteSource>,
     ) -> Retained<Self> {
         let queue = NSOperationQueue::new();
-        queue.setName(Some(&NSString::from_str("com.thatcube.scrozz.drag.promise")));
+        queue.setName(Some(&NSString::from_str(
+            "com.thatcube.scrozz.drag.promise",
+        )));
         queue.setMaxConcurrentOperationCount(1);
 
         let this = Self::alloc().set_ivars(PromiseState {

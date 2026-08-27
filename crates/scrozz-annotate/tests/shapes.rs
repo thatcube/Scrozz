@@ -3,9 +3,7 @@
 mod common;
 
 use common::{capture_with, flat, near, pixel, rect};
-use scrozz_annotate::{
-    font, Annotation, Color, Document, Renderer, SkiaRenderer, Style,
-};
+use scrozz_annotate::{Annotation, Color, Document, Renderer, SkiaRenderer, Style, font};
 use scrozz_core::{Frame, LogicalPoint, Provenance, ScaleFactor};
 
 /// A white canvas to draw black ink onto.
@@ -113,10 +111,7 @@ fn an_arrow_points_at_its_destination() {
     let (l, t, r, b) = ink_bounds(&out).expect("something was drawn");
 
     assert!(l <= 12 && t <= 12, "the tail starts near (10,10): {l},{t}");
-    assert!(
-        r >= 78 && b >= 78,
-        "the head reaches (80,80): {r},{b}"
-    );
+    assert!(r >= 78 && b >= 78, "the head reaches (80,80): {r},{b}");
 }
 
 #[test]
@@ -142,7 +137,10 @@ fn a_rectangle_can_be_stroked_filled_or_both() {
         ink(Style::stroked().with_stroke_width(2.0)),
     );
     let stroked = SkiaRenderer::new().render(&doc).unwrap();
-    assert!(near(pixel(&stroked, 40, 40), [255, 255, 255, 255], 2), "hollow");
+    assert!(
+        near(pixel(&stroked, 40, 40), [255, 255, 255, 255], 2),
+        "hollow"
+    );
     assert!(pixel(&stroked, 40, 20)[0] < 128, "the top edge is drawn");
 
     let mut doc = white(80, 80);
@@ -154,7 +152,10 @@ fn a_rectangle_can_be_stroked_filled_or_both() {
     );
     let filled = SkiaRenderer::new().render(&doc).unwrap();
     assert!(near(pixel(&filled, 40, 40), [0, 200, 0, 255], 2), "filled");
-    assert!(pixel(&filled, 40, 20)[1] < 200, "still stroked on top of the fill");
+    assert!(
+        pixel(&filled, 40, 20)[1] < 200,
+        "still stroked on top of the fill"
+    );
 }
 
 #[test]
@@ -190,7 +191,10 @@ fn freehand_is_smoothed_rather_than_drawn_as_raw_segments() {
     ];
 
     let mut doc = white(100, 100);
-    doc.add(Annotation::Freehand(points.clone()), ink(Style::stroked().with_stroke_width(2.0)));
+    doc.add(
+        Annotation::Freehand(points.clone()),
+        ink(Style::stroked().with_stroke_width(2.0)),
+    );
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
     // The corner is rounded away rather than drawn as a spike.
@@ -225,7 +229,10 @@ fn freehand_is_smoothed_rather_than_drawn_as_raw_segments() {
         let (x, y) = (p.x as u32, p.y as u32);
         let hit = (x.saturating_sub(2)..=x + 2)
             .any(|px| (y.saturating_sub(2)..=y + 2).any(|py| pixel(&out, px, py)[0] < 200));
-        assert!(hit, "the stroke must start and end on its captured point ({x},{y})");
+        assert!(
+            hit,
+            "the stroke must start and end on its captured point ({x},{y})"
+        );
     }
 }
 
@@ -277,7 +284,10 @@ fn text_draws_visible_glyphs() {
         ink(Style::stroked().with_font_size(24.0)),
     );
     let out = SkiaRenderer::new().render(&doc).unwrap();
-    assert!(ink_count(&out) > 50, "the label should actually be legible ink");
+    assert!(
+        ink_count(&out) > 50,
+        "the label should actually be legible ink"
+    );
 
     let (l, t, r, b) = ink_bounds(&out).unwrap();
     assert!(l >= 9, "the text starts at its anchor, not before it");
@@ -374,7 +384,10 @@ fn a_counter_draws_a_disc_with_a_legible_numeral() {
 
     // The disc is red.
     let edge = pixel(&out, 50, 34);
-    assert!(edge[0] > 150 && edge[1] < 90, "expected the disc, got {edge:?}");
+    assert!(
+        edge[0] > 150 && edge[1] < 90,
+        "expected the disc, got {edge:?}"
+    );
     // The numeral is drawn in a contrasting ink. Against a dark red disc that
     // resolves to white, so the centre of the marker is brighter than the disc
     // rather than darker.
@@ -406,7 +419,10 @@ fn counter_discs_scale_with_font_size() {
     };
     let small = extent(12.0);
     let large = extent(24.0);
-    assert!(large >= small * 2 - 3 && large <= small * 2 + 3, "{small} -> {large}");
+    assert!(
+        large >= small * 2 - 3 && large <= small * 2 + 3,
+        "{small} -> {large}"
+    );
 }
 
 #[test]
@@ -459,7 +475,9 @@ fn counters_render_double_digit_numbers() {
                 .with_font_size(14.0),
         );
     }
-    let out = SkiaRenderer::new().render(&doc).expect("twelve markers is not unusual");
+    let out = SkiaRenderer::new()
+        .render(&doc)
+        .expect("twelve markers is not unusual");
     assert!(ink_count(&out) > 100);
 }
 
@@ -476,7 +494,10 @@ fn opacity_lightens_without_removing() {
     );
     let out = SkiaRenderer::new().render(&doc).unwrap();
     let p = pixel(&out, 30, 30);
-    assert!(p[0] > 100 && p[0] < 160, "half-opacity black on white is mid grey: {p:?}");
+    assert!(
+        p[0] > 100 && p[0] < 160,
+        "half-opacity black on white is mid grey: {p:?}"
+    );
 }
 
 #[test]

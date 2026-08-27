@@ -107,7 +107,9 @@ pub fn every_annotation() -> Vec<(Annotation, Style)> {
                 from: LogicalPoint::new(4.5, 6.25),
                 to: LogicalPoint::new(88.0, 51.5),
             },
-            Style::stroked().with_stroke(Color::ACCENT).with_stroke_width(3.5),
+            Style::stroked()
+                .with_stroke(Color::ACCENT)
+                .with_stroke_width(3.5),
         ),
         (
             Annotation::Rectangle(rect(10.0, 12.0, 40.0, 22.0)),

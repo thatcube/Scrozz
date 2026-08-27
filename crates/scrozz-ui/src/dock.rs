@@ -129,10 +129,7 @@ impl Dock {
     /// the animation finishes.
     #[must_use]
     pub fn is_stowing(&self) -> bool {
-        matches!(
-            self.phase,
-            DockPhase::Collapsed | DockPhase::Collapsing(_)
-        )
+        matches!(self.phase, DockPhase::Collapsed | DockPhase::Collapsing(_))
     }
 
     /// Whether the collapse has finished.

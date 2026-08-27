@@ -34,4 +34,3 @@ pub(crate) fn main_thread(what: &str) -> Result<MainThreadMarker> {
         ))
     })
 }
-

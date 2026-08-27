@@ -129,9 +129,8 @@ impl X11Backend {
     ///
     /// Returns [`Error::Platform`] if no server is reachable.
     pub fn connect() -> Result<Self> {
-        let (conn, screen_index) = x11rb::connect(None).map_err(|err| {
-            Error::Platform(format!("could not connect to the X server: {err}"))
-        })?;
+        let (conn, screen_index) = x11rb::connect(None)
+            .map_err(|err| Error::Platform(format!("could not connect to the X server: {err}")))?;
 
         let setup = conn.setup();
         let screen = setup
@@ -276,7 +275,11 @@ impl X11Backend {
     /// The desktop-wide work area, already narrowed to the current desktop.
     fn desktop_work_area(&self) -> Option<PixelRect> {
         let desktop = self
-            .property(self.root, self.atoms.net_current_desktop, u32::from(AtomEnum::CARDINAL))
+            .property(
+                self.root,
+                self.atoms.net_current_desktop,
+                u32::from(AtomEnum::CARDINAL),
+            )
             .and_then(|(_, bytes)| ewmh::parse_u32_list(&bytes).first().copied())
             .unwrap_or(0);
 
@@ -294,12 +297,17 @@ impl X11Backend {
             .monitors()?
             .into_iter()
             .enumerate()
-            .map(|(index, (name, rect, primary))| (DisplayId(display_id(index, &name)), rect, primary))
+            .map(|(index, (name, rect, primary))| {
+                (DisplayId(display_id(index, &name)), rect, primary)
+            })
             .collect())
     }
 
     fn window_bounds(&self, window: u32, include_frame: bool) -> Option<PixelRect> {
-        let geometry = xproto::get_geometry(&self.conn, window).ok()?.reply().ok()?;
+        let geometry = xproto::get_geometry(&self.conn, window)
+            .ok()?
+            .reply()
+            .ok()?;
 
         // `GetGeometry` is parent-relative and the parent is usually the window
         // manager's frame, so the raw x/y is an offset inside the decoration,
@@ -659,9 +667,7 @@ impl CaptureBackend for X11Backend {
                 );
                 let region = layout::region_to_pixels(*rect, self.scale.get(), root_rect)
                     .ok_or_else(|| {
-                        Error::InvalidRequest(
-                            "the selected region lies entirely off-screen".into(),
-                        )
+                        Error::InvalidRequest("the selected region lies entirely off-screen".into())
                     })?;
                 self.grab(self.root, region, self.scale)?
             }

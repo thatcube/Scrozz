@@ -135,7 +135,11 @@ pub fn work_area_for(monitor: PixelRect, desktop_work_area: Option<PixelRect>) -
 /// the dead space of an L-shaped multi-monitor arrangement still yields an
 /// answer rather than an error.
 #[must_use]
-pub fn display_containing(x: i32, y: i32, displays: &[(DisplayId, PixelRect, bool)]) -> Option<DisplayId> {
+pub fn display_containing(
+    x: i32,
+    y: i32,
+    displays: &[(DisplayId, PixelRect, bool)],
+) -> Option<DisplayId> {
     displays
         .iter()
         .find(|(_, rect, _)| rect.contains(x, y))
@@ -204,11 +208,7 @@ pub fn bounding_box(rects: &[PixelRect]) -> Option<PixelRect> {
 /// `BadMatch` and a region dragged one pixel past the screen edge is an entirely
 /// ordinary thing for a user to do.
 #[must_use]
-pub fn region_to_pixels(
-    region: LogicalRect,
-    scale: f64,
-    root: PixelRect,
-) -> Option<PixelRect> {
+pub fn region_to_pixels(region: LogicalRect, scale: f64, root: PixelRect) -> Option<PixelRect> {
     let left = (region.origin.x * scale).floor();
     let top = (region.origin.y * scale).floor();
     let right = ((region.origin.x + region.size.width) * scale).ceil();

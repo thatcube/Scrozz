@@ -154,7 +154,8 @@ fn capture_window(
 
     // SAFETY: the desktop-independent-window initialiser, which captures the
     // window alone regardless of what overlaps it.
-    let filter = unsafe { SCContentFilter::initWithDesktopIndependentWindow(sck::alloc_filter(), &target) };
+    let filter =
+        unsafe { SCContentFilter::initWithDesktopIndependentWindow(sck::alloc_filter(), &target) };
 
     let config = configure(&filter, request, scale, None)?;
     let image = sck::capture_image(&filter, &config)?;
@@ -405,10 +406,7 @@ mod tests {
     use scrozz_core::{DisplayId, LogicalPoint, LogicalSize};
 
     fn display_at(id: &str, x: f64, width: f64, scale: f64) -> Display {
-        let bounds = LogicalRect::new(
-            LogicalPoint::new(x, 0.0),
-            LogicalSize::new(width, 1000.0),
-        );
+        let bounds = LogicalRect::new(LogicalPoint::new(x, 0.0), LogicalSize::new(width, 1000.0));
         Display {
             id: DisplayId(id.to_owned()),
             name: id.to_owned(),

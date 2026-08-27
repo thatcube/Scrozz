@@ -298,9 +298,5 @@ pub fn detect_compositor(env: &SessionEnv) -> Compositor {
 /// question worth answering about any Linux capture defect.
 #[must_use]
 pub fn describe(env: &SessionEnv) -> String {
-    format!(
-        "{} on {}",
-        detect_session(env),
-        detect_compositor(env)
-    )
+    format!("{} on {}", detect_session(env), detect_compositor(env))
 }

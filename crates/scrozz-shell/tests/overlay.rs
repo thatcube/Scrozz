@@ -9,13 +9,13 @@
 //! the main thread (see [`appkit`]). It never orders a window front and closes
 //! everything it makes.
 
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+use scrozz_shell::Capability;
 use scrozz_shell::overlay::{
-    anchor_bottom_left, appkit_to_logical, logical_to_appkit, AppKitRect, OverlayBehavior,
-    OverlayLevel, StackLayout,
+    AppKitRect, OverlayBehavior, OverlayLevel, StackLayout, anchor_bottom_left, appkit_to_logical,
+    logical_to_appkit,
 };
 use scrozz_shell::permissions::settings_pane_url;
-use scrozz_shell::Capability;
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 
 /// Height of the primary display in every fixture below.
 ///
@@ -121,7 +121,10 @@ fn the_stack_grows_upward() {
             "slot {slot} is not above slot {}",
             slot - 1
         );
-        assert_eq!(current.origin.x, previous.origin.x, "slots must stay aligned");
+        assert_eq!(
+            current.origin.x, previous.origin.x,
+            "slots must stay aligned"
+        );
         previous = current;
     }
 }
@@ -174,7 +177,10 @@ fn capacity_clamps_on_a_short_display() {
         "capacity {capacity} outside 1..={}",
         layout.max_slots
     );
-    assert!(capacity < layout.max_slots, "a 660pt work area cannot hold six 150pt cards");
+    assert!(
+        capacity < layout.max_slots,
+        "a 660pt work area cannot hold six 150pt cards"
+    );
 }
 
 #[test]
@@ -276,8 +282,14 @@ fn a_capture_card_floats_without_taking_focus() {
     );
     assert!(card.join_all_spaces, "a card must survive a Space switch");
     assert!(card.over_fullscreen);
-    assert!(!card.movable, "D27: transient surfaces are not user-movable");
-    assert!(!card.hides_on_deactivate, "the card outlives Scrozz losing focus");
+    assert!(
+        !card.movable,
+        "D27: transient surfaces are not user-movable"
+    );
+    assert!(
+        !card.hides_on_deactivate,
+        "the card outlives Scrozz losing focus"
+    );
 }
 
 #[test]
@@ -337,7 +349,6 @@ fn settings_urls_are_distinct() {
     assert_ne!(microphone, accessibility);
     assert_ne!(screen, accessibility);
 }
-
 
 // ---------------------------------------------------------------------------
 // Off-main-thread safety
@@ -463,7 +474,10 @@ mod permission_queries {
             AuthorizationStatus::from_raw(1),
             AuthorizationStatus::Restricted
         );
-        assert_eq!(AuthorizationStatus::from_raw(2), AuthorizationStatus::Denied);
+        assert_eq!(
+            AuthorizationStatus::from_raw(2),
+            AuthorizationStatus::Denied
+        );
         assert_eq!(
             AuthorizationStatus::from_raw(3),
             AuthorizationStatus::Authorized

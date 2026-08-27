@@ -64,7 +64,11 @@ fn assert_history_intact(store: &mut SqliteStore, ids: &[CaptureId]) {
         assert!(store.image(id).expect("read").is_some());
     }
     assert!(
-        store.record(&ids[0]).expect("read").expect("present").pinned,
+        store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .pinned,
         "a pin is part of the history, not part of the cache"
     );
 
@@ -148,12 +152,7 @@ fn the_corrupt_file_is_quarantined_rather_than_silently_destroyed() {
     let quarantined: Vec<_> = fs::read_dir(dir.path())
         .expect("read root")
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .contains(".corrupt-")
-        })
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
         .collect();
     assert_eq!(
         quarantined.len(),
@@ -176,8 +175,15 @@ fn reconciling_a_healthy_store_reports_a_clean_bill_of_health() {
 
     assert_eq!(report.records_recovered, ids.len());
     assert_eq!(report.records_unreadable, 0);
-    assert_eq!(report.rows_dropped, 0, "nothing was stale, so nothing was dropped");
-    assert_eq!(report.blobs_found, ids.len(), "one blob per distinct capture");
+    assert_eq!(
+        report.rows_dropped, 0,
+        "nothing was stale, so nothing was dropped"
+    );
+    assert_eq!(
+        report.blobs_found,
+        ids.len(),
+        "one blob per distinct capture"
+    );
     assert!(report.bytes_found > 0);
     assert_eq!(report.images_missing, 0);
     assert!(
@@ -284,13 +290,23 @@ fn a_missing_blob_downgrades_that_capture_and_leaves_everything_else_alone() {
     assert_eq!(record.annotation_count, 1, "its edits are untouched");
     assert_eq!(store.count().expect("count"), 3_u64);
     for id in [&ids[0], &ids[2]] {
-        assert!(store.image(id).expect("read").is_some(), "neighbours are fine");
+        assert!(
+            store.image(id).expect("read").is_some(),
+            "neighbours are fine"
+        );
     }
 
     // And the downgrade is durable, not just a per-read fudge.
     drop(store);
     let store = SqliteStore::open(dir.path()).expect("reopen");
-    assert!(!store.record(&ids[1]).expect("read").expect("present").image.is_present());
+    assert!(
+        !store
+            .record(&ids[1])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
 }
 
 #[test]

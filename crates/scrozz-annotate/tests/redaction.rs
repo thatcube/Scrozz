@@ -8,9 +8,7 @@
 mod common;
 
 use common::{capture_with, checkerboard, flat, near, pixel, rect};
-use scrozz_annotate::{
-    Annotation, Color, Document, RedactStyle, Renderer, SkiaRenderer, Style,
-};
+use scrozz_annotate::{Annotation, Color, Document, RedactStyle, Renderer, SkiaRenderer, Style};
 use scrozz_core::{Frame, Provenance, ScaleFactor};
 
 /// A document whose source is a black/white checkerboard.
@@ -104,7 +102,15 @@ fn blur_is_correct_at_the_edges_of_the_image() {
     );
     let out = SkiaRenderer::new().render(&doc).unwrap();
 
-    for (x, y) in [(0, 0), (59, 0), (0, 59), (59, 59), (30, 0), (0, 30), (30, 30)] {
+    for (x, y) in [
+        (0, 0),
+        (59, 0),
+        (0, 59),
+        (59, 59),
+        (30, 0),
+        (0, 30),
+        (30, 30),
+    ] {
         let p = pixel(&out, x, y);
         assert!(
             near(p, [128, 64, 192, 255], 2),
@@ -172,7 +178,10 @@ fn solid_defaults_to_opaque_even_if_the_style_is_transparent() {
     let out = SkiaRenderer::new().render(&doc).unwrap();
     for p in interior(&out, 10, 10, 50, 50) {
         assert_eq!(p[3], 255, "the redaction left transparent pixels: {p:?}");
-        assert!(p[0] < 40 && p[1] < 40 && p[2] < 40, "expected opaque black, got {p:?}");
+        assert!(
+            p[0] < 40 && p[1] < 40 && p[2] < 40,
+            "expected opaque black, got {p:?}"
+        );
     }
 }
 
@@ -324,7 +333,11 @@ fn redaction_survives_a_downscaled_export() {
     let out = SkiaRenderer::new().render_to_width(&doc, 100).unwrap();
     // 100..300 of 400 becomes 25..75 of 100.
     for p in interior(&out, 25, 25, 75, 75) {
-        assert_eq!(p, [0, 0, 0, 255], "the checkerboard reappeared after downscaling");
+        assert_eq!(
+            p,
+            [0, 0, 0, 255],
+            "the checkerboard reappeared after downscaling"
+        );
     }
 }
 

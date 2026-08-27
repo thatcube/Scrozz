@@ -507,7 +507,7 @@ mod tests {
     fn asking_for_headless_gets_headless_even_though_a_window_is_possible() {
         // The escape hatch every automated run depends on. If this ever stops
         // working, the test suite starts opening windows on someone's desk.
-        assert_eq!(Box::new(Headless).describe(), "headless");
+        assert_eq!(Headless.describe(), "headless");
     }
 
     #[test]

@@ -89,13 +89,20 @@ fn an_old_database_climbs_forward_with_every_row_intact() {
     assert_eq!(store.count().expect("count"), 4, "no history was lost");
     for (i, id) in ids.iter().enumerate() {
         let record = store.record(id).expect("read").expect("present");
-        assert_eq!(record.window_title.as_deref(), Some(&*format!("window {i}")));
+        assert_eq!(
+            record.window_title.as_deref(),
+            Some(&*format!("window {i}"))
+        );
         assert_eq!(record.app_name.as_deref(), Some("Xcode"));
         assert_eq!(record.annotation_count, 1);
         assert!(record.image.is_present());
     }
     assert!(
-        store.record(&ids[0]).expect("read").expect("present").pinned,
+        store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .pinned,
         "a pin set by the old build survives the upgrade"
     );
 }

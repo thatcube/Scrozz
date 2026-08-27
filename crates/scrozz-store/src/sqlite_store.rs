@@ -9,8 +9,7 @@ use scrozz_annotate::{AnnotationObject, Document, DocumentData};
 use scrozz_core::{Capture, Error, Frame, Result};
 
 use crate::{
-    CaptureId, RetentionPolicy, Store,
-    db, hash,
+    CaptureId, RetentionPolicy, Store, db, hash,
     id::capture_id_at,
     layout::StoreLayout,
     model::{
@@ -695,11 +694,7 @@ impl History for SqliteStore {
         tx.execute(
             "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (hash) DO UPDATE SET byte_len = excluded.byte_len",
-            params![
-                digest,
-                i64::try_from(byte_len).unwrap_or(i64::MAX),
-                now.0
-            ],
+            params![digest, i64::try_from(byte_len).unwrap_or(i64::MAX), now.0],
         )
         .map_err(store_err("cannot record blob"))?;
 
@@ -1144,10 +1139,7 @@ fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
 
     let like = |sql: &mut String, column: &str, needle: &str, args: &mut Vec<Box<dyn ToSql>>| {
         args.push(Box::new(like_pattern(needle)));
-        sql.push_str(&format!(
-            " AND {column} LIKE ?{} ESCAPE '\\'",
-            args.len()
-        ));
+        sql.push_str(&format!(" AND {column} LIKE ?{} ESCAPE '\\'", args.len()));
     };
 
     if let Some(text) = &query.text {

@@ -33,11 +33,11 @@
 use std::time::{Duration, Instant};
 
 use scrozz_core::{Error, Frame, Result};
-use windows::core::HSTRING;
 use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
+use windows::core::HSTRING;
 
 use crate::layout;
 use crate::prepare::{self, Prepared, Rgba8Image};

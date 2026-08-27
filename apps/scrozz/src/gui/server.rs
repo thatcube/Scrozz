@@ -510,7 +510,10 @@ mod tests {
         // this is a stable failure that does not touch the screen.
         let (command, response) = run(&argv(&["list", "displays"]), None);
         assert!(matches!(command, Some(Command::List(_))));
-        assert_ne!(response.code, 0, "a guarded backend must not report success");
+        assert_ne!(
+            response.code, 0,
+            "a guarded backend must not report success"
+        );
     }
 
     #[test]
@@ -531,7 +534,10 @@ mod tests {
         assert_eq!(response.stream, StreamKind::Text);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.contains("Would capture"), "{body}");
-        assert!(!body.ends_with('\n'), "the trailing newline is the wire's job");
+        assert!(
+            !body.ends_with('\n'),
+            "the trailing newline is the wire's job"
+        );
     }
 
     #[test]
@@ -589,7 +595,10 @@ mod tests {
         let path = dir.join("drop.sock");
         {
             let server = Server::bind_at(path.clone()).expect("binding a fresh path");
-            assert!(server.path().exists(), "the socket should exist while bound");
+            assert!(
+                server.path().exists(),
+                "the socket should exist while bound"
+            );
         }
         assert!(!path.exists(), "the socket should be gone after the drop");
         let _ = std::fs::remove_dir_all(&dir);

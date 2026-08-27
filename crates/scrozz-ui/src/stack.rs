@@ -894,7 +894,11 @@ impl CaptureStack {
         self.cards.push(Card {
             id,
             born_slot: slot,
-            entry: Some(Timeline::starting(m, self.timing.enter, self.timing.enter_ease)),
+            entry: Some(Timeline::starting(
+                m,
+                self.timing.enter,
+                self.timing.enter_ease,
+            )),
             fall: None,
             ret: None,
             drag: None,
@@ -1225,7 +1229,9 @@ impl CaptureStack {
     /// Where a resident card is, chrome aside.
     fn rect_of_resident(&self, slot: usize, m: &Motion) -> Rect {
         let card = &self.cards[slot];
-        let mut rect = self.layout.slot_rect_f(fractional_slot(card, slot, m, &self.layout));
+        let mut rect = self
+            .layout
+            .slot_rect_f(fractional_slot(card, slot, m, &self.layout));
 
         // Horizontal entry. Vertical position is untouched by design: entry
         // never carries a card upward.

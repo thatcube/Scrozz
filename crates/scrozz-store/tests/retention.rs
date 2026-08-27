@@ -52,7 +52,14 @@ fn a_history_under_the_cap_is_left_completely_alone() {
     assert!(!report.evicted_anything());
     assert_eq!(report.bytes_remaining, 5 * IMAGE_BYTES);
     for id in &ids {
-        assert!(store.record(id).expect("read").expect("present").image.is_present());
+        assert!(
+            store
+                .record(id)
+                .expect("read")
+                .expect("present")
+                .image
+                .is_present()
+        );
     }
 }
 
@@ -80,10 +87,24 @@ fn eviction_removes_the_oldest_first_and_stops_at_the_cap() {
         "the cap has to be respected in reality, not just in the report"
     );
     for id in &ids[..4] {
-        assert!(!store.record(id).expect("read").expect("present").image.is_present());
+        assert!(
+            !store
+                .record(id)
+                .expect("read")
+                .expect("present")
+                .image
+                .is_present()
+        );
     }
     for id in &ids[4..] {
-        assert!(store.record(id).expect("read").expect("present").image.is_present());
+        assert!(
+            store
+                .record(id)
+                .expect("read")
+                .expect("present")
+                .image
+                .is_present()
+        );
     }
 }
 
@@ -133,7 +154,10 @@ fn an_evicted_capture_still_lists_with_its_edits_intact() {
     assert_eq!(record.app_name.as_deref(), Some("Mail"));
     assert_eq!(record.window_title.as_deref(), Some("Contract"));
     assert_eq!(record.ocr_text.as_deref(), Some("Signature required"));
-    assert_eq!(record.annotation_count, 2, "D23: the document is kept forever");
+    assert_eq!(
+        record.annotation_count, 2,
+        "D23: the document is kept forever"
+    );
     assert_eq!(
         record.frame.size.width, 16.0,
         "the geometry outlives the pixels, so the UI can still lay it out"
@@ -173,8 +197,7 @@ fn edits_can_still_be_made_to_a_capture_whose_image_is_gone() {
         .evict(&RetentionPolicy { max_image_bytes: 0 })
         .expect("retention");
 
-    let DocumentState::ImageEvicted(evicted) =
-        store.document(&id).expect("read").expect("present")
+    let DocumentState::ImageEvicted(evicted) = store.document(&id).expect("read").expect("present")
     else {
         panic!("pixels should be gone");
     };
@@ -185,7 +208,11 @@ fn edits_can_still_be_made_to_a_capture_whose_image_is_gone() {
     drop(store);
     let mut store = SqliteStore::open(dir.path()).expect("reopen");
     assert_eq!(
-        store.record(&id).expect("read").expect("present").annotation_count,
+        store
+            .record(&id)
+            .expect("read")
+            .expect("present")
+            .annotation_count,
         0,
         "an edit to an evicted capture must persist like any other"
     );
@@ -222,13 +249,25 @@ fn pinned_captures_are_never_evicted_even_when_that_breaks_the_cap() {
 
     for id in &ids[..2] {
         assert!(
-            store.record(id).expect("read").expect("present").image.is_present(),
+            store
+                .record(id)
+                .expect("read")
+                .expect("present")
+                .image
+                .is_present(),
             "a pinned capture kept its pixels"
         );
         assert!(store.image(id).expect("read").is_some());
     }
     for id in &ids[2..] {
-        assert!(!store.record(id).expect("read").expect("present").image.is_present());
+        assert!(
+            !store
+                .record(id)
+                .expect("read")
+                .expect("present")
+                .image
+                .is_present()
+        );
     }
 }
 
@@ -241,7 +280,14 @@ fn unpinning_makes_a_capture_evictable_again() {
     store
         .evict(&RetentionPolicy { max_image_bytes: 0 })
         .expect("retention");
-    assert!(store.record(&ids[0]).expect("read").expect("present").image.is_present());
+    assert!(
+        store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
 
     store.set_pinned(&ids[0], false).expect("unpin");
     let report = store
@@ -261,17 +307,28 @@ fn eviction_never_removes_a_capture_or_its_document() {
         .evict(&RetentionPolicy { max_image_bytes: 0 })
         .expect("retention");
 
-    assert_eq!(store.count().expect("count"), 8, "no capture may be deleted");
+    assert_eq!(
+        store.count().expect("count"),
+        8,
+        "no capture may be deleted"
+    );
     assert_eq!(store.list().expect("list").len(), 8);
 
     let documents = std::fs::read_dir(store.layout().documents_dir())
         .expect("documents directory")
         .count();
-    assert_eq!(documents, 8, "the durable records are what D23 keeps forever");
+    assert_eq!(
+        documents, 8,
+        "the durable records are what D23 keeps forever"
+    );
 
     for id in &ids {
         assert_eq!(
-            store.record(id).expect("read").expect("present").annotation_count,
+            store
+                .record(id)
+                .expect("read")
+                .expect("present")
+                .annotation_count,
             1
         );
     }
@@ -368,8 +425,22 @@ fn eviction_state_survives_a_reopen() {
     let store = SqliteStore::open(dir.path()).expect("reopen");
     assert_eq!(store.count().expect("count"), 4);
     assert_eq!(store.stored_image_bytes().expect("size"), 2 * IMAGE_BYTES);
-    assert!(!store.record(&ids[0]).expect("read").expect("present").image.is_present());
-    assert!(store.record(&ids[3]).expect("read").expect("present").image.is_present());
+    assert!(
+        !store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
+    assert!(
+        store
+            .record(&ids[3])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
 }
 
 #[test]

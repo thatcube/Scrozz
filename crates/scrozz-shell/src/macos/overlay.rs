@@ -63,18 +63,19 @@ use std::ffi::c_void;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, NSObjectProtocol, Sel};
-use objc2::{sel, ClassType};
+use objc2::{ClassType, sel};
 use objc2_app_kit::{
-    NSPanel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
-    NSFloatingWindowLevel, NSNormalWindowLevel, NSPopUpMenuWindowLevel, NSStatusWindowLevel,
+    NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
+    NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
+    NSWindowStyleMask,
 };
 use objc2_core_graphics::CGShieldingWindowLevel;
 use objc2_foundation::NSRect;
 use scrozz_core::{Error, LogicalRect, Result};
 
-use crate::macos::{display, main_thread};
-use crate::overlay::{logical_to_appkit, OverlayBehavior, OverlayLevel, OverlayReport};
 use crate::OverlayWindow;
+use crate::macos::{display, main_thread};
+use crate::overlay::{OverlayBehavior, OverlayLevel, OverlayReport, logical_to_appkit};
 
 /// Name of the runtime-built `NSPanel` subclass windows are swizzled into.
 ///
@@ -423,9 +424,10 @@ impl MacOverlay {
         }
         // SAFETY: the caller guarantees a live `NSWindow *`; `retain` gives us
         // an owned reference with the usual ARC semantics.
-        let window = unsafe { Retained::retain(ns_window.cast::<NSWindow>()) }.ok_or_else(|| {
-            Error::TargetGone("the NSWindow pointer could not be retained".to_owned())
-        })?;
+        let window =
+            unsafe { Retained::retain(ns_window.cast::<NSWindow>()) }.ok_or_else(|| {
+                Error::TargetGone("the NSWindow pointer could not be retained".to_owned())
+            })?;
         Ok(Self {
             window,
             non_activating: false,

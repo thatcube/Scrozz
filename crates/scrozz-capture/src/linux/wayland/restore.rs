@@ -95,7 +95,8 @@ impl TokenStore {
         if token.is_empty() {
             self.tokens.remove(key.as_str());
         } else {
-            self.tokens.insert(key.as_str().to_owned(), token.to_owned());
+            self.tokens
+                .insert(key.as_str().to_owned(), token.to_owned());
         }
     }
 
@@ -171,9 +172,7 @@ pub fn token_path(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<st
         // The specification requires an absolute path; a relative one is a
         // misconfiguration, and resolving it against the current directory
         // would scatter token files wherever the app happened to start.
-        Some(state) if std::path::Path::new(state).is_absolute() => {
-            std::path::PathBuf::from(state)
-        }
+        Some(state) if std::path::Path::new(state).is_absolute() => std::path::PathBuf::from(state),
         _ => {
             let home = home.map(str::trim).filter(|s| !s.is_empty())?;
             std::path::Path::new(home).join(".local").join("state")

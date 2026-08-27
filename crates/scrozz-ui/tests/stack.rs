@@ -7,8 +7,8 @@
 use egui::{Rect, Vec2, pos2, vec2};
 use scrozz_ui::motion::Motion;
 use scrozz_ui::stack::{
-    CaptureStack, CardFrame, CardId, CardMetrics, CardState, Dir, GestureConfig, Intent,
-    MAX_SLOTS, MIN_SLOTS, StackLayout, Timing, classify,
+    CaptureStack, CardFrame, CardId, CardMetrics, CardState, Dir, GestureConfig, Intent, MAX_SLOTS,
+    MIN_SLOTS, StackLayout, Timing, classify,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,7 +158,10 @@ fn slots_stack_upward_from_the_bottom_of_the_work_area() {
     assert_rect_eq(
         slot0,
         Rect::from_min_size(
-            pos2(mbp16().left() + m.margin, mbp16().bottom() - m.margin - m.height),
+            pos2(
+                mbp16().left() + m.margin,
+                mbp16().bottom() - m.margin - m.height,
+            ),
             vec2(m.width, m.height),
         ),
         "slot 0 sits on the bottom-left of the work area",
@@ -253,7 +256,11 @@ fn existing_cards_do_not_move_at_all_while_the_pile_grows() {
         let frames = s.frame(&at(t));
         for (id, was) in &settled {
             let now = frame_of(&frames, *id);
-            assert_rect_eq(now.rect, *was, "a card already in the pile moved on arrival");
+            assert_rect_eq(
+                now.rect,
+                *was,
+                "a card already in the pile moved on arrival",
+            );
         }
         settled = frames.iter().map(|f| (f.id, f.rect)).collect();
     }
@@ -797,7 +804,11 @@ fn a_held_card_follows_the_pointer_one_to_one() {
     s.drag_to(origin + delta, &at(SETTLED + 16));
 
     let f = s.frame_of(id, &at(SETTLED + 16)).unwrap();
-    assert_rect_eq(f.rect, home.translate(delta), "a card must not lag the finger");
+    assert_rect_eq(
+        f.rect,
+        home.translate(delta),
+        "a card must not lag the finger",
+    );
     assert_eq!(f.state, CardState::Dragging);
     assert_eq!(f.lift, 1.0, "lift is instant, never eased (D19)");
 }
@@ -944,7 +955,10 @@ fn the_dock_is_card_width_and_a_sixth_the_height() {
         dock.height(),
         slot0.height()
     );
-    assert!((dock.bottom() - slot0.bottom()).abs() < 0.01, "shares the floor");
+    assert!(
+        (dock.bottom() - slot0.bottom()).abs() < 0.01,
+        "shares the floor"
+    );
 }
 
 #[test]

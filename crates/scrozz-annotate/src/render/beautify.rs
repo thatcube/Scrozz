@@ -49,7 +49,9 @@ pub fn apply(content: &Pixmap, beautification: &Beautification, scale: f64) -> R
     let width = content.width() + pad * 2;
     let height = content.height() + pad * 2;
     let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
-        Error::InvalidRequest(format!("beautified canvas {width}x{height} is not allocatable"))
+        Error::InvalidRequest(format!(
+            "beautified canvas {width}x{height} is not allocatable"
+        ))
     })?;
 
     paint_background(&mut canvas, beautification.background);
@@ -79,7 +81,8 @@ fn paint_background(canvas: &mut Pixmap, background: Background) {
             ));
         }
         Background::Gradient { start, end } => {
-            let Some(rect) = Rect::from_xywh(0.0, 0.0, canvas.width() as f32, canvas.height() as f32)
+            let Some(rect) =
+                Rect::from_xywh(0.0, 0.0, canvas.width() as f32, canvas.height() as f32)
             else {
                 return;
             };
@@ -132,7 +135,13 @@ fn draw_shadow(canvas: &mut Pixmap, image_rect: Rect, radius: f32, depth: f32) -
         return Ok(());
     };
     let paint = shapes::paint(Color::rgba(0, 0, 0, 130), 1.0, BlendMode::SourceOver);
-    layer.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    layer.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 
     if let Some(region) = IntRect::from_ltrb(0, 0, layer.width() as i32, layer.height() as i32) {
         redact::blur_with_sigma(&mut layer, region, depth / 2.0);
@@ -170,5 +179,11 @@ fn draw_content(canvas: &mut Pixmap, content: &Pixmap, image_rect: Rect, radius:
     let Some(path) = shapes::rounded_rect(image_rect, radius) else {
         return;
     };
-    canvas.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    canvas.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }

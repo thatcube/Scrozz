@@ -31,12 +31,7 @@ use std::{
 
 use scrozz_core::{Error, Result};
 
-use crate::{
-    CaptureId,
-    hash::is_valid_hash,
-    id::is_valid_id,
-    record::StoredRecord,
-};
+use crate::{CaptureId, hash::is_valid_hash, id::is_valid_id, record::StoredRecord};
 
 /// Directory name under the platform data directory.
 pub const APP_DIR: &str = "Scrozz";
@@ -131,7 +126,9 @@ impl StoreLayout {
     /// rather than trusted.
     pub fn blob_path(&self, hash: &str) -> Result<PathBuf> {
         if !is_valid_hash(hash) {
-            return Err(Error::Storage(format!("refusing malformed blob id {hash:?}")));
+            return Err(Error::Storage(format!(
+                "refusing malformed blob id {hash:?}"
+            )));
         }
         Ok(self
             .images_dir()
@@ -288,9 +285,14 @@ impl StoreLayout {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            match fs::read(&path).map_err(Error::from).and_then(|bytes| StoredRecord::from_json(&bytes)) {
+            match fs::read(&path)
+                .map_err(Error::from)
+                .and_then(|bytes| StoredRecord::from_json(&bytes))
+            {
                 Ok(record) if is_valid_id(&record.id) => records.push(record),
-                Ok(record) => failures.push((path, format!("malformed capture id {:?}", record.id))),
+                Ok(record) => {
+                    failures.push((path, format!("malformed capture id {:?}", record.id)))
+                }
                 Err(err) => failures.push((path, err.to_string())),
             }
         }
@@ -452,13 +454,19 @@ mod tests {
         let data = b"some pixels".to_vec();
         let hash = content_hash(&data);
 
-        assert!(layout.write_blob(&hash, &data).expect("write"), "first write is new");
+        assert!(
+            layout.write_blob(&hash, &data).expect("write"),
+            "first write is new"
+        );
         assert!(
             !layout.write_blob(&hash, &data).expect("write"),
             "identical content is already stored"
         );
         assert_eq!(layout.read_blob(&hash).expect("read"), Some(data.clone()));
-        assert_eq!(layout.blob_len(&hash).expect("len"), Some(data.len() as u64));
+        assert_eq!(
+            layout.blob_len(&hash).expect("len"),
+            Some(data.len() as u64)
+        );
 
         assert!(layout.delete_blob(&hash).expect("delete"));
         assert!(!layout.delete_blob(&hash).expect("delete again"));

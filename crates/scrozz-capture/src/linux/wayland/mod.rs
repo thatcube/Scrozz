@@ -41,9 +41,9 @@ use scrozz_core::{
     Window,
 };
 
-use super::session::{self, Compositor, PortalCapabilities, SessionEnv, SessionKind};
 use self::portal::SessionPlan;
 use self::restore::{TokenKey, TokenStore};
+use super::session::{self, Compositor, PortalCapabilities, SessionEnv, SessionKind};
 
 /// Still capture through `xdg-desktop-portal`.
 pub struct WaylandBackend {

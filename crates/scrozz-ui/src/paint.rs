@@ -426,6 +426,10 @@ pub fn focus_ring(painter: &egui::Painter, rect: Rect, radius: f32, palette: &Pa
 /// be stable across frames and independent of position: an id derived from the
 /// rectangle changes the moment the button moves, which drops focus and breaks
 /// press tracking during any card animation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an immediate-mode painter needs UI, surface, frame-stable identity, content, state, and reveal explicitly; bundling them would hide the accessibility and animation contracts"
+)]
 pub fn icon_button(
     ui: &mut Ui,
     surface: &Surface<'_>,
@@ -498,6 +502,10 @@ pub fn icon_button(
 ///
 /// `accent` picks the filled treatment. There is exactly one accent pill in any
 /// group; everything else is the quiet variant.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an immediate-mode painter needs UI, surface, frame-stable identity, content, treatment, and reveal explicitly; a bag-of-options struct would weaken the call site"
+)]
 pub fn pill_button(
     ui: &mut Ui,
     surface: &Surface<'_>,
@@ -813,6 +821,10 @@ impl Shortcut {
 /// native macOS behaviour and a good test of optical alignment. The highlight is
 /// instant — a menu highlight that ramps reads as lag while the pointer sweeps a
 /// list, and it is the clearest case for D19.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row's geometry, stable identity, accessible content, optional shortcut, and control state are separate immediate-mode inputs"
+)]
 pub fn menu_row(
     ui: &mut Ui,
     surface: &Surface<'_>,

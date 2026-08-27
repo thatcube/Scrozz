@@ -470,8 +470,8 @@ mod tests {
         let thumb = Thumbnail::downscale(64, 64, &source, 8);
         assert_eq!(thumb.width(), 8);
         assert_eq!(thumb.height(), 8);
-        for px in thumb.pixels().chunks_exact(4) {
-            assert_eq!(px, [10, 200, 30, 255]);
+        for px in thumb.pixels().as_chunks::<4>().0 {
+            assert_eq!(*px, [10, 200, 30, 255]);
         }
     }
 
@@ -500,7 +500,7 @@ mod tests {
     fn downscaling_averages_across_a_boundary() {
         // Left half black, right half white, halved horizontally: each output
         // column must be the mean of the two it covers.
-        let mut source = vec![0u8; 4 * 1 * 4];
+        let mut source = vec![0u8; 16];
         for x in 0..4 {
             let v = if x < 2 { 0 } else { 255 };
             source[x * 4..x * 4 + 4].copy_from_slice(&[v, v, v, 255]);

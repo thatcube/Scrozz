@@ -103,10 +103,7 @@ mod tests {
     use scrozz_core::{LogicalPoint, LogicalSize, ScaleFactor};
 
     fn display(id: &str, x: f64, is_primary: bool) -> Display {
-        let bounds = LogicalRect::new(
-            LogicalPoint::new(x, 0.0),
-            LogicalSize::new(1000.0, 1000.0),
-        );
+        let bounds = LogicalRect::new(LogicalPoint::new(x, 0.0), LogicalSize::new(1000.0, 1000.0));
         Display {
             id: DisplayId(id.to_owned()),
             name: id.to_owned(),

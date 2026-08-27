@@ -325,7 +325,11 @@ impl Document {
     /// position is the one they are pointing at.
     #[must_use]
     pub fn hit_test(&self, point: LogicalPoint) -> Option<AnnotationId> {
-        self.objects.iter().rev().find(|o| o.hit(point)).map(|o| o.id)
+        self.objects
+            .iter()
+            .rev()
+            .find(|o| o.hit(point))
+            .map(|o| o.id)
     }
 
     /// Every annotation under `point`, top-most first.

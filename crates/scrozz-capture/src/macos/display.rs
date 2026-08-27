@@ -223,8 +223,10 @@ mod tests {
     #[test]
     fn containment_excludes_the_far_edges_so_adjacent_displays_do_not_overlap() {
         let left = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(100.0, 100.0));
-        let right =
-            LogicalRect::new(LogicalPoint::new(100.0, 0.0), LogicalSize::new(100.0, 100.0));
+        let right = LogicalRect::new(
+            LogicalPoint::new(100.0, 0.0),
+            LogicalSize::new(100.0, 100.0),
+        );
 
         assert!(contains(left, (99.9, 50.0)));
         assert!(!contains(left, (100.0, 50.0)));

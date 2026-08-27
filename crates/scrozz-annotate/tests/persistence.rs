@@ -22,7 +22,10 @@ fn round_trip_preserves_every_annotation_exactly() {
     let json = serde_json::to_string(&before).expect("serialise");
     let after: DocumentData = serde_json::from_str(&json).expect("deserialise");
 
-    assert_eq!(before, after, "the sidecar must survive a JSON round trip byte for byte");
+    assert_eq!(
+        before, after,
+        "the sidecar must survive a JSON round trip byte for byte"
+    );
 
     // And re-hydrating into a live document preserves ids, order and styles.
     let restored = Document::from_data(region_capture(400, 300), after).expect("rehydrate");
@@ -44,7 +47,9 @@ fn round_trip_preserves_fractional_coordinates() {
             from: LogicalPoint::new(10.123_456_789, 20.987_654_321),
             to: LogicalPoint::new(300.5, 199.25),
         },
-        Style::stroked().with_stroke_width(2.375).with_opacity(0.625),
+        Style::stroked()
+            .with_stroke_width(2.375)
+            .with_opacity(0.625),
     );
     let json = serde_json::to_string(&doc.data()).unwrap();
     let back: DocumentData = serde_json::from_str(&json).unwrap();
@@ -63,16 +68,31 @@ fn round_trip_preserves_fractional_coordinates() {
 #[test]
 fn round_trip_preserves_id_allocation() {
     let mut doc = document(200, 200);
-    let a = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)), Style::stroked());
-    let b = doc.add(Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)), Style::stroked());
+    let a = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
+    let b = doc.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
     doc.remove(a);
 
     let json = serde_json::to_string(&doc.data()).unwrap();
-    let mut restored =
-        Document::from_data(region_capture(200, 200), serde_json::from_str(&json).unwrap()).unwrap();
+    let mut restored = Document::from_data(
+        region_capture(200, 200),
+        serde_json::from_str(&json).unwrap(),
+    )
+    .unwrap();
 
-    let c = restored.add(Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)), Style::stroked());
-    assert_ne!(c, a, "reloading must not restart id allocation and reuse a dead id");
+    let c = restored.add(
+        Annotation::Rectangle(rect(0.0, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
+    assert_ne!(
+        c, a,
+        "reloading must not restart id allocation and reuse a dead id"
+    );
     assert_ne!(c, b);
 }
 
@@ -89,7 +109,10 @@ fn round_trip_preserves_every_redaction_style() {
         );
         let json = serde_json::to_string(&doc.data()).unwrap();
         let back: DocumentData = serde_json::from_str(&json).unwrap();
-        let Annotation::Redact { style: reloaded, .. } = back.annotations[0].annotation else {
+        let Annotation::Redact {
+            style: reloaded, ..
+        } = back.annotations[0].annotation
+        else {
             panic!("expected redaction");
         };
         assert_eq!(
@@ -155,7 +178,10 @@ fn a_window_sidecar_carrying_beautification_is_refused() {
     // Decision D9. A document can arrive from disk, so refusing only at the
     // setter would leave a route in.
     let data = DocumentData {
-        beautification: Some(Beautification::padded(40.0, Background::Solid(Color::WHITE))),
+        beautification: Some(Beautification::padded(
+            40.0,
+            Background::Solid(Color::WHITE),
+        )),
         ..DocumentData::default()
     };
 
@@ -178,7 +204,10 @@ fn beautification_is_refused_for_window_captures() {
         format!("{err}").to_lowercase().contains("window"),
         "the refusal should say why: {err}"
     );
-    assert!(doc.beautification().is_none(), "the refusal must not half-apply");
+    assert!(
+        doc.beautification().is_none(),
+        "the refusal must not half-apply"
+    );
 
     // Clearing is always allowed, even for a window.
     assert!(doc.set_beautification(None).is_ok());
@@ -196,7 +225,10 @@ fn beautification_is_permitted_for_every_other_provenance() {
     ] {
         let capture = common::capture_with(common::flat(80, 60, [10, 20, 30, 255]), provenance);
         let mut doc = Document::new(capture);
-        assert!(doc.may_beautify(), "{provenance:?} should allow beautification");
+        assert!(
+            doc.may_beautify(),
+            "{provenance:?} should allow beautification"
+        );
         assert!(
             doc.set_beautification(Some(Beautification::padded(
                 16.0,

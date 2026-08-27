@@ -65,7 +65,12 @@ fn two_processes_can_write_to_one_history_at_the_same_time() {
         assert_eq!(mine.len(), usize::from(EACH), "writer {writer} lost rows");
     }
     assert_eq!(
-        store.layout().documents_dir().read_dir().expect("dir").count(),
+        store
+            .layout()
+            .documents_dir()
+            .read_dir()
+            .expect("dir")
+            .count(),
         expected,
         "one durable record per capture, no matter who wrote it"
     );
