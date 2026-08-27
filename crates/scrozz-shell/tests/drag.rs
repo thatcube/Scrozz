@@ -16,9 +16,9 @@
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_shell::drag::{
-    DragFormat, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, FALLBACK_STEM,
-    MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source, card_rect_in_view, check_origin,
-    sanitise_stem,
+    DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession,
+    FALLBACK_STEM, MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source,
+    card_rect_in_view, check_origin, sanitise_stem,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -513,6 +513,53 @@ fn the_first_outcome_wins() {
         Some(DragOutcome::Accepted(
             scrozz_shell::drag::DragOperation::Copy
         ))
+    );
+}
+
+#[test]
+fn an_accepted_lazy_drag_waits_for_delivery() {
+    let session = DragSession::awaiting_delivery();
+    session.finish(DragOutcome::Accepted(DragOperation::Copy));
+
+    assert!(session.is_active());
+    assert_eq!(session.outcome(), None);
+
+    session.delivery_succeeded();
+    assert_eq!(
+        session.outcome(),
+        Some(DragOutcome::Accepted(DragOperation::Copy))
+    );
+}
+
+#[test]
+fn delivery_failure_overrides_a_pending_acceptance() {
+    let session = DragSession::awaiting_delivery();
+    session.finish(DragOutcome::Accepted(DragOperation::Copy));
+    session.delivery_failed("disk full");
+    session.delivery_succeeded();
+
+    assert_eq!(
+        session.outcome(),
+        Some(DragOutcome::Failed("disk full".to_owned()))
+    );
+}
+
+#[test]
+fn lazy_delivery_and_platform_completion_can_arrive_in_either_order() {
+    let delivered_first = DragSession::awaiting_delivery();
+    delivered_first.delivery_succeeded();
+    delivered_first.finish(DragOutcome::Accepted(DragOperation::Copy));
+    assert_eq!(
+        delivered_first.outcome(),
+        Some(DragOutcome::Accepted(DragOperation::Copy))
+    );
+
+    let failed_first = DragSession::awaiting_delivery();
+    failed_first.delivery_failed("producer failed");
+    failed_first.finish(DragOutcome::Accepted(DragOperation::Copy));
+    assert_eq!(
+        failed_first.outcome(),
+        Some(DragOutcome::Failed("producer failed".to_owned()))
     );
 }
 

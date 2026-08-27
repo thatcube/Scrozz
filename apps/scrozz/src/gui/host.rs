@@ -15,17 +15,23 @@ use std::{
 
 use scrozz_ui::{
     OverlayHandle,
+    history::{WINDOW_TITLE as HISTORY_WINDOW_TITLE, viewport_builder, viewport_id},
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
 };
 
 use scrozz_core::Error as CoreError;
+use scrozz_shell::{
+    DragOrigin, DragSession, DragSource, NativeDragSource, NativeSurface, native_drag_source,
+    native_surface_for_window,
+};
 
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, Tick},
+        app::{App, Config, PendingDrag, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
+        pipeline::{DragGeometry, DragSubject},
         settings_window::SettingsWindow,
     },
     report::Report,
@@ -210,6 +216,14 @@ impl Host for Windowed {
             "Scrozz",
             scrozz_ui::overlay_app::native_options(geometry),
             Box::new(move |cc| {
+                let native_surface = native_surface(cc);
+                let drag_source = match native_drag_source() {
+                    Ok(source) => Some(source),
+                    Err(err) => {
+                        tracing::warn!("native drag-out is unavailable: {err}");
+                        None
+                    }
+                };
                 let overlay = OverlayApp::new(cc, handle, options);
                 let settings = SettingsWindow::new(&cc.egui_ctx, app.settings_revision())?;
                 Ok(Box::new(Driver {
@@ -223,6 +237,9 @@ impl Host for Windowed {
                     stopped: false,
                     #[cfg(target_os = "macos")]
                     url_events: scrozz_shell::macos::url_event::UrlEventHandler::install()?,
+                    native_surface,
+                    drag_source,
+                    active_drag: None,
                 }))
             }),
         )
@@ -271,6 +288,14 @@ struct Driver {
     stopped: bool,
     #[cfg(target_os = "macos")]
     url_events: scrozz_shell::macos::url_event::UrlEventHandler,
+    native_surface: NativeSurface,
+    drag_source: Option<NativeDragSource>,
+    active_drag: Option<ActiveDrag>,
+}
+
+struct ActiveDrag {
+    subject: DragSubject,
+    session: DragSession,
 }
 
 impl Driver {
@@ -303,6 +328,80 @@ impl Driver {
         self.handle
             .panel_report()
             .is_some_and(|report| report.non_activating)
+    }
+
+    fn show_history(&self, ctx: &egui::Context) {
+        let history = self.app.history();
+        let visible = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_visible();
+        if !visible {
+            return;
+        }
+
+        let viewport = viewport_id();
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(viewport, viewport_builder(), move |ui, _class| {
+            let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+            let mut history = history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if close_requested {
+                history.close();
+                return;
+            }
+            history.ui(ui);
+            ui.ctx().request_repaint_after(IDLE);
+        });
+    }
+
+    fn service_drag(&mut self, ctx: &egui::Context) {
+        if let Some(active) = self.active_drag.as_ref()
+            && let Some(outcome) = active.session.outcome()
+        {
+            let subject = active.subject.clone();
+            self.app.drag_finished(&subject, &outcome);
+            self.active_drag = None;
+        }
+        if self.active_drag.is_some() {
+            return;
+        }
+
+        let Some(pending) = self.app.take_drag() else {
+            return;
+        };
+        let subject = pending.subject.clone();
+        let Some(source) = self.drag_source.as_ref() else {
+            self.app.drag_finished(
+                &subject,
+                &scrozz_shell::DragOutcome::Failed(
+                    "the native drag backend is unavailable".to_owned(),
+                ),
+            );
+            return;
+        };
+        let origin = match drag_origin(ctx, self.native_surface, &pending) {
+            Ok(origin) => origin,
+            Err(error) => {
+                self.app.drag_finished(
+                    &subject,
+                    &scrozz_shell::DragOutcome::Failed(error.to_string()),
+                );
+                return;
+            }
+        };
+        match source.begin(pending.payload, origin) {
+            Ok(session) => {
+                self.active_drag = Some(ActiveDrag { subject, session });
+            }
+            Err(error) => {
+                self.app.drag_finished(
+                    &subject,
+                    &scrozz_shell::DragOutcome::Failed(error.to_string()),
+                );
+            }
+        }
     }
 }
 
@@ -364,12 +463,21 @@ impl eframe::App for Driver {
             Err(error) => tracing::error!(%error, "incoming URLs cannot be read"),
         }
 
-        if !self.stopped && self.app.tick() == Tick::Stop {
+        let tick = if self.stopped {
+            Tick::Continue
+        } else {
+            self.app.tick()
+        };
+        self.show_history(ctx);
+        self.service_drag(ctx);
+
+        if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
             let report = self.app.report();
             if let Ok(mut slot) = self.sink.lock() {
                 *slot = Some(report.clone());
             }
+
             // Before the window closes, so the menu-bar item never outlives
             // what the user can see.
             self.app.shut_down();
@@ -408,6 +516,60 @@ impl eframe::App for Driver {
         // over the user's whole work area — the "stray window" failure exactly.
         self.overlay.clear_color(visuals)
     }
+}
+
+fn drag_origin(
+    ctx: &egui::Context,
+    root_surface: NativeSurface,
+    pending: &PendingDrag,
+) -> scrozz_core::Result<DragOrigin> {
+    let mut geometry = pending.geometry;
+    let surface = if matches!(pending.subject, DragSubject::History(_)) {
+        let history_origin = ctx.input(|input| {
+            input
+                .raw
+                .viewports
+                .get(&viewport_id())
+                .and_then(|viewport| viewport.inner_rect)
+                .map(|rect| rect.min)
+        });
+        let history_origin = history_origin.ok_or_else(|| {
+            CoreError::TargetGone("the capture history window closed before drag-out began".into())
+        })?;
+        geometry = geometry_in_viewport(geometry, history_origin);
+        native_surface_for_window(HISTORY_WINDOW_TITLE)?
+    } else {
+        root_surface
+    };
+    Ok(DragOrigin::new(surface, geometry.rect, geometry.pointer))
+}
+
+fn geometry_in_viewport(mut geometry: DragGeometry, origin: egui::Pos2) -> DragGeometry {
+    geometry.rect.origin.x -= f64::from(origin.x);
+    geometry.rect.origin.y -= f64::from(origin.y);
+    geometry.pointer.x -= f64::from(origin.x);
+    geometry.pointer.y -= f64::from(origin.y);
+    geometry
+}
+
+#[cfg(target_os = "macos")]
+fn native_surface(cc: &eframe::CreationContext<'_>) -> NativeSurface {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = cc.window_handle() else {
+        return NativeSurface::null();
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return NativeSurface::null();
+    };
+    // SAFETY: the handle borrows eframe's live root window, and Driver cannot
+    // outlive that window.
+    unsafe { NativeSurface::from_raw(appkit.ns_view.as_ptr()) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_surface(_cc: &eframe::CreationContext<'_>) -> NativeSurface {
+    NativeSurface::null()
 }
 
 /// Set to `0` to leave the overlay window as `eframe` made it.
@@ -552,5 +714,27 @@ mod tests {
     fn the_probe_gap_names_the_fix_rather_than_apologising() {
         assert!(PROBE_GAP.contains("pointer_location"), "{PROBE_GAP}");
         assert!(PROBE_GAP.contains("350ms"), "{PROBE_GAP}");
+    }
+
+    #[test]
+    fn absolute_drag_geometry_is_translated_into_its_source_viewport() {
+        let geometry = DragGeometry {
+            rect: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(410.0, 260.0),
+                scrozz_core::LogicalSize::new(240.0, 160.0),
+            ),
+            pointer: scrozz_core::LogicalPoint::new(520.0, 330.0),
+        };
+
+        let translated = geometry_in_viewport(geometry, egui::pos2(100.0, 40.0));
+
+        assert_eq!(
+            translated.rect.origin,
+            scrozz_core::LogicalPoint::new(310.0, 220.0)
+        );
+        assert_eq!(
+            translated.pointer,
+            scrozz_core::LogicalPoint::new(420.0, 290.0)
+        );
     }
 }

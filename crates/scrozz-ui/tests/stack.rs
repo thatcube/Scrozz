@@ -746,7 +746,17 @@ fn a_swipe_right_or_up_begins_a_drag_out() {
 
         assert_eq!(release.intent, Intent::DragOut, "{dir:?}");
         assert_eq!(release.direction, Some(dir));
-        assert!(s.is_empty(), "the capture leaves the pile with the drag");
+        assert_eq!(release.pointer, origin + delta);
+        assert_eq!(
+            s.slot_of(id),
+            Some(0),
+            "the source remains in its exact slot until the native drop is accepted"
+        );
+        assert!(s.departing().is_empty());
+        assert_eq!(
+            frame_of(&s.frame(&at(SETTLED + 80)), id).state,
+            CardState::Returning
+        );
     }
 }
 

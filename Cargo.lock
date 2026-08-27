@@ -3504,6 +3504,7 @@ dependencies = [
  "resvg",
  "scrozz-annotate",
  "scrozz-core",
+ "scrozz-store",
  "thiserror 2.0.20",
  "tracing",
 ]

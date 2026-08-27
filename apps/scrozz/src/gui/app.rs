@@ -23,13 +23,21 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use scrozz_core::Error as CoreError;
+
+use scrozz_annotate::Document;
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
-    SystemPermissions, Tray, TrayAction,
+    Accelerator, Capability, DragOutcome, DragPayload, GlobalHotkeys, Hotkey, HotkeyManager,
+    KeyState, Permissions, SystemPermissions, Tray, TrayAction,
 };
+use scrozz_store::{CaptureId, Timestamp};
+use scrozz_ui::history::{HistoryAction, HistoryViewModel};
 
 use crate::{
     cli::{Cli, Command, SettingsCommand},
@@ -37,7 +45,7 @@ use crate::{
     gui::{
         action::{Action, CaptureKind},
         card::{CardEvent, CardSurface},
-        pipeline::{Job, Outcome, Pipeline},
+        pipeline::{DragGeometry, DragSubject, HistoryOperation, Job, Outcome, Pipeline},
         server::Server,
     },
     json::Json,
@@ -231,6 +239,9 @@ pub struct App {
     settings_revision: u64,
     active_window_capture: Option<crate::gui::card::CardId>,
     window_picker: Option<WindowPickerSession>,
+    history: Arc<Mutex<HistoryViewModel>>,
+    pending_drags: VecDeque<PendingDrag>,
+    pending_editors: VecDeque<(CaptureId, Document)>,
 }
 
 struct WindowPickerSession {
@@ -239,6 +250,16 @@ struct WindowPickerSession {
     theme: scrozz_ui::Theme,
     notice: Option<String>,
     committing: bool,
+}
+
+/// A worker-built drag waiting for the window host to enter the native loop.
+pub struct PendingDrag {
+    /// Card or history capture.
+    pub subject: DragSubject,
+    /// Promised file and image data.
+    pub payload: DragPayload,
+    /// Source geometry.
+    pub geometry: DragGeometry,
 }
 
 impl App {
@@ -323,6 +344,9 @@ impl App {
             settings_revision: 0,
             active_window_capture: None,
             window_picker: None,
+            history: Arc::new(Mutex::new(HistoryViewModel::new(Timestamp::now()))),
+            pending_drags: VecDeque::new(),
+            pending_editors: VecDeque::new(),
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -350,8 +374,10 @@ impl App {
         if self.drain_server() == Tick::Stop {
             return Tick::Stop;
         }
+        self.with_history(|history| history.advance_clock(Timestamp::now()));
         self.drain_pipeline();
         self.drain_cards();
+        self.drain_history();
 
         Tick::Continue
     }
@@ -430,6 +456,8 @@ impl App {
                     // again". There is nothing to show yet, so it is a no-op
                     // that has at least been answered rather than ignored.
                     self.note("a second launch was answered by this instance");
+                } else {
+                    self.with_history(|history| history.refresh_from_start(Timestamp::now()));
                 }
                 if settings_changed && let Err(error) = self.reload_settings() {
                     self.note(format!(
@@ -472,11 +500,27 @@ impl App {
                         self.window_picker = None;
                     }
                     self.captures += 1;
+                    let history_changed = card.capture_id.is_some();
                     let summary = card.summary();
+                    let card_id = card.id;
                     if let Err(err) = self.surface.present(*card) {
+                        self.pipeline.post(Job::Release(card_id));
                         self.note(format!("a card could not be shown: {err}"));
                     } else {
                         self.note(summary);
+                    }
+                    if history_changed {
+                        self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+                    }
+                }
+                Outcome::Restored(card) => {
+                    let summary = card.summary();
+                    let card_id = card.id;
+                    if let Err(err) = self.surface.present(*card) {
+                        self.pipeline.post(Job::Release(card_id));
+                        self.note(format!("a restored card could not be shown: {err}"));
+                    } else {
+                        self.note(format!("restored {summary}"));
                     }
                 }
                 Outcome::Failed { card, .. } if self.pipeline.is_window_cancelled(card) => {}
@@ -523,6 +567,79 @@ impl App {
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
+                Outcome::HistoryLoaded { request, page } => {
+                    self.with_history(|history| history.apply_page(request, page));
+                }
+                Outcome::HistoryFailed {
+                    request,
+                    operation,
+                    capture,
+                    error,
+                } => {
+                    let message = format!("could not {}: {error}", operation.label());
+                    self.with_history(|history| {
+                        if let Some(request) = request {
+                            history.apply_query_error(request, &message);
+                        } else {
+                            history.operation_failed(&message);
+                            if capture.is_some() {
+                                history.refresh_current(Timestamp::now());
+                            }
+                        }
+                    });
+                    if let Some(capture) = capture {
+                        self.note(format!("{}: {message}", capture.0));
+                    } else {
+                        self.note(message);
+                    }
+                }
+                Outcome::HistoryDone {
+                    operation,
+                    capture,
+                    pinned,
+                    detail,
+                } => {
+                    self.with_history(|history| match (operation, capture.as_ref(), pinned) {
+                        (HistoryOperation::Pin, Some(id), Some(pinned)) => {
+                            history.pinned(id, pinned);
+                        }
+                        (HistoryOperation::Delete, Some(id), _) => history.deleted(id),
+                        (HistoryOperation::Retention, _, _) => {
+                            history.completed(&detail);
+                            history.refresh_current(Timestamp::now());
+                        }
+                        _ => history.completed(&detail),
+                    });
+                    self.note(detail);
+                }
+                Outcome::EditorReady { capture, document } => {
+                    // Until the annotation-editor host lands, retain only the
+                    // newest handoff instead of accumulating full-resolution
+                    // documents without a bound.
+                    self.pending_editors.clear();
+                    self.pending_editors.push_back((capture.clone(), *document));
+                    self.with_history(|history| {
+                        history.completed("Editable document loaded");
+                    });
+                    self.note(format!("{} loaded for editing", capture.0));
+                }
+                Outcome::DragReady {
+                    subject,
+                    payload,
+                    geometry,
+                } => {
+                    self.pending_drags.push_back(PendingDrag {
+                        subject,
+                        payload,
+                        geometry,
+                    });
+                }
+                Outcome::DragFailed { subject, error } => {
+                    self.drag_finished(
+                        &subject,
+                        &DragOutcome::Failed(format!("could not prepare drag: {error}")),
+                    );
+                }
             }
         }
     }
@@ -548,13 +665,51 @@ impl App {
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
                 }
-                // Not yet routed. The drag payload is `scrozz-shell`'s
-                // `DragSource`, and collapsing into the dock is the capture
-                // stack's own animation — both belong to the surface that
-                // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
-                    self.note(format!("{id}: {event:?} is not routed yet"));
+                CardEvent::Drag { id, rect, pointer } => {
+                    if !self.pipeline.post(Job::Drag {
+                        card: id,
+                        geometry: DragGeometry { rect, pointer },
+                    }) {
+                        self.surface.finish_drag(id, false);
+                        self.note("the capture worker has gone");
+                    }
                 }
+                CardEvent::Collapse(id) => {
+                    self.note(format!("{id}: capture stack collapsed"));
+                }
+                CardEvent::Open(id) => {
+                    self.pipeline.post(Job::OpenCard(id));
+                }
+            }
+        }
+    }
+
+    fn drain_history(&mut self) {
+        let actions = self.with_history(HistoryViewModel::drain_actions);
+        for action in actions {
+            let posted = match action {
+                HistoryAction::Query { request, query } => {
+                    self.pipeline.query_history(request, query)
+                }
+                HistoryAction::Restore(capture) => {
+                    let card = self.pipeline.allocate();
+                    self.pipeline.post(Job::Restore { capture, card })
+                }
+                HistoryAction::OpenEditor(capture) => self.pipeline.post(Job::OpenEditor(capture)),
+                HistoryAction::Copy(capture) => self.pipeline.post(Job::CopyHistory(capture)),
+                HistoryAction::Save(capture) => self.pipeline.post(Job::SaveHistory(capture)),
+                HistoryAction::Drag { id, rect, pointer } => self.pipeline.post(Job::DragHistory {
+                    capture: id,
+                    geometry: DragGeometry { rect, pointer },
+                }),
+                HistoryAction::SetPinned { id, pinned } => self.pipeline.post(Job::SetPinned {
+                    capture: id,
+                    pinned,
+                }),
+                HistoryAction::Delete(capture) => self.pipeline.post(Job::Delete(capture)),
+            };
+            if !posted {
+                self.note("the capture worker has gone");
             }
         }
     }
@@ -575,7 +730,8 @@ impl App {
                 Tick::Continue
             }
             Action::OpenHistory => {
-                self.note("the history window is not built yet");
+                self.with_history(|history| history.open(Timestamp::now()));
+                self.note("capture history opened");
                 Tick::Continue
             }
             Action::OpenSettings => {
@@ -696,6 +852,51 @@ impl App {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);
+    }
+
+    fn with_history<R>(&self, f: impl FnOnce(&mut HistoryViewModel) -> R) -> R {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut history)
+    }
+
+    /// Shared state rendered by the secondary history viewport.
+    #[must_use]
+    pub fn history(&self) -> Arc<Mutex<HistoryViewModel>> {
+        Arc::clone(&self.history)
+    }
+
+    /// Takes a drag prepared by the worker.
+    pub fn take_drag(&mut self) -> Option<PendingDrag> {
+        self.pending_drags.pop_front()
+    }
+
+    /// Takes a document prepared for the editor host.
+    pub fn take_editor(&mut self) -> Option<(CaptureId, Document)> {
+        self.pending_editors.pop_front()
+    }
+
+    /// Records a native drag, retiring its source only after an accepted drop.
+    pub fn drag_finished(&mut self, subject: &DragSubject, outcome: &DragOutcome) {
+        let detail = match outcome {
+            DragOutcome::Accepted(_) => "Capture dragged to another app".to_owned(),
+            DragOutcome::Rejected => "The destination did not accept the capture".to_owned(),
+            DragOutcome::Cancelled => "Drag cancelled".to_owned(),
+            DragOutcome::Failed(reason) => format!("Drag failed: {reason}"),
+            _ => "Drag finished".to_owned(),
+        };
+        if let DragSubject::Card(card) = subject {
+            self.surface.finish_drag(*card, outcome.is_accepted());
+            if outcome.is_accepted() {
+                self.pipeline.post(Job::Release(*card));
+            }
+        }
+        if let DragSubject::History(_) = subject {
+            self.with_history(|history| history.completed(&detail));
+        }
+        self.note(detail);
     }
 
     /// How many cards are on screen.
@@ -966,14 +1167,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unwired_action_says_so_rather_than_doing_nothing() {
+    fn unwired_recording_says_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
-        for action in [Action::ToggleRecording, Action::OpenHistory] {
-            assert_eq!(app.perform(action), Tick::Continue);
-        }
+        assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
         assert!(notes.contains("recording is not wired up yet"), "{notes}");
-        assert!(notes.contains("history window"), "{notes}");
     }
 
     #[test]
@@ -983,6 +1181,21 @@ mod tests {
         assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
         assert!(app.take_settings_request());
         assert!(!app.take_settings_request(), "requests coalesce");
+    }
+
+    #[test]
+    fn opening_history_makes_the_window_visible_and_queues_a_query() {
+        let (mut app, _) = app();
+        assert_eq!(app.perform(Action::OpenHistory), Tick::Continue);
+        let history = app.history();
+        let mut history = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(history.is_visible());
+        assert!(matches!(
+            history.drain_actions().as_slice(),
+            [HistoryAction::Query { request: 1, .. }]
+        ));
     }
 
     #[test]
@@ -1019,15 +1232,57 @@ mod tests {
     }
 
     #[test]
-    fn an_unrouted_card_gesture_is_recorded_not_swallowed() {
+    fn dragging_a_card_reaches_the_worker() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Drag(CardId(5)));
+        surface.inject(CardEvent::Drag {
+            id: CardId(5),
+            rect: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(240.0, 160.0),
+            ),
+            pointer: scrozz_core::LogicalPoint::new(100.0, 80.0),
+        });
         app.tick();
-        assert!(
-            app.notes().iter().any(|n| n.contains("not routed yet")),
-            "{:?}",
-            app.notes()
+
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if app
+                .notes()
+                .iter()
+                .any(|note| note.contains("card:5 has no capture to drag"))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the drag never reached the worker: {:?}", app.notes());
+    }
+
+    #[test]
+    fn rejected_native_drag_keeps_the_original_card_resident() {
+        let (mut app, _) = app();
+        app.surface
+            .present(Card::placeholder(CardId(5), CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+
+        app.drag_finished(&DragSubject::Card(CardId(5)), &DragOutcome::Rejected);
+
+        assert_eq!(app.showing(), 1);
+    }
+
+    #[test]
+    fn accepted_native_drag_retires_the_original_card() {
+        let (mut app, _) = app();
+        app.surface
+            .present(Card::placeholder(CardId(5), CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+
+        app.drag_finished(
+            &DragSubject::Card(CardId(5)),
+            &DragOutcome::Accepted(scrozz_shell::DragOperation::Copy),
         );
+
+        assert_eq!(app.showing(), 0);
     }
 
     #[test]

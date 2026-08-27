@@ -26,7 +26,7 @@ pub mod url_scheme;
 pub use drag::{
     ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
     DragPreview, DragSession, DragSource, NativeDragSource, NativeSurface, PromisedFile,
-    byte_source, native_drag_source,
+    byte_source, native_drag_source, native_surface_for_window,
 };
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,

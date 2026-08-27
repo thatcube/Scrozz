@@ -56,7 +56,7 @@
 //! [`Activity::apply`](crate::motion::Activity::apply) turns it into the right
 //! call — including a timed wake when something is merely waiting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use egui::{Pos2, Rect, Vec2};
@@ -409,6 +409,8 @@ pub enum OverlayEvent {
         id: CardId,
         /// Where it was released, in window coordinates.
         at: Pos2,
+        /// Card geometry at release, in window coordinates.
+        rect: Rect,
     },
     /// The pile collapsed into the dock (D20).
     DockCollapsed,
@@ -423,6 +425,7 @@ pub enum OverlayEvent {
 enum Command {
     Dismiss(CardId),
     DismissAll,
+    FinishDrag(CardId, bool),
     Collapse,
     Expand,
     ToggleDock,
@@ -481,6 +484,11 @@ impl OverlayHandle {
     /// Retire every card.
     pub fn dismiss_all(&self) {
         self.command(Command::DismissAll);
+    }
+
+    /// Completes a native drag, removing its source only after acceptance.
+    pub fn finish_drag(&self, id: CardId, accepted: bool) {
+        self.command(Command::FinishDrag(id, accepted));
     }
 
     /// Collapse the pile into the dock (D20).
@@ -753,6 +761,9 @@ pub struct OverlayApp {
     hovered: Option<CardId>,
     dock_collapsed: bool,
     dragging: Option<CardId>,
+    pending_native_drag: Option<CardId>,
+    native_drag_just_finished: bool,
+    deferred_commands: VecDeque<Command>,
 }
 
 impl OverlayApp {
@@ -809,6 +820,9 @@ impl OverlayApp {
             hovered: None,
             dock_collapsed: false,
             dragging: None,
+            pending_native_drag: None,
+            native_drag_just_finished: false,
+            deferred_commands: VecDeque::new(),
         }
     }
 
@@ -866,6 +880,13 @@ impl OverlayApp {
     }
 
     fn ingest(&mut self, m: &Motion) {
+        if self.pending_native_drag.is_some() {
+            return;
+        }
+        if self.native_drag_just_finished {
+            self.native_drag_just_finished = false;
+            return;
+        }
         for request in self.take_inbox() {
             let id = self.stack.push(m);
             let thumb = request
@@ -887,7 +908,23 @@ impl OverlayApp {
     }
 
     fn run_commands(&mut self, ctx: &egui::Context, m: &Motion) {
-        for cmd in self.take_commands() {
+        let mut commands = std::mem::take(&mut self.deferred_commands);
+        commands.extend(self.take_commands());
+        if let Some(pending) = self.pending_native_drag
+            && let Some(index) = commands
+                .iter()
+                .position(|cmd| matches!(cmd, Command::FinishDrag(id, _) if *id == pending))
+            && let Some(finish) = commands.remove(index)
+        {
+            commands.push_front(finish);
+        }
+        for cmd in commands {
+            if (self.pending_native_drag.is_some() || self.native_drag_just_finished)
+                && !matches!(cmd, Command::FinishDrag(id, _) if Some(id) == self.pending_native_drag)
+            {
+                self.deferred_commands.push_back(cmd);
+                continue;
+            }
             match cmd {
                 Command::Dismiss(id) => {
                     if self.stack.dismiss(id, m) {
@@ -905,6 +942,18 @@ impl OverlayApp {
                             id,
                             reason: DismissReason::Programmatic,
                         });
+                    }
+                }
+                Command::FinishDrag(id, accepted) => {
+                    if self.pending_native_drag == Some(id) {
+                        self.pending_native_drag = None;
+                        self.native_drag_just_finished = true;
+                        if accepted && self.stack.dismiss(id, m) {
+                            self.emit(OverlayEvent::Dismissed {
+                                id,
+                                reason: DismissReason::DragOut,
+                            });
+                        }
                     }
                 }
                 Command::Collapse => self.stack.collapse(m),
@@ -1125,35 +1174,38 @@ impl eframe::App for OverlayApp {
 
         // Gestures, applied after drawing so this frame's responses drive the
         // next frame's layout rather than tearing the current one.
-        if dock_clicked {
+        if self.pending_native_drag.is_none() && dock_clicked {
             self.stack.expand(&m);
         }
-        if hovered != self.hovered {
+        if self.pending_native_drag.is_none() && hovered != self.hovered {
             self.hovered = hovered;
             self.stack.set_hover(hovered, &m);
         }
-        if let Some((id, pointer)) = drag_start
+        if self.pending_native_drag.is_none()
+            && let Some((id, pointer)) = drag_start
             && self.stack.begin_drag(id, pointer, &m)
         {
             self.dragging = Some(id);
             self.emit(OverlayEvent::DragStarted { id, at: pointer });
         }
-        if let Some(p) = drag_to {
+        if self.pending_native_drag.is_none()
+            && let Some(p) = drag_to
+        {
             self.stack.drag_to(p, &m);
         }
-        if drag_end {
+        if self.pending_native_drag.is_none() && drag_end {
             if let Some(release) = self.stack.release_drag(&m) {
-                let at = release.rect.center();
                 match release.intent {
                     Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
                         id: release.id,
                         reason: DismissReason::Swipe,
                     }),
                     Intent::DragOut => {
-                        self.emit(OverlayEvent::DragOut { id: release.id, at });
-                        self.emit(OverlayEvent::Dismissed {
+                        self.pending_native_drag = Some(release.id);
+                        self.emit(OverlayEvent::DragOut {
                             id: release.id,
-                            reason: DismissReason::DragOut,
+                            at: release.pointer,
+                            rect: release.rect,
                         });
                     }
                     Intent::Collapse | Intent::SpringBack => {}
@@ -1161,7 +1213,9 @@ impl eframe::App for OverlayApp {
             }
             self.dragging = None;
         }
-        if let Some((id, a)) = action {
+        if self.pending_native_drag.is_none()
+            && let Some((id, a)) = action
+        {
             self.handle_action(id, a, &m);
         }
 
@@ -1203,6 +1257,35 @@ mod tests {
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
         Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
+    }
+
+    fn test_overlay() -> (OverlayApp, egui::Context, OverlayHandle) {
+        let ctx = egui::Context::default();
+        let handle = OverlayHandle::new();
+        let geometry = OverlayGeometry::new(rect(0.0, 0.0, 1_440.0, 900.0));
+        (
+            OverlayApp {
+                stack: CaptureStack::for_work_area(geometry.local()),
+                content: HashMap::new(),
+                handle: handle.clone(),
+                theme: Theme::for_appearance(Appearance::Dark),
+                icons: IconStore::new(&ctx),
+                geometry,
+                passthrough: Passthrough::Auto,
+                probe: None,
+                thumbnail_px: THUMBNAIL_PX,
+                passthrough_now: false,
+                last_seen: 0.0,
+                hovered: None,
+                dock_collapsed: false,
+                dragging: None,
+                pending_native_drag: None,
+                native_drag_just_finished: false,
+                deferred_commands: VecDeque::new(),
+            },
+            ctx,
+            handle,
+        )
     }
 
     #[test]
@@ -1249,6 +1332,37 @@ mod tests {
         assert_eq!(h.shared.inbox.lock().unwrap().len(), 1);
         assert!(h.drain_events().is_empty());
         assert!(h.panel_report().is_none());
+    }
+
+    #[test]
+    fn incoming_captures_cannot_move_a_pending_native_drag_source() {
+        let (mut overlay, ctx, handle) = test_overlay();
+        let motion = Motion::at_ms(1_000);
+        for _ in 0..overlay.stack.capacity() {
+            overlay.stack.push(&motion);
+        }
+        let source = overlay.stack.cards()[0].id();
+        overlay.pending_native_drag = Some(source);
+        handle.push(CaptureRequest::new(
+            "Arrived while dragging.png",
+            Provenance::Display,
+            (100, 50),
+        ));
+
+        overlay.ingest(&motion);
+        assert_eq!(overlay.stack.slot_of(source), Some(0));
+        assert_eq!(handle.shared.inbox.lock().unwrap().len(), 1);
+
+        handle.finish_drag(source, false);
+        overlay.run_commands(&ctx, &motion);
+        overlay.ingest(&motion);
+
+        assert_eq!(
+            overlay.stack.slot_of(source),
+            Some(0),
+            "the cancelled source gets a complete frame in its original slot"
+        );
+        assert_eq!(handle.shared.inbox.lock().unwrap().len(), 1);
     }
 
     #[test]

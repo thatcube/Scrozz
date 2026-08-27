@@ -269,6 +269,12 @@ pub enum Scenario {
     /// re-runnable from any of them. [`KeyInstant`] selects which of the four
     /// topics is showing. See [`crate::onboarding_view`].
     Onboarding,
+    /// Capture history showing a page of recent media.
+    HistoryGrid,
+    /// Capture history with one capture's actions and metadata open.
+    HistoryDetail,
+    /// Capture history before the first capture exists.
+    HistoryEmpty,
 }
 
 impl Scenario {
@@ -287,6 +293,9 @@ impl Scenario {
             Self::EditorAnnotating,
             Self::SettingsForm,
             Self::Onboarding,
+            Self::HistoryGrid,
+            Self::HistoryDetail,
+            Self::HistoryEmpty,
         ]
     }
 
@@ -308,6 +317,9 @@ impl Scenario {
             Self::EditorAnnotating => "editor-annotating",
             Self::SettingsForm => "settings",
             Self::Onboarding => "onboarding",
+            Self::HistoryGrid => "history-grid",
+            Self::HistoryDetail => "history-detail",
+            Self::HistoryEmpty => "history-empty",
         }
     }
 
@@ -835,12 +847,44 @@ impl Fixture {
                     instants::ONBOARDING,
                     None,
                 ),
+                Scenario::HistoryGrid => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Find any capture again",
+                    "The ordinary history window, showing a filterable page of screenshots, recordings, and GIFs.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::HistoryDetail => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "A capture stays useful",
+                    "History detail exposes restore, edit, copy, save, drag, pin, and delete without hiding the surrounding timeline.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::HistoryEmpty => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "History starts with the first capture",
+                    "The empty history window explains what will appear here instead of presenting a dead grid.",
+                    instants::REST,
+                    None,
+                ),
             };
 
         let size_pt = match scenario {
             Scenario::SettingsForm => (640.0, 640.0),
             Scenario::Onboarding => (560.0, 620.0),
-            _ if annotating => (900.0, 620.0),
+            Scenario::EditorAnnotating => (900.0, 620.0),
+            Scenario::HistoryGrid | Scenario::HistoryDetail => (1180.0, 760.0),
+            Scenario::HistoryEmpty => (980.0, 680.0),
             _ => size_pt,
         };
 
@@ -1979,6 +2023,18 @@ impl SceneRegistry {
             Scenario::Onboarding,
             Box::new(crate::onboarding_view::OnboardingScene::new()),
         );
+        me.register(
+            Scenario::HistoryGrid,
+            Box::new(crate::history::HistoryScene),
+        );
+        me.register(
+            Scenario::HistoryDetail,
+            Box::new(crate::history::HistoryScene),
+        );
+        me.register(
+            Scenario::HistoryEmpty,
+            Box::new(crate::history::HistoryScene),
+        );
         me
     }
 
@@ -2566,7 +2622,7 @@ impl TextureStore {
     /// on drop that a `TexturesDelta` was consumed, and — more to the point —
     /// the font atlas usually arrives on a warm-up pass, so skipping one renders
     /// every glyph as a blank rectangle.
-    fn apply(&mut self, mut delta: egui::TexturesDelta) {
+    fn prepare(&mut self, mut delta: egui::TexturesDelta) -> Vec<egui::TextureId> {
         // Taken rather than destructured: `TexturesDelta` has a `Drop` impl that
         // asserts it was emptied, which is exactly the guard that stops a
         // forgotten warm-up pass from silently costing us the font atlas.
@@ -2582,6 +2638,10 @@ impl TextureStore {
                 self.set(id, patch);
             }
         }
+        free.into_iter().collect()
+    }
+
+    fn free(&mut self, free: Vec<egui::TextureId>) {
         for id in free {
             self.map.remove(&id);
         }
@@ -2735,11 +2795,15 @@ impl RasterJob {
         // and `epaint` asserts on drop if a delta is never consumed.
         for _ in 0..self.warmup_passes {
             let out = pass(input.clone(), &mut draw);
-            textures.apply(out.textures_delta);
+            let free = textures.prepare(out.textures_delta);
+            textures.free(free);
         }
 
         let out = pass(input.clone(), &mut draw);
-        textures.apply(out.textures_delta);
+        // Texture frees belong after painting. A short-lived image handle can
+        // be set and freed in the same egui output, but its mesh still needs the
+        // texture for this frame.
+        let free = textures.prepare(out.textures_delta);
         let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
 
         // Framebuffer in premultiplied sRGB, held at f32 so hundreds of blends
@@ -2780,6 +2844,7 @@ impl RasterJob {
                 raster_triangle(&mut fb, w_px, clip, ppp, a, b, c, tex);
             }
         }
+        textures.free(free);
 
         Image::from_premultiplied_f32(self.width_px, self.height_px, &fb)
     }

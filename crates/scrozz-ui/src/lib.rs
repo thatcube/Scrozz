@@ -104,6 +104,7 @@
 pub mod card;
 pub mod form;
 pub mod harness;
+pub mod history;
 pub mod icons;
 pub mod motion;
 pub mod onboarding_view;
@@ -119,6 +120,10 @@ pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use form::{
     ApplyOutcome, Row, RowChange, RowId, RowKind, SettingsForm, ShortcutChord, ShortcutStatus,
     Validation,
+};
+pub use history::{
+    DateFilter, HistoryAction, HistoryEntry, HistoryFilters, HistoryPage, HistoryThumbnail,
+    HistoryViewModel,
 };
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use onboarding_view::{OnboardingAction, OnboardingOutcome, OnboardingState, OnboardingTopic};
