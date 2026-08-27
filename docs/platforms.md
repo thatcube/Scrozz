@@ -90,6 +90,9 @@ a Linux VM running **both GNOME and KDE**, since the Wayland story differs sharp
 between them. This is the slowest and most manual layer, so it is reserved for
 behaviour the first three layers structurally cannot reach.
 
+The repeatable guest setup, evidence-retention wrappers and pass/fail/skip rules
+for this layer are in [`docs/native-platform-lab.md`](native-platform-lab.md).
+
 ---
 
 ## What this means for anyone writing platform code
