@@ -3,7 +3,7 @@
 //! The encoder is selected by the exact `h264_vaapi` name. There is no generic
 //! H.264 lookup and therefore no path by which an installed x264 can be used.
 
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr::{self, NonNull};
 
 use ffmpeg_sys_next as ffi;
@@ -427,14 +427,14 @@ fn ffmpeg_result(code: c_int) -> std::result::Result<(), String> {
 }
 
 fn ffmpeg_error(code: c_int) -> String {
-    let mut buffer = [0_u8; ffi::AV_ERROR_MAX_STRING_SIZE];
+    let mut buffer = [0 as c_char; ffi::AV_ERROR_MAX_STRING_SIZE];
     // SAFETY: buffer is writable and its exact length is supplied.
     let status = unsafe { ffi::av_strerror(code, buffer.as_mut_ptr(), buffer.len()) };
     if status < 0 {
         return format!("FFmpeg error {code}");
     }
     // SAFETY: av_strerror NUL-terminates on success.
-    unsafe { CStr::from_ptr(buffer.as_ptr().cast()) }
+    unsafe { CStr::from_ptr(buffer.as_ptr()) }
         .to_string_lossy()
         .into_owned()
 }

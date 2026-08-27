@@ -6,11 +6,11 @@ use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ashpd::desktop::PersistMode;
 use ashpd::desktop::ResponseError;
 use ashpd::desktop::screencast::{
     CursorMode as PortalCursorMode, Screencast, SelectSourcesOptions, SourceType,
 };
+use ashpd::desktop::{PersistMode, Session};
 use pipewire as pw;
 use pw::properties::{PropertiesBox, properties};
 use pw::spa;
@@ -20,7 +20,8 @@ use scrozz_capture::{
     detect_session, portal_capabilities, portal_token_path,
 };
 use scrozz_core::{
-    CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Error, PixelFormat, Result,
+    CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, DisplayId, Error, PixelFormat,
+    Result, WindowId,
 };
 
 use crate::audio::AudioBuffer;
@@ -30,6 +31,7 @@ pub(super) trait VideoSource {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<PackedFrame>>;
     fn name(&self) -> &str;
     fn backing_scale(&self) -> Option<f64>;
+    fn resolved_target(&self) -> Option<CaptureTarget>;
 }
 
 pub(super) fn open_video_source(
@@ -53,6 +55,7 @@ struct X11Source {
     backend: Box<dyn CaptureBackend>,
     request: CaptureRequest,
     backing_scale: Option<f64>,
+    target: CaptureTarget,
 }
 
 impl X11Source {
@@ -69,6 +72,7 @@ impl X11Source {
             backend,
             request,
             backing_scale,
+            target: target.clone(),
         })
     }
 }
@@ -95,6 +99,10 @@ impl VideoSource for X11Source {
 
     fn backing_scale(&self) -> Option<f64> {
         self.backing_scale
+    }
+
+    fn resolved_target(&self) -> Option<CaptureTarget> {
+        Some(self.target.clone())
     }
 }
 
@@ -150,16 +158,56 @@ fn common_backing_scale(scales: &[f64]) -> Option<f64> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PortalStream {
     node_id: u32,
     position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    source_type: Option<SourceType>,
+    id: Option<String>,
+    mapping_id: Option<String>,
 }
 
 struct PortalResponse {
     streams: Vec<PortalStream>,
     fd: OwnedFd,
     restore_token: Option<String>,
+    session: Session<Screencast>,
+}
+
+struct PortalLifetime {
+    runtime: tokio::runtime::Runtime,
+    session: Option<Session<Screencast>>,
+}
+
+impl PortalLifetime {
+    fn new(runtime: tokio::runtime::Runtime, session: Session<Screencast>) -> Self {
+        Self {
+            runtime,
+            session: Some(session),
+        }
+    }
+
+    fn close(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        if let Err(error) = self.runtime.block_on(session.close()) {
+            tracing::warn!(%error, "could not explicitly close the ScreenCast portal session");
+        }
+    }
+}
+
+impl Drop for PortalLifetime {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortalGeometry {
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
 }
 
 struct VideoUserData {
@@ -174,10 +222,12 @@ struct PortalVideoSource {
     mainloop: pw::main_loop::MainLoopRc,
     frames: Vec<Rc<RefCell<VecDeque<PackedFrame>>>>,
     errors: Vec<Rc<RefCell<Option<String>>>>,
-    positions: Vec<(i32, i32)>,
+    geometries: Vec<PortalGeometry>,
     latest: Vec<Option<PackedFrame>>,
     target: CaptureTarget,
+    resolved_target: Option<CaptureTarget>,
     name: String,
+    portal: PortalLifetime,
 }
 
 impl PortalVideoSource {
@@ -223,43 +273,69 @@ impl PortalVideoSource {
             }
             Err(error) => return Err(error),
         };
-        if let Some(token) = response.restore_token.as_deref() {
+        let PortalResponse {
+            streams: descriptors,
+            fd,
+            restore_token,
+            session,
+        } = response;
+        let portal = PortalLifetime::new(runtime, session);
+        if let Some(token) = restore_token.as_deref() {
             tokens.set(plan.restore_key, token);
             persist_tokens(token_path.as_deref(), &tokens);
         }
-        if response.streams.is_empty() {
+        if descriptors.is_empty() {
             return Err(Error::Platform(
                 "the screen-cast portal returned no PipeWire streams".into(),
             ));
         }
-        if response.streams.len() > 1
-            && response
-                .streams
+        let resolved_target = validate_portal_selection(target, &descriptors)?;
+        if descriptors.len() > 1
+            && descriptors
                 .iter()
-                .any(|stream| stream.position.is_none())
+                .any(|stream| stream.position.is_none() || stream.size.is_none())
         {
             return Err(Error::Unsupported {
                 what: "recording multiple portal streams".into(),
-                why: "the compositor omitted stream positions, so combining monitors would guess \
-                      their layout"
+                why: "the compositor omitted stream positions or displayed sizes, so combining \
+                      monitors in buffer-pixel coordinates would guess their layout"
                     .into(),
             });
         }
+        if matches!(target, CaptureTarget::Region(_))
+            && descriptors
+                .iter()
+                .any(|stream| stream.position.is_none() || stream.size.is_none())
+        {
+            return Err(Error::Unsupported {
+                what: "recording a region through the desktop portal".into(),
+                why: "the compositor omitted monitor position or displayed size, so the logical \
+                      region cannot be transformed into buffer pixels"
+                    .into(),
+            });
+        }
+        tracing::debug!(
+            selection = ?descriptors
+                .iter()
+                .map(portal_stream_identity)
+                .collect::<Vec<_>>(),
+            "desktop portal selected recording sources"
+        );
 
         let mainloop = pw::main_loop::MainLoopRc::new(None)
             .map_err(|error| pipewire_error("create its video event loop", error))?;
         let context = pw::context::ContextRc::new(&mainloop, None)
             .map_err(|error| pipewire_error("create its video context", error))?;
         let core = context
-            .connect_fd_rc(response.fd, None)
+            .connect_fd_rc(fd, None)
             .map_err(|error| pipewire_error("connect to the portal remote", error))?;
 
         let mut listeners = Vec::new();
         let mut streams = Vec::new();
         let mut frames = Vec::new();
         let mut errors = Vec::new();
-        let mut positions = Vec::new();
-        for descriptor in response.streams {
+        let mut geometries = Vec::new();
+        for descriptor in descriptors {
             let queue = Rc::new(RefCell::new(VecDeque::new()));
             let error = Rc::new(RefCell::new(None));
             let stream = pw::stream::StreamRc::new(
@@ -323,7 +399,10 @@ impl PortalVideoSource {
                 )
                 .map_err(|cause| pipewire_error("connect a portal video node", cause))?;
 
-            positions.push(descriptor.position.unwrap_or((0, 0)));
+            geometries.push(PortalGeometry {
+                position: descriptor.position,
+                size: descriptor.size,
+            });
             frames.push(queue);
             errors.push(error);
             listeners.push(listener);
@@ -337,9 +416,11 @@ impl PortalVideoSource {
             mainloop,
             frames,
             errors,
-            positions,
+            geometries,
             target: target.clone(),
+            resolved_target,
             name: format!("Wayland portal/PipeWire ({compositor})"),
+            portal,
         })
     }
 
@@ -358,27 +439,37 @@ impl PortalVideoSource {
         if self.latest.iter().any(Option::is_none) {
             return Ok(None);
         }
-        let placed: Vec<_> = self
+        let frames: Vec<_> = self
             .latest
             .iter()
-            .zip(&self.positions)
+            .map(|frame| frame.as_ref().expect("checked above"))
+            .collect();
+        let (positions, scale) = portal_pixel_layout(&frames, &self.geometries, &self.target)?;
+        let placed: Vec<_> = frames
+            .iter()
+            .zip(&positions)
             .map(|(frame, position)| PlacedFrame {
                 x: position.0,
                 y: position.1,
-                frame: frame.as_ref().expect("checked above"),
+                frame,
             })
             .collect();
         let (frame, origin) = compose_placed_frames(&placed)?;
         if let CaptureTarget::Region(region) = &self.target {
-            let x = (region.origin.x.round() as i64 - i64::from(origin.0))
+            let scale = scale.expect("region layout requires a portal scale");
+            let region_x = scale_portal_coordinate(region.origin.x, scale, "region x")?;
+            let region_y = scale_portal_coordinate(region.origin.y, scale, "region y")?;
+            let x = (i64::from(region_x) - i64::from(origin.0))
                 .try_into()
                 .map_err(|_| Error::InvalidRequest("portal region begins off-screen".into()))?;
-            let y = (region.origin.y.round() as i64 - i64::from(origin.1))
+            let y = (i64::from(region_y) - i64::from(origin.1))
                 .try_into()
                 .map_err(|_| Error::InvalidRequest("portal region begins off-screen".into()))?;
-            let width = region.size.width.round().max(0.0) as u32;
-            let height = region.size.height.round().max(0.0) as u32;
-            return crop(&frame, x, y, width, height).map(Some);
+            let width = scale_portal_extent(region.size.width, scale, "region width")?;
+            let height = scale_portal_extent(region.size.height, scale, "region height")?;
+            let cropped = crop(&frame, x, y, width, height)?;
+            self.resolved_target = Some(self.target.clone());
+            return Ok(Some(cropped));
         }
         Ok(Some(frame))
     }
@@ -388,6 +479,7 @@ impl VideoSource for PortalVideoSource {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<PackedFrame>> {
         let deadline = Instant::now() + timeout;
         loop {
+            self.mainloop.loop_().iterate(pw::loop_::Timeout::None);
             for error in &self.errors {
                 if let Some(message) = error.borrow_mut().take() {
                     return Err(Error::Platform(format!(
@@ -417,10 +509,15 @@ impl VideoSource for PortalVideoSource {
         // compositor-independent logical-to-physical scale.
         None
     }
+
+    fn resolved_target(&self) -> Option<CaptureTarget> {
+        self.resolved_target.clone()
+    }
 }
 
 impl Drop for PortalVideoSource {
     fn drop(&mut self) {
+        self.portal.close();
         // Keeping the listeners as a named field makes the required lifetime
         // obvious; reading its length also prevents an accidental "unused field"
         // cleanup from dropping callbacks immediately after registration.
@@ -452,10 +549,6 @@ async fn open_portal(
             what: "the requested portal recording source".into(),
             why: "the desktop portal reports no compatible source or cursor mode".into(),
         })?;
-    let session = proxy
-        .create_session(Default::default())
-        .await
-        .map_err(map_portal_error)?;
     let sources = match plan.types {
         1 => SourceType::Monitor.into(),
         2 => SourceType::Window.into(),
@@ -467,6 +560,10 @@ async fn open_portal(
             });
         }
     };
+    let session = proxy
+        .create_session(Default::default())
+        .await
+        .map_err(map_portal_error)?;
     let mut options = SelectSourcesOptions::default().set_sources(sources);
     options = options
         .set_cursor_mode(if plan.cursor == 2 {
@@ -481,34 +578,207 @@ async fn open_portal(
             PersistMode::DoNot
         })
         .set_restore_token(restore_token);
-    proxy
-        .select_sources(&session, options)
-        .await
-        .map_err(map_portal_error)?;
-    let response = proxy
-        .start(&session, None, Default::default())
-        .await
-        .map_err(map_portal_error)?
-        .response()
-        .map_err(map_portal_error)?;
-    let streams = response
-        .streams()
-        .iter()
-        .map(|stream| PortalStream {
-            node_id: stream.pipe_wire_node_id(),
-            position: stream.position(),
-        })
-        .collect();
-    let restore_token = response.restore_token().map(str::to_owned);
-    let fd = proxy
-        .open_pipe_wire_remote(&session, Default::default())
-        .await
-        .map_err(map_portal_error)?;
-    Ok(PortalResponse {
-        streams,
-        fd,
-        restore_token,
+    let opened = async {
+        proxy
+            .select_sources(&session, options)
+            .await
+            .map_err(map_portal_error)?;
+        let response = proxy
+            .start(&session, None, Default::default())
+            .await
+            .map_err(map_portal_error)?
+            .response()
+            .map_err(map_portal_error)?;
+        let streams = response
+            .streams()
+            .iter()
+            .map(|stream| PortalStream {
+                node_id: stream.pipe_wire_node_id(),
+                position: stream.position(),
+                size: stream.size(),
+                source_type: stream.source_type(),
+                id: stream.id().map(str::to_owned),
+                mapping_id: stream.mapping_id().map(str::to_owned),
+            })
+            .collect();
+        let restore_token = response.restore_token().map(str::to_owned);
+        let fd = proxy
+            .open_pipe_wire_remote(&session, Default::default())
+            .await
+            .map_err(map_portal_error)?;
+        Ok::<_, Error>((streams, fd, restore_token))
+    }
+    .await;
+    match opened {
+        Ok((streams, fd, restore_token)) => Ok(PortalResponse {
+            streams,
+            fd,
+            restore_token,
+            session,
+        }),
+        Err(error) => {
+            if let Err(close_error) = session.close().await {
+                tracing::warn!(
+                    %close_error,
+                    "could not close a failed ScreenCast portal session"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn validate_portal_selection(
+    requested: &CaptureTarget,
+    streams: &[PortalStream],
+) -> Result<Option<CaptureTarget>> {
+    if !matches!(requested, CaptureTarget::AllDisplays) && streams.len() != 1 {
+        return Err(Error::Platform(format!(
+            "the desktop portal returned {} sources for a single-source request",
+            streams.len()
+        )));
+    }
+    for stream in streams {
+        let Some(source_type) = stream.source_type else {
+            continue;
+        };
+        let valid = match requested {
+            CaptureTarget::Window(_) => source_type == SourceType::Window,
+            CaptureTarget::Display(_) | CaptureTarget::Region(_) => {
+                source_type == SourceType::Monitor
+            }
+            CaptureTarget::AllDisplays => {
+                matches!(source_type, SourceType::Monitor | SourceType::Virtual)
+            }
+        };
+        if !valid {
+            return Err(Error::Platform(format!(
+                "the desktop portal returned a {source_type:?} source for {requested:?}"
+            )));
+        }
+    }
+    if matches!(requested, CaptureTarget::Region(_)) || streams.len() != 1 {
+        return Ok(None);
+    }
+    let stream = &streams[0];
+    let Some(source_type) = stream.source_type else {
+        return Ok(None);
+    };
+    let Some(id) = portal_stream_id(stream) else {
+        return Ok(None);
+    };
+    Ok(match source_type {
+        SourceType::Monitor => Some(CaptureTarget::Display(DisplayId(id))),
+        SourceType::Window => Some(CaptureTarget::Window(WindowId(id))),
+        SourceType::Virtual => None,
     })
+}
+
+fn portal_stream_id(stream: &PortalStream) -> Option<String> {
+    stream
+        .id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("portal:{id}"))
+        .or_else(|| {
+            stream
+                .mapping_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("portal-mapping:{id}"))
+        })
+}
+
+fn portal_stream_identity(stream: &PortalStream) -> (Option<SourceType>, Option<String>) {
+    (stream.source_type, portal_stream_id(stream))
+}
+
+fn portal_pixel_layout(
+    frames: &[&PackedFrame],
+    geometries: &[PortalGeometry],
+    target: &CaptureTarget,
+) -> Result<(Vec<(i32, i32)>, Option<f64>)> {
+    if frames.len() != geometries.len() {
+        return Err(Error::Platform(
+            "portal stream geometry does not match its buffers".into(),
+        ));
+    }
+    let needs_global_geometry = frames.len() > 1 || matches!(target, CaptureTarget::Region(_));
+    if !needs_global_geometry {
+        return Ok((vec![(0, 0); frames.len()], None));
+    }
+
+    let mut common_scale: Option<f64> = None;
+    let mut positions = Vec::with_capacity(frames.len());
+    for (frame, geometry) in frames.iter().zip(geometries) {
+        let (x, y) = geometry.position.ok_or_else(|| Error::Unsupported {
+            what: "positioning desktop portal streams".into(),
+            why: "the compositor omitted a source position".into(),
+        })?;
+        let (width, height) = geometry.size.ok_or_else(|| Error::Unsupported {
+            what: "scaling desktop portal streams".into(),
+            why: "the compositor omitted a displayed source size".into(),
+        })?;
+        if width <= 0 || height <= 0 {
+            return Err(Error::Platform(format!(
+                "the desktop portal returned invalid displayed size {width}x{height}"
+            )));
+        }
+        let x_scale = f64::from(frame.width) / f64::from(width);
+        let y_scale = f64::from(frame.height) / f64::from(height);
+        if !scales_match(x_scale, y_scale) {
+            return Err(Error::Unsupported {
+                what: "non-uniformly scaled desktop portal streams".into(),
+                why: format!(
+                    "the compositor maps {width}x{height} coordinates to a {}x{} buffer",
+                    frame.width, frame.height
+                ),
+            });
+        }
+        let scale = (x_scale + y_scale) / 2.0;
+        if let Some(common) = common_scale
+            && !scales_match(common, scale)
+        {
+            return Err(Error::Unsupported {
+                what: "mixed-scale desktop portal recording".into(),
+                why: format!(
+                    "selected sources use incompatible buffer scales ({common:.3}x and \
+                     {scale:.3}x); Scrozz will not guess their pixel-space layout"
+                ),
+            });
+        }
+        common_scale = Some(scale);
+        positions.push((
+            scale_portal_coordinate(f64::from(x), scale, "stream x")?,
+            scale_portal_coordinate(f64::from(y), scale, "stream y")?,
+        ));
+    }
+    Ok((positions, common_scale))
+}
+
+fn scales_match(left: f64, right: f64) -> bool {
+    let tolerance = left.abs().max(right.abs()).max(1.0) * 0.01;
+    left.is_finite() && right.is_finite() && (left - right).abs() <= tolerance
+}
+
+fn scale_portal_coordinate(value: f64, scale: f64, label: &str) -> Result<i32> {
+    let scaled = value * scale;
+    if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+        return Err(Error::InvalidRequest(format!(
+            "portal {label} exceeds pixel coordinates"
+        )));
+    }
+    Ok(scaled.round() as i32)
+}
+
+fn scale_portal_extent(value: f64, scale: f64, label: &str) -> Result<u32> {
+    let scaled = value * scale;
+    if !scaled.is_finite() || scaled.round() < 1.0 || scaled.round() > f64::from(u32::MAX) {
+        return Err(Error::InvalidRequest(format!(
+            "portal {label} exceeds pixel dimensions"
+        )));
+    }
+    Ok(scaled.round() as u32)
 }
 
 fn map_portal_error(error: ashpd::Error) -> Error {
@@ -668,7 +938,8 @@ struct AudioUserData {
     format: spa::param::audio::AudioInfoRaw,
     frames: Rc<RefCell<VecDeque<AudioBuffer>>>,
     error: Rc<RefCell<Option<String>>>,
-    next_frame: u64,
+    pts_origin: Rc<RefCell<Option<i64>>>,
+    end_frame: u64,
 }
 
 impl PipeWireAudio {
@@ -688,6 +959,7 @@ impl PipeWireAudio {
         let mut errors = Vec::new();
         let mut microphone_queue = None;
         let mut system_queue = None;
+        let pts_origin = Rc::new(RefCell::new(None));
 
         for is_system in [false, true] {
             if (is_system && !system) || (!is_system && !microphone) {
@@ -718,7 +990,8 @@ impl PipeWireAudio {
                     format: Default::default(),
                     frames: Rc::clone(&queue),
                     error: Rc::clone(&error),
-                    next_frame: 0,
+                    pts_origin: Rc::clone(&pts_origin),
+                    end_frame: 0,
                 })
                 .state_changed(|_, user_data, _, new| {
                     if let pw::stream::StreamState::Error(message) = new {
@@ -781,10 +1054,19 @@ impl PipeWireAudio {
                 )));
             }
         }
-        Ok((
-            self.microphone.as_ref().and_then(drain_audio_queue),
-            self.system.as_ref().and_then(drain_audio_queue),
-        ))
+        let microphone = self
+            .microphone
+            .as_ref()
+            .map(drain_audio_queue)
+            .transpose()?
+            .flatten();
+        let system = self
+            .system
+            .as_ref()
+            .map(drain_audio_queue)
+            .transpose()?
+            .flatten();
+        Ok((microphone, system))
     }
 }
 
@@ -797,35 +1079,52 @@ impl Drop for PipeWireAudio {
     }
 }
 
-fn drain_audio_queue(queue: &Rc<RefCell<VecDeque<AudioBuffer>>>) -> Option<AudioBuffer> {
+fn drain_audio_queue(queue: &Rc<RefCell<VecDeque<AudioBuffer>>>) -> Result<Option<AudioBuffer>> {
     let mut queue = queue.borrow_mut();
-    let first = queue.pop_front()?;
+    let Some(first) = queue.pop_front() else {
+        return Ok(None);
+    };
     let sample_rate = first.sample_rate;
     let channels = first.channels;
     let start_frame = first.start_frame;
     let mut samples = first.samples;
     let mut expected = start_frame + samples.len() as u64 / u64::from(channels);
-    while let Some(next) = queue.pop_front() {
+    while let Some(mut next) = queue.pop_front() {
+        if next.sample_rate != sample_rate || next.channels != channels {
+            return Err(Error::Platform(
+                "PipeWire changed audio format without renegotiating the stream".into(),
+            ));
+        }
         if next.start_frame > expected {
             let silence_frames = next.start_frame - expected;
-            samples.resize(
-                samples.len().saturating_add(
-                    usize::try_from(silence_frames)
-                        .unwrap_or(usize::MAX / 2)
-                        .saturating_mul(usize::from(channels)),
-                ),
-                0.0,
-            );
+            let silence_samples = usize::try_from(silence_frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(usize::from(channels)))
+                .ok_or_else(|| Error::Platform("PipeWire audio gap exceeds memory".into()))?;
+            samples
+                .try_reserve(silence_samples)
+                .map_err(|_| Error::Platform("PipeWire audio gap exceeds memory".into()))?;
+            samples.resize(samples.len() + silence_samples, 0.0);
+        } else if next.start_frame < expected {
+            let overlap_frames = expected - next.start_frame;
+            let overlap_samples = usize::try_from(overlap_frames)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(usize::from(channels));
+            if overlap_samples >= next.samples.len() {
+                continue;
+            }
+            next.samples.drain(..overlap_samples);
+            next.start_frame = expected;
         }
         samples.extend_from_slice(&next.samples);
         expected = next.start_frame + next.samples.len() as u64 / u64::from(next.channels);
     }
-    Some(AudioBuffer {
+    Ok(Some(AudioBuffer {
         sample_rate,
         channels,
         start_frame,
         samples,
-    })
+    }))
 }
 
 fn audio_format_parameter() -> Result<Vec<u8>> {
@@ -850,6 +1149,25 @@ fn copy_audio_buffer(stream: &pw::stream::Stream, user_data: &mut AudioUserData)
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
+    let Some(header) = buffer.find_meta::<spa::buffer::meta::MetaHeader>() else {
+        *user_data.error.borrow_mut() =
+            Some("PipeWire audio buffer omitted presentation timestamp metadata".into());
+        return;
+    };
+    let pts = header.pts();
+    let flags = header.flags();
+    if pts < 0 {
+        *user_data.error.borrow_mut() =
+            Some(format!("PipeWire audio buffer returned invalid PTS {pts}"));
+        return;
+    }
+    if flags.contains(spa::buffer::meta::MetaHeaderFlags::CORRUPTED) {
+        *user_data.error.borrow_mut() = Some("PipeWire marked an audio buffer corrupted".into());
+        return;
+    }
+    if flags.contains(spa::buffer::meta::MetaHeaderFlags::GAP) {
+        return;
+    }
     let datas = buffer.datas_mut();
     let Some(data) = datas.first_mut() else {
         return;
@@ -877,17 +1195,152 @@ fn copy_audio_buffer(stream: &pw::stream::Stream, user_data: &mut AudioUserData)
         .iter()
         .map(|sample| f32::from_le_bytes(*sample))
         .collect();
+    if !samples.len().is_multiple_of(channels as usize) {
+        *user_data.error.borrow_mut() =
+            Some("PipeWire returned an incomplete interleaved audio frame".into());
+        return;
+    }
+    let origin = {
+        let mut origin = user_data.pts_origin.borrow_mut();
+        *origin.get_or_insert(pts)
+    };
+    let mut start_frame = nanoseconds_to_audio_frames(pts.saturating_sub(origin), rate);
+    let mut samples = samples;
+    if start_frame < user_data.end_frame {
+        let overlap_frames = user_data.end_frame - start_frame;
+        let overlap_samples = usize::try_from(overlap_frames)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(channels as usize);
+        if overlap_samples >= samples.len() {
+            return;
+        }
+        samples.drain(..overlap_samples);
+        start_frame = user_data.end_frame;
+    }
     let frames = samples.len() as u64 / u64::from(channels);
+    if frames == 0 {
+        return;
+    }
     let mut queue = user_data.frames.borrow_mut();
     queue.push_back(AudioBuffer {
         sample_rate: rate,
         channels: channels as u8,
-        start_frame: user_data.next_frame,
+        start_frame,
         samples,
     });
-    user_data.next_frame = user_data.next_frame.saturating_add(frames);
+    user_data.end_frame = start_frame.saturating_add(frames);
+}
+
+fn nanoseconds_to_audio_frames(nanoseconds: i64, sample_rate: u32) -> u64 {
+    let nanoseconds = u64::try_from(nanoseconds).unwrap_or_default();
+    ((u128::from(nanoseconds) * u128::from(sample_rate)) / 1_000_000_000)
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn pipewire_error(action: &str, error: pw::Error) -> Error {
     Error::Platform(format!("PipeWire could not {action}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use ashpd::desktop::screencast::SourceType;
+    use scrozz_core::{CaptureTarget, WindowId};
+
+    use super::{
+        PackedFrame, PackedPixelFormat, PortalGeometry, PortalStream, nanoseconds_to_audio_frames,
+        portal_pixel_layout, validate_portal_selection,
+    };
+
+    fn frame(width: u32, height: u32) -> PackedFrame {
+        PackedFrame {
+            width,
+            height,
+            stride: width as usize * 4,
+            format: PackedPixelFormat::Rgba,
+            data: vec![0; width as usize * height as usize * 4],
+        }
+    }
+
+    fn portal_stream(source_type: Option<SourceType>, id: Option<&str>) -> PortalStream {
+        PortalStream {
+            node_id: 7,
+            position: Some((0, 0)),
+            size: Some((100, 50)),
+            source_type,
+            id: id.map(str::to_owned),
+            mapping_id: None,
+        }
+    }
+
+    #[test]
+    fn portal_provenance_uses_selected_identity_not_requested_identity() {
+        let requested = CaptureTarget::Window(WindowId("requested-window".into()));
+        let selected = portal_stream(Some(SourceType::Window), Some("selected-window"));
+        assert_eq!(
+            validate_portal_selection(&requested, &[selected]).unwrap(),
+            Some(CaptureTarget::Window(WindowId(
+                "portal:selected-window".into()
+            )))
+        );
+
+        let unidentified = portal_stream(None, Some("untyped-source"));
+        assert_eq!(
+            validate_portal_selection(&requested, &[unidentified]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn portal_selection_rejects_an_unexpected_source_type() {
+        let requested = CaptureTarget::Window(WindowId("requested-window".into()));
+        let selected = portal_stream(Some(SourceType::Monitor), Some("monitor"));
+        assert!(validate_portal_selection(&requested, &[selected]).is_err());
+    }
+
+    #[test]
+    fn portal_layout_transforms_compositor_positions_to_buffer_pixels() {
+        let left = frame(200, 100);
+        let right = frame(200, 100);
+        let geometries = [
+            PortalGeometry {
+                position: Some((-100, 0)),
+                size: Some((100, 50)),
+            },
+            PortalGeometry {
+                position: Some((0, 0)),
+                size: Some((100, 50)),
+            },
+        ];
+        let (positions, scale) =
+            portal_pixel_layout(&[&left, &right], &geometries, &CaptureTarget::AllDisplays)
+                .unwrap();
+        assert_eq!(positions, vec![(-200, 0), (0, 0)]);
+        assert_eq!(scale, Some(2.0));
+    }
+
+    #[test]
+    fn portal_layout_rejects_mixed_buffer_scales() {
+        let left = frame(200, 100);
+        let right = frame(100, 50);
+        let geometries = [
+            PortalGeometry {
+                position: Some((0, 0)),
+                size: Some((100, 50)),
+            },
+            PortalGeometry {
+                position: Some((100, 0)),
+                size: Some((100, 50)),
+            },
+        ];
+        let error = portal_pixel_layout(&[&left, &right], &geometries, &CaptureTarget::AllDisplays)
+            .unwrap_err();
+        assert!(error.to_string().contains("mixed-scale"));
+    }
+
+    #[test]
+    fn pipewire_nanosecond_pts_convert_to_audio_frames() {
+        assert_eq!(nanoseconds_to_audio_frames(1_000_000_000, 48_000), 48_000);
+        assert_eq!(nanoseconds_to_audio_frames(10_000_000, 48_000), 480);
+    }
 }

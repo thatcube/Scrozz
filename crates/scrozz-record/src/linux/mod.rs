@@ -49,11 +49,12 @@ impl RecordingEngine for LinuxEngine {
 #[cfg(feature = "linux-native")]
 mod native {
     use std::collections::VecDeque;
-    use std::fs::{File, OpenOptions};
-    use std::io::ErrorKind;
+    use std::fs::{DirBuilder, File, OpenOptions};
+    use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,24 +62,28 @@ mod native {
     use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 
     use super::source::{PipeWireAudio, VideoSource, open_video_source};
-    use crate::audio::AudioMixer;
+    use crate::audio::{AudioBuffer, AudioMixer};
     use crate::config::{RecordingConfig, resolve_dimensions};
     use crate::encoder::aac::{AacEncoder, EncodedAudioPacket};
     use crate::encoder::{self, EncodedVideoPacket, VideoEncoder, VideoEncoderSettings};
     use crate::format::{Nv12Frame, PackedFrame, to_nv12};
     use crate::muxer::{
-        AudioTrackConfig, EncodedSample, FragmentedMp4, MediaFragment, TrackFragment,
-        VideoTrackConfig,
+        AudioTrackConfig, EncodedSample, FragmentedMp4, MediaFragment, RecoverySalvageability,
+        TrackFragment, VideoTrackConfig,
     };
     use crate::pacing::{FramePacer, PacingDecision};
     use crate::state::{RecorderCommand, RecorderState, RecordingStateMachine};
     use crate::timeline::RecordingTimeline;
     use crate::{
         Quality, Recording, RecordingMetadata, RecordingRequest, RecordingResolution,
-        RecordingSession, Salvageability, SessionEvent, VideoCodec,
+        RecordingSession, RecordingState as PublicRecordingState, Salvageability, SessionEvent,
+        VideoCodec,
     };
 
     static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+    const SESSION_RECORDING: u8 = 0;
+    const SESSION_PAUSED: u8 = 1;
+    const SESSION_STOPPED: u8 = 2;
 
     enum Control {
         Pause(SyncSender<Result<()>>),
@@ -89,6 +94,18 @@ mod native {
     enum WorkerSignal {
         FirstFrame,
         Terminal(Box<Result<Recording>>),
+    }
+
+    #[derive(Debug, Clone)]
+    struct TemporaryOutput {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    struct OpenedDestination {
+        path: PathBuf,
+        file: File,
+        temporary: Option<TemporaryOutput>,
     }
 
     enum TerminalOutcome {
@@ -176,6 +193,8 @@ mod native {
         terminal: Option<TerminalOutcome>,
         terminal_emitted: bool,
         elapsed_nanos: Arc<AtomicU64>,
+        state: Arc<AtomicU8>,
+        temporary_output: Option<TemporaryOutput>,
     }
 
     impl LinuxRecordingSession {
@@ -228,11 +247,34 @@ mod native {
             }
             let event = self.terminal.as_ref()?.event();
             self.terminal_emitted = true;
+            if matches!(self.terminal.as_ref(), Some(TerminalOutcome::Finished(_))) {
+                self.temporary_output = None;
+            }
             Some(event)
+        }
+
+        fn abandon_temporary_output(&mut self) {
+            let Some(output) = self.temporary_output.take() else {
+                return;
+            };
+            if let Err(error) = remove_temporary_output(&output) {
+                record_abandoned_output(&output, &error);
+            }
         }
     }
 
     impl RecordingSession for LinuxRecordingSession {
+        fn state(&self) -> PublicRecordingState {
+            if self.terminal.is_some() {
+                return PublicRecordingState::Stopped;
+            }
+            match self.state.load(Ordering::Acquire) {
+                SESSION_PAUSED => PublicRecordingState::Paused,
+                SESSION_STOPPED => PublicRecordingState::Stopped,
+                _ => PublicRecordingState::Recording,
+            }
+        }
+
         fn pause(&mut self) -> Result<()> {
             if self.terminal.is_some() {
                 return Err(Error::InvalidRequest(
@@ -289,10 +331,16 @@ mod native {
             if let Err(error) = self.join_worker() {
                 tracing::error!(%error, "Linux recording worker did not join after finalisation");
             }
-            self.terminal
-                .take()
-                .expect("terminal outcome was received")
-                .into_result()
+            match self.terminal.take().expect("terminal outcome was received") {
+                TerminalOutcome::Finished(recording) => {
+                    self.temporary_output = None;
+                    Ok(recording)
+                }
+                TerminalOutcome::Failed(error) => {
+                    self.abandon_temporary_output();
+                    Err(error.to_error())
+                }
+            }
         }
     }
 
@@ -307,6 +355,7 @@ mod native {
                     tracing::error!(%error, "Linux recording worker did not join during drop");
                 }
             }
+            self.abandon_temporary_output();
         }
     }
 
@@ -317,6 +366,8 @@ mod native {
         let (signal_tx, signal_rx) = mpsc::channel();
         let elapsed_nanos = Arc::new(AtomicU64::new(0));
         let worker_elapsed = Arc::clone(&elapsed_nanos);
+        let state = Arc::new(AtomicU8::new(SESSION_RECORDING));
+        let worker_state = Arc::clone(&state);
         let worker = thread::Builder::new()
             .name("scrozz-linux-recording".into())
             .spawn(move || {
@@ -326,18 +377,21 @@ mod native {
                     initialised_tx,
                     signal_tx,
                     worker_elapsed,
+                    worker_state,
                 )
             })
             .map_err(Error::Io)?;
 
         match initialised_rx.recv() {
-            Ok(Ok(())) => Ok(Box::new(LinuxRecordingSession {
+            Ok(Ok(temporary_output)) => Ok(Box::new(LinuxRecordingSession {
                 control: control_tx,
                 signals: signal_rx,
                 worker: Some(worker),
                 terminal: None,
                 terminal_emitted: false,
                 elapsed_nanos,
+                state,
+                temporary_output,
             })),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -357,24 +411,44 @@ mod native {
     fn worker_entry(
         config: RecordingConfig,
         controls: Receiver<Control>,
-        initialised: SyncSender<Result<()>>,
+        initialised: SyncSender<Result<Option<TemporaryOutput>>>,
         signals: Sender<WorkerSignal>,
         elapsed_nanos: Arc<AtomicU64>,
+        session_state: Arc<AtomicU8>,
     ) {
         match Worker::initialize(config) {
             Ok(WorkerStartup::Ready(mut worker)) => {
-                if initialised.send(Ok(())).is_ok() {
-                    let result = worker.run(&controls, &signals, &elapsed_nanos);
+                let temporary_output = worker.temporary_output.clone();
+                session_state.store(SESSION_RECORDING, Ordering::Release);
+                if initialised.send(Ok(temporary_output.clone())).is_ok() {
+                    let result = worker.run(&controls, &signals, &elapsed_nanos, &session_state);
                     drop(worker);
+                    session_state.store(SESSION_STOPPED, Ordering::Release);
                     let _ = signals.send(WorkerSignal::Terminal(Box::new(result)));
+                } else {
+                    drop(worker);
+                    if let Some(output) = temporary_output
+                        && let Err(error) = remove_temporary_output(&output)
+                    {
+                        record_abandoned_output(&output, &error);
+                    }
                 }
             }
-            Ok(WorkerStartup::Retained(recording)) => {
-                if initialised.send(Ok(())).is_ok() {
+            Ok(WorkerStartup::Retained {
+                recording,
+                temporary_output,
+            }) => {
+                session_state.store(SESSION_STOPPED, Ordering::Release);
+                if initialised.send(Ok(temporary_output.clone())).is_ok() {
                     let _ = signals.send(WorkerSignal::Terminal(Box::new(Ok(*recording))));
+                } else if let Some(output) = temporary_output
+                    && let Err(error) = remove_temporary_output(&output)
+                {
+                    record_abandoned_output(&output, &error);
                 }
             }
             Err(error) => {
+                session_state.store(SESSION_STOPPED, Ordering::Release);
                 let _ = initialised.send(Err(error));
             }
         }
@@ -382,13 +456,17 @@ mod native {
 
     enum WorkerStartup {
         Ready(Box<Worker>),
-        Retained(Box<Recording>),
+        Retained {
+            recording: Box<Recording>,
+            temporary_output: Option<TemporaryOutput>,
+        },
     }
 
     struct Worker {
         config: RecordingConfig,
         source: Box<dyn VideoSource>,
         engine_name: String,
+        resolved_target: Option<CaptureTarget>,
         first_frame: Option<PackedFrame>,
         dimensions: crate::config::Dimensions,
         video_encoder: Box<dyn VideoEncoder>,
@@ -396,7 +474,13 @@ mod native {
         audio_source: Option<PipeWireAudio>,
         audio_encoder: Option<AacEncoder>,
         audio_mixer: AudioMixer,
+        audio_cursor: u64,
+        audio_frame_offset: Option<i128>,
+        microphone_samples: bool,
+        system_audio_samples: bool,
+        audio_suspended: bool,
         muxer: Option<FragmentedMp4<File>>,
+        temporary_output: Option<TemporaryOutput>,
         state: RecordingStateMachine,
         pending_video: Option<EncodedVideoPacket>,
         pending_audio: VecDeque<EncodedAudioPacket>,
@@ -412,6 +496,7 @@ mod native {
             })?;
             first_frame.validate()?;
             let backing_scale = source.backing_scale();
+            let resolved_target = source.resolved_target();
             if config.resolution == RecordingResolution::LogicalPoints && backing_scale.is_none() {
                 tracing::warn!(
                     "the Linux source exposes physical buffers without a logical backing scale; \
@@ -454,7 +539,11 @@ mod native {
                 channels: AacEncoder::CHANNELS,
                 audio_specific_config: encoder.decoder_configuration().to_vec(),
             });
-            let (destination, file) = open_destination(config.destination.as_deref())?;
+            let OpenedDestination {
+                path: destination,
+                file,
+                temporary,
+            } = open_destination(config.destination.as_deref())?;
             config.destination = Some(destination.clone());
             let engine_name = format!("{} via {}", super::ENGINE_NAME, source.name());
             let muxer = match FragmentedMp4::new(file, &video_track, audio_track.as_ref()) {
@@ -466,7 +555,9 @@ mod native {
                         dimensions,
                         resolved_codec,
                         engine_name,
+                        resolved_target,
                         u16::from(audio_encoder.is_some()) * 2,
+                        temporary,
                         Error::Io(error),
                     );
                 }
@@ -479,7 +570,9 @@ mod native {
                     dimensions,
                     resolved_codec,
                     engine_name,
+                    resolved_target,
                     u16::from(audio_encoder.is_some()) * 2,
+                    temporary,
                     Error::Io(error),
                 );
             }
@@ -501,6 +594,7 @@ mod native {
                 config,
                 source,
                 engine_name,
+                resolved_target,
                 first_frame: Some(first_frame),
                 dimensions,
                 video_encoder,
@@ -508,7 +602,13 @@ mod native {
                 audio_source,
                 audio_encoder: audio_encoder.take(),
                 audio_mixer: AudioMixer::new(AacEncoder::SAMPLE_RATE),
+                audio_cursor: 0,
+                audio_frame_offset: None,
+                microphone_samples: false,
+                system_audio_samples: false,
+                audio_suspended: false,
                 muxer: Some(muxer),
+                temporary_output: temporary,
                 state,
                 pending_video: None,
                 pending_audio: VecDeque::new(),
@@ -522,6 +622,7 @@ mod native {
             controls: &Receiver<Control>,
             signals: &Sender<WorkerSignal>,
             elapsed_nanos: &AtomicU64,
+            session_state: &AtomicU8,
         ) -> Result<Recording> {
             let started = Instant::now();
             let mut timeline = RecordingTimeline::new(Duration::ZERO);
@@ -538,7 +639,13 @@ mod native {
                 if self.state.state() == RecorderState::Paused {
                     match controls.recv_timeout(Duration::from_millis(50)) {
                         Ok(control) => {
-                            if self.handle_control(control, started, &mut timeline, elapsed_nanos) {
+                            if self.handle_control(
+                                control,
+                                started,
+                                &mut timeline,
+                                elapsed_nanos,
+                                session_state,
+                            ) {
                                 user_stopped = true;
                                 break;
                             }
@@ -562,7 +669,13 @@ mod native {
                 loop {
                     match controls.try_recv() {
                         Ok(control) => {
-                            if self.handle_control(control, started, &mut timeline, elapsed_nanos) {
+                            if self.handle_control(
+                                control,
+                                started,
+                                &mut timeline,
+                                elapsed_nanos,
+                                session_state,
+                            ) {
                                 user_stopped = true;
                                 break;
                             }
@@ -588,7 +701,13 @@ mod native {
                 if now < next_capture {
                     match controls.recv_timeout(next_capture - now) {
                         Ok(control) => {
-                            if self.handle_control(control, started, &mut timeline, elapsed_nanos) {
+                            if self.handle_control(
+                                control,
+                                started,
+                                &mut timeline,
+                                elapsed_nanos,
+                                session_state,
+                            ) {
                                 user_stopped = true;
                                 break;
                             }
@@ -696,6 +815,7 @@ mod native {
             started: Instant,
             timeline: &mut RecordingTimeline,
             elapsed_nanos: &AtomicU64,
+            session_state: &AtomicU8,
         ) -> bool {
             let now = started.elapsed();
             match control {
@@ -706,6 +826,10 @@ mod native {
                         .and_then(|_| timeline.pause(now))
                         .and_then(|()| timeline.media_time(now))
                         .map(|elapsed| publish_elapsed(elapsed_nanos, elapsed));
+                    if result.is_ok() {
+                        self.audio_suspended = true;
+                        session_state.store(SESSION_PAUSED, Ordering::Release);
+                    }
                     let _ = reply.send(result);
                     false
                 }
@@ -716,6 +840,11 @@ mod native {
                         .and_then(|_| timeline.resume(now))
                         .and_then(|()| timeline.media_time(now))
                         .map(|elapsed| publish_elapsed(elapsed_nanos, elapsed));
+                    if result.is_ok() {
+                        self.audio_suspended = false;
+                        self.audio_frame_offset = None;
+                        session_state.store(SESSION_RECORDING, Ordering::Release);
+                    }
                     let _ = reply.send(result);
                     false
                 }
@@ -731,13 +860,27 @@ mod native {
                 return Ok(());
             };
             let (microphone, system) = source.poll()?;
+            self.microphone_samples |= microphone
+                .as_ref()
+                .is_some_and(|buffer| !buffer.samples.is_empty());
+            self.system_audio_samples |= system
+                .as_ref()
+                .is_some_and(|buffer| !buffer.samples.is_empty());
             let mixed = self.audio_mixer.mix(microphone.as_ref(), system.as_ref())?;
             if mixed.samples.is_empty() {
                 return Ok(());
             }
+            let samples = align_audio_to_timeline(
+                mixed,
+                &mut self.audio_cursor,
+                &mut self.audio_frame_offset,
+            )?;
+            if samples.is_empty() {
+                return Ok(());
+            }
             if let Some(encoder) = &mut self.audio_encoder {
                 self.pending_audio
-                    .extend(encoder.push_interleaved(&mixed.samples)?);
+                    .extend(encoder.push_interleaved(&samples)?);
             }
             Ok(())
         }
@@ -798,9 +941,14 @@ mod native {
             user_stopped: bool,
             mut failure: Option<String>,
         ) -> Result<Recording> {
-            match self.capture_audio() {
-                Ok(()) => {}
-                Err(error) => append_failure(&mut failure, error),
+            if !self.audio_suspended {
+                match self.capture_audio() {
+                    Ok(()) => {}
+                    Err(error) => append_failure(&mut failure, error),
+                }
+            }
+            if let Some(error) = self.missing_audio_error() {
+                append_failure(&mut failure, error);
             }
             match self.video_encoder.finish() {
                 Ok(packets) => {
@@ -827,11 +975,6 @@ mod native {
                 append_failure(&mut failure, error);
             }
 
-            let salvageability = if self.fragments_written > 0 {
-                Salvageability::Playable
-            } else {
-                Salvageability::InitialisationOnly
-            };
             if let Some(muxer) = self.muxer.take() {
                 match muxer.finish() {
                     Ok(file) => {
@@ -859,7 +1002,17 @@ mod native {
                 }
                 None => None,
             };
-            if partial_reason.is_some() {
+            let partial = if let Some(reason) = partial_reason {
+                let salvageability = recover_partial_output(&destination).map_err(|error| {
+                    Error::Storage(format!(
+                        "{reason}; no recoverable recording output was retained: {error}"
+                    ))
+                })?;
+                Some((salvageability, reason))
+            } else {
+                None
+            };
+            if partial.is_some() {
                 let _ = self.state.apply(RecorderCommand::Fail);
             } else {
                 let _ = self.state.apply(RecorderCommand::Finish);
@@ -868,15 +1021,24 @@ mod native {
                 path: destination,
                 duration_secs,
                 engine_name: self.engine_name.clone(),
-                target: self.config.target.clone(),
+                target: self.resolved_target.clone(),
                 dimensions: self.dimensions,
                 frames: self.frames_submitted,
                 audio_channels: if self.audio_encoder.is_some() { 2 } else { 0 },
                 codec: self.resolved_codec,
                 quality: self.config.quality,
                 resolution: self.config.resolution,
-                partial: partial_reason.map(|reason| (salvageability, reason)),
+                partial,
             })
+        }
+
+        fn missing_audio_error(&self) -> Option<Error> {
+            requested_audio_missing(
+                self.config.microphone,
+                self.config.system_audio,
+                self.microphone_samples,
+                self.system_audio_samples,
+            )
         }
     }
 
@@ -884,7 +1046,7 @@ mod native {
         path: PathBuf,
         duration_secs: f64,
         engine_name: String,
-        target: CaptureTarget,
+        target: Option<CaptureTarget>,
         dimensions: crate::config::Dimensions,
         frames: u64,
         audio_channels: u16,
@@ -900,34 +1062,45 @@ mod native {
         dimensions: crate::config::Dimensions,
         codec: VideoCodec,
         engine_name: String,
+        target: Option<CaptureTarget>,
         audio_channels: u16,
+        temporary_output: Option<TemporaryOutput>,
         error: Error,
     ) -> Result<WorkerStartup> {
-        match std::fs::remove_file(&path) {
-            Ok(()) => Err(error),
-            Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => Err(error),
-            Err(remove_error) => {
-                let recording = build_recording_report(FinalReport {
-                    path,
-                    duration_secs: 0.0,
-                    engine_name,
-                    target: config.target.clone(),
-                    dimensions,
-                    frames: 0,
-                    audio_channels,
-                    codec,
-                    quality: config.quality,
-                    resolution: config.resolution,
-                    partial: Some((
-                        Salvageability::InitialisationOnly,
-                        format!(
-                            "recording initialisation failed ({error}); the retained output could not be removed ({remove_error})"
-                        ),
-                    )),
-                })?;
-                Ok(WorkerStartup::Retained(Box::new(recording)))
+        let salvageability = match recover_partial_output(&path) {
+            Ok(salvageability) => salvageability,
+            Err(recovery_error) => {
+                if let Some(output) = temporary_output.as_ref()
+                    && let Err(cleanup_error) = remove_temporary_output(output)
+                {
+                    record_abandoned_output(output, &cleanup_error);
+                }
+                return Err(Error::Storage(format!(
+                    "recording initialisation failed ({error}); no recoverable output was retained: \
+                     {recovery_error}"
+                )));
             }
-        }
+        };
+        let recording = build_recording_report(FinalReport {
+            path,
+            duration_secs: 0.0,
+            engine_name,
+            target,
+            dimensions,
+            frames: 0,
+            audio_channels,
+            codec,
+            quality: config.quality,
+            resolution: config.resolution,
+            partial: Some((
+                salvageability,
+                format!("recording initialisation failed: {error}"),
+            )),
+        })?;
+        Ok(WorkerStartup::Retained {
+            recording: Box::new(recording),
+            temporary_output,
+        })
     }
 
     fn build_recording_report(report: FinalReport) -> Result<Recording> {
@@ -946,22 +1119,27 @@ mod native {
             resolution: Some(report.resolution),
         };
         let mut recording =
-            Recording::native(report.path, report.duration_secs, report.engine_name)?
-                .with_native_details(report.target, metadata)?;
+            Recording::native(report.path, report.duration_secs, report.engine_name)?;
+        if let Some(target) = report.target {
+            recording = recording.with_native_details(target, metadata)?;
+        } else {
+            recording.metadata = metadata;
+            recording.validate()?;
+        }
         if let Some((salvageability, reason)) = report.partial {
             recording = recording.into_partial_with_salvageability(salvageability, reason)?;
         }
         Ok(recording)
     }
 
-    fn open_destination(requested: Option<&Path>) -> Result<(PathBuf, File)> {
+    fn open_destination(requested: Option<&Path>) -> Result<OpenedDestination> {
         if let Some(path) = requested {
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(Error::Io)?;
-            return Ok((path.to_path_buf(), file));
+            let file = create_private_file(path)?;
+            return Ok(OpenedDestination {
+                path: path.to_path_buf(),
+                file,
+                temporary: None,
+            });
         }
 
         let epoch_nanos = SystemTime::now()
@@ -970,19 +1148,301 @@ mod native {
             .as_nanos();
         for _ in 0..1_024 {
             let counter = TEMP_OUTPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "scrozz-recording-{}-{epoch_nanos}-{counter}.mp4",
+            let directory = std::env::temp_dir().join(format!(
+                "scrozz-recording-{}-{epoch_nanos}-{counter}",
                 std::process::id()
             ));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((path, file)),
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&directory) {
+                Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(Error::Io(error)),
+            }
+            if let Err(error) =
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            {
+                let _ = std::fs::remove_dir(&directory);
+                return Err(Error::Io(error));
+            }
+            let path = directory.join("recording.mp4");
+            match create_private_file(&path) {
+                Ok(file) => {
+                    return Ok(OpenedDestination {
+                        path: path.clone(),
+                        file,
+                        temporary: Some(TemporaryOutput { directory, path }),
+                    });
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_dir(&directory);
+                    return Err(error);
+                }
             }
         }
         Err(Error::Platform(
             "could not reserve a collision-safe temporary recording path".into(),
         ))
+    }
+
+    fn create_private_file(path: &Path) -> Result<File> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(Error::Io)?;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(Error::Io(error));
+        }
+        Ok(file)
+    }
+
+    fn recover_partial_output(path: &Path) -> Result<Salvageability> {
+        let (salvageability, valid_prefix_len) = inspect_recovery_file(path).map_err(|error| {
+            remove_unreportable_output(
+                path,
+                format!("could not inspect partial recording output: {error}"),
+            )
+        })?;
+        let salvageability = match salvageability {
+            RecoverySalvageability::InitialisationOnly => Salvageability::InitialisationOnly,
+            RecoverySalvageability::Playable => Salvageability::Playable,
+            RecoverySalvageability::None => {
+                return Err(remove_unreportable_output(
+                    path,
+                    "the partial recording has no complete initialisation segment".into(),
+                ));
+            }
+        };
+        let file_len = std::fs::metadata(path)
+            .map_err(|error| {
+                remove_unreportable_output(
+                    path,
+                    format!("could not inspect partial recording length: {error}"),
+                )
+            })?
+            .len();
+        if valid_prefix_len < file_len {
+            let truncate = OpenOptions::new().write(true).open(path).and_then(|file| {
+                file.set_len(valid_prefix_len)?;
+                file.sync_all()
+            });
+            if let Err(error) = truncate {
+                return Err(remove_unreportable_output(
+                    path,
+                    format!(
+                        "could not truncate the partial recording to a playable prefix: {error}"
+                    ),
+                ));
+            }
+        }
+        Ok(salvageability)
+    }
+
+    fn inspect_recovery_file(path: &Path) -> std::io::Result<(RecoverySalvageability, u64)> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut cursor = 0_u64;
+        let mut valid_prefix = 0_u64;
+        let mut saw_ftyp = false;
+        let mut saw_moov = false;
+        let mut pending_moof = None;
+        let mut complete_fragments = 0_u64;
+        let mut header = [0_u8; 16];
+
+        while cursor.saturating_add(8) <= file_len {
+            let start = cursor;
+            file.seek(SeekFrom::Start(cursor))?;
+            file.read_exact(&mut header[..8])?;
+            let size32 = u32::from_be_bytes(header[..4].try_into().unwrap());
+            let kind: [u8; 4] = header[4..8].try_into().unwrap();
+            let (header_size, box_size) = if size32 == 1 {
+                if cursor.saturating_add(16) > file_len {
+                    break;
+                }
+                file.read_exact(&mut header[8..16])?;
+                (
+                    16_u64,
+                    u64::from_be_bytes(header[8..16].try_into().unwrap()),
+                )
+            } else if size32 == 0 {
+                (8_u64, file_len - cursor)
+            } else {
+                (8_u64, u64::from(size32))
+            };
+            if box_size < header_size || cursor.saturating_add(box_size) > file_len {
+                break;
+            }
+            cursor += box_size;
+            match &kind {
+                b"ftyp" => saw_ftyp = true,
+                b"moov" => saw_moov = true,
+                b"moof" if saw_ftyp && saw_moov => pending_moof = Some(start),
+                b"mdat" if pending_moof.take().is_some() => {
+                    complete_fragments = complete_fragments.saturating_add(1);
+                    valid_prefix = cursor;
+                }
+                _ => {
+                    if pending_moof.take().is_some() {
+                        break;
+                    }
+                }
+            }
+            if saw_ftyp && saw_moov && pending_moof.is_none() && complete_fragments == 0 {
+                valid_prefix = cursor;
+            }
+        }
+        if let Some(moof_start) = pending_moof {
+            valid_prefix = valid_prefix.min(moof_start);
+        }
+        let salvageability = if complete_fragments > 0 {
+            RecoverySalvageability::Playable
+        } else if saw_ftyp && saw_moov {
+            RecoverySalvageability::InitialisationOnly
+        } else {
+            RecoverySalvageability::None
+        };
+        Ok((salvageability, valid_prefix))
+    }
+
+    fn remove_unreportable_output(path: &Path, reason: String) -> Error {
+        match std::fs::remove_file(path) {
+            Ok(()) => Error::Storage(reason),
+            Err(error) if error.kind() == ErrorKind::NotFound => Error::Storage(reason),
+            Err(error) => Error::Storage(format!(
+                "{reason}; invalid output remains at {} because it could not be removed: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn remove_temporary_output(output: &TemporaryOutput) -> std::io::Result<()> {
+        match std::fs::remove_file(&output.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match std::fs::remove_dir(&output.directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_abandoned_output(output: &TemporaryOutput, cleanup_error: &std::io::Error) {
+        let Some(state_home) = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".local").join("state"))
+            })
+        else {
+            tracing::error!(
+                path = %output.path.display(),
+                %cleanup_error,
+                "abandoned recording could not be removed and no state directory is available"
+            );
+            return;
+        };
+        let directory = state_home.join("scrozz");
+        let persist = (|| -> std::io::Result<()> {
+            let mut builder = DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&directory)?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            let marker = directory.join("abandoned-recordings.log");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&marker)?;
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))?;
+            writeln!(file, "{:?}\tcleanup failed: {}", output.path, cleanup_error)?;
+            file.sync_all()
+        })();
+        if let Err(error) = persist {
+            tracing::error!(
+                path = %output.path.display(),
+                %cleanup_error,
+                persist_error = %error,
+                "abandoned recording could not be removed or written to the recovery log"
+            );
+        }
+    }
+
+    fn align_audio_to_timeline(
+        mut buffer: AudioBuffer,
+        cursor: &mut u64,
+        frame_offset: &mut Option<i128>,
+    ) -> Result<Vec<f32>> {
+        if buffer.channels != 2 || buffer.sample_rate != AacEncoder::SAMPLE_RATE {
+            return Err(Error::InvalidRequest(
+                "Linux mixed audio must be 48 kHz interleaved stereo".into(),
+            ));
+        }
+        let source_frames = buffer.samples.len() / usize::from(buffer.channels);
+        if source_frames == 0 {
+            return Ok(Vec::new());
+        }
+        let offset = frame_offset
+            .get_or_insert_with(|| i128::from(*cursor) - i128::from(buffer.start_frame));
+        let mapped_start = i128::from(buffer.start_frame) + *offset;
+        let mut mapped_start = u64::try_from(mapped_start).map_err(|_| {
+            Error::Platform("PipeWire audio timestamp precedes the timeline".into())
+        })?;
+        if mapped_start < *cursor {
+            let overlap_frames = *cursor - mapped_start;
+            let overlap_samples = usize::try_from(overlap_frames)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(usize::from(buffer.channels));
+            if overlap_samples >= buffer.samples.len() {
+                return Ok(Vec::new());
+            }
+            buffer.samples.drain(..overlap_samples);
+            mapped_start = *cursor;
+        }
+        let gap_frames = mapped_start - *cursor;
+        let gap_samples = usize::try_from(gap_frames)
+            .ok()
+            .and_then(|frames| frames.checked_mul(usize::from(buffer.channels)))
+            .ok_or_else(|| Error::Platform("PipeWire audio timeline gap exceeds memory".into()))?;
+        let output_len = gap_samples
+            .checked_add(buffer.samples.len())
+            .ok_or_else(|| Error::Platform("PipeWire audio timeline exceeds memory".into()))?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| Error::Platform("PipeWire audio timeline exceeds memory".into()))?;
+        output.resize(gap_samples, 0.0);
+        output.extend(buffer.samples);
+        let output_frames = output.len() / usize::from(buffer.channels);
+        *cursor = cursor.saturating_add(output_frames as u64);
+        Ok(output)
+    }
+
+    fn requested_audio_missing(
+        microphone_requested: bool,
+        system_requested: bool,
+        microphone_samples: bool,
+        system_samples: bool,
+    ) -> Option<Error> {
+        let mut missing = Vec::new();
+        if microphone_requested && !microphone_samples {
+            missing.push("microphone");
+        }
+        if system_requested && !system_samples {
+            missing.push("system audio");
+        }
+        (!missing.is_empty()).then(|| {
+            Error::Platform(format!(
+                "requested {} capture produced no samples",
+                missing.join(" and ")
+            ))
+        })
     }
 
     fn publish_elapsed(shared: &AtomicU64, elapsed: Duration) {
@@ -1002,7 +1462,9 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use std::sync::atomic::AtomicU64;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU8, AtomicU64};
         use std::sync::{Arc, mpsc};
         use std::thread;
         use std::time::Duration;
@@ -1010,13 +1472,21 @@ mod native {
         use scrozz_core::CaptureTarget;
 
         use super::{
-            FinalReport, LinuxRecordingSession, TerminalOutcome, WorkerSignal,
-            build_recording_report, open_destination,
+            FinalReport, LinuxRecordingSession, OpenedDestination, SESSION_PAUSED,
+            SESSION_RECORDING, SESSION_STOPPED, TerminalOutcome, WorkerSignal,
+            align_audio_to_timeline, build_recording_report, open_destination,
+            recover_partial_output, remove_temporary_output, requested_audio_missing,
         };
+        use crate::audio::AudioBuffer;
         use crate::config::Dimensions;
+        use crate::muxer::{
+            EncodedSample, FragmentedMp4, MediaFragment, TrackFragment, VideoCodecConfiguration,
+            VideoTrackConfig,
+        };
         use crate::{
             Quality, RecordingCompletion, RecordingEngine, RecordingProvenance,
-            RecordingResolution, RecordingSession, Salvageability, SessionEvent, VideoCodec,
+            RecordingResolution, RecordingSession, RecordingState, Salvageability, SessionEvent,
+            VideoCodec,
         };
 
         #[test]
@@ -1040,26 +1510,51 @@ mod native {
         }
 
         #[test]
-        fn temporary_destinations_are_mp4_and_collision_safe() {
-            let (first_path, first_file) = open_destination(None).unwrap();
-            let (second_path, second_file) = open_destination(None).unwrap();
-            assert_ne!(first_path, second_path);
+        fn temporary_destinations_are_private_mp4_files_in_private_directories() {
+            let first = open_destination(None).unwrap();
+            let second = open_destination(None).unwrap();
+            assert_ne!(first.path, second.path);
             assert_eq!(
-                first_path.extension().and_then(|value| value.to_str()),
+                first.path.extension().and_then(|value| value.to_str()),
                 Some("mp4")
             );
             assert_eq!(
-                second_path.extension().and_then(|value| value.to_str()),
+                second.path.extension().and_then(|value| value.to_str()),
                 Some("mp4")
             );
-            drop((first_file, second_file));
-            std::fs::remove_file(first_path).unwrap();
-            std::fs::remove_file(second_path).unwrap();
+            for destination in [&first, &second] {
+                let temporary = destination.temporary.as_ref().unwrap();
+                assert_eq!(
+                    std::fs::metadata(&temporary.directory)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    std::fs::metadata(&temporary.path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            let first_temporary = first.temporary.clone().unwrap();
+            let second_temporary = second.temporary.clone().unwrap();
+            drop((first.file, second.file));
+            remove_temporary_output(&first_temporary).unwrap();
+            remove_temporary_output(&second_temporary).unwrap();
         }
 
         #[test]
         fn report_contains_native_provenance_metadata_and_initialisation_partial() {
-            let (path, file) = open_destination(None).unwrap();
+            let OpenedDestination {
+                path,
+                file,
+                temporary,
+            } = open_destination(None).unwrap();
             drop(file);
             std::fs::write(&path, b"test").unwrap();
             let target = CaptureTarget::AllDisplays;
@@ -1067,7 +1562,7 @@ mod native {
                 path: path.clone(),
                 duration_secs: 1.25,
                 engine_name: "Linux test source".into(),
-                target: target.clone(),
+                target: Some(target.clone()),
                 dimensions: Dimensions {
                     width: 1280,
                     height: 720,
@@ -1112,7 +1607,141 @@ mod native {
                 recording.metadata.resolution,
                 Some(RecordingResolution::MaxShortestEdge(720))
             );
-            std::fs::remove_file(path).unwrap();
+            remove_temporary_output(&temporary.unwrap()).unwrap();
+        }
+
+        #[test]
+        fn report_does_not_invent_a_native_target() {
+            let OpenedDestination {
+                path,
+                file,
+                temporary,
+            } = open_destination(None).unwrap();
+            drop(file);
+            let recording = build_recording_report(FinalReport {
+                path,
+                duration_secs: 0.0,
+                engine_name: "Wayland test source".into(),
+                target: None,
+                dimensions: Dimensions {
+                    width: 2,
+                    height: 2,
+                },
+                frames: 0,
+                audio_channels: 0,
+                codec: VideoCodec::Av1,
+                quality: Quality::Balanced,
+                resolution: RecordingResolution::Native,
+                partial: Some((Salvageability::InitialisationOnly, "test partial".into())),
+            })
+            .unwrap();
+            assert_eq!(
+                recording.provenance,
+                RecordingProvenance::Native {
+                    engine: "Wayland test source".into(),
+                    target: None,
+                }
+            );
+            remove_temporary_output(&temporary.unwrap()).unwrap();
+        }
+
+        #[test]
+        fn partial_output_is_truncated_to_the_last_complete_fragment() {
+            let OpenedDestination {
+                path,
+                file,
+                temporary,
+            } = open_destination(None).unwrap();
+            let video = VideoTrackConfig {
+                width: 2,
+                height: 2,
+                timescale: 30,
+                codec: VideoCodecConfiguration::Av1(vec![0x81, 0, 0, 0]),
+            };
+            let mut muxer = FragmentedMp4::new(file, &video, None).unwrap();
+            muxer
+                .write_fragment(&MediaFragment {
+                    video: TrackFragment {
+                        base_decode_time: 0,
+                        samples: vec![EncodedSample {
+                            data: vec![1, 2, 3],
+                            duration: 1,
+                            keyframe: true,
+                        }],
+                    },
+                    audio: None,
+                })
+                .unwrap();
+            let mut file = muxer.finish().unwrap();
+            file.sync_all().unwrap();
+            let valid_len = file.metadata().unwrap().len();
+            file.write_all(&[0, 0, 0, 16, b'm', b'o', b'o', b'f'])
+                .unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+
+            assert_eq!(
+                recover_partial_output(&path).unwrap(),
+                Salvageability::Playable
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
+            remove_temporary_output(&temporary.unwrap()).unwrap();
+        }
+
+        #[test]
+        fn audio_timeline_preserves_pts_gaps_and_rebases_after_pause() {
+            let mut cursor = 0;
+            let mut offset = None;
+            let first = align_audio_to_timeline(
+                AudioBuffer {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    start_frame: 100,
+                    samples: vec![0.25, -0.25, 0.5, -0.5],
+                },
+                &mut cursor,
+                &mut offset,
+            )
+            .unwrap();
+            assert_eq!(first, vec![0.25, -0.25, 0.5, -0.5]);
+            assert_eq!(cursor, 2);
+
+            let second = align_audio_to_timeline(
+                AudioBuffer {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    start_frame: 104,
+                    samples: vec![0.75, -0.75],
+                },
+                &mut cursor,
+                &mut offset,
+            )
+            .unwrap();
+            assert_eq!(second, vec![0.0, 0.0, 0.0, 0.0, 0.75, -0.75]);
+            assert_eq!(cursor, 5);
+
+            offset = None;
+            let resumed = align_audio_to_timeline(
+                AudioBuffer {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    start_frame: 48_000,
+                    samples: vec![1.0, -1.0],
+                },
+                &mut cursor,
+                &mut offset,
+            )
+            .unwrap();
+            assert_eq!(resumed, vec![1.0, -1.0]);
+            assert_eq!(cursor, 6);
+        }
+
+        #[test]
+        fn requested_audio_without_samples_is_a_product_failure() {
+            let error = requested_audio_missing(true, true, false, true).unwrap();
+            assert!(error.to_string().contains("microphone"));
+            assert!(!error.to_string().contains("system audio"));
+            assert!(requested_audio_missing(true, false, true, false).is_none());
         }
 
         #[test]
@@ -1135,6 +1764,8 @@ mod native {
                 terminal: None,
                 terminal_emitted: false,
                 elapsed_nanos,
+                state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
+                temporary_output: None,
             };
 
             assert!(matches!(poll_until(&mut session), SessionEvent::FirstFrame));
@@ -1144,6 +1775,7 @@ mod native {
             assert_eq!(polled, expected);
             assert!(session.poll().is_none());
             assert_eq!(session.engine_elapsed_secs(), Some(1.25));
+            assert_eq!(session.state(), RecordingState::Stopped);
             assert_eq!(Box::new(session).stop().unwrap(), expected);
         }
 
@@ -1165,6 +1797,8 @@ mod native {
                 terminal: None,
                 terminal_emitted: false,
                 elapsed_nanos: Arc::new(AtomicU64::new(0)),
+                state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
+                temporary_output: None,
             };
             let SessionEvent::Failed(error) = poll_until(&mut session) else {
                 panic!("expected terminal failure event");
@@ -1193,12 +1827,67 @@ mod native {
                 terminal: None,
                 terminal_emitted: false,
                 elapsed_nanos: Arc::new(AtomicU64::new(0)),
+                state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
+                temporary_output: None,
             };
             let SessionEvent::Failed(error) = poll_until(&mut session) else {
                 panic!("expected terminal failure event");
             };
             assert!(error.is_cancellation());
             assert!(Box::new(session).stop().unwrap_err().is_cancellation());
+        }
+
+        #[test]
+        fn state_reports_paused_and_ended_workers() {
+            let (control, _controls) = mpsc::channel();
+            let (_signals, signal_rx) = mpsc::channel();
+            let state = Arc::new(AtomicU8::new(SESSION_PAUSED));
+            let session = LinuxRecordingSession {
+                control,
+                signals: signal_rx,
+                worker: None,
+                terminal: None,
+                terminal_emitted: false,
+                elapsed_nanos: Arc::new(AtomicU64::new(0)),
+                state: Arc::clone(&state),
+                temporary_output: None,
+            };
+            assert_eq!(session.state(), RecordingState::Paused);
+            state.store(SESSION_STOPPED, std::sync::atomic::Ordering::Release);
+            assert_eq!(session.state(), RecordingState::Stopped);
+        }
+
+        #[test]
+        fn dropping_an_unreported_session_removes_temporary_output() {
+            let OpenedDestination {
+                path,
+                file,
+                temporary,
+            } = open_destination(None).unwrap();
+            drop(file);
+            std::fs::write(&path, b"abandoned").unwrap();
+            let temporary = temporary.unwrap();
+            let directory = temporary.directory.clone();
+            let recording = crate::Recording::native(&path, 0.0, "Linux test").unwrap();
+            let (control, _controls) = mpsc::channel();
+            let (signals, signal_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                signals
+                    .send(WorkerSignal::Terminal(Box::new(Ok(recording))))
+                    .unwrap();
+            });
+            drop(LinuxRecordingSession {
+                control,
+                signals: signal_rx,
+                worker: Some(worker),
+                terminal: None,
+                terminal_emitted: false,
+                elapsed_nanos: Arc::new(AtomicU64::new(0)),
+                state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
+                temporary_output: Some(temporary),
+            });
+            assert!(!path.exists());
+            assert!(!directory.exists());
         }
 
         fn poll_until(session: &mut LinuxRecordingSession) -> SessionEvent {
