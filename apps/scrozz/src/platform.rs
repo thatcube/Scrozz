@@ -167,6 +167,13 @@ pub const fn ocr_available() -> bool {
     scrozz_ocr::SystemOcr::is_available()
 }
 
+/// Package identity of the running Windows process.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn windows_package_identity() -> scrozz_shell::windows::identity::PackageIdentity {
+    scrozz_shell::windows::identity::current()
+}
+
 /// Decodes an image file into a frame.
 ///
 /// Goes through `scrozz-export` rather than an image crate of its own, so the

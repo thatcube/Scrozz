@@ -103,6 +103,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     args.validate()?;
     let target = args.target.resolve()?;
     let sinks = args.sinks();
+    let runtime = runtime_json();
 
     let plan = Json::obj([
         ("target", target_json(&target)),
@@ -117,7 +118,11 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
 
     if args.dry_run {
         return Ok(Report::new(
-            Json::obj([("dry_run", Json::Bool(true)), ("plan", plan)]),
+            Json::obj([
+                ("dry_run", Json::Bool(true)),
+                ("runtime", runtime),
+                ("plan", plan),
+            ]),
             describe_plan("Would capture", &target, &sinks),
         ));
     }
@@ -185,6 +190,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     }
 
     let data = Json::obj([
+        ("runtime", runtime),
         ("plan", plan),
         ("width", Json::Int(i64::from(frame.width()))),
         ("height", Json::Int(i64::from(frame.height()))),
@@ -525,6 +531,54 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
     Report::new(data, text)
 }
 
+/// Runtime details whose behavior differs between artifact types.
+///
+/// Kept inside command payloads rather than the top-level envelope so adding a
+/// field does not break schema 1 consumers.
+fn runtime_json() -> Json {
+    #[cfg(target_os = "windows")]
+    {
+        let identity = platform::windows_package_identity();
+        return Json::obj([(
+            "package_identity",
+            package_identity_json(
+                identity.state(),
+                identity.full_name(),
+                identity.failure_status(),
+                identity.failure_detail(),
+            ),
+        )]);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Json::Null
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn package_identity_json(
+    state: &str,
+    full_name: Option<&str>,
+    failure_status: Option<u32>,
+    failure_detail: Option<&str>,
+) -> Json {
+    Json::obj([
+        ("state", Json::str(state)),
+        (
+            "full_name",
+            Json::opt(full_name, |name| Json::str(name.to_owned())),
+        ),
+        (
+            "failure_status",
+            Json::opt(failure_status, |status| Json::Int(i64::from(status))),
+        ),
+        (
+            "failure_detail",
+            Json::opt(failure_detail, |detail| Json::str(detail.to_owned())),
+        ),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // settings
 // ---------------------------------------------------------------------------
@@ -766,6 +820,30 @@ mod tests {
         assert!(rendered.contains(r#""kind":"region""#), "{rendered}");
         assert!(rendered.contains(r#""x":10.0"#), "{rendered}");
         assert!(rendered.contains(r#""width":300.0"#), "{rendered}");
+    }
+
+    #[test]
+    fn package_identity_json_keeps_each_runtime_state_distinct() {
+        assert_eq!(
+            package_identity_json(
+                "packaged",
+                Some("Scrozz_1.0.0.0_neutral__publisher"),
+                None,
+                None,
+            )
+            .to_compact_string(),
+            r#"{"state":"packaged","full_name":"Scrozz_1.0.0.0_neutral__publisher","failure_status":null,"failure_detail":null}"#
+        );
+        assert_eq!(
+            package_identity_json(
+                "unknown",
+                None,
+                Some(5),
+                Some("GetCurrentPackageFullName failed"),
+            )
+            .to_compact_string(),
+            r#"{"state":"unknown","full_name":null,"failure_status":5,"failure_detail":"GetCurrentPackageFullName failed"}"#
+        );
     }
 
     #[test]
