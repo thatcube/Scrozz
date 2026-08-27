@@ -7,13 +7,20 @@
 use scrozz_annotate::{Annotation, Style};
 use scrozz_core::LogicalPoint;
 use scrozz_store::{
-    CaptureId, DocumentState, History as _, ImageState, NewCapture, RetentionPolicy, SearchQuery,
-    SqliteStore, Store as _, Timestamp,
+    CaptureId, DocumentState, History as _, ImageState, NewCapture, RetentionPolicy,
+    RetentionWindow, SearchQuery, SqliteStore, Store as _, Timestamp,
     test_support::{ScratchDir, sample_document, scratch_dir},
 };
 
 /// Each capture is 16×16 RGBA, so exactly 1 KiB of pixels.
 const IMAGE_BYTES: u64 = 16 * 16 * 4;
+
+fn policy(max_image_bytes: u64) -> RetentionPolicy {
+    RetentionPolicy {
+        max_image_bytes,
+        ..RetentionPolicy::default()
+    }
+}
 
 fn store(label: &str) -> (ScratchDir, SqliteStore) {
     let dir = scratch_dir(label);
@@ -43,11 +50,7 @@ fn a_history_under_the_cap_is_left_completely_alone() {
     let (_dir, mut store) = store("under-cap");
     let ids = fill(&mut store, 5);
 
-    let report = store
-        .evict(&RetentionPolicy {
-            max_image_bytes: 10 * IMAGE_BYTES,
-        })
-        .expect("retention");
+    let report = store.evict(&policy(10 * IMAGE_BYTES)).expect("retention");
 
     assert!(!report.evicted_anything());
     assert_eq!(report.bytes_remaining, 5 * IMAGE_BYTES);
@@ -69,11 +72,7 @@ fn eviction_removes_the_oldest_first_and_stops_at_the_cap() {
     let ids = fill(&mut store, 10);
 
     // Room for six images. Four must go, and they must be the four oldest.
-    let report = store
-        .evict(&RetentionPolicy {
-            max_image_bytes: 6 * IMAGE_BYTES,
-        })
-        .expect("retention");
+    let report = store.evict(&policy(6 * IMAGE_BYTES)).expect("retention");
 
     assert_eq!(report.evicted.len(), 4, "{report:?}");
     assert_eq!(report.evicted, ids[..4].to_vec(), "oldest first, in order");
@@ -140,11 +139,7 @@ fn an_evicted_capture_still_lists_with_its_edits_intact() {
         .insert(NewCapture::new(&recent).taken_at(Timestamp(base + 60_000)))
         .expect("insert");
 
-    store
-        .evict(&RetentionPolicy {
-            max_image_bytes: IMAGE_BYTES,
-        })
-        .expect("retention");
+    store.evict(&policy(IMAGE_BYTES)).expect("retention");
 
     // Still in history.
     assert_eq!(store.count().expect("count"), 2);
@@ -193,9 +188,7 @@ fn edits_can_still_be_made_to_a_capture_whose_image_is_gone() {
     let document = sample_document(16, 16, 1, 1);
     let id = store.insert(NewCapture::new(&document)).expect("insert");
 
-    store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    store.evict(&policy(0)).expect("retention");
 
     let DocumentState::ImageEvicted(evicted) = store.document(&id).expect("read").expect("present")
     else {
@@ -231,9 +224,7 @@ fn pinned_captures_are_never_evicted_even_when_that_breaks_the_cap() {
     store.set_pinned(&ids[0], true).expect("pin");
     store.set_pinned(&ids[1], true).expect("pin");
 
-    let report = store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    let report = store.evict(&policy(0)).expect("retention");
 
     assert_eq!(report.pinned_bytes, 2 * IMAGE_BYTES);
     assert!(
@@ -277,9 +268,7 @@ fn unpinning_makes_a_capture_evictable_again() {
     let ids = fill(&mut store, 3);
     store.set_pinned(&ids[0], true).expect("pin");
 
-    store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    store.evict(&policy(0)).expect("retention");
     assert!(
         store
             .record(&ids[0])
@@ -290,9 +279,7 @@ fn unpinning_makes_a_capture_evictable_again() {
     );
 
     store.set_pinned(&ids[0], false).expect("unpin");
-    let report = store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    let report = store.evict(&policy(0)).expect("retention");
 
     assert_eq!(report.evicted, vec![ids[0].clone()]);
     assert_eq!(store.stored_image_bytes().expect("size"), 0);
@@ -303,9 +290,7 @@ fn eviction_never_removes_a_capture_or_its_document() {
     let (dir, mut store) = store("nothing-deleted");
     let ids = fill(&mut store, 8);
 
-    store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    store.evict(&policy(0)).expect("retention");
 
     assert_eq!(
         store.count().expect("count"),
@@ -353,9 +338,7 @@ fn deduplicated_pixels_survive_until_the_last_capture_referring_to_them_is_evict
     assert_eq!(store.stored_image_bytes().expect("size"), IMAGE_BYTES);
 
     // Cap of zero, but only the older capture is over the line first.
-    let report = store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    let report = store.evict(&policy(0)).expect("retention");
     assert_eq!(report.evicted, vec![older.clone(), newer.clone()]);
     assert_eq!(
         report.bytes_reclaimed, IMAGE_BYTES,
@@ -380,9 +363,7 @@ fn a_shared_blob_is_kept_while_a_pinned_capture_still_needs_it() {
         .expect("insert");
     store.set_pinned(&newer, true).expect("pin");
 
-    let report = store
-        .evict(&RetentionPolicy { max_image_bytes: 0 })
-        .expect("retention");
+    let report = store.evict(&policy(0)).expect("retention");
 
     assert_eq!(report.evicted, vec![older.clone()]);
     assert_eq!(
@@ -415,11 +396,7 @@ fn the_default_policy_is_ten_gigabytes_and_a_small_history_never_reaches_it() {
 fn eviction_state_survives_a_reopen() {
     let (dir, mut store) = store("eviction-persists");
     let ids = fill(&mut store, 4);
-    store
-        .evict(&RetentionPolicy {
-            max_image_bytes: 2 * IMAGE_BYTES,
-        })
-        .expect("retention");
+    store.evict(&policy(2 * IMAGE_BYTES)).expect("retention");
     drop(store);
 
     let store = SqliteStore::open(dir.path()).expect("reopen");
@@ -447,11 +424,7 @@ fn eviction_state_survives_a_reopen() {
 fn images_only_is_the_opt_in_and_history_shows_evicted_captures_by_default() {
     let (_dir, mut store) = store("images-only");
     fill(&mut store, 4);
-    store
-        .evict(&RetentionPolicy {
-            max_image_bytes: 2 * IMAGE_BYTES,
-        })
-        .expect("retention");
+    store.evict(&policy(2 * IMAGE_BYTES)).expect("retention");
 
     let everything = store.search(&SearchQuery::all()).expect("search");
     assert_eq!(
@@ -470,9 +443,7 @@ fn images_only_is_the_opt_in_and_history_shows_evicted_captures_by_default() {
 fn repeated_enforcement_is_idempotent() {
     let (_dir, mut store) = store("idempotent");
     fill(&mut store, 5);
-    let policy = RetentionPolicy {
-        max_image_bytes: 2 * IMAGE_BYTES,
-    };
+    let policy = policy(2 * IMAGE_BYTES);
 
     let first = store.evict(&policy).expect("retention");
     let second = store.evict(&policy).expect("retention");
@@ -483,6 +454,97 @@ fn repeated_enforcement_is_idempotent() {
         "a second pass at the same cap must find nothing to do"
     );
     assert_eq!(second.bytes_remaining, 2 * IMAGE_BYTES);
+}
+
+#[test]
+fn age_retention_runs_before_the_size_pass_and_keeps_recent_pixels() {
+    let (_dir, mut store) = store("age-window");
+    let now = Timestamp::now();
+    let day = 86_400_000;
+    let old_document = sample_document(16, 16, 31, 1);
+    let recent_document = sample_document(16, 16, 32, 1);
+    let old = store
+        .insert(NewCapture::new(&old_document).taken_at(Timestamp(now.0 - 8 * day)))
+        .expect("old");
+    let recent = store
+        .insert(NewCapture::new(&recent_document).taken_at(Timestamp(now.0 - day)))
+        .expect("recent");
+
+    let report = store
+        .evict(&RetentionPolicy {
+            max_image_bytes: u64::MAX,
+            max_image_age: RetentionWindow::OneWeek,
+        })
+        .expect("retention");
+
+    assert_eq!(report.evicted, vec![old.clone()]);
+    assert!(store.image(&old).expect("old image").is_none());
+    assert!(store.image(&recent).expect("recent image").is_some());
+    assert!(
+        matches!(
+            store
+                .document(&old)
+                .expect("old document")
+                .expect("present"),
+            DocumentState::ImageEvicted(_)
+        ),
+        "age retention evicts pixels, never the document"
+    );
+}
+
+#[test]
+fn age_retention_never_evicts_pinned_pixels() {
+    let (_dir, mut store) = store("age-pinned");
+    let old_document = sample_document(16, 16, 41, 1);
+    let old = store
+        .insert(
+            NewCapture::new(&old_document)
+                .taken_at(Timestamp(Timestamp::now().0 - 31 * 86_400_000))
+                .pinned(),
+        )
+        .expect("old pinned capture");
+
+    let report = store
+        .evict(&RetentionPolicy {
+            max_image_bytes: u64::MAX,
+            max_image_age: RetentionWindow::OneDay,
+        })
+        .expect("retention");
+
+    assert!(!report.evicted_anything());
+    assert!(store.image(&old).expect("image").is_some());
+}
+
+#[test]
+fn expiring_one_capture_never_removes_a_blob_shared_with_a_recent_capture() {
+    let (_dir, mut store) = store("age-shared-blob");
+    let now = Timestamp::now();
+    let document = sample_document(16, 16, 51, 0);
+    let old = store
+        .insert(NewCapture::new(&document).taken_at(Timestamp(now.0 - 2 * 86_400_000)))
+        .expect("old");
+    let recent = store
+        .insert(NewCapture::new(&document).taken_at(now))
+        .expect("recent");
+
+    let report = store
+        .evict(&RetentionPolicy {
+            max_image_bytes: u64::MAX,
+            max_image_age: RetentionWindow::OneDay,
+        })
+        .expect("retention");
+
+    assert_eq!(report.evicted, vec![old.clone()]);
+    assert_eq!(
+        report.bytes_reclaimed, 0,
+        "the recent capture still references the shared blob"
+    );
+    assert!(store.image(&old).expect("old image").is_none());
+    assert_eq!(
+        store.image(&recent).expect("recent image"),
+        Some(document.source.frame.data),
+        "the shared bytes must remain readable through the recent capture"
+    );
 }
 
 fn walk_files(dir: &std::path::Path) -> usize {

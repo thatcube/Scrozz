@@ -51,7 +51,8 @@ pub mod test_support;
 
 pub use layout::StoreLayout;
 pub use model::{
-    CaptureRecord, FrameHeader, ImageState, Page, RetentionReport, SearchQuery, Timestamp,
+    CaptureRecord, FrameHeader, ImageState, MediaKind, Page, RetentionReport, RetentionWindow,
+    SearchQuery, Timestamp,
 };
 pub use record::StoredRecord;
 pub use sqlite_store::{
@@ -70,6 +71,9 @@ pub struct CaptureId(pub String);
 pub struct RetentionPolicy {
     /// Maximum bytes of source imagery to retain.
     pub max_image_bytes: u64,
+    /// Maximum age of unpinned source imagery.
+    #[serde(default)]
+    pub max_image_age: RetentionWindow,
 }
 
 impl Default for RetentionPolicy {
@@ -78,6 +82,7 @@ impl Default for RetentionPolicy {
         // that the app cannot quietly consume a disk.
         Self {
             max_image_bytes: 10 * 1024 * 1024 * 1024,
+            max_image_age: RetentionWindow::Forever,
         }
     }
 }

@@ -13,15 +13,15 @@ use crate::{
     id::capture_id_at,
     layout::StoreLayout,
     model::{
-        CaptureRecord, FrameHeader, ImageState, Page, ProvenanceRepr, RetentionReport, SearchQuery,
-        TargetRepr, Timestamp,
+        CaptureRecord, FrameHeader, ImageState, MediaKind, Page, ProvenanceRepr, RetentionReport,
+        SearchQuery, TargetRepr, Timestamp,
     },
     record::StoredRecord,
     schema,
 };
 
 /// Columns every record query selects, in the order [`row_to_record`] reads.
-const RECORD_COLUMNS: &str = "id, created_at, pinned, app_name, window_title, provenance, \
+const RECORD_COLUMNS: &str = "id, created_at, media_kind, pinned, app_name, window_title, provenance, \
      target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text, \
      annotation_count";
 
@@ -37,6 +37,8 @@ pub struct NewCapture<'a> {
     pub document: &'a Document,
     /// When the capture was taken. Defaults to now.
     pub created_at: Timestamp,
+    /// Still, video or GIF. Defaults to a screenshot.
+    pub media_kind: MediaKind,
     /// Owning application, if known.
     pub app_name: Option<String>,
     /// Window title, if known.
@@ -51,9 +53,16 @@ impl<'a> NewCapture<'a> {
     /// A capture of `document`, taken now, with no platform metadata.
     #[must_use]
     pub fn new(document: &'a Document) -> Self {
+        Self::of_kind(document, MediaKind::Screenshot)
+    }
+
+    /// A capture of `document` with an explicit media kind.
+    #[must_use]
+    pub fn of_kind(document: &'a Document, media_kind: MediaKind) -> Self {
         Self {
             document,
             created_at: Timestamp::now(),
+            media_kind,
             app_name: None,
             window_title: None,
             ocr_text: None,
@@ -218,6 +227,20 @@ pub trait History: Store {
     ///
     /// Returns [`Error::Storage`] if the index is unreadable.
     fn search(&self, query: &SearchQuery) -> Result<Vec<CaptureRecord>>;
+
+    /// How many captures match `query`, ignoring its pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the index is unreadable.
+    fn count_matching(&self, query: &SearchQuery) -> Result<u64>;
+
+    /// Distinct application names represented in history, case-insensitively sorted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the index is unreadable.
+    fn apps(&self) -> Result<Vec<String>>;
 
     /// How many captures history holds.
     ///
@@ -660,6 +683,7 @@ impl History for SqliteStore {
             &id,
             capture.created_at,
             now,
+            capture.media_kind,
             capture.pinned,
             capture.app_name,
             capture.window_title,
@@ -797,6 +821,33 @@ impl History for SqliteStore {
             .map_err(store_err("cannot count history"))
     }
 
+    fn count_matching(&self, query: &SearchQuery) -> Result<u64> {
+        let (sql, args) = build_count(query);
+        self.conn
+            .query_row(&sql, params_from_iter(args.iter()), |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| u64::try_from(n).unwrap_or(0))
+            .map_err(store_err("cannot count matching history"))
+    }
+
+    fn apps(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT MIN(app_name) FROM captures
+                 WHERE app_name IS NOT NULL AND TRIM(app_name) <> ''
+                 GROUP BY app_fold
+                 ORDER BY app_fold ASC",
+            )
+            .map_err(store_err("cannot list history applications"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(store_err("cannot list history applications"))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(store_err("cannot list history applications"))
+    }
+
     fn delete(&mut self, id: &CaptureId) -> Result<bool> {
         let Some(record) = self.stored_record(id)? else {
             // The record may be gone while a stale row survives; clear it too.
@@ -906,65 +957,48 @@ impl History for SqliteStore {
             ..RetentionReport::default()
         };
 
-        if total <= policy.max_image_bytes {
-            tx.rollback().map_err(store_err("cannot end retention"))?;
-            return Ok(report);
+        let mut rewritten = Vec::new();
+        if let Some(cutoff) = policy.max_image_age.cutoff(now) {
+            let stale = eviction_candidates(
+                &tx,
+                "created_at < ?1",
+                params![cutoff.0],
+                "cannot find stale captures",
+            )?;
+            for (id, digest) in stale {
+                evict_capture(
+                    &tx,
+                    &self.layout,
+                    &id,
+                    &digest,
+                    now,
+                    &mut total,
+                    &mut report,
+                    &mut rewritten,
+                )?;
+            }
         }
 
-        // Oldest first. `id` breaks ties inside a millisecond and is itself
-        // chronological, so the order is total and stable across processes.
-        let candidates: Vec<(String, String)> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT id, image_hash FROM captures
-                     WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0
-                     ORDER BY created_at ASC, id ASC",
-                )
-                .map_err(store_err("cannot find evictable captures"))?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(store_err("cannot find evictable captures"))?;
-            rows.collect::<std::result::Result<_, _>>()
-                .map_err(store_err("cannot find evictable captures"))?
-        };
-
-        let mut rewritten = Vec::new();
-        for (id, digest) in candidates {
-            if total <= policy.max_image_bytes {
-                break;
+        if total > policy.max_image_bytes {
+            // Oldest first. `id` breaks ties inside a millisecond and is itself
+            // chronological, so the order is total and stable across processes.
+            let candidates =
+                eviction_candidates(&tx, "1 = 1", [], "cannot find evictable captures")?;
+            for (id, digest) in candidates {
+                if total <= policy.max_image_bytes {
+                    break;
+                }
+                evict_capture(
+                    &tx,
+                    &self.layout,
+                    &id,
+                    &digest,
+                    now,
+                    &mut total,
+                    &mut report,
+                    &mut rewritten,
+                )?;
             }
-
-            // The document is untouched. Only the pixels go. This one statement
-            // is the whole of decision D23.
-            tx.execute(
-                "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
-                params![id, now.0],
-            )
-            .map_err(store_err("cannot evict image"))?;
-
-            if !blob_still_referenced(&tx, &digest)? {
-                let byte_len: u64 = tx
-                    .query_row(
-                        "SELECT byte_len FROM blobs WHERE hash = ?1",
-                        params![digest],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(store_err("cannot size blob"))?
-                    .map_or(0, |n| u64::try_from(n).unwrap_or(0));
-
-                tx.execute("DELETE FROM blobs WHERE hash = ?1", params![digest])
-                    .map_err(store_err("cannot forget blob"))?;
-                // Unlinked inside the transaction on purpose: a concurrent
-                // insert that would dedupe onto this blob is blocked by the
-                // same write lock, so it cannot observe the file mid-removal.
-                self.layout.delete_blob(&digest)?;
-                total = total.saturating_sub(byte_len);
-                report.bytes_reclaimed += byte_len;
-            }
-
-            rewritten.push(CaptureId(id.clone()));
-            report.evicted.push(CaptureId(id));
         }
 
         report.bytes_remaining = total;
@@ -976,6 +1010,11 @@ impl History for SqliteStore {
                 pinned_bytes,
                 "retention cap not reached; the remainder is pinned and pinned captures are never evicted"
             );
+        }
+
+        if rewritten.is_empty() {
+            tx.rollback().map_err(store_err("cannot end retention"))?;
+            return Ok(report);
         }
 
         tx.commit().map_err(store_err("cannot commit retention"))?;
@@ -992,6 +1031,75 @@ impl History for SqliteStore {
 
         Ok(report)
     }
+}
+
+fn eviction_candidates<P>(
+    conn: &Connection,
+    extra_predicate: &str,
+    params: P,
+    context: &'static str,
+) -> Result<Vec<(String, String)>>
+where
+    P: rusqlite::Params,
+{
+    let sql = format!(
+        "SELECT id, image_hash FROM captures
+         WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0
+           AND {extra_predicate}
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(store_err(context))?;
+    let rows = stmt
+        .query_map(params, |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(store_err(context))?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(store_err(context))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evict_capture(
+    conn: &Connection,
+    layout: &StoreLayout,
+    id: &str,
+    digest: &str,
+    now: Timestamp,
+    total: &mut u64,
+    report: &mut RetentionReport,
+    rewritten: &mut Vec<CaptureId>,
+) -> Result<()> {
+    // The document is untouched. Only the pixels go. This one statement is the
+    // whole of decision D23.
+    conn.execute(
+        "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
+        params![id, now.0],
+    )
+    .map_err(store_err("cannot evict image"))?;
+
+    if !blob_still_referenced(conn, digest)? {
+        let byte_len: u64 = conn
+            .query_row(
+                "SELECT byte_len FROM blobs WHERE hash = ?1",
+                params![digest],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(store_err("cannot size blob"))?
+            .map_or(0, |n| u64::try_from(n).unwrap_or(0));
+
+        conn.execute("DELETE FROM blobs WHERE hash = ?1", params![digest])
+            .map_err(store_err("cannot forget blob"))?;
+        // Unlinked inside the transaction on purpose: a concurrent insert that
+        // would dedupe onto this blob is blocked by the same write lock, so it
+        // cannot observe the file mid-removal.
+        layout.delete_blob(digest)?;
+        *total = total.saturating_sub(byte_len);
+        report.bytes_reclaimed += byte_len;
+    }
+
+    let id = CaptureId(id.to_owned());
+    rewritten.push(id.clone());
+    report.evicted.push(id);
+    Ok(())
 }
 
 fn store_err(context: &'static str) -> impl Fn(rusqlite::Error) -> Error {
@@ -1027,15 +1135,16 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
 
     conn.execute(
         "INSERT INTO captures (
-             id, created_at, stored_at, pinned, app_name, window_title, provenance,
+             id, created_at, stored_at, media_kind, pinned, app_name, window_title, provenance,
              target_json, frame_json, image_hash, image_bytes, image_evicted_at,
              ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
          )
          ON CONFLICT (id) DO UPDATE SET
              created_at = excluded.created_at,
              stored_at = excluded.stored_at,
+             media_kind = excluded.media_kind,
              pinned = excluded.pinned,
              app_name = excluded.app_name,
              window_title = excluded.window_title,
@@ -1055,6 +1164,7 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
             record.id,
             record.created_at,
             record.stored_at,
+            record.media_kind.as_token(),
             i64::from(record.pinned),
             record.app_name,
             record.window_title,
@@ -1136,38 +1246,7 @@ fn like_pattern(needle: &str) -> String {
 fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
     let mut sql = format!("SELECT {RECORD_COLUMNS} FROM captures WHERE 1 = 1");
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
-
-    let like = |sql: &mut String, column: &str, needle: &str, args: &mut Vec<Box<dyn ToSql>>| {
-        args.push(Box::new(like_pattern(needle)));
-        sql.push_str(&format!(" AND {column} LIKE ?{} ESCAPE '\\'", args.len()));
-    };
-
-    if let Some(text) = &query.text {
-        like(&mut sql, "search_fold", text, &mut args);
-    }
-    if let Some(app) = &query.app_name {
-        like(&mut sql, "app_fold", app, &mut args);
-    }
-    if let Some(title) = &query.window_title {
-        like(&mut sql, "title_fold", title, &mut args);
-    }
-    if let Some(ocr) = &query.ocr_text {
-        like(&mut sql, "ocr_fold", ocr, &mut args);
-    }
-    if let Some(after) = query.created_after {
-        args.push(Box::new(after.0));
-        sql.push_str(&format!(" AND created_at >= ?{}", args.len()));
-    }
-    if let Some(before) = query.created_before {
-        args.push(Box::new(before.0));
-        sql.push_str(&format!(" AND created_at <= ?{}", args.len()));
-    }
-    if query.pinned_only {
-        sql.push_str(" AND pinned = 1");
-    }
-    if query.images_only {
-        sql.push_str(" AND image_hash IS NOT NULL AND image_evicted_at IS NULL");
-    }
+    push_search_filters(query, &mut sql, &mut args);
 
     sql.push_str(" ORDER BY created_at DESC, id DESC");
     args.push(Box::new(i64::from(query.page.limit)));
@@ -1178,22 +1257,68 @@ fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
     (sql, args)
 }
 
+fn build_count(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
+    let mut sql = "SELECT COUNT(*) FROM captures WHERE 1 = 1".to_owned();
+    let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    push_search_filters(query, &mut sql, &mut args);
+    (sql, args)
+}
+
+fn push_search_filters(query: &SearchQuery, sql: &mut String, args: &mut Vec<Box<dyn ToSql>>) {
+    let like = |sql: &mut String, column: &str, needle: &str, args: &mut Vec<Box<dyn ToSql>>| {
+        args.push(Box::new(like_pattern(needle)));
+        sql.push_str(&format!(" AND {column} LIKE ?{} ESCAPE '\\'", args.len()));
+    };
+
+    if let Some(text) = &query.text {
+        like(sql, "search_fold", text, args);
+    }
+    if let Some(app) = &query.app_name {
+        like(sql, "app_fold", app, args);
+    }
+    if let Some(title) = &query.window_title {
+        like(sql, "title_fold", title, args);
+    }
+    if let Some(ocr) = &query.ocr_text {
+        like(sql, "ocr_fold", ocr, args);
+    }
+    if let Some(after) = query.created_after {
+        args.push(Box::new(after.0));
+        sql.push_str(&format!(" AND created_at >= ?{}", args.len()));
+    }
+    if let Some(before) = query.created_before {
+        args.push(Box::new(before.0));
+        sql.push_str(&format!(" AND created_at <= ?{}", args.len()));
+    }
+    if let Some(kind) = query.media_kind {
+        args.push(Box::new(kind.as_token().to_owned()));
+        sql.push_str(&format!(" AND media_kind = ?{}", args.len()));
+    }
+    if query.pinned_only {
+        sql.push_str(" AND pinned = 1");
+    }
+    if query.images_only {
+        sql.push_str(" AND image_hash IS NOT NULL AND image_evicted_at IS NULL");
+    }
+}
+
 /// Reads one row into a record. The inner `Result` carries decoding failures,
 /// which are a storage problem rather than a SQLite one.
 fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let id: String = get(row, 0)?;
     let created_at: i64 = get(row, 1)?;
-    let pinned: i64 = get(row, 2)?;
-    let app_name: Option<String> = get(row, 3)?;
-    let window_title: Option<String> = get(row, 4)?;
-    let provenance: String = get(row, 5)?;
-    let target_json: String = get(row, 6)?;
-    let frame_json: String = get(row, 7)?;
-    let image_hash: Option<String> = get(row, 8)?;
-    let image_bytes: i64 = get(row, 9)?;
-    let image_evicted_at: Option<i64> = get(row, 10)?;
-    let ocr_text: Option<String> = get(row, 11)?;
-    let annotation_count: i64 = get(row, 12)?;
+    let media_kind: String = get(row, 2)?;
+    let pinned: i64 = get(row, 3)?;
+    let app_name: Option<String> = get(row, 4)?;
+    let window_title: Option<String> = get(row, 5)?;
+    let provenance: String = get(row, 6)?;
+    let target_json: String = get(row, 7)?;
+    let frame_json: String = get(row, 8)?;
+    let image_hash: Option<String> = get(row, 9)?;
+    let image_bytes: i64 = get(row, 10)?;
+    let image_evicted_at: Option<i64> = get(row, 11)?;
+    let ocr_text: Option<String> = get(row, 12)?;
+    let annotation_count: i64 = get(row, 13)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
@@ -1219,6 +1344,11 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     Ok(CaptureRecord {
         id: CaptureId(id),
         created_at: Timestamp(created_at),
+        media_kind: MediaKind::from_token(&media_kind).map_err(|_| {
+            Error::Storage(format!(
+                "cannot read media kind {media_kind:?} from history"
+            ))
+        })?,
         pinned: pinned != 0,
         app_name,
         window_title,
