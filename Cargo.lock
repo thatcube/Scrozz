@@ -3212,8 +3212,11 @@ dependencies = [
  "scrozz-stitch",
  "scrozz-store",
  "scrozz-ui",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "winit",
 ]
 

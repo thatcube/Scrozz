@@ -9,18 +9,19 @@
 #
 #   pwsh -File tools/windows-smoke.ps1 `
 #     -Binary artifacts/scrozz.exe `
-#     -ArtifactType portable
+#     -ArtifactType portable `
+#     -ExerciseIpc
 #
 # A packaged/sparse-package artifact must be declared explicitly:
 #
 #   pwsh -File tools/windows-smoke.ps1 `
 #     -Binary C:\Program Files\WindowsApps\...\scrozz.exe `
-#     -ArtifactType packaged
+#     -ArtifactType packaged `
+#     -ExerciseIpc
 #
-# This is intentionally a CLI/headless probe. It does not automate egui or
-# claim that the overlay behaves correctly; a person still has to verify focus,
-# hit-testing and placement. What it does exercise is the same native display,
-# capture, encoder, file, clipboard and OCR code the tray app's worker uses.
+# By default this is a CLI/headless probe. -ExerciseIpc starts the real GUI
+# listener and runs capture and OCR through it, but still does not automate the
+# overlay or claim that focus, hit-testing and placement behave correctly.
 
 [CmdletBinding()]
 param(
@@ -42,7 +43,10 @@ param(
     [switch] $RequireWgc,
 
     [Parameter()]
-    [switch] $RequireNegativeCoordinates
+    [switch] $RequireNegativeCoordinates,
+
+    [Parameter()]
+    [switch] $ExerciseIpc
 )
 
 Set-StrictMode -Version Latest
@@ -59,6 +63,58 @@ function Assert-Smoke {
 
     if (-not $Condition) {
         throw "Windows smoke test failed: $Message"
+    }
+}
+
+function Test-NamedPipeConnection {
+    param(
+        [Parameter(Mandatory)]
+        [string] $PipeName,
+
+        [Parameter()]
+        [int] $TimeoutMilliseconds = 100
+    )
+
+    $client = [System.IO.Pipes.NamedPipeClientStream]::new(
+        ".",
+        $PipeName,
+        [System.IO.Pipes.PipeDirection]::InOut,
+        [System.IO.Pipes.PipeOptions]::None
+    )
+    try {
+        $client.Connect($TimeoutMilliseconds)
+        return $client.IsConnected
+    } catch [System.TimeoutException] {
+        return $false
+    } catch [System.IO.IOException] {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Read-SharedText {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ""
+    }
+
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite
+    )
+    $reader = [System.IO.StreamReader]::new($stream)
+    try {
+        return $reader.ReadToEnd()
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
     }
 }
 
@@ -118,11 +174,18 @@ function Invoke-ScrozzJson {
         [string] $Scratch,
 
         [Parameter()]
-        [switch] $AllowUnsupported
+        [switch] $AllowUnsupported,
+
+        [Parameter()]
+        [switch] $UseIpc
     )
 
     $stderrPath = Join-Path $Scratch "$Name.stderr.log"
-    $allArguments = @("--json", "--no-ipc") + $Arguments
+    $allArguments = @("--json")
+    if (-not $UseIpc) {
+        $allArguments += "--no-ipc"
+    }
+    $allArguments += $Arguments
     $stdoutLines = & $Executable @allArguments 2> $stderrPath
     $exitCode = $LASTEXITCODE
     $stdout = [string]::Join([Environment]::NewLine, @($stdoutLines))
@@ -172,6 +235,8 @@ function Invoke-ScrozzJson {
     return [pscustomobject] @{
         Json = $document
         Stderr = $stderr
+        Stdout = $stdout
+        ExitCode = $exitCode
     }
 }
 
@@ -333,7 +398,18 @@ $oldTesseractDirectory = [Environment]::GetEnvironmentVariable(
     "SCROZZ_TESSERACT_DIR",
     [EnvironmentVariableTarget]::Process
 )
+$oldIpcEndpoint = [Environment]::GetEnvironmentVariable(
+    "SCROZZ_IPC_SOCKET",
+    [EnvironmentVariableTarget]::Process
+)
+$oldGuiTimeout = [Environment]::GetEnvironmentVariable(
+    "SCROZZ_GUI_TIMEOUT_MS",
+    [EnvironmentVariableTarget]::Process
+)
 $locationPushed = $false
+$guiProcess = $null
+$guiStdoutPath = Join-Path $scratch "gui.stdout.log"
+$guiStderrPath = Join-Path $scratch "gui.stderr.log"
 
 try {
     [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
@@ -394,12 +470,54 @@ try {
         Assert-TesseractStarts -PayloadDirectory $payloadDirectory
     }
 
+    if ($ExerciseIpc) {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $userSid = $identity.User.Value
+        $pipeName = "scrozz-$userSid"
+        $expectedEndpoint = "\\.\pipe\$pipeName"
+        $env:SCROZZ_IPC_SOCKET = $null
+        $env:SCROZZ_GUI_TIMEOUT_MS = "300000"
+
+        Assert-Smoke (-not (Test-NamedPipeConnection -PipeName $pipeName)) `
+            "another Scrozz instance is already listening at '$expectedEndpoint'"
+
+        Write-Host "[ipc] Starting the artifact GUI at its SID-scoped endpoint"
+        $guiProcess = Start-Process `
+            -FilePath $Binary `
+            -ArgumentList @("gui") `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $guiStdoutPath `
+            -RedirectStandardError $guiStderrPath `
+            -PassThru
+
+        $ready = $false
+        $readyDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        while (-not $ready -and [DateTime]::UtcNow -lt $readyDeadline) {
+            if ($guiProcess.HasExited) {
+                $stdout = Read-SharedText -Path $guiStdoutPath
+                $stderr = Read-SharedText -Path $guiStderrPath
+                throw (
+                    "Windows smoke test failed: the GUI exited $($guiProcess.ExitCode) " +
+                    "before opening '$expectedEndpoint'. stdout: $stdout stderr: $stderr"
+                )
+            }
+            $ready = Test-NamedPipeConnection -PipeName $pipeName
+            if (-not $ready) {
+                Start-Sleep -Milliseconds 50
+            }
+        }
+        Assert-Smoke $ready "the GUI did not open '$expectedEndpoint' within 15 seconds"
+        Start-Sleep -Milliseconds 100
+        Write-Host "      listening at $expectedEndpoint"
+    }
+
     Write-Host "[1/5] Enumerating native displays"
     $listed = Invoke-ScrozzJson `
         -Executable $Binary `
         -Arguments @("list", "displays") `
         -Name "list-displays" `
-        -Scratch $scratch
+        -Scratch $scratch `
+        -UseIpc:$ExerciseIpc
     Assert-Smoke ($listed.Json.command -eq "list.displays") `
         "display enumeration returned command '$($listed.Json.command)'"
 
@@ -445,7 +563,8 @@ try {
             "--format", "png"
         ) `
         -Name "capture" `
-        -Scratch $scratch
+        -Scratch $scratch `
+        -UseIpc:$ExerciseIpc
 
     Assert-Smoke ($captured.Json.command -eq "capture") `
         "capture returned command '$($captured.Json.command)'"
@@ -459,8 +578,12 @@ try {
             "-RequireWgc was set but capture selected '$backend'"
     }
     if ($backend -eq "GDI BitBlt") {
+        if ($ExerciseIpc) {
+            Start-Sleep -Milliseconds 100
+        }
+        $gdiDiagnostics = $captured.Stderr + (Read-SharedText -Path $guiStderrPath)
         Assert-Smoke (
-            $captured.Stderr -match "GDI fallback"
+            $gdiDiagnostics -match "GDI fallback"
         ) "capture used GDI without explaining the WGC downgrade"
     }
     $identity = $captured.Json.data.runtime.package_identity
@@ -523,7 +646,8 @@ try {
         -Arguments @("ocr", "--file", $pngPath) `
         -Name "ocr" `
         -Scratch $scratch `
-        -AllowUnsupported:($ArtifactType -eq "packaged")
+        -AllowUnsupported:($ArtifactType -eq "packaged") `
+        -UseIpc:$ExerciseIpc
     Assert-Smoke ($recognised.Json.command -eq "ocr") `
         "OCR returned command '$($recognised.Json.command)'"
     if ($recognised.Json.ok) {
@@ -546,12 +670,43 @@ try {
         $ocrBackend = "windows-media-ocr (language pack unavailable)"
     }
 
+    if ($ExerciseIpc) {
+        Assert-Smoke (-not $guiProcess.HasExited) `
+            "the GUI exited before all forwarded commands completed"
+        $guiDiagnostics = Read-SharedText -Path $guiStderrPath
+        Assert-Smoke (
+            $guiDiagnostics -notmatch "CO_E_NOTINITIALIZED|no COM apartment|thread with no COM apartment|has not entered a COM apartment"
+        ) "the forwarded-command thread reached WinRT without a COM apartment"
+    }
+
+    $ipcSummary = if ($ExerciseIpc) {
+        " through SCROZZ/2 named-pipe IPC"
+    } else {
+        ""
+    }
     Write-Host ((
         "PASS: {0} display(s); captured {1}x{2}, saved one PNG, and " +
         "round-tripped the same image through the Windows clipboard via {3}; " +
-        "{4} artifact identity selected {5}."
-    ) -f $displays.Count, $png.Width, $png.Height, $backend, $ArtifactType, $ocrBackend)
+        "{4} artifact identity selected {5}{6}."
+    ) -f
+        $displays.Count,
+        $png.Width,
+        $png.Height,
+        $backend,
+        $ArtifactType,
+        $ocrBackend,
+        $ipcSummary)
 } finally {
+    if ($null -ne $guiProcess) {
+        try {
+            if (-not $guiProcess.HasExited) {
+                $guiProcess.Kill()
+                $null = $guiProcess.WaitForExit(10000)
+            }
+        } finally {
+            $guiProcess.Dispose()
+        }
+    }
     if ($locationPushed) {
         Pop-Location
     }
@@ -568,6 +723,16 @@ try {
     [Environment]::SetEnvironmentVariable(
         "SCROZZ_TESSERACT_DIR",
         $oldTesseractDirectory,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "SCROZZ_IPC_SOCKET",
+        $oldIpcEndpoint,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "SCROZZ_GUI_TIMEOUT_MS",
+        $oldGuiTimeout,
         [EnvironmentVariableTarget]::Process
     )
     if (Test-Path -LiteralPath $scratch) {

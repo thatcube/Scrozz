@@ -14,14 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(not(target_os = "windows"))]
-use crate::fault::CliError;
 use crate::{
     cli::{Cli, Command},
     commands,
-    fault::CliResult,
-    ipc::{self, Response, StreamKind},
-    report::{error_envelope, success_envelope},
+    fault::{CliError, CliResult},
+    ipc::{self, Response},
+    report::Reporter,
 };
 
 const REQUEST_QUEUE_DEPTH: usize = 16;
@@ -311,6 +309,7 @@ fn windows_worker(
             if !shutdown.load(Ordering::Acquire) {
                 tracing::warn!("{error}");
             }
+            std::thread::sleep(WORKER_POLL);
             continue;
         }
         serve_connection(&mut listener, requests, shutdown);
@@ -608,7 +607,9 @@ mod tests {
         let (directory, path) = endpoint_for("roundtrip");
         let server = Server::bind_at(path.clone()).unwrap();
         crate::test_env::set(ipc::ENDPOINT_ENV, &path.to_string_lossy());
-        let client = std::thread::spawn(|| ipc::forward(&argv(&["capture", "--dry-run"])));
+        let arguments = argv(&["capture", "--dry-run"]);
+        let expected = run(&arguments, None).1;
+        let client = std::thread::spawn(move || ipc::forward(&arguments));
 
         let request = loop {
             if let Some(request) = server.poll() {
@@ -618,9 +619,36 @@ mod tests {
         };
         assert!(matches!(request.serve(), Some(Command::Capture(_))));
         let response = client.join().unwrap().unwrap();
-        assert_eq!(response.code, 0);
-        assert!(response.stderr.is_empty());
-        assert!(response.stdout.ends_with(b"\n"));
+        assert_eq!(response, expected);
+
+        drop(server);
+        #[cfg(unix)]
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn forwarded_failure_preserves_exact_stderr_and_exit_status() {
+        let _env = crate::test_env::lock();
+        let (directory, path) = endpoint_for("failure");
+        let server = Server::bind_at(path.clone()).unwrap();
+        crate::test_env::set(ipc::ENDPOINT_ENV, &path.to_string_lossy());
+        let arguments = argv(&["nonsuch"]);
+        let expected = run(&arguments, None).1;
+        let client = std::thread::spawn(move || ipc::forward(&arguments));
+
+        let request = loop {
+            if let Some(request) = server.poll() {
+                break request;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(request.serve().is_none());
+        let response = client.join().unwrap().unwrap();
+        assert_eq!(response, expected);
+        assert_eq!(response.code, 2);
+        assert!(response.stdout.is_empty());
+        assert!(!response.stderr.is_empty());
 
         drop(server);
         #[cfg(unix)]

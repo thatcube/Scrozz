@@ -20,6 +20,7 @@ use scrozz_ui::{
 };
 use winit::{
     application::ApplicationHandler,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     platform::run_on_demand::EventLoopExtRunOnDemand,
@@ -33,6 +34,12 @@ use crate::{
 };
 
 const TICK: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy)]
+struct RestoreBounds {
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+}
 
 pub(super) fn run(app: App, handle: OverlayHandle, options: OverlayOptions) -> CliResult<Report> {
     let mut event_loop = EventLoop::new()
@@ -59,12 +66,14 @@ struct Runtime {
     state: Option<egui_winit::State>,
     overlay: Option<OverlayApp>,
     presenter: Option<LayeredPresenter>,
+    restore_bounds: Option<RestoreBounds>,
     rasterizer: LiveSoftwareRenderer,
     report: Option<Report>,
     failure: Option<CliError>,
     stopped: bool,
     dirty: bool,
     presented_nonempty: bool,
+    was_minimized: bool,
     was_animating: bool,
     next_tick: Instant,
 }
@@ -84,12 +93,14 @@ impl Runtime {
             state: None,
             overlay: None,
             presenter: None,
+            restore_bounds: None,
             rasterizer: LiveSoftwareRenderer::default(),
             report: None,
             failure: None,
             stopped: false,
             dirty: true,
             presented_nonempty: false,
+            was_minimized: false,
             was_animating: true,
             next_tick: Instant::now(),
         }
@@ -166,6 +177,7 @@ impl Runtime {
             "the overlay is a non-activating per-pixel layered window"
         );
         window.set_visible(true);
+        let restore_bounds = current_restore_bounds(&window)?;
         window.request_redraw();
         self.next_tick = Instant::now() + TICK;
 
@@ -173,6 +185,7 @@ impl Runtime {
         self.state = Some(state);
         self.overlay = Some(overlay);
         self.presenter = Some(presenter);
+        self.restore_bounds = Some(restore_bounds);
         Ok(())
     }
 
@@ -191,7 +204,7 @@ impl Runtime {
             CoreError::Platform("the Windows overlay has no layered presenter".to_owned())
         })?;
         let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
+        if window.is_minimized() == Some(true) || size.width == 0 || size.height == 0 {
             // Minimized and show-desktop windows legitimately report zero. Do
             // not run egui and create texture deltas that cannot be consumed;
             // the restored size event will force a new native presentation.
@@ -390,6 +403,34 @@ impl ApplicationHandler for Runtime {
                     }
                 }
             }
+            event @ (WindowEvent::Resized(_)
+            | WindowEvent::Moved(_)
+            | WindowEvent::ScaleFactorChanged { .. }) => {
+                let minimized = window.is_minimized() == Some(true);
+                let restore = restore_after_minimize(&mut self.was_minimized, minimized);
+                // WM_SIZE can report minimized-icon dimensions for this
+                // borderless tool window. Replay the last non-iconic geometry
+                // on restore, but keep genuine move, resize and DPI changes.
+                if restore && let Some(bounds) = self.restore_bounds {
+                    window.set_outer_position(bounds.position);
+                    let _ = window.request_inner_size(bounds.size);
+                } else if !minimized {
+                    match current_restore_bounds(window) {
+                        Ok(bounds) => self.restore_bounds = Some(bounds),
+                        Err(error) => {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                    }
+                }
+                self.dirty = true;
+                if let Some(state) = self.state.as_mut() {
+                    let _ = state.on_window_event(window, &event);
+                }
+                if !minimized {
+                    window.request_redraw();
+                }
+            }
             event => {
                 if let Some(state) = self.state.as_mut() {
                     let response = state.on_window_event(window, &event);
@@ -417,6 +458,26 @@ impl ApplicationHandler for Runtime {
     }
 }
 
+fn restore_after_minimize(was_minimized: &mut bool, minimized: bool) -> bool {
+    if minimized {
+        *was_minimized = true;
+        false
+    } else {
+        std::mem::take(was_minimized)
+    }
+}
+
+fn current_restore_bounds(window: &Window) -> CliResult<RestoreBounds> {
+    Ok(RestoreBounds {
+        position: window.outer_position().map_err(|error| {
+            platform_error(format!(
+                "reading the Windows overlay restore position: {error}"
+            ))
+        })?,
+        size: window.inner_size(),
+    })
+}
+
 fn platform_error(message: String) -> CliError {
     CliError::Core(CoreError::Platform(message))
 }
@@ -439,7 +500,17 @@ const fn should_present(
 
 #[cfg(test)]
 mod tests {
-    use super::should_present;
+    use super::{restore_after_minimize, should_present};
+
+    #[test]
+    fn restore_is_requested_once_after_a_minimized_transition() {
+        let mut was_minimized = false;
+
+        assert!(!restore_after_minimize(&mut was_minimized, false));
+        assert!(!restore_after_minimize(&mut was_minimized, true));
+        assert!(restore_after_minimize(&mut was_minimized, false));
+        assert!(!restore_after_minimize(&mut was_minimized, false));
+    }
 
     #[test]
     fn the_first_settled_frame_after_an_animation_is_presented() {

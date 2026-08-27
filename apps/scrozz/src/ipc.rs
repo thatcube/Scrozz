@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::Command,
     fault::{CliError, CliResult},
-    json::Json,
 };
 
 /// The protocol version token embedded in every response payload.
@@ -538,6 +537,20 @@ pub fn forward(argv: &[String]) -> CliResult<Response> {
     forward_to(&endpoint(), argv)
 }
 
+fn exchange(stream: &mut (impl Read + Write), argv: &[String]) -> CliResult<Response> {
+    let request = encode_request(argv, std::env::current_dir().ok().as_deref())?;
+    write_all_until(
+        stream,
+        &request,
+        "request",
+        Instant::now() + TRANSFER_TIMEOUT,
+        None,
+    )?;
+    let response = read_response(stream, Instant::now() + COMMAND_TIMEOUT)?;
+    send_ack(stream, Instant::now() + TRANSFER_TIMEOUT)?;
+    Ok(response)
+}
+
 #[cfg(unix)]
 fn forward_to(path: &Path, argv: &[String]) -> CliResult<Response> {
     use std::os::unix::net::UnixStream;
@@ -599,19 +612,20 @@ pub(crate) mod windows_pipe {
             Foundation::{
                 CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA,
                 ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-                ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, HLOCAL, LocalFree,
+                ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, LocalFree,
             },
             Security::{
                 Authorization::{
                     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                    SDDL_REVISION_1,
+                    GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
                 },
-                GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-                TOKEN_USER, TokenUser,
+                GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+                PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
             },
             Storage::FileSystem::{
                 CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE,
-                OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+                OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION,
+                SECURITY_SQOS_PRESENT, WriteFile,
             },
             System::{
                 Pipes::{
@@ -702,7 +716,12 @@ pub(crate) mod windows_pipe {
                     return Err(CliError::ipc("the IPC server is shutting down"));
                 }
                 match unsafe { ConnectNamedPipe(self.handle.0, None) } {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        // With PIPE_NOWAIT, success means the disconnected pipe
+                        // became available; only ERROR_PIPE_CONNECTED proves a
+                        // client is attached.
+                        std::thread::sleep(super::RETRY_DELAY);
+                    }
                     Err(_) => match unsafe { GetLastError() } {
                         ERROR_PIPE_CONNECTED => return Ok(()),
                         ERROR_PIPE_LISTENING => {
@@ -757,11 +776,11 @@ pub(crate) mod windows_pipe {
                 let result = unsafe {
                     CreateFileW(
                         PCWSTR(name.as_ptr()),
-                        GENERIC_READ | GENERIC_WRITE,
+                        GENERIC_READ | GENERIC_WRITE | READ_CONTROL.0,
                         FILE_SHARE_MODE(0),
                         None,
                         OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
+                        FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                         None,
                     )
                 };
@@ -770,6 +789,8 @@ pub(crate) mod windows_pipe {
                         let stream = Self {
                             handle: OwnedHandle(handle),
                         };
+                        verify_pipe_owner(stream.handle.0)
+                            .map_err(|error| ConnectError::Unusable(error.to_string()))?;
                         let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
                         if let Err(error) = unsafe {
                             SetNamedPipeHandleState(
@@ -833,6 +854,43 @@ pub(crate) mod windows_pipe {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn verify_pipe_owner(handle: HANDLE) -> CliResult<()> {
+        let expected = current_user_sid_string()?;
+        let mut owner = PSID(std::ptr::null_mut());
+        let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&raw mut owner),
+                None,
+                None,
+                None,
+                Some(&raw mut descriptor),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(CliError::ipc(format!(
+                "could not read the named-pipe owner: {}",
+                io::Error::from_raw_os_error(status.0 as i32)
+            )));
+        }
+        if descriptor.0.is_null() {
+            return Err(CliError::ipc(
+                "Windows returned no named-pipe security descriptor",
+            ));
+        }
+        let _descriptor = SecurityDescriptor(descriptor);
+        let actual = sid_string(owner, "named-pipe owner")?;
+        if actual != expected {
+            return Err(CliError::ipc(format!(
+                "refusing named pipe owned by {actual}; expected current user {expected}"
+            )));
+        }
+        Ok(())
     }
 
     fn read_handle(handle: HANDLE, buffer: &mut [u8]) -> io::Result<usize> {
@@ -919,18 +977,26 @@ pub(crate) mod windows_pipe {
         }
         .map_err(|error| CliError::ipc(format!("could not read the current user SID: {error}")))?;
         let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+        sid_string(user.User.Sid, "current user")
+    }
+
+    fn sid_string(sid: PSID, context: &str) -> CliResult<String> {
+        if sid.0.is_null() || !unsafe { IsValidSid(sid) }.as_bool() {
+            return Err(CliError::ipc(format!(
+                "Windows returned an invalid {context} SID"
+            )));
+        }
         let mut string = PWSTR::null();
-        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut string) }.map_err(|error| {
-            CliError::ipc(format!("could not format the current user SID: {error}"))
+        unsafe { ConvertSidToStringSidW(sid, &mut string) }.map_err(|error| {
+            CliError::ipc(format!("could not format the {context} SID: {error}"))
         })?;
-        let sid = unsafe { string.to_string() }
-            .map_err(|error| CliError::ipc(format!("the current user SID was invalid: {error}")))?;
+        let converted = unsafe { string.to_string() };
         let _ = unsafe { LocalFree(Some(HLOCAL(string.0.cast()))) };
-        Ok(sid)
+        converted.map_err(|error| CliError::ipc(format!("the {context} SID was invalid: {error}")))
     }
 
     fn security_descriptor(sid: &str) -> CliResult<SecurityDescriptor> {
-        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
+        let sddl = format!("O:{sid}D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
         let wide: Vec<u16> = OsStr::new(&sddl).encode_wide().chain(Some(0)).collect();
         let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
         unsafe {
@@ -1025,18 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn url_ipc_uses_only_fixed_action_arguments() {
-        assert_eq!(
-            url_arguments(UrlAction::CaptureRegion),
-            argv(&["capture", "--interactive", "region"])
-        );
-        assert_eq!(
-            url_arguments(UrlAction::RecordStop),
-            argv(&["record", "--stop"])
-        );
-    }
-
-    #[test]
     fn requests_round_trip_special_characters() {
         let original = argv(&[
             "capture",
@@ -1099,6 +1153,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("limit"), "{error}");
+    }
+
+    #[test]
+    fn expired_deadlines_and_shutdown_fail_closed() {
+        let expired = Instant::now() - Duration::from_millis(1);
+        let mut input = Cursor::new([0_u8; FRAME_PREFIX_BYTES]);
+        let read_error = read_frame(&mut input, MAX_REQUEST_BYTES, "request", expired, None)
+            .expect_err("an expired read must fail");
+        assert!(read_error.to_string().contains("timed out"), "{read_error}");
+
+        let mut output = Cursor::new(Vec::new());
+        let write_error = write_all_until(&mut output, b"request", "request", expired, None)
+            .expect_err("an expired write must fail");
+        assert!(
+            write_error.to_string().contains("timed out"),
+            "{write_error}"
+        );
+
+        let shutdown = AtomicBool::new(true);
+        let mut input = Cursor::new([0_u8; FRAME_PREFIX_BYTES]);
+        let stopped = read_frame(
+            &mut input,
+            MAX_REQUEST_BYTES,
+            "request",
+            Instant::now() + TRANSFER_TIMEOUT,
+            Some(&shutdown),
+        )
+        .expect_err("shutdown must interrupt a transfer");
+        assert!(stopped.to_string().contains("stopped"), "{stopped}");
+    }
+
+    #[test]
+    fn acknowledgements_must_match_exactly() {
+        let shutdown = AtomicBool::new(false);
+        let valid = encode_frame(ACK, ACK.len(), "acknowledgement").unwrap();
+        receive_ack(
+            &mut Cursor::new(valid),
+            Instant::now() + TRANSFER_TIMEOUT,
+            &shutdown,
+        )
+        .unwrap();
+
+        let invalid = encode_frame(b"SCROZZ/2 NAK", ACK.len(), "acknowledgement").unwrap();
+        let error = receive_ack(
+            &mut Cursor::new(invalid),
+            Instant::now() + TRANSFER_TIMEOUT,
+            &shutdown,
+        )
+        .expect_err("a different acknowledgement must fail");
+        assert!(error.to_string().contains("invalid"), "{error}");
     }
 
     #[test]

@@ -182,7 +182,7 @@ case, not an edge case.
 
 ---
 
-## Windows first-slice findings (native run still required)
+## Windows first-slice findings
 
 The Windows slice now has a real `HWND` adapter rather than a set of intended
 flags. It applies `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED`, removes
@@ -220,8 +220,18 @@ OpenGL, DXGI composition modes, the physical GPU, and WARP. macOS and Linux keep
 the qualified eframe/Glow path. Setup or presentation failure is a platform
 error; Windows does not silently return to Glow, wgpu, an ordinary opaque
 window, or headless mode. Cross-target checks prove the API surface and
-host-testable alpha arithmetic; the replacement presenter still requires a
-native desktop run to prove visible pixels, focus, input regions and Z-order.
+host-testable alpha arithmetic. Native WGC evidence has additionally confirmed
+the per-pixel desktop composition, work-area placement, unchanged foreground
+window, card-only hit testing, resize repaint and clean close path.
+
+The winit event loop, `HWND`, egui input state and layered presenter all stay on
+the process main thread. The IPC worker performs framing only and hands bounded
+requests to that thread; it never creates or drives a window. `WM_SIZE` also
+needs stateful handling: a minimized borderless tool window can report the
+system's minimized-icon dimensions as a real resize. Scrozz skips presentation
+while the window is iconic, remembers its intended work-area bounds, and
+reasserts those bounds exactly once on the minimized-to-restored transition.
+Ordinary external resizes remain ordinary resizes.
 
 COM/WinRT membership is per thread, not per process. The direct CLI and the
 forwarded-command handler both enter through `commands::dispatch`, which holds
@@ -233,6 +243,27 @@ guards every recognition call, so library callers cannot accidentally reach
 signal rather than success: when winit has already selected an STA, Scrozz
 retries `RoInitialize(RO_INIT_SINGLETHREADED)` and balances only that successful
 WinRT entry, leaving winit's own apartment reference intact.
+
+Windows single-instance forwarding uses a versioned `SCROZZ/2` protocol over a
+current-user named pipe. The current token SID is part of both the pipe name and
+its protected DACL and is explicitly set as the pipe owner; LocalSystem is the
+only additional principal, remote clients are rejected, and
+`FILE_FLAG_FIRST_PIPE_INSTANCE` prevents a second server from claiming the
+endpoint. Clients use identification-only security quality of service so the
+server cannot impersonate them, then verify the connected kernel object's owner
+against their current token SID before sending any request bytes. Package
+identity does not change that rendezvous: an MSIX and a portable process running
+as the same user derive the same endpoint.
+
+Requests and responses are bounded `u32`-length-prefixed frames. Requests are
+limited to 1 MiB, combined response output to 512 MiB, transfers to ten seconds,
+and command execution to five minutes. Responses preserve exact stdout bytes,
+exact stderr bytes and the `u8` exit status, and the server waits for an exact
+acknowledgement before disconnecting. Socket/pipe I/O runs on one bounded worker
+while the GUI polls a bounded request channel. Only `Status::NotRunning` permits
+the normal local fallback; an unusable endpoint, framing error or transfer
+failure is surfaced rather than silently running the command twice.
+`--no-ipc` remains the explicit local-execution override.
 
 Package identity is likewise runtime state, not a Cargo feature or a property of
 the executable bytes. Scrozz probes `GetCurrentPackageFullName` and exposes the
@@ -285,8 +316,14 @@ an inherited override when none is explicit, so an incomplete ZIP cannot pass
 by borrowing a developer installation. Before capture it starts the staged
 `tesseract.exe --version` with a ten-second timeout and a system-only `PATH`,
 which catches a payload whose dependent DLLs were accidentally supplied only by
-the packaging machine. It deliberately does not claim to automate focus,
-Alt-Tab visibility, DWM alpha, Z-order or cross-application hit-testing.
+the packaging machine. `-ExerciseIpc` first refuses an already-running instance,
+starts that exact artifact's GUI with a hard timeout, waits for the default
+SID-scoped named pipe, and then runs the real capture, clipboard and OCR work
+through the GUI command handler. Running that mode once for the portable
+artifact and once for the installed package verifies that both package contexts
+derive the same per-user endpoint and that forwarded WinRT work enters its COM
+apartment. The script deliberately does not claim to automate focus, Alt-Tab
+visibility, DWM alpha, Z-order or cross-application hit-testing.
 `-RequireWgc` turns a legitimate GDI downgrade into a failure for a Windows 11
 WGC qualification run, while `-RequireNegativeCoordinates` requires the lab to
 arrange at least one monitor left of or above the primary and proves that its
