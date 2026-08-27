@@ -239,6 +239,24 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 | OCR-01 | Select area → text to clipboard | T1 | |
 | OCR-02 | **On-device only** (privacy) | T1 | macOS Vision; Windows `Windows.Media.Ocr`; Linux Tesseract. Three engines, three quality profiles — or one bundled engine everywhere for consistency |
 | OCR-03 | Works on images, video frames, scanned docs | T1 | Falls out of OCR-01 |
+| OCR-04 | **QR codes and barcodes** | T1 | **Newly identified.** The competitor's own onboarding sells the tool as copying text "from images, videos, PDFs, webpages, photos **and even QR codes**". A QR in a screenshot is a URL the user cannot click, and retyping it is not an option — so this is closer to essential than to a bonus. macOS `VNDetectBarcodesRequest` gives it almost free alongside Vision text; Windows has no system barcode API, so `rxing` (pure-Rust ZXing port) or `rqrr` covers Windows and Linux together. Should return the payload *and* its bounds, so the UI can indicate what it found |
+| OCR-05 | Recognise text the pointer is over, without selecting | T2 | Live text under cursor, rather than drag-a-region first |
+
+### Onboarding pattern worth stealing
+
+The competitor introduces this tool with a **one-time, two-panel dialog**: a
+sentence saying what it does, two captioned illustrations (*1. Select area with
+text* → *2. Paste the text*), and a single "Got it!" button. Reference:
+`cleanshot/onboarding-text-recognition.png`.
+
+It is worth copying the *shape* because it matches D26 exactly: it teaches only
+the thing the interface cannot teach itself — that a selection becomes clipboard
+text — and it costs one sentence and two pictures. Under D25 those two panels are
+**generated from the real UI**, so they cannot drift from the product.
+
+The same pattern applies to the one feature Scrozz most needs to explain, which
+is **drag-out** (D12): *1. Take a capture* → *2. Drag it straight into another
+app*. Nothing on screen announces that, and it is the hero action.
 
 ---
 

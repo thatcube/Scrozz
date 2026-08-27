@@ -19,6 +19,7 @@
 mod backend;
 mod dpi;
 mod enumerate;
+mod ffi;
 mod filter;
 mod gdi;
 mod geom;

@@ -4,13 +4,6 @@
 //! which path ends up doing the work.
 
 use scrozz_core::{Display, DisplayId, Error, Result, ScaleFactor, Window, WindowId};
-use windows::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
-};
-use windows::Win32::Graphics::Gdi::MONITORINFOEXW;
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-};
 use windows::{
     Win32::{
         Foundation::{HANDLE, HWND, LPARAM, POINT, RECT},
@@ -29,6 +22,7 @@ use windows::{
 
 use super::{
     dpi,
+    ffi::{self, MonitorInfoExW},
     filter::{self, WindowFacts},
     geom::{DeviceRect, dominant_monitor, logical_from_device},
 };
@@ -104,7 +98,10 @@ pub fn monitors() -> Result<Vec<MonitorRecord>> {
         return Err(Error::Platform("EnumDisplayMonitors failed".into()));
     }
 
-    let mut records: Vec<MonitorRecord> = handles.into_iter().filter_map(monitor_record).collect();
+    let mut records: Vec<MonitorRecord> = handles
+        .into_iter()
+        .filter_map(monitor_record)
+        .collect();
 
     if records.is_empty() {
         return Err(Error::Platform("no monitors reported".into()));
@@ -117,19 +114,14 @@ pub fn monitors() -> Result<Vec<MonitorRecord>> {
     Ok(records)
 }
 
-/// `MONITORINFOF_PRIMARY`, which win32metadata documents only in prose and so
-/// the generated bindings do not emit as a constant.
-const MONITORINFOF_PRIMARY: u32 = 1;
-
 fn monitor_record(handle: HMONITOR) -> Option<MonitorRecord> {
-    let mut info = MONITORINFOEXW::default();
-    // `GetMonitorInfoW` dispatches on `cbSize` and returns FALSE if it is not
-    // exactly the size of one of the two known structs. The generated
-    // `Default` is `mem::zeroed`, so this assignment is what distinguishes a
-    // MONITORINFOEXW — with `szDevice` — from a plain MONITORINFO, and
-    // omitting it makes every monitor fail to enumerate.
-    info.monitorInfo.cbSize = u32::try_from(size_of::<MONITORINFOEXW>()).ok()?;
-    let ok = unsafe { GetMonitorInfoW(handle, (&raw mut info).cast::<MONITORINFO>()) };
+    let mut info = MonitorInfoExW::default();
+    let ok = unsafe {
+        GetMonitorInfoW(
+            handle,
+            (&raw mut info).cast::<MONITORINFO>(),
+        )
+    };
     if !ok.as_bool() {
         return None;
     }
@@ -146,10 +138,10 @@ fn monitor_record(handle: HMONITOR) -> Option<MonitorRecord> {
     Some(MonitorRecord {
         handle,
         device_name,
-        bounds: rect_to_device(info.monitorInfo.rcMonitor),
-        work_area: rect_to_device(info.monitorInfo.rcWork),
+        bounds: rect_to_device(info.rcMonitor),
+        work_area: rect_to_device(info.rcWork),
         scale: dpi::scale_for_monitor(handle),
-        is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+        is_primary: info.dwFlags & ffi::MONITORINFOF_PRIMARY != 0,
     })
 }
 
@@ -284,15 +276,15 @@ unsafe fn collect_facts(hwnd: HWND, shell: HWND) -> WindowFacts {
 /// is the single most common way a Windows capture tool feels broken.
 unsafe fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
-    let ok = unsafe {
-        DwmGetWindowAttribute(
+    let hr = unsafe {
+        ffi::DwmGetWindowAttribute(
             hwnd,
-            DWMWA_CLOAKED,
+            filter::DWMWA_CLOAKED,
             (&raw mut cloaked).cast(),
             u32::try_from(size_of::<u32>()).unwrap_or(4),
         )
     };
-    ok.is_ok() && cloaked != 0
+    hr.is_ok() && cloaked != 0
 }
 
 /// The window's bounds, preferring the DWM extended frame.
@@ -303,15 +295,15 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
 /// and makes every window look mysteriously larger than it is.
 unsafe fn window_bounds(hwnd: HWND) -> Option<DeviceRect> {
     let mut frame = RECT::default();
-    let ok = unsafe {
-        DwmGetWindowAttribute(
+    let hr = unsafe {
+        ffi::DwmGetWindowAttribute(
             hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
+            filter::DWMWA_EXTENDED_FRAME_BOUNDS,
             (&raw mut frame).cast(),
             u32::try_from(size_of::<RECT>()).unwrap_or(16),
         )
     };
-    if ok.is_ok() {
+    if hr.is_ok() {
         let rect = rect_to_device(frame);
         if !rect.is_empty() {
             return Some(rect);
@@ -359,7 +351,13 @@ unsafe fn window_application(hwnd: HWND) -> Option<String> {
         return None;
     }
 
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let handle = unsafe {
+        ffi::OpenProcess(
+            ffi::PROCESS_QUERY_LIMITED_INFORMATION,
+            windows::core::BOOL(0),
+            pid,
+        )
+    };
     if handle.is_invalid() {
         return None;
     }
@@ -367,16 +365,16 @@ unsafe fn window_application(hwnd: HWND) -> Option<String> {
     let mut buf = [0u16; 260];
     let mut len = u32::try_from(buf.len()).unwrap_or(260);
     let ok = unsafe {
-        QueryFullProcessImageNameW(
+        ffi::QueryFullProcessImageNameW(
             handle,
-            PROCESS_NAME_WIN32,
+            0,
             windows::core::PWSTR(buf.as_mut_ptr()),
             &raw mut len,
         )
     };
     unsafe { close_handle(handle) };
 
-    if ok.is_err() || len == 0 {
+    if !ok.as_bool() || len == 0 {
         return None;
     }
 
@@ -421,10 +419,9 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
     let scale = monitors
         .get(record.monitor)
         .map_or(ScaleFactor::IDENTITY, |m| m.scale);
-    let display = monitors.get(record.monitor).map_or_else(
-        || DisplayId(String::new()),
-        |m| DisplayId(m.device_name.clone()),
-    );
+    let display = monitors
+        .get(record.monitor)
+        .map_or_else(|| DisplayId(String::new()), |m| DisplayId(m.device_name.clone()));
 
     Window {
         id: WindowId((record.handle.0 as isize).to_string()),

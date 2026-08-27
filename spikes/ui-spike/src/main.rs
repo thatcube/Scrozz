@@ -93,7 +93,7 @@ fn main() -> eframe::Result<()> {
     let cfg = parse_args();
 
     let inner_size = if cfg.interactive() {
-        egui::vec2(960.0, 840.0)
+        egui::vec2(960.0, 1040.0)
     } else {
         cfg.shot_window_size()
     };

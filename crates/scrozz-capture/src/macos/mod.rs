@@ -16,6 +16,7 @@
 //! [`scrozz_core::Error::Unsupported`] rather than misbehaving.
 
 mod appkit;
+mod block;
 mod display;
 mod error;
 mod image;

@@ -9,9 +9,7 @@
 //! 2. **Byte order.** ScreenCaptureKit documents its SDR output as BGRA, which
 //!    CoreGraphics expresses as "alpha first, 32-bit little-endian".
 //! 3. **Premultiplication.** That output is premultiplied. Reporting it as
-//!    straight alpha would make every semi-transparent edge composite wrong,
-//!    so it is named [`PixelFormat::BgraPremultiplied8`] and left in place
-//!    rather than converted at the capture boundary.
+//!    straight alpha would make every semi-transparent edge composite wrong.
 //! 4. **Colour space.** Modern Macs are Display P3. The frame reports whatever
 //!    the image says it is, and `Unknown` when that is not a space the core
 //!    model can name — never a hopeful sRGB.
@@ -148,15 +146,15 @@ impl MemoryOrder {
 
 /// Reports the pixel layout, rewriting the buffer in place when it must.
 ///
-/// BGRA — ScreenCaptureKit's usual output — is nameable in both alpha
-/// flavours, so the common case touches no colour bytes at all. That is worth
-/// protecting: a pass over a 6K display's pixels on every frame is exactly the
-/// cost [`PixelFormat::BgraPremultiplied8`] exists to avoid, and it would be
-/// paid during recording as well as for stills.
+/// [`PixelFormat`] can name RGBA (straight or premultiplied) and straight
+/// BGRA, and nothing else. Premultiplied BGRA — ScreenCaptureKit's usual
+/// output — therefore has to be swizzled rather than mislabelled as `Bgra8`,
+/// because the contract is that premultiplication is reported honestly rather
+/// than quietly dropped. ARGB and ABGR have no representation at all and are
+/// permuted into RGBA.
 ///
-/// ARGB and ABGR have no representation and are permuted into RGBA. That is a
-/// genuine conversion rather than a relabelling, so it is done honestly and
-/// only for the layouts that need it.
+/// Straight-alpha BGRA needs no surgery: `Bgra8` describes it exactly, and
+/// leaving it alone saves a pass over every pixel of a 6K display.
 fn normalise(
     data: &mut [u8],
     stride: usize,
@@ -197,17 +195,16 @@ fn normalise(
         for_each_pixel(data, stride, width, height, |pixel| pixel[offset] = 0xFF);
     }
 
-    // BGRA is describable exactly, either way round, without moving a byte.
-    if order == MemoryOrder::Bgra {
-        return Ok(if premultiplied {
-            PixelFormat::BgraPremultiplied8
-        } else {
-            PixelFormat::Bgra8
-        });
+    // Straight-alpha BGRA is the one case we can name without touching a byte.
+    if order == MemoryOrder::Bgra && !premultiplied {
+        return Ok(PixelFormat::Bgra8);
     }
 
     match order {
-        MemoryOrder::Rgba | MemoryOrder::Bgra => {}
+        MemoryOrder::Rgba => {}
+        MemoryOrder::Bgra => {
+            for_each_pixel(data, stride, width, height, |pixel| pixel.swap(0, 2));
+        }
         MemoryOrder::Argb => {
             // A R G B -> R G B A
             for_each_pixel(data, stride, width, height, |pixel| pixel.rotate_left(1));
@@ -332,12 +329,9 @@ mod tests {
         (data, stride, width, height)
     }
 
-    /// The common ScreenCaptureKit case, and the one that must cost nothing:
-    /// premultiplied BGRA is nameable outright, so no colour byte moves.
     #[test]
-    fn premultiplied_bgra_is_named_rather_than_converted() {
+    fn premultiplied_bgra_is_swizzled_to_rgba_and_reported_as_premultiplied() {
         let (mut data, stride, width, height) = padded_bgra(true);
-        let before = data.clone();
         let format = normalise(
             &mut data,
             stride,
@@ -348,14 +342,13 @@ mod tests {
         )
         .expect("supported layout");
 
-        assert_eq!(format, PixelFormat::BgraPremultiplied8);
-        assert_eq!(data, before, "BGRA is describable, so no bytes should move");
+        assert_eq!(format, PixelFormat::RgbaPremultiplied8);
+        // First pixel was B=0x10 G=0x20 R=0x30 A=0x80; now R,G,B,A.
+        assert_eq!(&data[0..4], &[0x30, 0x20, 0x10, 0x80]);
     }
 
-    /// ARGB genuinely has to be permuted, so it is the layout that proves the
-    /// permutation walks rows rather than the whole buffer.
     #[test]
-    fn row_padding_survives_a_permutation() {
+    fn row_padding_survives_the_swizzle() {
         let (mut data, stride, width, height) = padded_bgra(true);
         normalise(
             &mut data,
@@ -363,7 +356,7 @@ mod tests {
             width,
             height,
             CGImageAlphaInfo::PremultipliedFirst,
-            false,
+            true,
         )
         .expect("supported layout");
 
@@ -456,7 +449,7 @@ mod tests {
         .expect("supported layout");
 
         // NoneSkipFirst plus little-endian is BGRA, so the skipped byte sits
-        // last in memory, and BGRA is reported as-is.
+        // last in memory — and after the BGRA swizzle it is still last.
         for row in 0..height {
             for pixel in 0..width {
                 assert_eq!(data[row * stride + pixel * 4 + 3], 0xFF);

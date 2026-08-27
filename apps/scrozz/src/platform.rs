@@ -68,11 +68,9 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
     guard("listing displays and windows", "scrozz-capture")?;
     // Enumeration is part of the capture backend rather than a separate object:
     // the two have to agree about identifiers, and splitting them is how a
-    // window id starts meaning two different things.
-    Err(CliError::not_implemented(
-        "listing displays and windows",
-        "scrozz-capture (no enumerator constructor is exported yet)",
-    ))
+    // window id starts meaning two different things. `CaptureBackend` has
+    // `TargetEnumerator` as a supertrait, so this is a trait upcast.
+    Ok(scrozz_capture::backend()?)
 }
 
 /// Starts a screen recording.
@@ -248,12 +246,27 @@ mod tests {
     }
 
     #[test]
-    fn enumeration_is_a_named_gap() {
+    fn enumeration_is_gated_but_no_longer_a_gap() {
+        // Enumeration is now wired to the capture backend, so with the guard
+        // lifted this either succeeds or fails for a *platform* reason — a
+        // missing permission, or a compositor with no usable path. What it must
+        // never be again is `NotImplemented`.
         let _env = test_env::lock();
         test_env::set(UNSTABLE_ENV, "1");
-        let err = err_of(target_enumerator());
+        let lifted = target_enumerator();
         test_env::clear(UNSTABLE_ENV);
-        assert_eq!(err.exit(), Exit::NotImplemented);
+        if let Err(e) = &lifted {
+            assert_ne!(
+                e.exit(),
+                Exit::NotImplemented,
+                "enumeration is implemented; a failure here must name a real cause"
+            );
+        }
+
+        // With the guard in place it is still refused, so an unfinished backend
+        // is never reached by accident. Reuses the lock already held: taking it
+        // twice in one test deadlocks.
+        assert_eq!(err_of(target_enumerator()).exit(), Exit::NotImplemented);
     }
 
     #[test]

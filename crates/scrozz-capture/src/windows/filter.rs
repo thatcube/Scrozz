@@ -28,6 +28,15 @@ pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
 /// WGC.
 pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
 
+/// `DWMWA_CLOAKED` attribute index for `DwmGetWindowAttribute`.
+pub const DWMWA_CLOAKED: u32 = 14;
+
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` attribute index.
+///
+/// `GetWindowRect` includes the invisible resize border DWM adds around a
+/// window; this attribute is the rectangle the user actually sees.
+pub const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+
 /// Smallest edge, in device pixels, a window must have to be worth listing.
 ///
 /// Message-only and helper windows are routinely 0×0 or 1×1.

@@ -26,23 +26,6 @@
 //! [`CursorMode::Hidden`]: scrozz_core::CursorMode
 
 use scrozz_core::{ColorSpace, CursorMode, Error, Frame, PixelFormat, Result, ScaleFactor, Size};
-use windows::Graphics::DirectX::{
-    Direct3D11::{IDirect3DDevice, IDirect3DSurface},
-    DirectXPixelFormat,
-};
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
-};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::System::WinRT::{
-    Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
-    Graphics::Capture::IGraphicsCaptureItemInterop,
-};
 use windows::{
     Graphics::{
         Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
@@ -59,10 +42,13 @@ use windows::{
             Gdi::HMONITOR,
         },
     },
-    core::Interface,
+    core::{IUnknown, Interface},
 };
 
-use super::pixels;
+use super::{
+    ffi::{self, Texture2DDesc},
+    pixels,
+};
 
 /// A live D3D11 device, kept for the lifetime of the backend.
 ///
@@ -71,12 +57,13 @@ use super::pixels;
 pub struct WgcDevice {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    /// The WinRT device wrapper the frame pool needs.
+    /// The WinRT `IDirect3DDevice` wrapper the frame pool needs.
     ///
-    /// The same underlying D3D11 device as `device`, seen through the WinRT
-    /// projection that `Direct3D11CaptureFramePool` requires. Keeping both
-    /// avoids re-wrapping on every capture.
-    winrt_device: IDirect3DDevice,
+    /// Held as an untyped `IUnknown` because naming `IDirect3DDevice` requires
+    /// the `Graphics_DirectX_Direct3D11` feature this crate does not have; the
+    /// only thing done with it is passing it back across the ABI, which does
+    /// not care about the static type.
+    winrt_device: IUnknown,
 }
 
 // The D3D11 device is created with the default (thread-safe) flags and every
@@ -107,12 +94,14 @@ impl WgcDevice {
             .cast()
             .map_err(|e| Error::Platform(format!("device is not an IDXGIDevice: {e}")))?;
 
-        let winrt_device: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
+        let mut raw = core::ptr::null_mut();
+        unsafe { ffi::CreateDirect3D11DeviceFromDXGIDevice(dxgi.as_raw(), &mut raw) }
+            .ok()
             .map_err(|e| {
                 Error::Platform(format!("CreateDirect3D11DeviceFromDXGIDevice failed: {e}"))
-            })?
-            .cast()
-            .map_err(|e| Error::Platform(format!("not an IDirect3DDevice: {e}")))?;
+            })?;
+        let winrt_device: IUnknown = unsafe { ffi::take_raw(raw) }
+            .map_err(|e| Error::Platform(format!("null IDirect3DDevice: {e}")))?;
 
         Ok(Self {
             device,
@@ -123,27 +112,26 @@ impl WgcDevice {
 }
 
 fn create_d3d11_device() -> Result<ID3D11Device> {
-    const DRIVERS: [D3D_DRIVER_TYPE; 2] = [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP];
-
-    for driver in DRIVERS {
-        let mut device: Option<ID3D11Device> = None;
-        let created = unsafe {
-            D3D11CreateDevice(
-                None,
+    for driver in [ffi::D3D_DRIVER_TYPE_HARDWARE, ffi::D3D_DRIVER_TYPE_WARP] {
+        let mut device = core::ptr::null_mut();
+        let hr = unsafe {
+            ffi::D3D11CreateDevice(
+                core::ptr::null_mut(),
                 driver,
-                HMODULE::default(),
+                core::ptr::null_mut(),
                 // BGRA support is not optional: WGC interop refuses a device
                 // without it.
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&raw mut device),
-                None,
-                None,
+                ffi::D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                core::ptr::null(),
+                0,
+                ffi::D3D11_SDK_VERSION,
+                &mut device,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
             )
         };
-        if created.is_ok()
-            && let Some(device) = device
+        if hr.is_ok()
+            && let Ok(device) = unsafe { ffi::take_raw::<ID3D11Device>(device) }
         {
             return Ok(device);
         }
@@ -161,13 +149,14 @@ pub fn is_supported() -> bool {
 }
 
 /// The interop factory that turns an `HWND` or `HMONITOR` into a capture item.
-fn interop() -> Result<IGraphicsCaptureItemInterop> {
-    windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(|e| {
-        Error::Unsupported {
-            what: "Windows.Graphics.Capture".into(),
-            why: format!("its activation factory is unavailable on this build: {e}"),
-        }
-    })
+fn interop() -> Result<ffi::IGraphicsCaptureItemInterop> {
+    windows::core::imp::load_factory::<GraphicsCaptureItem, ffi::IGraphicsCaptureItemInterop>()
+        .map_err(|e| {
+            Error::Unsupported {
+                what: "Windows.Graphics.Capture".into(),
+                why: format!("its activation factory is unavailable on this build: {e}"),
+            }
+        })
 }
 
 /// A capture item for a window.
@@ -265,7 +254,7 @@ pub fn capture_item(
         // WGC hands back `B8G8R8A8UIntNormalized`. It stays that way: the
         // format travels with the buffer so a recording does not pay a
         // whole-image channel swap on every frame.
-        format: PixelFormat::BgraPremultiplied8,
+        format: PixelFormat::Bgra8,
         color_space: ColorSpace::Srgb,
         scale,
     })
@@ -279,13 +268,28 @@ fn create_pool(device: &WgcDevice, size: SizeInt32) -> Result<Direct3D11CaptureF
     // Two buffers rather than one. A single buffer forces the compositor to
     // block until the previous frame is released, and while that is invisible
     // for one screenshot it makes the same code unusable for recording later.
-    Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &device.winrt_device,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
-        size,
-    )
-    .map_err(|e| Error::Platform(format!("CreateFreeThreaded failed: {e}")))
+    static POOL_STATICS: windows::core::imp::FactoryCache<
+        Direct3D11CaptureFramePool,
+        ffi::IDirect3D11CaptureFramePoolStatics2,
+    > = windows::core::imp::FactoryCache::new();
+
+    POOL_STATICS
+        .call(|statics| {
+            let mut raw = core::ptr::null_mut();
+            unsafe {
+                (Interface::vtable(statics).CreateFreeThreaded)(
+                    Interface::as_raw(statics),
+                    device.winrt_device.as_raw(),
+                    ffi::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    2,
+                    size,
+                    &mut raw,
+                )
+                .ok()?;
+                ffi::take_raw::<Direct3D11CaptureFramePool>(raw)
+            }
+        })
+        .map_err(|e| Error::Platform(format!("CreateFreeThreaded failed: {e}")))
 }
 
 type FrameBytes = (Vec<u8>, usize, u32, u32);
@@ -299,9 +303,13 @@ fn poll_frame(device: &WgcDevice, pool: &Direct3D11CaptureFramePool) -> Result<F
                 let content = frame
                     .ContentSize()
                     .map_err(|_| Error::TargetGone("frame vanished before it was read".into()))?;
-                let surface = frame
-                    .Surface()
-                    .map_err(|e| Error::Platform(format!("Surface failed: {e}")))?;
+                let surface = {
+                    let accessor: ffi::IDirect3D11CaptureFrameSurface = frame
+                        .cast()
+                        .map_err(|e| Error::Platform(format!("frame has no Surface: {e}")))?;
+                    unsafe { accessor.Surface() }
+                        .map_err(|e| Error::Platform(format!("Surface failed: {e}")))?
+                };
                 let bytes = read_back(device, &surface, content);
                 let _ = frame.Close();
                 return bytes;
@@ -327,19 +335,19 @@ fn poll_frame(device: &WgcDevice, pool: &Direct3D11CaptureFramePool) -> Result<F
 /// was created, and often larger, so the copy is a `CopySubresourceRegion` of
 /// exactly `ContentSize` rather than a whole-resource copy — the GPU does the
 /// cropping for free and the staging texture stays as small as possible.
-fn read_back(
-    device: &WgcDevice,
-    surface: &IDirect3DSurface,
-    content: SizeInt32,
-) -> Result<FrameBytes> {
-    let access: IDirect3DDxgiInterfaceAccess = surface
+fn read_back(device: &WgcDevice, surface: &IUnknown, content: SizeInt32) -> Result<FrameBytes> {
+    let access: ffi::IDirect3DDxgiInterfaceAccess = surface
         .cast()
         .map_err(|e| Error::Platform(format!("surface has no DXGI interface: {e}")))?;
     let source: ID3D11Texture2D = unsafe { access.GetInterface() }
         .map_err(|e| Error::Platform(format!("GetInterface(ID3D11Texture2D) failed: {e}")))?;
 
-    let mut source_desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe { source.GetDesc(&raw mut source_desc) };
+    let source_desc = {
+        let desc_view: ffi::ID3D11Texture2DDesc = source
+            .cast()
+            .map_err(|e| Error::Platform(format!("texture GetDesc unavailable: {e}")))?;
+        unsafe { desc_view.GetDesc() }
+    };
 
     // Clamp to the real texture. `ContentSize` describes what the item wants,
     // and after a window resize it can briefly exceed what the pool allocated;
@@ -352,35 +360,33 @@ fn read_back(
         .unwrap_or(0)
         .min(source_desc.Height);
     if width == 0 || height == 0 {
-        return Err(Error::TargetGone("captured surface has no area".into()));
+        return Err(Error::TargetGone(
+            "captured surface has no area".into(),
+        ));
     }
 
-    let staging_desc = D3D11_TEXTURE2D_DESC {
+    let staging_desc = Texture2DDesc {
         Width: width,
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
+        Format: ffi::DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: ffi::DxgiSampleDesc {
             Count: 1,
             Quality: 0,
         },
-        Usage: D3D11_USAGE_STAGING,
+        Usage: ffi::D3D11_USAGE_STAGING,
         BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0.cast_unsigned(),
+        CPUAccessFlags: ffi::D3D11_CPU_ACCESS_READ,
         MiscFlags: 0,
     };
 
-    let mut staging: Option<ID3D11Texture2D> = None;
-    unsafe {
-        device
-            .device
-            .CreateTexture2D(&raw const staging_desc, None, Some(&raw mut staging))
-    }
-    .map_err(|e| Error::Platform(format!("staging texture creation failed: {e}")))?;
-    let staging = staging.ok_or_else(|| {
-        Error::Platform("CreateTexture2D succeeded but produced no texture".into())
-    })?;
+    let device_textures: ffi::ID3D11DeviceTextures = device
+        .device
+        .cast()
+        .map_err(|e| Error::Platform(format!("CreateTexture2D unavailable: {e}")))?;
+    let staging: ID3D11Texture2D = unsafe { device_textures.CreateTexture2D(&staging_desc) }
+        .map_err(|e| Error::Platform(format!("staging texture creation failed: {e}")))?;
 
     let region = D3D11_BOX {
         left: 0,

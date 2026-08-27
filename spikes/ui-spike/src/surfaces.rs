@@ -53,9 +53,14 @@ impl QuickVariant {
     /// room: swipe needs vertical travel, drag needs a drop target beside it.
     pub fn scene(self) -> Vec2 {
         match self {
-            // The live stack needs room above and to the left for the deck to
-            // spring into, and room to the right for a card to be thrown out.
-            Self::Live => vec2(560.0, 430.0),
+            // The live list is a vertical column of `stack::MAX_VISIBLE` (4)
+            // discrete cards anchored to the bottom of the docked edge, so the
+            // scene has to be tall enough to hold all of them plus their gaps:
+            // 4 × CARD_H(157) + 3 × SP_3(12) + 76 of headroom for the toast.
+            // Written out rather than computed so this module stays free of
+            // any dependency on `stack` (the snapshot test includes only the
+            // pure drawing modules).
+            Self::Live => vec2(540.0, 740.0),
             Self::Stack => vec2(384.0, 322.0),
             Self::Swipe => vec2(384.0, 392.0),
             Self::Drag => vec2(600.0, 340.0),

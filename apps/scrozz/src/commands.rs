@@ -19,7 +19,8 @@
 
 use std::path::Path;
 
-use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_core::{CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, TargetEnumerator};
+use scrozz_export::{Clipboard, Encoder, FrameEncoder};
 
 use crate::{
     cli::{
@@ -93,12 +94,83 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
         },
         include_window_shadow: !args.no_window_shadow,
     };
-    let _ = (backend, request);
 
-    Err(CliError::not_implemented(
-        "taking a capture",
-        "scrozz-capture",
-    ))
+    if let Some(secs) = args.delay {
+        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    }
+
+    let capture = backend.capture(&request)?;
+    let frame = &capture.frame;
+
+    let bytes = FrameEncoder::new()
+        .encode(frame, args.format().to_export())
+        .map_err(CliError::Core)?;
+
+    let mut written = Vec::new();
+    let mut raw = None;
+    for sink in &sinks {
+        match sink {
+            Sink::File(path) => {
+                std::fs::write(path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
+                written.push(path.display().to_string());
+            }
+            Sink::Clipboard => {
+                scrozz_export::SystemClipboard::new()
+                    .write_image(frame)
+                    .map_err(CliError::Core)?;
+                written.push("clipboard".to_string());
+            }
+            Sink::Stdout => raw = Some(bytes.clone()),
+            // D18: any folder the user picks, which is what lets a Dropbox or
+            // iCloud directory provide sync for free with no service on our side.
+            Sink::DefaultFolder => {
+                let dir = dirs::picture_dir()
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_else(std::env::temp_dir);
+                let name = format!(
+                    "Scrozz {}.{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    args.format().slug()
+                );
+                let path = dir.join(name);
+                std::fs::write(&path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
+                written.push(path.display().to_string());
+            }
+        }
+    }
+
+    let data = Json::obj([
+        ("plan", plan),
+        ("width", Json::Int(i64::from(frame.width()))),
+        ("height", Json::Int(i64::from(frame.height()))),
+        ("scale", Json::Float(frame.scale.get())),
+        ("bytes", Json::Int(bytes.len() as i64)),
+        ("provenance", Json::str(format!("{:?}", capture.provenance))),
+        (
+            "written",
+            Json::arr(written.iter().map(|w| Json::str(w.as_str()))),
+        ),
+    ]);
+
+    let human = format!(
+        "Captured {}×{} at {}× ({} KB){}",
+        frame.width(),
+        frame.height(),
+        frame.scale.get(),
+        bytes.len() / 1024,
+        if written.is_empty() {
+            String::new()
+        } else {
+            format!(" → {}", written.join(", "))
+        }
+    );
+
+    let mut report = Report::new(data, human);
+    report.raw = raw;
+    Ok(report)
 }
 
 /// Turns a resolved [`TargetSpec`] into the core request type.
@@ -111,10 +183,48 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
     match spec {
         TargetSpec::Region(rect) => Ok(CaptureTarget::Region(*rect)),
         TargetSpec::AllDisplays => Ok(CaptureTarget::AllDisplays),
-        TargetSpec::Window(_) | TargetSpec::Display(_) => Err(CliError::not_implemented(
-            "resolving a window or display by name",
-            "scrozz-capture (enumeration is needed to turn a name into an id)",
-        )),
+        // Resolving a name needs enumeration, so it goes through the same
+        // backend the capture will use — an id resolved by a different object
+        // is an id that can disagree.
+        TargetSpec::Display(sel) => {
+            let displays = platform::target_enumerator()?.displays()?;
+            let found = match sel {
+                DisplaySelector::Primary => displays.iter().find(|d| d.is_primary),
+                // The pointer's display, which is where an overlay should appear.
+                DisplaySelector::Active => platform::target_enumerator()
+                    .ok()
+                    .and_then(|e| e.active_display().ok())
+                    .and_then(|a| displays.iter().find(|d| d.id == a.id))
+                    .or_else(|| displays.iter().find(|d| d.is_primary)),
+                DisplaySelector::Id(name) => displays
+                    .iter()
+                    .find(|d| d.id.0 == *name || d.name.eq_ignore_ascii_case(name)),
+            };
+            found
+                .map(|d| CaptureTarget::Display(d.id.clone()))
+                .ok_or_else(|| {
+                    CliError::Core(CoreError::InvalidRequest(format!(
+                        "no display matches {sel:?}; `scrozz list displays` shows what is available"
+                    )))
+                })
+        }
+        TargetSpec::Window(name) => {
+            let windows = platform::target_enumerator()?.windows()?;
+            windows
+                .iter()
+                .find(|w| {
+                    w.id.0 == *name
+                        || w.title
+                            .as_deref()
+                            .is_some_and(|t| t.to_lowercase().contains(&name.to_lowercase()))
+                })
+                .map(|w| CaptureTarget::Window(w.id.clone()))
+                .ok_or_else(|| {
+                    CliError::Core(CoreError::InvalidRequest(format!(
+                        "no window matches {name:?}; `scrozz list windows` shows what is available"
+                    )))
+                })
+        }
         TargetSpec::Interactive(_) => Err(CliError::not_implemented(
             "choosing a target on screen",
             "scrozz-ui (the selection overlay)",
@@ -182,11 +292,32 @@ fn list(what: ListWhat) -> CliResult<Report> {
 
     match what {
         ListWhat::Displays => {
-            let _ = enumerator?;
-            Err(CliError::not_implemented(
-                "listing displays",
-                "scrozz-capture",
-            ))
+            let displays = enumerator?.displays()?;
+            let data = Json::arr(displays.iter().map(|d| {
+                Json::obj([
+                    ("id", Json::str(d.id.0.as_str())),
+                    ("name", Json::str(d.name.as_str())),
+                    ("width", Json::Float(d.bounds.size.width)),
+                    ("height", Json::Float(d.bounds.size.height)),
+                    ("scale", Json::Float(d.scale.get())),
+                    ("primary", Json::Bool(d.is_primary)),
+                ])
+            }));
+            let human = displays
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{}  {}×{} @{}×{}",
+                        d.id.0,
+                        d.bounds.size.width,
+                        d.bounds.size.height,
+                        d.scale.get(),
+                        if d.is_primary { "  (primary)" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Report::new(data, human))
         }
         ListWhat::Windows => {
             // D8: on Wayland this is not a missing feature, it is a missing
@@ -203,11 +334,29 @@ fn list(what: ListWhat) -> CliResult<Report> {
                         .to_string(),
                 }));
             }
-            let _ = enumerator?;
-            Err(CliError::not_implemented(
-                "listing windows",
-                "scrozz-capture",
-            ))
+            let windows = enumerator?.windows()?;
+            let data = Json::arr(windows.iter().map(|w| {
+                Json::obj([
+                    ("id", Json::str(w.id.0.as_str())),
+                    ("title", Json::opt(w.title.as_deref(), Json::str)),
+                    ("application", Json::opt(w.application.as_deref(), Json::str)),
+                    ("width", Json::Float(w.bounds.size.width)),
+                    ("height", Json::Float(w.bounds.size.height)),
+                ])
+            }));
+            let human = windows
+                .iter()
+                .map(|w| {
+                    format!(
+                        "{}  {}  {}",
+                        w.id.0,
+                        w.application.as_deref().unwrap_or("—"),
+                        w.title.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Report::new(data, human))
         }
     }
 }

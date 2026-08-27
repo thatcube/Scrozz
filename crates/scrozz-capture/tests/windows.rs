@@ -97,10 +97,7 @@ fn offset_from_rebases_onto_a_monitor_origin() {
     let monitor = DeviceRect::new(-1920, -200, 0, 880);
     let window = DeviceRect::new(-1900, -100, -1500, 300);
     // Relative to the monitor's own top-left, the window is at (20, 100).
-    assert_eq!(
-        window.offset_from(monitor),
-        DeviceRect::new(20, 100, 420, 500)
-    );
+    assert_eq!(window.offset_from(monitor), DeviceRect::new(20, 100, 420, 500));
 }
 
 #[test]
@@ -607,7 +604,8 @@ fn test_image(width: u32, height: u32, pad: usize) -> (Vec<u8>, usize) {
 #[test]
 fn cropping_repacks_tightly_and_takes_the_right_pixels() {
     let (src, stride) = test_image(16, 16, 48);
-    let (out, out_stride, w, h) = pixels::crop(&src, stride, 16, 16, DeviceRect::new(4, 4, 12, 12));
+    let (out, out_stride, w, h) =
+        pixels::crop(&src, stride, 16, 16, DeviceRect::new(4, 4, 12, 12));
 
     assert_eq!((w, h), (8, 8));
     assert_eq!(out_stride, 32, "a crop must be tightly packed");
@@ -625,7 +623,8 @@ fn cropping_repacks_tightly_and_takes_the_right_pixels() {
 #[test]
 fn a_crop_beyond_the_source_is_clamped() {
     let (src, stride) = test_image(8, 8, 0);
-    let (out, out_stride, w, h) = pixels::crop(&src, stride, 8, 8, DeviceRect::new(4, 4, 100, 100));
+    let (out, out_stride, w, h) =
+        pixels::crop(&src, stride, 8, 8, DeviceRect::new(4, 4, 100, 100));
     assert_eq!((w, h), (4, 4));
     assert_eq!(out.len(), out_stride * 4);
 }
@@ -935,18 +934,7 @@ mod live {
             .expect("a capture");
 
         assert_eq!(capture.provenance, Provenance::Display);
-        // WGC yields premultiplied BGRA; the GDI fallback yields opaque BGRA.
-        // Asserting one would fail on whichever machine took the other path,
-        // so this pins what actually matters: four-byte BGRA, never a silent
-        // swizzle to RGBA.
-        assert!(
-            matches!(
-                capture.frame.format,
-                PixelFormat::Bgra8 | PixelFormat::BgraPremultiplied8
-            ),
-            "unexpected format {:?}",
-            capture.frame.format
-        );
+        assert_eq!(capture.frame.format, PixelFormat::Bgra8);
         // Requirement 3 again, this time against a real `RowPitch`.
         assert!(
             capture.frame.is_well_formed(),
@@ -967,12 +955,10 @@ mod live {
 // - **Pixel correctness.** Nothing here has ever seen a real frame. That the
 //   stride arithmetic is right does not prove the D3D11 readback reads the
 //   right texture.
-// - **The two constants win32metadata omits.** `PW_RENDERFULLCONTENT` and
-//   `MONITORINFOF_PRIMARY` have no generated binding and are spelled out at
-//   their use sites. Both are fixed by the Win32 ABI and checkable against
-//   MSDN by eye, but a wrong value would compile and misbehave silently. Every
-//   COM interface and every other constant now comes from the generated
-//   bindings, so their slots and values are the crate's problem, not ours.
+// - **The hand-written COM vtables.** Six interfaces are declared by hand
+//   because the required Cargo features are not enabled (see the module docs in
+//   `src/windows/ffi.rs`). A wrong method *slot* type-checks perfectly and
+//   calls the wrong function at runtime. Only a Windows machine can catch that.
 // - **Yellow-border suppression.** `SetIsBorderRequired(false)` needs Windows
 //   11; whether it takes effect is unobservable from here.
 // - **Mixed-DPI behaviour in the wild.** The arithmetic is tested; that
