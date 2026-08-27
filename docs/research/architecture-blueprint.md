@@ -18,9 +18,9 @@ Claims flagged for verification before anything is built on them:
   - Logic-reuse percentages, latency figures, and binary-size ranges in the
     topology comparison table are estimates with no stated methodology.
   - "leveraging Capso's proven architecture" — Capso is BSL 1.1. Its DESIGN may
-    be studied; its CODE must not be copied. See docs/cleanshot-parity.md §13.
+    be studied; its CODE must not be copied. See docs/feature-audit.md §13.
 
-Cross-reference: docs/cleanshot-parity.md is the authoritative feature inventory,
+Cross-reference: docs/feature-audit.md is the authoritative feature inventory,
 derived directly from cleanshot.com/features.
 -->
 

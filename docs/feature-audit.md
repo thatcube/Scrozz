@@ -1,8 +1,12 @@
-# CleanShot X Parity Audit
+# Scrozz Feature Audit
 
-**Purpose:** define "done" for Scrozz. CleanShot X (macOS, $29) is the bar. This document is
-the authoritative feature inventory, the cross-platform feasibility analysis, and the build
-backlog.
+**Purpose:** define "done" for Scrozz. This document is the authoritative feature inventory,
+the cross-platform feasibility analysis, and the build backlog.
+
+> **Scope note (D24).** This file and the public comparison page are the **only** places
+> competitor names appear. Everything downstream — issues, code, commit messages, UI copy,
+> store listings — refers to features by **their Scrozz names**. The bar being matched here
+> is CleanShot X (macOS, $29); the goal is not to copy it but to beat it on three platforms.
 
 **Sources:**
 - `https://cleanshot.com/features` (rendered 2026-08-26) — authoritative, all 12 categories

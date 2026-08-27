@@ -3,7 +3,7 @@
 Decisions settled during the architecture design review. Each is binding until
 explicitly revisited. Open questions live at the bottom.
 
-**Related:** `cleanshot-parity.md` (feature inventory) · `research/` (inputs)
+**Related:** `feature-audit.md` (feature inventory) · `research/` (inputs)
 
 ---
 
@@ -67,7 +67,7 @@ app finished.
 - Automatic compression to the best codec the destination accepts
 - **Window capture with clean edges** (see D9)
 
-Everything else in `cleanshot-parity.md` is post-v1 and accumulates over time.
+Everything else in `feature-audit.md` is post-v1 and accumulates over time.
 
 **Why.** Agent capacity is not the constraint; verification attention is.
 Unverified features are worse than absent ones — that is what "Capso has bugs"
@@ -651,9 +651,10 @@ The polish does not live in egui; it lives in the token layer you bring. Rerun's
    not a library call. Glass drawn over the captured image looks excellent and is
    already achieved; genuine OS glass over the live desktop deserves its own spike
    if it becomes an identity requirement.
-6. **The eframe build in use diverges from upstream egui's `App` trait.** Resolve
-   and pin this deliberately **before Phase 0** — it affects every future upgrade,
-   and upstream examples will not drop in unmodified.
+6. **~~The eframe build diverges from upstream.~~ Investigated and false.** eframe
+   `0.36.1` is the genuine latest crates.io release and `fn ui(&mut self, ui, frame)`
+   *is* its real upstream `App` trait. The spike misread a crate newer than its own
+   training data as a patched environment. Nothing to resolve — see Open Questions.
 
 ---
 
@@ -671,11 +672,153 @@ the edit history along with the pixels.
 
 ---
 
+## D24 — Competitor names appear only in comparison documentation
+
+**Decision.** The names of other screenshot tools appear in exactly **two** places:
+this repository's `docs/` audit material, and a single public comparison page.
+They appear **nowhere else** — not in product copy, not in the UI, not in feature
+names, not in issue titles, not in code comments, not in commit messages, not in
+store listings or the README's own description of what Scrozz is.
+
+Everywhere downstream of the audit, features are referred to by **their Scrozz
+names**. An issue says "the capture dock collapses on downward swipe," never
+"like CleanShot's tray."
+
+**Why the strict version.** The loose version — "keep it out of marketing" — fails
+where it matters. Under D1 this is a clean-room build, and D5 means agents write
+most of it. An agent that reads "match CleanShot's magnifier" in an issue will
+reach for the competitor's behaviour as the specification. That is how a clean-room
+design quietly stops being one, and how you ship a worse copy of someone else's app
+instead of a better one of your own. Confining competitor names to the audit forces
+every downstream artifact to state what Scrozz should *do*, which is the only thing
+an implementer can actually build from.
+
+The positioning, stated plainly: **CleanShot X is the bar. It is also macOS-only.
+Scrozz is macOS, Windows and Linux — and better.** Steal like an artist: take the
+best ideas, name them ourselves, beat them.
+
+**The comparison page.** Modelled on the one Capso publishes. Candidate rows:
+screenshots, all-in-one capture HUD, recording, webcam PiP, OCR, annotation,
+pin-to-screen, beautification, cross-platform, open source, price. Three binding
+constraints:
+
+1. **It must be dated and factually accurate.** Naming a competitor in a comparison
+   is nominative fair use and is entirely legitimate; an out-of-date or wrong table
+   is the one way to turn that into a real complaint. Regenerate it each release.
+2. **No competitor logos or wordmarks** — plain text names only, no styling that
+   implies endorsement or affiliation.
+3. **At least one row we lose.** A table that wins everything is marketing and
+   reads as such. On day one CleanShot X will beat Scrozz on macOS polish, and
+   saying so is what makes the rows we do win believable.
+
+---
+
+## D25 — Every screenshot is generated; none is taken by hand
+
+**Decision.** Scrozz ships a **screenshot generator** built on the headless
+`egui_kittest` harness the spike proved out. It boots any UI surface with seeded
+state, renders it with no display server, and writes PNGs. It is the **only**
+source of product imagery. Nobody ever hand-captures a screenshot of Scrozz —
+which would be a delicious failure mode for a screenshot app.
+
+Three consumers, one harness, differing only in output profile:
+
+| Consumer | Profile |
+|---|---|
+| **Golden-image tests** | Fixed scale, committed baselines, CI fails on pixel diff |
+| **Store assets** | Exact per-store pixel dimensions, 2×/3×, localised |
+| **README and docs** | Annotated stills, plus animated captures for motion |
+
+**Why this is the important one.** It is the mechanism that makes agentic UI work
+possible at all. An agent cannot see. The spike demonstrated the failure exactly:
+it painted an unrounded scrim over a rounded thumbnail, squaring the bottom
+corners — the precise defect class D9 exists to prevent — and never noticed, while
+Brandon caught it in seconds. Golden images convert *"a human has to look at it"*
+into *"the build fails."* Without that, every visual regression needs a human; with
+it, agents can work the UI unattended and D5 holds.
+
+The store-asset payoff is separate and also large: per-store pixel dimensions are
+rigid, and producing them is a miserable manual chore once per release per store
+per locale. Generated, they are free, they are always of the **real** UI rather
+than a mockup, and **they cannot go stale** — they regenerate from the same code
+that ships.
+
+**What this requires, and these are hard requirements:**
+
+- **Determinism.** Fixed RNG seed, frozen clock, pinned font set, no live desktop
+  content behind glass, no real filesystem timestamps. A flaky golden test gets
+  disabled within a week and then the whole apparatus is worthless.
+- **A virtual clock.** D19 and D21 make Scrozz motion-heavy, so the harness must
+  render *a named instant* — "card-enter at t=180ms" — not whatever frame it
+  happened to catch. This same frame-stepping is what produces animated assets:
+  step the clock, dump N frames, encode. Stores accept app-preview video and
+  GitHub renders animated WebP.
+- **Named state fixtures.** "Six cards stacked," "dock collapsed," "annotation
+  toolbar open," "overflow evicting the oldest card." These serve as the golden
+  corpus *and* the marketing scenarios — one list, maintained once.
+- **Sizes as data.** A manifest of store targets, so supporting a new store is a
+  config entry rather than a code change.
+
+Localisation falls out for free: every locale, every store, one command.
+
+---
+
+## D26 — Onboarding teaches only what the app cannot teach itself
+
+**Decision.** Build the onboarding **flow** now; defer its **visuals** until the
+real UI exists. It is skippable, and re-runnable from settings.
+
+D15 already forbids the usual design: permissions are requested at first use of the
+feature that needs them, never up front, so onboarding is explicitly **not** a
+permission wizard. That constraint removes most of what onboarding normally
+contains, and what remains is small and genuinely necessary — the things that are
+invisible until someone points at them:
+
+1. **The drag-out gesture.** D12's hero action. Brandon called it "almost more
+   intuitive than copying" — but only *once you know it is there*. Nothing on
+   screen announces that a capture card can be dragged straight into another app.
+   This is the single highest-value thing onboarding does.
+2. **The capture hotkey** — confirm the default or set your own.
+3. **Where captures go** — D18's any-folder choice.
+4. **Linux/wlroots only:** hotkeys require a compositor keybinding. Explain it and
+   generate the config line to paste. Per D11 this is not a nicety; on wlroots it
+   is the only hotkey path that exists, and a user who is not told this concludes
+   the app is broken.
+
+Everything else the app teaches in place, at the moment it becomes relevant.
+
+**Why deferring the visuals costs nothing.** Each screen is a sentence and one
+animation, and under D25 that animation is *generated from the real UI* by the
+screenshot harness. Drawing onboarding art before the UI exists would mean drawing
+it twice and having the second version disagree with the product. Building the flow
+first and generating its imagery last is strictly cheaper and cannot drift.
+
+---
+
 # Open questions
 
-- **Onboarding and first-run flow.** Not yet designed. Interacts with D15's
-  permission sequencing — every invasive permission is requested at first use of
-  the feature it belongs to, never during onboarding.
 - **The Scrozz design language.** Seeded by the spike's token layer; needs
-  deliberate definition rather than inheritance from throwaway code.
-- **The eframe API-divergence question** (D22, cost 6) — resolve before Phase 0.
+  deliberate definition rather than inheritance from throwaway code. This is the
+  only open item, and it is the first task of Phase 0's UI crate.
+
+## Closed since last revision
+
+- ~~**Onboarding and first-run flow**~~ — settled in **D26**.
+- ~~**The eframe API-divergence question**~~ — **there was no divergence.** The
+  spike concluded the environment shipped a patched eframe because
+  `fn ui(&mut self, ui, frame)` did not match the signature it remembered.
+  Verified against crates.io and the vendored source: **eframe 0.36.1 is the
+  genuine latest published release, from the registry with a checksum, and that
+  *is* its real upstream `App` trait.** Nothing is patched, reproducibility for
+  outside contributors was never at risk, and there is nothing to resolve.
+
+  The real lesson is a process one, and it generalises past egui: **an agent's
+  memory of a fast-moving 0.x crate will be older than the pinned version, and the
+  tempting explanation for a mismatch is that the environment is nonstandard.** It
+  usually is not. Agents working on Scrozz read the vendored source under
+  `~/.cargo/registry/src/` before writing against a pinned dependency, and never
+  explain away a compile error by assuming a patched toolchain.
+
+  One genuine supply-chain concern from the spike does stand, and is unrelated:
+  **`window-vibrancy` is pinned to an unreleased git revision** for
+  `apply_liquid_glass`. Revisit before shipping.

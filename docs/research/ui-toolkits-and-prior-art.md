@@ -10,7 +10,7 @@ research time and will drift. Re-verify before adopting any dependency.
 Items the agent marked "unverified" are exactly that.
 
 Cross-reference:
-  docs/cleanshot-parity.md              — authoritative feature inventory
+  docs/feature-audit.md              — authoritative feature inventory
   docs/research/architecture-blueprint.md — externally supplied proposal
 -->
 
