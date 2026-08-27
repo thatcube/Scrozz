@@ -1,0 +1,49 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+Full license text: https://www.gnu.org/licenses/gpl-3.0.txt
+
+Scrozz — Copyright (c) 2026 Brandon Moore
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+────────────────────────────────────────────────────────────────────────
+
+                    APP STORE / STORE DISTRIBUTION EXCEPTION
+
+As a special exception to the terms and conditions of version 3.0 of
+the GPL, you are permitted to convey covered works through the Apple
+App Store (including the macOS, iOS and tvOS App Stores), the Microsoft
+Store, or any similar proprietary distribution platform, provided that
+you also comply with the GPL in all other respects.
+
+If you convey a copy of this program through such a service, you may
+include DRM mechanisms, access keys, certificates, or signing
+requirements imposed by the platform. Users who receive the program
+through such a service retain all rights granted by the GPL, including
+the right to obtain the complete corresponding source code.
+
+This exception does not invalidate any other reasons why a covered
+work might be covered by the GPL.
+
+────────────────────────────────────────────────────────────────────────
+
+                              TRADEMARKS
+
+This license covers the SOURCE CODE. It does not grant any right to use
+the name "Scrozz" or the Scrozz logo. See TRADEMARK.md.

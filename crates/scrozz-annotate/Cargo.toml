@@ -1,0 +1,19 @@
+[package]
+name = "scrozz-annotate"
+description = "The annotation document model, its renderer, and beautification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+scrozz-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+image.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

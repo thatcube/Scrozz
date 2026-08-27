@@ -795,6 +795,56 @@ first and generating its imagery last is strictly cheaper and cannot drift.
 
 ---
 
+## D27 — Every always-on-top surface has an escape hatch
+
+**Decision.** Any Scrozz window that floats above other applications must satisfy
+**all four** of the following. There are no exceptions, including for surfaces
+that are "obviously" transient.
+
+1. **It can be moved.** Dragging anywhere on its body relocates it. Borderless
+   windows have no titlebar, so the body *is* the drag handle.
+2. **It can be dismissed by keyboard**, from a key that works even when the
+   window does not have focus. Escape returns the surface to a normal,
+   interactive, movable state; a second Escape closes it.
+3. **It is never simultaneously always-on-top, click-through and undraggable.**
+   That combination is unreachable by mouse and unclosable by keyboard — a
+   window the user can neither move, click, nor dismiss.
+4. **It defaults to the least intrusive state that still works.** Always-on-top
+   is entered when a capture demands it and left immediately afterwards; it is
+   never the resting state.
+
+**Why this is a decision and not a style note.** We learned it by inflicting it.
+The overlay spike was built exactly as specified — borderless, no titlebar,
+always-on-top — and within minutes it had made the machine unusable: it sat over
+the work in progress, could not be dragged aside, and had no obvious way out.
+The session was halted over it.
+
+That is worth taking seriously rather than treating as a spike accident, because
+**Scrozz's real surfaces have precisely this shape.** The capture stack, the
+capture dock, the pinned-to-screen captures and the selection overlay are all
+floating always-on-top windows, and every one of them will be on screen while the
+user is trying to do something else. A screenshot tool that gets this wrong is
+not merely unpolished; it is actively hostile, and it is uninstalled quickly.
+
+The general principle: **the more insistent a window is, the cheaper its escape
+must be.** A surface that claims the top of the window stack has to earn it, and
+must be trivially movable and dismissible by someone who did not read any
+documentation and is mid-task and annoyed.
+
+**Consequences for D20 and D21.** Capture cards are already dismissible by
+swiping left and collapsible by swiping down, so the pile is well behaved. Two
+additions: the pile is **draggable as a unit** to anywhere on screen, not fixed to
+the bottom-left corner, and Escape collapses it to the dock from anywhere. Pinned
+captures get the same treatment — always draggable, always closable, never
+trapped on top.
+
+**Consequences for development.** Any spike or debug build that creates a floating
+window starts at `WindowLevel::Normal`, makes always-on-top an explicit opt-in
+toggle with a visible legend, and closes its window when it is done rather than
+leaving it on the developer's desktop between runs.
+
+---
+
 # Open questions
 
 - **The Scrozz design language.** Seeded by the spike's token layer; needs

@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Backtrace/profiling output
+*.profraw
+
+# Spike scratch — run logs, pids, and anything an agent leaves behind
+*.log
+*.pid
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Secrets — never commit signing keys or store credentials
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.mobileprovision
+
+# Competitor UI reference lives outside the repository by design (D17).
+# This entry exists so an accidental copy is never committed.
+/reference/

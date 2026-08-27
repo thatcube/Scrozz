@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+# The UI spike is deliberately excluded: it is throwaway, pins its own
+# dependency versions, and must not constrain the real build.
+exclude = ["spikes/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+authors = ["Brandon Moore"]
+repository = "https://github.com/thatcube/scrozz"
+homepage = "https://github.com/thatcube/scrozz"
+
+[workspace.dependencies]
+# ---- internal ----------------------------------------------------------
+scrozz-core = { path = "crates/scrozz-core" }
+scrozz-capture = { path = "crates/scrozz-capture" }
+scrozz-record = { path = "crates/scrozz-record" }
+scrozz-annotate = { path = "crates/scrozz-annotate" }
+scrozz-stitch = { path = "crates/scrozz-stitch" }
+scrozz-ocr = { path = "crates/scrozz-ocr" }
+scrozz-store = { path = "crates/scrozz-store" }
+scrozz-export = { path = "crates/scrozz-export" }
+scrozz-shell = { path = "crates/scrozz-shell" }
+scrozz-ui = { path = "crates/scrozz-ui" }
+
+# ---- external ----------------------------------------------------------
+# egui/eframe are 0.x and churn hard between releases; pin exactly. 0.36.1 is
+# the current release and its `App` trait is `fn ui(&mut self, ui, frame)`.
+# That is upstream, not a patch — see docs/decisions.md D22.
+eframe = { version = "=0.36.1", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+egui = "=0.36.1"
+
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+] }
+
+[workspace.lints.rust]
+# An unimplemented contract must still compile. Phase 0 is deliberately a tree
+# of `todo!()` bodies, so these cannot be denied yet.
+unused_variables = "allow"
+dead_code = "allow"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+todo = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
