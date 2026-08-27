@@ -18,7 +18,7 @@ use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 use windows::{
     Graphics::Capture::GraphicsCaptureSession,
     Win32::{
-        Foundation::{BOOL, HLOCAL, LocalFree},
+        Foundation::{HLOCAL, LocalFree},
         Security::{
             Authorization::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -32,6 +32,7 @@ use windows::{
             OPEN_EXISTING, SetFileInformationByHandle,
         },
     },
+    core::BOOL,
     core::PCWSTR,
 };
 
@@ -872,6 +873,36 @@ impl OutputPaths {
         self.owns_output = true;
     }
 
+    fn pin_identity(&mut self) -> Result<()> {
+        let path: Vec<u16> = self
+            .temporary_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map_err(|error| {
+            Error::Storage(format!(
+                "could not pin recording staging identity {}: {error}",
+                self.temporary_path.display()
+            ))
+        })?;
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        self.identity_info = Some(file_identity(&handle)?);
+        self.identity = Some(handle);
+        Ok(())
+    }
+
     fn discard(&mut self, error: Error) -> Error {
         self.identity.take();
         let path = self.owned_path().to_owned();
@@ -1094,88 +1125,50 @@ fn promote_output(paths: &mut OutputPaths) -> Result<()> {
             "recording was promoted but its empty private working directory remains"
         );
     }
-
-    impl OutputPaths {
-        fn pin_identity(&mut self) -> Result<()> {
-            let path: Vec<u16> = self
-                .temporary_path
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            let handle = unsafe {
-                CreateFileW(
-                    PCWSTR(path.as_ptr()),
-                    FILE_READ_ATTRIBUTES.0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    None,
-                )
-            }
-            .map_err(|error| {
-                Error::Storage(format!(
-                    "could not pin recording staging identity {}: {error}",
-                    self.temporary_path.display()
-                ))
-            })?;
-            let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-            self.identity_info = Some(file_identity(&handle)?);
-            self.identity = Some(handle);
-            Ok(())
-        }
-    }
-
-    fn file_identity(handle: &OwnedHandle) -> Result<FILE_ID_INFO> {
-        let mut identity = FILE_ID_INFO::default();
-        unsafe {
-            GetFileInformationByHandleEx(
-                windows::Win32::Foundation::HANDLE(handle.as_raw_handle()),
-                FileIdInfo,
-                (&raw mut identity).cast(),
-                u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO fits u32"),
-            )
-        }
-        .map_err(|error| {
-            Error::Storage(format!("could not read recording file identity: {error}"))
-        })?;
-        Ok(identity)
-    }
-
-    fn rename_handle_no_replace(handle: &OwnedHandle, destination: &[u16]) -> Result<()> {
-        let name = destination.strip_suffix(&[0]).unwrap_or(destination);
-        let name_bytes = name
-            .len()
-            .checked_mul(std::mem::size_of::<u16>())
-            .ok_or_else(|| Error::Storage("recording destination name is too long".into()))?;
-        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let allocation = offset
-            .checked_add(name_bytes)
-            .ok_or_else(|| Error::Storage("recording rename buffer is too large".into()))?;
-        let mut storage = vec![0_usize; allocation.div_ceil(std::mem::size_of::<usize>())];
-        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        unsafe {
-            (*rename).Anonymous.ReplaceIfExists = false;
-            (*rename).RootDirectory = windows::Win32::Foundation::HANDLE::default();
-            (*rename).FileNameLength = u32::try_from(name_bytes)
-                .map_err(|_| Error::Storage("recording destination name is too long".into()))?;
-            std::ptr::copy_nonoverlapping(
-                name.as_ptr(),
-                (*rename).FileName.as_mut_ptr(),
-                name.len(),
-            );
-            SetFileInformationByHandle(
-                windows::Win32::Foundation::HANDLE(handle.as_raw_handle()),
-                FileRenameInfo,
-                rename.cast(),
-                u32::try_from(allocation)
-                    .map_err(|_| Error::Storage("recording rename buffer is too large".into()))?,
-            )
-            .map_err(|error| Error::Storage(format!("handle-based rename failed: {error}")))
-        }
-    }
     Ok(())
+}
+
+fn file_identity(handle: &OwnedHandle) -> Result<FILE_ID_INFO> {
+    let mut identity = FILE_ID_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            windows::Win32::Foundation::HANDLE(handle.as_raw_handle()),
+            FileIdInfo,
+            (&raw mut identity).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO fits u32"),
+        )
+    }
+    .map_err(|error| Error::Storage(format!("could not read recording file identity: {error}")))?;
+    Ok(identity)
+}
+
+fn rename_handle_no_replace(handle: &OwnedHandle, destination: &[u16]) -> Result<()> {
+    let name = destination.strip_suffix(&[0]).unwrap_or(destination);
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| Error::Storage("recording destination name is too long".into()))?;
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let allocation = offset
+        .checked_add(name_bytes)
+        .ok_or_else(|| Error::Storage("recording rename buffer is too large".into()))?;
+    let mut storage = vec![0_usize; allocation.div_ceil(std::mem::size_of::<usize>())];
+    let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*rename).Anonymous.ReplaceIfExists = false;
+        (*rename).RootDirectory = windows::Win32::Foundation::HANDLE::default();
+        (*rename).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| Error::Storage("recording destination name is too long".into()))?;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*rename).FileName.as_mut_ptr(), name.len());
+        SetFileInformationByHandle(
+            windows::Win32::Foundation::HANDLE(handle.as_raw_handle()),
+            FileRenameInfo,
+            rename.cast(),
+            u32::try_from(allocation)
+                .map_err(|_| Error::Storage("recording rename buffer is too large".into()))?,
+        )
+        .map_err(|error| Error::Storage(format!("handle-based rename failed: {error}")))
+    }
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {

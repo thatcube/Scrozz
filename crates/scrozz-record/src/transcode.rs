@@ -895,6 +895,9 @@ fn create_staging_directory(parent: &Path) -> Result<(PathBuf, PathBuf)> {
         let token = format!("{}-{:016x}", std::process::id(), entropy.finish());
         let preparing = parent.join(format!("{PREPARING_DIRECTORY_PREFIX}{token}"));
         let directory = parent.join(format!("{STAGING_DIRECTORY_PREFIX}{token}"));
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         builder.mode(0o700);
@@ -1402,7 +1405,7 @@ fn finish_failed_video(
 ) -> WorkerTerminal {
     let duration = writer.media_end();
     let error = if writer.video_frames() == 0 {
-        drop(writer);
+        discard_video_writer(writer);
         error
     } else {
         match writer.finish(duration) {
@@ -1416,11 +1419,20 @@ fn finish_failed_video(
 fn finish_cancelled_video(mut writer: platform::VideoWriter, output_path: &Path) -> WorkerTerminal {
     let duration = writer.media_end();
     if writer.video_frames() == 0 {
-        drop(writer);
+        discard_video_writer(writer);
         return cancelled_after_cleanup(output_path);
     }
     let finalize_error = writer.finish(duration).err();
     terminal_cancelled(output_path, ArtifactKind::Video, duration, finalize_error)
+}
+
+fn discard_video_writer(writer: platform::VideoWriter) {
+    #[cfg(target_os = "macos")]
+    drop(writer);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _writer = writer;
+    }
 }
 
 fn terminal_failure(
