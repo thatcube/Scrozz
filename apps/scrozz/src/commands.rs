@@ -21,6 +21,7 @@ use std::path::Path;
 
 use scrozz_core::{CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, TargetEnumerator};
 use scrozz_export::{Clipboard, Encoder, FrameEncoder};
+use scrozz_ocr::Ocr as _;
 
 use crate::{
     cli::{
@@ -429,11 +430,9 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
                     format!("{} does not exist", path.display()),
                 ))));
             }
-            let _frame = platform::decode_image_file(&path)?;
-            Err(CliError::not_implemented(
-                "recognising text in a file",
-                "scrozz-export",
-            ))
+            let frame = platform::decode_image_file(&path)?;
+            let blocks = platform::ocr_engine().recognize(&frame)?;
+            Ok(ocr_report(&blocks, &path.display().to_string()))
         }
         OcrSubject::Capture(_) => {
             let _store = platform::store()?;
@@ -443,6 +442,42 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
             ))
         }
     }
+}
+
+/// Renders recognised text for both `--json` and human output.
+///
+/// The human rendering is **the text and nothing else**, one block per line, so
+/// `scrozz ocr shot.png | pbcopy` does the obvious thing. Bounds and confidence
+/// belong in `--json`, where a consumer asked for structure; printing them in
+/// the human path would corrupt the far more common case of piping the text
+/// somewhere.
+fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
+    let text = blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let data = Json::obj([
+        ("source", Json::str(source)),
+        ("block_count", Json::Int(blocks.len() as i64)),
+        ("text", Json::str(text.as_str())),
+        (
+            "blocks",
+            Json::arr(blocks.iter().map(|b| {
+                Json::obj([
+                    ("text", Json::str(b.text.as_str())),
+                    ("confidence", Json::Float(f64::from(b.confidence))),
+                    ("x", Json::Float(b.bounds.origin.x)),
+                    ("y", Json::Float(b.bounds.origin.y)),
+                    ("width", Json::Float(b.bounds.size.width)),
+                    ("height", Json::Float(b.bounds.size.height)),
+                ])
+            })),
+        ),
+    ]);
+
+    Report::new(data, text)
 }
 
 // ---------------------------------------------------------------------------
