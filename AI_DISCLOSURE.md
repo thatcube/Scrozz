@@ -69,10 +69,11 @@ These are properties of the shipped application, not promises about intent.
   it leaves your machine.
 - **Text recognition is local.** Optical character recognition uses Vision on
   macOS, `Windows.Media.Ocr` when the Windows process has package identity, and
-  an installed Tesseract executable for Linux and the portable Windows ZIP.
-  Scrozz bundles no OCR model, passes an explicit installed language model, and
-  returns an actionable error when the required executable or language data is
-  absent. Nothing is sent off the machine.
+  Tesseract on Linux and in the portable Windows ZIP. That ZIP includes the
+  Tesseract executable, its runtime DLLs, and English recognition data; Linux
+  uses the executable and language data installed by the user. Scrozz always
+  passes an explicit language model and returns an actionable error when a
+  requested model is absent. Nothing is sent off the machine.
 
 ### How you can verify that
 

@@ -9,8 +9,8 @@ binary:
   `Windows.Media.Ocr` and owns its startup task through `AppxManifest.xml`.
 
 The startup task is declared with `Enabled="false"`. Installing the package
-never opts the user into launch at login; `scrozz autostart enable` requests it
-through `Windows.ApplicationModel.StartupTask`.
+never opts the user into launch at login. To opt in, open **Windows Settings →
+Apps → Startup** and turn on **Scrozz**.
 
 ## Store identity and signing
 
@@ -24,8 +24,24 @@ SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME
 SCROZZ_MSIX_VERSION
 ```
 
-`SCROZZ_MSIX_VERSION` is optional and must have four numeric components. Without
-it, application version `1.2.3` becomes package version `1.2.3.0`.
+`SCROZZ_MSIX_VERSION` is optional for stable versions and required for
+prereleases. It must satisfy Partner Center's rules: four components no greater
+than 65535, a nonzero first component, and a fourth component of exactly zero.
+
+Stable semantic versions are encoded deterministically:
+
+```text
+native major = semantic major + 1
+native minor = semantic minor * 256 + semantic patch
+native build = 65535
+native revision = 0
+```
+
+Semantic major must be at most 65534; minor and patch must each be at most 255.
+For example, application version `1.2.3` becomes `2.515.65535.0`. Release
+prereleases use the same first two components, `GITHUB_RUN_NUMBER` in the range
+1–65534 as native build, and zero as native revision. This keeps each
+prerelease ordered and unique while reserving 65535 for the stable release.
 
 Signing is deliberately inert unless a human-approved environment supplies one
 of:
@@ -53,22 +69,29 @@ accepted.
 
 Each artifact has an adjacent `.artifact.json` file. Its `package_kind` and
 `ocr_backend` fields make the distribution contract explicit: portable means
-`tesseract`, while MSIX means `windows-media-ocr`.
+`tesseract`, while MSIX means `windows-media-ocr`. `signed` records the package
+container signature (and is always false for a ZIP); `payload_signed` separately
+records whether the enclosed `scrozz.exe` has a valid Authenticode signature.
 
 The portable build requires `SCROZZ_TESSERACT_DIR` to be an absolute directory
-with this shape:
+matching the checked-in `tesseract-payload.json` checksum manifest. That
+manifest pins the exact Chocolatey nupkg and embedded installer, every runtime
+file copied from it, and `eng.traineddata` from a full immutable
+`tessdata_fast` commit URL.
 
 ```text
 tesseract.exe
-*.dll
+the complete manifest-listed runtime DLL closure
+doc/
+  LICENSE
 tessdata/
   eng.traineddata
 ```
 
-The complete directory is copied to `tesseract/` beside `scrozz.exe`. Packaging
-fails if the executable or English model is absent, if the source overlaps the
-output directory, or if the payload contains reparse points. Scrozz never uses
-an ambient `tesseract.exe` from `PATH`.
+Only manifest-listed, checksum-verified files are copied to `tesseract/` beside
+`scrozz.exe`. Packaging fails on a missing, changed, or unexpected runtime DLL,
+if the source overlaps the output directory, or if the payload contains reparse
+points. Scrozz never uses an ambient `tesseract.exe` from `PATH`.
 
 At runtime, the portable executable uses that sibling `tesseract/` directory by
 default. `SCROZZ_TESSERACT_DIR` remains an absolute override for source builds

@@ -17,7 +17,10 @@ param(
     [string] $Architecture,
 
     [Parameter()]
-    [string] $TesseractDirectory = $env:SCROZZ_TESSERACT_DIR
+    [string] $TesseractDirectory = $env:SCROZZ_TESSERACT_DIR,
+
+    [Parameter()]
+    [string] $TesseractPayloadManifest = ""
 )
 
 Set-StrictMode -Version Latest
@@ -27,6 +30,11 @@ $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $Binary = [IO.Path]::GetFullPath($Binary)
 $OutputRoot = [IO.Path]::GetPathRoot($OutputDirectory)
+if ([String]::IsNullOrWhiteSpace($TesseractPayloadManifest)) {
+    $TesseractPayloadManifest = Join-Path `
+        $RepoRoot "packaging\windows\tesseract-payload.json"
+}
+$TesseractPayloadManifest = [IO.Path]::GetFullPath($TesseractPayloadManifest)
 
 if ($OutputDirectory.TrimEnd("\", "/") -eq $OutputRoot.TrimEnd("\", "/")) {
     throw "Refusing to package into a filesystem root: $OutputDirectory"
@@ -69,7 +77,10 @@ if ($null -ne $ReparsePoint) {
 if ($Stamp -notmatch "^[0-9A-Za-z._-]+$") {
     throw "Unsafe package stamp: $Stamp"
 }
-if ($Version -notmatch "^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$") {
+if ($Version -notmatch (
+        "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)" +
+        "(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+    )) {
     throw "Invalid application version: $Version"
 }
 if ($OutputDirectory.Contains('"') -or
@@ -111,24 +122,164 @@ function Test-PathWithin {
     )
 }
 
+function Confirm-TesseractPayload {
+    param([string] $Directory, [string] $ManifestPath)
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Tesseract payload manifest does not exist: $ManifestPath"
+    }
+    try {
+        $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    } catch {
+        throw "Tesseract payload manifest is not valid JSON: $ManifestPath"
+    }
+    if ($Manifest.schema -ne 1) {
+        throw "Unsupported Tesseract payload manifest schema in $ManifestPath"
+    }
+
+    $Entries = @($Manifest.payload_files)
+    if ($Entries.Count -eq 0) {
+        throw "Tesseract payload manifest contains no files: $ManifestPath"
+    }
+    $Seen = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($Entry in $Entries) {
+        $RelativePath = [string] $Entry.path
+        $ExpectedHash = ([string] $Entry.sha256).ToLowerInvariant()
+        $IsRuntimeDll = $RelativePath -match "^[0-9A-Za-z.+_-]+\.dll$"
+        if ($RelativePath -ne "tesseract.exe" -and
+            $RelativePath -ne "doc/LICENSE" -and
+            $RelativePath -ne "tessdata/eng.traineddata" -and
+            -not $IsRuntimeDll) {
+            throw "Unsafe or unexpected Tesseract payload path: $RelativePath"
+        }
+        if (-not $Seen.Add($RelativePath)) {
+            throw "Duplicate Tesseract payload path: $RelativePath"
+        }
+        if ($ExpectedHash -notmatch "^[0-9a-f]{64}$") {
+            throw "Invalid checksum for Tesseract payload path: $RelativePath"
+        }
+
+        $NativeRelativePath = $RelativePath.Replace(
+            "/", [IO.Path]::DirectorySeparatorChar
+        )
+        $Source = Join-Path $Directory $NativeRelativePath
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+            throw "The portable OCR payload is missing $Source"
+        }
+        $ActualHash = (
+            Get-FileHash -LiteralPath $Source -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if ($ActualHash -ne $ExpectedHash) {
+            throw (
+                "Checksum mismatch for Tesseract payload file $RelativePath. " +
+                "Expected $ExpectedHash, found $ActualHash"
+            )
+        }
+    }
+
+    foreach ($Required in @(
+        "tesseract.exe",
+        "doc/LICENSE",
+        "libtesseract-5.dll",
+        "libleptonica-6.dll",
+        "tessdata/eng.traineddata"
+    )) {
+        if (-not $Seen.Contains($Required)) {
+            throw "Tesseract payload manifest is missing required file $Required"
+        }
+    }
+
+    $ExpectedDlls = @(
+        $Entries |
+            ForEach-Object { [string] $_.path } |
+            Where-Object { $_ -match "^[0-9A-Za-z.+_-]+\.dll$" } |
+            Sort-Object
+    )
+    $ActualDlls = @(
+        Get-ChildItem -LiteralPath $Directory -Filter "*.dll" -File |
+            ForEach-Object { $_.Name } |
+            Sort-Object
+    )
+    $Difference = @(
+        Compare-Object -ReferenceObject $ExpectedDlls -DifferenceObject $ActualDlls
+    )
+    if ($Difference.Count -ne 0) {
+        $Details = ($Difference | ForEach-Object {
+            "$($_.InputObject) $($_.SideIndicator)"
+        }) -join ", "
+        throw "Tesseract runtime DLL closure differs from the manifest: $Details"
+    }
+
+    return $Entries
+}
+
 function Convert-ToMsixVersion {
     param([string] $ApplicationVersion)
     $Override = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_VERSION")
     if (-not [String]::IsNullOrWhiteSpace($Override)) {
         $Candidate = $Override
     } else {
-        $Candidate = (($ApplicationVersion -split "-", 2)[0] + ".0")
+        if ($ApplicationVersion.Contains("-")) {
+            throw (
+                "Prerelease artifacts require SCROZZ_MSIX_VERSION so distinct " +
+                "prereleases cannot collapse to one Windows package version"
+            )
+        }
+        $CoreParts = ($ApplicationVersion -split "-", 2)[0].Split(".")
+        [UInt64] $SemanticMajor = 0
+        [UInt64] $SemanticMinor = 0
+        [UInt64] $SemanticPatch = 0
+        if (-not [UInt64]::TryParse(
+                $CoreParts[0],
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref] $SemanticMajor
+            ) -or $SemanticMajor -gt 65534 -or
+            -not [UInt64]::TryParse(
+                $CoreParts[1],
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref] $SemanticMinor
+            ) -or $SemanticMinor -gt 255 -or
+            -not [UInt64]::TryParse(
+                $CoreParts[2],
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref] $SemanticPatch
+            ) -or $SemanticPatch -gt 255) {
+            throw (
+                "Stable MSIX mapping requires semantic major <= 65534 and " +
+                "minor/patch <= 255: $ApplicationVersion"
+            )
+        }
+        $NativeMajor = $SemanticMajor + 1
+        $NativeMinor = ($SemanticMinor * 256) + $SemanticPatch
+        $Candidate = "$NativeMajor.$NativeMinor.65535.0"
     }
     if ($Candidate -notmatch "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$") {
         throw "SCROZZ_MSIX_VERSION must contain four numeric parts: $Candidate"
     }
+    $Numbers = [Collections.Generic.List[UInt32]]::new()
     foreach ($Part in $Candidate.Split(".")) {
-        $Number = [UInt32]::Parse($Part, [Globalization.CultureInfo]::InvariantCulture)
-        if ($Number -gt 65535) {
+        [UInt64] $Number = 0
+        if (-not [UInt64]::TryParse(
+                $Part,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref] $Number
+            ) -or $Number -gt 65535) {
             throw "Every MSIX version component must be at most 65535: $Candidate"
         }
+        $Numbers.Add([UInt32] $Number)
     }
-    return $Candidate
+    if ($Numbers[0] -eq 0) {
+        throw "The first MSIX version component must be between 1 and 65535: $Candidate"
+    }
+    if ($Numbers[3] -ne 0) {
+        throw "The fourth MSIX version component must be 0: $Candidate"
+    }
+    return ($Numbers -join ".")
 }
 
 function Resolve-WindowsSdkTool {
@@ -300,7 +451,9 @@ function Write-ArtifactMetadata {
         [string] $Platform,
         [string] $PackageKind,
         [string] $OcrBackend,
+        [string] $NativePackageVersion,
         [bool] $Signed,
+        [bool] $PayloadSigned,
         [string] $IdentityName
     )
     $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -319,9 +472,11 @@ function Write-ArtifactMetadata {
         sha256 = $Hash
         size = $Length
         package_kind = $PackageKind
+        native_package_version = $NativePackageVersion
         ocr_backend = $OcrBackend
         package_identity = $IdentityName
         signed = $Signed
+        payload_signed = $PayloadSigned
         signed_manifest = $false
     }
     Write-Utf8NoBom -Path "$Artifact.artifact.json" -Text (
@@ -339,8 +494,14 @@ $PackagePublisher = Get-EnvironmentOrDefault `
     "SCROZZ_MSIX_PUBLISHER" "CN=Scrozz Development"
 $PublisherDisplayName = Get-EnvironmentOrDefault `
     "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME" "Scrozz Development"
+$TesseractPayloadFiles = @(
+    Confirm-TesseractPayload `
+        -Directory $TesseractDirectory `
+        -ManifestPath $TesseractPayloadManifest
+)
 $MsixVersion = Convert-ToMsixVersion $Version
 $MsixArchitecture = if ($Architecture -eq "x86_64") { "x64" } else { "arm64" }
+$PayloadSigned = (Get-AuthenticodeSignature -FilePath $Binary).Status -eq "Valid"
 
 if ($PackageIdentityName -notmatch "^[0-9A-Za-z.-]{3,50}$") {
     throw "SCROZZ_MSIX_IDENTITY_NAME is not a valid package identity name"
@@ -376,9 +537,16 @@ try {
     Copy-DistributionDocuments $MsixRoot
     $PortableTesseract = Join-Path $PortableRoot "tesseract"
     New-Item -ItemType Directory -Path $PortableTesseract | Out-Null
-    Get-ChildItem -LiteralPath $TesseractDirectory -Force | Copy-Item `
-        -Destination $PortableTesseract `
-        -Recurse
+    foreach ($PayloadFile in $TesseractPayloadFiles) {
+        $RelativePath = ([string] $PayloadFile.path).Replace(
+            "/", [IO.Path]::DirectorySeparatorChar
+        )
+        $Source = Join-Path $TesseractDirectory $RelativePath
+        $Destination = Join-Path $PortableTesseract $RelativePath
+        $DestinationParent = [IO.Path]::GetDirectoryName($Destination)
+        New-Item -ItemType Directory -Path $DestinationParent -Force | Out-Null
+        Copy-Item -LiteralPath $Source -Destination $Destination
+    }
 
     foreach ($Asset in @(
         "Square44x44Logo.png",
@@ -515,14 +683,18 @@ try {
         -Platform "windows-$Architecture" `
         -PackageKind "portable" `
         -OcrBackend "tesseract" `
+        -NativePackageVersion $Version `
         -Signed $false `
+        -PayloadSigned $PayloadSigned `
         -IdentityName ""
     Write-ArtifactMetadata `
         -Artifact $Msix `
         -Platform "windows-$Architecture" `
         -PackageKind "msix" `
         -OcrBackend "windows-media-ocr" `
+        -NativePackageVersion $MsixVersion `
         -Signed $Signed `
+        -PayloadSigned $PayloadSigned `
         -IdentityName $PackageIdentityName
 } finally {
     if (Test-Path -LiteralPath $Scratch) {

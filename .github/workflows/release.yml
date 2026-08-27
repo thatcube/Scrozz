@@ -54,23 +54,6 @@ jobs:
     name: Build — ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    # Signing secrets are surfaced as job-level environment variables because
-    # the `secrets` context is NOT available in a step's `if:` condition, while
-    # `env` is. This indirection is what lets each signing step skip cleanly
-    # when the corresponding secret has never been created. An unset secret
-    # interpolates to the empty string; nothing here assumes one exists.
-    env:
-      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-      WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      WINDOWS_MSIX_IDENTITY_NAME: ${{ secrets.WINDOWS_MSIX_IDENTITY_NAME }}
-      WINDOWS_MSIX_PUBLISHER: ${{ secrets.WINDOWS_MSIX_PUBLISHER }}
-      WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME }}
     strategy:
       # Publish nothing rather than a partial set: if Windows fails we still
       # want to see whether macOS and Linux succeeded, so the draft can be
@@ -120,13 +103,76 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          RELEASE_REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
-          # Strip a leading 'v' so the filename reads scrozz-0.1.0-... rather
-          # than scrozz-v0.1.0-...
+          set -euo pipefail
+          REF="$RELEASE_REF"
+          if [[ "$REF" != v* ]]; then
+            echo "::error title=Invalid release tag::Release tags must start with v: $REF"
+            exit 1
+          fi
           VERSION="${REF#v}"
+
+          CARGO_METADATA="$(
+            cargo metadata --locked --no-deps --format-version 1
+          )"
+          WORKSPACE_VERSION_COUNT="$(
+            jq '[.packages[] | select(.name == "scrozz")] | length' \
+              <<<"$CARGO_METADATA"
+          )"
+          if [[ "$WORKSPACE_VERSION_COUNT" -ne 1 ]]; then
+            echo "::error title=Workspace version unavailable::Expected exactly one scrozz package in Cargo workspace metadata."
+            exit 1
+          fi
+          CARGO_VERSION="$(
+            jq -r '.packages[] | select(.name == "scrozz") | .version' \
+              <<<"$CARGO_METADATA"
+          )"
+          if [[ "$VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error title=Release version mismatch::Tag $REF names $VERSION, but the Cargo workspace package version is $CARGO_VERSION."
+            exit 1
+          fi
+
           echo "version=$VERSION" >>"$GITHUB_OUTPUT"
           echo "Building version $VERSION from $REF"
+
+      - name: Select monotonic MSIX version
+        if: matrix.os == 'windows-latest'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error title=Invalid release version::$VERSION is not a supported semantic version."
+            exit 1
+          fi
+          SEMVER_MAJOR="${BASH_REMATCH[1]}"
+          SEMVER_MINOR="${BASH_REMATCH[2]}"
+          SEMVER_PATCH="${BASH_REMATCH[3]}"
+          if (( SEMVER_MAJOR > 65534 ||
+                SEMVER_MINOR > 255 ||
+                SEMVER_PATCH > 255 )); then
+            echo "::error title=MSIX version overflow::MSIX mapping requires semantic major <= 65534 and minor/patch <= 255."
+            exit 1
+          fi
+          NATIVE_MAJOR=$((SEMVER_MAJOR + 1))
+          NATIVE_MINOR=$((SEMVER_MINOR * 256 + SEMVER_PATCH))
+
+          # Store versions require a nonzero first component and a zero fourth
+          # component. The semantic minor/patch pair is packed into component
+          # two; component three orders prereleases below the stable release.
+          if [[ "$VERSION" == *-* ]]; then
+            NATIVE_BUILD="$GITHUB_RUN_NUMBER"
+            if (( NATIVE_BUILD < 1 || NATIVE_BUILD > 65534 )); then
+              echo "::error title=MSIX build exhausted::GitHub run number $NATIVE_BUILD is outside the reserved prerelease range 1..65534."
+              exit 1
+            fi
+          else
+            NATIVE_BUILD=65535
+          fi
+          MSIX_VERSION="${NATIVE_MAJOR}.${NATIVE_MINOR}.${NATIVE_BUILD}.0"
+          echo "SCROZZ_MSIX_VERSION=$MSIX_VERSION" >>"$GITHUB_ENV"
+          echo "MSIX package version: $MSIX_VERSION"
 
       # --- Compile ------------------------------------------------------------
       - name: Build (macOS universal)
@@ -138,10 +184,22 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
           cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
           mkdir -p dist
-          lipo -create -output dist/scrozz \
+          UNIVERSAL_BINARY="$PWD/dist/scrozz"
+          lipo -create -output "$UNIVERSAL_BINARY" \
             target/aarch64-apple-darwin/release/scrozz \
             target/x86_64-apple-darwin/release/scrozz
-          lipo -info dist/scrozz
+          lipo -info "$UNIVERSAL_BINARY"
+
+          BASE_VERSION="${{ steps.version.outputs.version }}"
+          BASE_VERSION="${BASE_VERSION%%-*}"
+          SCROZZ_PREBUILT_BIN="$UNIVERSAL_BINARY" \
+            SCROZZ_APP_VERSION="$BASE_VERSION" \
+            SCROZZ_BUILD_NUMBER="$GITHUB_RUN_NUMBER" \
+            SCROZZ_SIGNING_MODE=external-release \
+            SCROZZ_ALLOW_EXTERNAL_SIGNING=1 \
+            tools/make-app-bundle.sh "$PWD/dist/Scrozz.app"
+          rm -f "$UNIVERSAL_BINARY"
+          lipo -info dist/Scrozz.app/Contents/MacOS/Scrozz
 
       - name: Build (single target)
         if: matrix.os != 'macos-latest'
@@ -154,6 +212,137 @@ jobs:
             cp "target/${{ matrix.target }}/release/scrozz" dist/
           fi
 
+      - name: Acquire pinned Windows Tesseract payload
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ManifestPath = Join-Path `
+            $env:GITHUB_WORKSPACE "packaging\windows\tesseract-payload.json"
+          $Manifest = Get-Content -LiteralPath $ManifestPath -Raw |
+            ConvertFrom-Json
+          if ($Manifest.schema -ne 1) {
+            throw "Unsupported Tesseract payload manifest schema"
+          }
+
+          function Assert-Sha256 {
+            param([string] $Path, [string] $Expected)
+            $Actual = (
+              Get-FileHash -LiteralPath $Path -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            if ($Actual -ne $Expected.ToLowerInvariant()) {
+              throw "SHA-256 mismatch for ${Path}: expected $Expected, found $Actual"
+            }
+          }
+
+          $Package = $Manifest.chocolatey_package
+          $PackageId = [string] $Package.id
+          $PackageVersion = [string] $Package.version
+          $DownloadRoot = Join-Path $env:RUNNER_TEMP "scrozz-tesseract"
+          Remove-Item -LiteralPath $DownloadRoot -Recurse -Force `
+            -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $DownloadRoot | Out-Null
+          $Nupkg = Join-Path `
+            $DownloadRoot "$PackageId.$PackageVersion.nupkg"
+          Invoke-WebRequest -Uri $Package.url -OutFile $Nupkg
+          Assert-Sha256 $Nupkg $Package.sha256
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $Archive = [IO.Compression.ZipFile]::OpenRead($Nupkg)
+          try {
+            $InstallerEntry = $Archive.GetEntry($Package.installer_path)
+            if ($null -eq $InstallerEntry) {
+              throw "Verified nupkg is missing $($Package.installer_path)"
+            }
+            $Stream = $InstallerEntry.Open()
+            $Hasher = [Security.Cryptography.SHA256]::Create()
+            try {
+              $InstallerHash = [BitConverter]::ToString(
+                $Hasher.ComputeHash($Stream)
+              ).Replace("-", "").ToLowerInvariant()
+            } finally {
+              $Hasher.Dispose()
+              $Stream.Dispose()
+            }
+            if ($InstallerHash -ne $Package.installer_sha256) {
+              throw "Embedded Tesseract installer checksum mismatch"
+            }
+          } finally {
+            $Archive.Dispose()
+          }
+
+          # This local-only source plus ignored dependencies prevents Chocolatey
+          # from resolving any mutable package during release acquisition.
+          choco.exe install $PackageId `
+            "--version=$PackageVersion" `
+            "--source=$DownloadRoot" `
+            --yes `
+            --no-progress `
+            --require-checksums `
+            --ignore-dependencies `
+            --allow-downgrade `
+            --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey failed to install the verified local Tesseract package"
+          }
+
+          $Tesseract = Join-Path $env:ProgramFiles "Tesseract-OCR"
+          $Tessdata = Join-Path $Tesseract "tessdata"
+          New-Item -ItemType Directory -Path $Tessdata -Force | Out-Null
+          $Model = $Manifest.language_model
+          $DownloadedModel = Join-Path $DownloadRoot $Model.name
+          Invoke-WebRequest -Uri $Model.url -OutFile $DownloadedModel
+          Assert-Sha256 $DownloadedModel $Model.sha256
+          Move-Item `
+            -LiteralPath $DownloadedModel `
+            -Destination (Join-Path $Tessdata $Model.name) `
+            -Force
+
+          $ExpectedDlls = @()
+          foreach ($PayloadFile in @($Manifest.payload_files)) {
+            $RelativePath = [string] $PayloadFile.path
+            $NativePath = $RelativePath.Replace(
+              "/", [IO.Path]::DirectorySeparatorChar
+            )
+            $InstalledPath = Join-Path $Tesseract $NativePath
+            if (-not (Test-Path -LiteralPath $InstalledPath -PathType Leaf)) {
+              throw "Verified Tesseract payload is missing $RelativePath"
+            }
+            Assert-Sha256 $InstalledPath $PayloadFile.sha256
+            if ($RelativePath -match "^[0-9A-Za-z.+_-]+\.dll$") {
+              $ExpectedDlls += $RelativePath
+            }
+          }
+          $ExpectedDlls = @($ExpectedDlls | Sort-Object)
+          $ActualDlls = @(
+            Get-ChildItem -LiteralPath $Tesseract -Filter "*.dll" -File |
+              ForEach-Object { $_.Name } |
+              Sort-Object
+          )
+          $DllDifference = @(
+            Compare-Object `
+              -ReferenceObject $ExpectedDlls `
+              -DifferenceObject $ActualDlls
+          )
+          if ($DllDifference.Count -ne 0) {
+            throw "Installed Tesseract runtime DLL closure differs from the manifest"
+          }
+
+          $TesseractExecutable = Join-Path $Tesseract "tesseract.exe"
+          $Languages = @(
+            & $TesseractExecutable `
+              --tessdata-dir $Tessdata `
+              --list-langs 2>&1
+          )
+          if ($LASTEXITCODE -ne 0 -or $Languages -notcontains "eng") {
+            throw "Verified Tesseract payload cannot load the pinned English model"
+          }
+
+          "SCROZZ_TESSERACT_DIR=$Tesseract" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
       # --- macOS signing and notarisation (skipped unless secrets exist) ------
       #
       # Requires, all as repository secrets:
@@ -163,54 +352,68 @@ jobs:
       #   MACOS_NOTARY_KEY            base64 of an App Store Connect .p8 API key
       #   MACOS_NOTARY_KEY_ID         that key's ID
       #   MACOS_NOTARY_ISSUER_ID      the issuer UUID
-      - name: Sign and notarise (macOS)
-        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 != ''
+      - name: Sign and notarise macOS app (when configured)
+        if: matrix.os == 'macos-latest'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
+
+          if [[ -z "$MACOS_CERTIFICATE_P12" ]]; then
+            echo "::notice title=macOS app is unsigned::No MACOS_CERTIFICATE_P12 secret is set, so signing and notarisation were skipped. Gatekeeper will block this app on other people's machines until a Developer ID certificate is configured."
+            exit 0
+          fi
+          : "${MACOS_SIGN_IDENTITY:?MACOS_SIGN_IDENTITY is required}"
+          : "${MACOS_NOTARY_KEY:?MACOS_NOTARY_KEY is required}"
+          : "${MACOS_NOTARY_KEY_ID:?MACOS_NOTARY_KEY_ID is required}"
+          : "${MACOS_NOTARY_ISSUER_ID:?MACOS_NOTARY_ISSUER_ID is required}"
 
           # A throwaway keychain, so the certificate never touches the login
           # keychain and dies with the runner.
           KEYCHAIN="$RUNNER_TEMP/scrozz-signing.keychain-db"
+          CERTIFICATE="$RUNNER_TEMP/scrozz-signing.p12"
+          NOTARY_KEY="$RUNNER_TEMP/scrozz-notary.p8"
+          NOTARY_ARCHIVE="$RUNNER_TEMP/scrozz-notarize.zip"
+          cleanup_signing_material() {
+            rm -f "$CERTIFICATE" "$NOTARY_KEY" "$NOTARY_ARCHIVE"
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+          }
+          trap cleanup_signing_material EXIT
+
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 900 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
-          echo "$MACOS_CERTIFICATE_P12" | base64 --decode >"$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" \
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode >"$CERTIFICATE"
+          security import "$CERTIFICATE" \
             -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
             -T /usr/bin/codesign
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          rm -f "$RUNNER_TEMP/cert.p12"
 
-          # --options runtime is the hardened runtime; notarisation rejects
-          # anything without it. --timestamp is likewise mandatory.
           codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGN_IDENTITY" dist/scrozz
-          codesign --verify --strict --verbose=2 dist/scrozz
+            --sign "$MACOS_SIGN_IDENTITY" dist/Scrozz.app
+          codesign --verify --strict --verbose=2 dist/Scrozz.app
 
-          # Notarisation needs a container; a zip of the binary is enough for a
-          # bare executable. When Scrozz grows a .app bundle this should submit
-          # the bundle (or a .dmg) instead.
-          echo "$MACOS_NOTARY_KEY" | base64 --decode >"$RUNNER_TEMP/notary.p8"
-          ditto -c -k --keepParent dist/scrozz "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --key "$RUNNER_TEMP/notary.p8" \
+          echo "$MACOS_NOTARY_KEY" | base64 --decode >"$NOTARY_KEY"
+          ditto -c -k --keepParent dist/Scrozz.app "$NOTARY_ARCHIVE"
+          xcrun notarytool submit "$NOTARY_ARCHIVE" \
+            --key "$NOTARY_KEY" \
             --key-id "$MACOS_NOTARY_KEY_ID" \
             --issuer "$MACOS_NOTARY_ISSUER_ID" \
             --wait
-          rm -f "$RUNNER_TEMP/notary.p8"
-
-          # `stapler staple` only works on bundles and disk images, not bare
-          # executables, so it is intentionally not called here. Gatekeeper
-          # verifies a bare signed binary online instead.
-
-      - name: Note unsigned macOS build
-        if: matrix.os == 'macos-latest' && env.MACOS_CERTIFICATE_P12 == ''
-        run: |
-          echo "::notice title=macOS binary is unsigned::No MACOS_CERTIFICATE_P12 secret is set, so signing and notarisation were skipped. Gatekeeper will block this binary on other people's machines until a Developer ID certificate is configured."
+          xcrun stapler staple dist/Scrozz.app
+          xcrun stapler validate dist/Scrozz.app
+          spctl --assess --type execute --verbose=2 dist/Scrozz.app
+          echo "SCROZZ_MACOS_PAYLOAD_SIGNED=1" >>"$GITHUB_ENV"
+          echo "SCROZZ_MACOS_NOTARIZED=1" >>"$GITHUB_ENV"
 
       # --- Windows signing (skipped unless secrets exist) ---------------------
       #
@@ -221,11 +424,20 @@ jobs:
       # A cheaper, keyless alternative worth considering before buying an EV
       # certificate is Azure Trusted Signing, which swaps these two secrets for
       # an Azure identity and a different action.
-      - name: Sign (Windows)
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE_PFX != ''
+      - name: Sign Windows executable (when configured)
+        if: matrix.os == 'windows-latest'
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$RUNNER_TEMP/cert.pfx"
+          if [[ -z "$WINDOWS_CERTIFICATE_PFX" ]]; then
+            echo "::notice title=Windows executable is unsigned::No WINDOWS_CERTIFICATE_PFX secret is set, so executable signing was skipped. SmartScreen will warn on download until a code-signing certificate is configured."
+            exit 0
+          fi
+          PFX="$RUNNER_TEMP/scrozz-executable-signing.pfx"
+          trap 'rm -f "$PFX"' EXIT
+          echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$PFX"
 
           # signtool lives in the Windows SDK, whose directory is versioned.
           # Find the newest rather than hard-coding a version that a runner
@@ -238,19 +450,13 @@ jobs:
           fi
 
           "$SIGNTOOL" sign \
-            /f "$RUNNER_TEMP/cert.pfx" \
+            /f "$PFX" \
             /p "$WINDOWS_CERTIFICATE_PASSWORD" \
             /fd SHA256 \
             /tr http://timestamp.digicert.com \
             /td SHA256 \
             dist/scrozz.exe
           "$SIGNTOOL" verify /pa dist/scrozz.exe
-          rm -f "$RUNNER_TEMP/cert.pfx"
-
-      - name: Note unsigned Windows build
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE_PFX == ''
-        run: |
-          echo "::notice title=Windows binary is unsigned::No WINDOWS_CERTIFICATE_PFX secret is set, so signing was skipped. SmartScreen will warn on download until a code-signing certificate is configured."
 
       # --- Package ------------------------------------------------------------
       - name: Package
@@ -282,11 +488,69 @@ jobs:
           else
             shasum -a 256 "$ASSET" >"${ASSET}.sha256"
           fi
+
+          PACKAGE_KIND=portable-archive
+          PAYLOAD_SIGNED=false
+          NOTARIZED=false
+          PACKAGE_IDENTITY=""
+          NATIVE_PACKAGE_VERSION="$VERSION"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            PACKAGE_KIND=app-bundle-archive
+            PACKAGE_IDENTITY=com.thatcube.Scrozz
+            NATIVE_PACKAGE_VERSION="${VERSION%%-*}"
+            if [[ "${SCROZZ_MACOS_PAYLOAD_SIGNED:-0}" == "1" ]]; then
+              PAYLOAD_SIGNED=true
+            fi
+            if [[ "${SCROZZ_MACOS_NOTARIZED:-0}" == "1" ]]; then
+              NOTARIZED=true
+            fi
+          fi
+          python3 - \
+            "$ASSET" \
+            "$VERSION" \
+            "$NATIVE_PACKAGE_VERSION" \
+            "${{ matrix.slug }}" \
+            "$PACKAGE_KIND" \
+            "$PACKAGE_IDENTITY" \
+            "$PAYLOAD_SIGNED" \
+            "$NOTARIZED" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          asset = pathlib.Path(sys.argv[1])
+          metadata = {
+              "schema": 1,
+              "platform": sys.argv[4],
+              "version": sys.argv[2],
+              "file": asset.name,
+              "sha256": hashlib.sha256(asset.read_bytes()).hexdigest(),
+              "size": asset.stat().st_size,
+              "package_kind": sys.argv[5],
+              "native_package_version": sys.argv[3],
+              "package_identity": sys.argv[6],
+              "signed": False,
+              "payload_signed": sys.argv[7] == "true",
+              "notarized": sys.argv[8] == "true",
+              "signed_manifest": False,
+          }
+          pathlib.Path(f"{asset}.artifact.json").write_text(
+              json.dumps(metadata, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
           cat "${ASSET}.sha256"
           echo "asset=$ASSET" >>"$GITHUB_OUTPUT"
 
       - name: Package portable ZIP and MSIX
         if: matrix.os == 'windows-latest'
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_MSIX_IDENTITY_NAME: ${{ secrets.WINDOWS_MSIX_IDENTITY_NAME }}
+          WINDOWS_MSIX_PUBLISHER: ${{ secrets.WINDOWS_MSIX_PUBLISHER }}
+          WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME }}
         run: |
           set -euo pipefail
           export SCROZZ_WINDOWS_VERIFY_DETERMINISM=1
@@ -295,6 +559,7 @@ jobs:
           export SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME="$WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME"
 
           PFX="$RUNNER_TEMP/scrozz-msix-signing.pfx"
+          trap 'rm -f "$PFX"' EXIT
           if [[ -n "$WINDOWS_CERTIFICATE_PFX" &&
                 -n "$WINDOWS_MSIX_IDENTITY_NAME" &&
                 -n "$WINDOWS_MSIX_PUBLISHER" ]]; then
@@ -313,7 +578,6 @@ jobs:
             -Version "${{ steps.version.outputs.version }}" \
             -Stamp release \
             -Architecture x86_64
-          rm -f "$PFX"
 
       - name: Upload artefact
         if: matrix.os != 'windows-latest'
@@ -323,6 +587,7 @@ jobs:
           path: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.asset }}.sha256
+            ${{ steps.package.outputs.asset }}.artifact.json
           if-no-files-found: error
           retention-days: 7
 
@@ -346,10 +611,6 @@ jobs:
     permissions:
       # The one job that needs write access, and only for creating the release.
       contents: write
-    # Job level, not step level — see the note on the `build` job.
-    env:
-      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -377,10 +638,21 @@ jobs:
       # Optional detached signature over the checksum file — the customary way
       # to make a Linux release verifiable without any platform certificate.
       # Requires secrets GPG_PRIVATE_KEY (ASCII-armoured) and GPG_PASSPHRASE.
-      - name: Sign SHA256SUMS
-        if: env.GPG_PRIVATE_KEY != ''
+      - name: Sign SHA256SUMS (when configured)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
+          if [[ -z "$GPG_PRIVATE_KEY" ]]; then
+            echo "::notice title=Checksums are unsigned::No GPG_PRIVATE_KEY secret is set, so the detached checksum signature was skipped."
+            exit 0
+          fi
+          GNUPGHOME="$RUNNER_TEMP/scrozz-release-gnupg"
+          rm -rf "$GNUPGHOME"
+          mkdir -m 700 "$GNUPGHOME"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
           cd artifacts
           gpg --batch --yes --pinentry-mode loopback \
@@ -412,19 +684,58 @@ jobs:
 
       - name: Summarise what is and is not signed
         run: |
-          {
-            echo "### Signing status"
-            echo
-            echo "| Platform | Signed | Secret that enables it |"
-            echo "|---|---|---|"
-            echo "| macOS | ${{ secrets.MACOS_CERTIFICATE_P12 != '' && 'yes' || 'no' }} | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
-            echo "| Windows | ${{ secrets.WINDOWS_CERTIFICATE_PFX != '' && 'yes' || 'no' }} | \`WINDOWS_CERTIFICATE_PFX\` (+ password) |"
-            echo "| Checksums (GPG) | ${{ secrets.GPG_PRIVATE_KEY != '' && 'yes' || 'no' }} | \`GPG_PRIVATE_KEY\` (+ passphrase) |"
-            echo
-            echo "Unsigned binaries work, but Gatekeeper and SmartScreen will"
-            echo "warn users. Configure the secrets above in"
-            echo "**Settings → Secrets and variables → Actions** when signing"
-            echo "certificates exist. None are required for a draft release."
-            echo
-            echo "This release is a **draft**. Publishing it is a human decision (D5)."
-          } >>"$GITHUB_STEP_SUMMARY"
+          python3 <<'PY' >>"$GITHUB_STEP_SUMMARY"
+          import hashlib
+          import json
+          import pathlib
+
+          root = pathlib.Path("artifacts")
+          metadata_paths = sorted(root.glob("*.artifact.json"))
+          if not metadata_paths:
+              raise SystemExit("release artifacts have no signing metadata")
+
+          print("### Signing status")
+          print()
+          print("| Artifact | Package | Container signed | Payload signed | Notarized/stapled |")
+          print("|---|---|---:|---:|---:|")
+          for metadata_path in metadata_paths:
+              metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+              artifact = root / metadata["file"]
+              if not artifact.is_file():
+                  raise SystemExit(f"metadata references missing artifact: {artifact}")
+              digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+              if digest != metadata["sha256"]:
+                  raise SystemExit(f"metadata checksum mismatch: {artifact}")
+
+              yes_no = lambda value: "yes" if value else "no"
+              notarized = (
+                  yes_no(metadata["notarized"])
+                  if "notarized" in metadata
+                  else "n/a"
+              )
+              print(
+                  f"| `{metadata['file']}` "
+                  f"| {metadata['package_kind']} "
+                  f"| {yes_no(metadata['signed'])} "
+                  f"| {yes_no(metadata['payload_signed'])} "
+                  f"| {notarized} |"
+              )
+
+          checksum_signature = yes_no((root / "SHA256SUMS.asc").is_file())
+          print()
+          print(f"Detached GPG signature for `SHA256SUMS`: **{checksum_signature}**.")
+          print()
+          print(
+              "Windows executable and MSIX package signatures are reported "
+              "separately from artifact metadata. A PFX enables executable "
+              "signing; MSIX signing additionally requires Store identity and "
+              "publisher values."
+          )
+          print(
+              "Signing uses `MACOS_CERTIFICATE_P12`, "
+              "`WINDOWS_CERTIFICATE_PFX`, or `GPG_PRIVATE_KEY` only in the "
+              "specific step that consumes it."
+          )
+          print()
+          print("This release is a **draft**. Publishing it is a human decision (D5).")
+          PY

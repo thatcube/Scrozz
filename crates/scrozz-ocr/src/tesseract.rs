@@ -70,6 +70,19 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
         resolve_languages(&options.languages, &installed_languages)?
     };
 
+    let arguments = recognition_arguments(&selected_languages, options);
+
+    let output = run_tesseract(&arguments, Some(pgm(&prepared.image)), COMMAND_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(command_error("recognize text", &output.stderr));
+    }
+
+    let tsv = String::from_utf8(output.stdout)
+        .map_err(|error| Error::Codec(format!("Tesseract returned non-UTF-8 TSV: {error}")))?;
+    parse_tsv(&tsv, prepared.upscale, prepared.source_size, frame)
+}
+
+fn recognition_arguments(selected_languages: &[String], options: &Options) -> Vec<OsString> {
     let mut arguments = vec![
         OsString::from("stdin"),
         OsString::from("stdout"),
@@ -87,16 +100,13 @@ pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
             OsString::from("load_freq_dawg=0"),
         ]);
     }
-    arguments.push(OsString::from("tsv"));
-
-    let output = run_tesseract(&arguments, Some(pgm(&prepared.image)), COMMAND_TIMEOUT)?;
-    if !output.status.success() {
-        return Err(command_error("recognize text", &output.stderr));
-    }
-
-    let tsv = String::from_utf8(output.stdout)
-        .map_err(|error| Error::Codec(format!("Tesseract returned non-UTF-8 TSV: {error}")))?;
-    parse_tsv(&tsv, prepared.upscale, prepared.source_size, frame)
+    // The named `tsv` config is not part of the portable payload. Enabling its
+    // sole setting inline keeps the runtime contract self-contained.
+    arguments.extend([
+        OsString::from("-c"),
+        OsString::from("tessedit_create_tsv=1"),
+    ]);
+    arguments
 }
 
 fn run_tesseract(
@@ -931,6 +941,26 @@ mod tests {
         let error =
             parse_tsv("not tsv\n", 1.0, PhysicalSize::new(1.0, 1.0), &frame(1, 1)).unwrap_err();
         assert!(matches!(error, Error::Codec(_)));
+    }
+
+    #[test]
+    fn recognition_requests_tsv_without_an_external_config_file() {
+        let arguments = recognition_arguments(&["eng".to_string()], &Options::default());
+        let language = arguments
+            .iter()
+            .position(|argument| argument == "-l")
+            .expect("an explicit language argument");
+
+        assert_eq!(arguments[language + 1], "eng");
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "tessedit_create_tsv=1")
+        );
+        assert!(
+            !arguments.iter().any(|argument| argument == "tsv"),
+            "the named config would require tessdata/configs/tsv"
+        );
     }
 
     #[test]
