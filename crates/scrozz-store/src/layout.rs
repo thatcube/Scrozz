@@ -3,6 +3,7 @@
 //! ```text
 //! <data dir>/Scrozz/
 //! ├── index.sqlite            the query index — rebuildable, never authoritative
+//! ├── pending-index/           crash markers for sidecar/index synchronization
 //! ├── images/ab/cd/<sha256>   source pixels, content-addressed and deduplicated
 //! └── documents/<id>.json     the durable record: metadata + annotations
 //! ```
@@ -23,7 +24,7 @@
 //! retention cap then measures real disk usage rather than a sum of duplicates.
 
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -41,12 +42,23 @@ pub const INDEX_FILE: &str = "index.sqlite";
 pub const IMAGES_DIR: &str = "images";
 /// Subdirectory holding durable per-capture records.
 pub const DOCUMENTS_DIR: &str = "documents";
+/// Subdirectory holding crash-recovery markers for index cache updates.
+const PENDING_INDEX_DIR: &str = "pending-index";
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What [`StoreLayout::scan_records`] found: the records it could read, and the
 /// files it could not, each with the reason it could not be read.
 pub type ScannedRecords = (Vec<StoredRecord>, Vec<(PathBuf, String)>);
+
+/// One crash marker for a sidecar/index update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingIndexUpdate {
+    pub(crate) path: PathBuf,
+    /// New markers identify the one sidecar to repair. `None` supports markers
+    /// written before capture identities were recorded.
+    pub(crate) capture: Option<CaptureId>,
+}
 
 /// Resolved paths for one history store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +113,12 @@ impl StoreLayout {
         self.root.join(DOCUMENTS_DIR)
     }
 
+    /// Directory holding incomplete sidecar/index synchronization markers.
+    #[must_use]
+    fn pending_index_dir(&self) -> PathBuf {
+        self.root.join(PENDING_INDEX_DIR)
+    }
+
     /// Creates every directory the store needs.
     ///
     /// # Errors
@@ -110,6 +128,87 @@ impl StoreLayout {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(self.images_dir())?;
         fs::create_dir_all(self.documents_dir())?;
+        fs::create_dir_all(self.pending_index_dir())?;
+        Ok(())
+    }
+
+    /// Records that a durable sidecar and its rebuildable index cache are about
+    /// to change.
+    ///
+    /// Callers create this only while holding SQLite's immediate write lock.
+    /// The unique file survives a crash; a later open then repairs the index
+    /// from the authoritative sidecars before removing exactly this marker.
+    pub(crate) fn begin_index_update(&self, capture: &CaptureId) -> Result<PathBuf> {
+        if !is_valid_id(&capture.0) {
+            return Err(Error::Storage(format!(
+                "refusing index marker for malformed capture id {:?}",
+                capture.0
+            )));
+        }
+        let dir = self.pending_index_dir();
+        fs::create_dir_all(&dir)?;
+        loop {
+            let sequence = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("{}-{sequence}.pending", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(capture.0.as_bytes())?;
+                    file.write_all(b"\n")?;
+                    file.sync_all()?;
+                    if let Ok(dir) = File::open(&dir) {
+                        let _ = dir.sync_all();
+                    }
+                    return Ok(path);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// Lists incomplete index updates.
+    pub(crate) fn pending_index_updates(&self) -> Result<Vec<PendingIndexUpdate>> {
+        let dir = self.pending_index_dir();
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut pending = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "pending")
+            {
+                let capture = fs::read_to_string(&path).ok().and_then(|contents| {
+                    let id = contents.trim();
+                    is_valid_id(id).then(|| CaptureId(id.to_owned()))
+                });
+                pending.push(PendingIndexUpdate { path, capture });
+            }
+        }
+        pending.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(pending)
+    }
+
+    /// Clears one index update after its sidecar state is reflected in SQLite.
+    pub(crate) fn finish_index_update(&self, marker: &Path) -> Result<()> {
+        let dir = self.pending_index_dir();
+        if marker.parent() != Some(dir.as_path()) {
+            return Err(Error::Storage(format!(
+                "refusing index marker outside {}",
+                dir.display()
+            )));
+        }
+        match fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+        if let Ok(dir) = File::open(dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 

@@ -64,12 +64,50 @@ impl Request {
     /// branch that forgot to reply would leave the terminal hanging on a read
     /// that never returns.
     ///
-    /// Returns what the command was, so the app can decide whether it also has
-    /// local work to do — showing a card for a forwarded capture, or quitting.
+    /// Returns a successfully completed command, so the app can decide whether
+    /// it also has local work to do. Failed commands have already been answered
+    /// and must not mutate the live UI.
     pub fn serve(self) -> Option<Command> {
-        let (command, response) = run(&self.argv, self.cwd.as_deref());
+        self.serve_with(|_| Ok(()))
+    }
+
+    /// Runs a command, then completes required in-process work before replying.
+    ///
+    /// The hook exists for operations such as terminal unpinning whose durable
+    /// worker write must be ordered after older queued writes. A hook failure
+    /// replaces the otherwise successful command response.
+    pub fn serve_with(
+        self,
+        after_success: impl FnOnce(&Command) -> CliResult<()>,
+    ) -> Option<Command> {
+        let (command, mut response) = run(&self.argv, self.cwd.as_deref());
+        if response.code == 0
+            && let Some(command) = command.as_ref()
+            && let Err(error) = after_success(command)
+        {
+            response = Self::command_error_response(&self.argv, command, &error);
+        }
+        let succeeded = response.code == 0;
         self.reply(&response);
-        command
+        command.filter(|_| succeeded)
+    }
+
+    fn command_error_response(argv: &[String], command: &Command, error: &CliError) -> Response {
+        use clap::Parser as _;
+
+        let mut with_argv0 = Vec::with_capacity(argv.len() + 1);
+        with_argv0.push("scrozz".to_owned());
+        with_argv0.extend_from_slice(argv);
+        let json_requested = Cli::try_parse_from(with_argv0).is_ok_and(|cli| cli.global.json);
+        if json_requested {
+            let slug = command.slug();
+            json(
+                error.exit().code(),
+                error_envelope(&slug, error).to_compact_string(),
+            )
+        } else {
+            text(error.exit().code(), error.to_string())
+        }
     }
 
     #[cfg(unix)]
@@ -675,7 +713,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         assert_eq!(request.argv.first().map(String::as_str), Some("capture"));
-        let command = request.serve();
+        let command = request.serve_with(|_| {
+            assert!(
+                !client.is_finished(),
+                "the caller must remain blocked until the success hook finishes"
+            );
+            Ok(())
+        });
         assert!(matches!(command, Some(Command::Capture(_))));
 
         let response = client

@@ -37,10 +37,11 @@ pub struct Migration {
 /// `user_version` and a schema drift apart is an interrupted upgrade on a
 /// filesystem that lied about `fsync`, and idempotent rungs make that
 /// recoverable instead of fatal.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial history index",
-    sql: r"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial history index",
+        sql: r"
         -- One row per capture. Rows are NEVER deleted by retention: decision
         -- D23 evicts `image_hash`, not the capture.
         CREATE TABLE IF NOT EXISTS captures (
@@ -95,7 +96,22 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             value TEXT NOT NULL
         ) STRICT;
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "pinned window state cache",
+        sql: r"
+            -- Cache only. The documents/<id>.json sidecar remains authoritative
+            -- and can rebuild this table after index loss (D30). A separate
+            -- table keeps the migration idempotent on interrupted upgrades.
+            CREATE TABLE IF NOT EXISTS capture_pins (
+                capture_id TEXT NOT NULL PRIMARY KEY
+                    REFERENCES captures(id) ON DELETE CASCADE,
+                pin_json TEXT NOT NULL
+            ) STRICT;
+        ",
+    },
+];
 
 /// The version a freshly-migrated file ends up at.
 #[must_use]
@@ -338,7 +354,7 @@ mod tests {
         assert_eq!(version, latest_version(MIGRATIONS));
 
         let names = tables(&conn);
-        for expected in ["blobs", "captures", "store_meta"] {
+        for expected in ["blobs", "capture_pins", "captures", "store_meta"] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
         assert_eq!(migrate(&mut conn, MIGRATIONS).expect("again"), version);

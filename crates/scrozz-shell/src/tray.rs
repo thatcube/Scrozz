@@ -45,19 +45,22 @@ pub enum TrayAction {
     OpenHistory,
     /// Open settings — an ordinary, movable window, per D27.
     OpenSettings,
+    /// Unlock every click-through pinned capture.
+    UnlockPinnedCaptures,
     /// Quit Scrozz.
     Quit,
 }
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
         Self::ToggleRecording,
         Self::OpenHistory,
         Self::OpenSettings,
+        Self::UnlockPinnedCaptures,
         Self::Quit,
     ];
 
@@ -75,6 +78,7 @@ impl TrayAction {
             Self::ToggleRecording => "record.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
+            Self::UnlockPinnedCaptures => "pins.unlock",
             Self::Quit => "app.quit",
         }
     }
@@ -89,6 +93,7 @@ impl TrayAction {
             Self::ToggleRecording => "Start Recording",
             Self::OpenHistory => "History…",
             Self::OpenSettings => "Settings…",
+            Self::UnlockPinnedCaptures => "Unlock Pinned Captures",
             Self::Quit => "Quit Scrozz",
         }
     }
@@ -107,7 +112,10 @@ impl TrayAction {
     /// until they can actually fulfil the click.
     #[must_use]
     pub const fn is_available(self) -> bool {
-        matches!(self, Self::CaptureFullscreen | Self::Quit)
+        matches!(
+            self,
+            Self::CaptureFullscreen | Self::UnlockPinnedCaptures | Self::Quit
+        )
     }
 }
 
@@ -136,6 +144,7 @@ pub const fn menu_model() -> &'static [TrayEntry] {
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::OpenHistory),
         TrayEntry::Item(TrayAction::OpenSettings),
+        TrayEntry::Item(TrayAction::UnlockPinnedCaptures),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::Quit),
     ]

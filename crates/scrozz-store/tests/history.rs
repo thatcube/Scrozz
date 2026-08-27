@@ -1,7 +1,7 @@
 //! History as the app actually uses it: insert, read back, page, search, delete.
 
 use scrozz_annotate::{Annotation, Style};
-use scrozz_core::LogicalPoint;
+use scrozz_core::{DisplayId, LogicalPoint, LogicalRect, LogicalSize, Opacity, PinScale, PinState};
 use scrozz_store::{
     DocumentState, History as _, ImageState, NewCapture, Page, SearchQuery, SqliteStore,
     Store as _, Timestamp,
@@ -294,6 +294,197 @@ fn pinning_survives_a_reopen() {
         .search(&SearchQuery::all().pinned_only())
         .expect("search");
     assert_eq!(pinned.len(), 1);
+}
+
+#[test]
+fn screen_pin_state_is_authoritative_in_the_sidecar_and_unpin_clears_it() {
+    let (dir, mut store) = store("screen-pinning");
+    let document = sample_document(800, 600, 9, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let mut pin = PinState::new(
+        LogicalRect::new(
+            LogicalPoint::new(101.5, 42.0),
+            LogicalSize::new(400.0, 300.0),
+        ),
+        PinScale::new(0.5),
+        Some(DisplayId("external".into())),
+    );
+    pin.opacity = Opacity::new(0.62);
+    pin.locked = true;
+
+    store
+        .set_screen_pin(&id, Some(&pin))
+        .expect("persist screen pin");
+    let sidecar = store
+        .layout()
+        .read_record(&id)
+        .expect("read sidecar")
+        .expect("sidecar exists");
+    assert_eq!(sidecar.screen_pin.as_ref(), Some(&pin));
+    assert!(sidecar.pinned, "an on-screen pin must be retention-exempt");
+
+    drop(store);
+    let mut store = SqliteStore::open(dir.path()).expect("reopen");
+    let restored = store.record(&id).expect("read").expect("present");
+    assert_eq!(restored.screen_pin.as_ref(), Some(&pin));
+    assert!(restored.pinned);
+
+    store.set_pinned(&id, false).expect("unpin");
+    let cleared = store.record(&id).expect("read").expect("present");
+    assert!(!cleared.pinned);
+    assert_eq!(
+        cleared.screen_pin, None,
+        "a CLI-style unpin must not leave a window that restores on restart"
+    );
+}
+
+#[test]
+fn first_cache_bootstrap_repairs_legacy_stale_pins_when_record_counts_match() {
+    let (dir, store) = store("screen-pin-equal-count-recovery");
+    let document = sample_document(800, 600, 11, 0);
+    let id = {
+        let mut store = store;
+        store.insert(NewCapture::new(&document)).expect("insert")
+    };
+    let pin = PinState::new(
+        LogicalRect::new(
+            LogicalPoint::new(90.0, 60.0),
+            LogicalSize::new(400.0, 300.0),
+        ),
+        PinScale::new(0.5),
+        Some(DisplayId("main".into())),
+    );
+
+    let layout = scrozz_store::StoreLayout::new(dir.path());
+    let conn = rusqlite::Connection::open(layout.index_path()).expect("open raw index");
+    conn.execute(
+        "DELETE FROM store_meta WHERE key = 'pin_cache_sidecars_v1'",
+        [],
+    )
+    .expect("simulate a store from before pin cache bootstrap");
+    drop(conn);
+    let mut sidecar = layout
+        .read_record(&id)
+        .expect("read sidecar")
+        .expect("sidecar exists");
+    sidecar.pinned = true;
+    sidecar.screen_pin = Some(pin.clone());
+    layout
+        .write_record(&sidecar)
+        .expect("simulate a crash after the sidecar rename");
+
+    let store = SqliteStore::open(dir.path()).expect("reopen repairs the cache");
+    let restored = store.record(&id).expect("read").expect("present");
+    assert!(restored.pinned);
+    assert_eq!(restored.screen_pin, Some(pin));
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().pinned_only())
+            .expect("pinned query")
+            .len(),
+        1,
+        "retention queries must see the repaired cache"
+    );
+}
+
+#[test]
+fn clean_reopen_does_not_rewrite_every_pin_cache() {
+    let (dir, mut store) = store("screen-pin-clean-reopen");
+    let document = sample_document(800, 600, 13, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let index = store.layout().index_path();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(index).expect("open raw index");
+    conn.execute_batch(
+        "CREATE TRIGGER reject_startup_pin_rewrite
+         BEFORE UPDATE OF pinned ON captures
+         BEGIN
+             SELECT RAISE(FAIL, 'startup rewrote a clean pin cache');
+         END;",
+    )
+    .expect("install rewrite detector");
+    drop(conn);
+
+    let store = SqliteStore::open(dir.path()).expect("clean reopen avoids cache writes");
+    assert!(store.record(&id).expect("read").is_some());
+}
+
+#[test]
+fn history_queries_read_screen_pin_state_from_the_index_cache() {
+    let (_dir, mut store) = store("screen-pin-index-read");
+    let document = sample_document(800, 600, 14, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let pin = PinState::new(
+        LogicalRect::new(
+            LogicalPoint::new(100.0, 70.0),
+            LogicalSize::new(400.0, 300.0),
+        ),
+        PinScale::new(0.5),
+        Some(DisplayId("main".into())),
+    );
+    store
+        .set_screen_pin(&id, Some(&pin))
+        .expect("persist screen pin");
+
+    let sidecar = store.layout().record_path(&id).expect("sidecar path");
+    std::fs::remove_file(sidecar).expect("temporarily remove authoritative sidecar");
+
+    let record = store.record(&id).expect("indexed read").expect("present");
+    assert_eq!(record.screen_pin, Some(pin.clone()));
+    let found = store
+        .search(&SearchQuery::all().pinned_only())
+        .expect("indexed search");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].screen_pin, Some(pin));
+}
+
+#[test]
+fn a_failed_pin_cache_write_is_recovered_from_the_durable_sidecar() {
+    let (dir, mut store) = store("screen-pin-cache-failure");
+    let document = sample_document(800, 600, 12, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let index = store.layout().index_path();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(&index).expect("open raw index");
+    conn.execute_batch(
+        "CREATE TRIGGER reject_screen_pin
+         BEFORE INSERT ON capture_pins
+         BEGIN
+             SELECT RAISE(FAIL, 'forced pin cache failure');
+         END;",
+    )
+    .expect("install failure trigger");
+    drop(conn);
+
+    let mut store = SqliteStore::open(dir.path()).expect("open before pinning");
+    let pin = PinState::new(
+        LogicalRect::new(
+            LogicalPoint::new(100.0, 70.0),
+            LogicalSize::new(400.0, 300.0),
+        ),
+        PinScale::new(0.5),
+        Some(DisplayId("main".into())),
+    );
+    let error = store
+        .set_screen_pin(&id, Some(&pin))
+        .expect_err("the forced cache failure must be reported");
+    assert!(
+        error.to_string().contains("index reconciliation"),
+        "{error}"
+    );
+    drop(store);
+
+    let conn = rusqlite::Connection::open(&index).expect("open raw index");
+    conn.execute("DROP TRIGGER reject_screen_pin", [])
+        .expect("remove failure trigger");
+    drop(conn);
+
+    let store = SqliteStore::open(dir.path()).expect("reopen repairs from sidecar");
+    let restored = store.record(&id).expect("read").expect("present");
+    assert!(restored.pinned);
+    assert_eq!(restored.screen_pin, Some(pin));
 }
 
 #[test]

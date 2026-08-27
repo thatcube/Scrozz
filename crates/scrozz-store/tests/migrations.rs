@@ -168,7 +168,7 @@ fn the_tables_the_store_depends_on_actually_exist_after_migration() {
     let mut conn = Connection::open_in_memory().expect("memory database");
     migrate(&mut conn, MIGRATIONS).expect("migrate");
 
-    for table in ["captures", "blobs", "store_meta"] {
+    for table in ["captures", "blobs", "capture_pins", "store_meta"] {
         let found: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

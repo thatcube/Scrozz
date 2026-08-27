@@ -6,12 +6,12 @@ use rusqlite::{
     Connection, OptionalExtension as _, Row, ToSql, TransactionBehavior, params, params_from_iter,
 };
 use scrozz_annotate::{AnnotationObject, Document, DocumentData};
-use scrozz_core::{Capture, Error, Frame, Result};
+use scrozz_core::{Capture, Error, Frame, PinState, Result};
 
 use crate::{
     CaptureId, RetentionPolicy, Store, db, hash,
     id::capture_id_at,
-    layout::StoreLayout,
+    layout::{PendingIndexUpdate, StoreLayout},
     model::{
         CaptureRecord, FrameHeader, ImageState, Page, ProvenanceRepr, RetentionReport, SearchQuery,
         TargetRepr, Timestamp,
@@ -23,7 +23,11 @@ use crate::{
 /// Columns every record query selects, in the order [`row_to_record`] reads.
 const RECORD_COLUMNS: &str = "id, created_at, pinned, app_name, window_title, provenance, \
      target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text, \
-     annotation_count";
+     annotation_count, \
+     (SELECT pin_json FROM capture_pins WHERE capture_id = captures.id)";
+
+/// Records that the one-time legacy sidecar/cache comparison has completed.
+const PIN_CACHE_BOOTSTRAP_KEY: &str = "pin_cache_sidecars_v1";
 
 /// A capture on its way into history.
 ///
@@ -109,7 +113,7 @@ pub enum DocumentState {
     /// The pixels are here; this is the full editable document.
     Complete(Document),
     /// The pixels were evicted under the size cap. Every edit is intact.
-    ImageEvicted(EvictedDocument),
+    ImageEvicted(Box<EvictedDocument>),
 }
 
 impl DocumentState {
@@ -190,6 +194,16 @@ pub trait History: Store {
     ///
     /// Returns [`Error::Storage`] if the index is unreadable.
     fn record(&self, id: &CaptureId) -> Result<Option<CaptureRecord>>;
+
+    /// Persists or clears the state of an on-screen pinned window.
+    ///
+    /// Setting a state also sets the retention pin; clearing it removes both so
+    /// a closed window cannot reappear after restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture is unknown or the write fails.
+    fn set_screen_pin(&mut self, id: &CaptureId, state: Option<&PinState>) -> Result<()>;
 
     /// A capture's document, and whether its pixels survived.
     ///
@@ -320,7 +334,7 @@ impl SqliteStore {
             Err(err) => return Err(err),
         };
 
-        store.adopt_unindexed_records()?;
+        store.synchronize_index_on_open()?;
         Ok(store)
     }
 
@@ -430,6 +444,11 @@ impl SqliteStore {
     ///
     /// Returns [`Error::Storage`] if the rebuild fails.
     pub fn reconcile(&mut self) -> Result<RecoveryReport> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin rebuild"))?;
+        let pending = self.layout.pending_index_updates()?;
         let (records, failures) = self.layout.scan_records()?;
         let blobs = self.layout.scan_blobs()?;
 
@@ -444,10 +463,6 @@ impl SqliteStore {
         }
 
         let now = Timestamp::now();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(store_err("cannot begin rebuild"))?;
 
         tx.execute("DELETE FROM blobs", [])
             .map_err(store_err("cannot reset blob table"))?;
@@ -492,30 +507,83 @@ impl SqliteStore {
             params![now.0.to_string()],
         )
         .map_err(store_err("cannot record reconcile time"))?;
+        mark_pin_cache_bootstrapped(&tx)?;
 
         tx.commit().map_err(store_err("cannot commit rebuild"))?;
+        clear_index_markers(&self.layout, pending);
         Ok(report)
     }
 
-    /// Adopts records written by a process that crashed before committing.
+    /// Repairs sidecar-authoritative caches after interrupted writes.
     ///
-    /// Insert writes the durable record *before* the index row, so the only way
-    /// the two can disagree after a crash is a record with no row — a capture
-    /// the user took and would otherwise silently lose. Comparing counts is one
-    /// directory listing, cheap enough to do on every open.
-    fn adopt_unindexed_records(&mut self) -> Result<()> {
+    /// Existing stores get one complete comparison to seed the cache safely.
+    /// Thereafter, clean opens retain the original cheap record-count check while
+    /// crash markers identify the exact sidecars that need refreshing.
+    fn synchronize_index_on_open(&mut self) -> Result<()> {
         let on_disk = count_record_files(&self.layout)?;
-        let indexed = self.count()? as usize;
-        if on_disk == indexed {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin startup synchronization"))?;
+        let pending = self.layout.pending_index_updates()?;
+        let indexed = tx
+            .query_row("SELECT COUNT(*) FROM captures", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| usize::try_from(count).unwrap_or(0))
+            .map_err(store_err("cannot count indexed captures"))?;
+        let cache_bootstrapped = pin_cache_bootstrapped(&tx)?;
+
+        if indexed != on_disk {
+            tx.rollback()
+                .map_err(store_err("cannot end startup synchronization"))?;
+            tracing::info!(
+                on_disk,
+                indexed,
+                "history index disagrees with durable records; reconciling"
+            );
+            return self.reconcile().map(|_| ());
+        }
+
+        if pending.is_empty() && cache_bootstrapped {
+            tx.rollback()
+                .map_err(store_err("cannot end startup synchronization"))?;
             return Ok(());
         }
 
-        tracing::info!(
-            on_disk,
-            indexed,
-            "history index disagrees with durable records; reconciling"
-        );
-        self.reconcile().map(|_| ())
+        if !pending.is_empty()
+            && (!cache_bootstrapped || !repair_pending_index_updates(&tx, &self.layout, &pending)?)
+        {
+            tx.rollback()
+                .map_err(store_err("cannot end startup synchronization"))?;
+            tracing::info!(
+                markers = pending.len(),
+                "history has unresolved index recovery markers; fully reconciling"
+            );
+            return self.reconcile().map(|_| ());
+        }
+
+        if pending.is_empty() && !cache_bootstrapped {
+            let (records, failures) = self.layout.scan_records()?;
+            if records.len() + failures.len() != indexed || !synchronize_pin_records(&tx, &records)?
+            {
+                tx.rollback()
+                    .map_err(store_err("cannot end startup synchronization"))?;
+                tracing::info!(
+                    sidecars = records.len(),
+                    unreadable = failures.len(),
+                    indexed,
+                    "history index disagrees with durable records; reconciling"
+                );
+                return self.reconcile().map(|_| ());
+            }
+        }
+
+        mark_pin_cache_bootstrapped(&tx)?;
+        tx.commit()
+            .map_err(store_err("cannot commit startup synchronization"))?;
+        clear_index_markers(&self.layout, pending);
+        Ok(())
     }
 
     /// Removes blobs no capture refers to any more.
@@ -528,9 +596,19 @@ impl SqliteStore {
     ///
     /// Returns [`Error::Storage`] if the sweep fails.
     pub fn collect_garbage(&mut self) -> Result<u64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin garbage collection"))?;
+        let pending = self.layout.pending_index_updates()?;
+        if !repair_pending_index_updates(&tx, &self.layout, &pending)? {
+            tx.rollback()
+                .map_err(store_err("cannot end garbage collection"))?;
+            self.reconcile()?;
+            return self.collect_garbage();
+        }
         let referenced: Vec<String> = {
-            let mut stmt = self
-                .conn
+            let mut stmt = tx
                 .prepare(
                     "SELECT DISTINCT image_hash FROM captures
                      WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL",
@@ -551,11 +629,47 @@ impl SqliteStore {
             if self.layout.delete_blob(&hash)? {
                 reclaimed += byte_len;
             }
-            self.conn
-                .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+            tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
                 .map_err(store_err("cannot forget blob"))?;
         }
+        tx.commit()
+            .map_err(store_err("cannot commit garbage collection"))?;
+        clear_index_markers(&self.layout, pending);
         Ok(reclaimed)
+    }
+
+    /// Unlocks every persisted on-screen pin and returns how many changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if a sidecar or its cache cannot be updated.
+    pub fn unlock_screen_pins(&mut self) -> Result<u64> {
+        const PAGE_SIZE: u32 = 500;
+        let mut unlocked = 0u64;
+        let mut offset = 0;
+        loop {
+            let records = self.search(&SearchQuery {
+                pinned_only: true,
+                page: Page::new(PAGE_SIZE, offset),
+                ..SearchQuery::default()
+            })?;
+            if records.is_empty() {
+                break;
+            }
+            offset = offset.saturating_add(PAGE_SIZE);
+            for record in records {
+                let Some(mut state) = record.screen_pin else {
+                    continue;
+                };
+                if !state.locked {
+                    continue;
+                }
+                state.locked = false;
+                self.set_screen_pin(&record.id, Some(&state))?;
+                unlocked += 1;
+            }
+        }
+        Ok(unlocked)
     }
 
     /// The durable record for `id`, or `None`.
@@ -573,32 +687,129 @@ impl SqliteStore {
             return Ok(Some(bytes));
         }
 
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin missing-image repair"))?;
+        // An insert may have restored this content while this writer waited.
+        if let Some(bytes) = self.layout.read_blob(hash)? {
+            tx.rollback()
+                .map_err(store_err("cannot end missing-image repair"))?;
+            return Ok(Some(bytes));
+        }
+
         tracing::warn!(
             capture = %id.0,
             %hash,
             "source image is missing from disk; recording it as evicted"
         );
         let now = Timestamp::now();
-        self.conn
-            .execute(
-                "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
-                params![id.0, now.0],
-            )
-            .map_err(store_err("cannot record missing image"))?;
-        self.conn
-            .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
-            .map_err(store_err("cannot forget missing blob"))?;
-
-        if let Some(mut record) = self.stored_record(id)? {
+        let mut marker = None;
+        if let Some(mut record) = self.layout.read_record(id)?
+            && record.image_hash.as_deref() == Some(hash)
+            && record.image_evicted_at.is_none()
+        {
+            let pending = self.layout.begin_index_update(id)?;
+            marker = Some(pending);
             record.mark_evicted(now);
-            self.layout.write_record(&record)?;
+            if let Err(error) = self.layout.write_record(&record) {
+                drop(tx);
+                finish_unused_index_marker(&self.layout, marker.as_deref());
+                return Err(error);
+            }
+            if let Err(error) = upsert_record(&tx, &record) {
+                drop(tx);
+                return self.recover_partial_index_update(error).map(|()| None);
+            }
         }
+
+        if let Err(error) = tx
+            .execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+            .map_err(store_err("cannot forget missing blob"))
+        {
+            drop(tx);
+            if marker.is_some() {
+                return self.recover_partial_index_update(error).map(|()| None);
+            }
+            return Err(error);
+        }
+        if let Err(error) = tx
+            .commit()
+            .map_err(store_err("cannot commit missing-image repair"))
+        {
+            if marker.is_some() {
+                return self.recover_partial_index_update(error).map(|()| None);
+            }
+            return Err(error);
+        }
+        finish_committed_index_marker(&self.layout, marker.as_deref());
         Ok(None)
     }
 
-    fn require_record(&self, id: &CaptureId) -> Result<StoredRecord> {
-        self.stored_record(id)?
-            .ok_or_else(|| Error::Storage(format!("no capture {} in history", id.0)))
+    /// Mutates one authoritative sidecar and refreshes every cache derived from it.
+    ///
+    /// The write lock is acquired before the sidecar is read. This is important:
+    /// taking it only before the SQLite update lets two processes both read the
+    /// old document and then overwrite each other's pin, OCR, or annotation edit.
+    fn update_record(
+        &mut self,
+        id: &CaptureId,
+        mutate: impl FnOnce(&mut StoredRecord) -> Result<()>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin capture update"))?;
+        let Some(mut record) = self.layout.read_record(id)? else {
+            return Err(Error::Storage(format!("no capture {} in history", id.0)));
+        };
+        mutate(&mut record)?;
+        let marker = self.layout.begin_index_update(id)?;
+
+        if let Err(error) = self.layout.write_record(&record) {
+            drop(tx);
+            finish_unused_index_marker(&self.layout, Some(&marker));
+            return Err(error);
+        }
+
+        if let Err(error) = upsert_record(&tx, &record) {
+            drop(tx);
+            return self.recover_partial_index_update(error);
+        }
+        if let Err(error) = tx
+            .commit()
+            .map_err(store_err("cannot commit capture update"))
+        {
+            return self.recover_partial_index_update(error);
+        }
+
+        finish_committed_index_marker(&self.layout, Some(&marker));
+        Ok(())
+    }
+
+    fn recover_partial_index_update(&mut self, original: Error) -> Result<()> {
+        tracing::warn!(
+            error = %original,
+            "capture sidecar was written but its index update failed; reconciling"
+        );
+        self.synchronize_index_on_open().map_err(|recovery| {
+            Error::Storage(format!(
+                "{original}; the durable sidecar was written, but index reconciliation also failed: {recovery}"
+            ))
+        })
+    }
+
+    fn recover_retention_failure(&mut self, original: Error) -> Error {
+        tracing::warn!(
+            error = %original,
+            "retention changed a durable sidecar before failing; reconciling immediately"
+        );
+        match self.synchronize_index_on_open() {
+            Ok(()) => original,
+            Err(recovery) => Error::Storage(format!(
+                "{original}; retention changed a durable sidecar, but index reconciliation also failed: {recovery}"
+            )),
+        }
     }
 }
 
@@ -616,21 +827,13 @@ impl Store for SqliteStore {
     }
 
     fn set_pinned(&mut self, id: &CaptureId, pinned: bool) -> Result<()> {
-        let mut record = self.require_record(id)?;
-        record.pinned = pinned;
-        self.layout.write_record(&record)?;
-
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE captures SET pinned = ?2 WHERE id = ?1",
-                params![id.0, i64::from(pinned)],
-            )
-            .map_err(store_err("cannot change pinned state"))?;
-        if changed == 0 {
-            return Err(Error::Storage(format!("no capture {} in history", id.0)));
-        }
-        Ok(())
+        self.update_record(id, |record| {
+            record.pinned = pinned;
+            if !pinned {
+                record.screen_pin = None;
+            }
+            Ok(())
+        })
     }
 
     fn enforce_retention(&mut self, policy: &RetentionPolicy) -> Result<()> {
@@ -672,12 +875,9 @@ impl History for SqliteStore {
             &capture.document.data(),
         )?;
 
-        // Pixels, then the durable record, then the index row. Each step is
-        // recoverable from the one before it: a blob with no record is swept as
-        // garbage, and a record with no row is adopted on the next open. The
-        // reverse order would let a crash produce a row pointing at nothing.
+        // Blob contents are immutable, so this first write can race safely. The
+        // authoritative sidecar waits for the shared SQLite write lock below.
         self.layout.write_blob(&digest, &frame.data)?;
-        self.layout.write_record(&record)?;
 
         let tx = self
             .conn
@@ -691,15 +891,35 @@ impl History for SqliteStore {
         if !self.layout.blob_exists(&digest)? {
             self.layout.write_blob(&digest, &frame.data)?;
         }
-        tx.execute(
-            "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT (hash) DO UPDATE SET byte_len = excluded.byte_len",
-            params![digest, i64::try_from(byte_len).unwrap_or(i64::MAX), now.0],
-        )
-        .map_err(store_err("cannot record blob"))?;
+        let marker = self.layout.begin_index_update(&id)?;
+        if let Err(error) = self.layout.write_record(&record) {
+            drop(tx);
+            finish_unused_index_marker(&self.layout, Some(&marker));
+            return Err(error);
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (hash) DO UPDATE SET byte_len = excluded.byte_len",
+                params![digest, i64::try_from(byte_len).unwrap_or(i64::MAX), now.0],
+            )
+            .map_err(store_err("cannot record blob"))
+        {
+            drop(tx);
+            self.recover_partial_index_update(error)?;
+            return Ok(id);
+        }
 
-        upsert_record(&tx, &record)?;
-        tx.commit().map_err(store_err("cannot commit insert"))?;
+        if let Err(error) = upsert_record(&tx, &record) {
+            drop(tx);
+            self.recover_partial_index_update(error)?;
+            return Ok(id);
+        }
+        if let Err(error) = tx.commit().map_err(store_err("cannot commit insert")) {
+            self.recover_partial_index_update(error)?;
+            return Ok(id);
+        }
+        finish_committed_index_marker(&self.layout, Some(&marker));
 
         Ok(id)
     }
@@ -716,6 +936,14 @@ impl History for SqliteStore {
             .transpose()
     }
 
+    fn set_screen_pin(&mut self, id: &CaptureId, state: Option<&PinState>) -> Result<()> {
+        self.update_record(id, |record| {
+            record.screen_pin = state.cloned();
+            record.pinned = state.is_some();
+            Ok(())
+        })
+    }
+
     fn document(&mut self, id: &CaptureId) -> Result<Option<DocumentState>> {
         let Some(record) = self.stored_record(id)? else {
             return Ok(None);
@@ -728,12 +956,14 @@ impl History for SqliteStore {
         };
 
         let Some(pixels) = pixels else {
-            return Ok(Some(DocumentState::ImageEvicted(EvictedDocument {
-                record: self
-                    .record(id)?
-                    .unwrap_or_else(|| record.to_capture_record()),
-                data,
-            })));
+            return Ok(Some(DocumentState::ImageEvicted(Box::new(
+                EvictedDocument {
+                    record: self
+                        .record(id)?
+                        .unwrap_or_else(|| record.to_capture_record()),
+                    data,
+                },
+            ))));
         };
 
         let header = &record.frame;
@@ -781,11 +1011,10 @@ impl History for SqliteStore {
             .query_map(params_from_iter(args.iter()), |row| Ok(row_to_record(row)))
             .map_err(store_err("cannot run search"))?;
 
-        let mut found = Vec::new();
-        for row in rows {
-            found.push(row.map_err(store_err("cannot read search result"))??);
-        }
-        Ok(found)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(store_err("cannot read search result"))?
+            .into_iter()
+            .collect()
     }
 
     fn count(&self) -> Result<u64> {
@@ -798,32 +1027,57 @@ impl History for SqliteStore {
     }
 
     fn delete(&mut self, id: &CaptureId) -> Result<bool> {
-        let Some(record) = self.stored_record(id)? else {
-            // The record may be gone while a stale row survives; clear it too.
-            let removed = self
-                .conn
-                .execute("DELETE FROM captures WHERE id = ?1", params![id.0])
-                .map_err(store_err("cannot delete capture"))?;
-            return Ok(removed > 0);
-        };
-
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_err("cannot begin delete"))?;
-        tx.execute("DELETE FROM captures WHERE id = ?1", params![id.0])
-            .map_err(store_err("cannot delete capture"))?;
-
-        if let Some(hash) = record.image_hash.as_deref()
-            && !blob_still_referenced(&tx, hash)?
-        {
-            tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
-                .map_err(store_err("cannot forget blob"))?;
-            self.layout.delete_blob(hash)?;
+        let pending = self.layout.pending_index_updates()?;
+        if !repair_pending_index_updates(&tx, &self.layout, &pending)? {
+            tx.rollback().map_err(store_err("cannot end delete"))?;
+            self.reconcile()?;
+            return self.delete(id);
         }
-        tx.commit().map_err(store_err("cannot commit delete"))?;
+        let Some(record) = self.layout.read_record(id)? else {
+            // The record may be gone while a stale row survives; clear it too.
+            let removed = tx
+                .execute("DELETE FROM captures WHERE id = ?1", params![id.0])
+                .map_err(store_err("cannot delete capture"))?;
+            tx.commit().map_err(store_err("cannot commit delete"))?;
+            clear_index_markers(&self.layout, pending);
+            return Ok(removed > 0);
+        };
 
-        self.layout.delete_record(id)?;
+        let marker = self.layout.begin_index_update(id)?;
+        if let Err(error) = self.layout.delete_record(id) {
+            drop(tx);
+            finish_unused_index_marker(&self.layout, Some(&marker));
+            return Err(error);
+        }
+        let indexed = (|| -> Result<()> {
+            tx.execute("DELETE FROM captures WHERE id = ?1", params![id.0])
+                .map_err(store_err("cannot delete capture"))?;
+
+            if let Some(hash) = record.image_hash.as_deref()
+                && !blob_still_referenced(&tx, hash)?
+            {
+                tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+                    .map_err(store_err("cannot forget blob"))?;
+                self.layout.delete_blob(hash)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = indexed {
+            drop(tx);
+            self.recover_partial_index_update(error)?;
+            return Ok(true);
+        }
+        if let Err(error) = tx.commit().map_err(store_err("cannot commit delete")) {
+            self.recover_partial_index_update(error)?;
+            return Ok(true);
+        }
+
+        finish_committed_index_marker(&self.layout, Some(&marker));
+        clear_index_markers(&self.layout, pending);
         Ok(true)
     }
 
@@ -832,42 +1086,14 @@ impl History for SqliteStore {
     }
 
     fn save_edits(&mut self, id: &CaptureId, data: &DocumentData) -> Result<()> {
-        let mut record = self.require_record(id)?;
-        record.set_document(data)?;
-
-        // The durable record first, then the index. The index only caches the
-        // count, so the worst a crash between them can do is show a stale
-        // number until the next reconcile.
-        self.layout.write_record(&record)?;
-        self.conn
-            .execute(
-                "UPDATE captures SET annotation_count = ?2 WHERE id = ?1",
-                params![
-                    id.0,
-                    i64::try_from(data.annotations.len()).unwrap_or(i64::MAX)
-                ],
-            )
-            .map_err(store_err("cannot record edit count"))?;
-        Ok(())
+        self.update_record(id, |record| record.set_document(data))
     }
 
     fn set_ocr_text(&mut self, id: &CaptureId, text: Option<&str>) -> Result<()> {
-        let mut record = self.require_record(id)?;
-        record.ocr_text = text.map(ToOwned::to_owned);
-        self.layout.write_record(&record)?;
-
-        self.conn
-            .execute(
-                "UPDATE captures SET ocr_text = ?2, ocr_fold = ?3, search_fold = ?4 WHERE id = ?1",
-                params![
-                    id.0,
-                    record.ocr_text,
-                    record.ocr_text.as_ref().map(|t| t.to_lowercase()),
-                    record.search_text()
-                ],
-            )
-            .map_err(store_err("cannot record recognised text"))?;
-        Ok(())
+        self.update_record(id, |record| {
+            record.ocr_text = text.map(ToOwned::to_owned);
+            Ok(())
+        })
     }
 
     fn stored_image_bytes(&self) -> Result<u64> {
@@ -885,6 +1111,16 @@ impl History for SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_err("cannot begin retention"))?;
+        let pending = self.layout.pending_index_updates()?;
+        if !repair_pending_index_updates(&tx, &self.layout, &pending)? {
+            tx.rollback()
+                .map_err(store_err("cannot end retention recovery"))?;
+            self.reconcile()?;
+            return self.evict(policy);
+        }
+        if !pending.is_empty() {
+            mark_pin_cache_bootstrapped(&tx)?;
+        }
 
         let mut total = sum_blob_bytes(&tx)?;
         let pinned_bytes: u64 = tx
@@ -907,7 +1143,12 @@ impl History for SqliteStore {
         };
 
         if total <= policy.max_image_bytes {
-            tx.rollback().map_err(store_err("cannot end retention"))?;
+            if pending.is_empty() {
+                tx.rollback().map_err(store_err("cannot end retention"))?;
+            } else {
+                tx.commit().map_err(store_err("cannot commit retention"))?;
+                clear_index_markers(&self.layout, pending);
+            }
             return Ok(report);
         }
 
@@ -928,66 +1169,98 @@ impl History for SqliteStore {
                 .map_err(store_err("cannot find evictable captures"))?
         };
 
-        let mut rewritten = Vec::new();
-        for (id, digest) in candidates {
-            if total <= policy.max_image_bytes {
-                break;
-            }
+        let mut written_markers = Vec::new();
+        let mut durable_update_started = false;
+        let retained = (|| -> Result<()> {
+            for (id, digest) in candidates {
+                if total <= policy.max_image_bytes {
+                    break;
+                }
 
-            // The document is untouched. Only the pixels go. This one statement
-            // is the whole of decision D23.
-            tx.execute(
-                "UPDATE captures SET image_evicted_at = ?2, image_bytes = 0 WHERE id = ?1",
-                params![id, now.0],
-            )
-            .map_err(store_err("cannot evict image"))?;
+                let capture = CaptureId(id.clone());
+                let Some(mut record) = self.layout.read_record(&capture)? else {
+                    return Err(Error::Storage(format!(
+                        "cannot evict capture {id}: its authoritative record is missing"
+                    )));
+                };
+                if record.image_hash.as_deref() != Some(digest.as_str())
+                    || record.image_evicted_at.is_some()
+                {
+                    upsert_record(&tx, &record)?;
+                    continue;
+                }
+                if record.pinned || record.screen_pin.is_some() {
+                    if record.screen_pin.is_some() && !record.pinned {
+                        record.pinned = true;
+                        let marker = self.layout.begin_index_update(&capture)?;
+                        durable_update_started = true;
+                        self.layout.write_record(&record)?;
+                        written_markers.push(marker);
+                    }
+                    upsert_record(&tx, &record)?;
+                    continue;
+                }
 
-            if !blob_still_referenced(&tx, &digest)? {
-                let byte_len: u64 = tx
-                    .query_row(
-                        "SELECT byte_len FROM blobs WHERE hash = ?1",
-                        params![digest],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(store_err("cannot size blob"))?
-                    .map_or(0, |n| u64::try_from(n).unwrap_or(0));
-
-                tx.execute("DELETE FROM blobs WHERE hash = ?1", params![digest])
-                    .map_err(store_err("cannot forget blob"))?;
-                // Unlinked inside the transaction on purpose: a concurrent
-                // insert that would dedupe onto this blob is blocked by the
-                // same write lock, so it cannot observe the file mid-removal.
-                self.layout.delete_blob(&digest)?;
-                total = total.saturating_sub(byte_len);
-                report.bytes_reclaimed += byte_len;
-            }
-
-            rewritten.push(CaptureId(id.clone()));
-            report.evicted.push(CaptureId(id));
-        }
-
-        report.bytes_remaining = total;
-        report.cap_unreachable = total > policy.max_image_bytes;
-        if report.cap_unreachable {
-            tracing::info!(
-                cap = policy.max_image_bytes,
-                remaining = total,
-                pinned_bytes,
-                "retention cap not reached; the remainder is pinned and pinned captures are never evicted"
-            );
-        }
-
-        tx.commit().map_err(store_err("cannot commit retention"))?;
-
-        // Durable records last: if this is interrupted, the next open finds a
-        // record claiming pixels that are not there and marks it evicted, which
-        // is the same end state.
-        for id in rewritten {
-            if let Some(mut record) = self.stored_record(&id)? {
+                let marker = self.layout.begin_index_update(&capture)?;
+                durable_update_started = true;
                 record.mark_evicted(now);
                 self.layout.write_record(&record)?;
+                upsert_record(&tx, &record)?;
+                written_markers.push(marker);
+
+                if !blob_still_referenced(&tx, &digest)? {
+                    let byte_len: u64 = tx
+                        .query_row(
+                            "SELECT byte_len FROM blobs WHERE hash = ?1",
+                            params![digest],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(store_err("cannot size blob"))?
+                        .map_or(0, |n| u64::try_from(n).unwrap_or(0));
+
+                    tx.execute("DELETE FROM blobs WHERE hash = ?1", params![digest])
+                        .map_err(store_err("cannot forget blob"))?;
+                    // Unlinked inside the transaction on purpose: a concurrent
+                    // insert that would dedupe onto this blob is blocked by the
+                    // same write lock, so it cannot observe the file mid-removal.
+                    self.layout.delete_blob(&digest)?;
+                    total = total.saturating_sub(byte_len);
+                    report.bytes_reclaimed += byte_len;
+                }
+
+                report.evicted.push(capture);
             }
+
+            report.bytes_remaining = total;
+            report.cap_unreachable = total > policy.max_image_bytes;
+            if report.cap_unreachable {
+                tracing::info!(
+                    cap = policy.max_image_bytes,
+                    remaining = total,
+                    pinned_bytes,
+                    "retention cap not reached; the remainder is pinned and pinned captures are never evicted"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = retained {
+            drop(tx);
+            if durable_update_started {
+                return Err(self.recover_retention_failure(error));
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = tx.commit().map_err(store_err("cannot commit retention")) {
+            if durable_update_started {
+                return Err(self.recover_retention_failure(error));
+            }
+            return Err(error);
+        }
+        clear_index_markers(&self.layout, pending);
+        for marker in written_markers {
+            finish_committed_index_marker(&self.layout, Some(&marker));
         }
 
         Ok(report)
@@ -1024,14 +1297,20 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
         .map_err(|e| Error::Storage(format!("cannot serialise target: {e}")))?;
     let frame_json = serde_json::to_string(&record.frame)
         .map_err(|e| Error::Storage(format!("cannot serialise frame: {e}")))?;
+    let pin_json = record
+        .screen_pin
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| Error::Storage(format!("cannot serialise pin state: {e}")))?;
 
     conn.execute(
         "INSERT INTO captures (
              id, created_at, stored_at, pinned, app_name, window_title, provenance,
              target_json, frame_json, image_hash, image_bytes, image_evicted_at,
-             ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold
+            ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
          )
          ON CONFLICT (id) DO UPDATE SET
              created_at = excluded.created_at,
@@ -1073,7 +1352,185 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
         ],
     )
     .map_err(store_err("cannot write capture row"))?;
+    cache_screen_pin(conn, &CaptureId(record.id.clone()), pin_json.as_deref())?;
     Ok(())
+}
+
+fn cache_screen_pin(conn: &Connection, id: &CaptureId, pin_json: Option<&str>) -> Result<()> {
+    if let Some(pin_json) = pin_json {
+        conn.execute(
+            "INSERT INTO capture_pins (capture_id, pin_json) VALUES (?1, ?2)
+             ON CONFLICT (capture_id) DO UPDATE SET pin_json = excluded.pin_json",
+            params![id.0, pin_json],
+        )
+        .map_err(store_err("cannot cache screen pin"))?;
+    } else {
+        conn.execute(
+            "DELETE FROM capture_pins WHERE capture_id = ?1",
+            params![id.0],
+        )
+        .map_err(store_err("cannot clear screen pin cache"))?;
+    }
+    Ok(())
+}
+
+fn synchronize_pin_records(conn: &Connection, records: &[StoredRecord]) -> Result<bool> {
+    for record in records {
+        if !synchronize_pin_record(conn, record)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn synchronize_pin_record(conn: &Connection, record: &StoredRecord) -> Result<bool> {
+    let cached = conn
+        .query_row(
+            "SELECT pinned,
+                    (SELECT pin_json FROM capture_pins WHERE capture_id = captures.id)
+             FROM captures WHERE id = ?1",
+            params![record.id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(store_err("cannot read cached pin state"))?;
+    let Some((cached_pinned, cached_pin_json)) = cached else {
+        return Ok(false);
+    };
+
+    if cached_pinned != i64::from(record.pinned) {
+        conn.execute(
+            "UPDATE captures SET pinned = ?2 WHERE id = ?1",
+            params![record.id, i64::from(record.pinned)],
+        )
+        .map_err(store_err("cannot synchronize pinned state"))?;
+    }
+
+    let pin_json = serialize_screen_pin(record.screen_pin.as_ref())?;
+    if cached_pin_json.as_deref() != pin_json.as_deref() {
+        cache_screen_pin(conn, &CaptureId(record.id.clone()), pin_json.as_deref())?;
+    }
+    Ok(true)
+}
+
+fn repair_pending_index_updates(
+    conn: &Connection,
+    layout: &StoreLayout,
+    updates: &[PendingIndexUpdate],
+) -> Result<bool> {
+    let mut captures = Vec::with_capacity(updates.len());
+    for update in updates {
+        let Some(capture) = &update.capture else {
+            return Ok(false);
+        };
+        if !captures.contains(capture) {
+            captures.push(capture.clone());
+        }
+    }
+
+    for capture in captures {
+        let Some(record) = layout.read_record(&capture)? else {
+            return Ok(false);
+        };
+        synchronize_record_cache(conn, layout, &record)?;
+    }
+    Ok(true)
+}
+
+fn synchronize_record_cache(
+    conn: &Connection,
+    layout: &StoreLayout,
+    record: &StoredRecord,
+) -> Result<()> {
+    upsert_record(conn, record)?;
+    let Some(hash) = record.image_hash.as_deref() else {
+        return Ok(());
+    };
+
+    if record.image_evicted_at.is_none() {
+        if let Some(byte_len) = layout.blob_len(hash)? {
+            conn.execute(
+                "INSERT INTO blobs (hash, byte_len, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (hash) DO UPDATE SET byte_len = excluded.byte_len",
+                params![
+                    hash,
+                    i64::try_from(byte_len).unwrap_or(i64::MAX),
+                    record.stored_at
+                ],
+            )
+            .map_err(store_err("cannot repair blob cache"))?;
+        }
+    } else if !blob_still_referenced(conn, hash)? {
+        conn.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])
+            .map_err(store_err("cannot repair evicted blob cache"))?;
+    }
+    Ok(())
+}
+
+fn pin_cache_bootstrapped(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM store_meta WHERE key = ?1",
+        params![PIN_CACHE_BOOTSTRAP_KEY],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(store_err("cannot read pin cache bootstrap state"))
+}
+
+fn mark_pin_cache_bootstrapped(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO store_meta (key, value) VALUES (?1, '1')
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![PIN_CACHE_BOOTSTRAP_KEY],
+    )
+    .map_err(store_err("cannot record pin cache bootstrap"))?;
+    Ok(())
+}
+
+fn serialize_screen_pin(state: Option<&PinState>) -> Result<Option<String>> {
+    state
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| Error::Storage(format!("cannot serialise pin state: {error}")))
+}
+
+fn clear_index_markers(layout: &StoreLayout, markers: Vec<PendingIndexUpdate>) {
+    for marker in markers {
+        if let Err(error) = layout.finish_index_update(&marker.path) {
+            tracing::warn!(
+                marker = %marker.path.display(),
+                %error,
+                "could not clear a repaired index recovery marker"
+            );
+        }
+    }
+}
+
+fn finish_unused_index_marker(layout: &StoreLayout, marker: Option<&Path>) {
+    let Some(marker) = marker else {
+        return;
+    };
+    if let Err(cleanup) = layout.finish_index_update(marker) {
+        tracing::warn!(
+            marker = %marker.display(),
+            %cleanup,
+            "could not clear an unused index recovery marker"
+        );
+    }
+}
+
+fn finish_committed_index_marker(layout: &StoreLayout, marker: Option<&Path>) {
+    let Some(marker) = marker else {
+        return;
+    };
+    if let Err(error) = layout.finish_index_update(marker) {
+        tracing::warn!(
+            marker = %marker.display(),
+            %error,
+            "capture update committed but its recovery marker remains"
+        );
+    }
 }
 
 fn drop_rows_without_records(conn: &Connection, keep: &[String]) -> Result<usize> {
@@ -1194,11 +1651,18 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let image_evicted_at: Option<i64> = get(row, 10)?;
     let ocr_text: Option<String> = get(row, 11)?;
     let annotation_count: i64 = get(row, 12)?;
+    let pin_json: Option<String> = get(row, 13)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
     let frame: FrameHeader = serde_json::from_str(&frame_json)
         .map_err(|e| Error::Storage(format!("cannot read frame for {id}: {e}")))?;
+    let screen_pin = pin_json
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|e| Error::Storage(format!("cannot read screen pin for {id}: {e}")))
+        })
+        .transpose()?;
 
     let image = match (image_hash, image_evicted_at) {
         (Some(hash), None) => ImageState::Present {
@@ -1220,6 +1684,7 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         id: CaptureId(id),
         created_at: Timestamp(created_at),
         pinned: pinned != 0,
+        screen_pin,
         app_name,
         window_title,
         provenance: ProvenanceRepr::from_token(&provenance)?.into(),

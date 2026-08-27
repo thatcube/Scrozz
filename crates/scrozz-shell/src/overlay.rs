@@ -67,7 +67,7 @@ use std::ffi::c_void;
 
 #[cfg(not(target_os = "macos"))]
 use scrozz_core::{Error, Result};
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Opacity};
 
 /// A rectangle in AppKit screen coordinates: **bottom-left origin, y up**.
 ///
@@ -219,6 +219,8 @@ pub struct OverlayBehavior {
     pub opaque: bool,
     /// Whether the OS draws a drop shadow behind the window.
     pub has_shadow: bool,
+    /// Native opacity of the complete window.
+    pub opacity: Opacity,
     /// Whether the user can drag the window.
     ///
     /// `false` per D27: capture cards live in fixed slots because the slot *is*
@@ -240,6 +242,7 @@ impl Default for OverlayBehavior {
             hides_on_deactivate: false,
             opaque: true,
             has_shadow: true,
+            opacity: Opacity::OPAQUE,
             movable: true,
         }
     }
@@ -268,6 +271,7 @@ impl OverlayBehavior {
             hides_on_deactivate: false,
             opaque: false,
             has_shadow: false,
+            opacity: Opacity::OPAQUE,
             movable: false,
         }
     }
@@ -292,7 +296,31 @@ impl OverlayBehavior {
             hides_on_deactivate: false,
             opaque: false,
             has_shadow: false,
+            opacity: Opacity::OPAQUE,
             movable: false,
+        }
+    }
+
+    /// The behaviour of one pinned capture window.
+    ///
+    /// Each pin owns a native window because click-through is a whole-window
+    /// property. An unlocked pin may receive keyboard input for Escape and
+    /// arrow-key nudges; a locked pin relies on an external unlock route.
+    #[must_use]
+    pub const fn pinned_capture(locked: bool) -> Self {
+        Self {
+            level: OverlayLevel::Floating,
+            click_through: locked,
+            join_all_spaces: true,
+            over_fullscreen: true,
+            stationary: true,
+            ignore_cycle: true,
+            accepts_key: !locked,
+            hides_on_deactivate: false,
+            opaque: false,
+            has_shadow: true,
+            opacity: Opacity::OPAQUE,
+            movable: true,
         }
     }
 }

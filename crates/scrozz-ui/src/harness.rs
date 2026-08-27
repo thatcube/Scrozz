@@ -259,6 +259,10 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// A pinned capture with its hover controls visible.
+    PinnedCaptureHover,
+    /// A click-through pin showing its external unlock guidance.
+    PinnedCaptureLocked,
 }
 
 impl Scenario {
@@ -275,6 +279,8 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::PinnedCaptureHover,
+            Self::PinnedCaptureLocked,
         ]
     }
 
@@ -294,6 +300,8 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::PinnedCaptureHover => "pinned-capture-hover",
+            Self::PinnedCaptureLocked => "pinned-capture-locked",
         }
     }
 
@@ -747,9 +755,33 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::PinnedCaptureHover => (
+                    vec![],
+                    Gesture::None,
+                    false,
+                    false,
+                    "A capture, pinned above your work",
+                    "One capture in its own native window with hover controls for opacity, scale, locking, and close.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::PinnedCaptureLocked => (
+                    vec![],
+                    Gesture::None,
+                    false,
+                    false,
+                    "Pinned and click-through",
+                    "A locked pin ignores pointer input and always names the external Unlock Pinned Captures escape.",
+                    instants::REST,
+                    None,
+                ),
             };
 
-        let size_pt = if annotating { (900.0, 620.0) } else { size_pt };
+        let size_pt = match scenario {
+            Scenario::EditorAnnotating => (900.0, 620.0),
+            Scenario::PinnedCaptureHover | Scenario::PinnedCaptureLocked => (420.0, 270.0),
+            _ => size_pt,
+        };
 
         Self {
             scenario,
@@ -1870,7 +1902,7 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
@@ -1878,6 +1910,14 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        me.register(
+            Scenario::PinnedCaptureHover,
+            Box::new(crate::pinned::PinnedScene::hover()),
+        );
+        me.register(
+            Scenario::PinnedCaptureLocked,
+            Box::new(crate::pinned::PinnedScene::locked()),
+        );
         me
     }
 

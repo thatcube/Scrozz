@@ -5,7 +5,7 @@
 //! the edit history along with the pixels.
 
 use scrozz_annotate::{Annotation, Style};
-use scrozz_core::LogicalPoint;
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, PinScale, PinState};
 use scrozz_store::{
     CaptureId, DocumentState, History as _, ImageState, NewCapture, RetentionPolicy, SearchQuery,
     SqliteStore, Store as _, Timestamp,
@@ -269,6 +269,83 @@ fn pinned_captures_are_never_evicted_even_when_that_breaks_the_cap() {
                 .is_present()
         );
     }
+}
+
+#[test]
+fn an_on_screen_pin_is_never_evicted() {
+    let (_dir, mut store) = store("screen-pin-wins");
+    let ids = fill(&mut store, 3);
+    let state = PinState::new(
+        LogicalRect::new(
+            LogicalPoint::new(20.0, 30.0),
+            LogicalSize::new(320.0, 180.0),
+        ),
+        PinScale::ORIGINAL,
+        None,
+    );
+    store
+        .set_screen_pin(&ids[0], Some(&state))
+        .expect("screen pin");
+
+    let report = store
+        .evict(&RetentionPolicy { max_image_bytes: 0 })
+        .expect("retention");
+
+    assert!(!report.evicted.contains(&ids[0]));
+    assert_eq!(report.pinned_bytes, IMAGE_BYTES);
+    assert!(
+        store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
+}
+
+#[test]
+fn retention_repairs_a_pending_pin_update_before_choosing_evictions() {
+    let (dir, mut store) = store("pending-screen-pin-wins");
+    let ids = fill(&mut store, 3);
+    let state = PinState::new(
+        LogicalRect::new(
+            LogicalPoint::new(20.0, 30.0),
+            LogicalSize::new(320.0, 180.0),
+        ),
+        PinScale::ORIGINAL,
+        None,
+    );
+    let mut sidecar = store
+        .layout()
+        .read_record(&ids[0])
+        .expect("read sidecar")
+        .expect("sidecar exists");
+    sidecar.pinned = true;
+    sidecar.screen_pin = Some(state);
+    store
+        .layout()
+        .write_record(&sidecar)
+        .expect("simulate durable sidecar write");
+    std::fs::write(
+        dir.path().join("pending-index/pin.pending"),
+        format!("{}\n", ids[0].0),
+    )
+    .expect("simulate crash marker");
+
+    let report = store
+        .evict(&RetentionPolicy { max_image_bytes: 0 })
+        .expect("retention repairs first");
+
+    assert!(!report.evicted.contains(&ids[0]));
+    assert_eq!(report.pinned_bytes, IMAGE_BYTES);
+    assert!(
+        store
+            .record(&ids[0])
+            .expect("read")
+            .expect("present")
+            .image
+            .is_present()
+    );
 }
 
 #[test]

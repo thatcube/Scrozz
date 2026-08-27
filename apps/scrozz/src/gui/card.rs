@@ -28,7 +28,7 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_core::Frame;
+use scrozz_core::{Frame, PinState, Provenance};
 use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
@@ -54,6 +54,9 @@ impl std::fmt::Display for CardId {
 /// sharp on a Retina panel and small enough that the downscale of a 5K capture
 /// is measured in milliseconds.
 pub const THUMBNAIL_MAX_EDGE: u32 = 512;
+
+/// Longest texture edge retained for a native pinned window.
+pub const PIN_TEXTURE_MAX_EDGE: u32 = 2_048;
 
 /// Straight-alpha RGBA8 pixels, ready to upload as a texture.
 #[derive(Clone, PartialEq, Eq)]
@@ -223,6 +226,27 @@ pub struct Card {
     pub taken_at: SystemTime,
 }
 
+/// A persisted capture ready to restore into a native pinned window.
+#[derive(Debug, Clone)]
+pub struct PinnedCapture {
+    /// Durable history identity.
+    pub id: CaptureId,
+    /// Human-readable label.
+    pub name: String,
+    /// Source provenance, which controls synthetic chrome (D9).
+    pub provenance: Provenance,
+    /// Source width in physical pixels.
+    pub source_width: u32,
+    /// Source height in physical pixels.
+    pub source_height: u32,
+    /// Source pixels per logical point.
+    pub scale: f64,
+    /// Durable window geometry and presentation.
+    pub state: PinState,
+    /// Display texture, bounded independently from card thumbnails.
+    pub texture: Option<Thumbnail>,
+}
+
 impl Card {
     /// A card with nothing but an identity, for tests and for the failure path.
     #[must_use]
@@ -288,7 +312,7 @@ impl Card {
 /// to `scrozz-ui`, which knows the thresholds and the velocities. What crosses
 /// this seam is the *decision* — never a raw drag delta, because then two
 /// crates would be deciding what a swipe means.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CardEvent {
     /// Put this capture on the clipboard.
     Copy(CardId),
@@ -302,19 +326,42 @@ pub enum CardEvent {
     Collapse(CardId),
     /// Clicked: open it for editing.
     Open(CardId),
+    /// A card became a durable native pin.
+    Pin(CardId, CaptureId, PinState),
+    /// A pin's geometry or presentation changed.
+    PinChanged(CaptureId, PinState),
+    /// A pin closed and must not restore.
+    Unpin(CaptureId),
+    /// A native pin request was truthfully refused.
+    PinUnavailable {
+        /// Card that was not pinned.
+        card: CardId,
+        /// Platform reason and remedy.
+        reason: String,
+    },
+    /// A compositor refused explicit positioning.
+    PinPositioningUnavailable {
+        /// Durable capture identity.
+        capture: CaptureId,
+        /// Platform reason and remedy.
+        reason: String,
+    },
 }
 
 impl CardEvent {
     /// Which card this happened to.
     #[must_use]
-    pub const fn card(&self) -> CardId {
+    pub const fn card(&self) -> Option<CardId> {
         match self {
             Self::Copy(id)
             | Self::Save(id)
             | Self::Dismiss(id)
             | Self::Drag(id)
             | Self::Collapse(id)
-            | Self::Open(id) => *id,
+            | Self::Open(id)
+            | Self::Pin(id, _, _)
+            | Self::PinUnavailable { card: id, .. } => Some(*id),
+            Self::PinChanged(..) | Self::Unpin(..) | Self::PinPositioningUnavailable { .. } => None,
         }
     }
 }
@@ -338,6 +385,27 @@ pub trait CardSurface {
 
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
+
+    /// Restore or refresh a durable pinned capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explicit unsupported error when this surface has no native
+    /// window host, or a rendering error when the request cannot be accepted.
+    fn restore_pin(&mut self, pin: PinnedCapture) -> scrozz_core::Result<()>;
+
+    /// Refresh a live pin's pixels without replacing its UI-owned state.
+    fn refresh_pin_texture(
+        &mut self,
+        capture: &CaptureId,
+        texture: Thumbnail,
+    ) -> scrozz_core::Result<()>;
+
+    /// Remove a live pin without emitting another persistence mutation.
+    fn discard_pin(&mut self, capture: &CaptureId);
+
+    /// Unlock every pointer-transparent pin through an external escape.
+    fn unlock_pins(&mut self);
 
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
@@ -423,6 +491,28 @@ impl CardSurface for Recording {
             .expect("card log is poisoned")
             .retain(|card| card.id != id);
     }
+
+    fn restore_pin(&mut self, _pin: PinnedCapture) -> scrozz_core::Result<()> {
+        Err(scrozz_core::Error::Unsupported {
+            what: "native pinned capture windows".into(),
+            why: "the recording card surface has no window host".into(),
+        })
+    }
+
+    fn refresh_pin_texture(
+        &mut self,
+        _capture: &CaptureId,
+        _texture: Thumbnail,
+    ) -> scrozz_core::Result<()> {
+        Err(scrozz_core::Error::Unsupported {
+            what: "native pinned capture windows".into(),
+            why: "the recording card surface has no window host".into(),
+        })
+    }
+
+    fn discard_pin(&mut self, _capture: &CaptureId) {}
+
+    fn unlock_pins(&mut self) {}
 
     fn poll(&mut self) -> Option<CardEvent> {
         let mut queue = self.injected.lock().expect("card events are poisoned");
@@ -559,7 +649,7 @@ mod tests {
             CardEvent::Collapse(id),
             CardEvent::Open(id),
         ] {
-            assert_eq!(event.card(), id);
+            assert_eq!(event.card(), Some(id));
         }
     }
 

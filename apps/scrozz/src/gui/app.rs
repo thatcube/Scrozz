@@ -23,12 +23,17 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
+use scrozz_core::LockEscape;
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     SystemPermissions, Tray, TrayAction,
 };
+use scrozz_store::CaptureId;
 
 use crate::{
     cli::Cli,
@@ -187,6 +192,9 @@ pub struct App {
     tray: Option<Tray>,
     hotkeys: GlobalHotkeys,
     server: Option<Server>,
+    pin_lock_escapes: Vec<LockEscape>,
+    terminally_unpinned: HashSet<CaptureId>,
+    suppress_locked_restores: bool,
     started: Instant,
     captures: u64,
     notes: Vec<String>,
@@ -247,12 +255,17 @@ impl App {
         };
         hotkeys.set_command("scrozz");
 
+        let mut unlock_hotkey_registered = false;
         for (accelerator, action) in &config.bindings {
             let hotkey = Hotkey {
                 accelerator: accelerator.clone(),
             };
             match hotkeys.register(&hotkey, action.id()) {
-                Ok(()) => notes.push(format!("{accelerator} → {}", action.id())),
+                Ok(()) => {
+                    notes.push(format!("{accelerator} → {}", action.id()));
+                    unlock_hotkey_registered |=
+                        *action == Action::UnlockPins && hotkeys.is_bound_to_os();
+                }
                 // Wayland answers `Unsupported` carrying the compositor config
                 // line to paste, which is the actual remedy (D11). Losing it in
                 // a generic "hotkey failed" would be the wrong trade.
@@ -260,6 +273,8 @@ impl App {
             }
         }
 
+        let pin_lock_escapes =
+            established_lock_escapes(server.is_some(), tray.is_some(), unlock_hotkey_registered);
         let mut app = Self {
             config,
             surface,
@@ -267,6 +282,9 @@ impl App {
             tray,
             hotkeys,
             server,
+            pin_lock_escapes,
+            terminally_unpinned: HashSet::new(),
+            suppress_locked_restores: false,
             started: Instant::now(),
             captures: 0,
             notes,
@@ -277,6 +295,11 @@ impl App {
         }
 
         Ok(app)
+    }
+
+    /// Routes that were successfully established outside pinned windows.
+    pub(crate) fn pin_lock_escapes(&self) -> &[LockEscape] {
+        &self.pin_lock_escapes
     }
 
     /// Services every source once. Never blocks.
@@ -362,7 +385,21 @@ impl App {
             // it must produce byte-identical output to a local run and the
             // command layer is synchronous. A capture is tens of milliseconds;
             // a recording returns as soon as it has started.
-            if let Some(command) = request.serve() {
+            let command = request.serve_with(|command| {
+                if let Some(id) = forwarded_unpin(command) {
+                    let capture = CaptureId(id.to_owned());
+                    self.terminally_unpinned.insert(capture.clone());
+                    self.surface.discard_pin(&capture);
+                    self.pipeline.terminal_unpin(capture)?;
+                    self.note(format!("pinned capture {id} closed after forwarded unpin"));
+                }
+                if forwarded_unlock_pins(command) {
+                    self.unlock_all_pins()?;
+                    self.note("pinned captures unlocked from the command line");
+                }
+                Ok(())
+            });
+            if let Some(command) = command {
                 self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
@@ -401,6 +438,46 @@ impl App {
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
+                Outcome::PinReady(mut pin) => {
+                    if self.terminally_unpinned.contains(&pin.id) {
+                        continue;
+                    }
+                    if self.suppress_locked_restores {
+                        pin.state.locked = false;
+                    }
+                    let capture = pin.id.0.clone();
+                    if let Err(err) = self.surface.restore_pin(*pin) {
+                        self.note(format!(
+                            "pinned capture {capture} could not be shown: {err}"
+                        ));
+                    } else {
+                        self.note(format!("pinned capture {capture} restored"));
+                    }
+                }
+                Outcome::PinTextureReady { capture, texture } => {
+                    if self.terminally_unpinned.contains(&capture) {
+                        continue;
+                    }
+                    if let Err(err) = self.surface.refresh_pin_texture(&capture, texture) {
+                        self.note(format!(
+                            "pinned capture {} texture could not be refreshed: {err}",
+                            capture.0
+                        ));
+                    }
+                }
+                Outcome::PinCreationFailed { capture, error } => {
+                    self.surface.discard_pin(&capture);
+                    self.note(format!(
+                        "pinned capture {} was closed because it could not be persisted: {error}",
+                        capture.0
+                    ));
+                }
+                Outcome::PinPersistenceFailed { capture, error } => {
+                    self.note(format!(
+                        "pinned capture {} could not be persisted: {error}",
+                        capture.0
+                    ));
+                }
             }
         }
     }
@@ -425,6 +502,44 @@ impl App {
                     // ask for them.
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
+                }
+                CardEvent::Pin(id, capture, state) => {
+                    if self.terminally_unpinned.contains(&capture) {
+                        self.pipeline.post(Job::Release(id));
+                        continue;
+                    }
+                    self.pipeline.post(Job::PinCard {
+                        card: id,
+                        capture,
+                        state,
+                    });
+                    self.note(format!("{id} pinned"));
+                }
+                CardEvent::PinChanged(capture, state) => {
+                    if self.terminally_unpinned.contains(&capture) {
+                        continue;
+                    }
+                    self.pipeline.post(Job::SetPin {
+                        capture,
+                        state: Some(state),
+                    });
+                }
+                CardEvent::Unpin(capture) => {
+                    self.terminally_unpinned.insert(capture.clone());
+                    self.pipeline.post(Job::SetPin {
+                        capture: capture.clone(),
+                        state: None,
+                    });
+                    self.note(format!("pinned capture {} closed", capture.0));
+                }
+                CardEvent::PinUnavailable { card, reason } => {
+                    self.note(format!("{card} could not be pinned: {reason}"));
+                }
+                CardEvent::PinPositioningUnavailable { capture, reason } => {
+                    self.note(format!(
+                        "pinned capture {} cannot be positioned: {reason}",
+                        capture.0
+                    ));
                 }
                 // Not yet routed. The drag payload is `scrozz-shell`'s
                 // `DragSource`, and collapsing into the dock is the capture
@@ -460,6 +575,15 @@ impl App {
                 self.note("the settings window is not built yet");
                 Tick::Continue
             }
+            Action::UnlockPins => {
+                match self.unlock_all_pins() {
+                    Ok(_) => self.note("pinned captures unlocked"),
+                    Err(error) => {
+                        self.note(format!("pinned captures could not be unlocked: {error}"))
+                    }
+                }
+                Tick::Continue
+            }
             Action::Quit => {
                 self.note("quit");
                 Tick::Stop
@@ -485,6 +609,12 @@ impl App {
         if !self.pipeline.post(Job::Capture { kind, card }) {
             self.note("the capture worker has gone");
         }
+    }
+
+    fn unlock_all_pins(&mut self) -> CliResult<u64> {
+        self.suppress_locked_restores = true;
+        self.surface.unlock_pins();
+        self.pipeline.unlock_pins()
     }
 
     fn note(&mut self, what: impl Into<String>) {
@@ -542,6 +672,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.drain_cards();
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
@@ -555,6 +686,41 @@ impl App {
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
+}
+
+fn established_lock_escapes(
+    ipc_bound: bool,
+    tray_created: bool,
+    unlock_hotkey_registered: bool,
+) -> Vec<LockEscape> {
+    let mut escapes = Vec::new();
+    if tray_created {
+        escapes.push(LockEscape::TrayMenu);
+    }
+    if ipc_bound {
+        escapes.push(LockEscape::CommandLine);
+    }
+    if unlock_hotkey_registered {
+        escapes.push(LockEscape::GlobalHotkey);
+    }
+    escapes
+}
+
+fn forwarded_unpin(command: &crate::cli::Command) -> Option<&str> {
+    let crate::cli::Command::History(history) = command else {
+        return None;
+    };
+    let crate::cli::HistoryCommand::Pin { id, unpin: true } = &history.command else {
+        return None;
+    };
+    Some(id)
+}
+
+fn forwarded_unlock_pins(command: &crate::cli::Command) -> bool {
+    let crate::cli::Command::History(history) = command else {
+        return false;
+    };
+    matches!(&history.command, crate::cli::HistoryCommand::UnlockPins)
 }
 
 impl Drop for App {
@@ -593,6 +759,7 @@ pub fn menu_actions() -> Vec<Action> {
 mod tests {
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
+    use clap::Parser as _;
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
@@ -607,6 +774,48 @@ mod tests {
         assert!(app.tray.is_none(), "no menu-bar item");
         assert!(app.server.is_none(), "no socket");
         assert_eq!(app.config.bindings.len(), 0, "no keyboard registration");
+        assert!(
+            app.pin_lock_escapes().is_empty(),
+            "configured resources are not lock escapes until they exist"
+        );
+    }
+
+    #[test]
+    fn only_a_forwarded_unpin_requests_live_viewport_removal() {
+        let unpin = Cli::try_parse_from(["scrozz", "history", "pin", "capture-1", "--unpin"])
+            .expect("valid unpin")
+            .command
+            .expect("command");
+        assert_eq!(forwarded_unpin(&unpin), Some("capture-1"));
+
+        let pin = Cli::try_parse_from(["scrozz", "history", "pin", "capture-1"])
+            .expect("valid pin")
+            .command
+            .expect("command");
+        assert_eq!(forwarded_unpin(&pin), None);
+    }
+
+    #[test]
+    fn id_free_unlock_command_is_a_live_lock_escape() {
+        let unlock = Cli::try_parse_from(["scrozz", "history", "unlock-pins"])
+            .expect("valid unlock")
+            .command
+            .expect("command");
+        assert!(forwarded_unlock_pins(&unlock));
+        assert_eq!(forwarded_unpin(&unlock), None);
+    }
+
+    #[test]
+    fn only_established_external_routes_are_lock_escapes() {
+        assert!(established_lock_escapes(false, false, false).is_empty());
+        assert_eq!(
+            established_lock_escapes(true, true, true),
+            vec![
+                LockEscape::TrayMenu,
+                LockEscape::CommandLine,
+                LockEscape::GlobalHotkey
+            ]
+        );
     }
 
     #[test]

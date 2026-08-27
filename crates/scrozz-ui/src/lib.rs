@@ -86,6 +86,7 @@ pub mod icons;
 pub mod motion;
 pub mod overlay_app;
 pub mod paint;
+pub mod pinned;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;

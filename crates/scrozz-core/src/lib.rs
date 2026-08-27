@@ -29,6 +29,7 @@ pub mod capture;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod pin;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
@@ -37,5 +38,10 @@ pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
     PhysicalSize, Point, Rect, ScaleFactor, Size,
+};
+pub use pin::{
+    Direction as PinDirection, DisplaySet, LockEscape, LockEscapeRequired, MAX_OPACITY,
+    MIN_OPACITY, NudgeStep, Opacity, PinBorder, PinChrome, PinChromePolicy, PinId, PinScale,
+    PinState, PinnedSurface,
 };
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};
