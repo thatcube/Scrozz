@@ -970,6 +970,70 @@ launch while the index rebuilds*.
 - **Pinned captures survive even when that makes the size cap unreachable**, and
   the store reports that state rather than silently violating either promise.
 
+## D31 — GNOME/Wayland cannot host our overlays, and we adapt rather than pretend
+
+**The finding.** **Mutter does not implement `wlr-layer-shell`, and this is a
+deliberate, stated refusal — not a gap awaiting implementation.** Verified against
+mutter `main` at `82ad6279`: there is no layer-shell protocol XML in
+`src/wayland/protocol/`, and `src/meson.build` does not generate it. Issue
+mutter!973 was closed as a duplicate of gnome-shell!1141, where a GNOME maintainer
+states plainly: *"we don't intend to support third party panels, lock screens,
+notification UI's etc."* `gtk-layer-shell`'s own README independently lists
+GNOME-on-Wayland as unsupported.
+
+**There is no replacement to wait for.** `ext-layer-shell-v1` (MR !28), `xdg-pip`
+(!132) and `ext-toplevel-placement-v1` (!389) are all unmerged drafts.
+
+| Compositor | layer-shell | Consequence for Scrozz |
+|---|---|---|
+| **KWin** (Plasma ≥ 5.20) | ✓ | Overlays work fully |
+| **wlroots** (sway, Hyprland) | ✓ | Overlays work fully |
+| **Mutter** (GNOME) | **✗ deliberate** | **Overlays cannot be positioned at all** |
+
+**Why this is serious.** Wayland clients cannot set absolute window position —
+`xdg_shell` omits it on purpose — so layer-shell is the *only* way to place a
+floating surface. Without it, on GNOME/Wayland:
+
+- the **capture stack** (D28) cannot be anchored to the bottom-left;
+- the **capture dock** (D20) cannot be anchored anywhere;
+- the **selection overlay** cannot cover the screen as a client-drawn surface;
+- **pinned captures** cannot be placed.
+
+That is most of the product's surface, on the most common Linux desktop. D8
+promises full GNOME support, and taken naively that promise is now unkeepable.
+
+**Decision.** Scrozz does not pretend, and does not degrade silently. Three
+responses, in order of preference per surface:
+
+1. **Region selection goes through the portal on GNOME.** The `Screenshot`
+   portal's interactive mode hands selection to GNOME Shell's own selector. It is
+   not our UI and we cannot theme it, but it is the *correct* mechanism there, and
+   it works. GNOME Shell's internal screenshot UI is compositor-owned and its
+   D-Bus API is allowlisted to the portal backend, so replicating it from an
+   external app is not merely hard — it is closed off.
+
+2. **The capture stack falls back to an ordinary window on GNOME/Wayland.** A
+   normal `xdg_toplevel`, placed by the compositor rather than by us. This
+   contradicts D27's "fixed position" property, but the alternative is no capture
+   stack at all. It must be visibly a deliberate adaptation, not a broken version
+   of the macOS behaviour.
+
+3. **XWayland is documented, not defaulted.** Running under XWayland restores
+   absolute positioning and makes every overlay work as designed. It costs correct
+   fractional scaling and crisp HiDPI. Offer it as a setting for users who want the
+   full experience and accept the trade; never force it.
+
+**What we do not do.** We do not ship a GNOME Shell extension as a requirement —
+an app that only works after the user installs a separate extension is not an app
+that works. And we do not silently misplace overlays and let users conclude Scrozz
+is buggy; per D8 the limitation is stated, in the UI, with the reason.
+
+**Honest restatement of D8.** "Full GNOME and KDE support" now means: **KDE gets
+the complete Scrozz experience. GNOME gets full capture, recording, annotation,
+OCR and history, with compositor-owned region selection and a
+compositor-positioned capture stack.** That is a real difference and it belongs in
+the comparison table, not buried in a footnote.
+
 ---
 
 # Open questions

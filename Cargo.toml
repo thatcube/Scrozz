@@ -89,8 +89,17 @@ windows = "0.62"
 windows-core = "0.62"
 
 # --- Linux ---
-x11rb = "0.14"
-ashpd = "0.13"
+x11rb = { version = "0.14", features = [
+    "randr",          # monitor geometry; without it the wire protocol is hand-rolled
+    "shm",            # MIT-SHM protocol
+    "libc",           # the syscalls MIT-SHM actually needs; "shm" alone is not enough
+    "xfixes",         # cursor capture
+    "allow-unsafe-code",
+] }
+ashpd = { version = "0.13", features = [
+    "screencast",     # without these the portal cannot be called at all
+    "screenshot",
+] }
 
 [workspace.lints.rust]
 # An unimplemented contract must still compile. Phase 0 is deliberately a tree
