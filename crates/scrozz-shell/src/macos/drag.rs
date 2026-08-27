@@ -77,6 +77,23 @@ use crate::drag::{
 };
 use crate::overlay::AppKitRect;
 
+/// Resolves the content view for an ordinary application window.
+pub(crate) fn surface_for_window_title(title: &str) -> Result<crate::drag::NativeSurface> {
+    let mtm = crate::macos::main_thread("locating a drag source window")?;
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app
+        .windows()
+        .iter()
+        .find(|window| window.title().to_string() == title)
+        .ok_or_else(|| Error::TargetGone(format!("window {title:?} is no longer open")))?;
+    let view = window.contentView().ok_or_else(|| {
+        Error::TargetGone(format!("window {title:?} has no content view for dragging"))
+    })?;
+    // SAFETY: the application window retains its content view for as long as it
+    // remains open. The drag backend immediately takes its own strong reference.
+    Ok(unsafe { crate::drag::NativeSurface::from_raw(Retained::as_ptr(&view).cast_mut().cast()) })
+}
+
 // ---------------------------------------------------------------------------
 // Blocks ABI
 // ---------------------------------------------------------------------------
@@ -143,6 +160,8 @@ struct PromiseState {
     /// Background queue AppKit writes on, so a large encode does not stall the
     /// main thread at the moment of the drop.
     queue: Retained<NSOperationQueue>,
+    /// Keeps an accepted drag pending until lazy bytes actually reach its target.
+    session: DragSession,
 }
 
 define_class!(
@@ -187,12 +206,16 @@ define_class!(
         ) {
             match self.write_to(url) {
                 Ok(()) => {
+                    self.ivars().session.delivery_succeeded();
                     // SAFETY: `completion` is AppKit's block (or null); a nil
                     // NSError is the documented success signal.
                     unsafe { invoke_completion(completion, core::ptr::null_mut()) };
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "drag: promised file could not be written");
+                    self.ivars()
+                        .session
+                        .delivery_failed(format!("promised file could not be written: {err}"));
                     let ns_error = promise_error();
                     // SAFETY: as above; `ns_error` is alive for the call.
                     unsafe {
@@ -226,6 +249,7 @@ impl ScrozzDragPromise {
         file_name: String,
         file_bytes: ByteSource,
         image_bytes: Option<ByteSource>,
+        session: DragSession,
     ) -> Retained<Self> {
         let queue = NSOperationQueue::new();
         queue.setName(Some(&NSString::from_str(
@@ -238,6 +262,7 @@ impl ScrozzDragPromise {
             file_bytes,
             image_bytes,
             queue,
+            session,
         });
         // SAFETY: standard two-phase init of a class whose superclass is
         // NSObject; `set_ivars` has already populated our own storage.
@@ -272,11 +297,17 @@ impl ScrozzDragPromise {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::error!(error = %err, "drag: image flavour unavailable");
+                self.ivars()
+                    .session
+                    .delivery_failed(format!("drag image could not be produced: {err}"));
                 return;
             }
         };
         if png.is_empty() {
             tracing::error!("drag: image producer returned no bytes");
+            self.ivars()
+                .session
+                .delivery_failed("drag image producer returned no bytes");
             return;
         }
 
@@ -288,6 +319,7 @@ impl ScrozzDragPromise {
 
         if requested == png_type {
             item.setData_forType(&data, requested);
+            self.ivars().session.delivery_succeeded();
             return;
         }
 
@@ -301,9 +333,19 @@ impl ScrozzDragPromise {
             match image.TIFFRepresentation() {
                 Some(tiff) => {
                     item.setData_forType(&tiff, requested);
+                    self.ivars().session.delivery_succeeded();
                 }
-                None => tracing::error!("drag: NSImage produced no TIFF representation"),
+                None => {
+                    tracing::error!("drag: NSImage produced no TIFF representation");
+                    self.ivars()
+                        .session
+                        .delivery_failed("drag image could not be converted to TIFF");
+                }
             }
+        } else {
+            self.ivars()
+                .session
+                .delivery_failed("the destination requested an unsupported image flavor");
         }
     }
 }
@@ -463,25 +505,11 @@ impl MacDragSource {
 
     /// The event a drag must be attached to.
     ///
-    /// AppKit wants the mouse event that initiated the gesture. `scrozz-ui`
-    /// classifies gestures itself, so the current event is used when it is a
-    /// mouse event, and one is synthesised at the pointer otherwise.
+    /// AppKit wants the mouse event that initiated the gesture. Payload
+    /// preparation can outlive that gesture, so use the pointer and source
+    /// window captured for this request rather than AppKit's unrelated current
+    /// event.
     fn drag_event(&self, view: &NSView, pointer_in_view: NSPoint) -> Result<Retained<NSEvent>> {
-        let app = NSApplication::sharedApplication(self.mtm);
-        if let Some(current) = app.currentEvent()
-            && matches!(
-                current.r#type(),
-                NSEventType::LeftMouseDown
-                    | NSEventType::LeftMouseDragged
-                    | NSEventType::RightMouseDown
-                    | NSEventType::RightMouseDragged
-                    | NSEventType::OtherMouseDown
-                    | NSEventType::OtherMouseDragged
-            )
-        {
-            return Ok(current);
-        }
-
         let window = view
             .window()
             .ok_or_else(|| Error::TargetGone("drag origin view is not in a window".into()))?;
@@ -604,10 +632,12 @@ impl DragSource for MacDragSource {
         let bounds = view.bounds();
         let card = card_rect_in_view(origin.card(), bounds.size.height, view.isFlipped());
 
+        let session = DragSession::awaiting_delivery();
         let host = ScrozzDragPromise::new(
             payload.file().file_name(),
             payload.file().byte_source(),
             payload.image().cloned(),
+            session.clone(),
         );
 
         let mut items = Vec::with_capacity(2);
@@ -617,7 +647,6 @@ impl DragSource for MacDragSource {
         }
         let item_count = items.len();
 
-        let session = DragSession::new();
         let source = ScrozzDragSourceObject::new(self.mtm, session.clone());
         LIVE.with(|live| live.borrow_mut().push(source.clone()));
 
@@ -657,8 +686,8 @@ impl DragSource for MacDragSource {
 #[doc(hidden)]
 pub mod test_support {
     use super::{
-        ClassType, DragPayload, NSFilePromiseProvider, NSPasteboardItem, NSString, NSURL, NSView,
-        Result, Retained, ScrozzDragPromise, msg_send, sel,
+        ClassType, DragPayload, DragSession, NSFilePromiseProvider, NSPasteboardItem, NSString,
+        NSURL, NSView, Result, Retained, ScrozzDragPromise, msg_send, sel,
     };
 
     /// A standalone promise host, exactly as [`super::MacDragSource::begin`]
@@ -676,6 +705,7 @@ pub mod test_support {
                     payload.file().file_name(),
                     payload.file().byte_source(),
                     payload.image().cloned(),
+                    DragSession::awaiting_delivery(),
                 ),
             }
         }

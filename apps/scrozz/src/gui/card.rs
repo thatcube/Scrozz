@@ -28,7 +28,7 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_core::Frame;
+use scrozz_core::{Frame, LogicalPoint, LogicalRect};
 use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
@@ -288,7 +288,7 @@ impl Card {
 /// to `scrozz-ui`, which knows the thresholds and the velocities. What crosses
 /// this seam is the *decision* — never a raw drag delta, because then two
 /// crates would be deciding what a swipe means.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CardEvent {
     /// Put this capture on the clipboard.
     Copy(CardId),
@@ -296,14 +296,19 @@ pub enum CardEvent {
     Save(CardId),
     /// Swiped left: throw it away.
     Dismiss(CardId),
-    /// Dragged right or up: a drag onto another application has begun.
-    Drag(CardId),
+    /// Dragged right or up: prepare a drag onto another application.
+    Drag {
+        /// Card being dragged.
+        id: CardId,
+        /// Card geometry in the source window.
+        rect: LogicalRect,
+        /// Pointer at release in the source window.
+        pointer: LogicalPoint,
+    },
     /// Swiped down: collapse into the capture dock (D20).
     Collapse(CardId),
     /// Clicked: open it for editing.
     Open(CardId),
-    /// The annotate button was pressed: open the editable annotation document.
-    Annotate(CardId),
 }
 
 impl CardEvent {
@@ -314,10 +319,9 @@ impl CardEvent {
             Self::Copy(id)
             | Self::Save(id)
             | Self::Dismiss(id)
-            | Self::Drag(id)
             | Self::Collapse(id)
-            | Self::Open(id)
-            | Self::Annotate(id) => *id,
+            | Self::Open(id) => *id,
+            Self::Drag { id, .. } => *id,
         }
     }
 }
@@ -341,6 +345,17 @@ pub trait CardSurface {
 
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
+
+    /// Completes a native drag without losing the source card on cancellation.
+    ///
+    /// A drag source remains resident in its original slot until the operating
+    /// system confirms that another application accepted it. Rejected, cancelled,
+    /// and failed drags therefore need no reconstruction.
+    fn finish_drag(&mut self, id: CardId, accepted: bool) {
+        if accepted {
+            self.dismiss(id);
+        }
+    }
 
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
@@ -558,10 +573,16 @@ mod tests {
             CardEvent::Copy(id),
             CardEvent::Save(id),
             CardEvent::Dismiss(id),
-            CardEvent::Drag(id),
+            CardEvent::Drag {
+                id,
+                rect: LogicalRect::new(
+                    LogicalPoint::new(10.0, 20.0),
+                    scrozz_core::LogicalSize::new(240.0, 160.0),
+                ),
+                pointer: LogicalPoint::new(100.0, 80.0),
+            },
             CardEvent::Collapse(id),
             CardEvent::Open(id),
-            CardEvent::Annotate(id),
         ] {
             assert_eq!(event.card(), id);
         }

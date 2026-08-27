@@ -83,6 +83,7 @@
 pub mod card;
 pub mod editor;
 pub mod harness;
+pub mod history;
 pub mod icons;
 pub mod motion;
 pub mod overlay_app;
@@ -94,6 +95,10 @@ pub mod vibrancy;
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use editor::{
     AnnotationEditor, EditorDestination, EditorDragRequest, EditorEvent, EditorMode, EditorTool,
+};
+pub use history::{
+    DateFilter, HistoryAction, HistoryEntry, HistoryFilters, HistoryPage, HistoryThumbnail,
+    HistoryViewModel,
 };
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{

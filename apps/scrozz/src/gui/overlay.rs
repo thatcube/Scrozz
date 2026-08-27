@@ -22,10 +22,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
-use scrozz_ui::{
-    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
+use scrozz_core::{
+    ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, PixelFormat,
+    Provenance, ScaleFactor,
 };
+use scrozz_ui::{CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX};
 
 use crate::gui::{
     action::CaptureKind,
@@ -116,6 +117,16 @@ impl CardSurface for OverlayCards {
         self.forget(id);
     }
 
+    fn finish_drag(&mut self, id: CardId, accepted: bool) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .finish_drag(scrozz_ui::stack::CardId(theirs), accepted);
+        }
+        if accepted {
+            self.forget(id);
+        }
+    }
+
     fn poll(&mut self) -> Option<CardEvent> {
         // Anything left from the last batch first: the overlay's ordering is
         // the user's gesture order, and reordering it would let a dismiss
@@ -145,16 +156,9 @@ impl CardSurface for OverlayCards {
                         );
                     }
                 }
-                OverlayEvent::Dismissed { id, reason } => {
+                OverlayEvent::Dismissed { id, .. } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        // A drag that left the pile has already delivered the
-                        // file to wherever it was dropped. Treating it as a
-                        // plain dismissal would be right, but saying which it
-                        // was lets the pipeline release the bytes either way.
-                        out.push(match reason {
-                            DismissReason::DragOut => CardEvent::Drag(ours),
-                            _ => CardEvent::Dismiss(ours),
-                        });
+                        out.push(CardEvent::Dismiss(ours));
                         self.forget(ours);
                     }
                 }
@@ -170,14 +174,22 @@ impl CardSurface for OverlayCards {
                 }
                 OverlayEvent::AnnotateRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Annotate(ours));
+                        out.push(CardEvent::Open(ours));
                     }
                 }
-                OverlayEvent::DragStarted { id, .. } | OverlayEvent::DragOut { id, .. } => {
+                OverlayEvent::DragOut { id, at, rect } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Drag(ours));
+                        out.push(CardEvent::Drag {
+                            id: ours,
+                            rect: LogicalRect::new(
+                                LogicalPoint::new(f64::from(rect.left()), f64::from(rect.top())),
+                                LogicalSize::new(f64::from(rect.width()), f64::from(rect.height())),
+                            ),
+                            pointer: LogicalPoint::new(f64::from(at.x), f64::from(at.y)),
+                        });
                     }
                 }
+                OverlayEvent::DragStarted { .. } => {}
                 OverlayEvent::DockCollapsed => {
                     // Collapsing is about the pile, not a card. The oldest one
                     // stands in for it so the event is not lost entirely.

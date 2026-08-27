@@ -708,6 +708,8 @@ pub struct DragRelease {
     pub direction: Option<Dir>,
     /// Where the card was when it was let go.
     pub rect: Rect,
+    /// Where the pointer was when the card was let go.
+    pub pointer: Pos2,
     /// Release speed, in points per second.
     pub velocity: Vec2,
 }
@@ -1084,14 +1086,14 @@ impl CaptureStack {
         let rect = self.rect_of_resident(slot, m);
 
         match intent {
-            // Both remove the card from the pile, with the one shared exit
-            // animation (D21). What differs is what the shell does next: a
-            // dismiss is the end of the story, a drag-out hands the capture to
-            // the OS.
-            Intent::Dismiss | Intent::DragOut => {
+            Intent::Dismiss => {
                 let dir = direction.unwrap_or(Dir::Left);
                 self.retire_slot(slot, intent, dir, velocity, m);
             }
+            // Keep the original resident until the native drag reports an
+            // accepted drop. A cancellation can then return to this exact slot
+            // instead of reconstructing the card at the top of the pile.
+            Intent::DragOut => self.spring_back(slot, m),
             Intent::Collapse => {
                 self.spring_back(slot, m);
                 self.dock.collapse(m);
@@ -1104,6 +1106,7 @@ impl CaptureStack {
             intent,
             direction,
             rect,
+            pointer: drag.latest,
             velocity,
         })
     }
