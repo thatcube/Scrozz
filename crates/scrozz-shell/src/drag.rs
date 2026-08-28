@@ -73,6 +73,7 @@ use crate::overlay::{AppKitRect, logical_to_appkit};
 
 pub mod alpha;
 pub mod artifact;
+pub mod formats;
 pub mod hdrop;
 
 pub use artifact::{ArtifactState, DragArtifact};

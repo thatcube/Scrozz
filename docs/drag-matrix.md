@@ -33,6 +33,7 @@ These run on every push and need no display server.
 | The advertised URL round-trips back to the file we wrote | same |
 | The Windows `CF_HDROP` payload has the right header offset, `fWide` flag and double NUL | `scrozz-shell` — `drag::hdrop` tests (run on **all** platforms) |
 | The Windows drag image is straight-alpha, not premultiplied | `scrozz-shell` — `drag::alpha` tests (run on **all** platforms) |
+| The Windows data object stores and returns what the shell writes into it | `scrozz-shell` — `drag::formats` tests (run on **all** platforms) |
 
 The AppKit tests are `#[ignore]`d because they need a real `NSPasteboard`. Run
 them deliberately:
@@ -132,6 +133,41 @@ It offers three formats, in this preference order:
 | Registered `"PNG"` | What Chromium reads when it wants pixels rather than a path | Only when the payload has an image producer |
 | `CF_UNICODETEXT` | The path as text — the cheap last resort | Always |
 
+### The data object is a store, not a fixed list
+
+This is the one place where the obvious implementation is not merely worse but
+broken, so it is worth stating plainly.
+
+`IDragSourceHelper::InitializeFromBitmap` does not keep the thumbnail anywhere
+of its own. It **writes** it into the drag source's `IDataObject` — as
+`CFSTR_DRAGIMAGEBITS` and a handful of companion formats — and the shell reads
+them back out during the drag. Microsoft's *Shell Data Object* documentation
+says so directly:
+
+> To support the drag-and-drop helper object, the data object's `SetData` and
+> `GetData` implementations must be able to accept and return arbitrary private
+> formats.
+
+A drag source whose `SetData` returns `E_NOTIMPL` therefore does not get a
+slightly worse drag image. It gets **none, every time**, because the helper's
+first write fails and it abandons initialisation — and because `attach_image`
+is deliberately best-effort, nothing louder than a log line ever says so.
+
+So `CaptureData` has two halves: the flavours Scrozz offers, fixed for the life
+of the drag, and whatever the shell stored, owned as `STGMEDIUM`s and released
+with the object. Stored entries win a lookup, because that is what "set data"
+means; in practice they never collide, since the helper writes private
+registered formats and Scrozz offers `CF_HDROP`, `"PNG"` and `CF_UNICODETEXT`.
+
+The matching rules and the ownership bookkeeping live in
+`crates/scrozz-shell/src/drag/formats.rs`, with no `windows` types and no `cfg`,
+for the same reason `hdrop.rs` does: which entry answers which request, and who
+releases what when an entry is displaced, are decidable without an operating
+system, and their tests therefore run on every platform on every push. The COM
+edges that genuinely need Windows — `fRelease` ownership transfer, duplication
+per `tymed`, enumeration through `SHCreateStdEnumFmtEtc` — are covered by
+Windows-gated tests that a human on Windows still has to run.
+
 ### The drag image must be straight alpha
 
 `IDragSourceHelper::InitializeFromBitmap` premultiplies the bitmap itself.
@@ -153,8 +189,14 @@ understand `CF_HDROP`.
 What a human on Windows must check, beyond the macOS matrix translated to
 Explorer / Edge / Slack / Discord / Office:
 
-- The drag image appears at all — `IDragSourceHelper` is best-effort, and every
-  failure inside it is logged and swallowed rather than aborting the drag.
+- The drag image appears at all. Every failure inside `IDragSourceHelper` is
+  still logged and swallowed rather than aborting the drag, but the log line is
+  now a warning rather than a debug note: with the data object accepting private
+  formats, the remaining reasons to fail are environmental, and worth reading.
+- `cargo test -p scrozz-shell --lib windows::drag` on a real Windows machine.
+  Those tests allocate real global memory and exercise `SetData`/`GetData`
+  ownership, duplication and enumeration; they compile on every platform but
+  have only ever run on none.
 - The `DoDragDrop` modal loop does not visibly stall the overlay.
 - Right-click and Escape both cancel cleanly, leaving no temp file behind.
 
