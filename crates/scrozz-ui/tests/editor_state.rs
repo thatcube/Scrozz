@@ -2461,18 +2461,29 @@ fn cancelling_a_placement_from_the_undone_state_keeps_earlier_work() {
 }
 
 #[test]
-fn redoing_a_pre_existing_label_that_an_undo_removed_still_shows_it() {
+fn escaping_a_pre_existing_label_does_not_destroy_its_redo() {
     // The set-aside path must not be turned into a cancellation for a label the
-    // user did not place: undoing a deletion has to give the text back.
+    // user did not place. Escape leaves such a label alone, so the typing it
+    // still had on the redo stack has to come back afterwards — an escape that
+    // quietly committed, or that rolled the placement back, would eat it.
     let mut state = pre_existing_label();
     type_str(&mut state, "c");
+    assert_eq!(content(&state), "abc");
     state.command(Command::Undo).expect("undo the typing");
-    state.command(Command::Escape).expect("escape");
+    assert_eq!(content(&state), "ab");
 
+    state.command(Command::Escape).expect("escape");
     assert_eq!(
         content(&state),
         "ab",
         "a label that was there before this session is still there"
+    );
+
+    state.command(Command::Redo).expect("redo the typing");
+    assert_eq!(
+        content(&state),
+        "abc",
+        "and escaping never cost it the redo it was holding"
     );
 }
 
@@ -2653,5 +2664,201 @@ fn finishing_a_label_that_history_removed_does_not_un_create_it() {
         state.editing_text(),
         None,
         "and it came back finished, not reopened"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Settling an unfinished label before unrelated work
+// ---------------------------------------------------------------------------
+
+/// Draws a rectangle, places an empty label, then sets the label aside with an
+/// undo — leaving its placement holding an open rollback point.
+fn a_drawing_and_a_set_aside_label() -> EditorState {
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 90.0));
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.command(Command::Undo).expect("set the label aside");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the label is out of the document but not cancelled"
+    );
+    state
+}
+
+#[test]
+fn nudging_while_a_label_is_set_aside_does_not_lose_the_nudge() {
+    // The keyboard path had no gate at all. Selecting and nudging while a label
+    // sat set aside put the move *above* the rollback point the label was still
+    // holding, so the next Escape rolled the shape back to where it started —
+    // and truncated the redo stack on the way, so the move was gone for good.
+    let mut state = a_drawing_and_a_set_aside_label();
+    let before = rect_at(&state, 0);
+
+    state.command(Command::SelectAll).expect("select the shape");
+    state
+        .command(Command::Nudge { dx: 12.0, dy: 7.0 })
+        .expect("nudge it");
+    let moved = rect_at(&state, 0);
+    assert_ne!(moved, before, "the nudge moved the shape");
+
+    state.command(Command::Escape).expect("escape");
+    assert_eq!(
+        rect_at(&state, 0),
+        moved,
+        "escaping the label did not drag the shape back with it"
+    );
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "and the empty label is gone rather than left behind"
+    );
+
+    state.command(Command::Undo).expect("undo the nudge");
+    assert_eq!(rect_at(&state, 0), before, "the nudge is one undo deep");
+    state.command(Command::Redo).expect("redo the nudge");
+    assert_eq!(
+        rect_at(&state, 0),
+        moved,
+        "and it never stopped being redoable"
+    );
+}
+
+#[test]
+fn deleting_while_a_label_is_set_aside_settles_it_first() {
+    // Same gate, a different command: the deletion has to land above a closed
+    // rollback point, not an open one.
+    let mut state = a_drawing_and_a_set_aside_label();
+    state.command(Command::SelectAll).expect("select the shape");
+    state.command(Command::Delete).expect("delete it");
+    assert!(
+        state.document().annotations().is_empty(),
+        "the shape is gone and the label was never committed"
+    );
+
+    state.command(Command::Escape).expect("escape");
+    assert!(
+        state.document().annotations().is_empty(),
+        "escaping does not bring the deleted shape back"
+    );
+    state.command(Command::Undo).expect("undo the deletion");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the deletion is still undoable, and undoing it does not resurrect a label"
+    );
+}
+
+#[test]
+fn every_command_says_whether_it_settles_an_unfinished_label() {
+    // The classification is a compile-time exhaustive match, so this only has to
+    // pin the two commands the rule turns on: navigating the history is what a
+    // set-aside label exists to survive, and escaping settles it itself.
+    let mut state = a_drawing_and_a_set_aside_label();
+    state.command(Command::Redo).expect("redo the placement");
+    assert!(
+        state.editing_text().is_some(),
+        "redo picked the set-aside label back up rather than settling it away"
+    );
+}
+
+#[test]
+fn a_second_placement_is_refused_while_the_first_cannot_be_cancelled() {
+    // Draw something, place a label, undo the label, undo the drawing. The
+    // label's cancellation is now unreachable — the history is behind the point
+    // it would roll back to — so clicking to place a *second* label has to do
+    // nothing. Starting one closed the first label's edit and took the redo
+    // branch it was stranded in into its own safekeeping; escaping the second
+    // one handed that branch straight back, and two redos put an invisible,
+    // unselectable, uncancellable label into the document.
+    let mut state = a_drawing_and_a_set_aside_label();
+    state.command(Command::Undo).expect("undo the drawing");
+    assert!(state.document().annotations().is_empty());
+
+    state.pointer_pressed(at(300.0, 240.0));
+    state.pointer_released();
+    assert!(
+        state.document().annotations().is_empty(),
+        "no second label was started on top of the first"
+    );
+
+    state.command(Command::Escape).expect("escape");
+    state.command(Command::Redo).expect("redo the drawing");
+    state.command(Command::Redo).expect("redo the placement");
+
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "the drawing and exactly one label came back"
+    );
+    assert!(
+        state.editing_text().is_some(),
+        "and the label that came back is the one being edited, not an orphan"
+    );
+
+    type_str(&mut state, "hi");
+    match &state.document().annotations()[1].annotation {
+        Annotation::Text { content, .. } => {
+            assert_eq!(content, "hi", "the keystrokes reached it");
+        }
+        other => panic!("expected the label, found {other:?}"),
+    }
+
+    state.command(Command::Escape).expect("leave the label");
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "and escaping a label with text in it keeps it"
+    );
+}
+
+#[test]
+fn a_refused_placement_leaves_the_document_and_the_preview_alone() {
+    let mut state = a_drawing_and_a_set_aside_label();
+    state.command(Command::Undo).expect("undo the drawing");
+    let revision = state.revision();
+    let before = state.document().annotations().len();
+
+    state.pointer_pressed(at(300.0, 240.0));
+    assert_eq!(
+        state.document().annotations().len(),
+        before,
+        "the press placed nothing"
+    );
+    assert_eq!(
+        state.revision(),
+        revision,
+        "nothing changed, so nothing needs rerasterizing"
+    );
+    state.pointer_released();
+
+    assert_eq!(state.document().annotations().len(), before);
+}
+
+#[test]
+fn drawing_is_still_allowed_while_a_label_refuses_to_be_cancelled() {
+    // Only a *second* label is refused. Anything else the user draws lands above
+    // a rollback point the history has already ruled out, so it is safe — and
+    // refusing it as well would leave the editor feeling broken.
+    let mut state = a_drawing_and_a_set_aside_label();
+    state.command(Command::Undo).expect("undo the drawing");
+
+    state.set_tool(Tool::Ellipse);
+    drag(&mut state, at(150.0, 150.0), at(260.0, 240.0));
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the ellipse was drawn"
+    );
+
+    state.command(Command::Escape).expect("escape");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "and escaping the pending label did not take it back"
     );
 }

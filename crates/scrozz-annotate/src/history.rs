@@ -111,6 +111,11 @@ struct Open {
     /// anyway, so while the edit is open there is nothing to redo, and if the
     /// edit is abandoned it comes back untouched.
     future: Vec<Step>,
+    /// The coalescing group in force before the edit began.
+    ///
+    /// Moved here too, for the reason spelled out in [`begin`](History::begin):
+    /// a group left in force would let this edit's first commit fold into the
+    /// step the rollback point names instead of pushing it into the past.
     tag: Option<String>,
 }
 
@@ -164,9 +169,9 @@ impl History {
     /// stroke-width slider, nudging a selection with the arrow keys — where
     /// every intermediate value would otherwise become its own undo step.
     ///
-    /// Any [`Self::commit`], [`Self::undo`] or [`Self::redo`] closes the open
-    /// step, so a nudge, an unrelated edit, and another nudge are three steps
-    /// rather than a merged two.
+    /// Any [`Self::commit`], [`Self::begin`], [`Self::undo`] or [`Self::redo`]
+    /// closes the open step, so a nudge, an unrelated edit, and another nudge
+    /// are three steps rather than a merged two.
     pub fn commit_coalesced(&mut self, document: &Document, tag: &str) {
         let data = document.data();
         if data == self.present.data {
@@ -215,6 +220,22 @@ impl History {
     /// position in the stack, it *is* a snapshot plus an absolute depth, and
     /// [`abandon`](Self::abandon) already refuses when navigation has taken the
     /// document somewhere that depth no longer reaches.
+    ///
+    /// # Why it ends the coalescing group in force
+    ///
+    /// [`commit_coalesced`](Self::commit_coalesced) folds into the step already
+    /// in progress by *replacing* `present` rather than pushing it into the
+    /// past. If the group in force when this was called were left in force, the
+    /// edit's first commit under that same tag would replace the very state
+    /// this rollback point names — leaving nothing at `depth` for
+    /// [`abandon`](Self::abandon) to recognise, so a perfectly ordinary
+    /// cancellation would be refused and the caller left to clean up by hand.
+    ///
+    /// So the group is taken, not copied. Ending it costs at most one extra
+    /// undo step for a gesture the caller interrupted with a fresh edit, which
+    /// is what [`commit`](Self::commit) and the navigation methods already do
+    /// for interruptions of their own. Abandoning puts it back, so a gesture
+    /// interrupted by an edit that never happened carries on uninterrupted too.
     pub fn begin(&mut self) {
         self.finish();
         self.open = Some(Open {
@@ -225,7 +246,7 @@ impl History {
             // abandoned it goes back, and nothing the user could redo was lost
             // to a click they took back.
             future: std::mem::take(&mut self.future),
-            tag: self.tag.clone(),
+            tag: std::mem::take(&mut self.tag),
         });
     }
 

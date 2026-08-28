@@ -421,6 +421,48 @@ pub enum Command {
     BringToFront,
 }
 
+impl Command {
+    /// Whether this command has to settle an unfinished label before it runs.
+    ///
+    /// A label the user has not finished holds a rollback point: the click that
+    /// placed it, which Escape can still take back as though it never happened.
+    /// Anything committed while that point is open lands *above* it, so
+    /// cancelling the label afterwards rolls that work back as well — silently,
+    /// with nothing left to redo. Nudging a selection while a set-aside label
+    /// was pending used to lose the nudge outright that way.
+    ///
+    /// So every command that changes the document, the history, or which
+    /// annotation the next such command will act on settles the label first.
+    /// The match is exhaustive on purpose: a command added later cannot slip
+    /// through without someone deciding which side of this line it belongs on.
+    ///
+    /// [`Undo`](Self::Undo) and [`Redo`](Self::Redo) are deliberately outside
+    /// it. Navigating the history is *how* a label gets set aside and picked up
+    /// again; settling on the way past would make undo cancel the very label it
+    /// exists to be able to bring back. [`Escape`](Self::Escape) is outside it
+    /// too, because settling is the first thing it does itself and it has to be
+    /// able to carry on when that is refused.
+    const fn settles_unfinished_text(self) -> bool {
+        match self {
+            Self::Delete
+            | Self::SelectAll
+            | Self::Nudge { .. }
+            | Self::ApplyCrop
+            | Self::SendToBack
+            | Self::BringToFront => true,
+            Self::Escape
+            | Self::Undo
+            | Self::Redo
+            | Self::Copy
+            | Self::Save
+            | Self::Pick(_)
+            | Self::ZoomIn
+            | Self::ZoomOut
+            | Self::ZoomReset => false,
+        }
+    }
+}
+
 /// What the editor wants its host to do, after handling a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Intent {
@@ -561,7 +603,10 @@ impl EditorState {
             return;
         }
         self.cancel_drag();
-        self.finish_text();
+        // Best effort. Picking a tool commits nothing, so a label the history
+        // will not take back can stay pending without anything landing on top
+        // of it — and refusing the tool change would strand the user instead.
+        let _ = self.settle_text();
         self.tool = tool;
         // Select is the only tool where a selection is meaningful; keeping one
         // while a drawing tool is active would show handles the user cannot use.
@@ -924,6 +969,40 @@ impl EditorState {
         true
     }
 
+    /// Settles a label the user has not finished, before work that is not part
+    /// of it.
+    ///
+    /// This is the one gate for the rule that an unfinished label is dealt with
+    /// before anything else is committed — see
+    /// [`Command::settles_unfinished_text`] for why that rule exists.
+    ///
+    /// # What a refusal means
+    ///
+    /// `false` says the history has moved somewhere the label's placement can
+    /// no longer be lifted out of, so the label stays pending rather than being
+    /// faked away. Work committed after that is safe: it lands above a rollback
+    /// point that has already been ruled out, and the cancellation stays
+    /// refused, so nothing the user does next can be rolled back underneath
+    /// them.
+    ///
+    /// One thing is not safe, and only one: starting a *second* unfinished
+    /// label. Opening a rollback point closes the one already open and moves
+    /// the redo branch into its own safekeeping, so the pending label's
+    /// creation ends up stranded in a branch nothing is holding — and redoing
+    /// far enough put an invisible, unselectable, uncancellable label back in
+    /// the document. [`pointer_pressed`](Self::pointer_pressed) is where that
+    /// is refused.
+    ///
+    /// The state is rare and recoverable either way: one Redo returns to the
+    /// label and hands it back to the user, and Escape still unwinds normally
+    /// because it does not stop at this gate.
+    fn settle_text(&mut self) -> bool {
+        if self.editing_text.is_none() && self.suspended_text.is_none() {
+            return true;
+        }
+        self.finish_text()
+    }
+
     /// The current zoom factor.
     #[must_use]
     pub const fn zoom(&self) -> f32 {
@@ -1028,13 +1107,14 @@ impl EditorState {
     // -----------------------------------------------------------------------
 
     /// Handles a primary-button press at `point`, in document coordinates.
+    ///
+    /// Settles an unfinished label first, so that a drawing never lands on top
+    /// of one still waiting to be dealt with. A press that would start a
+    /// *second* unfinished label when the first one will not settle does
+    /// nothing at all: see [`settle_text`](Self::settle_text).
     pub fn pointer_pressed(&mut self, point: LogicalPoint) {
-        // The set-aside case counts too. Starting a drawing is walking away from
-        // an unfinished label just as surely as clicking elsewhere is, and
-        // leaving its rollback point open means the next thing committed sits
-        // above a group the editor still believes it may cancel.
-        if self.editing_text.is_some() || self.suspended_text.is_some() {
-            self.finish_text();
+        if !self.settle_text() && self.tool == Tool::Text {
+            return;
         }
         match self.tool {
             Tool::Select => self.press_select(point),
@@ -1279,11 +1359,21 @@ impl EditorState {
     /// revision: those two only ask the host for something and change nothing,
     /// so bumping would throw away a preview texture that is still correct.
     ///
+    /// Commands that touch the document settle an unfinished label first — see
+    /// [`Command::settles_unfinished_text`].
+    ///
     /// # Errors
     ///
     /// Returns an error if an undo or redo could not be applied. The state is
     /// left usable either way.
     pub fn command(&mut self, command: Command) -> Result<Intent> {
+        if command.settles_unfinished_text() {
+            // A refusal is safe to carry on from: whatever this command commits
+            // lands above a rollback point the history has already ruled out,
+            // so the cancellation stays refused rather than reaching back
+            // underneath it.
+            let _ = self.settle_text();
+        }
         let intent = match command {
             Command::Escape => self.escape(),
             Command::Delete => {
@@ -1382,7 +1472,7 @@ impl EditorState {
         // The set-aside case counts as editing: the label is unfinished even
         // though an undo has taken it out of the document, and Escape is how the
         // user says they are done with it.
-        if (self.editing_text.is_some() || self.suspended_text.is_some()) && self.finish_text() {
+        if (self.editing_text.is_some() || self.suspended_text.is_some()) && self.settle_text() {
             return Intent::None;
         }
         if self.is_dragging() {

@@ -500,3 +500,106 @@ fn an_abandon_refuses_after_its_rollback_point_was_undone_past_and_rebuilt() {
     assert_eq!(doc.data(), b, "B is still redoable");
     assert!(!history.can_redo(), "and nothing else is hiding above it");
 }
+
+#[test]
+fn an_edit_begun_inside_a_coalescing_group_can_still_be_cancelled() {
+    // `begin` marks the state an edit can be taken back to, and `abandon` checks
+    // that state is still standing before rolling back to it. A coalescing group
+    // still in force broke that check: the edit's first commit carried the same
+    // tag, so it *replaced* the marked state instead of pushing it into the past,
+    // and the rollback point vanished from under the open edit.
+    let (mut doc, mut history) = started();
+    doc.add(
+        Annotation::Ellipse(rect(60.0, 60.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+    let depth = history.undo_depth();
+
+    history.begin();
+    doc.add(
+        Annotation::Ellipse(rect(90.0, 90.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+    assert_eq!(doc.len(), 3);
+
+    assert!(
+        history.abandon(&mut doc).unwrap(),
+        "the edit is still cancellable"
+    );
+    assert_eq!(
+        doc.len(),
+        2,
+        "and cancelling it went back to where it began"
+    );
+    assert_eq!(
+        history.undo_depth(),
+        depth,
+        "leaving nothing of the edit behind in the past"
+    );
+}
+
+#[test]
+fn cancelling_an_edit_hands_the_coalescing_group_back() {
+    // Ending the group for the duration of the edit must not end it for good: a
+    // gesture interrupted by an edit that came to nothing should carry on
+    // folding into the same step.
+    let (mut doc, mut history) = started();
+    doc.add(
+        Annotation::Ellipse(rect(60.0, 60.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+    let depth = history.undo_depth();
+
+    history.begin();
+    doc.add(
+        Annotation::Ellipse(rect(90.0, 90.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+    history.abandon(&mut doc).unwrap();
+
+    // The gesture continues.
+    doc.add(
+        Annotation::Ellipse(rect(120.0, 120.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+    assert_eq!(
+        history.undo_depth(),
+        depth,
+        "the continuation folded into the step the gesture was already building"
+    );
+
+    assert!(history.undo(&mut doc).unwrap());
+    assert_eq!(doc.len(), 1, "and that step is the whole gesture");
+}
+
+#[test]
+fn an_edit_kept_inside_a_coalescing_group_becomes_its_own_step() {
+    // The other side of the same coin. Once an edit is accepted rather than
+    // cancelled, the group it interrupted has genuinely ended, so the edit is
+    // undoable on its own instead of being folded into the gesture before it.
+    let (mut doc, mut history) = started();
+    doc.add(
+        Annotation::Ellipse(rect(60.0, 60.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+
+    history.begin();
+    doc.add(
+        Annotation::Ellipse(rect(90.0, 90.0, 20.0, 20.0)),
+        Style::stroked(),
+    );
+    history.commit_coalesced(&doc, "drag");
+    history.finish();
+    history.seal();
+
+    assert!(history.undo(&mut doc).unwrap());
+    assert_eq!(doc.len(), 2, "the edit came back on its own");
+    assert!(history.undo(&mut doc).unwrap());
+    assert_eq!(doc.len(), 1, "and the gesture before it is still one step");
+}
