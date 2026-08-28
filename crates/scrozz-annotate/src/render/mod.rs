@@ -5,7 +5,7 @@ pub mod raster;
 pub mod redact;
 pub mod shapes;
 
-use scrozz_core::{Error, Frame, Result, ScaleFactor};
+use scrozz_core::{Error, Frame, LogicalRect, Result, ScaleFactor};
 use tiny_skia::{BlendMode, Pixmap, Transform};
 
 use crate::{
@@ -62,16 +62,16 @@ impl SkiaRenderer {
         }
 
         let source = raster::to_pixmap(&document.source.frame)?;
-        let logical = document.logical_size();
-        let width = (logical.width * scale.get()).round().max(1.0) as u32;
-        let height = (logical.height * scale.get()).round().max(1.0) as u32;
+        let content = document.content_bounds();
+        let width = (content.size.width * scale.get()).round().max(1.0) as u32;
+        let height = (content.size.height * scale.get()).round().max(1.0) as u32;
 
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
         })?;
-        draw_source(&mut canvas, &source);
+        let xf = Scaled::with_origin(scale.get(), content.origin);
+        draw_source(&mut canvas, &source, document.logical_bounds(), xf);
 
-        let xf = Scaled::new(scale.get());
         for object in document.annotations() {
             draw_object(&mut canvas, object, xf);
         }
@@ -100,7 +100,7 @@ impl SkiaRenderer {
                 "export width must be greater than zero".to_owned(),
             ));
         }
-        let logical = document.logical_size();
+        let logical = document.content_size();
         if logical.width <= 0.0 {
             return Err(Error::InvalidRequest(
                 "cannot scale a source with no width".to_owned(),
@@ -117,10 +117,16 @@ impl Renderer for SkiaRenderer {
     }
 }
 
-/// Draws the source image scaled to fill the canvas.
-fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
-    let sx = f64::from(canvas.width()) / f64::from(source.width());
-    let sy = f64::from(canvas.height()) / f64::from(source.height());
+/// Draws the source image into the canvas, positioned and scaled by `xf`.
+///
+/// `bounds` is the source's own logical rectangle; mapping it through the same
+/// transform the annotations use is what makes a crop line up exactly with the
+/// marks that were drawn over it.
+fn draw_source(canvas: &mut Pixmap, source: &Pixmap, bounds: LogicalRect, xf: Scaled) {
+    let target_w = f64::from(xf.length(bounds.size.width));
+    let target_h = f64::from(xf.length(bounds.size.height));
+    let sx = target_w / f64::from(source.width());
+    let sy = target_h / f64::from(source.height());
     let quality = if (sx - 1.0).abs() < 1e-9 && (sy - 1.0).abs() < 1e-9 {
         // Exact 1:1 must be a byte-for-byte copy. Any filter here would soften
         // a native-resolution export, which is the common case.
@@ -128,6 +134,7 @@ fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
     } else {
         tiny_skia::FilterQuality::Bilinear
     };
+    let (dx, dy) = xf.point(bounds.origin);
     canvas.draw_pixmap(
         0,
         0,
@@ -136,7 +143,7 @@ fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
             quality,
             ..tiny_skia::PixmapPaint::default()
         },
-        Transform::from_scale(sx as f32, sy as f32),
+        Transform::from_scale(sx as f32, sy as f32).post_translate(dx, dy),
         None,
     );
 }
@@ -161,6 +168,13 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
             shapes::stroke_path(canvas, &shaft, &paint, width);
             shapes::fill_path(canvas, &head, &paint);
+        }
+        Annotation::Line { from, to } => {
+            let Some(path) = shapes::line(*from, *to, xf) else {
+                return;
+            };
+            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            shapes::stroke_path(canvas, &path, &paint, width);
         }
         Annotation::Rectangle(rect) => {
             let Some(path) = shapes::rectangle(rect, xf) else {
@@ -222,10 +236,10 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
         Annotation::Redact { area, style } => {
             let Some(region) = redact::clip(
                 canvas,
-                xf.length(area.origin.x),
-                xf.length(area.origin.y),
-                xf.length(crate::geom::max_x(area)),
-                xf.length(crate::geom::max_y(area)),
+                xf.x(area.origin.x),
+                xf.y(area.origin.y),
+                xf.x(crate::geom::max_x(area)),
+                xf.y(crate::geom::max_y(area)),
             ) else {
                 return;
             };

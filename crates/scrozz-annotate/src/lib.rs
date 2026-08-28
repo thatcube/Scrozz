@@ -67,10 +67,12 @@ pub mod annotation;
 pub mod document;
 pub mod font;
 pub mod geom;
+pub mod history;
 pub mod render;
 pub mod style;
 
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
 pub use document::{AnnotationMut, Background, Beautification, Document, DocumentData};
+pub use history::History;
 pub use render::{Renderer, SkiaRenderer};
 pub use style::{Color, Style};

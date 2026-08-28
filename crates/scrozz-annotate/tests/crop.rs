@@ -1,0 +1,296 @@
+//! Non-destructive crop: what it changes, and what it must not.
+
+mod common;
+
+use common::{document, frame_with, near, pixel, rect};
+use scrozz_annotate::{
+    Annotation, Document, DocumentData, Renderer, SkiaRenderer, Style, document::Background,
+};
+use scrozz_core::{Capture, CaptureTarget, LogicalPoint, Provenance, ScaleFactor, WindowId};
+
+/// A 100×100 document whose pixels encode their own coordinates, so a crop that
+/// lands one pixel off is detectable rather than merely plausible.
+fn coded() -> Document {
+    let frame = frame_with(100, 100, 1.0, |x, y| [x as u8, y as u8, 128, 255]);
+    Document::new(Capture {
+        frame,
+        provenance: Provenance::Region,
+        target: CaptureTarget::Region(rect(0.0, 0.0, 100.0, 100.0)),
+    })
+}
+
+#[test]
+fn a_new_document_is_uncropped() {
+    let doc = document(200, 120);
+    assert_eq!(doc.crop(), None);
+    assert_eq!(doc.content_bounds(), doc.logical_bounds());
+}
+
+#[test]
+fn crop_changes_the_rendered_size() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(10.0, 20.0, 40.0, 30.0))).unwrap();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((frame.width(), frame.height()), (40, 30));
+}
+
+#[test]
+fn crop_selects_the_right_pixels() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(10.0, 20.0, 40.0, 30.0))).unwrap();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+
+    // The crop's top-left must be the source pixel at (10, 20), which encodes
+    // its own coordinates in red and green.
+    assert!(near(pixel(&frame, 0, 0), [10, 20, 128, 255], 1));
+    assert!(near(pixel(&frame, 39, 29), [49, 49, 128, 255], 1));
+}
+
+#[test]
+fn crop_moves_annotations_with_the_image() {
+    let mut doc = coded();
+    doc.add(
+        Annotation::Rectangle(rect(30.0, 30.0, 20.0, 20.0)),
+        Style::stroked()
+            .with_fill(Some(scrozz_annotate::Color::rgb(255, 0, 0)))
+            .with_stroke_width(1.0),
+    );
+    doc.set_crop(Some(rect(20.0, 20.0, 50.0, 50.0))).unwrap();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+
+    // The rectangle's interior sat at source (40, 40); after cropping to an
+    // origin of (20, 20) it must sit at (20, 20) in the output.
+    let inside = pixel(&frame, 20, 20);
+    assert!(
+        near(inside, [255, 0, 0, 255], 4),
+        "annotation did not track the crop: {inside:?}"
+    );
+}
+
+#[test]
+fn crop_is_non_destructive() {
+    let mut doc = coded();
+    let original = doc.source.frame.data.clone();
+    doc.set_crop(Some(rect(10.0, 10.0, 20.0, 20.0))).unwrap();
+    assert_eq!(
+        doc.source.frame.data, original,
+        "the source keeps every pixel: a crop is a view, not an edit"
+    );
+
+    doc.set_crop(None).unwrap();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(
+        (frame.width(), frame.height()),
+        (100, 100),
+        "clearing the crop must restore the whole capture"
+    );
+    assert!(near(pixel(&frame, 99, 99), [99, 99, 128, 255], 1));
+}
+
+#[test]
+fn crop_keeps_annotations_that_fall_outside_it() {
+    let mut doc = coded();
+    doc.add_default(Annotation::Rectangle(rect(80.0, 80.0, 10.0, 10.0)));
+    doc.set_crop(Some(rect(0.0, 0.0, 40.0, 40.0))).unwrap();
+    assert_eq!(
+        doc.len(),
+        1,
+        "cropping must not silently delete work: widening the crop brings it back"
+    );
+}
+
+#[test]
+fn crop_clamps_to_the_capture_rather_than_inventing_margin() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(-50.0, -50.0, 120.0, 120.0))).unwrap();
+    assert_eq!(doc.content_bounds(), rect(0.0, 0.0, 70.0, 70.0));
+
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((frame.width(), frame.height()), (70, 70));
+}
+
+#[test]
+fn a_crop_covering_everything_is_no_crop() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(-10.0, -10.0, 500.0, 500.0))).unwrap();
+    assert_eq!(
+        doc.crop(),
+        None,
+        "a crop the user cannot see must not be a crop they cannot clear"
+    );
+}
+
+#[test]
+fn a_crop_outside_the_capture_is_refused() {
+    let mut doc = coded();
+    assert!(doc.set_crop(Some(rect(500.0, 500.0, 10.0, 10.0))).is_err());
+    assert_eq!(doc.crop(), None, "a refused crop must not half-apply");
+}
+
+#[test]
+fn an_empty_crop_is_refused() {
+    let mut doc = coded();
+    assert!(doc.set_crop(Some(rect(10.0, 10.0, 0.0, 20.0))).is_err());
+}
+
+#[test]
+fn a_non_finite_crop_is_refused() {
+    let mut doc = coded();
+    assert!(doc.set_crop(Some(rect(f64::NAN, 0.0, 10.0, 10.0))).is_err());
+    assert!(
+        doc.set_crop(Some(rect(0.0, 0.0, f64::INFINITY, 10.0)))
+            .is_err()
+    );
+}
+
+#[test]
+fn crop_survives_a_round_trip_through_persistence() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(12.0, 34.0, 40.0, 25.0))).unwrap();
+    let json = serde_json::to_string(&doc.data()).unwrap();
+    let data: DocumentData = serde_json::from_str(&json).unwrap();
+    let restored = Document::from_data(doc.source.clone(), data).unwrap();
+    assert_eq!(restored.crop(), Some(rect(12.0, 34.0, 40.0, 25.0)));
+}
+
+#[test]
+fn documents_saved_before_crop_existed_still_load() {
+    // Version 1 payloads have no `crop` key at all. They must load as uncropped
+    // rather than failing, or every capture taken before this feature shipped
+    // would become unopenable.
+    let legacy = r#"{"version":1,"annotations":[],"beautification":null,"next_id":1}"#;
+    let data: DocumentData = serde_json::from_str(legacy).unwrap();
+    assert_eq!(data.crop, None);
+    let doc = Document::from_data(coded().source, data).unwrap();
+    assert_eq!(doc.crop(), None);
+}
+
+#[test]
+fn crop_scales_with_the_export_scale() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(10.0, 10.0, 30.0, 20.0))).unwrap();
+    let frame = SkiaRenderer::new()
+        .render_at(&doc, ScaleFactor::new(2.0))
+        .unwrap();
+    assert_eq!((frame.width(), frame.height()), (60, 40));
+}
+
+#[test]
+fn render_to_width_measures_the_crop_not_the_capture() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(0.0, 0.0, 50.0, 25.0))).unwrap();
+    let frame = SkiaRenderer::new().render_to_width(&doc, 200).unwrap();
+    assert_eq!(
+        (frame.width(), frame.height()),
+        (200, 100),
+        "the requested width applies to what is visible"
+    );
+}
+
+#[test]
+fn an_uncropped_render_is_still_byte_for_byte_at_one_to_one() {
+    let doc = coded();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    for (x, y) in [(0, 0), (1, 1), (50, 73), (99, 99)] {
+        assert_eq!(
+            pixel(&frame, x, y),
+            [x as u8, y as u8, 128, 255],
+            "adding a crop transform must not soften the uncropped common case"
+        );
+    }
+}
+
+#[test]
+fn crop_applies_before_beautification() {
+    let mut doc = coded();
+    doc.set_crop(Some(rect(10.0, 10.0, 40.0, 40.0))).unwrap();
+    doc.set_beautification(Some(scrozz_annotate::Beautification::padded(
+        20.0,
+        Background::Solid(scrozz_annotate::Color::rgb(0, 0, 255)),
+    )))
+    .unwrap();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(
+        (frame.width(), frame.height()),
+        (80, 80),
+        "padding must frame the cropped image, not the original"
+    );
+    assert!(
+        near(pixel(&frame, 2, 2), [0, 0, 255, 255], 2),
+        "the padding is the background colour"
+    );
+}
+
+#[test]
+fn cropping_a_window_capture_does_not_smuggle_in_compositing() {
+    // Decision D9. Crop is a legitimate operation on a window capture; it must
+    // not become a fourth route to beautifying one.
+    let capture = common::window_capture(100, 100);
+    let mut doc = Document::new(capture);
+    doc.set_crop(Some(rect(10.0, 10.0, 50.0, 50.0))).unwrap();
+    assert!(!doc.may_beautify());
+    assert!(doc.set_beautification(Some(Default::default())).is_err());
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((frame.width(), frame.height()), (50, 50));
+}
+
+#[test]
+fn a_redaction_inside_a_crop_still_destroys_pixels() {
+    let mut doc = Document::new(common::capture_with(
+        common::checkerboard(100, 100, 2),
+        Provenance::Region,
+    ));
+    doc.add_default(Annotation::Redact {
+        area: rect(30.0, 30.0, 20.0, 20.0),
+        style: scrozz_annotate::RedactStyle::Pixelate,
+    });
+    doc.set_crop(Some(rect(20.0, 20.0, 50.0, 50.0))).unwrap();
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+
+    // The redaction sat at source (30..50); in the crop it is at (10..30).
+    let mut extremes = 0;
+    for y in 12..28 {
+        for x in 12..28 {
+            let p = pixel(&frame, x, y);
+            if p[0] == 0 || p[0] == 255 {
+                extremes += 1;
+            }
+        }
+    }
+    assert_eq!(
+        extremes, 0,
+        "the checkerboard's pure black and white must be gone inside the redaction"
+    );
+}
+
+#[test]
+fn content_size_reports_the_visible_area() {
+    let mut doc = coded();
+    assert_eq!(doc.content_size().width, 100.0);
+    doc.set_crop(Some(rect(0.0, 0.0, 33.0, 44.0))).unwrap();
+    assert_eq!(doc.content_size().width, 33.0);
+    assert_eq!(doc.content_size().height, 44.0);
+}
+
+#[test]
+fn hit_testing_stays_in_source_coordinates() {
+    // The editor maps a click through the crop before hit-testing; the document
+    // itself must not double-apply that shift.
+    let mut doc = coded();
+    let id = doc.add_default(Annotation::Rectangle(rect(30.0, 30.0, 20.0, 20.0)));
+    doc.set_crop(Some(rect(20.0, 20.0, 50.0, 50.0))).unwrap();
+    assert_eq!(doc.hit_test(LogicalPoint::new(40.0, 30.0)), Some(id));
+}
+
+#[test]
+fn a_window_capture_crop_round_trips() {
+    let capture = Capture {
+        frame: common::flat(80, 80, [10, 20, 30, 255]),
+        provenance: Provenance::Window,
+        target: CaptureTarget::Window(WindowId("w".to_owned())),
+    };
+    let mut doc = Document::new(capture.clone());
+    doc.set_crop(Some(rect(5.0, 5.0, 40.0, 40.0))).unwrap();
+    let restored = Document::from_data(capture, doc.data()).unwrap();
+    assert_eq!(restored.crop(), Some(rect(5.0, 5.0, 40.0, 40.0)));
+}

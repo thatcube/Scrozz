@@ -20,16 +20,33 @@ use crate::{
 };
 
 /// Converts logical annotation coordinates into physical canvas pixels.
+///
+/// The origin is the logical point that lands on the canvas's top-left corner.
+/// It is non-zero when the document is cropped, and carrying it here — rather
+/// than pre-translating every annotation — is what keeps crop non-destructive:
+/// the annotations still hold their original coordinates, and only the view of
+/// them moves.
 #[derive(Debug, Clone, Copy)]
 pub struct Scaled {
     scale: f64,
+    origin: LogicalPoint,
 }
 
 impl Scaled {
-    /// A converter for a canvas rendered at `scale` physical pixels per point.
+    /// A converter for a canvas rendered at `scale` physical pixels per point,
+    /// showing the document from its own origin.
     #[must_use]
-    pub const fn new(scale: f64) -> Self {
-        Self { scale }
+    pub fn new(scale: f64) -> Self {
+        Self {
+            scale,
+            origin: LogicalPoint::new(0.0, 0.0),
+        }
+    }
+
+    /// A converter for a canvas whose top-left corner is `origin`.
+    #[must_use]
+    pub const fn with_origin(scale: f64, origin: LogicalPoint) -> Self {
+        Self { scale, origin }
     }
 
     /// The scale factor.
@@ -38,13 +55,29 @@ impl Scaled {
         self.scale
     }
 
+    /// A horizontal coordinate, in canvas pixels.
+    #[must_use]
+    pub fn x(self, v: f64) -> f32 {
+        ((v - self.origin.x) * self.scale) as f32
+    }
+
+    /// A vertical coordinate, in canvas pixels.
+    #[must_use]
+    pub fn y(self, v: f64) -> f32 {
+        ((v - self.origin.y) * self.scale) as f32
+    }
+
     /// A point, in canvas pixels.
     #[must_use]
     pub fn point(self, p: LogicalPoint) -> (f32, f32) {
-        ((p.x * self.scale) as f32, (p.y * self.scale) as f32)
+        (self.x(p.x), self.y(p.y))
     }
 
     /// A length, in canvas pixels.
+    ///
+    /// Deliberately *not* origin-shifted: a stroke width is a distance, not a
+    /// position, and translating one would make every stroke change thickness
+    /// as soon as the document was cropped.
     #[must_use]
     pub fn length(self, v: f64) -> f32 {
         (v * self.scale) as f32
@@ -54,10 +87,10 @@ impl Scaled {
     #[must_use]
     pub fn rect(self, r: &LogicalRect) -> Option<Rect> {
         Rect::from_ltrb(
-            self.length(r.origin.x),
-            self.length(r.origin.y),
-            self.length(geom::max_x(r)),
-            self.length(geom::max_y(r)),
+            self.x(r.origin.x),
+            self.y(r.origin.y),
+            self.x(geom::max_x(r)),
+            self.y(geom::max_y(r)),
         )
     }
 }
@@ -151,6 +184,23 @@ pub fn arrow(
     head.close();
 
     Some((shaft.finish()?, head.finish()?))
+}
+
+/// A straight line path between two points.
+///
+/// `None` for a zero-length line: a round-capped stroke of no length would
+/// paint a dot, which is not what "I dragged nowhere" should leave behind.
+#[must_use]
+pub fn line(from: LogicalPoint, to: LogicalPoint, xf: Scaled) -> Option<Path> {
+    let (x0, y0) = xf.point(from);
+    let (x1, y1) = xf.point(to);
+    if (x1 - x0).hypot(y1 - y0) <= f32::EPSILON {
+        return None;
+    }
+    let mut builder = PathBuilder::new();
+    builder.move_to(x0, y0);
+    builder.line_to(x1, y1);
+    builder.finish()
 }
 
 /// A rectangle path.

@@ -402,7 +402,9 @@ fn logical_bounds_covers_the_source() {
 #[test]
 fn every_variant_reports_a_kind_and_a_bounding_box() {
     let mut doc = document(200, 200);
-    for (annotation, style) in every_annotation() {
+    let fixture = every_annotation();
+    let expected = fixture.len();
+    for (annotation, style) in fixture {
         let id = doc.add(annotation, style);
         let object = doc.get(id).unwrap();
         let bounds = object.bounds();
@@ -412,7 +414,35 @@ fn every_variant_reports_a_kind_and_a_bounding_box() {
             object.kind()
         );
     }
-    assert_eq!(doc.len(), 10);
+    assert_eq!(doc.len(), expected);
+}
+
+#[test]
+fn the_coverage_fixture_includes_every_annotation_kind() {
+    // Guards the rest of the suite: several tests sweep `every_annotation()` to
+    // assert a property holds for all kinds, and each one silently weakens if a
+    // new variant is added to the enum but not to the fixture.
+    let covered: Vec<AnnotationKind> = every_annotation()
+        .iter()
+        .map(|(annotation, _)| annotation.kind())
+        .collect();
+    let all = [
+        AnnotationKind::Arrow,
+        AnnotationKind::Line,
+        AnnotationKind::Rectangle,
+        AnnotationKind::Ellipse,
+        AnnotationKind::Freehand,
+        AnnotationKind::Text,
+        AnnotationKind::Counter,
+        AnnotationKind::Highlight,
+        AnnotationKind::Redact,
+    ];
+    for kind in all {
+        assert!(
+            covered.contains(&kind),
+            "{kind:?} is missing from every_annotation(), so nothing sweeps it"
+        );
+    }
 }
 
 #[test]
@@ -453,4 +483,64 @@ fn index_of(doc: &Document, id: scrozz_annotate::AnnotationId) -> Option<u32> {
         Annotation::Counter { index, .. } => Some(index),
         _ => None,
     }
+}
+
+#[test]
+fn a_line_is_hit_along_its_length_not_its_bounding_box() {
+    let mut doc = document(200, 200);
+    let id = doc.add_default(Annotation::Line {
+        from: LogicalPoint::new(20.0, 20.0),
+        to: LogicalPoint::new(180.0, 180.0),
+    });
+    assert_eq!(doc.hit_test(LogicalPoint::new(100.0, 100.0)), Some(id));
+    assert_eq!(
+        doc.hit_test(LogicalPoint::new(170.0, 30.0)),
+        None,
+        "the far corner of the bounding box is nowhere near the line"
+    );
+}
+
+#[test]
+fn a_line_resizes_by_remapping_its_endpoints() {
+    let mut doc = document(400, 400);
+    let id = doc.add_default(Annotation::Line {
+        from: LogicalPoint::new(0.0, 0.0),
+        to: LogicalPoint::new(100.0, 50.0),
+    });
+    doc.set_bounds(id, rect(200.0, 100.0, 200.0, 100.0));
+    let Annotation::Line { from, to } = doc.get(id).unwrap().annotation.clone() else {
+        panic!("kind changed under resize");
+    };
+    assert_eq!(from, LogicalPoint::new(200.0, 100.0));
+    assert_eq!(to, LogicalPoint::new(400.0, 200.0));
+}
+
+#[test]
+fn a_line_translates_both_endpoints_together() {
+    let mut doc = document(200, 200);
+    let id = doc.add_default(Annotation::Line {
+        from: LogicalPoint::new(10.0, 10.0),
+        to: LogicalPoint::new(60.0, 40.0),
+    });
+    doc.translate(id, 5.0, -3.0);
+    let Annotation::Line { from, to } = doc.get(id).unwrap().annotation.clone() else {
+        panic!("kind changed under translate");
+    };
+    assert_eq!(from, LogicalPoint::new(15.0, 7.0));
+    assert_eq!(to, LogicalPoint::new(65.0, 37.0));
+}
+
+#[test]
+fn a_line_reports_its_own_kind() {
+    let mut doc = document(200, 200);
+    let id = doc.add_default(Annotation::Line {
+        from: LogicalPoint::new(0.0, 0.0),
+        to: LogicalPoint::new(10.0, 10.0),
+    });
+    assert_eq!(doc.get(id).unwrap().annotation.kind(), AnnotationKind::Line);
+    assert_ne!(
+        doc.get(id).unwrap().annotation.kind(),
+        AnnotationKind::Arrow,
+        "a line is not a headless arrow"
+    );
 }
