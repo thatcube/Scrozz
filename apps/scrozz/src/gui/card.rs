@@ -295,7 +295,7 @@ impl Card {
 /// to `scrozz-ui`, which knows the thresholds and the velocities. What crosses
 /// this seam is the *decision* — never a raw drag delta, because then two
 /// crates would be deciding what a swipe means.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CardEvent {
     /// Put this capture on the clipboard.
     Copy(CardId),
@@ -303,8 +303,19 @@ pub enum CardEvent {
     Save(CardId),
     /// Swiped left: throw it away.
     Dismiss(CardId),
-    /// Dragged right or up: a drag onto another application has begun.
-    Drag(CardId),
+    /// Dragged right or up far enough to mean it, **while the button is still
+    /// down**.
+    ///
+    /// This is the one card event that is not a report of something finished.
+    /// It is a request to start a native drag *now*, because every platform
+    /// refuses to start one after the mouse comes up. The geometry travels with
+    /// it because the drag image has to be placed where the card already is.
+    Drag {
+        /// Which card.
+        card: CardId,
+        /// Where the gesture was when it committed.
+        at: crate::gui::drag::DragSpot,
+    },
     /// Swiped down: collapse into the capture dock (D20).
     Collapse(CardId),
     /// Clicked: open it for editing.
@@ -319,9 +330,9 @@ impl CardEvent {
             Self::Copy(id)
             | Self::Save(id)
             | Self::Dismiss(id)
-            | Self::Drag(id)
             | Self::Collapse(id)
             | Self::Open(id) => *id,
+            Self::Drag { card, .. } => *card,
         }
     }
 }
@@ -364,6 +375,17 @@ pub trait CardSurface {
     /// A human-readable name for this surface, for diagnostics.
     fn describe(&self) -> String {
         "card surface".to_owned()
+    }
+
+    /// The native window this surface draws into, once there is one.
+    ///
+    /// Only a drag needs this, and only because every platform's drag API is
+    /// begun *from a window* rather than from an application. `None` is the
+    /// honest answer for a surface that has no window — the recording surface,
+    /// or a real one before it has opened — and callers refuse the drag rather
+    /// than guessing.
+    fn native_surface(&self) -> Option<scrozz_shell::NativeSurface> {
+        None
     }
 }
 
@@ -562,7 +584,13 @@ mod tests {
             CardEvent::Copy(id),
             CardEvent::Save(id),
             CardEvent::Dismiss(id),
-            CardEvent::Drag(id),
+            CardEvent::Drag {
+                card: id,
+                at: crate::gui::drag::DragSpot {
+                    card: [0.0, 0.0, 10.0, 10.0],
+                    pointer: [5.0, 5.0],
+                },
+            },
             CardEvent::Collapse(id),
             CardEvent::Open(id),
         ] {

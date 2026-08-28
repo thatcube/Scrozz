@@ -38,7 +38,8 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
-        card::{CardEvent, CardSurface},
+        card::{CardEvent, CardId, CardSurface},
+        drag::{DragHost, DragSpot},
         pipeline::{Job, Outcome, Pipeline},
         selection::CaptureSelector,
         server::{Forwarder, Server},
@@ -204,6 +205,7 @@ pub struct App {
     server: Option<Server>,
     forwarder: Option<Forwarder>,
     selector: Arc<dyn CaptureSelector>,
+    drag: DragHost,
     started: Instant,
     captures: u64,
     sound_warning_shown: bool,
@@ -320,12 +322,20 @@ impl App {
             server,
             forwarder,
             selector,
+            drag: DragHost::new(),
             started: Instant::now(),
             captures: 0,
             sound_warning_shown: false,
             settings_requested: false,
             notes,
         };
+
+        // A drag that was in flight when a previous run ended left its file
+        // behind on purpose; nothing is ever coming back for it.
+        let swept = app.drag.sweep_orphans();
+        if swept > 0 {
+            tracing::debug!(files = swept, "removed drag files from a previous run");
+        }
 
         if let Some(kind) = app.config.capture_on_start {
             app.begin_capture(kind);
@@ -354,6 +364,7 @@ impl App {
         }
         self.drain_pipeline();
         self.drain_cards();
+        self.drain_drags();
 
         Tick::Continue
     }
@@ -512,14 +523,53 @@ impl App {
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
                 }
-                // Not yet routed. The drag payload is `scrozz-shell`'s
-                // `DragSource`, and collapsing into the dock is the capture
-                // stack's own animation — both belong to the surface that
-                // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
+                CardEvent::Drag { card, at } => self.begin_drag(card, at),
+                // Not yet routed. Collapsing into the dock is the capture
+                // stack's own animation, and opening a card for editing belongs
+                // to the annotation window — both to the surface that raised
+                // the event, once there is one that can.
+                CardEvent::Collapse(id) | CardEvent::Open(id) => {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
             }
+        }
+    }
+
+    /// Hands a card to the platform's drag machinery.
+    ///
+    /// Called while the mouse button is still down — see [`crate::gui::drag`]
+    /// for why that is the only moment this can work. The card stays where it
+    /// is; [`Self::drain_drags`] removes it if and only if something accepts
+    /// the drop.
+    fn begin_drag(&mut self, card: CardId, at: DragSpot) {
+        if !self.drag.is_attached()
+            && let Some(surface) = self.surface.native_surface()
+        {
+            self.drag.attach(surface);
+        }
+
+        let Some(bytes) = self.pipeline.captures().get(card) else {
+            self.note(format!("{card} has no capture to drag"));
+            return;
+        };
+
+        match self.drag.begin(card, at, &bytes) {
+            Ok(()) => tracing::debug!(%card, "drag started"),
+            // Visible, not silent: a drag that quietly does nothing is exactly
+            // the failure this whole path exists to remove.
+            Err(why) => self.note(format!("{card} could not be dragged: {why}")),
+        }
+    }
+
+    /// Services drags already under way.
+    ///
+    /// Two jobs: take a card off the stack once its drop was accepted, and keep
+    /// sweeping the temporary file afterwards until the retention window closes.
+    fn drain_drags(&mut self) {
+        for card in self.drag.poll() {
+            self.surface.dismiss(card);
+            self.pipeline.post(Job::Release(card));
+            self.note(format!("{card} dropped"));
         }
     }
 
@@ -785,13 +835,44 @@ mod tests {
     #[test]
     fn an_unrouted_card_gesture_is_recorded_not_swallowed() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Drag(CardId(5)));
+        surface.inject(CardEvent::Collapse(CardId(5)));
         app.tick();
         assert!(
             app.notes().iter().any(|n| n.contains("not routed yet")),
             "{:?}",
             app.notes()
         );
+    }
+
+    #[test]
+    fn a_drag_without_a_capture_is_refused_in_writing() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Drag {
+            card: CardId(5),
+            at: DragSpot {
+                card: [0.0, 0.0, 200.0, 140.0],
+                pointer: [100.0, 70.0],
+            },
+        });
+        app.tick();
+
+        // The recording surface has no window, and card 5 was never captured.
+        // Either way the user is told, because a drag that silently does
+        // nothing is the failure this path exists to remove.
+        assert!(
+            app.notes()
+                .iter()
+                .any(|n| n.contains("card:5 has no capture to drag")
+                    || n.contains("card:5 could not be dragged")),
+            "{:?}",
+            app.notes()
+        );
+    }
+
+    #[test]
+    fn nothing_is_in_flight_before_a_drag_starts() {
+        let (app, _) = app();
+        assert_eq!(app.drag.in_flight(), 0);
     }
 
     #[test]

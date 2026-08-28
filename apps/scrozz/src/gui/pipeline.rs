@@ -21,11 +21,27 @@
 //! "copy this card" cheap without holding 30 MB of RGBA per card — the PNG of
 //! the same capture is a few hundred kilobytes, and `scrozz-export` decodes it
 //! back when the clipboard asks.
+//!
+//! # Why the bytes are shared and not private
+//!
+//! Copy and Save are asynchronous: the user presses a button, the worker does
+//! the work, an [`Outcome`] arrives a frame or two later, and nobody minds.
+//! A **drag** is not. AppKit will only start a dragging session while the mouse
+//! button is still held, so at the instant the gesture commits the main thread
+//! must already have the full-resolution PNG in hand — a round trip through
+//! this channel would arrive after the button came up, which is the difference
+//! between a drop and a card that animates away into nothing.
+//!
+//! So the encoded bytes live in a [`CaptureVault`]: the worker fills it, the
+//! main thread reads it, and both refer to the same `Arc<Vec<u8>>` rather than
+//! copying a few hundred kilobytes around. It is the only shared mutable state
+//! between the two threads, it is behind one mutex, and no lock is ever held
+//! across a capture, an encode or a filesystem call.
 
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
@@ -34,10 +50,10 @@ use std::{
 
 use scrozz_annotate::Document;
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, SelectionMode,
-    SelectionOptions,
+    Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
+    SelectionMode, SelectionOptions,
 };
-use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
@@ -105,6 +121,7 @@ pub struct Pipeline {
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
     next_card: u64,
+    vault: CaptureVault,
 }
 
 impl Pipeline {
@@ -119,10 +136,12 @@ impl Pipeline {
     pub fn start(selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
+        let vault = CaptureVault::new();
+        let worker_vault = vault.clone();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx, selector).run(&job_rx))
+            .spawn(move || Worker::new(outcome_tx, selector, worker_vault).run(&job_rx))
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -134,7 +153,17 @@ impl Pipeline {
             outcomes,
             worker: Some(worker),
             next_card: 1,
+            vault,
         })
+    }
+
+    /// The encoded captures, for callers that need the bytes synchronously.
+    ///
+    /// The one such caller is a drag: it must write a real file while the mouse
+    /// button is still down. Everything else should post a [`Job`] instead.
+    #[must_use]
+    pub fn captures(&self) -> CaptureVault {
+        self.vault.clone()
     }
 
     /// Allocates the next card identity.
@@ -172,16 +201,77 @@ impl Drop for Pipeline {
     }
 }
 
-/// What the worker remembers about a card it produced.
-struct Cached {
-    bytes: Vec<u8>,
+/// What is kept for a card that is still on screen.
+#[derive(Clone)]
+pub struct CaptureBytes {
+    /// The full-resolution PNG. What a copy, a save or a drag hands over.
+    pub full: Arc<Vec<u8>>,
+    /// A small PNG of the same capture, for a drag image. `None` if the
+    /// thumbnail could not be encoded, which costs a drag its picture but not
+    /// its payload.
+    pub preview: Option<Arc<Vec<u8>>>,
+}
+
+/// The encoded captures of every card still in the pile.
+///
+/// Cheap to clone: both ends hold the same map. See the module header for why
+/// this is shared rather than owned by the worker.
+#[derive(Clone, Default)]
+pub struct CaptureVault {
+    inner: Arc<Mutex<HashMap<CardId, CaptureBytes>>>,
+}
+
+impl CaptureVault {
+    /// An empty vault.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Files a freshly encoded capture.
+    fn store(&self, card: CardId, bytes: CaptureBytes) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(card, bytes);
+        }
+    }
+
+    /// The bytes for `card`, if it is still in the pile.
+    ///
+    /// Returns a clone of the handles, not of the bytes, so the lock is held
+    /// for a pointer copy and nothing else.
+    #[must_use]
+    pub fn get(&self, card: CardId) -> Option<CaptureBytes> {
+        self.inner.lock().ok()?.get(&card).cloned()
+    }
+
+    /// Drops a card's bytes. Called when the card leaves the pile.
+    ///
+    /// A drag that is still in flight is unaffected: the file it advertised was
+    /// already written, and its own bytes are held by the drag session.
+    fn forget(&self, card: CardId) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(&card);
+        }
+    }
+
+    /// How many captures are being held. For tests and diagnostics.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().map_or(0, |map| map.len())
+    }
+
+    /// Whether anything is being held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 struct Worker {
     outcomes: Sender<Outcome>,
     selector: Arc<dyn CaptureSelector>,
     store: Option<SqliteStore>,
-    cache: HashMap<CardId, Cached>,
+    vault: CaptureVault,
 }
 
 struct CaptureLifecycle {
@@ -212,7 +302,11 @@ impl Drop for CaptureLifecycle {
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>, selector: Arc<dyn CaptureSelector>) -> Self {
+    fn new(
+        outcomes: Sender<Outcome>,
+        selector: Arc<dyn CaptureSelector>,
+        vault: CaptureVault,
+    ) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -233,7 +327,7 @@ impl Worker {
             outcomes,
             selector,
             store,
-            cache: HashMap::new(),
+            vault,
         }
     }
 
@@ -243,9 +337,7 @@ impl Worker {
                 Job::Capture { kind, card } => self.capture(kind, card),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
-                Job::Release(card) => {
-                    self.cache.remove(&card);
-                }
+                Job::Release(card) => self.vault.forget(card),
                 Job::Stop => break,
             }
         }
@@ -344,7 +436,16 @@ impl Worker {
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
 
-        self.cache.insert(card, Cached { bytes });
+        // Encoded here, on the worker, because the only caller is a drag and a
+        // drag has no time to spare once it has started.
+        let preview = thumbnail.as_ref().and_then(preview_png).map(Arc::new);
+        self.vault.store(
+            card,
+            CaptureBytes {
+                full: Arc::new(bytes),
+                preview,
+            },
+        );
 
         Ok(Card {
             id: card,
@@ -399,7 +500,7 @@ impl Worker {
         // over IPC, where the worker never held a `Frame` at all.
         let result = self
             .cached(card, "copy")
-            .and_then(|cached| Ok(scrozz_export::decode(&cached.bytes)?))
+            .and_then(|cached| Ok(scrozz_export::decode(&cached.full)?))
             .and_then(|frame| {
                 SystemClipboard::new().write_image_reporting(&frame)?;
                 Ok("copied to the clipboard".to_owned())
@@ -409,15 +510,15 @@ impl Worker {
 
     fn save(&mut self, card: CardId) {
         let result = self.cached(card, "save").and_then(|cached| {
-            let path = crate::output::export_default(&cached.bytes)?;
+            let path = crate::output::export_default(&cached.full)?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer(card, result);
     }
 
-    fn cached(&self, card: CardId, verb: &str) -> CliResult<&Cached> {
-        self.cache
-            .get(&card)
+    fn cached(&self, card: CardId, verb: &str) -> CliResult<CaptureBytes> {
+        self.vault
+            .get(card)
             .ok_or_else(|| CliError::usage(format!("{card} has no capture to {verb}")))
     }
 
@@ -442,6 +543,26 @@ fn remember_region(
         .and_then(|id| displays.iter().find(|display| display.id == *id));
     crate::selection_store::RememberedRegionStore::default_location()?
         .save(crate::selection_store::RememberedRegion::new(rect, display))
+}
+
+/// Encodes a card's thumbnail as a PNG, for use as a drag image.
+///
+/// Small on purpose: this is the picture that follows the cursor, not the
+/// payload. A failure is logged and swallowed — a drag without a picture is a
+/// cosmetic loss, a drag refused because a picture would not encode is not.
+fn preview_png(thumbnail: &Thumbnail) -> Option<Vec<u8>> {
+    let image = RgbaImage {
+        width: thumbnail.width(),
+        height: thumbnail.height(),
+        data: thumbnail.pixels().to_vec(),
+    };
+    match FrameEncoder::new().encode_rgba(&image, ColorSpace::Srgb, ImageFormat::Png) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::debug!("the drag preview could not be encoded: {err}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

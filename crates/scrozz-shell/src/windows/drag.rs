@@ -1,0 +1,750 @@
+//! Dragging a capture out of the overlay, on Windows.
+//!
+//! # What a Windows drop target actually reads
+//!
+//! The same question the macOS backend answers, with a different answer. OLE
+//! drag-and-drop offers formats through an `IDataObject`; what a target reads
+//! depends entirely on what it is:
+//!
+//! - **`CF_HDROP`** is the universal one. Explorer, every Office application,
+//!   every browser's file-upload drop zone, Slack, Discord, Teams — all of them
+//!   look for a list of file paths first. Anything that accepts a file accepts
+//!   `CF_HDROP`.
+//! - **The registered `"PNG"` format** is what image-only surfaces read: a
+//!   rich-text editor, a canvas, a chat box that wants an inline image rather
+//!   than an attachment. Chromium registers and reads exactly this name.
+//! - **`CF_UNICODETEXT`** carrying the path, for the plain-text targets that
+//!   would otherwise take nothing at all. Cheap, and it is the difference
+//!   between "pasted the path" and "nothing happened".
+//!
+//! Deliberately **not** offered: `CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`
+//! delayed rendering. That pair is the elegant answer — it is how you drag a
+//! file that does not exist yet — but the file *does* already exist by the time
+//! the drag starts (see the artifact module: it is written eagerly, exactly as
+//! on macOS), so a promise would buy nothing and cost the compatibility gap.
+//! `CF_HDROP` from a real path is understood by strictly more targets.
+//!
+//! Also not offered: `CF_DIBV5`. Every target that reads DIB also reads
+//! `CF_HDROP`, DIB cannot carry an alpha channel that survives round-tripping
+//! through the older clipboard formats reliably, and building one means
+//! decoding the PNG for no gain.
+//!
+//! # Why `DoDragDrop` blocking is correct
+//!
+//! `DoDragDrop` runs a modal loop and does not return until the drop lands or
+//! the user gives up. That looks alarming next to the macOS backend, which
+//! returns immediately, but it is the documented and only supported shape: the
+//! OS owns the mouse for the duration. The overlay is a single-window
+//! always-on-top surface with no animation that must keep running mid-drag, so
+//! blocking its thread for the length of a drag is not observable. The
+//! [`DragSession`] is therefore already settled by the time `begin` returns,
+//! which the session type explicitly supports.
+//!
+//! # Lifetime
+//!
+//! Because the modal loop means `begin` does not return until the drag is over,
+//! there is none of the macOS ownership problem here — the data object and drop
+//! source live on the stack for exactly as long as they are needed, and Rust's
+//! ordinary scoping is sufficient. The temporary file outlives the drag by the
+//! usual retention window, handled by the shared artifact layer.
+//!
+//! # Status
+//!
+//! **The COM plumbing is type-checked but has never run; the byte layouts do
+//! run, everywhere.** The `IDataObject`/`DoDragDrop` path here cross-compiles
+//! clean against the documented contracts but has not executed on a Windows
+//! machine, so it carries the usual caveat: every native step degrades rather
+//! than panicking, and the drag image is best-effort.
+//!
+//! The `CF_HDROP` and `CF_UNICODETEXT` payload layouts are deliberately *not*
+//! in that position. They live in [`crate::drag::hdrop`], are built without a
+//! single `windows` type, and their tests run on macOS and Linux CI as well as
+//! Windows — because a missing second NUL or a wrong header offset is invisible
+//! to the type checker and fatal to a drop. The one fact that needs the real
+//! struct, `size_of::<DROPFILES>() == DROPFILES_LEN`, is asserted below.
+//!
+//! See `docs/drag-matrix.md` for what a human on Windows still has to check.
+
+use std::ffi::c_void;
+use std::path::Path;
+
+use windows::Win32::Foundation::GlobalFree;
+use windows::Win32::Foundation::{
+    DATA_S_SAMEFORMATETC, DV_E_FORMATETC, DV_E_TYMED, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY,
+    HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
+};
+use windows::Win32::System::Com::{
+    DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
+    IEnumSTATDATA, STGMEDIUM, TYMED_HGLOBAL,
+};
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{
+    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, DoDragDrop, IDropSource, IDropSource_Impl,
+    OleInitialize,
+};
+use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+use windows::Win32::UI::Shell::{
+    CLSID_DragDropHelper, IDragSourceHelper, SHCreateStdEnumFmtEtc, SHDRAGIMAGE,
+};
+use windows::core::{BOOL, Error as WinError, HRESULT, PCWSTR, Result as WinResult, implement};
+
+use scrozz_core::{Error, Result};
+
+use crate::drag::artifact::artifact_root;
+use crate::drag::{
+    DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragSession, DragSource,
+    check_origin,
+};
+
+/// `DoDragDrop` returned because the user released over a target.
+const DRAGDROP_S_DROP: HRESULT = HRESULT(0x0004_0100_u32 as i32);
+/// `DoDragDrop` returned because the user pressed Escape or right-clicked.
+const DRAGDROP_S_CANCEL: HRESULT = HRESULT(0x0004_0101_u32 as i32);
+/// `GiveFeedback` asking the shell to draw the cursor itself.
+const DRAGDROP_S_USEDEFAULTCURSORS: HRESULT = HRESULT(0x0004_0102_u32 as i32);
+
+/// The left mouse button, as `DoDragDrop` reports key state.
+const MK_LBUTTON: u32 = 0x0001;
+/// The right mouse button. Pressing it mid-drag is a cancel.
+const MK_RBUTTON: u32 = 0x0002;
+
+/// The clipboard format name Chromium registers and reads for inline images.
+///
+/// A registered name rather than a numbered format, so it has to be looked up
+/// at runtime. The lookup is cheap and the id is stable for the session.
+fn png_format() -> u16 {
+    // SAFETY: `RegisterClipboardFormatW` takes a NUL-terminated wide string and
+    // is documented to be callable from any thread at any time. The literal
+    // below is NUL-terminated.
+    let id = unsafe { RegisterClipboardFormatW(PCWSTR(windows::core::w!("PNG").as_ptr())) };
+    // 0 means the format table is full — vanishingly unlikely, and the only
+    // consequence is that image-only targets fall back to the file.
+    u16::try_from(id).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Bytes into an HGLOBAL
+// ---------------------------------------------------------------------------
+
+/// Copies `bytes` into a moveable `HGLOBAL` the receiver will own.
+///
+/// `GHND` is `GMEM_MOVEABLE | GMEM_ZEROINIT`: moveable because that is what
+/// every clipboard format requires, zeroed because several of the structures
+/// written here have trailing NUL terminators that are then simply left alone.
+fn to_hglobal(bytes: &[u8]) -> WinResult<HGLOBAL> {
+    // SAFETY: a non-zero size is passed and the result is checked.
+    let handle = unsafe { GlobalAlloc(GHND, bytes.len().max(1))? };
+
+    // SAFETY: `handle` was just allocated and is not yet locked.
+    let ptr = unsafe { GlobalLock(handle) };
+    if ptr.is_null() {
+        // SAFETY: `handle` is a live allocation that nothing else owns yet.
+        unsafe {
+            let _ = GlobalFree(Some(handle));
+        }
+        return Err(WinError::from(E_OUTOFMEMORY));
+    }
+
+    // SAFETY: `ptr` addresses at least `bytes.len()` writable bytes, and the
+    // source and destination cannot overlap — one is a fresh allocation.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        let _ = GlobalUnlock(handle);
+    }
+    Ok(handle)
+}
+
+/// The `CF_HDROP` payload naming exactly one file.
+///
+/// A `DROPFILES` header followed by the path as UTF-16, then *two* NULs: one
+/// ending the path and one ending the list. Getting that second NUL wrong is
+/// the classic way to make a drop silently deliver nothing, so it is spelled
+/// out rather than folded into an iterator.
+fn hdrop_bytes(path: &Path) -> Vec<u8> {
+    crate::drag::hdrop::hdrop(&wide(path))
+}
+
+/// The path as a NUL-terminated UTF-16 string, for `CF_UNICODETEXT`.
+fn unicode_text_bytes(path: &Path) -> Vec<u8> {
+    crate::drag::hdrop::unicode_text(&wide(path))
+}
+
+/// The path as UTF-16 code units, with no terminator.
+///
+/// `encode_wide` rather than a `String` conversion: Windows paths are WTF-16
+/// and may hold unpaired surrogates that `to_string_lossy` would replace with
+/// U+FFFD, naming a file that does not exist.
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().collect()
+}
+
+use std::os::windows::ffi::OsStrExt;
+
+// ---------------------------------------------------------------------------
+// The data object
+// ---------------------------------------------------------------------------
+
+/// One offered flavour: a clipboard format id and the bytes behind it.
+struct Flavour {
+    format: u16,
+    bytes: Vec<u8>,
+}
+
+/// What the drop target reads from.
+///
+/// Every flavour is materialised up front. That is the same trade the macOS
+/// backend makes for the same reason: the expensive part (encoding the capture)
+/// already happened, so the remaining copies are a few megabytes of memcpy, and
+/// eager data cannot dangle if the receiver asks late.
+#[implement(IDataObject)]
+struct CaptureData {
+    flavours: Vec<Flavour>,
+}
+
+impl CaptureData {
+    /// Everything this drag offers, in preference order.
+    fn new(path: &Path, png: &[u8]) -> Self {
+        let mut flavours = vec![Flavour {
+            format: CF_HDROP.0,
+            bytes: hdrop_bytes(path),
+        }];
+        let png_id = png_format();
+        if png_id != 0 {
+            flavours.push(Flavour {
+                format: png_id,
+                bytes: png.to_vec(),
+            });
+        }
+        flavours.push(Flavour {
+            format: CF_UNICODETEXT.0,
+            bytes: unicode_text_bytes(path),
+        });
+        Self { flavours }
+    }
+
+    /// The flavour matching a request, if this object serves it.
+    fn find(&self, request: *const FORMATETC) -> Option<&Flavour> {
+        if request.is_null() {
+            return None;
+        }
+        // SAFETY: checked non-null; OLE passes a valid pointer for the call.
+        let request = unsafe { &*request };
+        if request.tymed & TYMED_HGLOBAL.0.cast_unsigned() == 0 {
+            return None;
+        }
+        self.flavours.iter().find(|f| f.format == request.cfFormat)
+    }
+
+    /// The formats offered, in the shape `SHCreateStdEnumFmtEtc` wants.
+    fn format_list(&self) -> Vec<FORMATETC> {
+        self.flavours
+            .iter()
+            .map(|f| FORMATETC {
+                cfFormat: f.format,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0.cast_unsigned(),
+            })
+            .collect()
+    }
+}
+
+#[allow(non_snake_case, reason = "COM vtable method names")]
+impl IDataObject_Impl for CaptureData_Impl {
+    fn GetData(&self, request: *const FORMATETC) -> WinResult<STGMEDIUM> {
+        let flavour = self
+            .find(request)
+            .ok_or_else(|| WinError::from(DV_E_FORMATETC))?;
+        let handle = to_hglobal(&flavour.bytes)?;
+        Ok(STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0.cast_unsigned(),
+            u: windows::Win32::System::Com::STGMEDIUM_0 { hGlobal: handle },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        })
+    }
+
+    fn GetDataHere(&self, _request: *const FORMATETC, _into: *mut STGMEDIUM) -> WinResult<()> {
+        // Caller-allocated storage. Nothing that reads a dragged file uses it,
+        // and answering it wrongly is worse than declining.
+        Err(WinError::from(E_NOTIMPL))
+    }
+
+    fn QueryGetData(&self, request: *const FORMATETC) -> HRESULT {
+        if self.find(request).is_some() {
+            S_OK
+        } else if request.is_null() {
+            E_INVALIDARG
+        } else {
+            // SAFETY: checked non-null above.
+            let request = unsafe { &*request };
+            if request.tymed & TYMED_HGLOBAL.0.cast_unsigned() == 0 {
+                DV_E_TYMED
+            } else {
+                DV_E_FORMATETC
+            }
+        }
+    }
+
+    fn GetCanonicalFormatEtc(&self, _request: *const FORMATETC, out: *mut FORMATETC) -> HRESULT {
+        // No format here is a synonym for another, so the canonical form of any
+        // request is the request. The documented way to say that is to null the
+        // target device and return DATA_S_SAMEFORMATETC.
+        if !out.is_null() {
+            // SAFETY: checked non-null; OLE owns writable storage here.
+            unsafe {
+                (*out).ptd = std::ptr::null_mut();
+            }
+        }
+        DATA_S_SAMEFORMATETC
+    }
+
+    fn SetData(
+        &self,
+        _format: *const FORMATETC,
+        _medium: *const STGMEDIUM,
+        _release: BOOL,
+    ) -> WinResult<()> {
+        // A drop target may try to hand back "performed effect" state through
+        // SetData. Scrozz never moves or deletes a capture on the strength of a
+        // drop (the shot also lives in history), so there is nothing to record.
+        Err(WinError::from(E_NOTIMPL))
+    }
+
+    fn EnumFormatEtc(&self, direction: u32) -> WinResult<IEnumFORMATETC> {
+        // DATADIR_GET == 1. There is nothing to enumerate in the other
+        // direction because this object never accepts data.
+        if direction != 1 {
+            return Err(WinError::from(E_NOTIMPL));
+        }
+        let formats = self.format_list();
+        // SAFETY: `formats` is a live slice for the duration of the call, and
+        // `SHCreateStdEnumFmtEtc` is documented to copy it.
+        unsafe { SHCreateStdEnumFmtEtc(&formats) }
+    }
+
+    fn DAdvise(
+        &self,
+        _format: *const FORMATETC,
+        _flags: u32,
+        _sink: windows::core::Ref<'_, IAdviseSink>,
+    ) -> WinResult<u32> {
+        Err(WinError::from(OLE_E_ADVISENOTSUPPORTED))
+    }
+
+    fn DUnadvise(&self, _connection: u32) -> WinResult<()> {
+        Err(WinError::from(OLE_E_ADVISENOTSUPPORTED))
+    }
+
+    fn EnumDAdvise(&self) -> WinResult<IEnumSTATDATA> {
+        Err(WinError::from(OLE_E_ADVISENOTSUPPORTED))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The drop source
+// ---------------------------------------------------------------------------
+
+/// Decides, frame by frame, whether the drag continues.
+#[implement(IDropSource)]
+struct CaptureSource;
+
+#[allow(non_snake_case, reason = "COM vtable method names")]
+impl IDropSource_Impl for CaptureSource_Impl {
+    fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
+        // Escape, or the right button, cancels. Releasing the left button — the
+        // one that started the gesture — is the drop. Any other combination
+        // means the user is still dragging.
+        if escape.as_bool() || keys.0 & MK_RBUTTON != 0 {
+            DRAGDROP_S_CANCEL
+        } else if keys.0 & MK_LBUTTON == 0 {
+            DRAGDROP_S_DROP
+        } else {
+            S_OK
+        }
+    }
+
+    fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+        // The shell draws a better cursor than we would, and with the drag
+        // image helper installed it draws the thumbnail too.
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The drag image
+// ---------------------------------------------------------------------------
+
+/// Attaches the thumbnail that follows the pointer, if it can be built.
+///
+/// Best-effort by design. A drag with no image is a drag with the default file
+/// cursor, which is ordinary Windows behaviour; a drag that failed to start
+/// because a thumbnail could not be decoded would be a real regression. Every
+/// failure here is logged and swallowed.
+fn attach_image(data: &IDataObject, preview: Option<&[u8]>, cursor: POINT) {
+    let Some(png) = preview else {
+        return;
+    };
+    if let Err(err) = try_attach_image(data, png, cursor) {
+        tracing::debug!(%err, "drag: no drag image; the shell will draw a default cursor");
+    }
+}
+
+/// The fallible half of [`attach_image`].
+fn try_attach_image(data: &IDataObject, png: &[u8], cursor: POINT) -> WinResult<()> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HDC,
+    };
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+
+    // SAFETY: both classes are standard in-process COM servers, and COM is
+    // initialised on this thread before any of this runs.
+    let helper: IDragSourceHelper =
+        unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER)? };
+    let factory: IWICImagingFactory =
+        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
+
+    // SAFETY: the stream is created over a slice that outlives every use of it
+    // within this function, and WIC is documented to read it synchronously.
+    let stream = unsafe { factory.CreateStream()? };
+    unsafe {
+        stream.InitializeFromMemory(png)?;
+    }
+
+    // SAFETY: a live stream is passed and the decoder is used only on success.
+    let decoder = unsafe {
+        factory.CreateDecoderFromStream(
+            &stream,
+            std::ptr::null(),
+            WICDecodeMetadataCacheOnDemand,
+        )?
+    };
+    let frame = unsafe { decoder.GetFrame(0)? };
+
+    // Premultiplied BGRA is what a 32-bit DIB with an alpha channel wants, and
+    // what the drag helper blends correctly. Anything else shows black fringes.
+    let converter = unsafe { factory.CreateFormatConverter()? };
+    unsafe {
+        converter.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeMedianCut,
+        )?;
+    }
+
+    let (mut width, mut height) = (0_u32, 0_u32);
+    // SAFETY: both out-pointers address live locals.
+    unsafe {
+        converter.GetSize(&mut width, &mut height)?;
+    }
+    if width == 0 || height == 0 {
+        return Err(WinError::from(E_INVALIDARG));
+    }
+
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(40),
+            biWidth: i32::try_from(width).unwrap_or(i32::MAX),
+            // Negative height is a top-down DIB, which matches how WIC hands
+            // pixels over. Positive would render the thumbnail upside down.
+            biHeight: -i32::try_from(height).unwrap_or(i32::MAX),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `info` describes a valid 32-bit top-down DIB and `bits` receives
+    // the pixel pointer. A null DC means the bitmap is not tied to a device.
+    let bitmap = unsafe {
+        CreateDIBSection(
+            Some(HDC::default()),
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            Some(HANDLE::default()),
+            0,
+        )?
+    };
+    if bits.is_null() {
+        return Err(WinError::from(E_OUTOFMEMORY));
+    }
+
+    let stride = width.saturating_mul(4);
+    let total = stride.saturating_mul(height);
+    // SAFETY: `bits` addresses exactly `total` bytes, which is what the stride
+    // and height passed to `CopyPixels` describe.
+    unsafe {
+        converter.CopyPixels(
+            std::ptr::null(),
+            stride,
+            std::slice::from_raw_parts_mut(bits.cast::<u8>(), total as usize),
+        )?;
+    }
+
+    let image = SHDRAGIMAGE {
+        sizeDragImage: windows::Win32::Foundation::SIZE {
+            cx: i32::try_from(width).unwrap_or(i32::MAX),
+            cy: i32::try_from(height).unwrap_or(i32::MAX),
+        },
+        ptOffset: cursor,
+        hbmpDragImage: bitmap,
+        // Fully transparent colour key: the bitmap carries its own alpha, so
+        // no colour should be treated as see-through.
+        crColorKey: windows::Win32::Foundation::COLORREF(0xFFFF_FFFF),
+    };
+
+    // SAFETY: `image` owns a live bitmap; on success the helper takes it, and
+    // on failure it is freed below.
+    let taken = unsafe { helper.InitializeFromBitmap(&image, data) };
+    if taken.is_err() {
+        // SAFETY: the helper did not take ownership, so it is still ours.
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(bitmap.into());
+        }
+    }
+    taken
+}
+
+// ---------------------------------------------------------------------------
+// The backend
+// ---------------------------------------------------------------------------
+
+/// The Windows drag backend.
+#[derive(Debug)]
+pub struct WinDragSource {
+    _private: (),
+}
+
+impl WinDragSource {
+    /// Creates the backend, initialising COM for this thread.
+    ///
+    /// # Errors
+    ///
+    /// Never fails. `OleInitialize` returning `S_FALSE` means COM was already
+    /// initialised — which is the normal case, because winit does it — and an
+    /// outright failure is left to surface at `begin`, where it can be reported
+    /// as an ordinary refused drag rather than a failure to construct the app.
+    pub fn new() -> Result<Self> {
+        // SAFETY: callable on any thread; the documented failure modes are
+        // returned as an HRESULT rather than raised.
+        let hr = unsafe { OleInitialize(None) };
+        if hr.is_err() {
+            tracing::warn!(?hr, "drag: OleInitialize failed; drags may be refused");
+        }
+        Ok(Self { _private: () })
+    }
+}
+
+impl DragSource for WinDragSource {
+    fn name(&self) -> &str {
+        "Windows/OLE"
+    }
+
+    fn capability(&self) -> DragCapability {
+        DragCapability::FULL
+    }
+
+    fn begin(&self, payload: DragPayload, origin: DragOrigin) -> Result<DragSession> {
+        check_origin(&origin)?;
+
+        // Rejected before anything native happens, so the diagnosis names the
+        // real problem rather than an HRESULT from three calls later.
+        let hwnd = HWND(origin.surface().as_ptr().cast());
+        if hwnd.is_invalid() {
+            return Err(Error::InvalidRequest(
+                "drag origin is not a live window handle".to_owned(),
+            ));
+        }
+
+        // The one encode and the one write, exactly as on macOS.
+        let (artifact, bytes) = payload.materialise(&artifact_root())?;
+
+        let session = DragSession::new();
+        // Attached before anything can fail, so every exit path owns the file.
+        session.attach_artifact(artifact);
+
+        let path = session
+            .artifact_path()
+            .ok_or_else(|| Error::Platform("the drag file went missing".to_owned()))?;
+
+        let data: IDataObject = CaptureData::new(&path, &bytes).into();
+        let source: IDropSource = CaptureSource.into();
+
+        // Where inside the thumbnail the pointer grabbed, so the image does not
+        // jump to its own corner the instant the drag starts.
+        let card = origin.card();
+        let pointer = origin.pointer();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "screen coordinates, well inside i32"
+        )]
+        let cursor = POINT {
+            x: (pointer.x - card.origin.x) as i32,
+            y: (pointer.y - card.origin.y) as i32,
+        };
+        attach_image(&data, payload.preview_png(), cursor);
+
+        let mut effect = DROPEFFECT_NONE;
+        // SAFETY: both interfaces are live for the whole call, and `effect`
+        // addresses a live local. `DoDragDrop` runs a modal loop and returns
+        // only when the drag is over.
+        let hr = unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect) };
+
+        let outcome = if hr == DRAGDROP_S_DROP {
+            if effect == DROPEFFECT_NONE {
+                // Released over something that would not take it. Per D21 the
+                // card springs back; this is not an error.
+                DragOutcome::Rejected
+            } else {
+                DragOutcome::Accepted(operation_of(effect))
+            }
+        } else if hr == DRAGDROP_S_CANCEL {
+            DragOutcome::Cancelled
+        } else {
+            DragOutcome::Failed(format!("DoDragDrop failed: {hr:?}"))
+        };
+
+        session.finish(outcome);
+        Ok(session)
+    }
+}
+
+/// What the receiver said it did with the capture.
+fn operation_of(effect: DROPEFFECT) -> DragOperation {
+    use windows::Win32::System::Ole::{DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    if effect & DROPEFFECT_COPY != DROPEFFECT_NONE {
+        DragOperation::Copy
+    } else if effect & DROPEFFECT_MOVE != DROPEFFECT_NONE {
+        // Reported, never honoured: the capture also lives in history (D14), so
+        // a "move" out of Scrozz destroys nothing.
+        DragOperation::Move
+    } else if effect & DROPEFFECT_LINK != DROPEFFECT_NONE {
+        DragOperation::Link
+    } else {
+        DragOperation::Generic
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Shell::DROPFILES;
+
+    /// The one layout fact that can only be checked against the real struct.
+    ///
+    /// `crate::drag::hdrop` writes a hand-rolled 20-byte header so that its
+    /// layout tests run on every platform. That is only sound if 20 really is
+    /// `size_of::<DROPFILES>()`, and this is the assertion that ties the two
+    /// together. Everything else about the byte layout is covered portably.
+    #[test]
+    fn the_portable_header_length_matches_the_real_struct() {
+        assert_eq!(size_of::<DROPFILES>(), crate::drag::hdrop::DROPFILES_LEN);
+    }
+
+    /// And the bytes we hand to Windows really do start the path where the
+    /// real struct would end.
+    #[test]
+    fn the_payload_puts_the_path_after_a_real_sized_header() {
+        let path = r"C:\Users\Ann\Screenshot 2024.png";
+        let bytes = hdrop_bytes(Path::new(path));
+
+        let units = crate::drag::hdrop::read_units(&bytes[size_of::<DROPFILES>()..]);
+
+        assert_eq!(String::from_utf16_lossy(&units), path);
+    }
+
+    #[test]
+    fn unicode_text_is_nul_terminated() {
+        let bytes = unicode_text_bytes(Path::new(r"C:\a.png"));
+        assert_eq!(&bytes[bytes.len() - 2..], &[0, 0]);
+    }
+
+    #[test]
+    fn the_file_flavour_is_offered_before_the_image_one() {
+        // Order is preference. A target that reads both should attach the file
+        // rather than paste a bitmap, because the file keeps the filename.
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"\x89PNG\r\n\x1a\n");
+        assert_eq!(data.flavours[0].format, CF_HDROP.0);
+        assert!(data.flavours.len() >= 2);
+        assert_eq!(
+            data.flavours.last().map(|f| f.format),
+            Some(CF_UNICODETEXT.0),
+            "plain text is the last resort"
+        );
+    }
+
+    #[test]
+    fn every_offered_format_is_enumerated() {
+        // A target that enumerates rather than probing must see everything, or
+        // it will decline a drag it could have accepted.
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"\x89PNG\r\n\x1a\n");
+        let listed = data.format_list();
+        assert_eq!(listed.len(), data.flavours.len());
+        for (entry, flavour) in listed.iter().zip(&data.flavours) {
+            assert_eq!(entry.cfFormat, flavour.format);
+            assert_eq!(entry.tymed, TYMED_HGLOBAL.0.cast_unsigned());
+            assert_eq!(entry.lindex, -1);
+        }
+    }
+
+    #[test]
+    fn a_format_this_object_does_not_serve_is_not_matched() {
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"\x89PNG\r\n\x1a\n");
+        let bogus = FORMATETC {
+            cfFormat: 0xBEEF,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0.cast_unsigned(),
+        };
+        assert!(data.find(&raw const bogus).is_none());
+    }
+
+    #[test]
+    fn a_storage_medium_we_cannot_provide_is_declined() {
+        // TYMED_ISTREAM only. Every flavour here is HGLOBAL, and claiming
+        // otherwise would hand the receiver a handle of the wrong kind.
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"\x89PNG\r\n\x1a\n");
+        let stream_only = FORMATETC {
+            cfFormat: CF_HDROP.0,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: windows::Win32::System::Com::TYMED_ISTREAM.0.cast_unsigned(),
+        };
+        assert!(data.find(&raw const stream_only).is_none());
+    }
+
+    #[test]
+    fn a_null_request_is_not_a_match() {
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"\x89PNG\r\n\x1a\n");
+        assert!(data.find(std::ptr::null()).is_none());
+    }
+
+    #[test]
+    fn a_copy_is_the_ordinary_outcome() {
+        use windows::Win32::System::Ole::{DROPEFFECT_LINK, DROPEFFECT_MOVE};
+        assert_eq!(operation_of(DROPEFFECT_COPY), DragOperation::Copy);
+        assert_eq!(operation_of(DROPEFFECT_MOVE), DragOperation::Move);
+        assert_eq!(operation_of(DROPEFFECT_LINK), DragOperation::Link);
+        assert_eq!(operation_of(DROPEFFECT_NONE), DragOperation::Generic);
+        assert_eq!(
+            operation_of(DROPEFFECT_COPY | DROPEFFECT_MOVE),
+            DragOperation::Copy,
+            "a receiver offering both is taking a copy"
+        );
+    }
+}

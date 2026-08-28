@@ -417,7 +417,26 @@ pub enum OverlayEvent {
         /// Where the pointer was, in window coordinates.
         at: Pos2,
     },
-    /// A drag committed to leaving the pile.
+    /// A drag committed to leaving the pile *while the button is still down*.
+    ///
+    /// This is the one the host acts on: it is the last moment at which a
+    /// native drag session can still be started. The overlay makes no further
+    /// claim about the card — it will spring back on release — and the platform
+    /// drag becomes the sole authority on what happens next. The host removes
+    /// the card only once the drop is accepted.
+    DragOutArmed {
+        /// The card.
+        id: CardId,
+        /// Where the card is on screen right now, in window coordinates. The
+        /// platform uses this as the drag image's starting frame.
+        card: Rect,
+        /// Where the pointer is right now, in window coordinates.
+        pointer: Pos2,
+    },
+    /// A drag committed to leaving the pile, observed at release.
+    ///
+    /// Emitted only when no host took over via [`OverlayEvent::DragOutArmed`],
+    /// so a platform without a native drag source still sees the gesture.
     DragOut {
         /// The card.
         id: CardId,
@@ -800,6 +819,11 @@ pub struct OverlayApp {
     hovered: Option<CardId>,
     dock_collapsed: bool,
     dragging: Option<CardId>,
+    /// The card whose drag-out a host has already been handed, if any.
+    ///
+    /// Set the instant the live gesture commits, so the release path knows the
+    /// platform now owns this drag and must not be told about it a second time.
+    armed: Option<CardId>,
 }
 
 impl OverlayApp {
@@ -856,6 +880,7 @@ impl OverlayApp {
             hovered: None,
             dock_collapsed: false,
             dragging: None,
+            armed: None,
         }
     }
 
@@ -1221,13 +1246,37 @@ impl eframe::App for OverlayApp {
             && self.stack.begin_drag(id, pointer, &m)
         {
             self.dragging = Some(id);
+            self.armed = None;
             self.emit(OverlayEvent::DragStarted { id, at: pointer });
         }
         if let Some(p) = drag_to {
             self.stack.drag_to(p, &m);
         }
+        // Hand a committed drag-out over *before* the button comes up. AppKit
+        // will not start a dragging session from a released mouse, so waiting
+        // for `drag_stopped()` is waiting until it is too late — that is
+        // precisely the bug where the card animates away and nothing ever
+        // drops.
+        if self.armed.is_none()
+            && let Some(live) = self.stack.live_gesture(&m)
+            && live.intent == Intent::DragOut
+        {
+            self.armed = Some(live.id);
+            self.emit(OverlayEvent::DragOutArmed {
+                id: live.id,
+                card: live.rect,
+                pointer: live.pointer,
+            });
+        }
         if drag_end {
-            if let Some(release) = self.stack.release_drag(&m) {
+            if self.armed.is_some() {
+                // The platform owns this gesture now. The card springs back to
+                // its slot and stays there; it leaves the pile only if the drop
+                // is accepted, which the host reports separately. Re-emitting
+                // the drag-out here would race the native session and retire a
+                // capture that was never delivered (D14).
+                self.stack.cancel_drag(&m);
+            } else if let Some(release) = self.stack.release_drag(&m) {
                 let at = release.rect.center();
                 match release.intent {
                     Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
@@ -1245,6 +1294,7 @@ impl eframe::App for OverlayApp {
                 }
             }
             self.dragging = None;
+            self.armed = None;
         }
         if let Some((id, a)) = action {
             self.handle_action(id, a, &m);

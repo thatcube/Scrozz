@@ -306,7 +306,7 @@ impl Host for Windowed {
     fn surface(&self) -> Box<dyn CardSurface> {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
-        Box::new(OverlayCards::new(self.handle.clone()))
+        Box::new(OverlayCards::new(self.handle.clone()).with_native(self.native.clone()))
     }
 
     fn selector(&self) -> Arc<dyn CaptureSelector> {
@@ -630,9 +630,12 @@ fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
         tracing::warn!(
             "the panel conversion is disabled; capture cards will pull focus when clicked"
         );
-        return None;
     }
-    Some(crate::gui::panel::hook_with_controller(controller))
+    // Installed either way: the hook is also how the native window reaches the
+    // drag host, and that is not what this switch is about.
+    Some(crate::gui::panel::hook_with_controller_options(
+        controller, enabled,
+    ))
 }
 
 /// Where the overlay window goes.

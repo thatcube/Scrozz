@@ -719,6 +719,28 @@ pub struct DragRelease {
     pub velocity: Vec2,
 }
 
+/// What a drag currently in progress would mean if the pointer stopped now.
+///
+/// This exists because one platform's drag-out cannot wait for the release.
+/// AppKit will only start a dragging session while a mouse button is still
+/// down; a session begun after the button comes up ends instantly, which is
+/// exactly what "the card animates away and nothing ever drops" looks like. So
+/// the host is told a drag-out has committed *during* the gesture, and takes
+/// over from there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveGesture {
+    /// The card being held.
+    pub id: CardId,
+    /// What the gesture means so far.
+    pub intent: Intent,
+    /// Which way it is going, if it has committed.
+    pub direction: Option<Dir>,
+    /// Where the card is right now, in window coordinates.
+    pub rect: Rect,
+    /// Where the pointer is right now, in window coordinates.
+    pub pointer: Pos2,
+}
+
 /// The card currently under the pointer.
 #[derive(Debug, Clone)]
 struct ActiveDrag {
@@ -1080,6 +1102,39 @@ impl CaptureStack {
         if let Some(card) = self.cards.iter_mut().find(|c| c.id == id) {
             card.drag = Some(offset);
         }
+    }
+
+    /// What the drag in progress means so far, if it means anything yet.
+    ///
+    /// `None` covers both "nothing is held" and "held, but not yet committed
+    /// to any direction". Those are the same answer to the only question the
+    /// caller is asking — *should the platform take over now?* — and collapsing
+    /// them means a caller cannot arm a native drag off a gesture that is still
+    /// undecided by forgetting to check the intent.
+    ///
+    /// Deliberately scored on **distance only**. Speed is a statement made at
+    /// release — mid-gesture it is noise, and a fast pass through the commit
+    /// zone on the way somewhere else is not a drag-out. Requiring the travel
+    /// means the user has to actually pull the card clear before the operating
+    /// system takes over.
+    ///
+    /// See [`LiveGesture`] for why this is needed at all.
+    #[must_use]
+    pub fn live_gesture(&self, m: &Motion) -> Option<LiveGesture> {
+        let drag = self.drag.as_ref()?;
+        let travel = drag.latest - drag.origin;
+        let (intent, direction) = classify(travel, Vec2::ZERO, &self.gestures);
+        if intent == Intent::SpringBack {
+            return None;
+        }
+        let slot = self.slot_of(drag.id)?;
+        Some(LiveGesture {
+            id: drag.id,
+            intent,
+            direction,
+            rect: self.rect_of_resident(slot, m),
+            pointer: drag.latest,
+        })
     }
 
     /// Lets go, and acts on what the gesture meant.

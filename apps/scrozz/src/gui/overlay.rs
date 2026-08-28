@@ -23,11 +23,13 @@
 use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
-use scrozz_ui::{
-    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
-};
+use scrozz_ui::{CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX};
 
-use crate::gui::card::{Card, CardEvent, CardId, CardSurface};
+use crate::gui::{
+    card::{Card, CardEvent, CardId, CardSurface},
+    drag::DragSpot,
+    panel::BehaviorController,
+};
 
 /// A [`CardSurface`] backed by a running `scrozz-ui` overlay.
 ///
@@ -36,6 +38,10 @@ use crate::gui::card::{Card, CardEvent, CardId, CardSurface};
 /// pile when the overlay opens rather than being lost.
 pub struct OverlayCards {
     handle: OverlayHandle,
+    /// The native window, once the creation hook has seen it. Only a drag needs
+    /// it, and a drag asked for before the window exists is refused rather than
+    /// guessing at a handle.
+    native: Option<BehaviorController>,
     /// Pushed, awaiting the overlay's identifier. Front is oldest.
     pending: VecDeque<CardId>,
     /// Overlay identifier to ours, for cards currently in the pile.
@@ -55,11 +61,19 @@ impl OverlayCards {
     pub fn new(handle: OverlayHandle) -> Self {
         Self {
             handle,
+            native: None,
             pending: VecDeque::new(),
             mapped: HashMap::new(),
             reverse: HashMap::new(),
             queued: VecDeque::new(),
         }
+    }
+
+    /// Also reports the native window, so drags can start from it.
+    #[must_use]
+    pub fn with_native(mut self, native: BehaviorController) -> Self {
+        self.native = Some(native);
+        self
     }
 
     /// A clone of the handle, for the window that draws it.
@@ -144,14 +158,13 @@ impl CardSurface for OverlayCards {
                 }
                 OverlayEvent::Dismissed { id, reason } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        // A drag that left the pile has already delivered the
-                        // file to wherever it was dropped. Treating it as a
-                        // plain dismissal would be right, but saying which it
-                        // was lets the pipeline release the bytes either way.
-                        out.push(match reason {
-                            DismissReason::DragOut => CardEvent::Drag(ours),
-                            _ => CardEvent::Dismiss(ours),
-                        });
+                        // Every reason ends the same way here: the card is gone
+                        // from the pile and its bytes can be released. A drag
+                        // that was handed to the platform never reaches this
+                        // arm — the overlay springs that card back and the host
+                        // dismisses it only once a drop is accepted.
+                        tracing::debug!(?reason, card = %ours, "card left the pile");
+                        out.push(CardEvent::Dismiss(ours));
                         self.forget(ours);
                     }
                 }
@@ -170,11 +183,25 @@ impl CardSurface for OverlayCards {
                         out.push(CardEvent::Open(ours));
                     }
                 }
-                OverlayEvent::DragStarted { id, .. } | OverlayEvent::DragOut { id, .. } => {
+                OverlayEvent::DragOutArmed { id, card, pointer } => {
+                    // The only event that starts a native drag, and the only
+                    // one that arrives while the mouse button is still down.
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Drag(ours));
+                        out.push(CardEvent::Drag {
+                            card: ours,
+                            at: DragSpot {
+                                card: [card.min.x, card.min.y, card.width(), card.height()],
+                                pointer: [pointer.x, pointer.y],
+                            },
+                        });
                     }
                 }
+                // `DragStarted` is the pointer merely moving with the button
+                // down — far too early to commit to anything. `DragOut` is the
+                // release-time report, which the overlay raises only when no
+                // host armed the gesture; this host always does, on every
+                // platform, and refuses visibly if it cannot.
+                OverlayEvent::DragStarted { .. } | OverlayEvent::DragOut { .. } => {}
                 OverlayEvent::DockCollapsed => {
                     // Collapsing is about the pile, not a card. The oldest one
                     // stands in for it so the event is not lost entirely.
@@ -205,6 +232,10 @@ impl CardSurface for OverlayCards {
 
     fn len(&self) -> usize {
         self.mapped.len() + self.pending.len()
+    }
+
+    fn native_surface(&self) -> Option<scrozz_shell::NativeSurface> {
+        self.native.as_ref()?.native_surface()
     }
 
     fn describe(&self) -> String {

@@ -8,30 +8,42 @@
 //!
 //! [`Intent::DragOut`]: https://docs.rs/scrozz-ui
 //!
-//! # The one property that matters: promise, do not write
+//! # The one property that matters: nothing is produced until a drag starts
 //!
-//! A drag-out **must not write the file to disk before the drop**. The
-//! receiving application chooses the destination — Slack uploads from memory,
-//! Finder wants a real file in a real folder, Figma wants image bytes and no
-//! file at all — and the only way to serve all three is to advertise *what*
-//! will be produced and produce it only when someone asks.
+//! A capture is **never** written to disk because it exists. The payload here
+//! carries a [`ByteSource`] — a closure — and not a `Vec<u8>` and never a
+//! `PathBuf`, so a pile of twenty cards costs twenty PNGs in memory and zero
+//! files. Encoding happens at most once, at the moment a drag begins, for the
+//! one card the user actually dragged.
 //!
-//! Writing eagerly to a temp directory and copying afterwards is how these
-//! tools end up littering `/tmp` with orphaned captures and pasting a path that
-//! points at a file the user cannot find. So the payload here carries a
-//! [`ByteSource`] — a closure — and not a `Vec<u8>` and never a `PathBuf`.
+//! # Why the drag itself hands over a real file
 //!
-//! Each platform has a native mechanism for exactly this:
+//! The original design here promised the file and produced it at the drop,
+//! through `NSFilePromiseProvider` and its equivalents. That is the API Apple
+//! documents and it is honoured by Finder, Mail and TextEdit — and by almost
+//! nothing else. Chromium reads `public.file-url` and ignores promises, which
+//! means every Electron application (Slack, Discord, VS Code, Notion) and
+//! every browser drop zone silently refuses a promise-only drag. Those are
+//! exactly the destinations D12 names as the reason drag-out is the hero
+//! interaction, so "correct but refused in Slack" is the wrong trade.
 //!
-//! | Platform | Promise mechanism | Image alongside |
+//! So the file is materialised once when the drag starts — see
+//! [`artifact`] — and offered as a real `file://` URL *alongside* the image
+//! bytes. [`artifact::DragArtifact`] owns how long it then lives, because
+//! deleting it when the platform says the drag ended is how a drag delivers a
+//! zero-byte file to an uploader that had not read it yet.
+//!
+//! What each platform is asked to advertise:
+//!
+//! | Platform | File | Image alongside |
 //! |---|---|---|
-//! | macOS | `NSFilePromiseProvider` + delegate | `public.png`, `public.tiff` |
-//! | Windows | `CFSTR_FILEDESCRIPTOR` + `CFSTR_FILECONTENTS` delayed rendering | `CF_DIBV5`, `"PNG"` |
+//! | macOS | `public.file-url` | `public.png`, `public.tiff` |
+//! | Windows | `CF_HDROP` | `"PNG"` |
 //! | Linux/X11 | XDND `text/uri-list` | `image/png` |
 //! | Linux/Wayland | `wl_data_device` | `image/png` |
 //!
-//! Only macOS is implemented. See [`DragCapability`] for what each of the
-//! others is missing and why, stated per D8 rather than half-built.
+//! macOS and Windows are implemented; Linux is not. See [`DragCapability`] for
+//! what each is missing and why, stated per D8 rather than half-built.
 //!
 //! # Offering the image too, not only the file
 //!
@@ -47,16 +59,22 @@
 //! Everything except the drag itself: filename derivation and sanitising, the
 //! type negotiation (extension ⇄ UTI ⇄ MIME), the promise callback producing
 //! the right bytes, the coordinate flip that places the drag image under the
-//! pointer, and the mapping from platform failure to [`scrozz_core::Error`].
-//! `tests/drag.rs` covers those by default and keeps everything that needs a
-//! window server behind `#[ignore]`.
+//! pointer, the artifact's whole state machine, and the mapping from platform
+//! failure to [`scrozz_core::Error`]. `tests/drag.rs` covers those by default
+//! and keeps everything that needs a window server behind `#[ignore]`.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize, Result};
 
 use crate::overlay::{AppKitRect, logical_to_appkit};
+
+pub mod artifact;
+pub mod hdrop;
+
+pub use artifact::{ArtifactState, DragArtifact};
 
 // ---------------------------------------------------------------------------
 // What is being dragged
@@ -479,6 +497,28 @@ impl DragPayload {
     pub fn preview_png(&self) -> Option<&[u8]> {
         self.preview.as_ref().map(DragPreview::png)
     }
+
+    /// Produces the file this drag will hand over, exactly once.
+    ///
+    /// Returns the artifact *and* the bytes that were written, so a backend can
+    /// put the same bytes on the pasteboard as image data without asking the
+    /// [`ByteSource`] a second time — one encode serves the file flavour and
+    /// the image flavour between them.
+    ///
+    /// The artifact is in [`ArtifactState::InFlight`] on return and deletes
+    /// itself if dropped, so a backend that fails between here and the native
+    /// call leaves nothing behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the [`ByteSource`] reported — typically a capture that
+    /// has been evicted — or [`Error::Io`] if the temp file could not be
+    /// written.
+    pub fn materialise(&self, root: &std::path::Path) -> Result<(DragArtifact, Vec<u8>)> {
+        let bytes = self.file.produce()?;
+        let artifact = DragArtifact::materialise(root, &self.file.file_name(), &bytes)?;
+        Ok((artifact, bytes))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +703,7 @@ impl DragOutcome {
 #[derive(Debug, Default)]
 struct SessionState {
     outcome: Mutex<Option<DragOutcome>>,
+    artifact: Mutex<Option<DragArtifact>>,
 }
 
 /// A drag in flight.
@@ -676,6 +717,12 @@ struct SessionState {
 /// platform's event dispatch and therefore inside `scrozz-ui`'s frame, with no
 /// `&mut` access to the stack that needs updating. Polling costs one mutex
 /// acquisition per frame and keeps every mutation on the UI's own terms.
+///
+/// The session also owns the temporary file the receiver was handed, because
+/// the outcome and the deletion are the same decision: see
+/// [`artifact::DragArtifact`] for why an accepted drop must *not* delete
+/// immediately. A caller polls [`Self::sweep`] until [`Self::is_settled`] and
+/// only then drops the session.
 #[derive(Debug, Clone)]
 pub struct DragSession {
     state: Arc<SessionState>,
@@ -705,6 +752,41 @@ impl DragSession {
         session
     }
 
+    /// Hands the session the file the receiver is being offered.
+    ///
+    /// Called by a backend immediately after materialising it, so that however
+    /// the drag ends — including a backend that fails on the next line — the
+    /// artifact has an owner that knows when to delete it.
+    pub fn attach_artifact(&self, artifact: DragArtifact) {
+        let mut slot = self.lock_artifact();
+        // An already-decided session would never sweep a newcomer, so settle it
+        // straight away rather than leaking it into the temp directory.
+        if let Some(outcome) = self.outcome() {
+            let mut artifact = artifact;
+            artifact.settle(&outcome);
+            *slot = Some(artifact);
+            return;
+        }
+        *slot = Some(artifact);
+    }
+
+    /// Where the artifact is in its life, if there is one.
+    #[must_use]
+    pub fn artifact_state(&self) -> Option<ArtifactState> {
+        self.lock_artifact()
+            .as_ref()
+            .map(super::drag::DragArtifact::state)
+    }
+
+    /// The path handed to the receiver, while it still exists.
+    #[must_use]
+    pub fn artifact_path(&self) -> Option<std::path::PathBuf> {
+        self.lock_artifact()
+            .as_ref()
+            .filter(|artifact| artifact.state().expects_file())
+            .map(|artifact| artifact.path().to_path_buf())
+    }
+
     /// Records the outcome. The first call wins; later ones are ignored.
     ///
     /// Later calls are ignored rather than overwriting because AppKit can
@@ -722,7 +804,11 @@ impl DragSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_none() {
-            *slot = Some(outcome);
+            *slot = Some(outcome.clone());
+            drop(slot);
+            if let Some(artifact) = self.lock_artifact().as_mut() {
+                artifact.settle(&outcome);
+            }
         }
     }
 
@@ -740,6 +826,40 @@ impl DragSession {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.outcome().is_none()
+    }
+
+    /// Deletes a retained artifact whose grace period has elapsed.
+    ///
+    /// Called every frame by whoever is holding the session. Cheap: one mutex
+    /// and one comparison until the deadline passes.
+    pub fn sweep(&self) {
+        self.sweep_at(Instant::now());
+    }
+
+    /// [`Self::sweep`] against a supplied clock, so tests need not sleep.
+    pub fn sweep_at(&self, now: Instant) {
+        if let Some(artifact) = self.lock_artifact().as_mut() {
+            artifact.sweep_at(now);
+        }
+    }
+
+    /// Whether the drag has ended *and* its file has been dealt with.
+    ///
+    /// The signal that a caller can stop polling and drop the session.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        if self.is_active() {
+            return false;
+        }
+        self.artifact_state()
+            .is_none_or(|state| state == ArtifactState::Removed)
+    }
+
+    fn lock_artifact(&self) -> std::sync::MutexGuard<'_, Option<DragArtifact>> {
+        self.state
+            .artifact
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -856,7 +976,10 @@ pub fn check_origin(origin: &DragOrigin) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub use crate::macos::drag::MacDragSource as NativeDragSource;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub use crate::windows::drag::WinDragSource as NativeDragSource;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use self::unimplemented_platform::PlannedDragSource as NativeDragSource;
 
 /// The drag backend for this platform.
@@ -871,39 +994,19 @@ pub fn native_drag_source() -> Result<NativeDragSource> {
     NativeDragSource::new()
 }
 
-/// The two backends that are designed but not built.
+/// The backend that is designed but not built.
 ///
 /// This module is not a placeholder that returns `todo!()`. Per D8 an
 /// unavailable capability is an *outcome*, so it reports itself accurately, and
 /// per the same decision the reason is written down rather than discovered
-/// later. What is recorded here is exactly what each platform needs, so the
+/// later. What is recorded here is exactly what the platform needs, so the
 /// work is a matter of writing the FFI rather than re-deriving the design.
 ///
-/// # Windows
-///
-/// The mechanism is settled: an `IDataObject` offering
-///
-/// - `CFSTR_FILEDESCRIPTORW` — an `FILEGROUPDESCRIPTORW` naming one file, with
-///   `FD_PROGRESSUI` set and no size, so Explorer shows progress and does not
-///   demand the length up front;
-/// - `CFSTR_FILECONTENTS` at index 0 with `TYMED_ISTREAM` — the delayed
-///   rendering that makes this a *promise*. An `IStream` implementation whose
-///   first `Read` calls [`PromisedFile::produce`] is the whole trick; returning
-///   `TYMED_HGLOBAL` instead would force the bytes to exist before the drop,
-///   which is the thing this module is built to avoid;
-/// - `CF_DIBV5` and the registered `"PNG"` format for the image flavour;
-///
-/// handed to `DoDragDrop` with an `IDropSource` that ends the drag on button
-/// release, plus `IDragSourceHelper2::InitializeFromBitmap` for the drag image.
-///
-/// **What blocks it:** `scrozz-shell` declares the `windows` crate with only
-/// `Win32_UI_WindowsAndMessaging`, `Win32_Foundation` and `Win32_Graphics_Gdi`.
-/// `IDataObject`, `IStream`, `DoDragDrop`, `IDropSource`, `SHCreateMemStream`
-/// and the shell clipboard formats live in `Win32_System_Com`,
-/// `Win32_System_Ole` and `Win32_UI_Shell`, none of which are enabled. Those
-/// three features — and a direct `windows-core` dependency for
-/// `#[windows::core::implement]` to generate the COM vtables — are what this
-/// needs. That is a `Cargo.toml` change, and is reported rather than made.
+/// Windows used to be described here and no longer is: `crate::windows::drag`
+/// implements `IDataObject`/`DoDragDrop` for real. It records there why it
+/// offers `CF_HDROP` eagerly rather than the delayed-rendering promise this
+/// module once planned — the file exists before the drag starts, so a promise
+/// buys nothing and costs compatibility.
 ///
 /// # Linux/X11
 ///
@@ -976,13 +1079,6 @@ pub mod unimplemented_platform {
     }
 
     /// Why this platform cannot drag yet, in the terms the module docs set out.
-    #[cfg(target_os = "windows")]
-    const WHY: &str = "the Windows IDataObject/DoDragDrop backend needs the \
-                       Win32_System_Com, Win32_System_Ole and Win32_UI_Shell \
-                       features of the `windows` crate, which scrozz-shell does \
-                       not declare";
-
-    /// Why this platform cannot drag yet, in the terms the module docs set out.
     #[cfg(target_os = "linux")]
     const WHY: &str = "the X11 XDND state machine and selection-serving loop are \
                        not implemented, and the Wayland backend additionally \
@@ -990,7 +1086,7 @@ pub mod unimplemented_platform {
                        which DragOrigin does not yet carry";
 
     /// Why this platform cannot drag yet, in the terms the module docs set out.
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     const WHY: &str = "Scrozz has no drag backend for this platform";
 
     impl DragSource for PlannedDragSource {

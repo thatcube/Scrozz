@@ -3317,6 +3317,7 @@ dependencies = [
  "tracing",
  "tray-icon",
  "windows",
+ "windows-core",
  "x11rb 0.14.0",
 ]
 

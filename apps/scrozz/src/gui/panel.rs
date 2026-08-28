@@ -27,18 +27,43 @@
 //! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
 //! `detail` string rather than being a bool.
 
-use std::ffi::c_void;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, ffi::c_void, rc::Rc};
 
-use raw_window_handle::HasWindowHandle;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use raw_window_handle::RawWindowHandle;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use scrozz_core::LogicalRect;
 #[cfg(target_os = "macos")]
 use scrozz_shell::OverlayWindow;
-use scrozz_shell::{NativeOverlay, OverlayBehavior, OverlayCursor};
+use scrozz_shell::{NativeOverlay, NativeSurface, OverlayBehavior, OverlayCursor};
 use scrozz_ui::PanelReport;
+
+/// The raw native window a drag can be begun from, if this platform has one.
+///
+/// Every backend wants a different handle — an `NSView *`, an `HWND`, an X11
+/// window id widened to a pointer — and the one place that knows which is the
+/// one that already matched on the raw handle. Wayland has no such handle at
+/// all: drags there travel over `wl_data_device` and need the compositor
+/// protocol object, not a window, so this answers `None` rather than inventing
+/// a pointer that would be dereferenced.
+///
+/// # Safety
+///
+/// `handle` must name a live window, and the returned surface must not outlive
+/// it.
+unsafe fn native_surface_of(handle: RawWindowHandle) -> Option<NativeSurface> {
+    let raw: *mut c_void = match handle {
+        #[cfg(target_os = "macos")]
+        RawWindowHandle::AppKit(appkit) => appkit.ns_view.as_ptr(),
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(win32) => isize::from(win32.hwnd) as *mut c_void,
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xlib(xlib) => xlib.window as *mut c_void,
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xcb(xcb) => xcb.window.get() as usize as *mut c_void,
+        _ => return None,
+    };
+    // SAFETY: forwarded from this function's own contract.
+    Some(unsafe { NativeSurface::from_raw(raw) })
+}
 
 /// Main-thread control of the native window behavior after the creation hook.
 ///
@@ -46,6 +71,13 @@ use scrozz_ui::PanelReport;
 /// to the one eframe thread and must never become callable from a capture worker.
 #[derive(Clone, Default)]
 pub struct BehaviorController {
+    /// The raw native window, kept so a drag can be begun from it.
+    ///
+    /// Separate from `overlay` because it exists on every platform and is
+    /// needed even where no native overlay adapter does: a drag needs the
+    /// `NSView *` / `HWND` / X11 window itself, not the panel behaviour built
+    /// on top of it.
+    surface: Rc<RefCell<Option<NativeSurface>>>,
     #[cfg(target_os = "macos")]
     overlay: Rc<RefCell<Option<NativeOverlay>>>,
     #[cfg(target_os = "linux")]
@@ -140,6 +172,17 @@ impl BehaviorController {
         {
             tracing::warn!(%error, "could not acquire X11 selector keyboard focus");
         }
+    }
+
+    /// The native window drags start from, once the window exists.
+    #[must_use]
+    pub fn native_surface(&self) -> Option<NativeSurface> {
+        *self.surface.borrow()
+    }
+
+    /// Records the native window, as reported by the creation hook.
+    fn install_surface(&self, surface: NativeSurface) {
+        *self.surface.borrow_mut() = Some(surface);
     }
 
     #[cfg(target_os = "macos")]
@@ -247,6 +290,20 @@ pub fn hook() -> scrozz_ui::PanelHook {
 /// The creation hook plus a handle for later card/selector behavior changes.
 #[must_use]
 pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelHook {
+    hook_with_controller_options(controller, true)
+}
+
+/// The creation hook, with the native conversion optional.
+///
+/// `convert` off still records the native window, because that is what a drag
+/// starts from and dragging a card out has nothing to do with whether the
+/// window is a panel. Switching the conversion off used to switch dragging off
+/// with it, silently, which is not a trade anyone chose.
+#[must_use]
+pub fn hook_with_controller_options(
+    controller: BehaviorController,
+    convert: bool,
+) -> scrozz_ui::PanelHook {
     Box::new(move |cc: &eframe::CreationContext<'_>| {
         let handle = match cc.window_handle() {
             Ok(handle) => handle,
@@ -256,6 +313,20 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
                 ));
             }
         };
+
+        // SAFETY: the raw handle names a live window for the duration of this
+        // hook, and the surface is only ever used from this same main thread
+        // while the window is open.
+        if let Some(native) = unsafe { native_surface_of(handle.as_raw()) } {
+            controller.install_surface(native);
+        }
+
+        if !convert {
+            return PanelReport::unsupported(
+                "the panel conversion is switched off; the window keeps its native \
+                 activation behaviour, but cards can still be dragged out",
+            );
+        }
 
         #[cfg(target_os = "macos")]
         let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
