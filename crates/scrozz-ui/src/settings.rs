@@ -902,16 +902,25 @@ enum Chord {
 /// Escape and Delete are intercepted before they can be bound, because a shortcut
 /// recorder that lets you bind the key that cancels it has no way out.
 fn capture_chord(input: &egui::InputState) -> Option<Chord> {
-    for event in &input.events {
+    capture_events(&input.events)
+}
+
+fn capture_events(events: &[egui::Event]) -> Option<Chord> {
+    for event in events {
         let egui::Event::Key {
             key,
+            physical_key,
             pressed: true,
+            repeat: false,
             modifiers,
             ..
         } = event
         else {
             continue;
         };
+        if is_modifier_key(*key) || physical_key.is_some_and(is_modifier_key) {
+            continue;
+        }
         return Some(match key {
             Key::Escape => Chord::Cancelled,
             Key::Delete | Key::Backspace => Chord::Cleared,
@@ -925,6 +934,20 @@ fn capture_chord(input: &egui::InputState) -> Option<Chord> {
         });
     }
     None
+}
+
+const fn is_modifier_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::SuperLeft
+            | Key::SuperRight
+    )
 }
 
 /// Spells an egui key press the way the hotkey parser expects to read it.
@@ -956,7 +979,7 @@ fn spell(key: Key, modifiers: Modifiers) -> Option<String> {
     };
 
     let mut spelled = String::new();
-    if modifiers.ctrl && !modifiers.mac_cmd {
+    if modifiers.ctrl {
         spelled.push_str("Ctrl+");
     }
     if modifiers.alt {
@@ -1188,7 +1211,111 @@ mod tests {
             mac_cmd: true,
             command: true,
         };
-        assert_eq!(press(Key::A, all), Some("Alt+Shift+Cmd+A".to_owned()));
+        assert_eq!(press(Key::A, all), Some("Ctrl+Alt+Shift+Cmd+A".to_owned()));
+    }
+
+    fn key_event(
+        key: Key,
+        physical_key: Option<Key>,
+        pressed: bool,
+        modifiers: Modifiers,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn captured(events: Vec<egui::Event>) -> Option<Chord> {
+        capture_events(&events)
+    }
+
+    #[test]
+    fn left_and_right_modifier_keys_never_commit_as_the_primary_key() {
+        for modifier in [
+            Key::ShiftLeft,
+            Key::ShiftRight,
+            Key::ControlLeft,
+            Key::ControlRight,
+            Key::AltLeft,
+            Key::AltRight,
+            Key::SuperLeft,
+            Key::SuperRight,
+        ] {
+            assert_eq!(
+                captured(vec![
+                    key_event(
+                        modifier,
+                        Some(modifier),
+                        true,
+                        Modifiers {
+                            alt: matches!(modifier, Key::AltLeft | Key::AltRight),
+                            ctrl: matches!(modifier, Key::ControlLeft | Key::ControlRight),
+                            shift: matches!(modifier, Key::ShiftLeft | Key::ShiftRight),
+                            mac_cmd: matches!(modifier, Key::SuperLeft | Key::SuperRight),
+                            command: matches!(modifier, Key::SuperLeft | Key::SuperRight),
+                        },
+                    ),
+                    key_event(modifier, Some(modifier), false, Modifiers::NONE,),
+                ]),
+                None,
+                "{modifier:?} must remain a modifier"
+            );
+        }
+    }
+
+    #[test]
+    fn either_side_of_every_modifier_produces_the_same_ordered_chord() {
+        let all = Modifiers {
+            alt: true,
+            ctrl: true,
+            shift: true,
+            mac_cmd: true,
+            command: true,
+        };
+        for modifiers in [
+            [
+                Key::ControlLeft,
+                Key::AltLeft,
+                Key::ShiftLeft,
+                Key::SuperLeft,
+            ],
+            [
+                Key::SuperRight,
+                Key::ShiftRight,
+                Key::AltRight,
+                Key::ControlRight,
+            ],
+        ] {
+            let mut events: Vec<_> = modifiers
+                .into_iter()
+                .map(|key| key_event(key, Some(key), true, all))
+                .collect();
+            events.push(key_event(Key::Num0, Some(Key::Num0), true, all));
+            assert_eq!(
+                captured(events),
+                Some(Chord::Pressed("Ctrl+Alt+Shift+Cmd+0".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn key_up_events_cannot_replace_the_captured_non_modifier_key() {
+        let mut shifted_command = CMD;
+        shifted_command.shift = true;
+        assert_eq!(
+            captured(vec![
+                key_event(Key::ShiftLeft, Some(Key::ShiftLeft), true, shifted_command,),
+                key_event(Key::Num0, Some(Key::Num0), true, shifted_command),
+                key_event(Key::Num0, Some(Key::Num0), false, shifted_command),
+                key_event(Key::ShiftLeft, Some(Key::ShiftLeft), false, CMD),
+                key_event(Key::SuperLeft, Some(Key::SuperLeft), false, Modifiers::NONE,),
+            ]),
+            Some(Chord::Pressed("Shift+Cmd+0".to_owned()))
+        );
     }
 
     #[test]

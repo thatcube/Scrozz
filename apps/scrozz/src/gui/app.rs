@@ -1022,13 +1022,29 @@ mod tests {
     #[test]
     fn a_recorded_combination_replaces_the_old_one() {
         let mut app = app_with_shortcuts(Shortcuts::default());
+        let recorded = "Ctrl+Alt+Shift+Cmd+0";
         app.edit_shortcuts(&[ShortcutEdit::Set {
             id: ShortcutAction::CaptureRegion.id().to_owned(),
-            accelerator: "Ctrl+Shift+F9".to_owned(),
+            accelerator: recorded.to_owned(),
         }]);
+        let registered = Accelerator::parse(recorded)
+            .expect("recorded chord parses")
+            .to_string();
         assert_eq!(
             app.shortcuts.get(ShortcutAction::CaptureRegion),
-            Some("Ctrl+Shift+F9")
+            Some(registered.as_str())
+        );
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is always listed");
+        assert_eq!(row.accelerator, registered);
+        assert_eq!(
+            row.symbols,
+            Accelerator::parse(&row.accelerator)
+                .expect("recorded chord parses")
+                .symbols()
         );
     }
 
