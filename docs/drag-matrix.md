@@ -20,9 +20,19 @@ These run on every push and need no display server.
 | The card arms mid-gesture rather than at mouse-up | `scrozz-ui` — `tests/stack.rs`, "Mid-gesture hand-off" |
 | An uncommitted press never arms a drag | same |
 | The card is dismissed only on `Accepted` | `apps/scrozz` — `app.rs` drag tests |
+| `Cancelled`, `Rejected` and `Failed` each release the gesture and keep the card | same |
+| An outcome is acted on exactly once | same |
+| A settled drag springs the card back and frees the pile for the next one | `scrozz-ui` — `tests/stack.rs`, "Settling a drag the platform ran" |
+| A stale outcome cannot cancel whatever the user is holding now | same |
+| The native drag begins in the UI pass, not the logic pass | `apps/scrozz` — `host.rs`, `native_drags_are_started_in_the_ui_pass` |
+| An armed drag is acted on with no `tick` in between | `apps/scrozz` — `app.rs`, `an_armed_drag_is_acted_on_without_waiting_for_a_tick` |
+| A drag jumps the event queue; nothing else does | `apps/scrozz` — `overlay.rs` drag-splitting tests |
 | The pasteboard advertises `public.file-url` first, then `public.png`, then `public.tiff`, on one item | `scrozz-shell` — `tests/drag.rs`, `#[ignore]`d AppKit tests |
+| A payload with no image producer advertises **neither** `public.png` nor `public.tiff` | same |
+| Only a payload with an image offers image flavours, and never the file bytes | `scrozz-shell` — `tests/drag.rs`, payload matrix tests |
 | The advertised URL round-trips back to the file we wrote | same |
 | The Windows `CF_HDROP` payload has the right header offset, `fWide` flag and double NUL | `scrozz-shell` — `drag::hdrop` tests (run on **all** platforms) |
+| The Windows drag image is straight-alpha, not premultiplied | `scrozz-shell` — `drag::alpha` tests (run on **all** platforms) |
 
 The AppKit tests are `#[ignore]`d because they need a real `NSPasteboard`. Run
 them deliberately:
@@ -116,11 +126,24 @@ see and a drop fails silently on.
 
 It offers three formats, in this preference order:
 
-| Format | Why |
-| --- | --- |
-| `CF_HDROP` | The universal one. Explorer, Office, browsers, Slack, Discord, Teams |
-| Registered `"PNG"` | What Chromium reads when it wants pixels rather than a path |
-| `CF_UNICODETEXT` | The path as text — the cheap last resort |
+| Format | Why | When |
+| --- | --- | --- |
+| `CF_HDROP` | The universal one. Explorer, Office, browsers, Slack, Discord, Teams | Always |
+| Registered `"PNG"` | What Chromium reads when it wants pixels rather than a path | Only when the payload has an image producer |
+| `CF_UNICODETEXT` | The path as text — the cheap last resort | Always |
+
+### The drag image must be straight alpha
+
+`IDragSourceHelper::InitializeFromBitmap` premultiplies the bitmap itself.
+Microsoft's own documentation is explicit that passing premultiplied input
+raises no error and simply multiplies again, doubling the alpha — a translucent
+drag image comes out visibly darker and more transparent than it should. So the
+bitmap handed to it is straight-alpha BGRA, which WIC is asked for directly. The
+PBGRA path survives only as a fallback, followed by an explicit unpremultiply,
+because that conversion loses precision at low alpha and must not be the default.
+`crates/scrozz-shell/src/drag/alpha.rs` holds the conversion and its tests; they
+are portable and run on every platform, including the double-premultiplication
+demonstration.
 
 Delayed rendering (`CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`) is
 deliberately not used. The file already exists on disk before the drag begins, so

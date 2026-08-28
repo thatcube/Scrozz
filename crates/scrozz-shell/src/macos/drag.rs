@@ -367,9 +367,16 @@ fn capture_item(
 
     // Eager, from bytes that already exist: a receiver that wants image data
     // gets it without a callback that could outlive its provider.
-    if !png.is_empty() {
-        item.setData_forType(&NSData::with_bytes(png), png_type);
+    //
+    // Empty means the payload offered no image — an MP4 or a JPEG capture. Both
+    // image flavours are then withheld together, because a `public.tiff` the
+    // provider cannot fill is a type the receiver will ask for and get nothing
+    // from, which reads to it as a failed drop rather than an absent flavour.
+    if png.is_empty() {
+        return Ok(item);
     }
+
+    item.setData_forType(&NSData::with_bytes(png), png_type);
 
     let types = NSArray::from_slice(&[tiff_type]);
     let as_protocol: &ProtocolObject<dyn NSPasteboardItemDataProvider> =
@@ -519,7 +526,16 @@ impl DragSource for MacDragSource {
         // The one encode this whole feature costs, and the only write. If it
         // fails, nothing native has been touched yet.
         let (artifact, bytes) = payload.materialise(&artifact_root())?;
-        let png = std::sync::Arc::new(bytes);
+        let file_bytes = std::sync::Arc::new(bytes);
+
+        // Image flavours come from the image producer, never from the file
+        // bytes. For a screenshot the two are the same `Arc` and this costs
+        // nothing; for an MP4 or a JPEG there is no image to offer and this is
+        // the difference between "no PNG flavour" and "a PNG flavour that is
+        // not a PNG".
+        let png = payload
+            .image_png(&file_bytes)?
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
 
         let session = DragSession::new();
         // Attached before anything can fail, so every exit path from here has an
@@ -565,7 +581,8 @@ impl DragSource for MacDragSource {
 
         tracing::info!(
             file = %payload.file().file_name(),
-            bytes = png.len(),
+            bytes = file_bytes.len(),
+            image = !png.is_empty(),
             "drag: session began"
         );
         Ok(session)
@@ -607,10 +624,18 @@ pub mod test_support {
         /// Propagates whatever the byte producer, the filesystem or AppKit
         /// returned.
         pub fn new(payload: &DragPayload, root: &std::path::Path) -> Result<Self> {
+            // Mirrors `begin` exactly, including the split between the bytes
+            // written to disk and the bytes offered as an image. A harness that
+            // shortcut that split would report flavours the real drag does not
+            // advertise.
             let (artifact, bytes) = payload.materialise(root)?;
-            let provider = ScrozzImageProvider::new(std::sync::Arc::new(bytes.clone()));
+            let file_bytes = std::sync::Arc::new(bytes);
+            let png = payload
+                .image_png(&file_bytes)?
+                .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+            let provider = ScrozzImageProvider::new(std::sync::Arc::clone(&png));
             hold_provider(&provider);
-            let item = capture_item(artifact.path(), &bytes, &provider)?;
+            let item = capture_item(artifact.path(), &png, &provider)?;
             Ok(Self {
                 item,
                 provider,

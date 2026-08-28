@@ -1184,6 +1184,52 @@ impl CaptureStack {
         }
     }
 
+    /// Ends `id`'s drag from outside the gesture, and springs the card back.
+    ///
+    /// # Why this is not [`Self::cancel_drag`]
+    ///
+    /// Two differences, and both matter.
+    ///
+    /// It names the card. `cancel_drag` ends whatever is held, which is right
+    /// when the pointer itself let go, and wrong when the caller is a native
+    /// drag session finishing: by then the user may already be holding a
+    /// different card, and cancelling *that* gesture because an older one
+    /// finished would yank a card out from under the pointer.
+    ///
+    /// It does not require a drag to be in progress. After a native drag the
+    /// platform runs a modal event loop that can swallow the mouse-up entirely,
+    /// so the release this surface was waiting for may never arrive — the card
+    /// is left held, displaced, and unable to be dragged again. Equally, the
+    /// release may have arrived normally and been handled already. This copes
+    /// with both, because the caller cannot know which happened and should not
+    /// have to.
+    ///
+    /// Returns whether anything actually changed, which is what lets a caller
+    /// tell "the gesture was still stuck" from "the release came through
+    /// normally" without inspecting private state.
+    pub fn settle_drag(&mut self, id: CardId, m: &Motion) -> bool {
+        let mut changed = false;
+
+        if self.drag.as_ref().is_some_and(|drag| drag.id == id) {
+            self.drag = None;
+            changed = true;
+        }
+
+        // Displacement outlives the drag record, so this is checked separately
+        // rather than only when a drag was found.
+        if let Some(slot) = self.slot_of(id)
+            && self
+                .cards
+                .get(slot)
+                .is_some_and(|card| card.drag.is_some() || card.lifted)
+        {
+            self.spring_back(slot, m);
+            changed = true;
+        }
+
+        changed
+    }
+
     /// Sends a card back to its slot from wherever it is.
     fn spring_back(&mut self, slot: usize, m: &Motion) {
         let Some(card) = self.cards.get_mut(slot) else {

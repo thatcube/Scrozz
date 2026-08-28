@@ -47,6 +47,7 @@ use crate::{
     json::Json,
     report::Report,
 };
+use scrozz_shell::DragOutcome;
 
 /// What a hotkey is bound to unless the environment says otherwise.
 ///
@@ -535,6 +536,31 @@ impl App {
         }
     }
 
+    /// Starts any native drag the surface armed during the frame just drawn.
+    ///
+    /// **Must be called from the UI pass, immediately after the surface has
+    /// drawn.** `beginDraggingSessionWithItems:` on macOS and `DoDragDrop` on
+    /// Windows both seize the mouse from where it is *now*, so they only work
+    /// while the button the user is holding is still down. [`Self::tick`] runs
+    /// in the host's logic pass, which precedes the UI pass that produces the
+    /// gesture — draining there means acting a whole frame late, on a button
+    /// that may already be up. That is the bug this method exists to close, and
+    /// it is why the drag path is the one thing that does not wait its turn.
+    ///
+    /// Returns how many drags were started, which is what the ordering test
+    /// asserts on.
+    pub fn pump_drag_starts(&mut self) -> usize {
+        let armed = self.surface.poll_drag_starts();
+        let mut started = 0;
+        for event in armed {
+            if let CardEvent::Drag { card, at } = event {
+                self.begin_drag(card, at);
+                started += 1;
+            }
+        }
+        started
+    }
+
     /// Hands a card to the platform's drag machinery.
     ///
     /// Called while the mouse button is still down — see [`crate::gui::drag`]
@@ -563,13 +589,45 @@ impl App {
 
     /// Services drags already under way.
     ///
-    /// Two jobs: take a card off the stack once its drop was accepted, and keep
-    /// sweeping the temporary file afterwards until the retention window closes.
+    /// Three jobs: release the surface's gesture whatever happened, take a card
+    /// off the stack once its drop was accepted, and keep sweeping the
+    /// temporary file afterwards until the retention window closes.
+    ///
+    /// The gesture release is unconditional and comes first. The platform's
+    /// drag loop is modal and may have eaten the mouse-up the surface was
+    /// waiting for, so this is the only reliable moment the card is known to be
+    /// free — and a card left armed can never be dragged again.
     fn drain_drags(&mut self) {
-        for card in self.drag.poll() {
-            self.surface.dismiss(card);
-            self.pipeline.post(Job::Release(card));
-            self.note(format!("{card} dropped"));
+        for (card, outcome) in self.drag.poll() {
+            let accepted = matches!(outcome, DragOutcome::Accepted { .. });
+            self.surface.settle_drag(card, accepted);
+
+            match outcome {
+                DragOutcome::Accepted { .. } => {
+                    self.surface.dismiss(card);
+                    self.pipeline.post(Job::Release(card));
+                    self.note(format!("{card} dropped"));
+                }
+                // The card stays. Said out loud rather than logged quietly:
+                // "I dragged it and nothing happened" is the complaint this
+                // whole path exists to answer, and the three reasons it can
+                // happen are worth telling apart.
+                DragOutcome::Cancelled => {
+                    tracing::debug!(%card, "drag cancelled");
+                }
+                DragOutcome::Rejected => {
+                    self.note(format!("{card} was not accepted there"));
+                }
+                DragOutcome::Failed(why) => {
+                    self.note(format!("{card} could not be dropped: {why}"));
+                }
+                // The enum is `#[non_exhaustive]`. A future outcome this build
+                // has never heard of still has to release the gesture, which it
+                // already did above — so the only thing left is to say so.
+                other => {
+                    tracing::warn!(%card, ?other, "drag ended in an unrecognised way");
+                }
+            }
         }
     }
 
@@ -978,5 +1036,203 @@ mod tests {
         assert_eq!(menu.len(), TrayAction::ALL.len());
         assert!(menu.contains(&Action::Quit));
         assert!(menu.contains(&Action::Capture(CaptureKind::Fullscreen)));
+    }
+
+    // -----------------------------------------------------------------------
+    // When the drag starts, not just that it starts
+    // -----------------------------------------------------------------------
+    //
+    // The original bug produced entirely correct events, one frame too late.
+    // `beginDraggingSessionWithItems:` and `DoDragDrop` both take the mouse
+    // from where it is *now*, so a drag armed during the UI pass and acted on
+    // during the next logic pass is acted on after the button came up — and
+    // the platform simply refuses. Tests that only assert the event was
+    // produced cannot see that, so these assert on the order of the calls.
+
+    use crate::gui::card::SurfaceCall;
+
+    fn drag_spot() -> DragSpot {
+        DragSpot {
+            card: [10.0, 20.0, 210.0, 150.0],
+            pointer: [60.0, 70.0],
+        }
+    }
+
+    #[test]
+    fn an_armed_drag_is_acted_on_without_waiting_for_a_tick() {
+        // The property, stated exactly: between the surface arming the drag and
+        // the app acting on it, nothing else runs. In particular no `tick`,
+        // which is the pass that used to own this and is a frame away.
+        let (mut app, surface) = app();
+        surface.arm(CardEvent::Drag {
+            card: CardId(1),
+            at: drag_spot(),
+        });
+        surface.clear_trace();
+
+        assert_eq!(app.pump_drag_starts(), 1, "the armed drag was not started");
+        assert_eq!(
+            surface.trace(),
+            vec![SurfaceCall::PollDragStarts],
+            "something other than the drag drain ran inside the gesture frame"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_drain_is_not_what_starts_a_drag() {
+        // If `tick` still started drags, moving the call would be cosmetic and
+        // the bug would survive. It must not: `tick` drains `poll`, and `poll`
+        // is a frame behind.
+        let (mut app, surface) = app();
+        surface.arm(CardEvent::Drag {
+            card: CardId(1),
+            at: drag_spot(),
+        });
+        surface.clear_trace();
+
+        app.tick();
+        assert!(
+            !surface.trace().contains(&SurfaceCall::PollDragStarts),
+            "the logic pass drained the armed drags: {:?}",
+            surface.trace()
+        );
+        assert_eq!(
+            app.pump_drag_starts(),
+            1,
+            "the drag was consumed by the wrong pass and is gone"
+        );
+    }
+
+    #[test]
+    fn pumping_drags_leaves_the_ordinary_events_alone() {
+        // The drag jumps the queue; nothing else may.
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Copy(CardId(2)));
+        surface.arm(CardEvent::Drag {
+            card: CardId(1),
+            at: drag_spot(),
+        });
+
+        assert_eq!(app.pump_drag_starts(), 1);
+        app.tick();
+        assert!(
+            surface.trace().contains(&SurfaceCall::Poll),
+            "the queued copy was never drained"
+        );
+    }
+
+    #[test]
+    fn a_drag_with_no_capture_behind_it_says_so_rather_than_failing_silently() {
+        let (mut app, surface) = app();
+        surface.arm(CardEvent::Drag {
+            card: CardId(77),
+            at: drag_spot(),
+        });
+
+        assert_eq!(app.pump_drag_starts(), 1, "the attempt still counts");
+        assert!(
+            app.notes().iter().any(|n| n.contains("no capture")),
+            "a drag that could not start said nothing: {:?}",
+            app.notes()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Every outcome reaches the card
+    // -----------------------------------------------------------------------
+    //
+    // The platform's drag loop is modal and can consume the mouse-up, so the
+    // surface may never learn the gesture ended. Whatever the outcome, the
+    // gesture is released — and only an accepted drop retires the card.
+
+    /// Runs `drain_drags` against a session that has already finished.
+    fn settle(outcome: DragOutcome) -> (Vec<SurfaceCall>, Vec<String>) {
+        let (mut app, surface) = app();
+        app.drag.adopt_finished(CardId(3), outcome);
+        surface.clear_trace();
+        app.drain_drags();
+        (surface.trace(), app.notes().to_vec())
+    }
+
+    #[test]
+    fn an_accepted_drop_releases_the_gesture_then_retires_the_card() {
+        let (trace, notes) = settle(DragOutcome::Accepted(scrozz_shell::DragOperation::Copy));
+        assert_eq!(
+            trace,
+            vec![
+                SurfaceCall::Settle {
+                    id: CardId(3),
+                    accepted: true
+                },
+                SurfaceCall::Dismiss(CardId(3)),
+            ],
+            "the card was retired before its gesture was released"
+        );
+        assert!(notes.iter().any(|n| n.contains("dropped")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_cancelled_drag_releases_the_gesture_and_keeps_the_card() {
+        let (trace, _) = settle(DragOutcome::Cancelled);
+        assert_eq!(
+            trace,
+            vec![SurfaceCall::Settle {
+                id: CardId(3),
+                accepted: false
+            }],
+            "a cancelled drag must release the gesture and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_rejected_drop_releases_the_gesture_and_says_so() {
+        let (trace, notes) = settle(DragOutcome::Rejected);
+        assert_eq!(
+            trace,
+            vec![SurfaceCall::Settle {
+                id: CardId(3),
+                accepted: false
+            }]
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("not accepted")),
+            "a refused drop was silent: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_drag_releases_the_gesture_and_reports_the_reason() {
+        let (trace, notes) = settle(DragOutcome::Failed("the pasteboard refused".to_owned()));
+        assert_eq!(
+            trace,
+            vec![SurfaceCall::Settle {
+                id: CardId(3),
+                accepted: false
+            }]
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("the pasteboard refused")),
+            "the reason a drag failed was swallowed: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_outcome_is_only_acted_on_once() {
+        // `drain_drags` runs every tick, and the session stays around while its
+        // file is being swept. Reporting twice would dismiss a card the user
+        // had since brought back.
+        let (mut app, surface) = app();
+        app.drag.adopt_finished(
+            CardId(3),
+            DragOutcome::Accepted(scrozz_shell::DragOperation::Copy),
+        );
+        app.drain_drags();
+        surface.clear_trace();
+        app.drain_drags();
+        assert!(
+            surface.trace().is_empty(),
+            "the same outcome was acted on twice: {:?}",
+            surface.trace()
+        );
     }
 }

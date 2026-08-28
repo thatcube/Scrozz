@@ -205,13 +205,19 @@ struct CaptureData {
 
 impl CaptureData {
     /// Everything this drag offers, in preference order.
+    ///
+    /// `png` empty means the payload offered no image — an MP4 or a JPEG
+    /// capture — and the registered `"PNG"` format is then not advertised at
+    /// all. Registering it over the file's bytes would hand a receiver that
+    /// prefers pixels something that is not a PNG. `CF_HDROP` is unconditional
+    /// because it names a real file whatever is in it.
     fn new(path: &Path, png: &[u8]) -> Self {
         let mut flavours = vec![Flavour {
             format: CF_HDROP.0,
             bytes: hdrop_bytes(path),
         }];
         let png_id = png_format();
-        if png_id != 0 {
+        if png_id != 0 && !png.is_empty() {
             flavours.push(Flavour {
                 format: png_id,
                 bytes: png.to_vec(),
@@ -398,8 +404,9 @@ fn try_attach_image(data: &IDataObject, png: &[u8], cursor: POINT) -> WinResult<
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, HDC,
     };
     use windows::Win32::Graphics::Imaging::{
-        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
-        WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnDemand,
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, GUID_WICPixelFormat32bppPBGRA,
+        IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut,
+        WICDecodeMetadataCacheOnDemand,
     };
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 
@@ -427,19 +434,46 @@ fn try_attach_image(data: &IDataObject, png: &[u8], cursor: POINT) -> WinResult<
     };
     let frame = unsafe { decoder.GetFrame(0)? };
 
-    // Premultiplied BGRA is what a 32-bit DIB with an alpha channel wants, and
-    // what the drag helper blends correctly. Anything else shows black fringes.
-    let converter = unsafe { factory.CreateFormatConverter()? };
-    unsafe {
+    // Straight-alpha BGRA, *not* premultiplied. `InitializeFromBitmap` is
+    // documented to perform the multiplication itself and to report no error if
+    // handed premultiplied input — it simply multiplies again, halving a
+    // half-alpha pixel a second time. For a card with a soft shadow that is a
+    // visibly dark, visibly wrong thumbnail with nothing in any log.
+    //
+    // Asked of WIC directly rather than converted here: going via PBGRA and
+    // dividing back out is lossy at low alpha, and there is no reason to pay
+    // that when the decoder can hand over the flavour wanted. `super::alpha` is
+    // the fallback for the pairs WIC declines.
+    let mut converter = unsafe { factory.CreateFormatConverter()? };
+    let straight = unsafe {
         converter.Initialize(
             &frame,
-            &GUID_WICPixelFormat32bppPBGRA,
+            &GUID_WICPixelFormat32bppBGRA,
             WICBitmapDitherTypeNone,
             None,
             0.0,
             WICBitmapPaletteTypeMedianCut,
-        )?;
-    }
+        )
+    };
+    let premultiplied = if straight.is_ok() {
+        false
+    } else {
+        // A second converter: one that failed `Initialize` is not documented to
+        // be reusable, and reusing it would be guessing.
+        let retry = unsafe { factory.CreateFormatConverter()? };
+        unsafe {
+            retry.Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeMedianCut,
+            )?;
+        }
+        converter = retry;
+        true
+    };
 
     let (mut width, mut height) = (0_u32, 0_u32);
     // SAFETY: both out-pointers address live locals.
@@ -492,6 +526,12 @@ fn try_attach_image(data: &IDataObject, png: &[u8], cursor: POINT) -> WinResult<
             stride,
             std::slice::from_raw_parts_mut(bits.cast::<u8>(), total as usize),
         )?;
+    }
+
+    if premultiplied {
+        // SAFETY: the DIB owns exactly `total` bytes, just written by WIC.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), total as usize) };
+        crate::drag::alpha::unpremultiply_bgra(pixels);
     }
 
     let image = SHDRAGIMAGE {
@@ -571,6 +611,14 @@ impl DragSource for WinDragSource {
 
         // The one encode and the one write, exactly as on macOS.
         let (artifact, bytes) = payload.materialise(&artifact_root())?;
+        let file_bytes = std::sync::Arc::new(bytes);
+
+        // The registered "PNG" flavour comes from the image producer, never
+        // from the file. Empty means the payload had no image to offer and the
+        // format is withheld rather than filled with something that is not one.
+        let png = payload
+            .image_png(&file_bytes)?
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
 
         let session = DragSession::new();
         // Attached before anything can fail, so every exit path owns the file.
@@ -580,7 +628,7 @@ impl DragSource for WinDragSource {
             .artifact_path()
             .ok_or_else(|| Error::Platform("the drag file went missing".to_owned()))?;
 
-        let data: IDataObject = CaptureData::new(&path, &bytes).into();
+        let data: IDataObject = CaptureData::new(&path, &png).into();
         let source: IDropSource = CaptureSource.into();
 
         // Where inside the thumbnail the pointer grabbed, so the image does not

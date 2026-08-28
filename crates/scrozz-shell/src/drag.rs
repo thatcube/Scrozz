@@ -71,6 +71,7 @@ use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize, Result};
 
 use crate::overlay::{AppKitRect, logical_to_appkit};
 
+pub mod alpha;
 pub mod artifact;
 pub mod hdrop;
 
@@ -498,12 +499,61 @@ impl DragPayload {
         self.preview.as_ref().map(DragPreview::png)
     }
 
+    /// The bytes to advertise as clipboard *image* data, if any.
+    ///
+    /// **A backend must call this rather than reusing what [`Self::materialise`]
+    /// wrote.** The two are the same only for a still-image capture. A drag
+    /// whose promised file is an MP4, a JPEG, a WebP or a GIF has no PNG to
+    /// offer, and labelling the file's bytes `public.png` — or Windows'
+    /// registered `"PNG"` — publishes a corrupt image to every target that
+    /// prefers pixels over paths. The file flavour is unaffected: `file-url`
+    /// and `CF_HDROP` name a real file whatever is in it.
+    ///
+    /// Returns `None` when no image was offered, which is the case to respect
+    /// by advertising no image type at all.
+    ///
+    /// `file_bytes` is what `materialise` already produced. When one producer
+    /// backs both flavours — the ordinary screenshot, built by
+    /// [`Self::png_capture`] — those bytes are handed straight back and nothing
+    /// is encoded twice. That is the optimisation this used to get by assuming;
+    /// it is now checked rather than assumed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the image [`ByteSource`] reported, when it has to be asked.
+    pub fn image_png(&self, file_bytes: &Arc<Vec<u8>>) -> Result<Option<Arc<Vec<u8>>>> {
+        let Some(source) = &self.image else {
+            return Ok(None);
+        };
+
+        if self.image_is_file() {
+            return Ok(Some(Arc::clone(file_bytes)));
+        }
+
+        Ok(Some(Arc::new(source()?)))
+    }
+
+    /// Whether the promised file *is* the image that would be advertised.
+    ///
+    /// True only when the file is a PNG and the very same producer backs both
+    /// flavours. Pointer equality rather than a format check alone: two
+    /// distinct PNG producers may yield different pixels — a full capture and a
+    /// cropped one, say — and quietly substituting one for the other would be a
+    /// subtler bug than the one this guards.
+    #[must_use]
+    pub fn image_is_file(&self) -> bool {
+        self.file.format() == DragFormat::Png
+            && self
+                .image
+                .as_ref()
+                .is_some_and(|image| Arc::ptr_eq(image, &self.file.bytes))
+    }
+
     /// Produces the file this drag will hand over, exactly once.
     ///
-    /// Returns the artifact *and* the bytes that were written, so a backend can
-    /// put the same bytes on the pasteboard as image data without asking the
-    /// [`ByteSource`] a second time — one encode serves the file flavour and
-    /// the image flavour between them.
+    /// Returns the artifact *and* the bytes that were written. Use
+    /// [`Self::image_png`] to decide what — if anything — those bytes may also
+    /// be advertised as; they are not image data by virtue of existing.
     ///
     /// The artifact is in [`ArtifactState::InFlight`] on return and deletes
     /// itself if dropped, so a backend that fails between here and the native

@@ -597,6 +597,17 @@ impl eframe::App for Driver {
             self.selection.ui(ui);
         } else {
             self.overlay.ui(ui, frame);
+
+            // Inside the same frame that drew the gesture, while the mouse
+            // button is still physically down. `App::tick` runs in `logic`,
+            // which precedes this pass — draining a drag there would start it
+            // a frame late, after the button may have been released, and the
+            // native call would either refuse or capture a mouse that is no
+            // longer held. Nothing else here is time-critical; this is.
+            let started = self.app.pump_drag_starts();
+            if started > 0 {
+                tracing::debug!(started, "drag: began within the gesture frame");
+            }
         }
         self.settings.show(
             ui.ctx(),
@@ -745,6 +756,66 @@ pub fn headless_requested() -> bool {
 mod tests {
     use super::*;
     use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
+
+    /// Which frame pass a call sits in, read from this file's own source.
+    ///
+    /// `Driver` needs a live `eframe::Frame` and a window, so no test can
+    /// drive its two passes. But *which pass* starts a native drag is the
+    /// whole bug — a drain moved from `ui` back into `logic` produces
+    /// identical events one frame late, when the mouse button is already up
+    /// and AppKit will refuse. That is exactly the kind of regression a
+    /// reviewer would wave through, so it is pinned here rather than left to
+    /// the comment beside it.
+    fn driver_pass(name: &str) -> &'static str {
+        let src = include_str!("host.rs");
+        // The second `impl eframe::App` block in this file is `Driver`'s; the
+        // first belongs to `OneShotDriver`.
+        let driver = src
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .expect("Driver must implement eframe::App");
+        let logic = driver
+            .split_once("fn logic(")
+            .expect("Driver has a logic pass")
+            .1;
+        let (logic_body, after) = logic
+            .split_once("fn ui(")
+            .expect("the ui pass follows the logic pass");
+        let ui_body = after
+            .split_once("fn clear_color(")
+            .expect("clear_color follows the ui pass")
+            .0;
+
+        match (logic_body.contains(name), ui_body.contains(name)) {
+            (true, false) => "logic",
+            (false, true) => "ui",
+            (true, true) => "both",
+            (false, false) => "neither",
+        }
+    }
+
+    #[test]
+    fn native_drags_are_started_in_the_ui_pass() {
+        assert_eq!(
+            driver_pass("pump_drag_starts()"),
+            "ui",
+            "native drags must begin inside the frame that drew the gesture, \
+             while the mouse button is still down — not in the logic pass, \
+             which runs a frame earlier and would act on a released button"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_event_drain_stays_in_the_logic_pass() {
+        // The other half. `tick` deliberately runs while the window is hidden,
+        // so a menu-bar app still notices hotkeys at rest; moving it into `ui`
+        // to "fix" drag timing would break that instead.
+        assert_eq!(
+            driver_pass("app.tick()"),
+            "logic",
+            "the app's ordinary tick must keep running in the logic pass"
+        );
+    }
 
     #[test]
     fn a_headless_run_ends_by_itself() {

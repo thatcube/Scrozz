@@ -357,12 +357,52 @@ pub trait CardSurface {
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
 
+    /// Reports that `id`'s native drag has finished, however it finished.
+    ///
+    /// The surface armed the gesture and then handed it to the platform; this
+    /// is how it learns the platform is done. It must be called for **every**
+    /// outcome, because a native drag loop can consume the mouse-up that the
+    /// surface would otherwise have used to notice — leaving a card held under
+    /// a pointer that has long since let go, and unable to be dragged again.
+    ///
+    /// `accepted` says whether something took the drop. Every outcome releases
+    /// the gesture; only an accepted one is followed by the card being retired.
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        let _ = (id, accepted);
+    }
+
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
     /// Polled rather than delivered through a callback, for the same reason
     /// `scrozz-shell` polls `muda`: a registered handler is a global the first
     /// caller wins.
     fn poll(&mut self) -> Option<CardEvent>;
+
+    /// Takes only the drag-outs, leaving every other event for [`Self::poll`].
+    ///
+    /// # Why this exists separately
+    ///
+    /// Every other card event can wait a frame. A drag-out cannot. AppKit's
+    /// `beginDraggingSessionWithItems:` and OLE's `DoDragDrop` both take over
+    /// the mouse from wherever it *currently* is, so they have to be called
+    /// while the button is still physically down — within the same input frame
+    /// that produced the gesture. One frame late is a drag that never starts,
+    /// or worse, one that starts under a released button and follows the cursor
+    /// until the user clicks something.
+    ///
+    /// The ordinary [`Self::poll`] is drained from the host's logic pass, which
+    /// runs *before* the UI pass that generates the gesture — so an event born
+    /// in frame N is not seen until frame N+1. This method is called straight
+    /// after the surface has drawn, inside the same frame, and returns only the
+    /// events that cannot survive that wait. Everything else it drains is
+    /// buffered and comes back out of `poll` in order.
+    ///
+    /// Returning drags ahead of buffered non-drag events is deliberate: the
+    /// alternative is holding a drag behind a dismiss for a frame, which is the
+    /// exact failure this exists to prevent.
+    fn poll_drag_starts(&mut self) -> Vec<CardEvent> {
+        Vec::new()
+    }
 
     /// How many cards are showing.
     fn len(&self) -> usize;
@@ -399,6 +439,33 @@ pub trait CardSurface {
 pub struct Recording {
     log: Arc<Mutex<Vec<Card>>>,
     injected: Arc<Mutex<Vec<CardEvent>>>,
+    /// Events armed mid-gesture, answered by
+    /// [`CardSurface::poll_drag_starts`] rather than by `poll`.
+    armed: Arc<Mutex<Vec<CardEvent>>>,
+    /// Every surface call, in the order it happened.
+    ///
+    /// Ordering is the whole subject of the drag hand-off: producing the right
+    /// events in the wrong frame is exactly the bug, and a test that only reads
+    /// the events cannot see it.
+    trace: Arc<Mutex<Vec<SurfaceCall>>>,
+}
+
+/// One call into a [`Recording`], for tests that care when things happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceCall {
+    /// [`CardSurface::poll`] was drained.
+    Poll,
+    /// [`CardSurface::poll_drag_starts`] was drained.
+    PollDragStarts,
+    /// A card was dismissed.
+    Dismiss(CardId),
+    /// A native drag reported back.
+    Settle {
+        /// Which card's drag ended.
+        id: CardId,
+        /// Whether something took the drop.
+        accepted: bool,
+    },
 }
 
 impl Recording {
@@ -432,6 +499,54 @@ impl Recording {
             .push(event);
     }
 
+    /// Arms an event for the next [`CardSurface::poll_drag_starts`].
+    ///
+    /// Separate from [`Self::inject`] on purpose: the two are drained by
+    /// different passes of the frame, and a test that conflates them cannot
+    /// tell a drag started in the gesture frame from one started a frame late.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    pub fn arm(&self, event: CardEvent) {
+        self.armed
+            .lock()
+            .expect("armed events are poisoned")
+            .push(event);
+    }
+
+    /// Every surface call so far, in order.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    #[must_use]
+    pub fn trace(&self) -> Vec<SurfaceCall> {
+        self.trace
+            .lock()
+            .expect("surface trace is poisoned")
+            .clone()
+    }
+
+    /// Forgets the call trace, so a test can time one phase in isolation.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    pub fn clear_trace(&self) {
+        self.trace
+            .lock()
+            .expect("surface trace is poisoned")
+            .clear();
+    }
+
+    fn record(&self, call: SurfaceCall) {
+        self.trace
+            .lock()
+            .expect("surface trace is poisoned")
+            .push(call);
+    }
+
     /// A handle sharing this recorder's state.
     #[must_use]
     pub fn handle(&self) -> Self {
@@ -447,13 +562,24 @@ impl CardSurface for Recording {
     }
 
     fn dismiss(&mut self, id: CardId) {
+        self.record(SurfaceCall::Dismiss(id));
         self.log
             .lock()
             .expect("card log is poisoned")
             .retain(|card| card.id != id);
     }
 
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        self.record(SurfaceCall::Settle { id, accepted });
+    }
+
+    fn poll_drag_starts(&mut self) -> Vec<CardEvent> {
+        self.record(SurfaceCall::PollDragStarts);
+        std::mem::take(&mut *self.armed.lock().expect("armed events are poisoned"))
+    }
+
     fn poll(&mut self) -> Option<CardEvent> {
+        self.record(SurfaceCall::Poll);
         let mut queue = self.injected.lock().expect("card events are poisoned");
         if queue.is_empty() {
             None

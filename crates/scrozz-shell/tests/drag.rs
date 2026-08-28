@@ -688,6 +688,30 @@ mod appkit {
 
     #[test]
     #[ignore = "needs the main thread and a running AppKit"]
+    fn a_payload_with_no_image_advertises_no_image_flavours() {
+        // Both image types are withheld together. A registered `public.tiff`
+        // the provider cannot fill does not read to a receiver as an absent
+        // flavour — it reads as a failed drop.
+        let root = scratch("item-imageless");
+        let payload = super::file_only("Recording", super::DragFormat::Mp4, vec![0, 0, 0, 0x18]);
+        let harness = ItemHarness::new(&payload, &root).expect("item");
+
+        let types = harness.types();
+        assert!(
+            types.iter().any(|ty| ty == "public.file-url"),
+            "the file is the whole point of the drag and must still be offered: {types:?}"
+        );
+        assert!(
+            !types
+                .iter()
+                .any(|ty| ty == "public.png" || ty == "public.tiff"),
+            "an MP4 was advertised as an image: {types:?}"
+        );
+        harness.finish();
+    }
+
+    #[test]
+    #[ignore = "needs the main thread and a running AppKit"]
     fn an_accepted_drop_leaves_the_file_where_the_receiver_can_read_it() {
         let root = scratch("item-lifetime");
         let payload = DragPayload::png_capture("Kept", byte_source(|| Ok(png_bytes())));
@@ -977,4 +1001,135 @@ mod artifact_lifetime {
             "{root:?} has to be identifiably ours"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Which image flavours a payload is entitled to advertise
+// ---------------------------------------------------------------------------
+//
+// A drag advertises two independent things: a file, and — sometimes — an
+// image. Conflating them is the bug this section pins. The file always exists;
+// the image exists only when the payload was given an image producer. Labelling
+// an MP4's or a JPEG's file bytes `public.png` produces a drop that every
+// receiver accepts and then fails to decode, which is worse than offering no
+// image at all.
+
+/// A payload whose file is `format` and which was given no image producer.
+fn file_only(stem: &str, format: DragFormat, bytes: Vec<u8>) -> DragPayload {
+    DragPayload::new(PromisedFile::new(
+        stem,
+        format,
+        byte_source(move || Ok(bytes.clone())),
+    ))
+}
+
+#[test]
+fn a_screenshot_offers_its_file_bytes_as_the_image() {
+    // The common case, and the one that must stay free: a PNG capture has a
+    // single `Arc` behind both flavours, so the image costs no second encode.
+    let payload = DragPayload::png_capture("Capture", byte_source(|| Ok(png_bytes())));
+    assert!(
+        payload.image_is_file(),
+        "a PNG capture must recognise its own file bytes as the image"
+    );
+
+    let file = Arc::new(png_bytes());
+    let image = payload
+        .image_png(&file)
+        .expect("the image producer must not fail")
+        .expect("a PNG capture must offer an image");
+    assert!(
+        Arc::ptr_eq(&image, &file),
+        "the image was re-encoded instead of reusing the bytes already written"
+    );
+}
+
+#[test]
+fn a_jpeg_payload_offers_no_image() {
+    let payload = file_only("Photo", DragFormat::Jpeg, vec![0xff, 0xd8, 0xff]);
+    assert!(payload.image().is_none(), "no image producer was given");
+    assert!(!payload.image_is_file());
+    assert_eq!(
+        payload
+            .image_png(&Arc::new(vec![0xff, 0xd8, 0xff]))
+            .expect("asking must not fail"),
+        None,
+        "JPEG file bytes were about to be advertised as a PNG"
+    );
+}
+
+#[test]
+fn a_video_payload_offers_no_image() {
+    // The worst case if this regresses: an MP4 announced as `public.png`.
+    let payload = file_only("Recording", DragFormat::Mp4, vec![0, 0, 0, 0x18]);
+    assert_eq!(
+        payload
+            .image_png(&Arc::new(vec![0, 0, 0, 0x18]))
+            .expect("asking must not fail"),
+        None,
+        "MP4 bytes were about to be advertised as a PNG"
+    );
+}
+
+#[test]
+fn webp_and_gif_payloads_offer_no_image() {
+    // Both are images, and neither is a PNG. Being image-shaped is not the
+    // test — having an image *producer* is.
+    for (stem, format, bytes) in [
+        ("Sticker", DragFormat::Webp, vec![b'R', b'I', b'F', b'F']),
+        ("Loop", DragFormat::Gif, vec![b'G', b'I', b'F', b'8']),
+    ] {
+        let payload = file_only(stem, format, bytes.clone());
+        assert_eq!(
+            payload
+                .image_png(&Arc::new(bytes))
+                .expect("asking must not fail"),
+            None,
+            "{format:?} bytes were about to be advertised as a PNG"
+        );
+    }
+}
+
+#[test]
+fn a_png_file_with_its_own_image_producer_uses_the_producer() {
+    // The subtle case. Both flavours are genuinely PNG, so format alone would
+    // say "reuse the file bytes" — but the producers are different, and a
+    // cropped preview standing in for the full capture is a quieter bug than
+    // the one being fixed here. Pointer identity, not format, decides.
+    let cropped = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
+    let expect = cropped.clone();
+    let payload = file_only("Capture", DragFormat::Png, png_bytes())
+        .with_image(byte_source(move || Ok(cropped.clone())));
+
+    assert!(
+        !payload.image_is_file(),
+        "two different PNG producers were treated as one"
+    );
+
+    let file = Arc::new(png_bytes());
+    let image = payload
+        .image_png(&file)
+        .expect("the image producer must not fail")
+        .expect("an image producer was given");
+    assert_eq!(&*image, &expect, "the file bytes were served as the image");
+    assert!(!Arc::ptr_eq(&image, &file));
+}
+
+#[test]
+fn a_failing_image_producer_is_reported_not_swallowed() {
+    // If the image cannot be produced the drag must fail loudly rather than
+    // quietly advertising an empty PNG, which reads to a receiver as a
+    // successful drop of a corrupt file.
+    let payload =
+        file_only("Capture", DragFormat::Png, png_bytes()).with_image(byte_source(|| {
+            Err(Error::Unsupported {
+                what: "PNG encoding".into(),
+                why: "no encoder".into(),
+            })
+        }));
+
+    assert!(
+        payload.image_png(&Arc::new(png_bytes())).is_err(),
+        "a failing image producer was reported as 'no image'"
+    );
 }

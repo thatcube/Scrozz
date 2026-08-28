@@ -77,9 +77,9 @@ impl DragSpot {
 /// What a drag that has been started is still waiting to find out.
 struct InFlight {
     session: DragSession,
-    /// Whether the card has already been taken off the stack, so an outcome
-    /// arriving twice cannot dismiss twice.
-    dismissed: bool,
+    /// Whether the outcome has already been handed to the caller, so a drag
+    /// that is still being swept cannot be reported — or acted on — twice.
+    reported: bool,
 }
 
 /// Owns the platform drag source and every drag still in flight.
@@ -185,7 +185,7 @@ impl DragHost {
                     card,
                     InFlight {
                         session,
-                        dismissed: false,
+                        reported: false,
                     },
                 );
                 Ok(())
@@ -196,18 +196,23 @@ impl DragHost {
 
     /// Services every drag in flight. Never blocks.
     ///
-    /// Returns the cards whose drop was **accepted**, which is the only signal
-    /// that should take a card off the stack. Cancelled and failed drags are
-    /// logged by the caller and leave the card alone.
-    pub fn poll(&mut self) -> Vec<CardId> {
-        let mut accepted = Vec::new();
+    /// Returns **every** drag that has reached an outcome, with that outcome,
+    /// exactly once each. Not just the accepted ones: a cancelled, refused or
+    /// failed drag has to be reported too, because the surface that armed the
+    /// gesture is still holding it. The native drag loop is modal and can
+    /// swallow the mouse-up, so "the user let go" is not a signal the surface
+    /// can be relied on to see for itself — this is the signal.
+    ///
+    /// Only [`DragOutcome::Accepted`] should take a card off the stack.
+    pub fn poll(&mut self) -> Vec<(CardId, DragOutcome)> {
+        let mut settled = Vec::new();
 
         self.live.retain(|card, flight| {
-            if let Some(DragOutcome::Accepted { .. }) = flight.session.outcome()
-                && !flight.dismissed
+            if let Some(outcome) = flight.session.outcome()
+                && !flight.reported
             {
-                flight.dismissed = true;
-                accepted.push(*card);
+                flight.reported = true;
+                settled.push((*card, outcome));
             }
 
             // Keep servicing after the outcome: the file is deliberately still
@@ -216,13 +221,29 @@ impl DragHost {
             !flight.session.is_settled()
         });
 
-        accepted
+        settled
     }
 
     /// What happened to `card`'s drag, if it has finished.
     #[must_use]
     pub fn outcome(&self, card: CardId) -> Option<DragOutcome> {
         self.live.get(&card).and_then(|f| f.session.outcome())
+    }
+
+    /// Adopts an already-finished session, as though the platform had run it.
+    ///
+    /// The only way to exercise outcome handling without a real drag, and a
+    /// real drag is not something a test suite may start: it seizes the
+    /// machine's pointer for as long as the button is held.
+    #[cfg(test)]
+    pub(super) fn adopt_finished(&mut self, card: CardId, outcome: DragOutcome) {
+        self.live.insert(
+            card,
+            InFlight {
+                session: DragSession::finished(outcome),
+                reported: false,
+            },
+        );
     }
 
     fn source(&mut self) -> Result<&NativeDragSource, String> {

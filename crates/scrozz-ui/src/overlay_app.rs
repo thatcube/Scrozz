@@ -455,6 +455,7 @@ pub enum OverlayEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
     Dismiss(CardId),
+    SettleDrag { id: CardId, accepted: bool },
     DismissAll,
     Collapse,
     Expand,
@@ -496,6 +497,17 @@ impl OverlayHandle {
         self.wake();
     }
 
+    /// Places an event in the outbox as though the overlay had raised it.
+    ///
+    /// The renderer does not use this — it emits directly. This is for a host
+    /// that notices something natively which the renderer cannot see, and for
+    /// tests that need to drive a host's event translation without a window.
+    pub fn report(&self, event: OverlayEvent) {
+        if let Ok(mut q) = self.shared.outbox.lock() {
+            q.push(event);
+        }
+    }
+
     /// Take everything that has happened since the last call.
     #[must_use]
     pub fn drain_events(&self) -> Vec<OverlayEvent> {
@@ -509,6 +521,30 @@ impl OverlayHandle {
     /// Retire one card.
     pub fn dismiss(&self, id: CardId) {
         self.command(Command::Dismiss(id));
+    }
+
+    /// Reports that the native drag for `id` has finished.
+    ///
+    /// # Why the host has to tell the overlay this
+    ///
+    /// Once a drag-out is armed the platform owns the gesture, and every
+    /// platform runs it as a *modal* loop: AppKit's dragging session and
+    /// Windows' `DoDragDrop` both pump events themselves until the drop is
+    /// over. The mouse-up that ended the drag is consumed in there and never
+    /// reaches egui, so the surface's own `drag_stopped` may simply never fire.
+    ///
+    /// Left alone, the card stays held and displaced under a pointer that is no
+    /// longer pressing it, and — because a gesture is only armed once — it can
+    /// never be dragged again. The window looks broken and nothing has logged a
+    /// thing.
+    ///
+    /// So the outcome comes back the way it went out: explicitly. Call this for
+    /// **every** ending, not just the happy one. `accepted` distinguishes a
+    /// drop something took from one that was cancelled, refused, or failed; all
+    /// four release the gesture, and only the first is followed by the host
+    /// retiring the card.
+    pub fn settle_drag(&self, id: CardId, accepted: bool) {
+        self.command(Command::SettleDrag { id, accepted });
     }
 
     /// Retire every card.
@@ -976,6 +1012,20 @@ impl OverlayApp {
                             reason: DismissReason::Programmatic,
                         });
                     }
+                }
+                Command::SettleDrag { id, accepted } => {
+                    // Uniform on purpose: cancelled, refused and failed are
+                    // three ways of saying the card did not go anywhere, and
+                    // the card's answer to all three is to sit back down. Only
+                    // the arming state is per-card, so only that is guarded.
+                    let stuck = self.stack.settle_drag(id, m);
+                    if self.armed == Some(id) {
+                        self.armed = None;
+                    }
+                    if self.dragging == Some(id) {
+                        self.dragging = None;
+                    }
+                    tracing::debug!(card = id.0, accepted, stuck, "overlay: native drag settled");
                 }
                 Command::DismissAll => {
                     let ids: Vec<CardId> = self.stack.cards().iter().map(|c| c.id()).collect();
