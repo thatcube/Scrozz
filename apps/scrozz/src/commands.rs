@@ -38,6 +38,7 @@ use crate::{
     platform,
     report::Report,
     settings,
+    shortcuts::{ShortcutAction, ShortcutStore},
 };
 
 /// Runs a command locally.
@@ -695,15 +696,22 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 // ---------------------------------------------------------------------------
 
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
+    let shortcuts = settings::stored_shortcuts();
     match command {
         SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json())]),
-            settings::all_human(),
+            Json::obj([("settings", settings::all_json_resolved(&shortcuts))]),
+            settings::all_human_resolved(&shortcuts),
         )),
 
         SettingsCommand::Get { key: Some(key) } => {
             let setting = settings::lookup(key)?;
-            Ok(Report::new(setting.to_json(), setting.default.to_string()))
+            let (value, source) = settings::resolve(setting, &shortcuts);
+            let text = if value.is_empty() {
+                "(unassigned)".to_owned()
+            } else {
+                value.clone()
+            };
+            Ok(Report::new(setting.to_json_valued(&value, source), text))
         }
 
         SettingsCommand::Set { key, value } => {
@@ -713,9 +721,45 @@ fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
             // one even while the second is true.
             let setting = settings::lookup(key)?;
             setting.validate(value)?;
-            Err(CliError::not_implemented(
-                format!("saving {key}"),
-                "scrozz-store (settings persistence)",
+
+            // Shortcuts are the one area with somewhere to put a value. Storing
+            // them here rather than only in the GUI matters because the CLI is
+            // how a dotfiles setup configures a machine it has never opened.
+            let Some(action) = ShortcutAction::from_stored_key(setting.key) else {
+                return Err(CliError::not_implemented(
+                    format!("saving {key}"),
+                    "scrozz-store (settings persistence)",
+                ));
+            };
+
+            let mut updated = shortcuts.clone();
+            updated.set(action, Some(value.as_str()));
+            // Checked against the *other* rows after the assignment, so the
+            // conflict reported is the one the user just created rather than one
+            // they merely re-typed.
+            if let Err(problem) = updated.check(action, value) {
+                return Err(CliError::usage(format!(
+                    "{key} cannot be {value:?}: {problem}"
+                )));
+            }
+
+            let store = ShortcutStore::default_location().map_err(CliError::Core)?;
+            store.save(&updated).map_err(CliError::Core)?;
+
+            let stored = updated.get(action).unwrap_or_default().to_owned();
+            let text = if stored.is_empty() {
+                format!("{key} is now unassigned")
+            } else {
+                format!("{key} is now {stored}")
+            };
+            Ok(Report::new(
+                Json::obj([
+                    ("key", Json::str(setting.key)),
+                    ("value", Json::str(&stored)),
+                    ("source", Json::str("user")),
+                    ("path", Json::str(store.path().display().to_string())),
+                ]),
+                text,
             ))
         }
     }
@@ -1193,10 +1237,17 @@ mod tests {
             "sway",
         ])
         .unwrap();
+        // Derived rather than literal: the region default is platform-specific,
+        // so spelling it out here would assert the authoring machine.
+        let accelerator = crate::hotkey_config::Accelerator::parse(
+            crate::cli::HotkeyAction::CaptureRegion.default_accelerator(),
+        )
+        .unwrap()
+        .to_sway();
         assert!(
             report
                 .human
-                .contains("bindsym Mod4+Shift+4 exec scrozz capture")
+                .contains(&format!("bindsym {accelerator} exec scrozz capture"))
         );
         assert!(
             report
@@ -1208,6 +1259,10 @@ mod tests {
 
     #[test]
     fn generating_a_hyprland_config_works_today() {
+        let accelerator = crate::hotkey_config::Accelerator::parse(
+            crate::cli::HotkeyAction::CaptureRegion.default_accelerator(),
+        )
+        .unwrap();
         let report = run(&[
             "scrozz",
             "hotkey",
@@ -1216,11 +1271,11 @@ mod tests {
             "hyprland",
         ])
         .unwrap();
-        assert!(
-            report
-                .human
-                .contains("bind = SUPER SHIFT, 4, exec, scrozz capture")
-        );
+        assert!(report.human.contains(&format!(
+            "bind = {}, {}, exec, scrozz capture",
+            accelerator.to_hyprland_modifiers(),
+            accelerator.key
+        )));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! rendering at 1× — including stroke widths, arrowhead sizes and glyph weight,
 //! all of which would otherwise be scaled by a different rule than the geometry.
 
-use scrozz_core::{LogicalPoint, LogicalRect};
+use scrozz_core::{LogicalPoint, LogicalRect, Transform as ColorTransform};
 use tiny_skia::{
     BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Rect, Shader, Stroke,
     Transform,
@@ -96,15 +96,31 @@ impl Scaled {
 }
 
 /// A solid-colour paint with `opacity` folded into its alpha.
+///
+/// `into` converts the colour into the working space before it is painted.
+/// Annotation colours are authored in sRGB — the swatch the user picked is an
+/// sRGB triple — but the canvas is in the *capture's* space, which for a modern
+/// Mac screenshot is Display P3. Writing sRGB bytes into a P3 buffer paints a
+/// visibly more saturated colour than the one chosen, and makes the same
+/// annotation look different depending on which display it was captured from.
+/// The conversion is a no-op for an sRGB or unknown source, which is the common
+/// case, and costs a handful of operations per *annotation* either way — this is
+/// nowhere near the per-pixel path.
 #[must_use]
-pub fn paint(color: Color, opacity: f32, blend_mode: BlendMode) -> Paint<'static> {
+pub fn paint(
+    color: Color,
+    opacity: f32,
+    blend_mode: BlendMode,
+    into: ColorTransform,
+) -> Paint<'static> {
     let c = color.scaled_alpha(opacity);
+    let [r, g, b] = into.convert_u8([c.r, c.g, c.b]);
     let mut paint = Paint {
         anti_alias: true,
         blend_mode,
         ..Paint::default()
     };
-    paint.shader = Shader::SolidColor(tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a));
+    paint.shader = Shader::SolidColor(tiny_skia::Color::from_rgba8(r, g, b, c.a));
     paint
 }
 

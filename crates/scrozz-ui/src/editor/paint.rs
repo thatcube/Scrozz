@@ -17,7 +17,9 @@
 
 use egui::{Color32, CursorIcon, Painter, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use scrozz_annotate::{Annotation, SkiaRenderer, font};
-use scrozz_core::{LogicalPoint, LogicalRect, ScaleFactor};
+use scrozz_core::{
+    ColorSpace, LogicalPoint, LogicalRect, PixelFormat, ScaleFactor, Transform as ColorTransform,
+};
 
 use crate::paint::{Surface, focus_ring};
 use crate::theme::{Palette, Radius, Space, corner};
@@ -95,24 +97,106 @@ impl Preview {
 }
 
 /// Renders the document to a colour image at `target_px` wide.
+///
+/// # Why the format and the colour space are both consulted
+///
+/// The frame comes back in whatever the renderer produced, and getting either
+/// wrong is visible rather than theoretical.
+///
+/// tiny-skia composites in *premultiplied* RGBA, so a 50%-alpha highlight comes
+/// out with its channels already scaled. Handing those bytes to
+/// [`Color32::from_rgba_unmultiplied`] scales them a second time, and the
+/// highlight previews darker than it exports. The format says which it is, so
+/// this asks instead of assuming.
+///
+/// The pixels are also in the *capture's* colour space, which on a modern Mac is
+/// Display P3. egui uploads texture bytes and the GPU shows them as sRGB, so P3
+/// bytes sent through unchanged preview over-saturated — and would disagree with
+/// the exported file, which carries a P3 profile and is therefore correct. They
+/// are converted here instead. Only here: the document keeps its own space, so
+/// nothing about the export changes.
 fn render(state: &EditorState, target_px: u32) -> scrozz_core::Result<egui::ColorImage> {
     let frame = SkiaRenderer.render_to_width(state.document(), target_px.max(1))?;
+    Ok(to_color_image(&frame))
+}
+
+/// Turns a rendered frame into what egui uploads, honouring its format and
+/// colour space. See [`render`] for why both matter.
+#[must_use]
+pub fn to_color_image(frame: &scrozz_core::Frame) -> egui::ColorImage {
     let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let premultiplied = frame.format.is_premultiplied();
+    let bgra = matches!(
+        frame.format,
+        PixelFormat::Bgra8 | PixelFormat::BgraPremultiplied8
+    );
+
+    // Display space, not document space. The identity case — an sRGB or unknown
+    // capture — costs one branch per pixel and no arithmetic.
+    let to_display = ColorTransform::new(frame.color_space, ColorSpace::Srgb);
+    let linear = to_display.source_linear_table();
+
     let mut pixels = Vec::with_capacity(w * h);
     for y in 0..h {
         let row = &frame.data[y * frame.stride..];
         for x in 0..w {
             let p = &row[x * 4..x * 4 + 4];
-            // The renderer emits straight (un-premultiplied) RGBA; egui's
-            // `Color32::from_rgba_unmultiplied` premultiplies for us.
-            pixels.push(Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]));
+            let (r, g, b) = if bgra {
+                (p[2], p[1], p[0])
+            } else {
+                (p[0], p[1], p[2])
+            };
+            let (r, g, b) = if to_display.is_identity() {
+                (r, g, b)
+            } else {
+                // Converting premultiplied channels directly would apply the
+                // matrix to values already scaled by alpha, which is not the
+                // colour that was composited. Undo the premultiplication for the
+                // conversion and put it back afterwards.
+                let (r, g, b) = if premultiplied {
+                    unpremultiply(r, g, b, p[3])
+                } else {
+                    (r, g, b)
+                };
+                let out = to_display.convert_linear([
+                    linear[r as usize],
+                    linear[g as usize],
+                    linear[b as usize],
+                ]);
+                let quantise = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+                let (r, g, b) = (quantise(out[0]), quantise(out[1]), quantise(out[2]));
+                if premultiplied {
+                    (scale(r, p[3]), scale(g, p[3]), scale(b, p[3]))
+                } else {
+                    (r, g, b)
+                }
+            };
+            pixels.push(if premultiplied {
+                Color32::from_rgba_premultiplied(r, g, b, p[3])
+            } else {
+                Color32::from_rgba_unmultiplied(r, g, b, p[3])
+            });
         }
     }
-    Ok(egui::ColorImage {
+    egui::ColorImage {
         size: [w, h],
         pixels,
         source_size: egui::vec2(w as f32, h as f32),
-    })
+    }
+}
+
+/// Recovers straight channels from premultiplied ones.
+fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
+    if a == 0 {
+        return (0, 0, 0);
+    }
+    let recover = |c: u8| ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8;
+    (recover(r), recover(g), recover(b))
+}
+
+/// Scales one channel by alpha, rounding half up.
+fn scale(c: u8, a: u8) -> u8 {
+    ((u32::from(c) * u32::from(a) + 127) / 255) as u8
 }
 
 /// Where the document ended up on screen, and what the pointer did.

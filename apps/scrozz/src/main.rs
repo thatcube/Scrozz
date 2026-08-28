@@ -53,6 +53,7 @@ mod platform;
 mod report;
 mod selection_store;
 mod settings;
+mod shortcuts;
 #[cfg(test)]
 mod test_env;
 

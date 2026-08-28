@@ -295,6 +295,10 @@ fn a_capture_card_floats_without_taking_focus() {
         !card.hides_on_deactivate,
         "the card outlives Scrozz losing focus"
     );
+    assert!(
+        !card.suppress_system_ui,
+        "capture cards must not change normal Dock behavior"
+    );
 }
 
 #[test]
@@ -316,6 +320,10 @@ fn the_selection_overlay_sits_above_the_menu_bar() {
         "the selection overlay reads Escape and arrow keys"
     );
     assert!(!overlay.click_through, "it is the thing being dragged on");
+    assert!(
+        overlay.suppress_system_ui,
+        "the Dock must not respond to the pointer during selection"
+    );
 }
 
 #[test]

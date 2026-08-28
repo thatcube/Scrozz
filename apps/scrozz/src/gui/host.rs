@@ -25,7 +25,7 @@ use scrozz_ui::{
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, Tick},
+        app::{App, Config, KeyboardOwner, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
         panel::BehaviorController,
@@ -484,7 +484,8 @@ impl Driver {
 
         // Tied to the viewport's lifetime rather than to `editing`, so the keys
         // come back even if the document is torn down by some other path.
-        self.app.set_hotkeys_suspended(self.editor.is_open());
+        self.app
+            .set_keyboard_owner(KeyboardOwner::Editor, self.editor.is_open());
 
         let Some((card, editor)) = self.editing.as_mut() else {
             return;
@@ -670,13 +671,30 @@ impl eframe::App for Driver {
         } else {
             self.overlay.ui(ui, frame);
         }
-        self.settings.show(
+        // Drawn from the app's own view of the shortcuts, and edits are handed
+        // straight back to it: the pane reports intent, the app decides whether
+        // the OS will accept it.
+        let edits = self.settings.show(
             ui.ctx(),
             scrozz_ui::settings::BuildInfo {
                 version: crate::build_info::VERSION,
                 build: crate::build_info::BUILD,
             },
+            &self.app.shortcut_rows(),
         );
+        // Order matters. Applying the edits can rebind every global hotkey, so
+        // the editor's claim on the keyboard has to be re-asserted *after* that
+        // — otherwise an edit made while the editor is open would leave the new
+        // combinations grabbed underneath it.
+        // An armed shortcut row is waiting to *see* a combination, so a global
+        // hotkey bound to it must not fire a capture underneath the recorder.
+        // Only while a row is actually armed: merely having Settings open is no
+        // reason to surrender the keyboard.
+        self.app.set_keyboard_owner(
+            KeyboardOwner::ShortcutRecorder,
+            self.settings.is_recording(),
+        );
+        self.app.edit_shortcuts(&edits);
         self.show_editor(ui.ctx());
     }
 

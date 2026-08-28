@@ -38,7 +38,7 @@ use egui::{Key, Modifiers, Ui};
 use scrozz_annotate::Document;
 use scrozz_core::{LogicalPoint, LogicalRect};
 
-pub use paint::{CanvasView, Preview};
+pub use paint::{CanvasView, Preview, to_color_image};
 pub use scene::EditorScene;
 pub use state::{
     Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE,

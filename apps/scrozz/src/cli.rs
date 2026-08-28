@@ -38,6 +38,7 @@ use crate::{
     build_info::VERSION,
     fault::{CliError, CliResult},
     json::Json,
+    shortcuts::ShortcutAction,
 };
 
 /// Scrozz — screenshots and screen recording for macOS, Windows and Linux.
@@ -1322,13 +1323,22 @@ impl HotkeyAction {
     /// `Super` rather than `Ctrl` or `Alt` because on both sway and Hyprland the
     /// super key is the conventional compositor modifier and is least likely to
     /// already be taken by an application.
+    ///
+    /// The capture actions defer to [`ShortcutAction`] rather than repeating its
+    /// table, so that changing a default changes it everywhere. That does mean
+    /// generating a compositor config *from* a Mac emits the Mac defaults; the
+    /// alternative is two tables that drift, which is the failure this delegation
+    /// exists to prevent, and `generate-config` is realistically run on the
+    /// machine the config is for.
     #[must_use]
     pub const fn default_accelerator(self) -> &'static str {
         match self {
-            Self::CaptureRegion => "Super+Shift+4",
-            Self::CaptureWindow => "Super+Shift+5",
-            Self::CaptureDisplay => "Super+Shift+3",
-            Self::CaptureAllDisplays => "Super+Shift+6",
+            Self::CaptureRegion => ShortcutAction::CaptureRegion.default_accelerator_setting(),
+            Self::CaptureWindow => ShortcutAction::CaptureWindow.default_accelerator_setting(),
+            Self::CaptureDisplay => ShortcutAction::CaptureFullscreen.default_accelerator_setting(),
+            Self::CaptureAllDisplays => {
+                ShortcutAction::CaptureAllDisplays.default_accelerator_setting()
+            }
             Self::RecordStart => "Super+Shift+R",
             Self::RecordStop => "Super+Shift+Escape",
         }

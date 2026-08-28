@@ -19,6 +19,9 @@
 //! A shipped `.app` should *also* set `LSUIElement` in its `Info.plist`; the
 //! runtime call covers `cargo run`, the CLI and tests, where there is no bundle.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
 use scrozz_core::{Error, Result, SelectionMode};
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -288,8 +291,15 @@ pub fn use_accessory_activation_policy() -> Result<()> {
 /// screen, which D27 forbids.
 pub struct Tray {
     icon: TrayIcon,
+    /// Every activatable row, so labels can be re-rendered when the shortcut
+    /// bound to an action changes.
+    items: Vec<(TrayAction, MenuItem)>,
     /// Held so its label can be swapped between "Start" and "Stop Recording".
     record_item: MenuItem,
+    /// The accelerator shown beside each action, in the platform's notation.
+    shortcuts: RefCell<HashMap<TrayAction, String>>,
+    /// Which of the two recording labels is currently shown.
+    recording: Cell<bool>,
     /// Kept alive alongside the icon; dropping the menu unhooks the items.
     _menu: Menu,
 }
@@ -330,6 +340,7 @@ impl Tray {
         mut is_available: impl FnMut(TrayAction) -> bool,
     ) -> Result<Self> {
         let menu = Menu::new();
+        let mut items: Vec<(TrayAction, MenuItem)> = Vec::new();
         let mut record_item = None;
 
         for entry in menu_model() {
@@ -347,8 +358,9 @@ impl Tray {
                     );
                     append(&menu, &item)?;
                     if action == TrayAction::ToggleRecording {
-                        record_item = Some(item);
+                        record_item = Some(item.clone());
                     }
+                    items.push((action, item));
                 }
             }
         }
@@ -379,7 +391,10 @@ impl Tray {
 
         Ok(Self {
             icon: tray,
+            items,
             record_item,
+            shortcuts: RefCell::new(HashMap::new()),
+            recording: Cell::new(false),
             _menu: menu,
         })
     }
@@ -412,7 +427,40 @@ impl Tray {
 
     /// Switches the recording entry between "Start" and "Stop Recording".
     pub fn set_recording(&self, recording: bool) {
-        self.record_item.set_text(recording_label(recording));
+        self.recording.set(recording);
+        self.relabel(TrayAction::ToggleRecording, &self.record_item);
+    }
+
+    /// Shows the shortcut currently bound to each action beside its label.
+    ///
+    /// A menu that names a shortcut the app is not actually listening for is
+    /// worse than one that names none, so this takes the *effective* bindings
+    /// rather than the configured ones: an action whose shortcut was refused, or
+    /// deliberately left unassigned, is passed as absent and shown bare.
+    pub fn set_shortcuts(&self, shortcuts: impl IntoIterator<Item = (TrayAction, String)>) {
+        {
+            let mut current = self.shortcuts.borrow_mut();
+            current.clear();
+            current.extend(shortcuts);
+        }
+        for (action, item) in &self.items {
+            self.relabel(*action, item);
+        }
+    }
+
+    /// Re-renders one row's text from its label and its shortcut.
+    fn relabel(&self, action: TrayAction, item: &MenuItem) {
+        let base = if action == TrayAction::ToggleRecording {
+            recording_label(self.recording.get())
+        } else {
+            action.label()
+        };
+        item.set_text(match self.shortcuts.borrow().get(&action) {
+            // Two spaces, not a tab: `muda` renders the label verbatim, and a
+            // tab is drawn as a glyph on some GTK themes rather than as a gap.
+            Some(accelerator) => format!("{base}  {accelerator}"),
+            None => base.to_owned(),
+        });
     }
 
     /// Shows or hides the item without destroying it.

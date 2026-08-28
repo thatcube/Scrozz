@@ -12,6 +12,7 @@
 //! subcommand, and that the three agree. This module is where that promise is
 //! kept.
 
+use crate::shortcuts::ShortcutAction;
 use scrozz_core::{SelectionCapabilities, SelectionMode};
 use scrozz_shell::{DisplayServer, Session, TrayAction};
 
@@ -204,6 +205,49 @@ impl Action {
             Self::ToggleRecording | Self::OpenHistory => false,
         }
     }
+
+    /// The bindable action this is, if a global shortcut can trigger it.
+    ///
+    /// `None` for quit, settings and history: they are one click away in the
+    /// tray, and a system-wide key grab is a scarce resource taken from every
+    /// other application on the machine.
+    #[must_use]
+    pub fn shortcut(self) -> Option<ShortcutAction> {
+        ShortcutAction::from_id(self.id())
+    }
+}
+
+/// The bridge back the other way.
+///
+/// Lives here rather than in [`crate::shortcuts`] so that all three vocabularies
+/// — tray, action, shortcut — are reconciled in one file, and a new action
+/// cannot be added to one of them without this module failing to compile.
+impl ShortcutAction {
+    /// What the dispatcher should do when this shortcut fires.
+    #[must_use]
+    pub const fn action(self) -> Action {
+        match self {
+            Self::CaptureAllInOne => Action::Capture(CaptureKind::AllInOne),
+            Self::CaptureRegion => Action::Capture(CaptureKind::Region),
+            Self::CaptureWindow => Action::Capture(CaptureKind::Window),
+            Self::CaptureFullscreen => Action::Capture(CaptureKind::Fullscreen),
+            Self::CaptureAllDisplays => Action::Capture(CaptureKind::AllDisplays),
+            Self::ToggleRecording => Action::ToggleRecording,
+        }
+    }
+
+    /// The tray item whose label should show this shortcut.
+    #[must_use]
+    pub const fn tray(self) -> TrayAction {
+        match self {
+            Self::CaptureAllInOne => TrayAction::CaptureAllInOne,
+            Self::CaptureRegion => TrayAction::CaptureRegion,
+            Self::CaptureWindow => TrayAction::CaptureWindow,
+            Self::CaptureFullscreen => TrayAction::CaptureFullscreen,
+            Self::CaptureAllDisplays => TrayAction::CaptureAllDisplays,
+            Self::ToggleRecording => TrayAction::ToggleRecording,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +262,40 @@ mod tests {
                 action.id(),
                 tray.id(),
                 "the tray and the action vocabulary must agree on {tray:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_bindable_shortcut_names_a_real_action_and_a_real_tray_item() {
+        // Three vocabularies, one set of identifiers. If they ever disagree, a
+        // hotkey fires into nothing and a menu item shows the wrong keys.
+        for shortcut in ShortcutAction::ALL {
+            assert_eq!(
+                shortcut.id(),
+                shortcut.action().id(),
+                "{shortcut:?} does not name its own action"
+            );
+            assert_eq!(
+                shortcut.id(),
+                shortcut.tray().id(),
+                "{shortcut:?} does not name its own tray item"
+            );
+            assert_eq!(shortcut.action().shortcut(), Some(shortcut));
+        }
+    }
+
+    #[test]
+    fn the_actions_without_shortcuts_are_the_ones_reachable_from_the_tray() {
+        for action in Action::all() {
+            let bindable = action.shortcut().is_some();
+            let expected = !matches!(
+                action,
+                Action::Quit | Action::OpenSettings | Action::OpenHistory
+            );
+            assert_eq!(
+                bindable, expected,
+                "{action:?} is on the wrong side of the bindable line"
             );
         }
     }

@@ -667,6 +667,13 @@ mod tests {
 
     #[test]
     fn sway_lines_are_pasteable() {
+        // The expected accelerator is derived, not spelled out: the default is
+        // deliberately platform-specific (`Cmd+Shift+8` on macOS, `Super+Shift+4`
+        // elsewhere), so a literal here would assert the authoring machine rather
+        // than the format under test.
+        let accelerator = Accelerator::parse(HotkeyAction::CaptureRegion.default_accelerator())
+            .unwrap()
+            .to_sway();
         let config = generate(
             Compositor::Sway,
             "scrozz",
@@ -676,12 +683,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.bindings[0].line,
-            "bindsym Mod4+Shift+4 exec scrozz capture --interactive region"
+            format!("bindsym {accelerator} exec scrozz capture --interactive region")
+        );
+        assert!(
+            config.bindings[0].line.contains("Mod4"),
+            "a sway binding must name the modifier the way sway spells it"
         );
     }
 
     #[test]
     fn hyprland_lines_are_pasteable() {
+        // Derived for the same reason as the sway case above.
+        let accelerator =
+            Accelerator::parse(HotkeyAction::CaptureRegion.default_accelerator()).unwrap();
         let config = generate(
             Compositor::Hyprland,
             "scrozz",
@@ -691,7 +705,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.bindings[0].line,
-            "bind = SUPER SHIFT, 4, exec, scrozz capture --interactive region"
+            format!(
+                "bind = {}, {}, exec, scrozz capture --interactive region",
+                accelerator.to_hyprland_modifiers(),
+                accelerator.key
+            )
+        );
+        assert!(
+            config.bindings[0].line.contains("SUPER"),
+            "a Hyprland binding must name the modifier the way Hyprland spells it"
         );
     }
 

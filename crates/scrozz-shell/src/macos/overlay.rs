@@ -65,9 +65,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, NSObjectProtocol, Sel};
 use objc2::{ClassType, sel};
 use objc2_app_kit::{
-    NSCursor, NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
-    NSScreenSaverWindowLevel, NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowLevel, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationOptions, NSApplicationPresentationOptions, NSCursor,
+    NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
+    NSRunningApplication, NSScreenSaverWindowLevel, NSStatusWindowLevel, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::NSRect;
 use scrozz_core::{Error, LogicalRect, Result};
@@ -391,6 +392,41 @@ pub fn collection_behavior(behavior: &OverlayBehavior) -> NSWindowCollectionBeha
 pub struct MacOverlay {
     window: Retained<NSWindow>,
     non_activating: bool,
+    presentation_lease: Option<PresentationLease>,
+}
+
+#[derive(Debug)]
+struct PresentationLease {
+    previous_application: Option<Retained<NSRunningApplication>>,
+    previous_options: NSApplicationPresentationOptions,
+}
+
+impl PresentationLease {
+    fn acquire(mtm: objc2::MainThreadMarker) -> Self {
+        let app = NSApplication::sharedApplication(mtm);
+        let previous_options = app.presentationOptions();
+        let previous_application = NSWorkspace::sharedWorkspace().frontmostApplication();
+        let mut selection_options = previous_options;
+        selection_options.remove(NSApplicationPresentationOptions::AutoHideDock);
+        selection_options.insert(NSApplicationPresentationOptions::HideDock);
+        app.setPresentationOptions(selection_options);
+        app.activate();
+        Self {
+            previous_application,
+            previous_options,
+        }
+    }
+
+    fn release(self, mtm: objc2::MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        app.setPresentationOptions(self.previous_options);
+        app.deactivate();
+        if let Some(previous) = self.previous_application
+            && !previous.isTerminated()
+        {
+            let _ = previous.activateWithOptions(NSApplicationActivationOptions::empty());
+        }
+    }
 }
 
 impl MacOverlay {
@@ -427,6 +463,7 @@ impl MacOverlay {
         Ok(Self {
             window,
             non_activating: false,
+            presentation_lease: None,
         })
     }
 
@@ -456,6 +493,7 @@ impl MacOverlay {
         Ok(Self {
             window,
             non_activating: false,
+            presentation_lease: None,
         })
     }
 
@@ -488,7 +526,15 @@ impl MacOverlay {
     ///
     /// Returns [`Error::Platform`] if called off the main thread.
     pub fn apply(&mut self, behavior: &OverlayBehavior) -> Result<OverlayReport> {
-        let _mtm = main_thread("configuring an overlay window")?;
+        let mtm = main_thread("configuring an overlay window")?;
+
+        if behavior.suppress_system_ui {
+            if self.presentation_lease.is_none() {
+                self.presentation_lease = Some(PresentationLease::acquire(mtm));
+            }
+        } else if let Some(lease) = self.presentation_lease.take() {
+            lease.release(mtm);
+        }
 
         // SAFETY: we are on the main thread (checked above) and hold a strong
         // reference to a live window.
@@ -709,6 +755,16 @@ impl MacOverlay {
             accepts_mouse_moved_events: self.window.acceptsMouseMovedEvents(),
             is_visible: self.window.isVisible(),
         })
+    }
+}
+
+impl Drop for MacOverlay {
+    fn drop(&mut self) {
+        if let Some(lease) = self.presentation_lease.take()
+            && let Some(mtm) = objc2::MainThreadMarker::new()
+        {
+            lease.release(mtm);
+        }
     }
 }
 

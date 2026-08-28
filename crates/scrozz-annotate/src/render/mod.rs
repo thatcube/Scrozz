@@ -5,7 +5,9 @@ pub mod raster;
 pub mod redact;
 pub mod shapes;
 
-use scrozz_core::{Error, Frame, LogicalRect, Result, ScaleFactor};
+use scrozz_core::{
+    ColorSpace, Error, Frame, LogicalRect, Result, ScaleFactor, Transform as ColorTransform,
+};
 use tiny_skia::{BlendMode, Pixmap, Transform};
 
 use crate::{
@@ -69,15 +71,19 @@ impl SkiaRenderer {
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
         })?;
+        // One working space for the whole composite: the capture's own. Source
+        // pixels are already in it and are never resampled; only the
+        // annotations, authored in sRGB, have to be converted on the way in.
+        let into = ColorTransform::new(ColorSpace::Srgb, document.source.frame.color_space);
         let xf = Scaled::with_origin(scale.get(), content.origin);
         draw_source(&mut canvas, &source, document.logical_bounds(), xf);
 
         for object in document.annotations() {
-            draw_object(&mut canvas, object, xf);
+            draw_object(&mut canvas, object, xf, into);
         }
 
         let canvas = match document.beautification() {
-            Some(beautification) => beautify::apply(&canvas, beautification, scale.get())?,
+            Some(beautification) => beautify::apply(&canvas, beautification, scale.get(), into)?,
             None => canvas,
         };
 
@@ -153,7 +159,7 @@ fn draw_source(canvas: &mut Pixmap, source: &Pixmap, bounds: LogicalRect, xf: Sc
 /// Redactions are handled in z-order like everything else, and destroy whatever
 /// has been composited beneath them — including earlier annotations. That is the
 /// stricter reading and the safer one: a redaction always erases what it covers.
-fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
+fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, into: ColorTransform) {
     let opacity = object.style.effective_opacity();
     if opacity <= 0.0 {
         return;
@@ -165,7 +171,7 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             let Some((shaft, head)) = shapes::arrow(object, *from, *to, xf) else {
                 return;
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver, into);
             shapes::stroke_path(canvas, &shaft, &paint, width);
             shapes::fill_path(canvas, &head, &paint);
         }
@@ -173,33 +179,33 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             let Some(path) = shapes::line(*from, *to, xf) else {
                 return;
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver, into);
             shapes::stroke_path(canvas, &path, &paint, width);
         }
         Annotation::Rectangle(rect) => {
             let Some(path) = shapes::rectangle(rect, xf) else {
                 return;
             };
-            fill_then_stroke(canvas, &path, object, opacity, width);
+            fill_then_stroke(canvas, &path, object, opacity, width, into);
         }
         Annotation::Ellipse(rect) => {
             let Some(path) = shapes::ellipse(rect, xf) else {
                 return;
             };
-            fill_then_stroke(canvas, &path, object, opacity, width);
+            fill_then_stroke(canvas, &path, object, opacity, width, into);
         }
         Annotation::Freehand(points) => {
             let Some(path) = shapes::freehand(points, xf) else {
                 return;
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver, into);
             shapes::stroke_path(canvas, &path, &paint, width);
         }
         Annotation::Text { at, content } => {
             let Some(path) = shapes::text(content, *at, &object.style, xf) else {
                 return;
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver, into);
             // Type weight is a fraction of cap height, not the shape stroke
             // width: an 18pt label drawn with a 12pt shape stroke is a blob.
             let weight = xf
@@ -212,12 +218,12 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
                 return;
             };
             let fill = object.style.fill.unwrap_or(object.style.stroke);
-            let disc_paint = shapes::paint(fill, opacity, BlendMode::SourceOver);
+            let disc_paint = shapes::paint(fill, opacity, BlendMode::SourceOver, into);
             shapes::fill_path(canvas, &disc, &disc_paint);
             if let Some(label) = label {
                 // Pick black or white against the disc so the numeral stays
                 // legible whatever colour the user chose.
-                let ink = shapes::paint(fill.contrasting(), opacity, BlendMode::SourceOver);
+                let ink = shapes::paint(fill.contrasting(), opacity, BlendMode::SourceOver, into);
                 let weight = xf.length(object.counter_radius() * 0.2).max(1.0);
                 shapes::stroke_path(canvas, &label, &ink, weight);
             }
@@ -230,7 +236,7 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
             // and leaves dark text readable, where a translucent overlay would
             // wash it out towards the highlight colour.
             let color = object.style.fill.unwrap_or(object.style.stroke);
-            let paint = shapes::paint(color, opacity, BlendMode::Multiply);
+            let paint = shapes::paint(color, opacity, BlendMode::Multiply, into);
             shapes::fill_path(canvas, &path, &paint);
         }
         Annotation::Redact { area, style } => {
@@ -266,13 +272,14 @@ fn fill_then_stroke(
     object: &AnnotationObject,
     opacity: f32,
     width: f32,
+    into: ColorTransform,
 ) {
     if let Some(fill) = object.style.fill.filter(|c| !c.is_invisible()) {
-        let paint = shapes::paint(fill, opacity, BlendMode::SourceOver);
+        let paint = shapes::paint(fill, opacity, BlendMode::SourceOver, into);
         shapes::fill_path(canvas, path, &paint);
     }
     if !object.style.stroke.is_invisible() && object.style.stroke_width > 0.0 {
-        let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+        let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver, into);
         shapes::stroke_path(canvas, path, &paint, width);
     }
 }

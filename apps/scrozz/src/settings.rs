@@ -23,6 +23,7 @@ use crate::{
     fault::{CliError, CliResult},
     hotkey_config::Accelerator,
     json::Json,
+    shortcuts::{ShortcutAction, ShortcutStore, Shortcuts},
 };
 use scrozz_shell::ScreenshotSound;
 use std::path::PathBuf;
@@ -82,15 +83,25 @@ impl Setting {
     /// The JSON representation, including the current (always default) value.
     #[must_use]
     pub fn to_json(self) -> Json {
+        self.to_json_valued(self.default, "default")
+    }
+
+    /// The JSON representation with a resolved value and its provenance.
+    ///
+    /// Split from [`Setting::to_json`] rather than replacing it because the
+    /// schema and the current state are two different questions: `--defaults`
+    /// wants the former, and a script asking what is in force wants the latter.
+    #[must_use]
+    pub fn to_json_valued(self, value: &str, source: &str) -> Json {
         let mut fields = vec![
             ("key", Json::str(self.key)),
             ("type", Json::str(self.kind.slug())),
-            ("value", Json::str(self.default)),
+            ("value", Json::str(value)),
             ("default", Json::str(self.default)),
-            // Honest about where the value came from. When persistence lands
-            // this becomes "user" for anything overridden, and a script that
-            // already reads it keeps working.
-            ("source", Json::str("default")),
+            // Honest about where the value came from: "user" once something has
+            // been stored, so a script can tell a deliberate choice from a
+            // default that may move in a later release.
+            ("source", Json::str(source)),
             ("description", Json::str(self.description)),
         ];
         if let Kind::Choice(options) = self.kind {
@@ -159,7 +170,17 @@ impl Setting {
                     )))
                 }
             }
-            Kind::Accelerator => Accelerator::parse(value).map(|_| ()),
+            Kind::Accelerator => {
+                // An empty accelerator is the recorded decision to have no
+                // shortcut for something, which is a real answer and not a
+                // missing one. Rejecting it would leave a user who wants an
+                // action unbound with nothing to type.
+                if value.trim().is_empty() {
+                    Ok(())
+                } else {
+                    Accelerator::parse(value).map(|_| ())
+                }
+            }
         }
     }
 }
@@ -278,28 +299,40 @@ pub const SETTINGS: &[Setting] = &[
         description: "Disk budget for stored source images. Pinned captures are never evicted.",
     },
     Setting {
+        key: "hotkey.capture-all-in-one",
+        kind: Kind::Accelerator,
+        default: ShortcutAction::CaptureAllInOne.default_accelerator_setting(),
+        description: "Hotkey for the all-in-one capture selector.",
+    },
+    Setting {
         key: "hotkey.capture-region",
         kind: Kind::Accelerator,
-        default: "Super+Shift+4",
+        default: ShortcutAction::CaptureRegion.default_accelerator_setting(),
         description: "Hotkey for an interactive region capture.",
     },
     Setting {
         key: "hotkey.capture-window",
         kind: Kind::Accelerator,
-        default: "Super+Shift+5",
+        default: ShortcutAction::CaptureWindow.default_accelerator_setting(),
         description: "Hotkey for an interactive window capture.",
     },
     Setting {
         key: "hotkey.capture-display",
         kind: Kind::Accelerator,
-        default: "Super+Shift+3",
+        default: ShortcutAction::CaptureFullscreen.default_accelerator_setting(),
         description: "Hotkey for capturing the active display.",
     },
     Setting {
         key: "hotkey.capture-all-displays",
         kind: Kind::Accelerator,
-        default: "Super+Shift+6",
+        default: ShortcutAction::CaptureAllDisplays.default_accelerator_setting(),
         description: "Hotkey for capturing every display.",
+    },
+    Setting {
+        key: "hotkey.record-toggle",
+        kind: Kind::Accelerator,
+        default: ShortcutAction::ToggleRecording.default_accelerator_setting(),
+        description: "Hotkey for starting or stopping a recording. Empty means unassigned.",
     },
     Setting {
         key: "hotkey.record-start",
@@ -375,6 +408,67 @@ pub fn all_human() -> String {
     SETTINGS
         .iter()
         .map(|s| format!("{:width$}  {}", s.key, s.default))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The shortcuts stored on this machine, or the defaults.
+///
+/// Never fails: a settings listing that errors because a config file is
+/// unreadable is less useful than one that shows what the app will actually do,
+/// which without a readable file is the defaults.
+#[must_use]
+pub fn stored_shortcuts() -> Shortcuts {
+    ShortcutStore::default_location().map_or_else(|_| Shortcuts::default(), |store| store.load())
+}
+
+/// The value in force for a setting, and whether the user chose it.
+///
+/// Only the shortcut keys can currently be overridden; everything else still
+/// reports its default, which is the truth rather than a placeholder.
+#[must_use]
+pub fn resolve(setting: &Setting, shortcuts: &Shortcuts) -> (String, &'static str) {
+    match ShortcutAction::from_stored_key(setting.key) {
+        Some(action) => {
+            let value = shortcuts.get(action).unwrap_or_default().to_owned();
+            let source = if shortcuts.is_default(action) {
+                "default"
+            } else {
+                "user"
+            };
+            (value, source)
+        }
+        None => (setting.default.to_owned(), "default"),
+    }
+}
+
+/// Every setting as JSON, with anything the user has stored applied.
+#[must_use]
+pub fn all_json_resolved(shortcuts: &Shortcuts) -> Json {
+    Json::arr(SETTINGS.iter().map(|setting| {
+        let (value, source) = resolve(setting, shortcuts);
+        setting.to_json_valued(&value, source)
+    }))
+}
+
+/// Every setting as aligned text, with anything the user has stored applied.
+///
+/// An unassigned shortcut prints as `(unassigned)` rather than as nothing at
+/// all, because a blank column in a listing reads as a bug.
+#[must_use]
+pub fn all_human_resolved(shortcuts: &Shortcuts) -> String {
+    let width = SETTINGS.iter().map(|s| s.key.len()).max().unwrap_or(0);
+    SETTINGS
+        .iter()
+        .map(|setting| {
+            let (value, _) = resolve(setting, shortcuts);
+            let shown = if value.is_empty() {
+                "(unassigned)".to_owned()
+            } else {
+                value
+            };
+            format!("{:width$}  {}", setting.key, shown)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

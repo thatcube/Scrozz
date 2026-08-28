@@ -110,6 +110,43 @@ impl History {
         self.tag = Some(tag.to_owned());
     }
 
+    /// Discards the open coalescing group, restoring `document` to before it.
+    ///
+    /// # Why this is not [`undo`](Self::undo)
+    ///
+    /// Undo is a step the user took back, so it goes on the redo stack. This is
+    /// for a step the user never finished: placing a text label and typing
+    /// nothing into it. Committing that would leave an invisible empty
+    /// annotation one ⌘Z away — the user sees nothing happen, presses undo, and
+    /// something they never made comes back. There is nothing to redo either,
+    /// because nothing happened.
+    ///
+    /// Only the open group is discarded. Anything sealed before it is untouched,
+    /// so this cannot swallow an edit the user did finish.
+    ///
+    /// Returns `false` when there is no open group to abandon — the caller
+    /// still has to clean up the document itself in that case.
+    /// # Errors
+    ///
+    /// Returns an error only if the recorded state cannot be applied to this
+    /// document, for the same reason [`undo`](Self::undo) can.
+    pub fn abandon(&mut self, document: &mut Document) -> Result<bool> {
+        if self.tag.is_none() {
+            return Ok(false);
+        }
+        let Some(previous) = self.past.last().cloned() else {
+            // A zero-limit history keeps no past, so there is nothing to go back
+            // to and the caller has to undo the change by hand.
+            self.tag = None;
+            return Ok(false);
+        };
+        document.restore(previous.clone())?;
+        self.past.pop();
+        self.present = previous;
+        self.tag = None;
+        Ok(true)
+    }
+
     /// Abandons any open coalescing group.
     ///
     /// Call it when a gesture ends, so the next edit of the same kind starts a

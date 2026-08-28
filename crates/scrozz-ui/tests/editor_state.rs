@@ -1430,3 +1430,237 @@ fn editing_the_document_does_invalidate_the_rendered_preview() {
         "drawing moved the viewport as a side effect"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Caret and composition hygiene across history
+// ---------------------------------------------------------------------------
+
+/// Places a label and types `text` into it, leaving the field open.
+fn typed(text: &str) -> EditorState {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Insert(text.to_owned()));
+    state
+}
+
+#[test]
+fn undoing_past_a_multibyte_character_leaves_the_caret_on_a_boundary() {
+    // "é" is two bytes, so a caret at 3 after "aéb" is mid-character once the
+    // history restores a shorter string. Slicing there would panic.
+    let mut state = typed("aéb");
+    assert_eq!(state.text_caret(), 4);
+
+    state.command(Command::Undo).expect("undo");
+
+    let len = state.text_buffer().map_or(0, str::len);
+    assert!(state.text_caret() <= len, "the caret outran the text");
+    if let Some(text) = state.text_buffer() {
+        assert!(
+            text.is_char_boundary(state.text_caret()),
+            "caret {} is inside a code point of {text:?}",
+            state.text_caret()
+        );
+    }
+}
+
+#[test]
+fn typing_after_an_undo_into_multibyte_text_does_not_panic() {
+    let mut state = typed("日本語");
+    state.command(Command::Undo).expect("undo");
+    // Whatever the caret was clamped to, an insert must be well defined.
+    state.text_edit(&TextEdit::Insert("x".to_owned()));
+    state.text_edit(&TextEdit::Backspace);
+}
+
+#[test]
+fn deleting_after_an_undo_into_multibyte_text_does_not_panic() {
+    let mut state = typed("🙂🙂🙂");
+    state.command(Command::Undo).expect("undo");
+    state.text_edit(&TextEdit::Backspace);
+    state.text_edit(&TextEdit::DeleteForward);
+}
+
+#[test]
+fn redoing_into_multibyte_text_also_lands_on_a_boundary() {
+    let mut state = typed("aé");
+    state.command(Command::Undo).expect("undo");
+    state.command(Command::Redo).expect("redo");
+    if let Some(text) = state.text_buffer() {
+        assert!(text.is_char_boundary(state.text_caret()));
+    }
+}
+
+#[test]
+fn history_ends_a_composition_rather_than_leaving_it_dangling() {
+    let mut state = typed("ab");
+    state.text_edit(&TextEdit::Preedit("か".to_owned()));
+    assert!(state.preedit().is_some());
+
+    state.command(Command::Undo).expect("undo");
+
+    assert!(
+        state.preedit().is_none(),
+        "a composition survived the undo that removed the text it spanned"
+    );
+}
+
+#[test]
+fn a_composition_abandoned_by_undo_cannot_corrupt_later_typing() {
+    let mut state = typed("aé");
+    state.text_edit(&TextEdit::Preedit("한".to_owned()));
+    state.command(Command::Undo).expect("undo");
+    assert!(state.preedit().is_none());
+    // Whether the label survived the undo or not, the next keystroke must be
+    // well defined rather than addressing a range that no longer exists.
+    state.text_edit(&TextEdit::Insert("z".to_owned()));
+    if let Some(text) = state.text_buffer() {
+        assert!(text.contains('z'), "typing after the undo went nowhere");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Abandoning an empty label
+// ---------------------------------------------------------------------------
+
+#[test]
+fn placing_a_label_and_typing_nothing_leaves_the_undo_stack_alone() {
+    let mut state = state();
+    let before = state.undo_depth();
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(40.0, 40.0));
+    state.pointer_released();
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(
+        state.undo_depth(),
+        before,
+        "an abandoned empty label left an undoable step behind"
+    );
+    assert_eq!(state.document().annotations().len(), 0);
+}
+
+#[test]
+fn undoing_after_abandoning_an_empty_label_does_not_resurrect_it() {
+    let mut state = state();
+    // One real annotation first, so there is something to undo *past*.
+    state.set_tool(Tool::Rectangle);
+    state.pointer_pressed(at(10.0, 10.0));
+    state.pointer_dragged(at(90.0, 90.0), false);
+    state.pointer_released();
+    assert_eq!(state.document().annotations().len(), 1);
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.command(Command::Escape).expect("escape");
+
+    state.command(Command::Undo).expect("undo");
+
+    // One undo must remove the rectangle, not bring back an invisible label.
+    assert_eq!(
+        state.document().annotations().len(),
+        0,
+        "undo restored something the user never made"
+    );
+}
+
+#[test]
+fn abandoning_an_empty_label_leaves_nothing_to_redo() {
+    let mut state = state();
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(40.0, 40.0));
+    state.pointer_released();
+    state.command(Command::Escape).expect("escape");
+    assert_eq!(state.redo_depth(), 0);
+}
+
+#[test]
+fn emptying_a_label_that_already_existed_is_still_undoable() {
+    let mut state = typed("hello");
+    state.command(Command::Escape).expect("escape");
+    let with_text = state.undo_depth();
+    assert_eq!(state.document().annotations().len(), 1);
+
+    // Re-enter it and delete everything: a real edit to real content.
+    // Click inside the label's own box, which starts at its origin and is as
+    // wide as the glyphs it holds.
+    let box_of = state.document().annotations()[0].bounds();
+    let middle = at(
+        box_of.origin.x + box_of.size.width / 2.0,
+        box_of.origin.y + box_of.size.height / 2.0,
+    );
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(middle);
+    state.pointer_released();
+    assert!(
+        state.editing_text().is_some(),
+        "clicking the label did not re-enter it"
+    );
+    for _ in 0..5 {
+        state.text_edit(&TextEdit::Backspace);
+    }
+    state.command(Command::Escape).expect("escape");
+    assert_eq!(state.document().annotations().len(), 0);
+
+    assert!(
+        state.undo_depth() > with_text,
+        "deleting text the user really typed was not recorded"
+    );
+    state.command(Command::Undo).expect("undo");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "undo did not bring the deleted label back"
+    );
+}
+
+#[test]
+fn a_label_with_real_text_is_kept_and_recorded() {
+    let mut state = typed("note");
+    let before = state.undo_depth();
+    state.command(Command::Escape).expect("escape");
+    assert_eq!(state.document().annotations().len(), 1);
+    assert!(state.undo_depth() >= before);
+}
+
+// ---------------------------------------------------------------------------
+// Panning is a view change, not a document change
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gesture_panning_does_not_spend_a_document_revision() {
+    let mut state = state();
+    let content = state.revision();
+    let view = state.view_revision();
+
+    state.begin_pan((100.0, 100.0));
+    state.pan_to((140.0, 130.0));
+    state.pan_to((180.0, 160.0));
+
+    assert_eq!(
+        state.revision(),
+        content,
+        "panning rerasterised the preview"
+    );
+    assert!(
+        state.view_revision() > view,
+        "panning did not register as a view change"
+    );
+}
+
+#[test]
+fn gesture_panning_still_moves_the_picture() {
+    let mut state = state();
+    state.begin_pan((100.0, 100.0));
+    state.pan_to((150.0, 120.0));
+    assert_eq!(state.pan(), (50.0, 20.0));
+}
+
+#[test]
+fn a_pan_that_goes_nowhere_costs_nothing() {
+    let mut state = state();
+    state.begin_pan((100.0, 100.0));
+    let view = state.view_revision();
+    state.pan_to((100.0, 100.0));
+    assert_eq!(state.view_revision(), view);
+}

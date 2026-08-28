@@ -448,6 +448,9 @@ pub struct EditorState {
     selection: Option<AnnotationId>,
     drag: Drag,
     editing_text: Option<AnnotationId>,
+    /// Whether [`editing_text`](Self::editing_text) was created by the click
+    /// that opened it. See [`EditorState::finish_text`].
+    text_is_new: bool,
     caret: usize,
     preedit: Option<Range<usize>>,
     zoom: f32,
@@ -471,6 +474,7 @@ impl EditorState {
             selection: None,
             drag: Drag::Idle,
             editing_text: None,
+            text_is_new: false,
             caret: 0,
             preedit: None,
             zoom: 1.0,
@@ -759,8 +763,12 @@ impl EditorState {
     }
 
     /// Starts typing into `id`, with the caret after whatever is already there.
-    fn begin_text(&mut self, id: AnnotationId) {
+    ///
+    /// `fresh` says whether `id` was created by the click that started this —
+    /// see [`finish_text`](Self::finish_text) for why that distinction matters.
+    fn begin_text(&mut self, id: AnnotationId, fresh: bool) {
         self.editing_text = Some(id);
+        self.text_is_new = fresh;
         self.caret = self.text_buffer().map_or(0, str::len);
         self.preedit = None;
     }
@@ -770,10 +778,23 @@ impl EditorState {
     /// An empty text annotation is invisible but selectable, which reads as a
     /// bug: clicking to place text and then thinking better of it must leave
     /// nothing behind.
+    ///
+    /// # Why abandoning differs from deleting
+    ///
+    /// Placing a label and typing nothing must leave the undo stack exactly as
+    /// it was. Removing the annotation and committing would not do that: the
+    /// step that *created* it is still on the stack, so one ⌘Z brings back an
+    /// invisible empty label the user never made. That group is discarded
+    /// instead, as though the click had not happened.
+    ///
+    /// Emptying a label that already existed is the opposite case — the user
+    /// deleted text that was really there, and undo must bring it back — so that
+    /// one commits normally. `text_is_new` is what tells them apart.
     pub fn finish_text(&mut self) {
         let Some(id) = self.editing_text.take() else {
             return;
         };
+        let fresh = std::mem::take(&mut self.text_is_new);
         // Any composition in flight becomes ordinary text. Dropping it would
         // discard glyphs the user can see, which is never what leaving a field
         // means on any platform.
@@ -784,10 +805,19 @@ impl EditorState {
             Some(Annotation::Text { content, .. }) if content.trim().is_empty()
         );
         if empty {
-            self.document.remove(id);
             if self.selection == Some(id) {
                 self.selection = None;
             }
+            if fresh
+                && self
+                    .history
+                    .abandon(&mut self.document)
+                    .expect("the document has not changed provenance mid-edit")
+            {
+                self.touch();
+                return;
+            }
+            self.document.remove(id);
         }
         self.history.seal();
         self.commit();
@@ -853,7 +883,23 @@ impl EditorState {
         self.history.can_undo()
     }
 
-    /// Whether redo is available.
+    /// How many undo steps are available.
+    ///
+    /// Exposed because "did that gesture record a step?" is otherwise
+    /// unobservable, and the difference between recording one and recording none
+    /// is exactly what separates a real edit from an abandoned one.
+    #[must_use]
+    pub fn undo_depth(&self) -> usize {
+        self.history.undo_depth()
+    }
+
+    /// How many redo steps are available.
+    #[must_use]
+    pub fn redo_depth(&self) -> usize {
+        self.history.redo_depth()
+    }
+
+    /// Whether there is anything to redo.
     #[must_use]
     pub fn can_redo(&self) -> bool {
         self.history.can_redo()
@@ -1043,10 +1089,14 @@ impl EditorState {
     }
 
     /// Continues a pan to a screen-space point.
+    ///
+    /// Through [`set_pan`](Self::set_pan) deliberately: panning changes where
+    /// the picture sits, not what it contains, so it must not spend a document
+    /// revision and force the 2400px preview to be rasterised and re-uploaded
+    /// on every mouse move.
     pub fn pan_to(&mut self, at: (f32, f32)) {
         if let Drag::Panning { grab, start } = self.drag {
-            self.pan = (start.0 + at.0 - grab.0, start.1 + at.1 - grab.1);
-            self.touch();
+            self.set_pan((start.0 + at.0 - grab.0, start.1 + at.1 - grab.1));
         }
     }
 
@@ -1241,7 +1291,9 @@ impl EditorState {
                     let is_text = matches!(object.annotation, Annotation::Text { .. });
                     let bounds = object.bounds();
                     if is_text {
-                        self.begin_text(id);
+                        // Re-entering a label that already exists: emptying it is
+                        // a real deletion, undoable like any other.
+                        self.begin_text(id, false);
                     }
                     self.drag = Drag::Moving {
                         grab: point,
@@ -1263,7 +1315,7 @@ impl EditorState {
                     },
                     self.style,
                 );
-                self.begin_text(id);
+                self.begin_text(id, true);
                 id
             }
             Tool::Counter => {
@@ -1376,7 +1428,30 @@ impl EditorState {
         {
             self.editing_text = None;
         }
+
+        // A composition belongs to the keystrokes that were just undone. Keeping
+        // its byte range would leave `text_edit` addressing text that no longer
+        // exists, and the platform IME has no idea the document moved under it.
+        self.preedit = None;
+
+        // The caret is a byte offset into text the history just replaced. After
+        // undoing past a multi-byte character the old offset can land *inside* a
+        // code point, and the next insert or delete would slice a `String` off a
+        // character boundary and panic. Clamp it to the restored text.
+        self.caret = match self.editing_text.and_then(|id| self.text_of(id)) {
+            Some(text) => clamp_boundary(text, self.caret),
+            None => 0,
+        };
+
         self.dirty = true;
+    }
+
+    /// The content of `id`, if it is a text annotation.
+    fn text_of(&self, id: AnnotationId) -> Option<&str> {
+        match &self.document.get(id)?.annotation {
+            Annotation::Text { content, .. } => Some(content.as_str()),
+            _ => None,
+        }
     }
 
     fn touch(&mut self) {
