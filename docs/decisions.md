@@ -1088,7 +1088,9 @@ Apple an invalid `CFBundleShortVersionString`.
 
 **Decision.** Capture Area always uses the operating system's native crosshair
 pointer. Moving the pointer alone draws no selection; the rectangle begins only
-after primary-button press and movement.
+after primary-button press and movement. Before that movement, the frozen
+desktop remains visually unchanged: no dimming scrim, display label, border, or
+other overlay paint is shown.
 
 The additional full-screen guides and pixel loupe form one user-facing
 **Crosshair Mode** in Screenshot settings. It has three states:

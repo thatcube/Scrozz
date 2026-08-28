@@ -49,6 +49,12 @@ fn selector_scenes_render_non_empty_and_distinct_images() {
         .unwrap();
 
     assert!(idle.width() > 0 && idle.height() > 0);
+    let probe = (idle.width() / 4, idle.height() / 3);
+    assert_eq!(
+        idle.pixel(probe.0, probe.1),
+        dragging.pixel(probe.0, probe.1),
+        "idle Capture Area must show the same undimmed frozen pixel that a selection reveals"
+    );
     assert_ne!(idle.fingerprint(), dragging.fingerprint());
     assert_ne!(dragging.fingerprint(), hud.fingerprint());
 }

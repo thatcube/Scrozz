@@ -310,7 +310,7 @@ fn a_hidden_surface_cannot_intercept_pointer_input() {
 #[test]
 fn the_selection_overlay_sits_above_the_menu_bar() {
     let overlay = OverlayBehavior::selection_overlay();
-    assert_eq!(overlay.level, OverlayLevel::Shielding);
+    assert_eq!(overlay.level, OverlayLevel::ScreenSaver);
     assert!(
         overlay.accepts_key,
         "the selection overlay reads Escape and arrow keys"
@@ -323,7 +323,7 @@ fn overlay_levels_are_ordered_the_way_the_window_server_stacks_them() {
     assert!(OverlayLevel::Normal < OverlayLevel::Floating);
     assert!(OverlayLevel::Floating < OverlayLevel::Status);
     assert!(OverlayLevel::Status < OverlayLevel::AboveMenuBar);
-    assert!(OverlayLevel::AboveMenuBar < OverlayLevel::Shielding);
+    assert!(OverlayLevel::AboveMenuBar < OverlayLevel::ScreenSaver);
 }
 
 // ---------------------------------------------------------------------------

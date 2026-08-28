@@ -130,8 +130,6 @@ pub fn logical_to_appkit(rect: LogicalRect, reference_height: f64) -> AppKitRect
 /// How insistently an overlay sits above other windows.
 ///
 /// The numeric values are AppKit's documented `NSWindowLevel` constants.
-/// [`Self::Shielding`] is resolved at runtime from `CGShieldingWindowLevel()`
-/// because Apple does not promise its value.
 /// The natural ordering is the stacking order: a greater level is always in
 /// front of a lesser one. Derived rather than written out because the variants
 /// are already declared bottom-to-top, and keeping the two in sync by hand is
@@ -156,12 +154,23 @@ pub enum OverlayLevel {
     Status,
     /// `NSPopUpMenuWindowLevel` — above the menu bar, below the Dock's menus.
     AboveMenuBar,
-    /// `CGShieldingWindowLevel()` — where the login window and screen-saver
-    /// shields live, and the highest level the system will draw at.
+    /// `NSScreenSaverWindowLevel` — above fullscreen application content and
+    /// menu-bar UI while remaining below the operating system's cursor.
     ///
-    /// This is what the fullscreen selection overlay needs, and it is strictly
-    /// higher than winit's `WindowLevel::AlwaysOnTop` can reach.
-    Shielding,
+    /// This is the highest level Scrozz uses for interactive content.
+    /// `CGShieldingWindowLevel()` is intentionally avoided: Apple does not
+    /// recommend positioning UI there and warns that it can become invisible.
+    ScreenSaver,
+}
+
+/// Native cursor requested while an overlay owns pointer input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayCursor {
+    /// The platform's ordinary pointer.
+    #[default]
+    Arrow,
+    /// The platform's native region-selection crosshair.
+    Crosshair,
 }
 
 /// The complete set of native properties a floating overlay needs.
@@ -215,7 +224,8 @@ pub struct OverlayBehavior {
     /// Whether the overlay is opaque and draws its own background.
     ///
     /// `false` for every Scrozz overlay: capture cards are rounded thumbnails
-    /// on empty space, and the selection overlay is a dimmed pass-through.
+    /// on empty space, and the selection overlay composites only its active
+    /// selection affordances.
     pub opaque: bool,
     /// Whether the OS draws a drop shadow behind the window.
     pub has_shadow: bool,
@@ -294,7 +304,7 @@ impl OverlayBehavior {
     #[must_use]
     pub const fn selection_overlay() -> Self {
         Self {
-            level: OverlayLevel::Shielding,
+            level: OverlayLevel::ScreenSaver,
             click_through: false,
             join_all_spaces: true,
             over_fullscreen: true,

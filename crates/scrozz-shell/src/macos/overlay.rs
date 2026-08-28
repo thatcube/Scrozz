@@ -65,17 +65,18 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, NSObjectProtocol, Sel};
 use objc2::{ClassType, sel};
 use objc2_app_kit::{
-    NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
-    NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
-    NSWindowStyleMask,
+    NSCursor, NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
+    NSScreenSaverWindowLevel, NSStatusWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowLevel, NSWindowStyleMask,
 };
-use objc2_core_graphics::CGShieldingWindowLevel;
 use objc2_foundation::NSRect;
 use scrozz_core::{Error, LogicalRect, Result};
 
 use crate::OverlayWindow;
 use crate::macos::{display, main_thread};
-use crate::overlay::{OverlayBehavior, OverlayLevel, OverlayReport, logical_to_appkit};
+use crate::overlay::{
+    OverlayBehavior, OverlayCursor, OverlayLevel, OverlayReport, logical_to_appkit,
+};
 
 /// Name of the runtime-built `NSPanel` subclass windows are swizzled into.
 ///
@@ -317,9 +318,6 @@ pub unsafe fn make_nonactivating_panel(window: &NSWindow) -> Result<String> {
 
 /// Resolves an [`OverlayLevel`] to its `NSWindowLevel`.
 ///
-/// [`OverlayLevel::Shielding`] is read from `CGShieldingWindowLevel()` at call
-/// time because Apple documents it as "the level above which the system does
-/// not draw" rather than as a fixed number.
 #[must_use]
 pub fn level_value(level: OverlayLevel) -> NSWindowLevel {
     match level {
@@ -327,10 +325,29 @@ pub fn level_value(level: OverlayLevel) -> NSWindowLevel {
         OverlayLevel::Floating => NSFloatingWindowLevel,
         OverlayLevel::Status => NSStatusWindowLevel,
         OverlayLevel::AboveMenuBar => NSPopUpMenuWindowLevel,
-        // `CGShieldingWindowLevel` is a pure query with no arguments and no
-        // failure mode; the binding is safe in objc2-core-graphics 0.3.
-        OverlayLevel::Shielding => CGShieldingWindowLevel() as NSWindowLevel,
+        OverlayLevel::ScreenSaver => NSScreenSaverWindowLevel,
     }
+}
+
+/// Immediately changes the native cursor while Scrozz owns pointer input.
+///
+/// Winit normally applies egui's cursor output. A retained capture-card window
+/// can expand underneath a stationary pointer, however, while winit still
+/// considers that pointer outside the old card-sized frame. AppKit must receive
+/// the first cursor directly; normal cursor-rect handling resumes as soon as a
+/// pointer event reaches winit.
+///
+/// # Errors
+///
+/// Returns [`Error::Platform`] when called off the main thread.
+pub fn set_overlay_cursor(cursor: OverlayCursor) -> Result<()> {
+    let _mtm = main_thread("setting the overlay cursor")?;
+    match cursor {
+        OverlayCursor::Arrow => NSCursor::arrowCursor(),
+        OverlayCursor::Crosshair => NSCursor::crosshairCursor(),
+    }
+    .set();
+    Ok(())
 }
 
 /// Assembles the `NSWindowCollectionBehavior` mask for a behaviour.
@@ -509,8 +526,8 @@ impl MacOverlay {
     /// Sets just the stacking level.
     ///
     /// Separate from [`Self::apply`] because the selection overlay is raised to
-    /// [`OverlayLevel::Shielding`] only while it is on screen, and dropped back
-    /// afterwards.
+    /// [`OverlayLevel::ScreenSaver`] only while it is on screen, and dropped
+    /// back afterwards.
     ///
     /// # Errors
     ///

@@ -129,7 +129,7 @@ thread hides the capture cards, waits one frame, prepares any frozen pixels,
 shows the desktop-sized selector, hides it after commit, captures, then restores
 the cards. Only one selector may own that lifecycle at a time. CLI one-shot
 selection uses the same bridge in an ordinary temporary window. That one-shot
-window intentionally skips reversible AppKit panel conversion, so its shielding
+window intentionally skips reversible AppKit panel conversion, so its layering
 across Spaces and fullscreen apps still needs a native smoke run. On X11, both
 hosts retain their exact override-redirect window ID, take keyboard ownership
 with `SetInputFocus` after the window becomes viewable, and restore the prior
@@ -172,7 +172,7 @@ All-display composition remains separate capture-backend work.
 
 Selector geometry, state, input, accessibility labels, frozen-pixel sampling and
 deterministic harness scenes are covered headlessly. The remaining native gaps
-are one-shot macOS shielding across Spaces/fullscreen apps, mapped layer-shell
+are one-shot macOS layering across Spaces/fullscreen apps, mapped layer-shell
 rendering, compositor-owned result adaptation, Wayland all-display composition,
 portal-provided optional geometry, GNOME/KDE runtime smoke, and hands-on
 Windows/X11 focus, DPI and accessibility verification.

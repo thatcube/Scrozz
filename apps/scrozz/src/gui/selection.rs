@@ -14,7 +14,9 @@ use scrozz_core::{
     Frame, LogicalPoint, LogicalRect, PhysicalSize, Provenance, RegionSelector, Result,
     SelectionCapabilities, SelectionHost, SelectionOptions, SelectionOutcome, Window,
 };
-use scrozz_shell::{SelectionIntegration, SelectionPlan, Session, resolve_selection};
+use scrozz_shell::{
+    OverlayCursor, SelectionIntegration, SelectionPlan, Session, resolve_selection,
+};
 use scrozz_ui::{
     FrozenDisplayFrame, SelectionDecision, SelectionUi, overlay_app::OverlayGeometry,
     select::DisplayLayout,
@@ -936,8 +938,14 @@ fn activate_selection(
     prepared: Box<PreparedSelection>,
     decision: Sender<Result<SelectionOutcome>>,
 ) -> ControllerPhase {
+    let cursor = if prepared.options.mode == scrozz_core::SelectionMode::Region {
+        OverlayCursor::Crosshair
+    } else {
+        OverlayCursor::Arrow
+    };
     configure_viewport(ctx, prepared.viewports.root.geometry, true);
     native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
+    native.set_cursor(cursor);
     let selector = SelectionUi::new(prepared.options, prepared.displays, prepared.frozen)
         .with_windows(prepared.windows)
         .with_capabilities(SelectionCapabilities::CLIENT_OVERLAY);
@@ -1274,7 +1282,7 @@ fn configure_viewport(ctx: &egui::Context, geometry: OverlayGeometry, selection:
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
     ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!selection));
     // The viewport starts always-on-top. Re-queueing that level here would run
-    // after the native macOS adapter raises selection to shielding level and
+    // after the native macOS adapter raises selection to screen-saver level and
     // silently lower it back to an ordinary floating window.
     if selection {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1678,6 +1686,11 @@ mod tests {
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "the hidden preparation window must release input before selection takes it"
+        );
+        assert_eq!(
+            native.recorded_cursors(),
+            vec![OverlayCursor::Arrow, OverlayCursor::Crosshair],
+            "the hidden surface restores the arrow before region selection installs a crosshair"
         );
 
         let mut output = ctx.run_ui(

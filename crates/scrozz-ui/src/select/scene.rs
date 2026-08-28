@@ -60,7 +60,7 @@ fn build_selector(fixture: &Fixture, seed: u64) -> SelectionUi {
 fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Window>) {
     match fixture.scenario {
         Scenario::SelectorIdle | Scenario::SelectorDragging => (
-            SelectionOptions::region(),
+            capture_area_options(),
             vec![display(
                 "main",
                 "Built-in Display",
@@ -74,7 +74,7 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
             Vec::new(),
         ),
         Scenario::SelectorMagnifier => (
-            SelectionOptions::region().with_crosshair_mode(CrosshairMode::Always),
+            capture_area_options().with_crosshair_mode(CrosshairMode::Always),
             vec![display(
                 "main",
                 "Built-in Display",
@@ -93,7 +93,7 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
                     LogicalPoint::new(120.0, 84.0),
                     LogicalSize::new(250.0, 160.0),
                 )),
-                ..SelectionOptions::region()
+                ..capture_area_options()
             },
             vec![display(
                 "main",
@@ -112,7 +112,7 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
                 constraint: SizeConstraint::free()
                     .with_exact(LogicalSize::new(320.0, 200.0))
                     .expect("valid exact size"),
-                ..SelectionOptions::region()
+                ..capture_area_options()
             },
             vec![display(
                 "main",
@@ -130,7 +130,7 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
             SelectionOptions {
                 constraint: SizeConstraint::free()
                     .with_aspect(AspectLock::ratio(16.0, 9.0).expect("valid ratio")),
-                ..SelectionOptions::region()
+                ..capture_area_options()
             },
             vec![display(
                 "main",
@@ -314,6 +314,13 @@ fn display(id: &str, name: &str, bounds: LogicalRect, scale: f64, is_primary: bo
         work_area: bounds,
         scale: ScaleFactor::new(scale),
         is_primary,
+    }
+}
+
+fn capture_area_options() -> SelectionOptions {
+    SelectionOptions {
+        hud: false,
+        ..SelectionOptions::region()
     }
 }
 

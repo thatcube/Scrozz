@@ -70,7 +70,13 @@ pub(super) fn draw_overlay(
     if state.options_ref().freeze
         && matches!(state.mode(), SelectionMode::Region | SelectionMode::Display)
     {
-        draw_backdrop(&painter, canvas_rect, theme, view);
+        draw_backdrop(
+            &painter,
+            canvas_rect,
+            theme,
+            view,
+            state.mode() == SelectionMode::Display,
+        );
     }
     let paints_focus = view.display.is_none() || state.focus_display() == view.display;
     let focus = if state.mode() == SelectionMode::AllDisplays {
@@ -80,7 +86,9 @@ pub(super) fn draw_overlay(
     } else {
         None
     };
-    draw_scrim(&painter, canvas_rect, focus, view.surface, theme);
+    if should_draw_scrim(state.mode(), focus.is_some()) {
+        draw_scrim(&painter, canvas_rect, focus, view.surface, theme);
+    }
     let mut confirmation = HudPaintResult {
         action: OverlayAction::None,
         pointer_over_hud: false,
@@ -161,7 +169,13 @@ fn magnifier_grid(state: &SelectionState, frozen: &FrozenDesktop) -> Option<Magn
     ))
 }
 
-fn draw_backdrop(painter: &egui::Painter, canvas_rect: Rect, theme: &Theme, view: OverlayView<'_>) {
+fn draw_backdrop(
+    painter: &egui::Painter,
+    canvas_rect: Rect,
+    theme: &Theme,
+    view: OverlayView<'_>,
+    decorate_displays: bool,
+) {
     if view.frozen.is_empty() {
         return;
     }
@@ -189,25 +203,31 @@ fn draw_backdrop(painter: &egui::Painter, canvas_rect: Rect, theme: &Theme, view
         } else {
             painter.rect_filled(rect, corner(Radius::CARD), palette.card_fill_raised);
         }
-        painter.rect_stroke(
-            rect,
-            corner(Radius::CARD),
-            Stroke::new(1.0, palette.hairline),
-            StrokeKind::Inside,
-        );
-        let label_rect = Rect::from_min_size(
-            pos2(rect.left() + Space::LG, rect.bottom() - 34.0),
-            vec2((display.name.len() as f32 * 8.0 + 30.0).max(96.0), 24.0),
-        );
-        chrome::glass_panel(painter, label_rect, Radius::BUTTON, &palette, false);
-        painter.text(
-            label_rect.center(),
-            Align2::CENTER_CENTER,
-            &display.name,
-            theme.font(Text::Caption),
-            palette.text,
-        );
+        if decorate_displays {
+            painter.rect_stroke(
+                rect,
+                corner(Radius::CARD),
+                Stroke::new(1.0, palette.hairline),
+                StrokeKind::Inside,
+            );
+            let label_rect = Rect::from_min_size(
+                pos2(rect.left() + Space::LG, rect.bottom() - 34.0),
+                vec2((display.name.len() as f32 * 8.0 + 30.0).max(96.0), 24.0),
+            );
+            chrome::glass_panel(painter, label_rect, Radius::BUTTON, &palette, false);
+            painter.text(
+                label_rect.center(),
+                Align2::CENTER_CENTER,
+                &display.name,
+                theme.font(Text::Caption),
+                palette.text,
+            );
+        }
     }
+}
+
+fn should_draw_scrim(mode: SelectionMode, has_focus: bool) -> bool {
+    mode != SelectionMode::Region || has_focus
 }
 
 fn draw_scrim(
@@ -667,5 +687,22 @@ fn target_label(state: &SelectionState) -> Option<String> {
         }
         SelectionMode::Display => state.hovered_display().map(|display| display.name.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_capture_does_not_dim_before_a_region_exists() {
+        assert!(!should_draw_scrim(SelectionMode::Region, false));
+        assert!(should_draw_scrim(SelectionMode::Region, true));
+    }
+
+    #[test]
+    fn semantic_targets_keep_their_targeting_scrim() {
+        assert!(should_draw_scrim(SelectionMode::Window, false));
+        assert!(should_draw_scrim(SelectionMode::Display, false));
     }
 }

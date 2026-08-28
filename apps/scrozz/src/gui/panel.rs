@@ -37,7 +37,7 @@ use raw_window_handle::RawWindowHandle;
 use scrozz_core::LogicalRect;
 #[cfg(target_os = "macos")]
 use scrozz_shell::OverlayWindow;
-use scrozz_shell::{NativeOverlay, OverlayBehavior};
+use scrozz_shell::{NativeOverlay, OverlayBehavior, OverlayCursor};
 use scrozz_ui::PanelReport;
 
 /// Main-thread control of the native window behavior after the creation hook.
@@ -52,6 +52,8 @@ pub struct BehaviorController {
     x11_focus: Rc<RefCell<Option<scrozz_shell::X11FocusLease>>>,
     #[cfg(test)]
     behavior_log: Rc<RefCell<Vec<OverlayBehavior>>>,
+    #[cfg(test)]
+    cursor_log: Rc<RefCell<Vec<OverlayCursor>>>,
 }
 
 impl BehaviorController {
@@ -91,8 +93,27 @@ impl BehaviorController {
         #[cfg(test)]
         self.behavior_log.borrow_mut().push(*behavior);
 
+        if behavior.click_through {
+            self.set_cursor(OverlayCursor::Arrow);
+        }
+
         #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
         let _ = behavior;
+    }
+
+    /// Applies the first native cursor before the window toolkit has observed
+    /// that the retained card window expanded beneath the pointer.
+    pub fn set_cursor(&self, cursor: OverlayCursor) {
+        #[cfg(all(target_os = "macos", not(test)))]
+        if let Err(error) = scrozz_shell::macos::overlay::set_overlay_cursor(cursor) {
+            tracing::warn!(%error, "could not update native overlay cursor");
+        }
+
+        #[cfg(test)]
+        self.cursor_log.borrow_mut().push(cursor);
+
+        #[cfg(all(not(target_os = "macos"), not(test)))]
+        let _ = cursor;
     }
 
     /// Retries native behavior that had to wait for queued window commands.
@@ -119,6 +140,11 @@ impl BehaviorController {
     pub(crate) fn recording() -> (Self, Rc<RefCell<Vec<OverlayBehavior>>>) {
         let controller = Self::default();
         (controller.clone(), Rc::clone(&controller.behavior_log))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_cursors(&self) -> Vec<OverlayCursor> {
+        self.cursor_log.borrow().clone()
     }
 }
 

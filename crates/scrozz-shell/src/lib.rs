@@ -30,8 +30,8 @@ pub use hotkey::{
     ReservedShortcut, Session,
 };
 pub use overlay::{
-    AppKitRect, NativeOverlay, OverlayBehavior, OverlayLevel, OverlayReport, StackLayout,
-    anchor_bottom_left, appkit_to_logical, logical_to_appkit,
+    AppKitRect, NativeOverlay, OverlayBehavior, OverlayCursor, OverlayLevel, OverlayReport,
+    StackLayout, anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
 pub use permissions::SystemPermissions;
 pub use selection::{SelectionIntegration, SelectionPlan, resolve_selection};
