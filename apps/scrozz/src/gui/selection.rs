@@ -851,10 +851,13 @@ impl ClientOverlayController {
                 surface_can_remain_visible: false,
                 cursor,
             } if matches!(self.phase, ControllerPhase::Cards) => {
-                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                // Clear the cards for one frame but keep the transparent panel
+                // alive and interactive. A hidden click-through window cannot
+                // own the system cursor, so the application underneath can
+                // restore its arrow until preparation finishes.
+                native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
                 native.set_cursor(cursor);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforePreparation { id, hidden, cursor };
             }
@@ -896,7 +899,9 @@ impl ClientOverlayController {
                     ControllerPhase::WaitingForPreparation { id: waiting, .. } if waiting == id
                 ) =>
             {
-                native.set_cursor(OverlayCursor::Arrow);
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.phase = ControllerPhase::AwaitingCapture { id };
             }
             BridgeEvent::PreparationFailed { id }
@@ -1766,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_hides_before_preparing_and_holds_the_gate_through_capture() {
+    fn bridge_clears_cards_before_preparing_and_holds_the_gate_through_capture() {
         let preparations = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&preparations);
         let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor| {
@@ -1828,7 +1833,7 @@ mod tests {
         assert_eq!(
             preparations.load(Ordering::SeqCst),
             0,
-            "preparation must wait until a hidden frame has elapsed"
+            "preparation must wait until a transparent card-free frame has elapsed"
         );
 
         controller.logic(&ctx, &native);
@@ -1840,13 +1845,13 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
-            "the hidden preparation window must release input before selection takes it"
+            "the transparent preparation window must retain pointer ownership"
         );
         let cursors = native.recorded_cursors();
-        assert_eq!(cursors.first(), Some(&OverlayCursor::Arrow));
+        assert_eq!(cursors.first(), Some(&OverlayCursor::Crosshair));
         assert_eq!(cursors.last(), Some(&OverlayCursor::Crosshair));
         let pinned_count = cursors
             .iter()
@@ -1900,7 +1905,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "focus must remain owned until the decision handshake advances"
@@ -1909,7 +1914,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "focus must remain owned until the committing key is released"
@@ -1946,7 +1951,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::hidden_surface(),
             ],
@@ -2281,7 +2286,7 @@ mod tests {
         assert!(controller.owns_surface());
         assert_eq!(
             *behavior_log.borrow(),
-            vec![scrozz_shell::OverlayBehavior::hidden_surface()]
+            vec![scrozz_shell::OverlayBehavior::selection_overlay()]
         );
         assert!(
             native
@@ -2315,7 +2320,7 @@ mod tests {
         });
         assert!(
             controller.owns_surface(),
-            "the hidden selector must retain its native frame while draining the launch click"
+            "the transparent selector must retain its native frame while draining the launch click"
         );
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -2346,7 +2351,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::selection_overlay()
             ]
         );
