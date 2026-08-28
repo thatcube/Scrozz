@@ -11,8 +11,8 @@ use std::{
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, Display, DisplayId, Error,
-    Frame, LogicalPoint, LogicalRect, PhysicalSize, Provenance, RegionSelector, Result,
-    SelectionCapabilities, SelectionHost, SelectionOptions, SelectionOutcome, Window,
+    Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, Provenance, RegionSelector,
+    Result, SelectionCapabilities, SelectionHost, SelectionOptions, SelectionOutcome, Window,
 };
 use scrozz_shell::{
     OverlayCursor, SelectionIntegration, SelectionPlan, Session, resolve_selection,
@@ -856,6 +856,7 @@ impl ClientOverlayController {
                 // own the system cursor, so the application underneath can
                 // restore its arrow until preparation finishes.
                 native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
+                claim_macos_desktop(native);
                 native.set_cursor(cursor);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
                 ctx.request_repaint();
@@ -931,7 +932,7 @@ impl ClientOverlayController {
                     let _ = restored.send(());
                     self.phase = ControllerPhase::Cards;
                 } else {
-                    configure_viewport(ctx, self.cards, false);
+                    configure_viewport(ctx, native, self.cards, false);
                     native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     ctx.request_repaint();
                     self.phase = ControllerPhase::RestoringCards { restored };
@@ -986,7 +987,7 @@ fn activate_selection(
     } else {
         OverlayCursor::Arrow
     };
-    configure_viewport(ctx, prepared.viewports.root.geometry, true);
+    configure_viewport(ctx, native, prepared.viewports.root.geometry, true);
     native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
     native.set_cursor(cursor);
     let selector = SelectionUi::new(prepared.options, prepared.displays, prepared.frozen)
@@ -1337,10 +1338,26 @@ fn input_is_quiescent(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
     })
 }
 
-fn configure_viewport(ctx: &egui::Context, geometry: OverlayGeometry, selection: bool) {
+fn configure_viewport(
+    ctx: &egui::Context,
+    native: &crate::gui::panel::BehaviorController,
+    geometry: OverlayGeometry,
+    selection: bool,
+) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
-    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+    #[cfg(target_os = "macos")]
+    if selection {
+        native.set_frame(logical_frame(geometry));
+    } else {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = native;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+    }
     ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!selection));
     // The viewport starts always-on-top. Re-queueing that level here would run
     // after the native macOS adapter raises selection to screen-saver level and
@@ -1349,6 +1366,28 @@ fn configure_viewport(ctx: &egui::Context, geometry: OverlayGeometry, selection:
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
+}
+
+fn logical_frame(geometry: OverlayGeometry) -> LogicalRect {
+    let viewport = geometry.viewport();
+    LogicalRect::new(
+        LogicalPoint::new(f64::from(viewport.min.x), f64::from(viewport.min.y)),
+        LogicalSize::new(f64::from(viewport.width()), f64::from(viewport.height())),
+    )
+}
+
+fn claim_macos_desktop(native: &crate::gui::panel::BehaviorController) {
+    #[cfg(all(target_os = "macos", not(test)))]
+    match scrozz_shell::macos::display::displays().and_then(|displays| desktop_geometry(&displays))
+    {
+        Ok(geometry) => native.set_frame(logical_frame(geometry)),
+        Err(error) => {
+            tracing::warn!(%error, "could not cover the desktop during selection startup")
+        }
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    let _ = native;
 }
 
 fn bridge_error(detail: impl Into<String>) -> Error {
