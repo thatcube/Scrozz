@@ -130,6 +130,7 @@ impl TrayAction {
                 | Self::CaptureFullscreen
                 | Self::CaptureAllDisplays
                 | Self::Quit
+                | Self::OpenSettings
         )
     }
 
@@ -154,8 +155,8 @@ impl TrayAction {
                 session.server,
                 DisplayServer::Wayland | DisplayServer::Headless
             ),
-            Self::Quit => true,
-            Self::ToggleRecording | Self::OpenHistory | Self::OpenSettings => false,
+            Self::Quit | Self::OpenSettings => true,
+            Self::ToggleRecording | Self::OpenHistory => false,
         }
     }
 }

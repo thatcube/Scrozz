@@ -155,8 +155,10 @@ jobs:
           # binary is the only kind that runs natively on both Apple Silicon
           # and the Intel Macs still in use.
           SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+          SCROZZ_BUILD_NUMBER="${{ steps.version.outputs.build_number }}" \
             cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
           SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+          SCROZZ_BUILD_NUMBER="${{ steps.version.outputs.build_number }}" \
             cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
           mkdir -p dist
           lipo -create -output dist/scrozz \
@@ -201,6 +203,7 @@ jobs:
         if: matrix.os != 'macos-latest'
         run: |
           SCROZZ_VERSION="${{ steps.version.outputs.version }}" \
+          SCROZZ_BUILD_NUMBER="${{ steps.version.outputs.build_number }}" \
             cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
           mkdir -p dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then

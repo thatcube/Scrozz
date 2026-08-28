@@ -266,6 +266,7 @@ impl Host for Windowed {
                     handle: reporting,
                     emit: Some(emit),
                     selection,
+                    settings: scrozz_ui::settings::SettingsWindow::default(),
                     native,
                     display_id,
                     pointer_geometry,
@@ -440,6 +441,7 @@ struct Driver {
     handle: OverlayHandle,
     emit: Option<Emit>,
     selection: ClientOverlayController,
+    settings: scrozz_ui::settings::SettingsWindow,
     native: BehaviorController,
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
@@ -559,7 +561,11 @@ impl eframe::App for Driver {
             }
         }
 
-        if !self.stopped && self.app.tick() == Tick::Stop {
+        let tick = self.app.tick();
+        if self.app.take_settings_request() {
+            self.settings.open();
+        }
+        if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
             let report = self.app.report();
             if let Ok(mut slot) = self.sink.lock() {
@@ -592,6 +598,13 @@ impl eframe::App for Driver {
         } else {
             self.overlay.ui(ui, frame);
         }
+        self.settings.show(
+            ui.ctx(),
+            scrozz_ui::settings::BuildInfo {
+                version: crate::build_info::VERSION,
+                build: crate::build_info::BUILD,
+            },
+        );
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

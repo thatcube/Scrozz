@@ -207,6 +207,7 @@ pub struct App {
     started: Instant,
     captures: u64,
     sound_warning_shown: bool,
+    settings_requested: bool,
     notes: Vec<String>,
 }
 
@@ -322,6 +323,7 @@ impl App {
             started: Instant::now(),
             captures: 0,
             sound_warning_shown: false,
+            settings_requested: false,
             notes,
         };
 
@@ -541,7 +543,8 @@ impl App {
                 Tick::Continue
             }
             Action::OpenSettings => {
-                self.note("the settings window is not built yet");
+                self.settings_requested = true;
+                self.note("settings requested");
                 Tick::Continue
             }
             Action::Quit => {
@@ -575,6 +578,11 @@ impl App {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);
+    }
+
+    /// Takes a pending request to open or focus Settings.
+    pub fn take_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_requested)
     }
 
     /// How many cards are on screen.
@@ -724,17 +732,21 @@ mod tests {
     #[test]
     fn an_unwired_action_says_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
-        for action in [
-            Action::ToggleRecording,
-            Action::OpenHistory,
-            Action::OpenSettings,
-        ] {
+        for action in [Action::ToggleRecording, Action::OpenHistory] {
             assert_eq!(app.perform(action), Tick::Continue);
         }
         let notes = app.notes().join("\n");
         assert!(notes.contains("recording is not wired up yet"), "{notes}");
         assert!(notes.contains("history window"), "{notes}");
-        assert!(notes.contains("settings window"), "{notes}");
+    }
+
+    #[test]
+    fn settings_requests_are_delivered_once() {
+        let (mut app, _) = app();
+        assert!(!app.take_settings_request());
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
+        assert!(app.take_settings_request());
+        assert!(!app.take_settings_request());
     }
 
     #[test]

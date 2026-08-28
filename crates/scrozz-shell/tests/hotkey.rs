@@ -663,6 +663,7 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
         TrayAction::CaptureWindow,
         TrayAction::CaptureFullscreen,
         TrayAction::CaptureAllDisplays,
+        TrayAction::OpenSettings,
         TrayAction::Quit,
     ] {
         assert!(
@@ -671,11 +672,7 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
         );
     }
 
-    for unfinished in [
-        TrayAction::ToggleRecording,
-        TrayAction::OpenHistory,
-        TrayAction::OpenSettings,
-    ] {
+    for unfinished in [TrayAction::ToggleRecording, TrayAction::OpenHistory] {
         assert!(
             !unfinished.is_available(),
             "{unfinished:?} has no end-to-end implementation and must look \

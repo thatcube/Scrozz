@@ -35,13 +35,9 @@ use scrozz_core::{
 };
 
 use crate::{
+    build_info::VERSION,
     fault::{CliError, CliResult},
     json::Json,
-};
-
-const VERSION: &str = match option_env!("SCROZZ_VERSION") {
-    Some(version) => version,
-    None => env!("CARGO_PKG_VERSION"),
 };
 
 /// Scrozz — screenshots and screen recording for macOS, Windows and Linux.

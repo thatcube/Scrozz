@@ -87,6 +87,7 @@ pub mod motion;
 pub mod overlay_app;
 pub mod paint;
 pub mod select;
+pub mod settings;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;

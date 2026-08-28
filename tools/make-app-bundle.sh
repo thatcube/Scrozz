@@ -146,6 +146,7 @@ if [[ -n "$PREBUILT" ]]; then
 else
   echo "==> building release binary (Scrozz $APP_VERSION)"
   SCROZZ_VERSION="$APP_VERSION" \
+    SCROZZ_BUILD_NUMBER="$BUILD_NUMBER" \
     CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
   SOURCE_BIN="$TARGET_DIR/release/scrozz"
 fi
