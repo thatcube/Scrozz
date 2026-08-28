@@ -16,6 +16,7 @@ pub mod macos;
 pub mod overlay;
 pub mod permissions;
 pub mod selection;
+pub mod sound;
 pub mod tray;
 #[cfg(target_os = "linux")]
 mod x11_focus;
@@ -35,6 +36,7 @@ pub use overlay::{
 };
 pub use permissions::SystemPermissions;
 pub use selection::{SelectionIntegration, SelectionPlan, resolve_selection};
+pub use sound::{ScreenshotSound, play_screenshot_sound};
 pub use tray::{Tray, TrayAction, TrayEntry};
 #[cfg(target_os = "linux")]
 pub use x11_focus::X11FocusLease;

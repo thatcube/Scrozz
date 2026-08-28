@@ -279,17 +279,6 @@ fn display_local_viewport_maps_pointer_input_to_its_own_display() {
         }],
         |ui| decision = selector.update_display(ui, &hidpi),
     );
-    driver.step(
-        [280.0, 200.0],
-        vec![Event::Key {
-            key: egui::Key::Enter,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }],
-        |ui| decision = selector.update_display(ui, &hidpi),
-    );
 
     match decision {
         SelectionDecision::Selected(outcome) => {
@@ -328,7 +317,7 @@ fn window_mode_is_only_available_after_windows_are_supplied() {
 }
 
 #[test]
-fn clicking_an_existing_region_commits_without_a_keyboard() {
+fn region_drag_commits_on_the_first_mouse_release() {
     let displays = vec![display("main", 0.0, 0.0, 360.0, 240.0, 2.0, true)];
     let mut selector = selection_ui(SelectionMode::Region, displays);
     let mut driver = Driver::new();
@@ -359,34 +348,11 @@ fn clicking_an_existing_region_commits_without_a_keyboard() {
         }],
         |ui| decision = selector.update(ui),
     );
-    assert_eq!(decision, SelectionDecision::Pending);
-
-    driver.step(
-        [360.0, 240.0],
-        vec![Event::PointerButton {
-            pos: pos2(100.0, 180.0),
-            button: PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        }],
-        |ui| decision = selector.update(ui),
-    );
-    driver.step(
-        [360.0, 240.0],
-        vec![Event::PointerButton {
-            pos: pos2(100.0, 180.0),
-            button: PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        }],
-        |ui| decision = selector.update(ui),
-    );
-
     assert!(matches!(decision, SelectionDecision::Selected(_)));
 }
 
 #[test]
-fn a_small_move_does_not_also_commit_as_a_click() {
+fn a_one_point_move_is_a_capture_not_a_click() {
     let displays = vec![display("main", 0.0, 0.0, 360.0, 240.0, 2.0, true)];
     let frames = displays
         .iter()
@@ -432,11 +398,59 @@ fn a_small_move_does_not_also_commit_as_a_click() {
         |ui| decision = selector.update(ui),
     );
 
-    assert_eq!(decision, SelectionDecision::Pending);
-    assert_eq!(
-        selector.state().region().unwrap().origin,
-        LogicalPoint::new(41.0, 80.0)
+    assert!(matches!(decision, SelectionDecision::Selected(_)));
+}
+
+#[test]
+fn a_primary_click_without_movement_cancels_region_capture() {
+    let displays = vec![display("main", 0.0, 0.0, 360.0, 240.0, 2.0, true)];
+    let mut selector = selection_ui(SelectionMode::Region, displays);
+    let mut driver = Driver::new();
+    let mut decision = SelectionDecision::Pending;
+
+    driver.step(
+        [360.0, 240.0],
+        vec![Event::PointerButton {
+            pos: pos2(100.0, 140.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        |ui| decision = selector.update(ui),
     );
+    driver.step(
+        [360.0, 240.0],
+        vec![Event::PointerButton {
+            pos: pos2(100.0, 140.0),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        |ui| decision = selector.update(ui),
+    );
+
+    assert_eq!(decision, SelectionDecision::Cancelled);
+}
+
+#[test]
+fn right_click_cancels_region_capture() {
+    let displays = vec![display("main", 0.0, 0.0, 360.0, 240.0, 2.0, true)];
+    let mut selector = selection_ui(SelectionMode::Region, displays);
+    let mut driver = Driver::new();
+    let mut decision = SelectionDecision::Pending;
+
+    driver.step(
+        [360.0, 240.0],
+        vec![Event::PointerButton {
+            pos: pos2(100.0, 140.0),
+            button: PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        |ui| decision = selector.update(ui),
+    );
+
+    assert_eq!(decision, SelectionDecision::Cancelled);
 }
 
 #[test]
@@ -483,7 +497,11 @@ fn escape_wins_when_enter_arrives_in_the_same_frame() {
 #[test]
 fn hud_keyboard_focus_survives_between_tab_and_space_frames() {
     let displays = vec![display("main", 0.0, 0.0, 360.0, 240.0, 2.0, true)];
-    let mut selector = selection_ui(SelectionMode::Region, displays);
+    let frames = displays
+        .iter()
+        .map(|display| FrozenDisplayFrame::synthetic(display.clone(), 1))
+        .collect();
+    let mut selector = SelectionUi::new(SelectionOptions::default(), displays, frames);
     let mut driver = Driver::new();
     let mut decision = SelectionDecision::Pending;
 

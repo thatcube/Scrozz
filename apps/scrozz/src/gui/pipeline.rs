@@ -45,7 +45,7 @@ use crate::{
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
-        selection::{CaptureSelector, display_captures_exclude_current_process},
+        selection::CaptureSelector,
     },
     platform,
 };
@@ -259,6 +259,9 @@ impl Worker {
             Ok(built) => {
                 let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
             }
+            Err(error) if error.is_cancellation() => {
+                tracing::debug!(%card, "capture selection cancelled");
+            }
             Err(error) => {
                 tracing::warn!(%card, "capture failed: {error}");
                 let _ = self.outcomes.send(Outcome::Failed { card, error });
@@ -304,12 +307,10 @@ impl Worker {
                         ),
                     }));
                 }
-                let surface_can_remain_visible =
-                    display_captures_exclude_current_process(backend.as_ref())?;
                 let outcome = self.selector.select_for_capture(
                     &capabilities.honour(&options),
                     CursorMode::Hidden,
-                    surface_can_remain_visible,
+                    false,
                 )?;
                 selection_outcome = Some(outcome.clone());
                 outcome.target

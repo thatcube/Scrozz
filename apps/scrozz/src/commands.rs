@@ -32,7 +32,7 @@ use crate::{
         InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
     },
     fault::{CliError, CliResult},
-    gui::selection::{CaptureSelector, display_captures_exclude_current_process},
+    gui::selection::CaptureSelector,
     hotkey_config, ipc,
     json::Json,
     platform,
@@ -137,10 +137,7 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             let options = args
                 .selection_options(remembered)?
                 .expect("an interactive target has selection options");
-            let surface_can_remain_visible =
-                display_captures_exclude_current_process(backend.as_ref())?;
-            let (outcome, frozen) =
-                select_target(&options, args, selector, surface_can_remain_visible)?;
+            let (outcome, frozen) = select_target(&options, args, selector, false)?;
             (outcome.target.clone(), Some(outcome), frozen)
         }
         concrete => (capture_target(&concrete)?, None, None),
@@ -207,6 +204,9 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
                 written.push(path.display().to_string());
             }
         }
+    }
+    if let Err(error) = scrozz_shell::play_screenshot_sound(&settings::screenshot_sound()?) {
+        tracing::warn!(%error, "the screenshot succeeded but its sound could not play");
     }
 
     let data = Json::obj([
@@ -862,6 +862,7 @@ fn selection_json(options: &SelectionOptions, retake: bool) -> Json {
         ("crosshair_mode", Json::str(options.crosshair_mode.slug())),
         ("magnifier", Json::Bool(options.magnifier)),
         ("crosshair", Json::Bool(options.crosshair)),
+        ("dimension_label", Json::str(options.dimension_label.slug())),
     ])
 }
 

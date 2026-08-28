@@ -23,7 +23,9 @@ pub use geom::DisplayLayout;
 pub use hud::{HudEntry, HudModel, HudNav};
 pub use magnifier::{MagnifierCell, MagnifierConfig, MagnifierGrid};
 pub use scene::SelectionScene;
-pub use state::{AxisDirection, ResizeHandle, SelectionAnnouncement, SelectionState};
+pub use state::{
+    AxisDirection, DragModifiers, ResizeHandle, SelectionAnnouncement, SelectionState,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectionDecision {
@@ -42,6 +44,12 @@ pub struct SelectionUi {
     hud: HudModel,
     textures: BTreeMap<String, TextureHandle>,
     immediate: Option<SelectionDecision>,
+}
+
+#[derive(Debug, Default)]
+struct PointerUpdate {
+    changed: bool,
+    decision: Option<SelectionDecision>,
 }
 
 impl SelectionUi {
@@ -153,6 +161,12 @@ impl SelectionUi {
         if focused && self.handle_keyboard(ui) {
             return SelectionDecision::Cancelled;
         }
+        let drag_modifiers = ui.ctx().input(|input| DragModifiers {
+            shift: input.modifiers.shift,
+            alt: input.modifiers.alt,
+            space: input.key_down(Key::Space),
+        });
+        self.state.set_drag_modifiers(drag_modifiers);
         let primary_modifier = ui.ctx().input(|input| input.modifiers.command);
         let paint = paint::draw_overlay(
             ui,
@@ -187,16 +201,21 @@ impl SelectionUi {
                 }
             }
         }
-        if self.handle_pointer(
+        let pointer = self.handle_pointer(
             ui,
             &paint.canvas,
             paint.pointer_over_controls,
             surface,
             surface_display,
-        ) {
+        );
+        if pointer.changed {
             ui.ctx().request_repaint();
         }
-        if paint.canvas.clicked()
+        if let Some(decision) = pointer.decision {
+            return decision;
+        }
+        if !self.state.options_ref().commits_region_on_release()
+            && paint.canvas.clicked()
             && !self.state.gesture_changed()
             && let Some(outcome) = self.state.commit()
         {
@@ -259,26 +278,35 @@ impl SelectionUi {
         pointer_over_hud: bool,
         surface: LogicalRect,
         surface_display: Option<&DisplayId>,
-    ) -> bool {
-        let (latest, pressed, released, down) = ui.ctx().input(|input| {
+    ) -> PointerUpdate {
+        let (latest, pressed, released, down, cancelled) = ui.ctx().input(|input| {
             (
                 input.pointer.latest_pos(),
                 input.pointer.button_pressed(PointerButton::Primary),
                 input.pointer.button_released(PointerButton::Primary),
                 input.pointer.button_down(PointerButton::Primary),
+                input.pointer.button_pressed(PointerButton::Secondary),
             )
         });
+        if cancelled {
+            let _ = self.state.cancel();
+            return PointerUpdate {
+                changed: true,
+                decision: Some(SelectionDecision::Cancelled),
+            };
+        }
         let Some(point) =
             latest.filter(|point| canvas.rect.contains(*point) || self.state.is_interacting())
         else {
-            return false;
+            return PointerUpdate::default();
         };
         let point = DisplayLayout::point_from_canvas_in(surface, point - canvas.rect.min.to_vec2());
         if pointer_over_hud && !self.state.is_interacting() {
-            return false;
+            return PointerUpdate::default();
         }
         let moved = self.state.pointer() != Some(point);
         let mut changed = false;
+        let mut decision = None;
         if pressed && canvas.rect.contains(latest.expect("latest exists")) {
             if let Some(display) = surface_display {
                 self.state.pointer_pressed_on(display, point);
@@ -313,8 +341,20 @@ impl SelectionUi {
                 self.state.pointer_released(point);
             }
             changed = true;
+            if self.state.options_ref().commits_region_on_release() {
+                decision = if self.state.gesture_changed() {
+                    self.state.commit().map(SelectionDecision::Selected)
+                } else {
+                    let _ = self.state.cancel();
+                    Some(SelectionDecision::Cancelled)
+                };
+                if decision.is_none() {
+                    let _ = self.state.cancel();
+                    decision = Some(SelectionDecision::Cancelled);
+                }
+            }
         }
-        changed
+        PointerUpdate { changed, decision }
     }
 
     fn handle_keyboard(&mut self, ui: &Ui) -> bool {
@@ -349,7 +389,7 @@ impl SelectionUi {
                     HudNav::Next
                 });
             }
-            if space {
+            if space && !self.state.is_interacting() {
                 ui.ctx().input_mut(|input| {
                     let modifiers = input.modifiers;
                     let _ = input.consume_key(modifiers, Key::Space);

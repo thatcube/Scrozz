@@ -40,8 +40,8 @@ pub use geometry::{
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
 pub use selection::{
-    AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, MIN_SELECTION, RegionSelector,
-    SelectionCapabilities, SelectionHost, SelectionMode, SelectionOptions, SelectionOutcome,
-    SelectionSource, SessionFacts, SizeConstraint, host_for,
+    AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, DimensionLabelMode, MIN_SELECTION,
+    RegionSelector, SelectionCapabilities, SelectionHost, SelectionMode, SelectionOptions,
+    SelectionOutcome, SelectionSource, SessionFacts, SizeConstraint, host_for,
 };
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};

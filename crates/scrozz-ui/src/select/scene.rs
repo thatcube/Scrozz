@@ -147,6 +147,7 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
         Scenario::SelectorAllInOne => (
             SelectionOptions {
                 hud: true,
+                freeze: true,
                 ..SelectionOptions::region()
             },
             vec![display(
@@ -187,6 +188,8 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
         Scenario::SelectorMixedDpi => (
             SelectionOptions {
                 mode: SelectionMode::Window,
+                hud: true,
+                freeze: true,
                 ..SelectionOptions::region()
             },
             vec![
@@ -240,7 +243,7 @@ fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Wind
             ],
         ),
         _ => (
-            SelectionOptions::region(),
+            capture_area_options(),
             vec![display(
                 "main",
                 "Built-in Display",
@@ -320,6 +323,7 @@ fn display(id: &str, name: &str, bounds: LogicalRect, scale: f64, is_primary: bo
 fn capture_area_options() -> SelectionOptions {
     SelectionOptions {
         hud: false,
+        freeze: true,
         ..SelectionOptions::region()
     }
 }

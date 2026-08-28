@@ -337,6 +337,14 @@ pub fn level_value(level: OverlayLevel) -> NSWindowLevel {
 /// the first cursor directly; normal cursor-rect handling resumes as soon as a
 /// pointer event reaches winit.
 ///
+/// This free function has no window to hold onto, so it cannot do anything
+/// about winit's *own* cursor rect on whichever window is under the pointer —
+/// see [`MacOverlay::set_cursor`] for why that matters and for the version that
+/// actually keeps a chosen cursor from being silently reverted. Prefer that
+/// method whenever an installed [`MacOverlay`] is available; this function
+/// exists for the moments before one is, or for a window this crate never
+/// retrofitted (a secondary-display selection viewport, say).
+///
 /// # Errors
 ///
 /// Returns [`Error::Platform`] when called off the main thread.
@@ -535,6 +543,133 @@ impl MacOverlay {
     pub fn set_level(&mut self, level: OverlayLevel) -> Result<()> {
         let _mtm = main_thread("setting an overlay window level")?;
         self.window.setLevel(level_value(level));
+        Ok(())
+    }
+
+    /// Sets the native cursor and makes it stick for as long as this window is
+    /// under the pointer.
+    ///
+    /// # Why [`set_overlay_cursor`] alone is not enough
+    ///
+    /// That free function calls `-[NSCursor set]` directly, which changes the
+    /// system's *current* cursor immediately — but it does not touch this
+    /// window's own idea of what the cursor should be. Winit registers a
+    /// **cursor rect** covering the whole content view (`-resetCursorRects`,
+    /// `-addCursorRect:cursor:`), and AppKit re-applies *that* cursor — via its
+    /// own call to `-[NSCursor set]` — the moment the pointer so much as twitches
+    /// inside the window, key or not. Winit's rect still says "arrow" (or
+    /// whatever egui last asked for) until winit itself observes a pointer
+    /// event and updates it, which is exactly the event a retained,
+    /// currently-click-through, or freshly expanded window may not have
+    /// received yet. That race is why the crosshair so often loses to a plain
+    /// arrow on the very first use: the direct `set()` wins for a frame, then
+    /// the next native mouse-moved event hands the cursor straight back to
+    /// winit's stale rect.
+    ///
+    /// [`NSWindow::disableCursorRects`] stops that reassertion cold — while
+    /// disabled, nothing but an explicit `-[NSCursor set]` call changes the
+    /// cursor, which is exactly the ownership the selection overlay needs for
+    /// its full lifetime. [`NSWindow::enableCursorRects`] hands the window back
+    /// to winit's normal per-frame cursor handling, which is what capture-card
+    /// hover relies on. Both are queried before being flipped
+    /// ([`NSWindow::areCursorRectsEnabled`]): AppKit documents the pair as
+    /// nestable/balanced, like `NSCursor`'s own `hide`/`unhide`, and calling
+    /// either one when the window already agrees is a no-op that keeps the
+    /// count exactly where a single matching call would have left it.
+    ///
+    /// # Verifying this on a real machine
+    ///
+    /// A doctest rather than a `#[test]`, for the reason given on
+    /// [`make_nonactivating_panel`]: only the main thread may touch AppKit, and
+    /// a doctest is compiled into its own `fn main`.
+    ///
+    /// ```
+    /// use objc2::rc::Retained;
+    /// use objc2::{MainThreadMarker, MainThreadOnly};
+    /// use objc2_app_kit::{
+    ///     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSWindow,
+    ///     NSWindowStyleMask,
+    /// };
+    /// use objc2_foundation::{NSPoint, NSRect, NSSize};
+    /// use scrozz_shell::macos::overlay::MacOverlay;
+    /// use scrozz_shell::overlay::OverlayCursor;
+    ///
+    /// let mtm = MainThreadMarker::new().expect("doctests run on the main thread");
+    /// NSApplication::sharedApplication(mtm)
+    ///     .setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+    ///
+    /// let window = unsafe {
+    ///     NSWindow::initWithContentRect_styleMask_backing_defer(
+    ///         NSWindow::alloc(mtm),
+    ///         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
+    ///         NSWindowStyleMask::Borderless,
+    ///         NSBackingStoreType::Buffered,
+    ///         true,
+    ///     )
+    /// };
+    /// unsafe { window.setReleasedWhenClosed(false) };
+    /// assert!(window.areCursorRectsEnabled(), "a fresh window starts with rects enabled");
+    ///
+    /// // SAFETY: the pointer names the live window `window` keeps retained for
+    /// // the rest of this block.
+    /// let overlay = unsafe {
+    ///     MacOverlay::from_ns_window(Retained::as_ptr(&window).cast_mut().cast())
+    /// }
+    /// .expect("adopting a live NSWindow never fails");
+    ///
+    /// overlay
+    ///     .set_cursor(OverlayCursor::Crosshair)
+    ///     .expect("the doctest runs on the main thread");
+    /// assert!(
+    ///     !window.areCursorRectsEnabled(),
+    ///     "the crosshair must pin the window so winit's own cursor rect cannot revert it"
+    /// );
+    ///
+    /// // A caller that reasserts the same cursor every frame — which is
+    /// // exactly what `BehaviorController` does while a selection is live —
+    /// // must never leave the window more disabled than one call would have.
+    /// // `areCursorRectsEnabled` is queried before every toggle specifically
+    /// // to guarantee that.
+    /// overlay
+    ///     .set_cursor(OverlayCursor::Crosshair)
+    ///     .expect("the doctest runs on the main thread");
+    /// overlay
+    ///     .set_cursor(OverlayCursor::Arrow)
+    ///     .expect("the doctest runs on the main thread");
+    /// assert!(
+    ///     window.areCursorRectsEnabled(),
+    ///     "returning to Arrow must hand the window back to winit's hover-driven cursor handling"
+    /// );
+    ///
+    /// window.close();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] if called off the main thread.
+    pub fn set_cursor(&self, cursor: OverlayCursor) -> Result<()> {
+        let _mtm = main_thread("setting the overlay window cursor")?;
+        match cursor {
+            OverlayCursor::Crosshair => {
+                // Disabling first and setting second means the window can
+                // never observe a rect-driven reset in between: no code here
+                // yields to the run loop before the crosshair is current.
+                if self.window.areCursorRectsEnabled() {
+                    self.window.disableCursorRects();
+                }
+                NSCursor::crosshairCursor().set();
+            }
+            OverlayCursor::Arrow => {
+                NSCursor::arrowCursor().set();
+                // Hand the window back to winit's own cursor-rect machinery
+                // now that nothing native needs to stay pinned. A card's hover
+                // cursor is driven by egui, through winit, and both stop being
+                // reachable once this window is left disabled.
+                if !self.window.areCursorRectsEnabled() {
+                    self.window.enableCursorRects();
+                }
+            }
+        }
         Ok(())
     }
 

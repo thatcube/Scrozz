@@ -408,22 +408,23 @@ the test already exist.
 
 ---
 
-## D17 — Competitor UI reference lives outside the repository
+## D17 — Competitor UI references are limited audit evidence
 
-**Decision.** Competitor screenshots (CleanShot X, Capso) are kept at
-`~/.copilot/scrozz-ui-reference/`, indexed by `INDEX.md`, and are **never
-committed to this repository**. Documentation references them by path only.
+**Decision.** The complete competitor screenshot library stays outside the
+repository at `~/.copilot/scrozz-ui-reference/`, indexed by `INDEX.md`. A small,
+user-supplied image may be committed under `docs/reference/` only when it is
+needed to explain a specific audited behavior. It must remain in research
+documentation, be attributed as competitor UI, and never become a product asset,
+fixture, icon source, or implementation input.
 
-Agents may study them to calibrate the *quality bar* — spacing rhythm, corner
-radii, shadow softness, control density, information hierarchy, and which
-options are worth exposing at all. Agents may **not** copy their designs, icons,
-colour values, or layouts. Scrozz's visual design is original and uses Tabler
-Icons (MIT).
+Agents may study references to calibrate the *quality bar* and enumerate
+behavior. They may **not** copy designs, icons, colour values, or layouts.
+Scrozz's visual design remains original and uses Tabler Icons (MIT).
 
-**Why.** These are copyrighted product UI. A GPL-3.0 repository must stay clean
-of them permanently. Keeping the library in a stable location outside any
-worktree also means it survives branch switches and new worktrees, so every
-future agent session can find it.
+**Why.** Keeping the full library outside the worktree avoids turning
+copyrighted product UI into project assets. The narrow documentation exception
+preserves concrete evidence the maintainer explicitly asked the audit to retain,
+while its location and purpose prevent it from leaking into shipped artwork.
 
 ---
 
@@ -1087,10 +1088,31 @@ Apple an invalid `CFBundleShortVersionString`.
 ## D33 — Capture Area is quiet by default; precision aids are one mode
 
 **Decision.** Capture Area always uses the operating system's native crosshair
-pointer. Moving the pointer alone draws no selection; the rectangle begins only
-after primary-button press and movement. Before that movement, the frozen
-desktop remains visually unchanged: no dimming scrim, display label, border, or
-other overlay paint is shown.
+pointer. The click that launches Capture Area finishes before selection starts;
+the next primary press begins the gesture. Moving the pointer alone draws
+nothing. A primary click with no movement cancels and restores the ordinary
+pointer. Any non-zero drag, including a one-axis drag normalized to a one-
+physical-pixel strip, captures immediately on mouse-up. There is no confirmation
+click. Escape and secondary click also cancel, and every completion path releases
+pointer ownership before capture work continues.
+
+Ordinary Capture Area never dims the desktop. During a drag it paints only a
+neutral high-contrast outline, an approximately 8% neutral tint inside the
+selected rectangle, and its dimension label; pixels outside remain untouched.
+All-in-One is the only capture surface that uses a surrounding scrim. Region
+drags may span displays.
+
+Drag modifiers are live and reversible:
+
+1. **Space** moves the current rectangle without resizing it.
+2. **Shift** constrains creation or Space-driven movement to the dominant
+   horizontal or vertical axis only while held.
+3. **Option** on macOS and **Alt** elsewhere grows the selection symmetrically
+   from its starting point. It has no effect while Space is held.
+
+Dimension labels default to logical 1× dimensions. Screenshot settings offer
+Logical, Output pixels, and Both. Native Retina/HiDPI output remains the default;
+scaling still images to 1× is a separate global option.
 
 The additional full-screen guides and pixel loupe form one user-facing
 **Crosshair Mode** in Screenshot settings. It has three states:
@@ -1100,15 +1122,26 @@ The additional full-screen guides and pixel loupe form one user-facing
    platform-primary modifier elsewhere.
 3. **Always**.
 
-When active, Crosshair Mode shows both the horizontal and vertical guides and a
-larger 25 × 25-source-pixel loupe. The lower-level CLI may still request either
-aid independently for scripting.
+When active, Crosshair Mode shows neutral black/white, approximately
+50%-transparent horizontal and vertical guides. A 160 × 160-physical-pixel loupe
+prefers the pointer's lower-right quadrant and flips to stay on-screen. It shows
+32 × 32 source pixels at exact 5× nearest-neighbor scale with the crosshair
+through its center. The lower-level CLI may still request either aid independently
+for scripting.
 
 **Freeze screen while selecting** is a separate Screenshot setting and defaults
-on. It freezes pixel-addressed region and display capture so transient content
+**off**. When disabled, a region captures the desktop at mouse-up. When enabled,
+it uses the frame from selection activation so transient content
 stays capturable; window selection remains live because a native window capture
 cannot be reconstructed faithfully from a frozen display image. A magnifier may
 still require a prepared display frame even when the visible backdrop is live.
+
+Every successful still capture, including fullscreen, plays the configured
+screenshot sound after valid pixels exist. The default is a shutter sound;
+settings offer bundled alternatives, Off, and a custom file. A broken custom
+file falls back to the default sound and warns once per app session. Failed
+captures make no shutter sound. The desktop itself does not flash, shake, zoom,
+or animate as capture feedback.
 
 **Why.** A native crosshair communicates region selection without filling the
 screen with motion before the user acts. Guides and a loupe are precision tools,

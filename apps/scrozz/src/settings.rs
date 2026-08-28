@@ -24,6 +24,8 @@ use crate::{
     hotkey_config::Accelerator,
     json::Json,
 };
+use scrozz_shell::ScreenshotSound;
+use std::path::PathBuf;
 
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,8 @@ pub enum Kind {
     /// A filesystem path. Not required to exist: a default folder on a
     /// not-yet-mounted volume is a legitimate thing to configure.
     Path,
+    /// A filesystem path that may be empty while its companion feature is off.
+    OptionalPath,
     /// One of a fixed set of strings.
     Choice(&'static [&'static str]),
     /// A key combination, validated by the same parser the hotkey commands use.
@@ -54,6 +58,7 @@ impl Kind {
             Self::Bool => "bool",
             Self::Int { .. } => "int",
             Self::Path => "path",
+            Self::OptionalPath => "optional-path",
             Self::Choice(_) => "choice",
             Self::Accelerator => "accelerator",
         }
@@ -142,6 +147,7 @@ impl Setting {
                     Ok(())
                 }
             }
+            Kind::OptionalPath => Ok(()),
             Kind::Choice(options) => {
                 if options.contains(&value) {
                     Ok(())
@@ -196,8 +202,32 @@ pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "capture.freeze-screen",
         kind: Kind::Bool,
-        default: "true",
+        default: "false",
         description: "Freeze screen contents while choosing a region or display.",
+    },
+    Setting {
+        key: "capture.dimension-label",
+        kind: Kind::Choice(&["logical", "output-pixels", "both"]),
+        default: "logical",
+        description: "Show logical 1x dimensions, output pixels, or both while selecting.",
+    },
+    Setting {
+        key: "capture.retina-output",
+        kind: Kind::Choice(&["native", "1x"]),
+        default: "native",
+        description: "Keep native Retina resolution or scale still images to logical 1x output.",
+    },
+    Setting {
+        key: "capture.screenshot-sound",
+        kind: Kind::Choice(&["shutter", "soft-shutter", "camera", "custom", "off"]),
+        default: "shutter",
+        description: "Sound played after every successful screenshot.",
+    },
+    Setting {
+        key: "capture.custom-sound-file",
+        kind: Kind::OptionalPath,
+        default: "",
+        description: "Custom screenshot sound file used when screenshot sound is custom.",
     },
     Setting {
         key: "capture.copy-to-clipboard",
@@ -342,6 +372,32 @@ pub fn all_human() -> String {
         .join("\n")
 }
 
+/// Resolves the screenshot sound from schema values.
+///
+/// Persistence will pass the stored values through this same parser; today the
+/// schema defaults are the current values.
+pub fn screenshot_sound() -> CliResult<ScreenshotSound> {
+    let selected = lookup("capture.screenshot-sound")?.default;
+    let custom = lookup("capture.custom-sound-file")?.default;
+    screenshot_sound_from(selected, custom)
+}
+
+fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSound> {
+    match selected {
+        "shutter" => Ok(ScreenshotSound::Shutter),
+        "soft-shutter" => Ok(ScreenshotSound::SoftShutter),
+        "camera" => Ok(ScreenshotSound::Camera),
+        "off" => Ok(ScreenshotSound::Off),
+        "custom" if custom.trim().is_empty() => Err(CliError::usage(
+            "capture.custom-sound-file must be set when capture.screenshot-sound is custom",
+        )),
+        "custom" => Ok(ScreenshotSound::Custom(PathBuf::from(custom))),
+        other => Err(CliError::usage(format!(
+            "unknown screenshot sound {other:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,8 +505,47 @@ mod tests {
     }
 
     #[test]
-    fn frozen_selection_defaults_on() {
-        assert_eq!(lookup("capture.freeze-screen").unwrap().default, "true");
+    fn frozen_selection_defaults_off() {
+        assert_eq!(lookup("capture.freeze-screen").unwrap().default, "false");
+    }
+
+    #[test]
+    fn selector_dimension_labels_default_to_logical_1x() {
+        let setting = lookup("capture.dimension-label").unwrap();
+        let Kind::Choice(options) = setting.kind else {
+            panic!("capture.dimension-label should be a choice")
+        };
+        assert_eq!(options, ["logical", "output-pixels", "both"]);
+        assert_eq!(setting.default, "logical");
+    }
+
+    #[test]
+    fn retina_output_defaults_to_native_resolution() {
+        let setting = lookup("capture.retina-output").unwrap();
+        let Kind::Choice(options) = setting.kind else {
+            panic!("capture.retina-output should be a choice")
+        };
+        assert_eq!(options, ["native", "1x"]);
+        assert_eq!(setting.default, "native");
+    }
+
+    #[test]
+    fn screenshot_sound_defaults_on_and_supports_custom_or_off() {
+        let setting = lookup("capture.screenshot-sound").unwrap();
+        let Kind::Choice(options) = setting.kind else {
+            panic!("capture.screenshot-sound should be a choice")
+        };
+        assert_eq!(
+            options,
+            ["shutter", "soft-shutter", "camera", "custom", "off"]
+        );
+        assert_eq!(setting.default, "shutter");
+        assert_eq!(screenshot_sound().unwrap(), ScreenshotSound::Shutter);
+        assert_eq!(
+            screenshot_sound_from("custom", "/tmp/shutter.wav").unwrap(),
+            ScreenshotSound::Custom(PathBuf::from("/tmp/shutter.wav"))
+        );
+        assert!(screenshot_sound_from("custom", "").is_err());
     }
 
     #[test]

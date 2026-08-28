@@ -49,11 +49,17 @@ fn selector_scenes_render_non_empty_and_distinct_images() {
         .unwrap();
 
     assert!(idle.width() > 0 && idle.height() > 0);
-    let probe = (idle.width() / 4, idle.height() / 3);
+    let outside = (20, 20);
     assert_eq!(
-        idle.pixel(probe.0, probe.1),
-        dragging.pixel(probe.0, probe.1),
-        "idle Capture Area must show the same undimmed frozen pixel that a selection reveals"
+        idle.pixel(outside.0, outside.1),
+        dragging.pixel(outside.0, outside.1),
+        "ordinary Capture Area must leave pixels outside the selection untouched"
+    );
+    let inside = (idle.width() / 4, idle.height() / 3);
+    assert_ne!(
+        idle.pixel(inside.0, inside.1),
+        dragging.pixel(inside.0, inside.1),
+        "the selected area should receive its subtle neutral highlight"
     );
     assert_ne!(idle.fingerprint(), dragging.fingerprint());
     assert_ne!(dragging.fingerprint(), hud.fingerprint());

@@ -107,27 +107,37 @@ behaviour the first three layers structurally cannot reach.
 The selector is one state machine with platform-specific hosting. Region,
 window, display and all-display modes share the same measured desktop geometry,
 HUD and outcome contract. The client-owned route supports drag creation,
-move/resize handles, arrow-key nudging, Alt+arrow resizing, Shift for 10-point
-steps, exact size, aspect lock, remembered regions, retake, Escape cancellation,
-crosshairs, a frozen backdrop and a pixel magnifier. All-in-One exposes the
-available modes in the same HUD rather than opening a second picker.
+move/resize handles in All-in-One, arrow-key nudging, Alt+arrow resizing, exact
+size, aspect lock, remembered regions, retake, Escape cancellation, crosshairs,
+a frozen backdrop and a pixel magnifier. Direct Capture Area is intentionally
+one gesture: its launcher click is drained, the next press-drag-release captures
+immediately, and a no-movement click cancels. Space moves an active rectangle,
+Shift constrains creation or movement to one axis while held, and Option/Alt
+grows from center. All-in-One exposes the available modes in the same HUD rather
+than opening a second picker.
 
-Freeze applies to region and single-display choices, where the pre-overlay
+Freeze is off by default. When enabled it applies to region and single-display
+choices, where the pre-overlay
 display frame can be returned exactly (and cropped for a region). Window mode
 stays live so the backend can preserve the window's native isolation, shape and
 shadow; all-display mode stays live so the backend owns mixed-scale composition.
 
 Mixed-DPI desktops stay in logical coordinates while the user selects. A region
-is owned and clamped by one measured display, and only that display's scale is
-used to round the final rectangle outward to physical pixels. Window outcomes
-use the enumerator's owning display rather than the primary display. This avoids
-both negative-origin errors and the common 1.0x/1.5x boundary mismatch.
+wholly contained by one display retains that display's measured scale for exact
+outward pixel rounding. A region spanning displays carries no false single-
+display ownership and is handed to the backend's virtual-desktop capture path.
+Window outcomes use the enumerator's owning display rather than the primary
+display. This avoids both negative-origin errors and the common 1.0x/1.5x
+boundary mismatch.
 
 The app reuses its existing eframe loop instead of starting a nested event loop:
 the capture worker blocks on the synchronous selector trait while the main
-thread hides the capture cards, waits one frame, prepares any frozen pixels,
+thread hides capture cards for every interactive mode, waits for the launcher
+input to become quiescent, prepares any frozen pixels,
 shows the desktop-sized selector, hides it after commit, captures, then restores
-the cards. Only one selector may own that lifecycle at a time. CLI one-shot
+the cards to their prior slots; only the new card animates. Immediate fullscreen
+capture leaves cards visible when the backend can exclude Scrozz from the output.
+Only one selector may own that lifecycle at a time. CLI one-shot
 selection uses the same bridge in an ordinary temporary window. That one-shot
 window intentionally skips reversible AppKit panel conversion, so its layering
 across Spaces and fullscreen apps still needs a native smoke run. On X11, both

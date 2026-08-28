@@ -98,8 +98,8 @@ pub use overlay_app::{
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
 };
 pub use select::{
-    AxisDirection, DisplayLayout, FrozenDesktop, FrozenDisplayFrame, FrozenPixel, HudEntry,
-    HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,
+    AxisDirection, DisplayLayout, DragModifiers, FrozenDesktop, FrozenDisplayFrame, FrozenPixel,
+    HudEntry, HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,
     SelectionAnnouncement, SelectionDecision, SelectionScene, SelectionState, SelectionUi,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

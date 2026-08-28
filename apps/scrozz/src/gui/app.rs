@@ -29,8 +29,8 @@ use std::{
 };
 
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions, Session,
-    SystemPermissions, Tray, TrayAction,
+    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
+    ScreenshotSound, Session, SystemPermissions, Tray, TrayAction, play_screenshot_sound,
 };
 
 use crate::{
@@ -94,6 +94,8 @@ pub struct Config {
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
     pub capture_on_start: Option<CaptureKind>,
+    /// Audible feedback after a successful screenshot.
+    pub screenshot_sound: ScreenshotSound,
 }
 
 impl Default for Config {
@@ -107,6 +109,7 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
+            screenshot_sound: ScreenshotSound::Shutter,
         }
     }
 }
@@ -164,6 +167,7 @@ impl Config {
             ipc: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
+            screenshot_sound: ScreenshotSound::Off,
         }
     }
 }
@@ -202,6 +206,7 @@ pub struct App {
     selector: Arc<dyn CaptureSelector>,
     started: Instant,
     captures: u64,
+    sound_warning_shown: bool,
     notes: Vec<String>,
 }
 
@@ -316,6 +321,7 @@ impl App {
             selector,
             started: Instant::now(),
             captures: 0,
+            sound_warning_shown: false,
             notes,
         };
 
@@ -442,6 +448,27 @@ impl App {
             match outcome {
                 Outcome::Ready(card) => {
                     self.captures += 1;
+                    if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
+                        let fell_back = !matches!(
+                            self.config.screenshot_sound,
+                            ScreenshotSound::Shutter | ScreenshotSound::Off
+                        );
+                        if fell_back {
+                            let _ = play_screenshot_sound(&ScreenshotSound::Shutter);
+                        }
+                        if !self.sound_warning_shown {
+                            self.sound_warning_shown = true;
+                            self.note(if fell_back {
+                                format!(
+                                    "the screenshot succeeded, but its selected sound failed; using the default this session: {error}"
+                                )
+                            } else {
+                                format!(
+                                    "the screenshot succeeded, but its sound could not play: {error}"
+                                )
+                            });
+                        }
+                    }
                     let summary = card.summary();
                     if let Err(err) = self.surface.present(*card) {
                         self.note(format!("a card could not be shown: {err}"));

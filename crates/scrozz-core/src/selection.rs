@@ -40,15 +40,40 @@ use crate::{
     CaptureTarget, DisplayId, Error, LogicalPoint, LogicalRect, LogicalSize, Result, ScaleFactor,
 };
 
-/// The smallest selection that is worth taking, in logical points.
+/// The static minimum applied before display scale is known.
 ///
-/// Below this a drag is almost certainly a mis-click rather than an intent, and
-/// the resulting image is unusable. It is not zero because a zero-area capture
-/// is a failure the encoder would have to reject later, with less context.
-pub const MIN_SELECTION: f64 = 8.0;
+/// A moved drag is normalized to at least one physical pixel by the client
+/// selector. Keeping the schema minimum at zero lets a 2× or 3× display express
+/// that one-pixel strip without imposing an incorrect app-wide scale.
+pub const MIN_SELECTION: f64 = 0.0;
 
 /// The default magnifier zoom, in screen pixels per magnified pixel.
-pub const DEFAULT_MAGNIFIER_ZOOM: u32 = 8;
+pub const DEFAULT_MAGNIFIER_ZOOM: u32 = 5;
+
+/// Which dimensions the selector reports while a region is being dragged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DimensionLabelMode {
+    /// Logical desktop dimensions, independent of Retina/HiDPI scale.
+    #[default]
+    Logical,
+    /// Final physical pixels when the region belongs to one display.
+    OutputPixels,
+    /// Logical dimensions and physical output pixels together.
+    Both,
+}
+
+impl DimensionLabelMode {
+    /// The stable value used by settings and structured output.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Logical => "logical",
+            Self::OutputPixels => "output-pixels",
+            Self::Both => "both",
+        }
+    }
+}
 
 /// When the advanced crosshair guides and pixel loupe are active.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +409,9 @@ pub struct SelectionOptions {
     pub magnifier: bool,
     /// Screen pixels per magnified pixel.
     pub magnifier_zoom: u32,
+    /// Dimensions shown beside a dragged region.
+    #[serde(default)]
+    pub dimension_label: DimensionLabelMode,
     /// Wait this long before the overlay appears.
     pub delay: Option<Duration>,
     /// Show the mode heads-up display.
@@ -398,11 +426,12 @@ impl Default for SelectionOptions {
             remembered_display: None,
             reuse_immediately: false,
             constraint: SizeConstraint::default(),
-            freeze: true,
+            freeze: false,
             crosshair_mode: CrosshairMode::Off,
             crosshair: false,
             magnifier: false,
             magnifier_zoom: DEFAULT_MAGNIFIER_ZOOM,
+            dimension_label: DimensionLabelMode::Logical,
             delay: None,
             hud: true,
         }
@@ -413,7 +442,7 @@ impl SelectionOptions {
     /// Options for a plain region drag.
     #[must_use]
     pub fn region() -> Self {
-        Self::default()
+        Self::for_mode(SelectionMode::Region)
     }
 
     /// Enables the complete advanced crosshair experience with one activation policy.
@@ -449,9 +478,17 @@ impl SelectionOptions {
     pub fn for_mode(mode: SelectionMode) -> Self {
         Self {
             mode,
-            freeze: matches!(mode, SelectionMode::Region | SelectionMode::Display),
+            freeze: false,
+            hud: false,
             ..Self::default()
         }
+    }
+
+    /// Whether a region drag is a one-gesture capture rather than an adjustable
+    /// All-in-One selection.
+    #[must_use]
+    pub fn commits_region_on_release(&self) -> bool {
+        self.mode == SelectionMode::Region && !self.hud
     }
 }
 
@@ -954,9 +991,9 @@ mod tests {
     }
 
     #[test]
-    fn the_minimum_rejects_a_misclick_but_not_a_small_deliberate_drag() {
+    fn the_static_minimum_defers_to_the_displays_one_pixel_size() {
         let c = SizeConstraint::free();
-        assert!(!c.is_satisfied_by(rect(0.0, 0.0, 2.0, 2.0)));
+        assert!(c.is_satisfied_by(rect(0.0, 0.0, 0.25, 0.25)));
         assert!(c.is_satisfied_by(rect(0.0, 0.0, MIN_SELECTION, MIN_SELECTION)));
     }
 
@@ -967,7 +1004,9 @@ mod tests {
         assert_eq!(options.crosshair_mode, CrosshairMode::Off);
         assert!(!options.crosshair);
         assert!(!options.magnifier);
-        assert!(options.freeze);
+        assert!(!options.freeze);
+        assert!(!options.hud);
+        assert_eq!(options.dimension_label, DimensionLabelMode::Logical);
     }
 
     #[test]

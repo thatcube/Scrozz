@@ -6,7 +6,7 @@ use scrozz_core::{
     ColorSpace, Display, DisplayId, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
     PixelFormat, ScaleFactor,
 };
-use scrozz_ui::{FrozenDisplayFrame, FrozenPixel};
+use scrozz_ui::{FrozenDisplayFrame, FrozenPixel, MagnifierConfig};
 
 fn display(scale: f64) -> Display {
     let bounds = LogicalRect::new(LogicalPoint::new(10.0, 20.0), LogicalSize::new(2.0, 1.0));
@@ -89,4 +89,29 @@ fn global_logical_sampling_uses_the_display_scale() {
     let expected = frozen.sample_local(1, 0);
     let sampled = frozen.sample_global_logical(LogicalPoint::new(10.5, 20.0));
     assert_eq!(sampled, expected);
+}
+
+#[test]
+fn magnifier_uses_a_crisp_thirty_two_pixel_grid_at_five_x() {
+    let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(64.0, 64.0));
+    let display = Display {
+        id: DisplayId("loupe".to_owned()),
+        name: "loupe".to_owned(),
+        bounds,
+        work_area: bounds,
+        scale: ScaleFactor::IDENTITY,
+        is_primary: true,
+    };
+    let frozen = FrozenDisplayFrame::synthetic(display, 9);
+    let grid = scrozz_ui::select::magnifier::sample(
+        &frozen,
+        LogicalPoint::new(32.0, 32.0),
+        MagnifierConfig::default(),
+    );
+
+    assert_eq!(grid.side, 32);
+    assert_eq!(grid.zoom, 5);
+    assert_eq!(grid.cells.len(), 32 * 32);
+    assert_eq!(grid.centre().x, grid.focus_px.0);
+    assert_eq!(grid.centre().y, grid.focus_px.1);
 }

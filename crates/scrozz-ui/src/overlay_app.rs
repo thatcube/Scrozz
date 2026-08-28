@@ -633,6 +633,39 @@ pub fn passes_through(pointer: Option<Pos2>, hits: &[Rect]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Card hover
+// ---------------------------------------------------------------------------
+
+/// Which card, if any, sits under the pointer — hit-tested from the same
+/// authoritative pointer source click-through already trusts, rather than
+/// read back from whether egui has *observed* a pointer event over that card.
+///
+/// # Why `Response::hovered()` is not enough on its own
+///
+/// egui only updates a widget's hover state when it actually receives a
+/// pointer-moved (or similar) event at that screen position. A retained card
+/// window can expand underneath a pointer that has not moved — the ordinary
+/// shape of "reveal a card that just grew into place" — and winit has nothing
+/// to deliver in that case, so `hovered()` stays false for every card until
+/// the next click manufactures an event. [`OverlayApp::pointer`] already
+/// tracks the pointer independently of that, through the macOS
+/// [`PointerProbe`] when one is installed, for exactly the reason that
+/// click-through cannot trust egui's pointer state either (see
+/// [`passes_through`]); this reuses the same source for hover.
+///
+/// `hits` must already be in back-to-front paint order, as produced by
+/// [`sort_card_frames_for_painting`] — later entries are on top and win where
+/// two cards' rectangles overlap.
+#[must_use]
+pub fn hovered_card(pointer: Option<Pos2>, hits: &[(CardId, Rect)]) -> Option<CardId> {
+    let p = pointer?;
+    hits.iter()
+        .rev()
+        .find(|(_, rect)| rect.contains(p))
+        .map(|(id, _)| *id)
+}
+
+// ---------------------------------------------------------------------------
 // Thumbnails
 // ---------------------------------------------------------------------------
 
@@ -1120,7 +1153,15 @@ impl eframe::App for OverlayApp {
         let mut frames = self.stack.frame(&m);
         sort_card_frames_for_painting(&mut frames);
 
+        // Computed up front, not just before `apply_passthrough` as before: the
+        // same authoritative position now also drives card hover below, since
+        // it is exactly what stays correct when winit has not delivered a
+        // fresh pointer event over a card that just moved or grew under a
+        // stationary pointer.
+        let pointer = self.pointer(&ctx);
+
         let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
+        let mut card_hits: Vec<(CardId, Rect)> = Vec::with_capacity(frames.len());
         let mut hovered = None;
         let mut action = None;
         let mut drag_start = None;
@@ -1137,6 +1178,7 @@ impl eframe::App for OverlayApp {
             }
             let response = card::draw_card(ui, &surface, f, &content);
             hits.push(response.hit);
+            card_hits.push((f.id, response.hit));
 
             if response.body.hovered() {
                 hovered = Some(f.id);
@@ -1154,6 +1196,12 @@ impl eframe::App for OverlayApp {
                 drag_end = true;
             }
         }
+
+        // The geometric read wins whenever it has an answer: it is the one
+        // that still works when egui's own hover state is stale. It only
+        // falls back to egui's `hovered()` result when the pointer itself is
+        // unknown (no probe and no recent egui pointer event either).
+        hovered = hovered_card(pointer, &card_hits).or(hovered);
 
         let (dock_hit, dock_clicked) = self.draw_dock(ui, &surface, &m);
         if let Some(rect) = dock_hit {
@@ -1215,7 +1263,6 @@ impl eframe::App for OverlayApp {
             self.emit(OverlayEvent::Emptied);
         }
 
-        let pointer = self.pointer(&ctx);
         self.apply_passthrough(&ctx, &hits, pointer);
 
         // The single place repainting is requested: idle costs nothing, an
@@ -1314,6 +1361,64 @@ mod tests {
         // Including when it is nowhere: there is nothing to click, so this is
         // trivially recoverable the moment a card appears.
         assert!(passes_through(None, &[]));
+    }
+
+    #[test]
+    fn hover_is_found_from_the_authoritative_pointer_alone() {
+        // No `Response::hovered()` in sight: a stationary pointer over a card
+        // that only just grew into place must still resolve to that card, the
+        // exact case where egui's own hover state has nothing to go on yet.
+        let card = rect(40.0, 700.0, 210.0, 150.0);
+        assert_eq!(
+            hovered_card(Some(Pos2::new(100.0, 760.0)), &[(CardId(1), card)]),
+            Some(CardId(1))
+        );
+    }
+
+    #[test]
+    fn hover_is_none_beside_every_card() {
+        let card = rect(40.0, 700.0, 210.0, 150.0);
+        assert_eq!(
+            hovered_card(Some(Pos2::new(600.0, 400.0)), &[(CardId(1), card)]),
+            None
+        );
+    }
+
+    #[test]
+    fn hover_is_none_without_a_known_pointer() {
+        let card = rect(40.0, 700.0, 210.0, 150.0);
+        assert_eq!(hovered_card(None, &[(CardId(1), card)]), None);
+    }
+
+    #[test]
+    fn hover_is_none_with_no_cards_at_all() {
+        assert_eq!(hovered_card(Some(Pos2::new(1.0, 1.0)), &[]), None);
+    }
+
+    #[test]
+    fn overlapping_cards_resolve_to_the_topmost_one() {
+        // `hits` mirrors paint order: later entries are on top, matching
+        // `sort_card_frames_for_painting`'s back-to-front convention.
+        let overlap = rect(40.0, 700.0, 210.0, 150.0);
+        let hits = [(CardId(1), overlap), (CardId(2), overlap)];
+        assert_eq!(
+            hovered_card(Some(Pos2::new(100.0, 760.0)), &hits),
+            Some(CardId(2)),
+            "the last entry paints on top and must win the tie"
+        );
+    }
+
+    #[test]
+    fn hover_survives_no_egui_response_over_a_freshly_expanded_card() {
+        // Regression test for the actual bug report: a retained card window
+        // expands under a pointer that never moved, so egui's own
+        // `Response::hovered()` would still say false. The geometric read
+        // must not depend on that at all.
+        let expanded = rect(40.0, 500.0, 210.0, 360.0);
+        assert_eq!(
+            hovered_card(Some(Pos2::new(120.0, 520.0)), &[(CardId(7), expanded)]),
+            Some(CardId(7))
+        );
     }
 
     #[test]

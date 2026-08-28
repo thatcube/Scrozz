@@ -101,12 +101,28 @@ impl BehaviorController {
         let _ = behavior;
     }
 
-    /// Applies the first native cursor before the window toolkit has observed
-    /// that the retained card window expanded beneath the pointer.
+    /// Makes the native cursor stick for as long as this choice holds, rather
+    /// than leaving it to whichever cursor winit's own tracking last set.
+    ///
+    /// Routes through the installed [`scrozz_shell::macos::overlay::MacOverlay`]
+    /// when one exists: only its `set_cursor` can pin *that window's* cursor
+    /// rect, which is what stops a direct `NSCursor::set()` from being quietly
+    /// reverted by the next native mouse-moved event (see that method's docs).
+    /// The free function is a best-effort fallback for the moment before the
+    /// panel hook installs an overlay at all.
     pub fn set_cursor(&self, cursor: OverlayCursor) {
         #[cfg(all(target_os = "macos", not(test)))]
-        if let Err(error) = scrozz_shell::macos::overlay::set_overlay_cursor(cursor) {
-            tracing::warn!(%error, "could not update native overlay cursor");
+        {
+            let routed = self
+                .overlay
+                .borrow()
+                .as_ref()
+                .map(|overlay| overlay.set_cursor(cursor));
+            let result =
+                routed.unwrap_or_else(|| scrozz_shell::macos::overlay::set_overlay_cursor(cursor));
+            if let Err(error) = result {
+                tracing::warn!(%error, "could not update native overlay cursor");
+            }
         }
 
         #[cfg(test)]

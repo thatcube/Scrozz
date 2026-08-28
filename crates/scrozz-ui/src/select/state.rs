@@ -34,6 +34,13 @@ pub enum ResizeHandle {
     West,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DragModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub space: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionAnnouncement(pub String);
 
@@ -53,6 +60,7 @@ pub struct SelectionState {
     hovered_window: Option<WindowId>,
     last_pointer: Option<LogicalPoint>,
     phase: Phase,
+    drag_modifiers: DragModifiers,
     gesture_changed: bool,
     announcement: Option<SelectionAnnouncement>,
 }
@@ -63,6 +71,7 @@ enum Phase {
     Creating {
         anchor: LogicalPoint,
         display: DisplayId,
+        space_move: Option<SpaceMove>,
     },
     Moving {
         grab: (f64, f64),
@@ -75,6 +84,12 @@ enum Phase {
     PlacingExact {
         display: DisplayId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SpaceMove {
+    pointer: LogicalPoint,
+    region: LogicalRect,
 }
 
 impl SelectionState {
@@ -139,6 +154,7 @@ impl SelectionState {
             hovered_window: None,
             last_pointer: None,
             phase: Phase::Idle,
+            drag_modifiers: DragModifiers::default(),
             gesture_changed: false,
         };
         if !state.capabilities.supports(state.mode) {
@@ -190,6 +206,58 @@ impl SelectionState {
     #[must_use]
     pub const fn options_ref(&self) -> &SelectionOptions {
         &self.options
+    }
+
+    pub fn set_drag_modifiers(&mut self, modifiers: DragModifiers) {
+        if self.drag_modifiers == modifiers {
+            return;
+        }
+        let previous = self.drag_modifiers;
+        self.drag_modifiers = modifiers;
+
+        let Phase::Creating {
+            mut anchor,
+            display,
+            space_move: _,
+        } = self.phase.clone()
+        else {
+            return;
+        };
+        let Some(pointer) = self.last_pointer else {
+            return;
+        };
+
+        if !previous.space && modifiers.space {
+            if let Some(region) = self.region {
+                self.phase = Phase::Creating {
+                    anchor,
+                    display,
+                    space_move: Some(SpaceMove { pointer, region }),
+                };
+            }
+            return;
+        }
+
+        if previous.space && !modifiers.space {
+            if let Some(region) = self.region {
+                anchor = if modifiers.alt {
+                    geom::centre(region)
+                } else {
+                    opposite_corner(region, pointer)
+                };
+            }
+            self.phase = Phase::Creating {
+                anchor,
+                display,
+                space_move: None,
+            };
+            self.pointer_moved_after_hover(pointer);
+            return;
+        }
+
+        if self.is_interacting() {
+            self.pointer_moved_after_hover(pointer);
+        }
     }
 
     #[must_use]
@@ -337,25 +405,69 @@ impl SelectionState {
         let previous_region = self.region;
         match self.phase.clone() {
             Phase::Idle => {}
-            Phase::Creating { anchor, display } => {
-                let Some(bounds) = self.display_bounds(&display) else {
+            Phase::Creating {
+                anchor,
+                display,
+                space_move,
+            } => {
+                let Some(bounds) = self.layout.desktop_bounds() else {
                     return;
                 };
                 let point = geom::clamp_point(bounds, point);
+                if let Some(space_move) = space_move {
+                    let delta = constrained_delta(
+                        point.x - space_move.pointer.x,
+                        point.y - space_move.pointer.y,
+                        self.drag_modifiers.shift,
+                    );
+                    let moved = LogicalRect::new(
+                        LogicalPoint::new(
+                            space_move.region.origin.x + delta.0,
+                            space_move.region.origin.y + delta.1,
+                        ),
+                        space_move.region.size,
+                    );
+                    let rect = geom::clamp_rect(bounds, moved);
+                    self.region = Some(rect);
+                    self.region_display = self.region_display_for(rect, Some(&display));
+                    if self.region != previous_region {
+                        self.gesture_changed = true;
+                    }
+                    return;
+                }
                 let rect = if let Some(exact) = self.options.constraint.exact {
                     self.phase = Phase::PlacingExact {
                         display: display.clone(),
                     };
-                    let Some(rect) = place_exact(bounds, point, exact) else {
-                        self.reject_exact_size(bounds, exact);
+                    let Some(display_bounds) = self.display_bounds(&display) else {
+                        return;
+                    };
+                    let Some(rect) = place_exact(display_bounds, point, exact) else {
+                        self.reject_exact_size(display_bounds, exact);
                         return;
                     };
                     rect
                 } else {
-                    let raw = LogicalRect::from_corners(anchor, point);
-                    fit_aspect_rect(bounds, anchor, raw, self.options.constraint.aspect)
+                    let Some(scale) = self.layout.display(&display).map(|display| display.scale)
+                    else {
+                        return;
+                    };
+                    let Some(raw) =
+                        dragged_region(bounds, anchor, point, scale, self.drag_modifiers)
+                    else {
+                        self.region = None;
+                        self.region_display = None;
+                        return;
+                    };
+                    let aspect = if self.drag_modifiers.shift {
+                        scrozz_core::selection::AspectLock::Free
+                    } else {
+                        self.options.constraint.aspect
+                    };
+                    fit_aspect_rect(bounds, anchor, raw, aspect)
                 };
                 self.region = Some(rect);
+                self.region_display = self.region_display_for(rect, Some(&display));
             }
             Phase::Moving { grab, display } => {
                 if let (Some(bounds), Some(current)) = (self.display_bounds(&display), self.region)
@@ -371,13 +483,8 @@ impl SelectionState {
                 if let (Some(bounds), Some(current)) = (self.display_bounds(&display), self.region)
                 {
                     let point = geom::clamp_point(bounds, point);
-                    self.region = Some(resize_rect(
-                        bounds,
-                        current,
-                        point,
-                        handle,
-                        self.options.constraint,
-                    ));
+                    let constraint = self.constraint_for_display(&display);
+                    self.region = Some(resize_rect(bounds, current, point, handle, constraint));
                 }
             }
             Phase::PlacingExact { display } => {
@@ -464,6 +571,7 @@ impl SelectionState {
         let Some(display) = self.region_owner(rect).cloned() else {
             return;
         };
+        let constraint = self.constraint_for_display(&display.id);
         self.region_display = Some(display.id.clone());
         self.active_display = Some(display.id);
         let bounds = display.bounds;
@@ -490,13 +598,7 @@ impl SelectionState {
             AxisDirection::Up => ResizeHandle::North,
             AxisDirection::Down => ResizeHandle::South,
         };
-        self.region = Some(resize_rect(
-            bounds,
-            rect,
-            point,
-            handle,
-            self.options.constraint,
-        ));
+        self.region = Some(resize_rect(bounds, rect, point, handle, constraint));
         self.announcement = self.region.map(|rect| {
             SelectionAnnouncement(format!("Selection resized to {}", describe_size(rect.size)))
         });
@@ -710,6 +812,7 @@ impl SelectionState {
             self.phase = Phase::Creating {
                 anchor: point,
                 display: display.clone(),
+                space_move: None,
             };
             self.region = None;
         }
@@ -717,14 +820,14 @@ impl SelectionState {
 
     fn commit_region(&self, source: SelectionSource) -> Option<SelectionOutcome> {
         let rect = self.region?;
-        if !self.options.constraint.is_satisfied_by(rect) {
+        if rect.is_empty() || !self.options.constraint.is_satisfied_by(rect) {
             return None;
         }
-        let display = self.region_owner(rect)?;
+        let display = self.region_owner(rect);
         Some(SelectionOutcome::region(
             rect,
-            Some(display.id.clone()),
-            display.scale,
+            display.map(|display| display.id.clone()),
+            display.map_or(ScaleFactor::IDENTITY, |display| display.scale),
             source,
         ))
     }
@@ -774,6 +877,17 @@ impl SelectionState {
         self.layout.display(id).map(|display| display.bounds)
     }
 
+    fn constraint_for_display(&self, id: &DisplayId) -> SizeConstraint {
+        let Some(display) = self.layout.display(id) else {
+            return self.options.constraint;
+        };
+        let pixel = 1.0 / display.scale.get();
+        let mut constraint = self.options.constraint;
+        constraint.minimum.width = constraint.minimum.width.max(pixel);
+        constraint.minimum.height = constraint.minimum.height.max(pixel);
+        constraint
+    }
+
     fn window(&self, id: &WindowId) -> Option<&Window> {
         self.windows.iter().find(|window| window.id == *id)
     }
@@ -796,6 +910,18 @@ impl SelectionState {
             .and_then(|display| self.layout.display(display))
             .filter(|display| geom::contains_rect(display.bounds, rect))
             .or_else(|| self.layout.display_owning_rect(rect))
+    }
+
+    fn region_display_for(
+        &self,
+        rect: LogicalRect,
+        preferred: Option<&DisplayId>,
+    ) -> Option<DisplayId> {
+        preferred
+            .and_then(|id| self.layout.display(id))
+            .filter(|display| geom::contains_rect(display.bounds, rect))
+            .or_else(|| self.layout.display_owning_rect(rect))
+            .map(|display| display.id.clone())
     }
 
     fn selected_announcement(&self, outcome: &SelectionOutcome) -> String {
@@ -911,6 +1037,77 @@ fn fit_aspect_rect(
     LogicalRect::from_corners(
         anchor,
         LogicalPoint::new(anchor.x + sign_x * width, anchor.y + sign_y * height),
+    )
+}
+
+fn dragged_region(
+    bounds: LogicalRect,
+    anchor: LogicalPoint,
+    point: LogicalPoint,
+    scale: ScaleFactor,
+    modifiers: DragModifiers,
+) -> Option<LogicalRect> {
+    let (dx, dy) = constrained_delta(point.x - anchor.x, point.y - anchor.y, modifiers.shift);
+    if dx.abs() <= f64::EPSILON && dy.abs() <= f64::EPSILON {
+        return None;
+    }
+
+    let pixel = 1.0 / scale.get();
+    let dragged = LogicalPoint::new(anchor.x + dx, anchor.y + dy);
+    let mut rect = if modifiers.alt {
+        LogicalRect::from_corners(LogicalPoint::new(anchor.x - dx, anchor.y - dy), dragged)
+    } else {
+        LogicalRect::from_corners(anchor, dragged)
+    };
+    if rect.size.width < pixel {
+        let x = if modifiers.alt {
+            anchor.x - pixel / 2.0
+        } else if anchor.x + pixel <= geom::right(bounds) {
+            anchor.x
+        } else {
+            anchor.x - pixel
+        };
+        rect.origin.x = x;
+        rect.size.width = pixel;
+    }
+    if rect.size.height < pixel {
+        let y = if modifiers.alt {
+            anchor.y - pixel / 2.0
+        } else if anchor.y + pixel <= geom::bottom(bounds) {
+            anchor.y
+        } else {
+            anchor.y - pixel
+        };
+        rect.origin.y = y;
+        rect.size.height = pixel;
+    }
+    Some(geom::clamp_rect(bounds, rect))
+}
+
+fn constrained_delta(dx: f64, dy: f64, axis_locked: bool) -> (f64, f64) {
+    if !axis_locked {
+        return (dx, dy);
+    }
+    if dx.abs() >= dy.abs() {
+        (dx, 0.0)
+    } else {
+        (0.0, dy)
+    }
+}
+
+fn opposite_corner(region: LogicalRect, pointer: LogicalPoint) -> LogicalPoint {
+    let centre = geom::centre(region);
+    LogicalPoint::new(
+        if pointer.x >= centre.x {
+            region.origin.x
+        } else {
+            geom::right(region)
+        },
+        if pointer.y >= centre.y {
+            region.origin.y
+        } else {
+            geom::bottom(region)
+        },
     )
 }
 

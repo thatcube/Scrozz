@@ -569,9 +569,9 @@ impl CaptureSelector for ClientOverlaySelector {
         &self,
         options: &SelectionOptions,
         cursor: CursorMode,
-        surface_can_remain_visible: bool,
+        _surface_can_remain_visible: bool,
     ) -> Result<SelectionOutcome> {
-        self.select_internal(options, cursor, surface_can_remain_visible)
+        self.select_internal(options, cursor, false)
     }
 
     fn take_frozen_capture(&self, request: &CaptureRequest) -> Option<Capture> {
@@ -714,9 +714,7 @@ impl ClientOverlayController {
     pub fn owns_surface(&self) -> bool {
         !matches!(
             self.phase,
-            ControllerPhase::Cards
-                | ControllerPhase::PreparingWithCards { .. }
-                | ControllerPhase::ReadyToSelect { .. }
+            ControllerPhase::Cards | ControllerPhase::PreparingWithCards { .. }
         )
     }
 
@@ -756,6 +754,7 @@ impl ClientOverlayController {
                 result,
                 viewports,
             } => {
+                native.set_cursor(OverlayCursor::Arrow);
                 if !selector_input_is_quiescent(ctx, &viewports) {
                     ctx.request_repaint();
                     ControllerPhase::ReleaseBeforeHide {
@@ -860,7 +859,12 @@ impl ClientOverlayController {
                 ControllerPhase::WaitingForPreparation { id: waiting } if waiting == id
             ) =>
             {
-                self.phase = activate_selection(ctx, native, id, prepared, decision);
+                self.phase = ControllerPhase::ReadyToSelect {
+                    id,
+                    prepared,
+                    decision,
+                    saw_quiet_frame: false,
+                };
             }
             BridgeEvent::PreparationFailed { id }
                 if matches!(
@@ -1000,6 +1004,34 @@ fn prepare_native(options: SelectionOptions, cursor: CursorMode) -> Result<Prepa
                 });
             }
         }
+        if options.freeze
+            && displays.len() > 1
+            && let Some(bounds) = DisplayLayout::new(displays.clone()).desktop_bounds()
+        {
+            match backend.capture(&CaptureRequest {
+                target: CaptureTarget::AllDisplays,
+                cursor,
+                include_window_shadow: false,
+            }) {
+                Ok(capture) => frozen_sources.push(FrozenSource {
+                    display: Display {
+                        id: DisplayId("scrozz:frozen-all-displays".to_owned()),
+                        name: "All displays".to_owned(),
+                        bounds,
+                        work_area: bounds,
+                        scale: capture.frame.scale,
+                        is_primary: false,
+                    },
+                    capture,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "cross-display frozen selection is unavailable; single-display freeze remains available"
+                    );
+                }
+            }
+        }
     }
 
     Ok(PreparedSelection {
@@ -1025,31 +1057,21 @@ fn require_visible_window(options: &SelectionOptions, windows: &[Window]) -> Res
     Ok(())
 }
 
-/// Whether every display snapshot used to prepare selection omits Scrozz while
-/// leaving its windows visible to the user.
-pub(crate) fn display_captures_exclude_current_process(
-    backend: &dyn CaptureBackend,
-) -> Result<bool> {
-    let displays = backend.displays()?;
-    Ok(!displays.is_empty()
-        && displays.iter().all(|display| {
-            backend.excludes_current_process(&CaptureTarget::Display(display.id.clone()))
-        }))
-}
-
 fn frozen_capture_for_outcome(
     outcome: SelectionOutcome,
     frozen_sources: Vec<FrozenSource>,
 ) -> Result<Option<Capture>> {
     match outcome.mode {
         scrozz_core::SelectionMode::Region => {
-            let Some(display_id) = outcome.display.as_ref() else {
-                return Ok(None);
+            let source = match outcome.display.as_ref() {
+                Some(display_id) => frozen_sources
+                    .into_iter()
+                    .find(|source| source.display.id == *display_id),
+                None => frozen_sources
+                    .into_iter()
+                    .find(|source| source.capture.target == CaptureTarget::AllDisplays),
             };
-            let Some(source) = frozen_sources
-                .into_iter()
-                .find(|source| source.display.id == *display_id)
-            else {
+            let Some(source) = source else {
                 return Ok(None);
             };
             let Some(rect) = outcome.rect else {
@@ -1507,6 +1529,50 @@ mod tests {
         assert_eq!(&capture.frame.data[16..20], &[2, 2, 99, 255]);
     }
 
+    #[test]
+    fn cross_display_region_crops_the_frozen_all_display_frame() {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(4.0, 2.0));
+        let display = Display {
+            id: DisplayId("scrozz:frozen-all-displays".to_owned()),
+            name: "All displays".to_owned(),
+            bounds,
+            work_area: bounds,
+            scale: ScaleFactor::new(2.0),
+            is_primary: false,
+        };
+        let source = FrozenSource {
+            display: display.clone(),
+            capture: Capture {
+                frame: Frame {
+                    data: vec![200; 8 * 4 * 4],
+                    size: PhysicalSize::new(8.0, 4.0),
+                    stride: 8 * 4,
+                    format: scrozz_core::PixelFormat::Rgba8,
+                    color_space: scrozz_core::ColorSpace::Srgb,
+                    scale: display.scale,
+                },
+                provenance: Provenance::AllDisplays,
+                target: CaptureTarget::AllDisplays,
+            },
+        };
+        let rect = LogicalRect::new(LogicalPoint::new(1.0, 0.5), LogicalSize::new(2.0, 1.0));
+        let outcome = SelectionOutcome::region(
+            rect,
+            None,
+            ScaleFactor::IDENTITY,
+            scrozz_core::SelectionSource::ClientOverlay,
+        );
+
+        let capture = frozen_capture_for_outcome(outcome, vec![source])
+            .expect("the all-display frozen crop should be valid")
+            .expect("a cross-display region should reuse the frozen composite");
+
+        assert_eq!(capture.target, CaptureTarget::Region(rect));
+        assert_eq!(capture.provenance, Provenance::Region);
+        assert_eq!(capture.frame.width(), 4);
+        assert_eq!(capture.frame.height(), 2);
+    }
+
     struct RecordingBackend {
         displays: Vec<Display>,
         targets: Mutex<Vec<CaptureTarget>>,
@@ -1529,26 +1595,38 @@ mod tests {
     impl CaptureBackend for RecordingBackend {
         fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
             self.targets.lock().unwrap().push(request.target.clone());
-            let CaptureTarget::Display(display_id) = &request.target else {
-                panic!("the selected display should be captured before cropping")
+            let (width, height, scale, provenance) = match &request.target {
+                CaptureTarget::Display(display_id) => {
+                    let display = self
+                        .displays
+                        .iter()
+                        .find(|display| display.id == *display_id)
+                        .unwrap();
+                    (
+                        (display.bounds.size.width * display.scale.get()) as usize,
+                        (display.bounds.size.height * display.scale.get()) as usize,
+                        display.scale,
+                        Provenance::Display,
+                    )
+                }
+                CaptureTarget::Region(rect) => (
+                    rect.size.width.ceil() as usize,
+                    rect.size.height.ceil() as usize,
+                    ScaleFactor::IDENTITY,
+                    Provenance::Region,
+                ),
+                target => panic!("unexpected recording target: {target:?}"),
             };
-            let display = self
-                .displays
-                .iter()
-                .find(|display| display.id == *display_id)
-                .unwrap();
-            let width = (display.bounds.size.width * display.scale.get()) as usize;
-            let height = (display.bounds.size.height * display.scale.get()) as usize;
             Ok(Capture {
                 frame: Frame {
-                    data: vec![display.scale.get() as u8; width * height * 4],
+                    data: vec![scale.get() as u8; width * height * 4],
                     size: PhysicalSize::new(width as f64, height as f64),
                     stride: width * 4,
                     format: scrozz_core::PixelFormat::Rgba8,
                     color_space: scrozz_core::ColorSpace::Srgb,
-                    scale: display.scale,
+                    scale,
                 },
-                provenance: Provenance::Display,
+                provenance,
                 target: request.target.clone(),
             })
         }
@@ -1605,6 +1683,52 @@ mod tests {
         assert_eq!(capture.frame.width(), 40);
         assert_eq!(capture.frame.height(), 30);
         assert!(capture.frame.data.iter().all(|byte| *byte == 2));
+    }
+
+    #[test]
+    fn live_cross_display_region_uses_the_backends_virtual_desktop_path() {
+        let left_bounds =
+            LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(100.0, 80.0));
+        let right_bounds =
+            LogicalRect::new(LogicalPoint::new(100.0, 0.0), LogicalSize::new(100.0, 80.0));
+        let backend = RecordingBackend {
+            displays: vec![
+                Display {
+                    id: DisplayId("left".to_owned()),
+                    name: "Left".to_owned(),
+                    bounds: left_bounds,
+                    work_area: left_bounds,
+                    scale: ScaleFactor::new(2.0),
+                    is_primary: true,
+                },
+                Display {
+                    id: DisplayId("right".to_owned()),
+                    name: "Right".to_owned(),
+                    bounds: right_bounds,
+                    work_area: right_bounds,
+                    scale: ScaleFactor::IDENTITY,
+                    is_primary: false,
+                },
+            ],
+            targets: Mutex::new(Vec::new()),
+        };
+        let rect = LogicalRect::new(LogicalPoint::new(80.0, 10.0), LogicalSize::new(40.0, 20.0));
+        let outcome = SelectionOutcome::region(
+            rect,
+            None,
+            ScaleFactor::IDENTITY,
+            scrozz_core::SelectionSource::ClientOverlay,
+        );
+        let request = CaptureRequest::new(CaptureTarget::Region(rect));
+
+        let capture = capture_selected(&backend, &request, Some(&outcome)).unwrap();
+
+        assert_eq!(
+            backend.targets.into_inner().unwrap(),
+            vec![CaptureTarget::Region(rect)]
+        );
+        assert_eq!(capture.target, CaptureTarget::Region(rect));
+        assert_eq!(capture.provenance, Provenance::Region);
     }
 
     #[test]
@@ -2056,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_prepares_behind_visible_cards_when_exclusion_is_supported() {
+    fn interactive_selection_hides_cards_even_when_exclusion_is_supported() {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let prepare_barrier = Arc::clone(&barrier);
         let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor| {
@@ -2105,11 +2229,14 @@ mod tests {
             controller.logic(&ctx, &native);
             matches!(
                 &controller.phase,
-                ControllerPhase::PreparingWithCards { .. }
+                ControllerPhase::WaitingForPreparation { .. }
             )
         });
-        assert!(!controller.owns_surface());
-        assert!(behavior_log.borrow().is_empty());
+        assert!(controller.owns_surface());
+        assert_eq!(
+            *behavior_log.borrow(),
+            vec![scrozz_shell::OverlayBehavior::hidden_surface()]
+        );
 
         let pointer = egui::pos2(60.0, 60.0);
         let mut output = ctx.run_ui(
@@ -2135,8 +2262,8 @@ mod tests {
             matches!(&controller.phase, ControllerPhase::ReadyToSelect { .. })
         });
         assert!(
-            !controller.owns_surface(),
-            "the cards keep the release frame so a press cannot leak into selection"
+            controller.owns_surface(),
+            "the hidden selector must retain its native frame while draining the launch click"
         );
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -2166,7 +2293,10 @@ mod tests {
         ));
         assert_eq!(
             *behavior_log.borrow(),
-            vec![scrozz_shell::OverlayBehavior::selection_overlay()]
+            vec![
+                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::selection_overlay()
+            ]
         );
 
         selector.cancel();

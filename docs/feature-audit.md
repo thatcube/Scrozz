@@ -15,9 +15,9 @@ the cross-platform feasibility analysis, and the build backlog.
 - `lzhgus/Capso` README — the closest existing OSS attempt (macOS-only, Swift 6, **BSL 1.1**)
 
 **UI reference library:** `~/.copilot/scrozz-ui-reference/` (start at `INDEX.md`).
-Competitor screenshots are kept **outside this repository deliberately** — they are
-copyrighted product UI. They are there to calibrate the *quality bar*, never to be
-copied, and no image from that library is ever committed here.
+The complete library stays outside the repository. D17 permits a narrowly scoped,
+user-supplied image under `docs/reference/` when the audit needs concrete visual
+evidence for one behavior; it remains documentation, never a Scrozz product asset.
 
 **Scope:** Scrozz targets macOS, Windows, and Linux. CleanShot is macOS-only, so every feature
 below carries a per-platform feasibility note. That column, not the feature list, is what
@@ -53,6 +53,19 @@ determines the architecture.
 | CAP-06 | Multi-display / mixed-DPI correctness | T0 | M | M | M | M |
 | CAP-07 | Retina/HiDPI scaling on output | T1 | S | S | S | S |
 | CAP-08 | PixelSnap integration (measure tool) | T3 | — | — | — | — |
+
+### All-in-One capture reference
+
+The user-supplied CleanShot X reference below records the interaction category
+Scrozz's All-in-One surface must cover: one temporary selector that can switch
+among area, window, display, and all-display targets without returning to the
+menu. It is behavioral audit evidence, not a Scrozz layout or styling template.
+
+![CleanShot X All-in-One Capture reference](reference/cleanshot/all-in-one-capture.png)
+
+Scrozz keeps its own visual language. The required behavior is a dimmed
+All-in-One workspace with a mode HUD; direct Capture Area remains visually quiet
+and never dims pixels outside the selected region.
 
 **Window screenshot options (CleanShot):** with background, adjustable padding, desktop
 background / custom image / plain color / transparent, shadow on/off.

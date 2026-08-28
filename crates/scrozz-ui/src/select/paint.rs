@@ -6,7 +6,7 @@ use egui::{
     Align2, Color32, CornerRadius, Id, Pos2, Rect, Response, Sense, Stroke, StrokeKind,
     TextureHandle, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
-use scrozz_core::selection::SelectionMode;
+use scrozz_core::selection::{DimensionLabelMode, SelectionMode};
 use scrozz_core::{DisplayId, LogicalPoint, LogicalRect};
 
 use crate::{
@@ -78,7 +78,10 @@ pub(super) fn draw_overlay(
             state.mode() == SelectionMode::Display,
         );
     }
-    let paints_focus = view.display.is_none() || state.focus_display() == view.display;
+    let paints_focus = view.display.is_none()
+        || state
+            .focus_rect()
+            .is_some_and(|rect| overlaps(rect, view.surface));
     let focus = if state.mode() == SelectionMode::AllDisplays {
         Some(view.surface)
     } else if paints_focus {
@@ -86,7 +89,7 @@ pub(super) fn draw_overlay(
     } else {
         None
     };
-    if should_draw_scrim(state.mode(), focus.is_some()) {
+    if should_draw_scrim(state.options_ref().hud) {
         draw_scrim(&painter, canvas_rect, focus, view.surface, theme);
     }
     let mut confirmation = HudPaintResult {
@@ -106,18 +109,20 @@ pub(super) fn draw_overlay(
                 canvas_rect,
                 view.surface,
                 region,
-                state.constraint().exact.is_none(),
+                state.options_ref().hud && state.constraint().exact.is_none(),
                 theme,
             );
-            confirmation = draw_size_readout(
-                ui,
-                canvas_rect,
-                view.layout,
-                view.surface,
-                state,
-                region,
-                theme,
-            );
+            if view.display.is_none() || state.pointer_display() == view.display {
+                confirmation = draw_size_readout(
+                    ui,
+                    canvas_rect,
+                    view.layout,
+                    view.surface,
+                    state,
+                    region,
+                    theme,
+                );
+            }
         }
     } else if paints_focus && let Some(rect) = state.focus_rect() {
         draw_target_highlight(&painter, canvas_rect, view.surface, rect, state, theme);
@@ -226,8 +231,8 @@ fn draw_backdrop(
     }
 }
 
-fn should_draw_scrim(mode: SelectionMode, has_focus: bool) -> bool {
-    mode != SelectionMode::Region || has_focus
+fn should_draw_scrim(all_in_one: bool) -> bool {
+    all_in_one
 }
 
 fn draw_scrim(
@@ -327,22 +332,22 @@ fn draw_crosshair(
     theme: &Theme,
 ) {
     let point = DisplayLayout::canvas_pos_in(surface, pointer) + canvas_rect.min.to_vec2();
-    let stroke = Stroke::new(1.0, Color32::from_white_alpha(120));
-    painter.line_segment(
-        [
-            pos2(canvas_rect.left(), point.y),
-            pos2(canvas_rect.right(), point.y),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            pos2(point.x, canvas_rect.top()),
-            pos2(point.x, canvas_rect.bottom()),
-        ],
-        stroke,
-    );
-    painter.circle_stroke(point, 5.0, Stroke::new(1.5, theme.palette.accent));
+    let horizontal = [
+        pos2(canvas_rect.left(), point.y),
+        pos2(canvas_rect.right(), point.y),
+    ];
+    let vertical = [
+        pos2(point.x, canvas_rect.top()),
+        pos2(point.x, canvas_rect.bottom()),
+    ];
+    for (width, colour) in [
+        (3.0, Color32::from_black_alpha(128)),
+        (1.0, Color32::from_white_alpha(128)),
+    ] {
+        painter.line_segment(horizontal, Stroke::new(width, colour));
+        painter.line_segment(vertical, Stroke::new(width, colour));
+    }
+    let _ = theme;
 }
 
 fn draw_selection(
@@ -358,16 +363,21 @@ fn draw_selection(
         DisplayLayout::canvas_rect_in(surface, region),
         canvas_rect.min,
     );
-    painter.rect_stroke(
+    painter.rect_filled(
         rect,
-        corner(Radius::CARD),
-        Stroke::new(2.0, palette.accent),
-        StrokeKind::Inside,
+        CornerRadius::ZERO,
+        Color32::from_rgba_unmultiplied(128, 128, 128, 20),
     );
     painter.rect_stroke(
         rect.expand(1.0),
-        corner(Radius::CARD + 1.0),
-        Stroke::new(1.0, Color32::from_white_alpha(140)),
+        CornerRadius::ZERO,
+        Stroke::new(3.0, Color32::from_black_alpha(170)),
+        StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, Color32::from_white_alpha(220)),
         StrokeKind::Inside,
     );
     if resizable {
@@ -376,7 +386,7 @@ fn draw_selection(
             painter.rect_stroke(
                 handle,
                 corner(Radius::CHIP),
-                Stroke::new(1.0, palette.accent),
+                Stroke::new(1.0, Color32::from_black_alpha(170)),
                 StrokeKind::Inside,
             );
         }
@@ -392,24 +402,30 @@ fn draw_size_readout(
     region: LogicalRect,
     theme: &Theme,
 ) -> HudPaintResult {
-    let Some(display_id) = state.focus_display() else {
-        return HudPaintResult {
-            action: OverlayAction::None,
-            pointer_over_hud: false,
-        };
-    };
-    let Some(display) = layout.display(display_id) else {
-        return HudPaintResult {
-            action: OverlayAction::None,
-            pointer_over_hud: false,
-        };
-    };
-    let pixels = region.to_physical(display.scale);
-    let label = format!(
-        "{} × {} px · Capture",
-        pixels.pixel_width(),
-        pixels.pixel_height()
+    let logical = format!(
+        "{} × {}",
+        region.size.width.round() as u64,
+        region.size.height.round() as u64
     );
+    let pixels = state
+        .focus_display()
+        .and_then(|display| layout.display(display))
+        .map(|display| region.to_physical(display.scale))
+        .map(|rect| format!("{} × {} px", rect.pixel_width(), rect.pixel_height()));
+    let dimensions = match state.options_ref().dimension_label {
+        DimensionLabelMode::Logical => logical.clone(),
+        DimensionLabelMode::OutputPixels => pixels.clone().unwrap_or_else(|| logical.clone()),
+        DimensionLabelMode::Both => pixels.map_or_else(
+            || logical.clone(),
+            |pixels| format!("{logical} logical · {pixels}"),
+        ),
+    };
+    let confirms = state.options_ref().hud;
+    let label = if confirms {
+        format!("{dimensions} · Capture")
+    } else {
+        dimensions
+    };
     let region_rect = translate(
         DisplayLayout::canvas_rect_in(surface, region),
         canvas_rect.min,
@@ -424,16 +440,24 @@ fn draw_size_readout(
         canvas_rect.right() - size.x - Space::SM,
     );
     let rect = Rect::from_min_size(origin, size);
-    let response = ui.interact(rect, Id::new("selector-confirm"), Sense::click());
+    let response = ui.interact(
+        rect,
+        Id::new("selector-dimensions"),
+        if confirms {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
     response.widget_info(|| {
         WidgetInfo::labeled(
             WidgetType::Button,
             true,
-            format!(
-                "Capture selected region, {} by {} pixels",
-                pixels.pixel_width(),
-                pixels.pixel_height()
-            ),
+            if confirms {
+                format!("Capture selected region, {label}")
+            } else {
+                format!("Selected region, {label}")
+            },
         )
     });
     chrome::glass_panel(ui.painter(), rect, Radius::BUTTON, &theme.palette, true);
@@ -442,7 +466,7 @@ fn draw_size_readout(
         corner(Radius::BUTTON),
         Stroke::new(
             1.0,
-            if response.hovered() {
+            if confirms && response.hovered() {
                 theme.palette.focus_ring
             } else {
                 theme.palette.hairline
@@ -458,12 +482,12 @@ fn draw_size_readout(
         theme.palette.text,
     );
     HudPaintResult {
-        action: if response.clicked() {
+        action: if confirms && response.clicked() {
             OverlayAction::Confirm
         } else {
             OverlayAction::None
         },
-        pointer_over_hud: response.hovered(),
+        pointer_over_hud: confirms && response.hovered(),
     }
 }
 
@@ -478,7 +502,7 @@ fn draw_magnifier(
     let point = DisplayLayout::canvas_pos_in(surface, pointer) + canvas_rect.min.to_vec2();
     let cell = grid.zoom as f32 / painter.ctx().pixels_per_point().max(f32::EPSILON);
     let side = grid.side as f32 * cell;
-    let size = vec2(side + 18.0, side + 18.0);
+    let size = vec2(side, side);
     let mut origin = pos2(point.x + 22.0, point.y + 22.0);
     if origin.x + size.x > canvas_rect.right() - Space::SM {
         origin.x = point.x - size.x - 22.0;
@@ -495,8 +519,7 @@ fn draw_magnifier(
         canvas_rect.bottom() - size.y - Space::SM,
     );
     let rect = Rect::from_min_size(origin, size);
-    chrome::glass_panel(painter, rect, Radius::CARD, &theme.palette, true);
-    let pixels = Rect::from_min_max(rect.min + vec2(9.0, 9.0), rect.max - vec2(9.0, 9.0));
+    let pixels = rect;
     for (index, sample) in grid.cells.iter().enumerate() {
         let x = index % grid.side;
         let y = index / grid.side;
@@ -509,22 +532,33 @@ fn draw_magnifier(
         );
         painter.rect_filled(cell_rect, CornerRadius::ZERO, sample.pixel.to_color32());
     }
-    let centre = grid.centre_index();
-    let x = centre % grid.side;
-    let y = centre / grid.side;
-    let focus = Rect::from_min_size(
-        pos2(
-            pixels.left() + x as f32 * cell,
-            pixels.top() + y as f32 * cell,
-        ),
-        vec2(cell, cell),
-    );
+    let centre = pixels.center();
+    for (width, colour) in [
+        (3.0, Color32::from_black_alpha(180)),
+        (1.0, Color32::from_white_alpha(220)),
+    ] {
+        painter.line_segment(
+            [
+                pos2(pixels.left(), centre.y),
+                pos2(pixels.right(), centre.y),
+            ],
+            Stroke::new(width, colour),
+        );
+        painter.line_segment(
+            [
+                pos2(centre.x, pixels.top()),
+                pos2(centre.x, pixels.bottom()),
+            ],
+            Stroke::new(width, colour),
+        );
+    }
     painter.rect_stroke(
-        focus.expand(1.0),
-        CornerRadius::ZERO,
-        Stroke::new(2.0, theme.palette.accent),
+        rect,
+        corner(Radius::CARD),
+        Stroke::new(1.0, Color32::from_black_alpha(180)),
         StrokeKind::Inside,
     );
+    let _ = theme;
 }
 
 fn draw_hud(
@@ -667,6 +701,13 @@ fn handles(rect: Rect) -> [Rect; 8] {
     ]
 }
 
+fn overlaps(a: LogicalRect, b: LogicalRect) -> bool {
+    a.origin.x < b.origin.x + b.size.width
+        && a.origin.x + a.size.width > b.origin.x
+        && a.origin.y < b.origin.y + b.size.height
+        && a.origin.y + a.size.height > b.origin.y
+}
+
 fn translate(rect: Rect, offset: Pos2) -> Rect {
     rect.translate(offset.to_vec2())
 }
@@ -695,14 +736,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn region_capture_does_not_dim_before_a_region_exists() {
-        assert!(!should_draw_scrim(SelectionMode::Region, false));
-        assert!(should_draw_scrim(SelectionMode::Region, true));
+    fn ordinary_capture_never_draws_a_scrim() {
+        assert!(!should_draw_scrim(false));
     }
 
     #[test]
-    fn semantic_targets_keep_their_targeting_scrim() {
-        assert!(should_draw_scrim(SelectionMode::Window, false));
-        assert!(should_draw_scrim(SelectionMode::Display, false));
+    fn all_in_one_keeps_its_targeting_scrim() {
+        assert!(should_draw_scrim(true));
     }
 }

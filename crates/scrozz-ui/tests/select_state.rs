@@ -9,7 +9,7 @@ use scrozz_core::{
     CaptureTarget, Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScaleFactor, Window,
     WindowId,
 };
-use scrozz_ui::{AxisDirection, DisplayLayout, SelectionState};
+use scrozz_ui::{AxisDirection, DisplayLayout, DragModifiers, SelectionState};
 
 fn display(id: &str, x: f64, y: f64, w: f64, h: f64, scale: f64, primary: bool) -> Display {
     let bounds = LogicalRect::new(LogicalPoint::new(x, y), LogicalSize::new(w, h));
@@ -308,22 +308,121 @@ fn window_mode_enter_selects_the_hovered_window() {
 }
 
 #[test]
-fn too_small_a_drag_is_rejected() {
+fn a_tiny_drag_is_still_a_valid_capture() {
     let mut state = state(SelectionOptions::region());
 
     state.pointer_pressed(LogicalPoint::new(10.0, 10.0));
     state.pointer_moved(LogicalPoint::new(14.0, 15.0));
     state.pointer_released(LogicalPoint::new(14.0, 15.0));
 
-    assert!(state.region().is_none());
     assert_eq!(
-        state.take_announcement().unwrap().0,
-        "Selection too small; minimum is 8 by 8 points"
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(10.0, 10.0),
+            LogicalSize::new(4.0, 5.0)
+        ))
     );
 }
 
 #[test]
-fn crossing_a_dpi_boundary_keeps_the_gesture_display_and_scale() {
+fn a_one_axis_drag_expands_to_one_physical_pixel() {
+    let mut state = state(SelectionOptions::region());
+
+    state.pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    state.pointer_moved(LogicalPoint::new(120.0, 20.0));
+    state.pointer_released(LogicalPoint::new(120.0, 20.0));
+
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(20.0, 20.0),
+            LogicalSize::new(100.0, 0.5)
+        ))
+    );
+    assert!(state.commit().is_some());
+}
+
+#[test]
+fn shift_axis_lock_is_live_and_reversible_mid_drag() {
+    let mut state = state(SelectionOptions::region());
+    state.pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    state.pointer_moved(LogicalPoint::new(120.0, 80.0));
+
+    state.set_drag_modifiers(DragModifiers {
+        shift: true,
+        ..DragModifiers::default()
+    });
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(20.0, 20.0),
+            LogicalSize::new(100.0, 0.5)
+        ))
+    );
+
+    state.set_drag_modifiers(DragModifiers::default());
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(20.0, 20.0),
+            LogicalSize::new(100.0, 60.0)
+        ))
+    );
+}
+
+#[test]
+fn option_alt_grows_the_selection_from_its_center() {
+    let mut state = state(SelectionOptions::region());
+    state.set_drag_modifiers(DragModifiers {
+        alt: true,
+        ..DragModifiers::default()
+    });
+    state.pointer_pressed(LogicalPoint::new(100.0, 100.0));
+    state.pointer_moved(LogicalPoint::new(120.0, 130.0));
+
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(80.0, 70.0),
+            LogicalSize::new(40.0, 60.0)
+        ))
+    );
+}
+
+#[test]
+fn space_moves_the_region_and_shift_constrains_that_movement() {
+    let mut state = state(SelectionOptions::region());
+    state.pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    state.pointer_moved(LogicalPoint::new(120.0, 80.0));
+    state.set_drag_modifiers(DragModifiers {
+        space: true,
+        ..DragModifiers::default()
+    });
+    state.pointer_moved(LogicalPoint::new(150.0, 100.0));
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(50.0, 40.0),
+            LogicalSize::new(100.0, 60.0)
+        ))
+    );
+
+    state.set_drag_modifiers(DragModifiers {
+        shift: true,
+        space: true,
+        ..DragModifiers::default()
+    });
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(50.0, 20.0),
+            LogicalSize::new(100.0, 60.0)
+        ))
+    );
+}
+
+#[test]
+fn crossing_a_dpi_boundary_produces_one_cross_display_region() {
     let mut state = state_with_windows(
         SelectionOptions::region(),
         vec![
@@ -337,14 +436,14 @@ fn crossing_a_dpi_boundary_keeps_the_gesture_display_and_scale() {
     state.pointer_moved(LogicalPoint::new(520.0, 180.0));
     state.pointer_released(LogicalPoint::new(520.0, 180.0));
 
-    let outcome = state.commit().expect("the clamped region should commit");
-    assert_eq!(outcome.display, Some(DisplayId("left".to_owned())));
-    assert_eq!(outcome.scale, ScaleFactor::new(2.0));
+    let outcome = state.commit().expect("the spanning region should commit");
+    assert_eq!(outcome.display, None);
+    assert_eq!(outcome.scale, ScaleFactor::IDENTITY);
     assert_eq!(
         outcome.rect.unwrap(),
         LogicalRect::new(
             LogicalPoint::new(350.0, 80.0),
-            LogicalSize::new(50.0, 100.0)
+            LogicalSize::new(170.0, 100.0)
         )
     );
 }
@@ -569,7 +668,7 @@ fn minimum_corner_resize_keeps_the_opposite_corner_fixed() {
 
     assert_eq!(
         state.region().unwrap(),
-        LogicalRect::new(LogicalPoint::new(142.0, 122.0), LogicalSize::new(8.0, 8.0))
+        LogicalRect::new(LogicalPoint::new(149.0, 129.0), LogicalSize::new(1.0, 1.0))
     );
 }
 
@@ -589,7 +688,7 @@ fn corner_resize_does_not_reverse_after_crossing_the_fixed_corner() {
 
     assert_eq!(
         state.region().unwrap(),
-        LogicalRect::new(LogicalPoint::new(142.0, 122.0), LogicalSize::new(8.0, 8.0))
+        LogicalRect::new(LogicalPoint::new(149.5, 129.5), LogicalSize::new(0.5, 0.5))
     );
 }
 

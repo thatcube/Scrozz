@@ -7,16 +7,13 @@ use super::frozen::{FrozenDisplayFrame, FrozenPixel};
 pub struct MagnifierConfig {
     /// Physical pixels per magnified pixel.
     pub zoom: u32,
-    /// Radius of sampled pixels around the focus point.
-    pub radius: usize,
+    /// Number of sampled source pixels on each side.
+    pub side: usize,
 }
 
 impl Default for MagnifierConfig {
     fn default() -> Self {
-        Self {
-            zoom: 8,
-            radius: 12,
-        }
+        Self { zoom: 5, side: 32 }
     }
 }
 
@@ -52,7 +49,8 @@ impl MagnifierGrid {
     /// The centre cell index.
     #[must_use]
     pub fn centre_index(&self) -> usize {
-        self.side * self.side / 2
+        let centre = self.side / 2;
+        centre * self.side + centre
     }
 
     /// The centre sampled cell.
@@ -70,12 +68,13 @@ pub fn sample(
     config: MagnifierConfig,
 ) -> MagnifierGrid {
     let (focus_x, focus_y) = super::geom::logical_to_local_physical(&frame.display, point);
-    let side = config.radius * 2 + 1;
+    let side = config.side.max(1);
+    let half = side / 2;
     let mut cells = Vec::with_capacity(side * side);
     for dy in 0..side {
         for dx in 0..side {
-            let px = focus_x as i64 + dx as i64 - config.radius as i64;
-            let py = focus_y as i64 + dy as i64 - config.radius as i64;
+            let px = focus_x as i64 + dx as i64 - half as i64;
+            let py = focus_y as i64 + dy as i64 - half as i64;
             let px = px.clamp(0, frame.width().saturating_sub(1) as i64) as u32;
             let py = py.clamp(0, frame.height().saturating_sub(1) as i64) as u32;
             cells.push(MagnifierCell {
