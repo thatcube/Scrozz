@@ -395,6 +395,40 @@ impl App {
         Tick::Continue
     }
 
+    /// Steps the global hotkeys aside while a window owns the keyboard.
+    ///
+    /// The annotation editor binds ⌘C, ⌘S, ⌘Z and the rest, and the user can
+    /// bind any of those to a capture as well. Whoever registered first would
+    /// otherwise win, which is not something a user can reason about — so while
+    /// the editor is up, the global keys stand down and the editor's own
+    /// accelerators are the only ones that fire.
+    ///
+    /// Reserving a fixed list here instead would be wrong twice over: the
+    /// editor's accelerators are not the only ones that can collide, and the
+    /// capture shortcuts are configurable, so the collision set is not known
+    /// until runtime. Suspending the whole set is the only rule that stays true
+    /// whatever either side is bound to.
+    ///
+    /// The bindings themselves are untouched, so the menu-bar item keeps
+    /// showing the right shortcut beside each command throughout.
+    pub fn set_hotkeys_suspended(&mut self, suspended: bool) {
+        if suspended == self.hotkeys.is_suspended() {
+            return;
+        }
+        if suspended {
+            self.hotkeys.suspend();
+        } else {
+            self.hotkeys.resume();
+        }
+        tracing::debug!(suspended, "global hotkeys");
+    }
+
+    /// Whether the global hotkeys are currently stood down.
+    #[must_use]
+    pub const fn hotkeys_suspended(&self) -> bool {
+        self.hotkeys.is_suspended()
+    }
+
     fn drain_hotkeys(&mut self) {
         let mut pending = Vec::new();
         while let Some(event) = self.hotkeys.poll() {
@@ -749,6 +783,58 @@ mod tests {
         )
         .expect("a sealed app must start");
         (app, handle)
+    }
+
+    #[test]
+    fn a_new_app_has_its_hotkeys_live() {
+        let (app, _) = app();
+        assert!(!app.hotkeys_suspended());
+    }
+
+    #[test]
+    fn opening_the_editor_stands_the_hotkeys_down() {
+        let (mut app, _) = app();
+
+        app.set_hotkeys_suspended(true);
+        assert!(
+            app.hotkeys_suspended(),
+            "the editor's own accelerators must be the only ones that fire"
+        );
+
+        app.set_hotkeys_suspended(false);
+        assert!(
+            !app.hotkeys_suspended(),
+            "closing the editor gives the capture shortcuts back"
+        );
+    }
+
+    #[test]
+    fn the_editor_lifecycle_is_idempotent() {
+        let (mut app, _) = app();
+
+        // A per-frame sync calls this with the same answer over and over.
+        for _ in 0..3 {
+            app.set_hotkeys_suspended(true);
+        }
+        assert!(app.hotkeys_suspended());
+        for _ in 0..3 {
+            app.set_hotkeys_suspended(false);
+        }
+        assert!(!app.hotkeys_suspended());
+    }
+
+    #[test]
+    fn suspension_does_not_disturb_the_configuration() {
+        let (mut app, _) = app();
+        let before = app.config.bindings.len();
+
+        app.set_hotkeys_suspended(true);
+
+        assert_eq!(
+            app.config.bindings.len(),
+            before,
+            "the configured shortcuts are what the tray and settings read"
+        );
     }
 
     #[test]

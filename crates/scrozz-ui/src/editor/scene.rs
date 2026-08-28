@@ -83,7 +83,8 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
 fn sample_document(fixture: &Fixture, seed: u64) -> Document {
     let (w, h) = (
         f64::from(fixture.size_pt.0).max(320.0),
-        f64::from(fixture.size_pt.1).max(240.0) - f64::from(super::toolbar::HEIGHT),
+        f64::from(fixture.size_pt.1).max(240.0)
+            - f64::from(super::toolbar::height_for(fixture.size_pt.0)),
     );
     let size = LogicalSize::new(w, h);
     let mut document = Document::new(synthetic_capture(size, seed));

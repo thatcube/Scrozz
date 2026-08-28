@@ -11,7 +11,9 @@ use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
-use scrozz_ui::editor::{Command, EditorUi, Tool, fit, rect_to_screen, to_document, to_screen};
+use scrozz_ui::editor::{
+    Command, EditorUi, Tool, fit, rect_to_screen, to_document, to_screen, toolbar,
+};
 
 const W: u32 = 800;
 const H: u32 = 600;
@@ -500,4 +502,86 @@ fn a_document_carrying_every_annotation_kind_exports() {
     let rendered = EditorUi::new(document).render().expect("render");
     assert_eq!(rendered.width(), W);
     assert_eq!(rendered.height(), H);
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar layout
+// ---------------------------------------------------------------------------
+
+/// A toolbar rect `width` points across, as the editor would allocate it.
+fn bar(width: f32) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2(width, toolbar::height_for(width)),
+    )
+}
+
+#[test]
+fn the_toolbar_never_overlaps_itself_at_any_allowed_width() {
+    // Every width the editor window can be, plus a margin either side of the
+    // wrap threshold where an off-by-one would hide.
+    let mut width = toolbar::WRAPPED_W;
+    while width <= 3000.0 {
+        let bar = bar(width);
+        assert!(
+            toolbar::actions_left(bar) >= toolbar::controls_right(bar),
+            "controls ran under the actions at {width}pt: {} > {}",
+            toolbar::controls_right(bar),
+            toolbar::actions_left(bar)
+        );
+        width += 1.0;
+    }
+}
+
+#[test]
+fn the_editor_window_is_never_allowed_to_be_narrower_than_the_toolbar() {
+    // A const block, so a regression is a compile error rather than a failure
+    // someone has to run the suite to see.
+    const {
+        assert!(
+            scrozz_ui::editor::MIN_WINDOW_SIZE[0] >= toolbar::WRAPPED_W,
+            "the window can be dragged narrower than its own toolbar"
+        );
+    }
+}
+
+#[test]
+fn the_toolbar_wraps_rather_than_overlapping_when_it_runs_out_of_room() {
+    assert_eq!(
+        toolbar::height_for(toolbar::SINGLE_ROW_W),
+        toolbar::HEIGHT,
+        "a bar wide enough for one row still wrapped"
+    );
+    assert_eq!(
+        toolbar::height_for(toolbar::SINGLE_ROW_W - 1.0),
+        toolbar::HEIGHT_WRAPPED,
+        "the bar failed to wrap one point below its natural width"
+    );
+}
+
+#[test]
+fn wrapping_puts_the_tools_on_their_own_row() {
+    let narrow = bar(toolbar::WRAPPED_W);
+    let (tools, controls) = toolbar::rows(narrow);
+    assert!(tools < controls, "the rows did not separate");
+    assert!(
+        controls + 20.0 <= narrow.bottom(),
+        "the second row hangs out of the bar"
+    );
+
+    let wide = bar(toolbar::SINGLE_ROW_W + 200.0);
+    let (tools, controls) = toolbar::rows(wide);
+    assert!(
+        (tools - controls).abs() < f32::EPSILON,
+        "a wide bar wrapped anyway"
+    );
+}
+
+#[test]
+fn a_wrapped_toolbar_still_leaves_the_canvas_most_of_the_window() {
+    let height = toolbar::height_for(toolbar::WRAPPED_W);
+    assert!(
+        height < 400.0 / 3.0,
+        "the toolbar ate a third of the shortest allowed window"
+    );
 }

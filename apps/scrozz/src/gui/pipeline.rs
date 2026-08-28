@@ -34,8 +34,8 @@ use std::{
 
 use scrozz_annotate::Document;
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
-    SelectionMode, SelectionOptions,
+    Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError, Frame,
+    Provenance, ScaleFactor, SelectionMode, SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
@@ -214,6 +214,20 @@ struct Cached {
     provenance: Provenance,
     /// What was aimed at, for the same reason.
     target: CaptureTarget,
+    /// The display scale the pixels were captured at.
+    ///
+    /// A PNG has no notion of backing scale, so `decode` can only return
+    /// `IDENTITY`. Restoring the original matters because every logical
+    /// coordinate in the editor is derived from it: reopening a Retina capture
+    /// at 1.0 would double every annotation's apparent size and export at the
+    /// wrong resolution.
+    scale: ScaleFactor,
+    /// How the samples should be interpreted.
+    ///
+    /// `decode` reports `Unknown` for the same reason — the encoder does not
+    /// round-trip a colour profile — and a capture that was known to be
+    /// Display P3 must not silently become unlabelled on its way to the editor.
+    color_space: ColorSpace,
 }
 
 struct Worker {
@@ -392,6 +406,8 @@ impl Worker {
                 bytes,
                 provenance: capture.provenance,
                 target: capture.target.clone(),
+                scale: capture.frame.scale,
+                color_space: capture.frame.color_space,
             },
         );
 
@@ -449,7 +465,12 @@ impl Worker {
     /// holds rather than guess.
     fn open(&mut self, card: CardId) {
         let decoded = self.cached(card, "open").and_then(|cached| {
-            let frame = scrozz_export::decode(&cached.bytes)?;
+            let mut frame = scrozz_export::decode(&cached.bytes)?;
+            // The PNG carries neither of these, so `decode` returns identity
+            // and `Unknown`. Put the capture's own metadata back rather than
+            // letting a round trip through the cache quietly rescale it.
+            frame.scale = cached.scale;
+            frame.color_space = cached.color_space;
             Ok(Capture {
                 frame,
                 provenance: cached.provenance,
@@ -602,6 +623,106 @@ mod tests {
             .expect("a one pixel frame should encode")
     }
 
+    fn two_by_two_png() -> Vec<u8> {
+        let frame = Frame {
+            data: vec![255; 16],
+            size: scrozz_core::PhysicalSize::new(2.0, 2.0),
+            stride: 8,
+            format: scrozz_core::PixelFormat::Rgba8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::new(2.0),
+        };
+        FrameEncoder::new()
+            .encode(&frame, ImageFormat::Png)
+            .expect("a two by two frame should encode")
+    }
+
+    #[test]
+    fn opening_a_capture_restores_the_scale_the_png_could_not_carry() {
+        // A PNG has no backing-scale field, so `decode` can only return
+        // identity. If the cache did not remember the real one, reopening a
+        // Retina capture would halve its logical size: every annotation would
+        // land at twice its intended scale and the export would come out at
+        // the wrong resolution. This is why the metadata rides alongside the
+        // bytes rather than being re-derived from them.
+        let card = CardId(1);
+        let (mut worker, inbox) = worker_holding(
+            card,
+            Cached {
+                bytes: one_pixel_png(),
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::new(2.0),
+                color_space: ColorSpace::DisplayP3,
+            },
+        );
+        worker.open(card);
+
+        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+            panic!("opening a cached card should produce a capture");
+        };
+        assert!(
+            (capture.frame.scale.get() - 2.0).abs() < f64::EPSILON,
+            "the capture's own scale should survive the cache, not decode's identity"
+        );
+        assert_eq!(
+            capture.frame.color_space,
+            ColorSpace::DisplayP3,
+            "a wide-gamut capture must not become unlabelled on the way to the editor"
+        );
+    }
+
+    #[test]
+    fn a_restored_scale_gives_the_editor_the_right_logical_size() {
+        // The consequence, stated as the thing that actually matters: logical
+        // geometry is physical size divided by scale, and the editor lays every
+        // annotation out in logical coordinates.
+        let card = CardId(1);
+        let (mut worker, inbox) = worker_holding(
+            card,
+            Cached {
+                bytes: two_by_two_png(),
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::new(2.0),
+                color_space: ColorSpace::Srgb,
+            },
+        );
+        worker.open(card);
+
+        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+            panic!("opening a cached card should produce a capture");
+        };
+        let logical = f64::from(capture.frame.width()) / capture.frame.scale.get();
+        assert!(
+            (logical - 1.0).abs() < f64::EPSILON,
+            "a 2x2 physical capture at 2.0 scale is 1x1 logical, not 2x2"
+        );
+    }
+
+    #[test]
+    fn an_unknown_colour_space_is_preserved_as_unknown() {
+        // The cache restores what it was told, including the absence of a
+        // profile. It must not upgrade `Unknown` to `Srgb` on the way through.
+        let card = CardId(1);
+        let (mut worker, inbox) = worker_holding(
+            card,
+            Cached {
+                bytes: one_pixel_png(),
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::IDENTITY,
+                color_space: ColorSpace::Unknown,
+            },
+        );
+        worker.open(card);
+
+        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+            panic!("opening a cached card should produce a capture");
+        };
+        assert_eq!(capture.frame.color_space, ColorSpace::Unknown);
+    }
+
     #[test]
     fn opening_a_window_capture_keeps_it_a_window_capture() {
         // D9: a window capture may not be beautified. The editor rebuilds its
@@ -615,6 +736,8 @@ mod tests {
                 bytes: one_pixel_png(),
                 provenance: Provenance::Window,
                 target: CaptureTarget::Window(scrozz_core::WindowId("test-window".to_owned())),
+                scale: ScaleFactor::IDENTITY,
+                color_space: ColorSpace::Srgb,
             },
         );
         worker.open(card);
@@ -642,6 +765,8 @@ mod tests {
                 bytes: one_pixel_png(),
                 provenance: Provenance::Region,
                 target: CaptureTarget::Region(bounds),
+                scale: ScaleFactor::IDENTITY,
+                color_space: ColorSpace::Srgb,
             },
         );
         worker.open(card);
@@ -661,6 +786,8 @@ mod tests {
                 bytes: one_pixel_png(),
                 provenance: Provenance::Region,
                 target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::IDENTITY,
+                color_space: ColorSpace::Srgb,
             },
         );
         worker.open(CardId(9));

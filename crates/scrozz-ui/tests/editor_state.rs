@@ -11,7 +11,9 @@ use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
-use scrozz_ui::editor::{Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_ZOOM, Tool};
+use scrozz_ui::editor::{
+    Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_ZOOM, TextEdit, Tool,
+};
 
 /// A flat capture, 400x300 logical at 2x, big enough that the minimum-size
 /// clamp never fires by accident on the drags these tests perform.
@@ -1060,4 +1062,371 @@ fn a_size_the_editor_reports_matches_what_it_would_render() {
     let cropped = state.document().content_size();
     assert!((cropped.width - 160.0).abs() < 1.0, "{cropped:?}");
     assert!((cropped.height - 140.0).abs() < 1.0, "{cropped:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Text entry
+// ---------------------------------------------------------------------------
+
+/// Opens a text annotation and returns the state with the caret ready.
+fn typing() -> EditorState {
+    let mut state = state();
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(80.0, 80.0));
+    state.pointer_released();
+    state
+}
+
+/// The content of the one text annotation, as the document holds it.
+fn content(state: &EditorState) -> String {
+    match &state.document().annotations()[0].annotation {
+        Annotation::Text { content, .. } => content.clone(),
+        other => panic!("expected text, found {other:?}"),
+    }
+}
+
+fn type_str(state: &mut EditorState, text: &str) {
+    for ch in text.chars() {
+        state.text_edit(&TextEdit::Insert(ch.to_string()));
+    }
+}
+
+#[test]
+fn typing_characters_appends_them_in_order() {
+    let mut state = typing();
+    type_str(&mut state, "Ship");
+
+    assert_eq!(content(&state), "Ship");
+    assert_eq!(state.text_caret(), 4);
+}
+
+#[test]
+fn backspace_removes_the_character_before_the_caret() {
+    let mut state = typing();
+    type_str(&mut state, "Shipp");
+    state.text_edit(&TextEdit::Backspace);
+
+    assert_eq!(content(&state), "Ship");
+    assert_eq!(state.text_caret(), 4);
+}
+
+#[test]
+fn backspace_on_an_empty_field_is_harmless() {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Backspace);
+
+    assert_eq!(content(&state), "");
+    assert_eq!(state.text_caret(), 0);
+}
+
+#[test]
+fn typing_inserts_at_the_caret_rather_than_the_end() {
+    let mut state = typing();
+    type_str(&mut state, "Shp");
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    state.text_edit(&TextEdit::Insert("i".to_owned()));
+
+    assert_eq!(content(&state), "Ship");
+    assert_eq!(state.text_caret(), 3);
+}
+
+#[test]
+fn backspace_steps_over_a_whole_multibyte_character() {
+    let mut state = typing();
+    type_str(&mut state, "aé");
+    assert_eq!(state.text_caret(), 3, "é is two bytes");
+    state.text_edit(&TextEdit::Backspace);
+
+    assert_eq!(content(&state), "a");
+    assert_eq!(state.text_caret(), 1);
+}
+
+#[test]
+fn forward_delete_removes_the_character_after_the_caret() {
+    let mut state = typing();
+    type_str(&mut state, "Ship");
+    state.text_edit(&TextEdit::Caret(Caret::LineStart));
+    state.text_edit(&TextEdit::DeleteForward);
+
+    assert_eq!(content(&state), "hip");
+    assert_eq!(state.text_caret(), 0);
+}
+
+#[test]
+fn the_caret_stops_at_both_ends_rather_than_wrapping() {
+    let mut state = typing();
+    type_str(&mut state, "ab");
+    state.text_edit(&TextEdit::Caret(Caret::Right));
+    assert_eq!(state.text_caret(), 2);
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    assert_eq!(state.text_caret(), 0);
+}
+
+#[test]
+fn home_and_end_work_on_the_current_line_only() {
+    let mut state = typing();
+    type_str(&mut state, "one\ntwo");
+    state.text_edit(&TextEdit::Caret(Caret::LineStart));
+    assert_eq!(state.text_caret(), 4, "home left the second line");
+    state.text_edit(&TextEdit::Caret(Caret::LineEnd));
+    assert_eq!(state.text_caret(), 7);
+}
+
+#[test]
+fn moving_up_a_line_clamps_to_the_shorter_line() {
+    let mut state = typing();
+    type_str(&mut state, "ab\nlonger");
+    state.text_edit(&TextEdit::Caret(Caret::Up));
+
+    assert_eq!(
+        state.text_caret_cell(),
+        Some((0, 2)),
+        "overshot the short line"
+    );
+}
+
+#[test]
+fn the_caret_cell_tracks_rows_and_columns_for_drawing() {
+    let mut state = typing();
+    type_str(&mut state, "ab\ncd");
+
+    assert_eq!(state.text_caret_cell(), Some((1, 2)));
+    state.text_edit(&TextEdit::Caret(Caret::Up));
+    assert_eq!(state.text_caret_cell(), Some((0, 2)));
+}
+
+#[test]
+fn an_ime_composition_shows_in_the_document_before_it_is_committed() {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Preedit("に".to_owned()));
+
+    assert_eq!(content(&state), "に", "composition must be visible");
+    assert!(state.preedit().is_some(), "composition was not tracked");
+}
+
+#[test]
+fn a_longer_composition_replaces_the_shorter_one() {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Preedit("に".to_owned()));
+    state.text_edit(&TextEdit::Preedit("にほん".to_owned()));
+
+    assert_eq!(content(&state), "にほん", "compositions accumulated");
+}
+
+#[test]
+fn committing_a_composition_leaves_the_text_and_clears_the_range() {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Preedit("にほん".to_owned()));
+    state.text_edit(&TextEdit::Insert("日本".to_owned()));
+
+    assert_eq!(content(&state), "日本");
+    assert_eq!(state.preedit(), None);
+    assert_eq!(state.text_caret(), "日本".len());
+}
+
+#[test]
+fn a_dismissed_composition_removes_its_own_glyphs() {
+    let mut state = typing();
+    type_str(&mut state, "a");
+    state.text_edit(&TextEdit::Preedit("にほん".to_owned()));
+    state.text_edit(&TextEdit::Preedit(String::new()));
+
+    assert_eq!(content(&state), "a");
+    assert_eq!(state.preedit(), None);
+}
+
+#[test]
+fn typing_around_a_composition_keeps_it_anchored() {
+    let mut state = typing();
+    type_str(&mut state, "ab");
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    state.text_edit(&TextEdit::Preedit("ん".to_owned()));
+
+    assert_eq!(
+        content(&state),
+        "aんb",
+        "composition landed at the wrong end"
+    );
+}
+
+#[test]
+fn leaving_the_field_keeps_a_composition_the_user_can_see() {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Preedit("にほん".to_owned()));
+    state.finish_text();
+
+    assert_eq!(state.document().annotations().len(), 1);
+    assert_eq!(content(&state), "にほん");
+    assert_eq!(state.preedit(), None);
+}
+
+#[test]
+fn a_stray_keystroke_after_committing_does_not_reopen_the_label() {
+    let mut state = typing();
+    type_str(&mut state, "done");
+    state.finish_text();
+    state.text_edit(&TextEdit::Insert("x".to_owned()));
+
+    assert_eq!(
+        content(&state),
+        "done",
+        "text arrived after the field closed"
+    );
+    assert_eq!(state.editing_text(), None);
+}
+
+#[test]
+fn typing_then_undo_restores_the_text_in_one_step() {
+    let mut state = typing();
+    type_str(&mut state, "Ship it");
+    state.finish_text();
+    state.command(Command::Undo).expect("undo");
+
+    assert!(
+        state.document().annotations().is_empty(),
+        "undo left half a label behind"
+    );
+}
+
+#[test]
+fn replacing_the_whole_buffer_leaves_the_caret_somewhere_valid() {
+    let mut state = typing();
+    type_str(&mut state, "a long label");
+    state.set_text_buffer("hi");
+
+    assert!(state.text_caret() <= 2, "caret dangled past the end");
+    assert_eq!(state.text_caret_cell(), Some((0, state.text_caret())));
+}
+
+// ---------------------------------------------------------------------------
+// Zoom-invariant hit tolerance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_grab_radius_is_the_same_on_screen_at_every_zoom() {
+    let mut state = state();
+    let fit = {
+        state.set_view_scale(0.25);
+        state.handle_tolerance()
+    };
+    state.set_view_scale(4.0);
+    let close = state.handle_tolerance();
+
+    // A tolerance measured on screen is a document distance divided by the
+    // scale, so the product is what must stay constant.
+    assert!(
+        (fit * 0.25 - close * 4.0).abs() < 1e-9,
+        "grab radius changed with zoom: {fit} vs {close}"
+    );
+}
+
+#[test]
+fn a_handle_is_grabbable_when_the_capture_is_zoomed_far_out() {
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(100.0, 100.0), at(200.0, 180.0));
+    // Fitting a large capture into a small window: one document unit is a
+    // quarter of a point, so a click 20 units away is 5pt away on screen.
+    state.set_view_scale(0.25);
+
+    assert_eq!(
+        state.handle_at(at(220.0, 180.0)),
+        Some(Handle::BottomRight),
+        "the corner was unreachable at fit zoom"
+    );
+}
+
+#[test]
+fn a_handle_does_not_swallow_distant_clicks_when_zoomed_in() {
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(100.0, 100.0), at(200.0, 180.0));
+    state.set_view_scale(4.0);
+
+    // At 4x, 5 document units is 20pt away: well outside any sane handle.
+    assert_eq!(
+        state.handle_at(at(205.0, 180.0)),
+        None,
+        "the handle grabbed a click 20pt away"
+    );
+    assert_eq!(
+        state.handle_at(at(201.0, 180.0)),
+        Some(Handle::BottomRight),
+        "the handle became unusably small when zoomed in"
+    );
+}
+
+#[test]
+fn an_impossible_view_scale_is_ignored_rather_than_dividing_by_zero() {
+    let mut state = state();
+    state.set_view_scale(2.0);
+    state.set_view_scale(0.0);
+    state.set_view_scale(f64::NAN);
+
+    assert!((state.view_scale() - 2.0).abs() < f64::EPSILON);
+    assert!(state.handle_tolerance().is_finite());
+}
+
+// ---------------------------------------------------------------------------
+// Render revision versus viewport revision
+// ---------------------------------------------------------------------------
+
+#[test]
+fn panning_does_not_invalidate_the_rendered_preview() {
+    let mut state = state();
+    let render = state.revision();
+    let view = state.view_revision();
+
+    state.set_pan((40.0, 12.0));
+
+    assert_eq!(
+        state.revision(),
+        render,
+        "a pan re-rasterised the whole capture"
+    );
+    assert!(state.view_revision() > view, "the pan was not observed");
+}
+
+#[test]
+fn zooming_does_not_invalidate_the_rendered_preview() {
+    let mut state = state();
+    let render = state.revision();
+
+    state.set_zoom(2.0);
+
+    assert_eq!(state.revision(), render, "a zoom re-rasterised the capture");
+    assert!(state.view_revision() > 0);
+}
+
+#[test]
+fn panning_to_where_it_already_is_changes_nothing() {
+    let mut state = state();
+    state.set_pan((10.0, 10.0));
+    let view = state.view_revision();
+    state.set_pan((10.0, 10.0));
+
+    assert_eq!(
+        state.view_revision(),
+        view,
+        "an idle drag woke the viewport every frame"
+    );
+}
+
+#[test]
+fn editing_the_document_does_invalidate_the_rendered_preview() {
+    let mut state = state();
+    let render = state.revision();
+    let view = state.view_revision();
+
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(10.0, 10.0), at(90.0, 90.0));
+
+    assert!(state.revision() > render, "a new shape did not redraw");
+    assert_eq!(
+        state.view_revision(),
+        view,
+        "drawing moved the viewport as a side effect"
+    );
 }

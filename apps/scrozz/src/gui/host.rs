@@ -470,8 +470,21 @@ impl Driver {
     /// to distinguish from never having closed. Nothing is written back to the
     /// card: per D14 a capture's own pixels are never replaced by an annotated
     /// version unless the user explicitly saves one.
+    ///
+    /// **Known gap.** D14 also promises that history persists the editable
+    /// document, so a past capture reopens with its annotations intact. That
+    /// half is not built: closing this window discards the scene graph, and
+    /// reopening the card starts from the original pixels. There is no
+    /// dirty-state guard on the way out either, because a warning that offers
+    /// no way to keep the work is just an obstacle. Both wait on the storage
+    /// format decision D14 deliberately left open, which is a product call, not
+    /// something to invent here.
     fn show_editor(&mut self, ctx: &egui::Context) {
         use scrozz_ui::editor::Intent;
+
+        // Tied to the viewport's lifetime rather than to `editing`, so the keys
+        // come back even if the document is torn down by some other path.
+        self.app.set_hotkeys_suspended(self.editor.is_open());
 
         let Some((card, editor)) = self.editing.as_mut() else {
             return;

@@ -15,9 +15,9 @@
 //! renderer makes "what you see" and "what you export" the same code path by
 //! construction rather than by discipline.
 
-use egui::{Color32, CursorIcon, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use scrozz_annotate::SkiaRenderer;
-use scrozz_core::{LogicalRect, ScaleFactor};
+use egui::{Color32, CursorIcon, Painter, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use scrozz_annotate::{Annotation, SkiaRenderer, font};
+use scrozz_core::{LogicalPoint, LogicalRect, ScaleFactor};
 
 use crate::paint::{Surface, focus_ring};
 use crate::theme::{Palette, Radius, Space, corner};
@@ -160,6 +160,10 @@ pub fn draw_canvas(
         content,
         hovered: false,
     };
+    // Hand the layout back to the state so screen-space hit tolerances survive
+    // zoom. Done before `gestures` so the very first press of a frame is judged
+    // against the scale that frame is actually drawn at.
+    state.set_view_scale(f64::from(view.scale()));
 
     let target_px = preview_width(image, ui.ctx().pixels_per_point());
     if let Some(texture) = preview.texture(ui.ctx(), state, target_px) {
@@ -189,8 +193,70 @@ pub fn draw_canvas(
     let chrome = ui.painter_at(area);
     draw_crop_scrim(&chrome, state, &view, palette);
     draw_selection(&chrome, state, &view, palette);
+    draw_caret(ui, &chrome, state, &view, palette);
     cursor(ui, state, &response);
     view
+}
+
+/// Draws the text caret and tells the platform where to put its IME window.
+///
+/// Publishing [`IMEOutput`](egui::output::IMEOutput) is what makes `egui_winit`
+/// call `set_ime_allowed(true)`, so this is not merely cosmetic: without it the
+/// OS never starts a composition and CJK input is impossible.
+fn draw_caret(
+    ui: &Ui,
+    painter: &Painter,
+    state: &EditorState,
+    view: &CanvasView,
+    palette: &Palette,
+) {
+    let Some(id) = state.editing_text() else {
+        return;
+    };
+    let Some((row, column)) = state.text_caret_cell() else {
+        return;
+    };
+    let Some(object) = state.document().annotations().iter().find(|o| o.id == id) else {
+        return;
+    };
+    let Annotation::Text { at, .. } = &object.annotation else {
+        return;
+    };
+    let size = object.style.effective_font_size();
+    // The built-in font is monospaced, so the caret's column is an exact
+    // multiple of the advance; no shaping pass is needed to place it.
+    let x = at.x + column as f64 * font::ADVANCE * size;
+    let y = at.y + row as f64 * font::LINE_HEIGHT * size;
+    let top = super::to_screen(LogicalPoint::new(x, y), view.image, view.content);
+    let bottom = super::to_screen(LogicalPoint::new(x, y + size), view.image, view.content);
+    let caret = Rect::from_min_max(top, bottom);
+
+    // Blink on the same cadence as the rest of the system, and keep the frame
+    // loop alive so it actually blinks while the pointer is still.
+    let blink = 1.06;
+    let phase = ui.input(|i| i.time).rem_euclid(blink);
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(
+            ((blink - phase) * 1000.0).max(16.0) as u64,
+        ));
+    if phase < blink / 2.0 {
+        painter.rect_filled(
+            Rect::from_min_max(caret.min, caret.max + egui::vec2(1.5, 0.0)),
+            corner(0.0),
+            palette.accent,
+        );
+    }
+
+    ui.ctx().output_mut(|out| {
+        out.ime = Some(egui::output::IMEOutput {
+            rect: caret.expand(2.0),
+            cursor_rect: caret,
+            purpose: egui::IMEPurpose::Normal,
+            // The caret only ever moves here by the user's own action, so a
+            // composition in flight is never stale enough to need interrupting.
+            should_interrupt_composition: false,
+        });
+    });
 }
 
 /// The width, in pixels, the preview should be rendered at.

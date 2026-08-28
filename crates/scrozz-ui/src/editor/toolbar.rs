@@ -17,14 +17,112 @@ use crate::theme::{Radius, Space, corner};
 use super::paint::CanvasView;
 use super::state::{EditorState, Intent, Tool};
 
-/// The toolbar's height, in points.
-pub const HEIGHT: f32 = 52.0;
+/// The height of one row of controls, in points.
+const ROW: f32 = 40.0;
+
+/// The toolbar's height when everything fits on one row, in points.
+pub const HEIGHT: f32 = ROW + Space::MD;
+
+/// The toolbar's height when its controls wrap onto a second row.
+pub const HEIGHT_WRAPPED: f32 = ROW * 2.0 + Space::MD;
 
 /// A tool or action button's side, in points.
 const BUTTON: f32 = 30.0;
 
 /// A colour swatch's side, in points.
 const SWATCH: f32 = 18.0;
+
+/// The stroke-width slider's length, in points.
+const STROKE: f32 = 104.0;
+
+/// The width the tool palette occupies, including its trailing gap.
+const TOOLS_W: f32 = Tool::ALL.len() as f32 * (BUTTON + Space::HAIR);
+
+/// The width the colour swatches occupy, including their trailing gaps.
+const SWATCHES_W: f32 = PALETTE.len() as f32 * (SWATCH + Space::SM);
+
+/// The space a divider needs: the gap before it, and the gap after.
+const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
+
+/// The width of the right-hand action group, at its widest.
+///
+/// Four buttons, plus the crop confirmation that appears while a crop is
+/// pending. Sized for the wide case so the toolbar does not start overlapping
+/// itself the moment the user drags a crop out.
+const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR) + Space::SM + BUTTON;
+
+/// The width the whole toolbar needs to sit on a single row.
+///
+/// Below this the controls wrap, because the alternative — forcing the window
+/// to be this wide — would stop the editor fitting beside anything else on a
+/// laptop display.
+pub const SINGLE_ROW_W: f32 = Space::MD
+    + TOOLS_W
+    + DIVIDER_W
+    + SWATCHES_W
+    + Space::XS
+    + DIVIDER_W
+    + STROKE
+    + Space::MD
+    + ACTIONS_W
+    + Space::MD;
+
+/// The width the controls need once they have wrapped onto two rows.
+///
+/// The wider of the two rows wins: tools on the first, everything else on the
+/// second. This is the real floor under the editor window's minimum width.
+pub const WRAPPED_W: f32 = {
+    let tools = Space::MD + TOOLS_W + Space::MD;
+    let rest =
+        Space::MD + SWATCHES_W + Space::XS + DIVIDER_W + STROKE + Space::MD + ACTIONS_W + Space::MD;
+    if tools > rest { tools } else { rest }
+};
+
+/// How tall the toolbar must be to hold its controls at `width`.
+#[must_use]
+pub fn height_for(width: f32) -> f32 {
+    if width >= SINGLE_ROW_W {
+        HEIGHT
+    } else {
+        HEIGHT_WRAPPED
+    }
+}
+
+/// The vertical centre of each of the toolbar's rows.
+///
+/// One row means both groups share it; two rows put the tools above the
+/// controls. Returned as a pair so the drawing code never has to ask "did we
+/// wrap?" more than once.
+#[must_use]
+pub fn rows(bar: Rect) -> (f32, f32) {
+    if height_for(bar.width()) == HEIGHT {
+        let cy = bar.center().y;
+        (cy, cy)
+    } else {
+        let top = bar.top() + Space::SM + ROW / 2.0;
+        (top, top + ROW)
+    }
+}
+
+/// Where the left-hand controls end, for a bar of this width.
+///
+/// Exposed so a test can prove the two groups never overlap, at any size the
+/// editor window allows.
+#[must_use]
+pub fn controls_right(bar: Rect) -> f32 {
+    let wrapped = height_for(bar.width()) > HEIGHT;
+    let mut x = bar.left() + Space::MD;
+    if !wrapped {
+        x += TOOLS_W + DIVIDER_W;
+    }
+    x + SWATCHES_W + Space::XS + DIVIDER_W + STROKE
+}
+
+/// Where the right-hand action group begins, for a bar of this width.
+#[must_use]
+pub fn actions_left(bar: Rect) -> f32 {
+    bar.right() - Space::MD - ACTIONS_W
+}
 
 pub use super::state::{STROKE_MAX, STROKE_MIN};
 
@@ -83,13 +181,15 @@ pub fn draw(
         egui::Stroke::new(1.0, palette.hairline),
     );
 
+    let (tools_y, cy) = rows(bar);
+    let wrapped = tools_y < cy;
     let mut x = bar.left() + Space::MD;
-    let cy = bar.center().y;
 
-    // Tools.
+    // Tools. On a narrow window they get a row to themselves rather than being
+    // squeezed, dropped behind an overflow menu, or run under the actions.
     let mut picked = None;
     for tool in Tool::ALL {
-        let rect = Rect::from_center_size(pos2(x + BUTTON / 2.0, cy), vec2(BUTTON, BUTTON));
+        let rect = Rect::from_center_size(pos2(x + BUTTON / 2.0, tools_y), vec2(BUTTON, BUTTON));
         let state_flags = ControlState::new().selected(state.tool() == tool);
         let response = icon_button(
             ui,
@@ -113,15 +213,14 @@ pub fn draw(
         state.set_tool(tool);
     }
 
-    x += Space::SM;
-    divider_v(
-        ui.painter(),
-        x,
-        bar.top() + Space::SM,
-        bar.bottom() - Space::SM,
-        palette,
-    );
-    x += Space::SM + Space::XS;
+    if wrapped {
+        // The row break is the separation; a divider as well would be noise.
+        x = bar.left() + Space::MD;
+    } else {
+        x += Space::SM;
+        divider_v(ui.painter(), x, row_top(cy), row_bottom(cy), palette);
+        x += Space::SM + Space::XS;
+    }
 
     // Colour.
     let mut chosen = None;
@@ -147,17 +246,11 @@ pub fn draw(
     }
 
     x += Space::XS;
-    divider_v(
-        ui.painter(),
-        x,
-        bar.top() + Space::SM,
-        bar.bottom() - Space::SM,
-        palette,
-    );
+    divider_v(ui.painter(), x, row_top(cy), row_bottom(cy), palette);
     x += Space::SM + Space::XS;
 
     // Stroke width.
-    let width_rect = Rect::from_center_size(pos2(x + 52.0, cy), vec2(104.0, BUTTON - 4.0));
+    let width_rect = Rect::from_center_size(pos2(x + STROKE / 2.0, cy), vec2(STROKE, BUTTON - 4.0));
     let fraction = width_fraction(state.stroke_width());
     let response = stroke_width(
         ui,
@@ -179,6 +272,11 @@ pub fn draw(
     // Actions, right-aligned. Laid out from the right so the group stays
     // anchored to the window edge as the toolbar grows and shrinks.
     let mut rx = bar.right() - Space::MD - BUTTON;
+    debug_assert!(
+        actions_left(bar) >= controls_right(bar),
+        "the toolbar overlapped itself at {}pt",
+        bar.width()
+    );
     let mut intent = None;
     for (icon, label, action) in [
         (Icon::DeviceFloppy, "Save", Action::Intent(Intent::Save)),
@@ -304,4 +402,14 @@ pub fn draw_style_preview(ui: &Ui, surface: &Surface<'_>, rect: Rect, style: &St
         ],
         egui::Stroke::new(w.clamp(1.0, rect.height() - 4.0), to_egui(style.stroke)),
     );
+}
+
+/// The top of a divider drawn beside the controls on row centred at `cy`.
+fn row_top(cy: f32) -> f32 {
+    cy - ROW / 2.0 + Space::XS
+}
+
+/// The bottom of a divider drawn beside the controls on row centred at `cy`.
+fn row_bottom(cy: f32) -> f32 {
+    cy + ROW / 2.0 - Space::XS
 }

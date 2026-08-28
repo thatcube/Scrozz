@@ -756,3 +756,159 @@ fn the_generated_menu_bar_icon_is_a_well_formed_template_image() {
         "template images must be black with a shaped alpha channel"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Suspending while another window owns the keyboard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_fresh_manager_is_not_suspended() {
+    assert!(!GlobalHotkeys::detached().is_suspended());
+}
+
+#[test]
+fn suspending_keeps_every_binding() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.register(&hotkey("Cmd+Shift+F14"), "capture.window")
+        .expect("a free combination must bind");
+
+    keys.suspend();
+
+    assert!(keys.is_suspended());
+    assert_eq!(
+        keys.bindings().count(),
+        2,
+        "suspending releases the grab, not the configuration"
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region"),
+        "the settings pane and the menu bar still need to know what is bound"
+    );
+}
+
+#[test]
+fn resuming_restores_the_same_bindings() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    keys.suspend();
+    keys.resume();
+
+    assert!(!keys.is_suspended());
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region")
+    );
+}
+
+#[test]
+fn suspending_and_resuming_are_idempotent() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    // Opening the editor twice without closing it, and closing it twice, are
+    // both things a real event loop does.
+    keys.suspend();
+    keys.suspend();
+    assert!(keys.is_suspended());
+
+    keys.resume();
+    keys.resume();
+    assert!(!keys.is_suspended());
+    assert_eq!(keys.bindings().count(), 1);
+}
+
+#[test]
+fn a_suspended_manager_still_reports_conflicts() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    let conflict = keys
+        .check(&hotkey("Cmd+Shift+F13"))
+        .expect("a parseable accelerator")
+        .expect("the combination is taken");
+
+    assert!(
+        matches!(conflict, Conflict::AlreadyBound { ref action } if action == "capture.region"),
+        "settings must not offer a combination that comes back on resume"
+    );
+}
+
+#[test]
+fn a_shortcut_changed_while_suspended_survives_the_resume() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    // The user re-binds capture while the editor is open.
+    keys.unregister(&hotkey("Cmd+Shift+F13"))
+        .expect("the binding exists");
+    keys.register(&hotkey("Cmd+Shift+F15"), "capture.region")
+        .expect("a free combination must bind");
+
+    keys.resume();
+
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        None
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F15").expect("parses")),
+        Some("capture.region"),
+        "the new binding must be the one that comes back"
+    );
+}
+
+#[test]
+fn unregistering_everything_clears_the_suspension() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    keys.unregister_all();
+
+    assert!(
+        !keys.is_suspended(),
+        "a manager with nothing bound has nothing stood down"
+    );
+    assert_eq!(keys.bindings().count(), 0);
+}
+
+#[test]
+fn the_menu_labels_do_not_depend_on_suspension() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    let before: Vec<&str> = menu_model()
+        .iter()
+        .filter_map(|entry| match entry {
+            TrayEntry::Item(action) => Some(action.label()),
+            TrayEntry::Separator => None,
+        })
+        .collect();
+
+    keys.suspend();
+
+    let during: Vec<&str> = menu_model()
+        .iter()
+        .filter_map(|entry| match entry {
+            TrayEntry::Item(action) => Some(action.label()),
+            TrayEntry::Separator => None,
+        })
+        .collect();
+
+    assert_eq!(
+        before, during,
+        "the menu bar must read the same whether or not the editor is up"
+    );
+}

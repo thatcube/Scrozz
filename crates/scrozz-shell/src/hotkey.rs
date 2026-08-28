@@ -870,6 +870,10 @@ pub struct GlobalHotkeys {
     command: String,
     bindings: HashMap<Accelerator, Binding>,
     by_id: HashMap<u32, Accelerator>,
+    /// Whether the OS grabs are released while the bookkeeping stays.
+    ///
+    /// See [`GlobalHotkeys::suspend`].
+    suspended: bool,
 }
 
 impl GlobalHotkeys {
@@ -924,7 +928,67 @@ impl GlobalHotkeys {
             command: "scrozz capture region".to_owned(),
             bindings: HashMap::new(),
             by_id: HashMap::new(),
+            suspended: false,
         }
+    }
+
+    /// Releases every OS grab while keeping the bindings.
+    ///
+    /// This is what an in-app window that owns the keyboard needs. The editor
+    /// binds ⌘C, ⌘S, ⌘Z and anything else the user has configured for it, and
+    /// a global capture hotkey on the same combination would fire underneath —
+    /// so while that window is up, the global keys step aside.
+    ///
+    /// Suspending rather than unregistering matters: the bindings survive, so
+    /// the tray still shows the right shortcut beside each command, the
+    /// settings pane still shows what is bound, and conflict detection still
+    /// works. Only the grab goes away, and only until [`resume`](Self::resume).
+    ///
+    /// Idempotent, so a caller does not have to track whether it already asked.
+    pub fn suspend(&mut self) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        if let Backend::Os(manager) = &self.backend {
+            let keys: Vec<HotKey> = self
+                .bindings
+                .keys()
+                .map(|accelerator| accelerator.to_hotkey())
+                .collect();
+            if !keys.is_empty()
+                && let Err(err) = manager.unregister_all(&keys)
+            {
+                tracing::warn!(%err, "could not suspend the global hotkeys");
+            }
+        }
+    }
+
+    /// Re-grabs everything [`suspend`](Self::suspend) released.
+    ///
+    /// A binding the OS refuses on the way back — because another application
+    /// took the combination while the editor had it released — is kept in the
+    /// bookkeeping and logged, not dropped. Silently deleting a shortcut the
+    /// user configured because of a transient race would be far worse than a
+    /// shortcut that needs re-applying.
+    pub fn resume(&mut self) {
+        if !self.suspended {
+            return;
+        }
+        self.suspended = false;
+        if let Backend::Os(manager) = &self.backend {
+            for accelerator in self.bindings.keys() {
+                if let Err(err) = manager.register(accelerator.to_hotkey()) {
+                    tracing::warn!(%err, %accelerator, "could not restore a global hotkey");
+                }
+            }
+        }
+    }
+
+    /// Whether the OS grabs are currently released.
+    #[must_use]
+    pub const fn is_suspended(&self) -> bool {
+        self.suspended
     }
 
     /// Sets the CLI invocation used in generated compositor config lines.
@@ -1020,6 +1084,9 @@ impl GlobalHotkeys {
     #[must_use]
     pub fn poll(&self) -> Option<HotkeyEvent> {
         while let Ok(raw) = GlobalHotKeyEvent::receiver().try_recv() {
+            if self.suspended {
+                continue;
+            }
             if let Some(event) = self.resolve(raw) {
                 return Some(event);
             }
@@ -1034,6 +1101,9 @@ impl GlobalHotkeys {
     /// feeding *every* consumer in the process for the rest of its life.
     pub fn drain(&self, mut handler: impl FnMut(HotkeyEvent)) {
         while let Ok(raw) = GlobalHotKeyEvent::receiver().try_recv() {
+            if self.suspended {
+                continue;
+            }
             if let Some(event) = self.resolve(raw) {
                 handler(event);
             }
@@ -1071,6 +1141,7 @@ impl GlobalHotkeys {
         }
         self.bindings.clear();
         self.by_id.clear();
+        self.suspended = false;
     }
 }
 
@@ -1096,7 +1167,12 @@ impl HotkeyManager for GlobalHotkeys {
             )));
         }
 
-        if let Backend::Os(manager) = &self.backend {
+        // While suspended the binding is recorded but not grabbed; `resume`
+        // picks it up. A shortcut changed in settings while the editor is open
+        // must still be the shortcut once the editor closes.
+        if let Backend::Os(manager) = &self.backend
+            && !self.suspended
+        {
             manager.register(accelerator.to_hotkey()).map_err(|err| {
                 Error::InvalidRequest(format!(
                     "hotkey {accelerator} cannot be bound to \"{action}\": {}",
@@ -1129,7 +1205,9 @@ impl HotkeyManager for GlobalHotkeys {
         }
         self.by_id.remove(&accelerator.id());
 
-        if let Backend::Os(manager) = &self.backend {
+        if let Backend::Os(manager) = &self.backend
+            && !self.suspended
+        {
             manager.unregister(accelerator.to_hotkey()).map_err(|err| {
                 Error::Platform(format!("could not release {accelerator}: {err}"))
             })?;

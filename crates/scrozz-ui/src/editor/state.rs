@@ -25,8 +25,13 @@ use scrozz_annotate::{
     Annotation, AnnotationId, AnnotationKind, Color, Document, History, RedactStyle, Style, geom,
 };
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Result};
+use std::ops::Range;
 
-/// How close, in logical points, a pointer must come to a resize handle.
+/// How close, in *screen* points, a pointer must come to a resize handle.
+///
+/// Screen rather than document, because it describes reaching a control drawn
+/// at a fixed on-screen size. [`EditorState::handle_at`] divides it by the
+/// current view scale to compare against a document-space point.
 pub const HANDLE_TOLERANCE: f64 = 7.0;
 
 /// The visual radius of a resize handle, in logical points.
@@ -332,6 +337,46 @@ enum Drag {
     },
 }
 
+/// Where to move the text caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caret {
+    /// One character left.
+    Left,
+    /// One character right.
+    Right,
+    /// Same column, previous line.
+    Up,
+    /// Same column, next line.
+    Down,
+    /// The start of the current line.
+    LineStart,
+    /// The end of the current line.
+    LineEnd,
+}
+
+/// One editing operation on the text annotation being typed into.
+///
+/// Separate from [`Command`] because these carry text: an accelerator table
+/// stays `Copy` and comparable, while input that arrives as a string does not
+/// have to pretend to be a keystroke. [`Insert`](TextEdit::Insert) is what a
+/// keypress or a finished IME composition produces;
+/// [`Preedit`](TextEdit::Preedit) is composition still in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextEdit {
+    /// Insert committed text at the caret, replacing any composition.
+    Insert(String),
+    /// Replace the composition in progress with `0`, which may be empty.
+    ///
+    /// Empty means the IME was dismissed, so the composition is simply removed.
+    Preedit(String),
+    /// Delete the character before the caret.
+    Backspace,
+    /// Delete the character after the caret.
+    DeleteForward,
+    /// Move the caret without changing the text.
+    Caret(Caret),
+}
+
 /// A keyboard command the editor understands.
 ///
 /// The state machine maps keys to these rather than acting on key codes
@@ -403,9 +448,13 @@ pub struct EditorState {
     selection: Option<AnnotationId>,
     drag: Drag,
     editing_text: Option<AnnotationId>,
+    caret: usize,
+    preedit: Option<Range<usize>>,
     zoom: f32,
     pan: (f32, f32),
+    view_scale: f64,
     revision: u64,
+    view_revision: u64,
     dirty: bool,
 }
 
@@ -422,9 +471,13 @@ impl EditorState {
             selection: None,
             drag: Drag::Idle,
             editing_text: None,
+            caret: 0,
+            preedit: None,
             zoom: 1.0,
             pan: (0.0, 0.0),
+            view_scale: 1.0,
             revision: 0,
+            view_revision: 0,
             dirty: false,
         }
     }
@@ -435,15 +488,35 @@ impl EditorState {
         &self.document
     }
 
-    /// A counter that changes whenever what is drawn would change.
+    /// A counter that changes whenever the rendered *content* would change.
     ///
     /// The painter caches its preview texture against this rather than
     /// re-rendering every frame: a full composite of a 5K capture is far too
     /// slow for 60 fps, and re-doing it when nothing moved would make the
     /// editor unusable on exactly the large captures it matters for.
+    ///
+    /// Deliberately *not* bumped by zoom and pan. Moving the viewport does not
+    /// change a single pixel of the composite, and a pan is a continuous
+    /// gesture: bumping this would re-rasterise and re-upload a 2400 px texture
+    /// on every frame of a drag, which is precisely the stall the cache exists
+    /// to avoid. Zoom can change the *resolution* the preview wants, but the
+    /// painter already keys on its quantised target width for that, so zoom
+    /// does not belong here either. Use [`EditorState::view_revision`] to
+    /// observe viewport movement.
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// A counter that changes whenever the viewport moves.
+    ///
+    /// Zoom and pan only, never content. Separate from
+    /// [`EditorState::revision`] so a caller can tell "the picture changed"
+    /// from "the camera moved" — the first needs a new composite, the second
+    /// needs nothing but a different destination rectangle.
+    #[must_use]
+    pub const fn view_revision(&self) -> u64 {
+        self.view_revision
     }
 
     /// Whether anything has been edited since the editor opened.
@@ -564,6 +637,100 @@ impl EditorState {
         }
     }
 
+    /// The caret's position in the text being edited, as a byte offset.
+    ///
+    /// Byte rather than character offset because it indexes the content string
+    /// directly; every mutation keeps it on a `char` boundary.
+    #[must_use]
+    pub const fn text_caret(&self) -> usize {
+        self.caret
+    }
+
+    /// The caret's row and column, in characters, for drawing it.
+    ///
+    /// The built-in font is monospaced, so a column translates to an x offset
+    /// by multiplying by the advance — which is why this is the useful shape to
+    /// return rather than a pixel position the state has no business computing.
+    #[must_use]
+    pub fn text_caret_cell(&self) -> Option<(usize, usize)> {
+        let text = self.text_buffer()?;
+        let before = text.get(..self.caret.min(text.len()))?;
+        let row = before.matches('\n').count();
+        let col = before
+            .rsplit('\n')
+            .next()
+            .map_or(0, |line| line.chars().count());
+        Some((row, col))
+    }
+
+    /// The byte range of the IME composition in progress, if any.
+    #[must_use]
+    pub fn preedit(&self) -> Option<Range<usize>> {
+        self.preedit.clone()
+    }
+
+    /// Applies one text-editing operation to the annotation being typed into.
+    ///
+    /// A no-op when no text annotation is being edited, so a stray keystroke
+    /// after a commit cannot resurrect one.
+    pub fn text_edit(&mut self, edit: &TextEdit) {
+        if self.editing_text.is_none() {
+            return;
+        }
+        let Some(text) = self.text_buffer().map(str::to_owned) else {
+            return;
+        };
+        let caret = self.caret.min(text.len());
+        let preedit = self
+            .preedit
+            .clone()
+            .filter(|r| r.start <= text.len() && r.end <= text.len() && r.start <= r.end);
+
+        let (next, caret, preedit) = match edit {
+            TextEdit::Insert(insert) => {
+                let range = preedit.unwrap_or(caret..caret);
+                let mut next = text.clone();
+                next.replace_range(range.clone(), insert);
+                (next, range.start + insert.len(), None)
+            }
+            TextEdit::Preedit(composition) => {
+                let range = preedit.unwrap_or(caret..caret);
+                let mut next = text.clone();
+                next.replace_range(range.clone(), composition);
+                let end = range.start + composition.len();
+                let still = (!composition.is_empty()).then_some(range.start..end);
+                (next, end, still)
+            }
+            TextEdit::Backspace => {
+                // While composing, the platform IME owns backspace and sends a
+                // shorter preedit; this path is for ordinary typing.
+                let Some(prev) = prev_boundary(&text, caret) else {
+                    return;
+                };
+                let mut next = text.clone();
+                next.replace_range(prev..caret, "");
+                (next, prev, shift_preedit(preedit, prev, caret))
+            }
+            TextEdit::DeleteForward => {
+                let Some(following) = next_boundary(&text, caret) else {
+                    return;
+                };
+                let mut next = text.clone();
+                next.replace_range(caret..following, "");
+                (next, caret, shift_preedit(preedit, caret, following))
+            }
+            TextEdit::Caret(motion) => {
+                // Moving the caret ends any composition in place: the glyphs
+                // stay, they simply stop being provisional.
+                (text.clone(), move_caret(&text, caret, *motion), None)
+            }
+        };
+
+        self.set_text_buffer(&next);
+        self.caret = caret.min(next.len());
+        self.preedit = preedit;
+    }
+
     /// Replaces the text of the annotation being edited.
     pub fn set_text_buffer(&mut self, text: &str) {
         let Some(id) = self.editing_text else {
@@ -581,10 +748,21 @@ impl EditorState {
             _ => false,
         };
         drop(object);
+        // Clamp rather than reset: a caller replacing the whole buffer must not
+        // be able to leave the caret pointing past the end, or into the middle
+        // of a multi-byte character.
+        self.caret = clamp_boundary(text, self.caret);
         if changed {
             self.commit_coalesced("text");
             self.touch();
         }
+    }
+
+    /// Starts typing into `id`, with the caret after whatever is already there.
+    fn begin_text(&mut self, id: AnnotationId) {
+        self.editing_text = Some(id);
+        self.caret = self.text_buffer().map_or(0, str::len);
+        self.preedit = None;
     }
 
     /// Finishes text entry, removing the annotation if nothing was typed.
@@ -596,6 +774,11 @@ impl EditorState {
         let Some(id) = self.editing_text.take() else {
             return;
         };
+        // Any composition in flight becomes ordinary text. Dropping it would
+        // discard glyphs the user can see, which is never what leaving a field
+        // means on any platform.
+        self.preedit = None;
+        self.caret = 0;
         let empty = matches!(
             self.document.get(id).map(|o| &o.annotation),
             Some(Annotation::Text { content, .. }) if content.trim().is_empty()
@@ -622,7 +805,7 @@ impl EditorState {
         let clamped = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         if (clamped - self.zoom).abs() > f32::EPSILON {
             self.zoom = clamped;
-            self.touch();
+            self.touch_view();
         }
     }
 
@@ -634,8 +817,34 @@ impl EditorState {
 
     /// Sets the pan offset.
     pub fn set_pan(&mut self, pan: (f32, f32)) {
+        if (pan.0 - self.pan.0).abs() <= f32::EPSILON && (pan.1 - self.pan.1).abs() <= f32::EPSILON
+        {
+            return;
+        }
         self.pan = pan;
-        self.touch();
+        self.touch_view();
+    }
+
+    /// How many screen points one document point currently occupies.
+    ///
+    /// The painter feeds this back each frame. The state needs it for exactly
+    /// one thing — sizing hit-test tolerances that are specified in screen
+    /// points — and taking it as a value keeps the state free of any other
+    /// knowledge of the view.
+    #[must_use]
+    pub const fn view_scale(&self) -> f64 {
+        self.view_scale
+    }
+
+    /// Records the document-to-screen scale the view is currently drawing at.
+    ///
+    /// Pure view bookkeeping: it changes no pixel of the composite, so it
+    /// bumps nothing. Ignores non-finite and non-positive values rather than
+    /// letting a degenerate layout poison every later hit test.
+    pub const fn set_view_scale(&mut self, scale: f64) {
+        if scale.is_finite() && scale > 0.0 {
+            self.view_scale = scale;
+        }
     }
 
     /// Whether undo is available.
@@ -815,7 +1024,13 @@ impl EditorState {
             _ => {}
         }
         self.commit();
-        self.history.seal();
+        // Releasing the mouse ends a gesture — except when it opened a label,
+        // where the caret is still blinking and the user is only halfway
+        // through making one thing. Sealing here would split "add a label" and
+        // "type in it" into two undo steps.
+        if self.editing_text.is_none() {
+            self.history.seal();
+        }
         self.touch();
     }
 
@@ -861,12 +1076,28 @@ impl EditorState {
     }
 
     /// The handle under `point`, if the selection has one there.
+    ///
+    /// [`HANDLE_TOLERANCE`] is a *screen* distance, because it describes how
+    /// close a pointer has to get to a handle drawn at a fixed on-screen size.
+    /// `point` is in document coordinates, so the tolerance is divided by the
+    /// current view scale. Without that division the grab target shrinks as you
+    /// zoom in — at 8x a handle drawn 9 px across would only accept a click
+    /// within 1 px of its centre — and balloons as you zoom out, where a
+    /// fit-to-window view of a 5K capture would make every handle swallow
+    /// clicks a hundred points away.
     #[must_use]
     pub fn handle_at(&self, point: LogicalPoint) -> Option<Handle> {
         let bounds = self.selection_bounds()?;
+        let tolerance = self.handle_tolerance();
         Handle::ALL
             .into_iter()
-            .find(|h| geom::distance(h.position(&bounds), point) <= HANDLE_TOLERANCE)
+            .find(|h| geom::distance(h.position(&bounds), point) <= tolerance)
+    }
+
+    /// [`HANDLE_TOLERANCE`] expressed in document points at the current zoom.
+    #[must_use]
+    pub fn handle_tolerance(&self) -> f64 {
+        HANDLE_TOLERANCE / self.view_scale
     }
 
     // -----------------------------------------------------------------------
@@ -1010,7 +1241,7 @@ impl EditorState {
                     let is_text = matches!(object.annotation, Annotation::Text { .. });
                     let bounds = object.bounds();
                     if is_text {
-                        self.editing_text = Some(id);
+                        self.begin_text(id);
                     }
                     self.drag = Drag::Moving {
                         grab: point,
@@ -1032,7 +1263,7 @@ impl EditorState {
                     },
                     self.style,
                 );
-                self.editing_text = Some(id);
+                self.begin_text(id);
                 id
             }
             Tool::Counter => {
@@ -1047,7 +1278,15 @@ impl EditorState {
             _ => return,
         };
         self.selection = Some(id);
-        self.commit();
+        if tool == Tool::Text {
+            // A label and the words in it are one thing to the user. Coalescing
+            // the creation into the same entry as the typing means one undo
+            // takes the whole label away, instead of leaving an empty box that
+            // draws nothing and can still be clicked.
+            self.commit_coalesced("text");
+        } else {
+            self.commit();
+        }
     }
 
     /// Grows the annotation being dragged out, creating it on the first move
@@ -1142,6 +1381,83 @@ impl EditorState {
 
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    const fn touch_view(&mut self) {
+        self.view_revision = self.view_revision.wrapping_add(1);
+    }
+}
+
+/// The nearest `char` boundary at or before `at`, never past the end.
+fn clamp_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The `char` boundary before `at`, or `None` at the start of the string.
+fn prev_boundary(text: &str, at: usize) -> Option<usize> {
+    text.get(..at)?.char_indices().next_back().map(|(i, _)| i)
+}
+
+/// The `char` boundary after `at`, or `None` at the end of the string.
+fn next_boundary(text: &str, at: usize) -> Option<usize> {
+    let rest = text.get(at..)?;
+    rest.chars().next().map(|ch| at + ch.len_utf8())
+}
+
+/// Adjusts a composition range for a deletion of `start..end`.
+///
+/// A composition that overlapped the deleted span is abandoned rather than
+/// truncated: half a half-typed glyph is not a composition anyone can finish.
+fn shift_preedit(preedit: Option<Range<usize>>, start: usize, end: usize) -> Option<Range<usize>> {
+    let range = preedit?;
+    if range.start >= end {
+        let by = end - start;
+        Some(range.start - by..range.end - by)
+    } else if range.end <= start {
+        Some(range)
+    } else {
+        None
+    }
+}
+
+/// Where a caret motion lands, as a byte offset on a `char` boundary.
+fn move_caret(text: &str, caret: usize, motion: Caret) -> usize {
+    let line_start = text[..caret].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[caret..].find('\n').map_or(text.len(), |i| caret + i);
+    match motion {
+        Caret::Left => prev_boundary(text, caret).unwrap_or(0),
+        Caret::Right => next_boundary(text, caret).unwrap_or(caret),
+        Caret::LineStart => line_start,
+        Caret::LineEnd => line_end,
+        Caret::Up | Caret::Down => {
+            let column = text[line_start..caret].chars().count();
+            let target = if motion == Caret::Up {
+                if line_start == 0 {
+                    return 0;
+                }
+                let above_end = line_start - 1;
+                let above_start = text[..above_end].rfind('\n').map_or(0, |i| i + 1);
+                above_start..above_end
+            } else {
+                if line_end == text.len() {
+                    return text.len();
+                }
+                let below_start = line_end + 1;
+                let below_end = text[below_start..]
+                    .find('\n')
+                    .map_or(text.len(), |i| below_start + i);
+                below_start..below_end
+            };
+            // Clamp to the shorter line rather than overshooting into the next.
+            let line = &text[target.clone()];
+            line.char_indices()
+                .nth(column)
+                .map_or(target.end, |(i, _)| target.start + i)
+        }
     }
 }
 

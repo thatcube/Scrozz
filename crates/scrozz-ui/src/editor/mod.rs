@@ -41,10 +41,23 @@ use scrozz_core::{LogicalPoint, LogicalRect};
 pub use paint::{CanvasView, Preview};
 pub use scene::EditorScene;
 pub use state::{
-    Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE,
-    NUDGE_COARSE, Tool, ZOOM_STEP,
+    Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE,
+    NUDGE_COARSE, TextEdit, Tool, ZOOM_STEP,
 };
 pub use toolbar::{PALETTE, STROKE_MAX, STROKE_MIN};
+
+/// The smallest the editor window may be dragged, in points.
+///
+/// The width is whatever the toolbar's wrapped layout needs, so the window can
+/// never be made narrower than its own controls.
+pub const MIN_WINDOW_SIZE: [f32; 2] = [
+    if toolbar::WRAPPED_W > 560.0 {
+        toolbar::WRAPPED_W
+    } else {
+        560.0
+    },
+    400.0,
+];
 
 /// The editor surface: state, cached preview, and the frame's decisions.
 pub struct EditorUi {
@@ -114,7 +127,9 @@ impl EditorUi {
         }
 
         let full = ui.available_rect_before_wrap();
-        let toolbar_h = toolbar::HEIGHT;
+        // The toolbar wraps rather than overlapping itself, so how much room it
+        // needs depends on how wide the window is.
+        let toolbar_h = toolbar::height_for(full.width());
         let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), toolbar_h));
         let canvas =
             egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
@@ -127,17 +142,22 @@ impl EditorUi {
         self.pending.take().unwrap_or(Intent::None)
     }
 
-    /// Maps this frame's key presses onto editor commands.
+    /// Maps this frame's input onto editor commands and text edits.
     fn keyboard(&mut self, ui: &Ui) -> Option<Intent> {
-        // Typing into a text annotation swallows everything but Escape and the
-        // undo family, otherwise pressing "r" mid-word would swap the tool.
+        // Typing into a text annotation swallows the accelerators, otherwise
+        // pressing "r" mid-word would swap the tool.
         let typing = self.state.editing_text().is_some();
         let mut result = None;
-        for command in collect_commands(ui, typing) {
-            match self.state.command(command) {
-                Ok(Intent::None) => {}
-                Ok(intent) => result = Some(intent),
-                Err(error) => tracing::warn!(%error, "editor command failed"),
+        // One ordered pass: a frame can carry both a keystroke and the text it
+        // produced, and applying them out of order would type backwards.
+        for input in collect_input(ui, typing) {
+            match input {
+                Input::Command(command) => match self.state.command(command) {
+                    Ok(Intent::None) => {}
+                    Ok(intent) => result = Some(intent),
+                    Err(error) => tracing::warn!(%error, "editor command failed"),
+                },
+                Input::Text(edit) => self.state.text_edit(&edit),
             }
         }
         result
@@ -166,14 +186,47 @@ fn shared_icons(ctx: &egui::Context) -> std::sync::Arc<crate::icons::IconStore> 
 /// Shorthand for the shared icon store's stored type.
 type Store = std::sync::Arc<crate::icons::IconStore>;
 
-/// Reads this frame's input and turns it into commands.
-fn collect_commands(ui: &Ui, typing: bool) -> Vec<Command> {
+/// One thing this frame's input asked for, in the order it arrived.
+enum Input {
+    /// An accelerator.
+    Command(Command),
+    /// Text entry, only produced while a text annotation is being typed into.
+    Text(TextEdit),
+}
+
+/// Reads this frame's input and turns it into commands and text edits.
+///
+/// Ordering is load-bearing. egui delivers a `Key` event and the `Text` event
+/// it produced in the same frame, and a backspace followed by a character is
+/// not the same as a character followed by a backspace, so both kinds come back
+/// interleaved in arrival order rather than as two separate lists.
+fn collect_input(ui: &Ui, typing: bool) -> Vec<Input> {
     ui.ctx().input(|input| {
         let mut out = Vec::new();
         let cmd = input.modifiers.command;
         let shift = input.modifiers.shift;
 
         for event in &input.events {
+            if typing {
+                // While typing, text and composition events are input, not
+                // accelerators. Command-modified keys still fall through to the
+                // accelerator table below so Copy, Save and Undo keep working.
+                match event {
+                    egui::Event::Text(text) if !cmd => {
+                        out.push(Input::Text(TextEdit::Insert(text.clone())));
+                        continue;
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                        out.push(Input::Text(TextEdit::Preedit(text.clone())));
+                        continue;
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                        out.push(Input::Text(TextEdit::Insert(text.clone())));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let egui::Event::Key {
                 key,
                 pressed: true,
@@ -185,26 +238,38 @@ fn collect_commands(ui: &Ui, typing: bool) -> Vec<Command> {
             };
             let cmd = modifiers.command;
             let shift = modifiers.shift;
+            if typing
+                && !cmd
+                && let Some(edit) = text_key(*key, shift)
+            {
+                out.push(Input::Text(edit));
+                continue;
+            }
             match key {
-                Key::Escape => out.push(Command::Escape),
-                Key::Z if cmd && shift => out.push(Command::Redo),
-                Key::Z if cmd => out.push(Command::Undo),
-                Key::Y if cmd => out.push(Command::Redo),
-                Key::C if cmd => out.push(Command::Copy),
-                Key::S if cmd => out.push(Command::Save),
-                Key::A if cmd => out.push(Command::SelectAll),
-                Key::Plus | Key::Equals if cmd => out.push(Command::ZoomIn),
-                Key::Minus if cmd => out.push(Command::ZoomOut),
-                Key::Num0 if cmd => out.push(Command::ZoomReset),
-                Key::OpenBracket if cmd => out.push(Command::SendToBack),
-                Key::CloseBracket if cmd => out.push(Command::BringToFront),
+                Key::Escape => out.push(Input::Command(Command::Escape)),
+                Key::Z if cmd && shift => out.push(Input::Command(Command::Redo)),
+                Key::Z if cmd => out.push(Input::Command(Command::Undo)),
+                Key::Y if cmd => out.push(Input::Command(Command::Redo)),
+                Key::C if cmd => out.push(Input::Command(Command::Copy)),
+                Key::S if cmd => out.push(Input::Command(Command::Save)),
+                Key::A if cmd => out.push(Input::Command(Command::SelectAll)),
+                Key::Plus | Key::Equals if cmd => out.push(Input::Command(Command::ZoomIn)),
+                Key::Minus if cmd => out.push(Input::Command(Command::ZoomOut)),
+                Key::Num0 if cmd => out.push(Input::Command(Command::ZoomReset)),
+                Key::OpenBracket if cmd => out.push(Input::Command(Command::SendToBack)),
+                Key::CloseBracket if cmd => out.push(Input::Command(Command::BringToFront)),
                 _ if cmd => {}
-                Key::Delete | Key::Backspace if !typing => out.push(Command::Delete),
-                Key::Enter if !typing => out.push(Command::ApplyCrop),
-                Key::ArrowLeft if !typing => out.push(nudge(-1.0, 0.0, shift)),
-                Key::ArrowRight if !typing => out.push(nudge(1.0, 0.0, shift)),
-                Key::ArrowUp if !typing => out.push(nudge(0.0, -1.0, shift)),
-                Key::ArrowDown if !typing => out.push(nudge(0.0, 1.0, shift)),
+                Key::Delete | Key::Backspace if !typing => {
+                    out.push(Input::Command(Command::Delete))
+                }
+                Key::Enter if !typing => out.push(Input::Command(Command::ApplyCrop)),
+                // Enter while typing means "done", which is the first layer
+                // Escape unwinds, so it commits through exactly the same path.
+                Key::Enter if !shift => out.push(Input::Command(Command::Escape)),
+                Key::ArrowLeft if !typing => out.push(Input::Command(nudge(-1.0, 0.0, shift))),
+                Key::ArrowRight if !typing => out.push(Input::Command(nudge(1.0, 0.0, shift))),
+                Key::ArrowUp if !typing => out.push(Input::Command(nudge(0.0, -1.0, shift))),
+                Key::ArrowDown if !typing => out.push(Input::Command(nudge(0.0, 1.0, shift))),
                 _ => {}
             }
         }
@@ -215,12 +280,33 @@ fn collect_commands(ui: &Ui, typing: bool) -> Vec<Command> {
                 _ => None,
             }) {
                 if let Some(tool) = text.chars().next().and_then(Tool::from_accelerator) {
-                    out.push(Command::Pick(tool));
+                    out.push(Input::Command(Command::Pick(tool)));
                 }
             }
         }
         out
     })
+}
+
+/// The text edit a bare key performs while typing, if any.
+///
+/// Enter inserts a newline only with Shift; a plain Enter falls through to the
+/// accelerator table, where it means "done", matching every other single-line
+/// field the user has ever used.
+fn text_key(key: Key, shift: bool) -> Option<TextEdit> {
+    let edit = match key {
+        Key::Backspace => TextEdit::Backspace,
+        Key::Delete => TextEdit::DeleteForward,
+        Key::ArrowLeft => TextEdit::Caret(Caret::Left),
+        Key::ArrowRight => TextEdit::Caret(Caret::Right),
+        Key::ArrowUp => TextEdit::Caret(Caret::Up),
+        Key::ArrowDown => TextEdit::Caret(Caret::Down),
+        Key::Home => TextEdit::Caret(Caret::LineStart),
+        Key::End => TextEdit::Caret(Caret::LineEnd),
+        Key::Enter if shift => TextEdit::Insert("\n".to_owned()),
+        _ => return None,
+    };
+    Some(edit)
 }
 
 const fn nudge(x: f64, y: f64, coarse: bool) -> Command {
@@ -296,7 +382,7 @@ impl EditorWindow {
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size([560.0, 400.0]);
+            .with_min_inner_size(MIN_WINDOW_SIZE);
         if focus {
             builder = builder.with_active(true);
         }
