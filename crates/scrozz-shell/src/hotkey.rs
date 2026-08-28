@@ -45,7 +45,7 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use scrozz_core::{Error, Result};
 
-use crate::{Hotkey, HotkeyManager};
+use crate::{Capability, Hotkey, HotkeyManager, Permissions};
 
 // ---------------------------------------------------------------------------
 // Accelerators
@@ -137,6 +137,39 @@ impl Accelerator {
         reserved_shortcuts()
             .iter()
             .find(|reserved| Self::parse(reserved.accelerator).is_ok_and(|it| it == *self))
+    }
+
+    /// The combination in the platform's own notation, for a menu or a label.
+    ///
+    /// macOS prints modifiers as glyphs and never separates them, so
+    /// `Cmd+Shift+8` belongs on a menu item as `⇧⌘8`. Writing "Cmd+Shift+8"
+    /// there is immediately recognisable as not-a-Mac-app. Everywhere else the
+    /// spelled form *is* the platform idiom, so this is [`Display`](fmt::Display)
+    /// verbatim.
+    ///
+    /// The glyph order is Apple's — control, option, shift, command — and is not
+    /// the order [`Display`](fmt::Display) happens to use by coincidence: both
+    /// follow the same table because it is the same convention.
+    #[must_use]
+    pub fn symbols(&self) -> String {
+        if !cfg!(target_os = "macos") {
+            return self.to_string();
+        }
+        let mut out = String::new();
+        if self.mods.contains(Modifiers::CONTROL) {
+            out.push('\u{2303}');
+        }
+        if self.mods.contains(Modifiers::ALT) {
+            out.push('\u{2325}');
+        }
+        if self.mods.contains(Modifiers::SHIFT) {
+            out.push('\u{21e7}');
+        }
+        if self.mods.contains(Modifiers::SUPER) {
+            out.push('\u{2318}');
+        }
+        out.push_str(&display_for(self.code));
+        out
     }
 
     fn to_hotkey(self) -> HotKey {
@@ -850,6 +883,16 @@ enum Backend {
     /// nothing to bind to. Tests use this so a test run can never grab a key
     /// off the machine it runs on.
     Detached,
+    /// Detached, but refuses one nominated accelerator.
+    ///
+    /// The rollback in [`GlobalHotkeys::apply`] only runs when the *OS* turns a
+    /// registration down after validation has already passed — a state no
+    /// combination of inputs can reach through the public API, because the
+    /// refusal comes from another running application. Without a backend that
+    /// can be told to say no, the most consequential branch in this module would
+    /// be the one branch never exercised.
+    #[cfg(test)]
+    Refusing(Accelerator),
 }
 
 /// Registers system-wide hotkeys, or explains why it cannot.
@@ -915,6 +958,15 @@ impl GlobalHotkeys {
     #[must_use]
     pub fn detached_in(session: Session) -> Self {
         Self::with_backend(Backend::Detached, session)
+    }
+
+    /// A detached manager that refuses one accelerator, as the OS would.
+    #[cfg(test)]
+    fn refusing(accelerator: &str) -> Self {
+        Self::with_backend(
+            Backend::Refusing(Accelerator::parse(accelerator).expect("a parseable accelerator")),
+            Session::detect(),
+        )
     }
 
     fn with_backend(backend: Backend, session: Session) -> Self {
@@ -1072,6 +1124,243 @@ impl GlobalHotkeys {
         self.bindings.clear();
         self.by_id.clear();
     }
+
+    /// Puts an entire binding set in force, atomically.
+    ///
+    /// # Why a set and not a loop over [`register`](HotkeyManager::register)
+    ///
+    /// A settings pane hands over the *whole* table every time the user edits
+    /// one row, and the edit must either take effect completely or not at all.
+    /// Registering one row at a time cannot do that: swapping two shortcuts
+    /// transiently double-books one of them, and a refusal halfway through
+    /// leaves the user with some new bindings, some old ones, and no way to know
+    /// which. That state is worse than the edit having failed, because the
+    /// keyboard no longer matches anything on screen.
+    ///
+    /// So this validates the entire set before touching the OS — every
+    /// accelerator parses, no two rows want the same combination, none is one
+    /// the system already owns — and only then rebinds. If the OS still refuses
+    /// a row (another application can hold a combination without the reserved
+    /// table knowing), everything is released and the *previous* set is put back,
+    /// so a failed edit leaves the shortcuts that were working still working.
+    ///
+    /// Rows are keyed by action, so passing fewer rows than are currently bound
+    /// unbinds the rest: an unassigned shortcut is simply a row the caller does
+    /// not include.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`Rejection`] in the set, so a settings pane can mark each
+    /// offending row rather than reporting only the first. Nothing has changed
+    /// when this returns `Err`.
+    pub fn apply(&mut self, desired: &[DesiredBinding]) -> ApplyResult {
+        let mut rejections = Vec::new();
+        let mut resolved: Vec<(Accelerator, &DesiredBinding)> = Vec::new();
+        let mut claimed: HashMap<Accelerator, &str> = HashMap::new();
+
+        for want in desired {
+            let accelerator = match Accelerator::parse(&want.accelerator) {
+                Ok(accelerator) => accelerator,
+                Err(err) => {
+                    rejections.push(Rejection::new(want, err.to_string()));
+                    continue;
+                }
+            };
+
+            // Wayland first, for the same reason `register` checks it first:
+            // reporting a conflict for a binding that could never have been made
+            // sends the user chasing the wrong problem.
+            if !self.session.supports_global_hotkeys() {
+                let remedy = self.session.unsupported(&accelerator, &self.command);
+                rejections.push(Rejection::new(want, remedy.to_string()));
+                continue;
+            }
+
+            if let Some(holder) = claimed.get(&accelerator) {
+                rejections.push(Rejection::new(
+                    want,
+                    Conflict::AlreadyBound {
+                        action: (*holder).to_owned(),
+                    }
+                    .to_string(),
+                ));
+                continue;
+            }
+
+            if let Some(reserved) = accelerator.system_owner() {
+                rejections.push(Rejection::new(
+                    want,
+                    Conflict::SystemReserved {
+                        reserved: *reserved,
+                    }
+                    .to_string(),
+                ));
+                continue;
+            }
+
+            claimed.insert(accelerator, want.action.as_str());
+            resolved.push((accelerator, want));
+        }
+
+        if !rejections.is_empty() {
+            // Nothing above touched the OS, so there is nothing to undo.
+            return Err(rejections);
+        }
+
+        let previous: Vec<(Accelerator, String)> = self
+            .bindings
+            .iter()
+            .map(|(accelerator, binding)| (*accelerator, binding.action.clone()))
+            .collect();
+
+        self.unregister_all();
+
+        for (accelerator, want) in &resolved {
+            if let Err(detail) = self.grab(*accelerator) {
+                self.unregister_all();
+                self.restore(previous);
+                return Err(vec![Rejection::new(want, refusal(&detail).to_string())]);
+            }
+            self.remember(*accelerator, want.action.clone());
+        }
+
+        Ok(())
+    }
+
+    /// Registers with the OS without recording anything.
+    fn grab(&self, accelerator: Accelerator) -> std::result::Result<(), String> {
+        match &self.backend {
+            Backend::Os(manager) => manager
+                .register(accelerator.to_hotkey())
+                .map_err(|err| err.to_string()),
+            Backend::Detached => Ok(()),
+            #[cfg(test)]
+            Backend::Refusing(refused) => {
+                if accelerator == *refused {
+                    Err("HotKey already registered".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Records a registration that has already been made.
+    fn remember(&mut self, accelerator: Accelerator, action: String) {
+        self.by_id.insert(accelerator.id(), accelerator);
+        self.bindings.insert(
+            accelerator,
+            Binding {
+                action,
+                accelerator,
+            },
+        );
+        tracing::debug!(hotkey = %accelerator, "bound global hotkey");
+    }
+
+    /// Puts a released set back after a failed [`apply`](GlobalHotkeys::apply).
+    ///
+    /// A rollback that itself fails is logged rather than propagated: the caller
+    /// is already being told its edit was refused, and the useful part of that
+    /// message is the reason, not a second failure it can do nothing about.
+    fn restore(&mut self, previous: Vec<(Accelerator, String)>) {
+        for (accelerator, action) in previous {
+            match self.grab(accelerator) {
+                Ok(()) => self.remember(accelerator, action),
+                Err(err) => {
+                    tracing::error!(hotkey = %accelerator, action, %err, "could not restore a hotkey after a failed edit");
+                }
+            }
+        }
+    }
+}
+
+/// One binding a caller wants in force after [`GlobalHotkeys::apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredBinding {
+    /// The accelerator, in the platform-independent spelling
+    /// [`Accelerator::parse`] accepts.
+    pub accelerator: String,
+    /// The action name reported back by [`HotkeyEvent`].
+    pub action: String,
+}
+
+impl DesiredBinding {
+    /// Creates a desired binding.
+    #[must_use]
+    pub fn new(accelerator: impl Into<String>, action: impl Into<String>) -> Self {
+        Self {
+            accelerator: accelerator.into(),
+            action: action.into(),
+        }
+    }
+}
+
+/// Why one row of a desired set could not be put in force.
+///
+/// Carries the row's own identity rather than only a message, because a settings
+/// pane needs to know *which* row to mark, and matching on message text would be
+/// a parser waiting to break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The action whose row was refused.
+    pub action: String,
+    /// The accelerator as the caller spelled it, so the row can be found even
+    /// when it did not parse.
+    pub accelerator: String,
+    /// One sentence, ready to show under the control.
+    pub reason: String,
+}
+
+impl Rejection {
+    fn new(want: &DesiredBinding, reason: String) -> Self {
+        Self {
+            action: want.action.clone(),
+            accelerator: want.accelerator.clone(),
+            reason,
+        }
+    }
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} cannot be bound: {}", self.accelerator, self.reason)
+    }
+}
+
+/// The outcome of [`GlobalHotkeys::apply`]: nothing, or every rejected row.
+pub type ApplyResult = std::result::Result<(), Vec<Rejection>>;
+
+/// Turns an OS refusal into something the user can act on.
+///
+/// The platform says only that registration failed. On macOS that has two
+/// common causes worth naming, because the remedies are different and neither is
+/// discoverable from "failed": another application registered the combination
+/// first, or Scrozz is not trusted for Accessibility. The second is checked
+/// rather than guessed — asserting a permission problem that does not exist
+/// sends the user to a settings pane that will not help.
+fn refusal(detail: &str) -> Conflict {
+    if !cfg!(target_os = "macos") {
+        return Conflict::Refused {
+            detail: detail.to_owned(),
+        };
+    }
+
+    let trusted =
+        crate::permissions::SystemPermissions::new().is_granted(Capability::Accessibility);
+    let detail = if trusted {
+        format!(
+            "{detail}. Another application is probably holding this combination; \
+             free it there, or in System Settings › Keyboard › Keyboard Shortcuts"
+        )
+    } else {
+        format!(
+            "{detail}. Scrozz is not trusted for Accessibility, which some \
+             combinations require; grant it in System Settings › Privacy & \
+             Security › Accessibility, or pick another combination"
+        )
+    };
+    Conflict::Refused { detail }
 }
 
 impl Drop for GlobalHotkeys {
@@ -1135,5 +1424,234 @@ impl HotkeyManager for GlobalHotkeys {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two combinations that are free on every platform Scrozz supports.
+    ///
+    /// `Cmd+Shift+4` and friends are reserved on macOS and free on Linux, so a
+    /// literal chosen on one machine quietly changes what the test proves on
+    /// another. `Ctrl+Shift+…` is owned by nobody anywhere.
+    const FREE: &str = "Ctrl+Shift+F9";
+    const ALSO_FREE: &str = "Ctrl+Shift+F10";
+
+    fn want(accelerator: &str, action: &str) -> DesiredBinding {
+        DesiredBinding::new(accelerator, action)
+    }
+
+    fn bound(manager: &GlobalHotkeys) -> Vec<(String, String)> {
+        let mut rows: Vec<_> = manager
+            .bindings()
+            .map(|(accelerator, action)| (accelerator.to_string(), action.to_owned()))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn applying_a_valid_set_binds_all_of_it() {
+        let mut manager = GlobalHotkeys::detached();
+        manager
+            .apply(&[
+                want(FREE, "capture.region"),
+                want(ALSO_FREE, "capture.window"),
+            ])
+            .expect("two free combinations must both bind");
+        // Sorted, so the expectation is in lexical order rather than the order
+        // the rows were applied in.
+        assert_eq!(
+            bound(&manager),
+            vec![
+                (ALSO_FREE.to_owned(), "capture.window".to_owned()),
+                (FREE.to_owned(), "capture.region".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_row_costs_nothing_that_was_already_bound() {
+        // The whole point of the transaction: an edit that cannot be honoured
+        // must not be able to take away shortcuts that were working.
+        let mut manager = GlobalHotkeys::detached();
+        manager
+            .apply(&[want(FREE, "capture.region")])
+            .expect("the starting set must bind");
+
+        let refused = manager
+            .apply(&[
+                want(FREE, "capture.region"),
+                want("Ctrl+Shift+Nonsense", "capture.window"),
+            ])
+            .expect_err("an unparseable accelerator must be refused");
+
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].action, "capture.window");
+        assert_eq!(
+            bound(&manager),
+            vec![(FREE.to_owned(), "capture.region".to_owned())],
+            "the previous binding must survive a refused edit untouched"
+        );
+    }
+
+    #[test]
+    fn every_bad_row_is_reported_at_once() {
+        // Reporting only the first would send the user round the loop once per
+        // mistake, which is how a settings pane earns its reputation.
+        let mut manager = GlobalHotkeys::detached();
+        let refused = manager
+            .apply(&[
+                want("Ctrl+Shift+Nonsense", "capture.region"),
+                want("also not a combination", "capture.window"),
+            ])
+            .expect_err("both rows are unusable");
+        assert_eq!(refused.len(), 2);
+    }
+
+    #[test]
+    fn the_same_combination_twice_in_one_set_is_a_duplicate() {
+        let mut manager = GlobalHotkeys::detached();
+        let refused = manager
+            .apply(&[want(FREE, "capture.region"), want(FREE, "capture.window")])
+            .expect_err("one combination cannot serve two actions");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].action, "capture.window",
+            "the second row is the one that collides, not the first"
+        );
+        assert!(refused[0].reason.contains("capture.region"));
+    }
+
+    #[test]
+    fn a_differently_spelled_duplicate_is_still_a_duplicate() {
+        // Detection happens on the parsed accelerator, not the string, so
+        // reordering the modifiers cannot smuggle a collision past it.
+        let mut manager = GlobalHotkeys::detached();
+        let refused = manager
+            .apply(&[
+                want("Ctrl+Shift+F9", "capture.region"),
+                want("shift+ctrl+f9", "capture.window"),
+            ])
+            .expect_err("spelling is not identity");
+        assert_eq!(refused.len(), 1);
+    }
+
+    #[test]
+    fn a_system_owned_combination_is_refused_by_name() {
+        let Some(reserved) = reserved_shortcuts().first() else {
+            return;
+        };
+        let mut manager = GlobalHotkeys::detached();
+        let refused = manager
+            .apply(&[want(reserved.accelerator, "capture.region")])
+            .expect_err("the system already owns this");
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].reason.contains(reserved.owner),
+            "the refusal must name who holds it, not merely that it is taken"
+        );
+    }
+
+    #[test]
+    fn omitting_a_row_unbinds_it() {
+        // How "Clear" reaches the OS: the set is the whole truth, so an action
+        // that is not in it is not registered.
+        let mut manager = GlobalHotkeys::detached();
+        manager
+            .apply(&[
+                want(FREE, "capture.region"),
+                want(ALSO_FREE, "capture.window"),
+            ])
+            .expect("both must bind");
+        manager
+            .apply(&[want(FREE, "capture.region")])
+            .expect("dropping a row is a valid edit");
+        assert_eq!(
+            bound(&manager),
+            vec![(FREE.to_owned(), "capture.region".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_empty_set_unbinds_everything() {
+        let mut manager = GlobalHotkeys::detached();
+        manager
+            .apply(&[want(FREE, "capture.region")])
+            .expect("the starting set must bind");
+        manager.apply(&[]).expect("unbinding everything is valid");
+        assert!(bound(&manager).is_empty());
+    }
+
+    #[test]
+    fn a_refusal_from_the_os_puts_the_previous_set_back() {
+        // The branch that cannot be reached from the outside: validation passes,
+        // the old registrations are released, and only then does the OS say no.
+        let mut manager = GlobalHotkeys::refusing(ALSO_FREE);
+        manager
+            .apply(&[want(FREE, "capture.region")])
+            .expect("the starting set must bind");
+
+        let refused = manager
+            .apply(&[
+                want(FREE, "capture.region"),
+                want(ALSO_FREE, "capture.window"),
+            ])
+            .expect_err("the backend refuses the second row");
+
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].action, "capture.window");
+        assert_eq!(
+            bound(&manager),
+            vec![(FREE.to_owned(), "capture.region".to_owned())],
+            "a refusal partway through must leave the previous set in force"
+        );
+    }
+
+    #[test]
+    fn an_os_refusal_explains_itself_in_terms_the_user_can_act_on() {
+        let mut manager = GlobalHotkeys::refusing(FREE);
+        let refused = manager
+            .apply(&[want(FREE, "capture.region")])
+            .expect_err("the backend refuses this");
+        let reason = &refused[0].reason;
+        assert!(
+            reason.contains("System Settings") || reason.contains("Accessibility"),
+            "a refusal must point somewhere: {reason}"
+        );
+    }
+
+    #[test]
+    fn wayland_refuses_every_row_with_the_line_to_paste() {
+        // Not a conflict and not a permission problem: there is no protocol to
+        // grab a key at all, and the remedy is the compositor's own config.
+        let mut manager = GlobalHotkeys::detached_in(Session::from_env(
+            Some("GNOME"),
+            Some("wayland-0"),
+            Some("wayland"),
+            None,
+        ));
+        manager.set_command("scrozz");
+        let refused = manager
+            .apply(&[want(FREE, "capture.region")])
+            .expect_err("Wayland has nothing to bind to");
+        assert_eq!(refused.len(), 1);
+        assert!(bound(&manager).is_empty());
+    }
+
+    #[test]
+    fn symbols_are_spelled_the_way_the_platform_spells_them() {
+        let accelerator = Accelerator::parse("Cmd+Shift+8").expect("parses");
+        let symbols = accelerator.symbols();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                symbols, "⇧⌘8",
+                "a macOS menu never writes out the modifier names"
+            );
+        } else {
+            assert_eq!(symbols, accelerator.to_string());
+        }
     }
 }
