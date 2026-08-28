@@ -2819,6 +2819,52 @@ impl RasterJob {
     }
 }
 
+/// Renders one platform-adaptive Settings golden with the same CPU renderer as
+/// the rest of the committed corpus.
+///
+/// # Errors
+///
+/// Returns an error if the deterministic rasterizer cannot produce the image.
+pub fn render_settings_golden(case: &SettingsGoldenCase) -> Result<Image> {
+    let pixels_per_point = 2.0;
+    let appearance = match case.theme {
+        egui::Theme::Dark => crate::theme::Appearance::Dark,
+        egui::Theme::Light => crate::theme::Appearance::Light,
+    };
+    let icons = std::sync::Mutex::new(None);
+    RasterJob {
+        width_px: 1600,
+        height_px: 1200,
+        pixels_per_point,
+        theme: case.theme,
+        background: Background::Solid([0, 0, 0, 0]),
+        seed: DEFAULT_SEED,
+        time: 0.0,
+        warmup_passes: 3,
+    }
+    .run_with_setup(
+        |ctx| {
+            crate::theme::install_fonts(ctx);
+            crate::theme::install_style(ctx, &crate::theme::Theme::for_appearance(appearance));
+            if let Ok(mut slot) = icons.lock() {
+                *slot = Some(crate::icons::IconStore::new(ctx));
+            }
+        },
+        |ui| {
+            let guard = icons
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let empty = crate::icons::IconStore::empty();
+            crate::settings::render_preview(
+                ui,
+                case.platform,
+                guard.as_ref().unwrap_or(&empty),
+                &crate::settings::preview_shortcuts(case.platform),
+            );
+        },
+    )
+}
+
 /// The headless renderer.
 ///
 /// Pure CPU, no GPU, no window, no display server. That is not a compromise —
@@ -3746,6 +3792,57 @@ pub struct GoldenCase {
     pub spec: RenderSpec,
     /// What the picture is supposed to show, in prose.
     pub expectation: String,
+}
+
+/// A committed platform-adaptive Settings image.
+#[derive(Debug, Clone)]
+pub struct SettingsGoldenCase {
+    /// Baseline file name, without extension.
+    pub name: &'static str,
+    /// Desktop navigation convention to render.
+    pub platform: crate::settings::SettingsPlatform,
+    /// OS appearance to render.
+    pub theme: egui::Theme,
+    /// What a reviewer should verify.
+    pub expectation: &'static str,
+}
+
+/// Settings cases that cover native navigation and system appearance.
+#[must_use]
+pub fn settings_golden_plan() -> Vec<SettingsGoldenCase> {
+    use crate::settings::SettingsPlatform;
+    vec![
+        SettingsGoldenCase {
+            name: "settings-macos--light",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Light,
+            expectation: "macOS top category toolbar in system light appearance",
+        },
+        SettingsGoldenCase {
+            name: "settings-macos--dark",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Dark,
+            expectation: "macOS top category toolbar in system dark appearance",
+        },
+        SettingsGoldenCase {
+            name: "settings-windows--light",
+            platform: SettingsPlatform::Windows,
+            theme: egui::Theme::Light,
+            expectation: "Windows left navigation with the spacious Settings form",
+        },
+        SettingsGoldenCase {
+            name: "settings-linux--dark",
+            platform: SettingsPlatform::Linux,
+            theme: egui::Theme::Dark,
+            expectation: "desktop-neutral Linux sidebar in system dark appearance",
+        },
+        SettingsGoldenCase {
+            name: "settings-linux--light",
+            platform: SettingsPlatform::Linux,
+            theme: egui::Theme::Light,
+            expectation: "desktop-neutral Linux sidebar in system light appearance",
+        },
+    ]
 }
 
 /// The complete golden corpus.

@@ -68,6 +68,7 @@ arboard = "3.6"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 global-hotkey = "0.8"
 tray-icon = "0.24"
+dark-light = { version = "3", default-features = false }
 
 # --- macOS ---
 objc2 = "0.6"
