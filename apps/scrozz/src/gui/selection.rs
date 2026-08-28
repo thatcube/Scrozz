@@ -238,6 +238,7 @@ enum BridgeEvent {
         id: u64,
         hidden: Sender<()>,
         surface_can_remain_visible: bool,
+        cursor: OverlayCursor,
     },
     Prepared {
         id: u64,
@@ -277,12 +278,15 @@ enum ControllerPhase {
     HideBeforePreparation {
         id: u64,
         hidden: Sender<()>,
+        cursor: OverlayCursor,
     },
     WaitingForPreparation {
         id: u64,
+        cursor: OverlayCursor,
     },
     PreparingWithCards {
         id: u64,
+        cursor: OverlayCursor,
     },
     ReadyToSelect {
         id: u64,
@@ -452,6 +456,7 @@ impl ClientOverlaySelector {
                 id,
                 hidden: hidden_tx,
                 surface_can_remain_visible,
+                cursor: selection_cursor(options),
             })
             .map_err(|_| bridge_error("the selector window closed before it could hide"))?;
         self.receive(
@@ -646,12 +651,22 @@ impl ClientOverlayController {
             self.handle_event(ctx, native, event);
         }
         native.refresh();
-        if let ControllerPhase::Selecting { ui, .. } = &self.phase
-            && ui.state().mode() == scrozz_core::SelectionMode::Region
-            && !ui.state().options_ref().hud
-        {
-            native.set_cursor(OverlayCursor::Crosshair);
+        if let Some(cursor) = self.pending_selection_cursor() {
+            native.set_cursor(cursor);
+            ctx.request_repaint();
         }
+    }
+
+    fn pending_selection_cursor(&self) -> Option<OverlayCursor> {
+        let cursor = match &self.phase {
+            ControllerPhase::HideBeforePreparation { cursor, .. }
+            | ControllerPhase::WaitingForPreparation { cursor, .. }
+            | ControllerPhase::PreparingWithCards { cursor, .. } => *cursor,
+            ControllerPhase::ReadyToSelect { prepared, .. } => selection_cursor(&prepared.options),
+            ControllerPhase::Selecting { ui, .. } => selection_cursor(ui.state().options_ref()),
+            _ => return None,
+        };
+        (cursor == OverlayCursor::Crosshair).then_some(cursor)
     }
 
     /// Draws the selector when a prepared selection owns the window.
@@ -731,9 +746,9 @@ impl ClientOverlayController {
                 let _ = hidden.send(());
                 ControllerPhase::AwaitingCapture { id }
             }
-            ControllerPhase::HideBeforePreparation { id, hidden } => {
+            ControllerPhase::HideBeforePreparation { id, hidden, cursor } => {
                 let _ = hidden.send(());
-                ControllerPhase::WaitingForPreparation { id }
+                ControllerPhase::WaitingForPreparation { id, cursor }
             }
             ControllerPhase::ReadyToSelect {
                 id,
@@ -825,20 +840,23 @@ impl ClientOverlayController {
                 id,
                 hidden,
                 surface_can_remain_visible: true,
+                cursor,
             } if matches!(self.phase, ControllerPhase::Cards) => {
                 let _ = hidden.send(());
-                self.phase = ControllerPhase::PreparingWithCards { id };
+                self.phase = ControllerPhase::PreparingWithCards { id, cursor };
             }
             BridgeEvent::Begin {
                 id,
                 hidden,
                 surface_can_remain_visible: false,
+                cursor,
             } if matches!(self.phase, ControllerPhase::Cards) => {
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                native.set_cursor(cursor);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
-                self.phase = ControllerPhase::HideBeforePreparation { id, hidden };
+                self.phase = ControllerPhase::HideBeforePreparation { id, hidden, cursor };
             }
             BridgeEvent::Prepared {
                 id,
@@ -846,7 +864,7 @@ impl ClientOverlayController {
                 decision,
             } if matches!(
                 self.phase,
-                ControllerPhase::PreparingWithCards { id: waiting } if waiting == id
+                ControllerPhase::PreparingWithCards { id: waiting, .. } if waiting == id
             ) =>
             {
                 self.phase = ControllerPhase::ReadyToSelect {
@@ -862,7 +880,7 @@ impl ClientOverlayController {
                 decision,
             } if matches!(
                 self.phase,
-                ControllerPhase::WaitingForPreparation { id: waiting } if waiting == id
+                ControllerPhase::WaitingForPreparation { id: waiting, .. } if waiting == id
             ) =>
             {
                 self.phase = ControllerPhase::ReadyToSelect {
@@ -875,17 +893,19 @@ impl ClientOverlayController {
             BridgeEvent::PreparationFailed { id }
                 if matches!(
                     self.phase,
-                    ControllerPhase::WaitingForPreparation { id: waiting } if waiting == id
+                    ControllerPhase::WaitingForPreparation { id: waiting, .. } if waiting == id
                 ) =>
             {
+                native.set_cursor(OverlayCursor::Arrow);
                 self.phase = ControllerPhase::AwaitingCapture { id };
             }
             BridgeEvent::PreparationFailed { id }
                 if matches!(
                     self.phase,
-                    ControllerPhase::PreparingWithCards { id: waiting } if waiting == id
+                    ControllerPhase::PreparingWithCards { id: waiting, .. } if waiting == id
                 ) =>
             {
+                native.set_cursor(OverlayCursor::Arrow);
                 self.phase = ControllerPhase::Cards;
             }
             BridgeEvent::PreparationFailed { id }
@@ -938,6 +958,14 @@ impl ClientOverlayController {
                 tracing::warn!("ignored an out-of-order selector lifecycle event");
             }
         }
+    }
+}
+
+fn selection_cursor(options: &SelectionOptions) -> OverlayCursor {
+    if options.mode == scrozz_core::SelectionMode::Region && !options.hud {
+        OverlayCursor::Crosshair
+    } else {
+        OverlayCursor::Arrow
     }
 }
 
@@ -2254,6 +2282,12 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![scrozz_shell::OverlayBehavior::hidden_surface()]
+        );
+        assert!(
+            native
+                .recorded_cursors()
+                .contains(&OverlayCursor::Crosshair),
+            "direct region capture must switch cursors before native preparation finishes"
         );
 
         let pointer = egui::pos2(60.0, 60.0);
