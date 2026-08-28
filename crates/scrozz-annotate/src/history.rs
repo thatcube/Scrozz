@@ -174,6 +174,23 @@ impl History {
     ///
     /// Opening a second edit finishes the first, which is the only sane reading
     /// of starting something new while something is unfinished.
+    ///
+    /// # Why [`undo`](Self::undo) and [`redo`](Self::redo) do not close it
+    ///
+    /// They used to, on the reasoning that navigating the history made the edit
+    /// part of it. That reasoning is wrong for the case this exists to serve.
+    /// Place a label, change its colour, press ⌘Z, press Escape: the label is
+    /// still unfinished and still empty, and the click that made it still has
+    /// to be taken back. Closing the edit on the ⌘Z left `open` gone, so the
+    /// cancellation fell through to deleting the annotation and committing —
+    /// which puts an invisible empty label one ⌘Z away, exactly the bug this
+    /// was built to prevent — and threw away the redo branch `begin` had put
+    /// into safekeeping.
+    ///
+    /// The rollback point survives navigation because it does not describe a
+    /// position in the stack, it *is* a snapshot plus an absolute depth, and
+    /// [`abandon`](Self::abandon) already refuses when navigation has taken the
+    /// document somewhere that depth no longer reaches.
     pub fn begin(&mut self) {
         self.finish();
         self.open = Some(Open {
@@ -292,9 +309,6 @@ impl History {
                 let current = std::mem::replace(&mut self.present, previous);
                 self.future.push(current);
                 self.tag = None;
-                // Navigating the history makes the edit in progress part of it:
-                // its rollback point no longer describes where the document is.
-                self.finish();
                 Ok(true)
             }
             Err(error) => {
@@ -321,7 +335,6 @@ impl History {
                 let current = std::mem::replace(&mut self.present, next);
                 self.past.push(current);
                 self.tag = None;
-                self.finish();
                 Ok(true)
             }
             Err(error) => {

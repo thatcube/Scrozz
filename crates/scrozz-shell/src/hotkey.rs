@@ -909,6 +909,9 @@ struct FakeOs {
     /// Accelerators this backend refuses, the way a combination another
     /// application already owns is refused.
     refuse: HashSet<Accelerator>,
+    /// Accelerators this backend will not let go of, the way an OS can fail an
+    /// unregister. Interior mutability so a test can relent and prove the retry.
+    refuse_release: std::cell::RefCell<HashSet<Accelerator>>,
     /// What is grabbed right now.
     grabbed: std::cell::RefCell<HashSet<Accelerator>>,
 }
@@ -918,6 +921,7 @@ impl FakeOs {
     fn refusing(accelerator: Accelerator) -> Self {
         Self {
             refuse: HashSet::from([accelerator]),
+            refuse_release: std::cell::RefCell::default(),
             grabbed: std::cell::RefCell::default(),
         }
     }
@@ -932,17 +936,31 @@ impl FakeOs {
         Ok(())
     }
 
-    /// Drops a set of grabs, aborting at the first key it does not hold.
+    /// Drops one grab, or refuses to.
+    ///
+    /// A refusal leaves the key grabbed, which is the whole point: the manager
+    /// has to keep believing the OS holds it.
+    fn release_one(&self, accelerator: Accelerator) -> std::result::Result<(), String> {
+        if self.refuse_release.borrow().contains(&accelerator) {
+            return Err("HotKey is still in use".to_owned());
+        }
+        if !self.grabbed.borrow_mut().remove(&accelerator) {
+            return Err("HotKey is not registered".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Drops a set of grabs, aborting at the first key it cannot release.
     ///
     /// The abort is the interesting part, and it is not invented: the Windows
     /// implementation of the underlying crate's bulk unregister returns on the
-    /// first failure, so every key after the missing one stays grabbed. A
-    /// release driven from the *configured* set rather than the *held* set
-    /// walks straight into that, which is exactly what this reproduces.
-    fn release(&self, accelerators: &[Accelerator]) {
-        let mut grabbed = self.grabbed.borrow_mut();
+    /// first failure, so every key after the failing one stays grabbed. The
+    /// manager does not use this — [`release_grabs`](GlobalHotkeys::release_grabs)
+    /// goes one at a time precisely to avoid it — and it is kept so a test can
+    /// show what that decision is avoiding rather than only assert a comment.
+    fn release_all(&self, accelerators: &[Accelerator]) {
         for accelerator in accelerators {
-            if !grabbed.remove(accelerator) {
+            if self.release_one(*accelerator).is_err() {
                 return;
             }
         }
@@ -1061,6 +1079,23 @@ impl GlobalHotkeys {
         }
     }
 
+    /// Makes the stand-in OS refuse to release `accelerator`, or relent.
+    #[cfg(test)]
+    fn refuse_release(&self, accelerator: &str, refuse: bool) {
+        let accelerator = Accelerator::parse(accelerator).expect("a parseable accelerator");
+        match &self.backend {
+            Backend::Fake(os) => {
+                let mut set = os.refuse_release.borrow_mut();
+                if refuse {
+                    set.insert(accelerator);
+                } else {
+                    set.remove(&accelerator);
+                }
+            }
+            _ => panic!("only an observable manager can be driven"),
+        }
+    }
+
     fn with_backend(backend: Backend, session: Session) -> Self {
         Self {
             backend,
@@ -1092,11 +1127,10 @@ impl GlobalHotkeys {
     /// force. A shortcut edited while the editor is open is therefore the one
     /// that comes back.
     ///
-    /// Idempotent, so a caller does not have to track whether it already asked.
+    /// Idempotent, so a caller does not have to track whether it already asked
+    /// — and a repeat is not wasted: a release the OS refused leaves a grab
+    /// live and still tracked, and the next suspend tries it again.
     pub fn suspend(&mut self) {
-        if self.suspended {
-            return;
-        }
         // Release *first*. Setting the flag first would be a lie for as long as
         // it took to act on it, and anything that consults it on the way —
         // including the release itself — would conclude there was nothing left
@@ -1333,21 +1367,33 @@ impl GlobalHotkeys {
     /// Separate from [`unregister_all`](Self::unregister_all) because
     /// [`apply`](Self::apply) rebinds through it: clearing the suspension there
     /// would hand the keyboard back while the editor still had it.
+    ///
+    /// # Why one at a time
+    ///
+    /// A bulk unregister is one call instead of ten, and the wrong shape. The
+    /// Windows implementation of the underlying crate returns on the first
+    /// failure, so a single stubborn key leaves every key after it grabbed —
+    /// and if the set has already been drained, grabbed by an OS nobody is
+    /// tracking. Nothing can release them after that: suspend, `unregister_all`
+    /// and `Drop` all work from the set. Releasing individually costs a handful
+    /// of syscalls per keyboard handover and keeps `active` true, so a key that
+    /// refuses to let go stays on the list and the next attempt tries it again.
     fn release_grabs(&mut self) {
         if self.active.is_empty() {
             return;
         }
-        let held: Vec<Accelerator> = self.active.drain().collect();
-        match &self.backend {
-            Backend::Os(manager) => {
-                let keys: Vec<HotKey> = held.iter().map(|a| a.to_hotkey()).collect();
-                if let Err(err) = manager.unregister_all(&keys) {
-                    tracing::warn!(%err, "could not release all hotkeys");
+        let held: Vec<Accelerator> = self.active.iter().copied().collect();
+        for accelerator in held {
+            match self.release_backend(accelerator) {
+                Ok(()) => {
+                    self.active.remove(&accelerator);
+                }
+                Err(err) => {
+                    // Deliberately left in `active`: it is still grabbed, and
+                    // forgetting it is how a grab becomes unreleasable.
+                    tracing::warn!(hotkey = %accelerator, %err, "could not release a hotkey");
                 }
             }
-            Backend::Detached => {}
-            #[cfg(test)]
-            Backend::Fake(os) => os.release(&held),
         }
     }
 
@@ -1464,6 +1510,12 @@ impl GlobalHotkeys {
         if self.suspended {
             return Ok(());
         }
+        // Already held: a release the OS refused never handed it back, so this
+        // is nothing to ask for. Asking anyway would be refused as a duplicate
+        // and reported to the user as a conflict that does not exist.
+        if self.active.contains(&accelerator) {
+            return Ok(());
+        }
         let outcome = match &self.backend {
             Backend::Os(manager) => manager
                 .register(accelerator.to_hotkey())
@@ -1483,20 +1535,28 @@ impl GlobalHotkeys {
     /// Silent when it is not: a binding refused on the way back from a suspend
     /// is still configured, and removing it should not report a failure for a
     /// key nobody ever held.
+    ///
+    /// The bookkeeping is only updated once the OS agrees. Removing it first
+    /// would mean a refused release left a grab live and untracked, and nothing
+    /// afterwards would know to try again.
     fn release_one(&mut self, accelerator: Accelerator) -> std::result::Result<(), String> {
-        if !self.active.remove(&accelerator) {
+        if !self.active.contains(&accelerator) {
             return Ok(());
         }
+        self.release_backend(accelerator)?;
+        self.active.remove(&accelerator);
+        Ok(())
+    }
+
+    /// Asks the OS to drop one grab, without touching any bookkeeping.
+    fn release_backend(&self, accelerator: Accelerator) -> std::result::Result<(), String> {
         match &self.backend {
             Backend::Os(manager) => manager
                 .unregister(accelerator.to_hotkey())
                 .map_err(|err| err.to_string()),
             Backend::Detached => Ok(()),
             #[cfg(test)]
-            Backend::Fake(os) => {
-                os.release(&[accelerator]);
-                Ok(())
-            }
+            Backend::Fake(os) => os.release_one(accelerator),
         }
     }
 
@@ -1513,11 +1573,6 @@ impl GlobalHotkeys {
         tracing::debug!(hotkey = %accelerator, "bound global hotkey");
     }
 
-    /// Puts a released set back after a failed [`apply`](GlobalHotkeys::apply).
-    ///
-    /// A rollback that itself fails is logged rather than propagated: the caller
-    /// is already being told its edit was refused, and the useful part of that
-    /// message is the reason, not a second failure it can do nothing about.
     /// Clears every binding, keeping any suspension in force.
     fn rebind_from_scratch(&mut self) {
         self.release_grabs();
@@ -1525,14 +1580,24 @@ impl GlobalHotkeys {
         self.by_id.clear();
     }
 
+    /// Puts a released set back after a failed [`apply`](GlobalHotkeys::apply).
+    ///
+    /// A rollback that itself fails is logged rather than propagated: the caller
+    /// is already being told its edit was refused, and the useful part of that
+    /// message is the reason, not a second failure it can do nothing about.
+    ///
+    /// The rollback puts the *configuration* back whatever the OS says. A binding
+    /// the OS refuses is still the binding the user has — it shows in the tray
+    /// and the settings pane, and `inactive` reports it as not in force — so
+    /// dropping it here would let a failed edit silently delete a row the user
+    /// never touched. Only a successful grab enters `active`, which `grab`
+    /// already handles.
     fn restore(&mut self, previous: Vec<(Accelerator, String)>) {
         for (accelerator, action) in previous {
-            match self.grab(accelerator) {
-                Ok(()) => self.remember(accelerator, action),
-                Err(err) => {
-                    tracing::error!(hotkey = %accelerator, action, %err, "could not restore a hotkey after a failed edit");
-                }
+            if let Err(err) = self.grab(accelerator) {
+                tracing::error!(hotkey = %accelerator, action = %action, %err, "could not restore a hotkey after a failed edit");
             }
+            self.remember(accelerator, action);
         }
     }
 }
@@ -1672,15 +1737,20 @@ impl HotkeyManager for GlobalHotkeys {
     fn unregister(&mut self, hotkey: &Hotkey) -> Result<()> {
         let accelerator = Accelerator::parse(&hotkey.accelerator)?;
 
-        if self.bindings.remove(&accelerator).is_none() {
+        if !self.bindings.contains_key(&accelerator) {
             return Err(Error::InvalidRequest(format!(
                 "hotkey {accelerator} is not bound"
             )));
         }
-        self.by_id.remove(&accelerator.id());
 
+        // The OS goes first. Dropping the bookkeeping before the grab is gone
+        // would leave a live grab with nothing tracking it, and would delete a
+        // binding the user still has configured on the strength of a failure.
         self.release_one(accelerator)
             .map_err(|err| Error::Platform(format!("could not release {accelerator}: {err}")))?;
+
+        self.bindings.remove(&accelerator);
+        self.by_id.remove(&accelerator.id());
         Ok(())
     }
 }
@@ -1696,6 +1766,7 @@ mod tests {
     /// another. `Ctrl+Shift+…` is owned by nobody anywhere.
     const FREE: &str = "Ctrl+Shift+F9";
     const ALSO_FREE: &str = "Ctrl+Shift+F10";
+    const THIRD_FREE: &str = "Ctrl+Shift+F11";
 
     fn want(accelerator: &str, action: &str) -> DesiredBinding {
         DesiredBinding::new(accelerator, action)
@@ -2170,5 +2241,207 @@ mod tests {
 
         assert!(holding(&keys).is_empty());
         assert_eq!(keys.active_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Releases that fail.
+    //
+    // A grab the OS will not drop is the one case where the manager's
+    // bookkeeping and reality can part company permanently: forget the key and
+    // nothing will ever ask for it back. These drive an OS that refuses.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_refused_release_keeps_the_others_from_being_stranded() {
+        // The Windows bulk-unregister shape. Three grabs, the middle one will
+        // not let go; the other two must still come back.
+        let mut keys = GlobalHotkeys::observable();
+        for (accelerator, action) in [
+            (FREE, "capture.region"),
+            (ALSO_FREE, "capture.window"),
+            (THIRD_FREE, "capture.screen"),
+        ] {
+            keys.register(&key(accelerator), action)
+                .expect("a free combination must bind");
+        }
+        keys.refuse_release(ALSO_FREE, true);
+
+        keys.suspend();
+
+        assert_eq!(
+            holding(&keys),
+            vec![acc(ALSO_FREE).to_string()],
+            "only the stubborn key may still be held"
+        );
+    }
+
+    #[test]
+    fn a_refused_release_stays_on_the_books_so_it_can_be_retried() {
+        let mut keys = GlobalHotkeys::observable();
+        keys.register(&key(FREE), "capture.region")
+            .expect("a free combination must bind");
+        keys.refuse_release(FREE, true);
+
+        keys.suspend();
+        assert_eq!(
+            keys.active_count(),
+            1,
+            "a grab the OS kept must still be tracked as held"
+        );
+        assert_eq!(holding(&keys).len(), 1);
+
+        // The other application lets go. Any later handover retries it.
+        keys.refuse_release(FREE, false);
+        keys.suspend();
+
+        assert!(
+            holding(&keys).is_empty(),
+            "the retry must reach the grab the first attempt could not"
+        );
+        assert_eq!(keys.active_count(), 0);
+    }
+
+    #[test]
+    fn a_refused_release_never_loses_the_configuration() {
+        let mut keys = GlobalHotkeys::observable();
+        keys.register(&key(FREE), "capture.region")
+            .expect("a free combination must bind");
+        keys.register(&key(ALSO_FREE), "capture.window")
+            .expect("a free combination must bind");
+        keys.refuse_release(FREE, true);
+
+        keys.suspend();
+        assert_eq!(
+            keys.bindings().count(),
+            2,
+            "a failed release is not a reason to forget what the user configured"
+        );
+
+        keys.refuse_release(FREE, false);
+        keys.resume().expect("nothing here is contested");
+
+        assert_eq!(holding(&keys).len(), 2);
+        assert_eq!(keys.inactive().count(), 0);
+    }
+
+    #[test]
+    fn a_stubborn_grab_is_cleared_by_a_later_unregister_all() {
+        // The end of the retry story: whatever is still held has to be
+        // reachable from the last thing the process does before it exits.
+        let mut keys = GlobalHotkeys::observable();
+        keys.register(&key(FREE), "capture.region")
+            .expect("a free combination must bind");
+        keys.refuse_release(FREE, true);
+        keys.suspend();
+        assert_eq!(holding(&keys).len(), 1);
+
+        keys.refuse_release(FREE, false);
+        keys.unregister_all();
+
+        assert!(
+            holding(&keys).is_empty(),
+            "an unregister_all that cannot see the grab cannot release it"
+        );
+        assert_eq!(keys.active_count(), 0);
+    }
+
+    #[test]
+    fn removing_one_binding_that_will_not_release_keeps_it_bound() {
+        let mut keys = GlobalHotkeys::observable();
+        keys.register(&key(FREE), "capture.region")
+            .expect("a free combination must bind");
+        keys.refuse_release(FREE, true);
+
+        keys.unregister(&key(FREE))
+            .expect_err("the OS would not give the key back");
+
+        assert_eq!(
+            keys.bindings().count(),
+            1,
+            "the binding is still in force, so it is still configuration"
+        );
+        assert_eq!(keys.active_count(), 1);
+        assert_eq!(holding(&keys).len(), 1);
+
+        keys.refuse_release(FREE, false);
+        keys.unregister(&key(FREE))
+            .expect("the retry must be able to succeed");
+        assert_eq!(keys.bindings().count(), 0);
+        assert!(holding(&keys).is_empty());
+    }
+
+    #[test]
+    fn a_bulk_release_would_have_stranded_the_rest() {
+        // Not a test of the manager: a test of the hazard the manager avoids.
+        // If release_grabs ever goes back to one bulk call, this is the
+        // behaviour it would be buying.
+        let os = FakeOs::default();
+        for accelerator in [FREE, ALSO_FREE, THIRD_FREE] {
+            os.register(acc(accelerator)).expect("free");
+        }
+        os.refuse_release.borrow_mut().insert(acc(ALSO_FREE));
+
+        os.release_all(&[acc(FREE), acc(ALSO_FREE), acc(THIRD_FREE)]);
+
+        assert_eq!(
+            os.held(),
+            HashSet::from([acc(ALSO_FREE), acc(THIRD_FREE)]),
+            "the abort must strand everything after the failure"
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_keeps_a_binding_the_os_had_already_refused() {
+        // The exact sequence: a resume leaves one binding configured but not
+        // held, then an edit fails, and the rollback cannot re-grab the refused
+        // one either. It is still the user's binding.
+        let mut keys = GlobalHotkeys::observable();
+        keys.set_command("scrozz");
+        keys.apply(&[
+            want(FREE, "capture.region"),
+            want(ALSO_FREE, "capture.window"),
+        ])
+        .expect("both are free");
+        keys.suspend();
+
+        // Another application takes one of them while we are stood down.
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        os.refuse.insert(acc(FREE));
+        os.grabbed.borrow_mut().insert(acc(FREE));
+
+        keys.resume().expect_err("one of them is contested now");
+        assert_eq!(keys.bindings().count(), 2);
+        assert_eq!(keys.inactive().count(), 1, "FREE is configured, not held");
+
+        // Now an edit fails outright, so the rollback has to put both back —
+        // including the one the OS will still refuse.
+        let refused = keys
+            .apply(&[
+                want(FREE, "capture.region"),
+                want(THIRD_FREE, "capture.screen"),
+            ])
+            .expect_err("FREE is still taken");
+        assert_eq!(refused.len(), 1);
+
+        let mut rows: Vec<String> = keys
+            .bindings()
+            .map(|(accelerator, action)| format!("{action}={accelerator}"))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                format!("capture.region={}", acc(FREE)),
+                format!("capture.window={}", acc(ALSO_FREE)),
+            ],
+            "a failed edit must leave the configuration exactly as it found it"
+        );
+        assert_eq!(
+            keys.inactive().count(),
+            1,
+            "and the one the OS refuses is still only configured"
+        );
     }
 }

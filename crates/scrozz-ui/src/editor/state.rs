@@ -1213,14 +1213,20 @@ impl EditorState {
             }
             Command::Undo => {
                 self.cancel_drag();
-                self.history.undo(&mut self.document)?;
-                self.after_history();
+                // Only when the document actually moved. An undo with nothing
+                // behind it is not an edit, and treating it as one would clear
+                // a composition in flight and tell the platform IME to cancel
+                // itself over a keystroke that did nothing.
+                if self.history.undo(&mut self.document)? {
+                    self.after_history();
+                }
                 Intent::None
             }
             Command::Redo => {
                 self.cancel_drag();
-                self.history.redo(&mut self.document)?;
-                self.after_history();
+                if self.history.redo(&mut self.document)? {
+                    self.after_history();
+                }
                 Intent::None
             }
             Command::Copy => return Ok(Intent::Copy),

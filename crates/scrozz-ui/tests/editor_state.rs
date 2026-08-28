@@ -2066,3 +2066,223 @@ fn an_undo_that_removes_the_label_still_interrupts() {
 
     assert!(state.ime_interrupt_pending());
 }
+
+// ---------------------------------------------------------------------------
+// Cancelling a label the user never filled in
+// ---------------------------------------------------------------------------
+
+/// A finished rectangle, so there is something on the undo stack worth losing.
+fn with_a_rectangle() -> EditorState {
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 90.0));
+    state
+}
+
+#[test]
+fn escaping_a_fresh_label_after_undoing_its_colour_leaves_nothing_behind() {
+    // The whole sequence in one place: place a label, restyle it, take the
+    // restyle back, then think better of the label. Every one of those is
+    // something a user does without thinking, and the end state has to be the
+    // one they started from.
+    let mut state = typing();
+    state.set_stroke_color(Color::rgb(10, 200, 40));
+    state.command(Command::Undo).expect("undo the colour");
+    state.command(Command::Escape).expect("escape");
+
+    assert!(
+        state.document().annotations().is_empty(),
+        "an empty label the user backed out of must not survive"
+    );
+    state.command(Command::Undo).expect("undo");
+    assert!(
+        state.document().annotations().is_empty(),
+        "and undo must not resurrect it either"
+    );
+}
+
+#[test]
+fn escaping_a_fresh_label_after_undoing_its_width_leaves_nothing_behind() {
+    // The same, through a different style property, because a fix that keys off
+    // which tag the history happens to be carrying would only cover one.
+    let mut state = typing();
+    state.set_stroke_width(9.0);
+    state.command(Command::Undo).expect("undo the width");
+    state.command(Command::Escape).expect("escape");
+
+    assert!(state.document().annotations().is_empty());
+    state.command(Command::Undo).expect("undo");
+    assert!(state.document().annotations().is_empty());
+}
+
+#[test]
+fn undoing_a_fresh_labels_style_then_escaping_keeps_the_earlier_redo() {
+    // A click the user takes back must not cost them a step they can redo. The
+    // rectangle is undone *before* the label is placed, so its redo branch is
+    // what `begin` put into safekeeping.
+    let mut state = with_a_rectangle();
+    state.command(Command::Undo).expect("undo the rectangle");
+    assert!(state.document().annotations().is_empty());
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.set_stroke_color(Color::rgb(10, 200, 40));
+    state.command(Command::Undo).expect("undo the colour");
+    state.command(Command::Escape).expect("escape");
+
+    assert!(
+        state.document().annotations().is_empty(),
+        "the abandoned label must be gone"
+    );
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the rectangle was redoable before the label was placed, and still is"
+    );
+    assert_eq!(
+        state.document().annotations()[0].annotation.kind(),
+        AnnotationKind::Rectangle
+    );
+}
+
+#[test]
+fn escaping_a_fresh_label_after_undoing_its_style_leaves_no_selectable_ghost() {
+    // An empty label is invisible but hit-testable, so a ghost shows up as a
+    // click that selects nothing the user can see.
+    let mut state = typing();
+    state.set_stroke_width(9.0);
+    state.command(Command::Undo).expect("undo the width");
+    state.command(Command::Escape).expect("escape");
+    // The ghost only appears once the removal that was committed is taken back.
+    state.command(Command::Undo).expect("undo");
+
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(at(80.0, 80.0));
+    state.pointer_released();
+    assert!(
+        state.selection().is_none(),
+        "there is nothing there to select"
+    );
+    assert!(state.document().annotations().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Undo and redo that do not move
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_redo_with_no_future_leaves_a_composition_alone() {
+    // Nothing moved, so nothing about the composition is stale. Clearing it and
+    // telling the platform to cancel would throw away glyphs the user is
+    // looking at over a keystroke that did nothing.
+    let mut state = reentered("ab");
+    state.text_edit(&TextEdit::Preedit("か".to_owned()));
+    let before = content(&state);
+    let composing = state.preedit().expect("the composition was tracked");
+    let caret = state.text_caret();
+    let _ = state.take_ime_interrupt();
+
+    state.command(Command::Redo).expect("redo");
+
+    assert_eq!(content(&state), before, "the document must not have moved");
+    assert_eq!(
+        state.preedit(),
+        Some(composing),
+        "the composition is still live"
+    );
+    assert_eq!(state.text_caret(), caret);
+    assert!(
+        !state.ime_interrupt_pending(),
+        "a redo that did nothing must not cancel the IME"
+    );
+}
+
+/// A label that was already in the document when the editor opened — the
+/// history's origin — reopened for editing. Reaching an undo with *nothing*
+/// behind it needs a label the user did not just place.
+fn pre_existing_label() -> EditorState {
+    let mut document = Document::new(capture());
+    document.add(
+        Annotation::Text {
+            at: at(80.0, 80.0),
+            content: "ab".to_owned(),
+        },
+        Style::stroked(),
+    );
+    let mut state = EditorState::new(document);
+    let box_of = state.document().annotations()[0].bounds();
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(at(
+        box_of.origin.x + box_of.size.width / 2.0,
+        box_of.origin.y + box_of.size.height / 2.0,
+    ));
+    state.pointer_released();
+    assert!(state.editing_text().is_some(), "the label must reopen");
+    state
+}
+
+#[test]
+fn an_undo_with_no_past_changes_nothing_and_interrupts_nothing() {
+    let mut state = pre_existing_label();
+    let before = content(&state);
+    let caret = state.text_caret();
+    let _ = state.take_ime_interrupt();
+
+    state.command(Command::Undo).expect("undo");
+
+    assert_eq!(content(&state), before, "there was nothing behind this");
+    assert_eq!(state.preedit(), None);
+    assert_eq!(state.text_caret(), caret, "the caret must not be reset");
+    assert!(
+        !state.ime_interrupt_pending(),
+        "an undo with nothing behind it must not cancel the IME"
+    );
+}
+
+#[test]
+fn a_second_undo_at_the_origin_does_not_interrupt_again() {
+    // The realistic route into a no-op undo: compose, undo — which really does
+    // move and really should interrupt — then press ⌘Z once more out of habit.
+    let mut state = pre_existing_label();
+    state.text_edit(&TextEdit::Preedit("か".to_owned()));
+    state.command(Command::Undo).expect("the real one");
+    assert!(
+        state.take_ime_interrupt(),
+        "the undo that moved has to interrupt"
+    );
+    let before = content(&state);
+    let caret = state.text_caret();
+
+    state.command(Command::Undo).expect("the one that cannot");
+
+    assert_eq!(content(&state), before);
+    assert_eq!(state.preedit(), None);
+    assert_eq!(state.text_caret(), caret);
+    assert!(
+        !state.ime_interrupt_pending(),
+        "the second ⌘Z did nothing, so it must ask for nothing"
+    );
+}
+
+#[test]
+fn a_real_undo_still_interrupts_the_composition_exactly_once() {
+    let mut state = reentered("ab");
+    state.text_edit(&TextEdit::Insert("c".to_owned()));
+    state.text_edit(&TextEdit::Preedit("か".to_owned()));
+    let _ = state.take_ime_interrupt();
+
+    state.command(Command::Undo).expect("undo");
+
+    assert_eq!(content(&state), "ab", "the history did move");
+    assert_eq!(state.preedit(), None);
+    assert!(
+        state.take_ime_interrupt(),
+        "a real undo has to tell the platform to drop its composition"
+    );
+    assert!(
+        !state.ime_interrupt_pending(),
+        "and it must say so exactly once"
+    );
+}
