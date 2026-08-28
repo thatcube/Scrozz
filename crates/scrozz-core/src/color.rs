@@ -294,10 +294,16 @@ impl Transform {
     #[must_use]
     pub fn convert_linear(&self, linear: [f32; 3]) -> [f32; 3] {
         let Some(matrix) = self.matrix else {
+            // No matrix means no conversion: `convert` and `convert_u8` hand the
+            // colour straight back, and this has to agree with them. The caller
+            // has already linearised with the *source* curve, so undoing that is
+            // the source curve too — encoding with `to` would silently regrade
+            // the image whenever the two curves differ, which is exactly what
+            // Rec. 2020 into an unlabelled destination used to do.
             return [
-                from_linear(linear[0], self.to),
-                from_linear(linear[1], self.to),
-                from_linear(linear[2], self.to),
+                from_linear(linear[0], self.from),
+                from_linear(linear[1], self.from),
+                from_linear(linear[2], self.from),
             ];
         };
         let converted = apply(matrix, linear);
@@ -473,6 +479,91 @@ mod tests {
         let table = t.source_linear_table();
         let out = t.convert_linear([table[128], table[128], table[128]]);
         assert!((out[0] - 128.0 / 255.0).abs() < 1e-3, "{out:?}");
+    }
+
+    /// Every space whose bytes we might be handed, paired with a value that
+    /// exercises the curved part of its transfer function.
+    const SPACES: [ColorSpace; 4] = [
+        ColorSpace::Srgb,
+        ColorSpace::DisplayP3,
+        ColorSpace::Rec2020,
+        ColorSpace::Unknown,
+    ];
+
+    #[test]
+    fn a_transform_with_no_matrix_is_the_same_conversion_whichever_way_it_is_driven() {
+        // `convert_u8` hands a colour back untouched when there is no matrix.
+        // The table-driven path has to reach the same answer, or a per-pixel
+        // loop and a per-annotation colour disagree about the same conversion.
+        // Rec. 2020 is the case that caught this: its transfer function is the
+        // BT.709 curve, not sRGB's, so re-encoding with the wrong one moved
+        // mid-grey from 128 to 140.
+        for from in SPACES {
+            for to in SPACES {
+                let t = Transform::new(from, to);
+                if !t.is_identity() {
+                    continue;
+                }
+                let table = t.source_linear_table();
+                for byte in [0u8, 1, 17, 64, 128, 200, 254, 255] {
+                    let out = t.convert_linear([table[byte as usize]; 3]);
+                    let got = (out[0] * 255.0).round() as u8;
+                    assert_eq!(
+                        got, byte,
+                        "{from:?} -> {to:?} moved {byte} to {got} through the table"
+                    );
+                    assert_eq!(
+                        t.convert_u8([byte; 3]),
+                        [byte; 3],
+                        "{from:?} -> {to:?} is supposed to be a pass-through"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rec2020_into_an_unlabelled_destination_does_not_regrade_the_image() {
+        // The exact regression: mid-grey came out ~140 through the table and
+        // 128 through `convert_u8`.
+        let t = Transform::new(ColorSpace::Rec2020, ColorSpace::Unknown);
+        let table = t.source_linear_table();
+        let out = t.convert_linear([table[128]; 3]);
+        assert_eq!((out[0] * 255.0).round() as u8, 128);
+        assert_eq!(t.convert_u8([128, 128, 128]), [128, 128, 128]);
+    }
+
+    #[test]
+    fn a_real_conversion_still_agrees_with_itself_across_both_paths() {
+        // The no-matrix fix must not have changed what happens when there *is*
+        // a matrix: the two entry points are the same conversion there too.
+        for (from, to) in [
+            (ColorSpace::Srgb, ColorSpace::DisplayP3),
+            (ColorSpace::DisplayP3, ColorSpace::Srgb),
+            (ColorSpace::Srgb, ColorSpace::Rec2020),
+            (ColorSpace::Rec2020, ColorSpace::DisplayP3),
+        ] {
+            let t = Transform::new(from, to);
+            assert!(!t.is_identity(), "{from:?} -> {to:?} should convert");
+            let table = t.source_linear_table();
+            for rgb in [[220u8, 40, 30], [30, 200, 90], [10, 60, 240], [128; 3]] {
+                let linear = [
+                    table[rgb[0] as usize],
+                    table[rgb[1] as usize],
+                    table[rgb[2] as usize],
+                ];
+                let via_table = t.convert_linear(linear);
+                let direct = t.convert_u8(rgb);
+                for c in 0..3 {
+                    let got = (via_table[c] * 255.0).round() as u8;
+                    assert!(
+                        got.abs_diff(direct[c]) <= 1,
+                        "{from:?} -> {to:?} {rgb:?}: table gave {got}, direct gave {}",
+                        direct[c]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -34,6 +34,22 @@ use crate::document::{Document, DocumentData};
 /// bounded so a long-lived editor window cannot grow without limit.
 pub const DEFAULT_LIMIT: usize = 200;
 
+/// A caller-supplied marker recorded alongside a state.
+///
+/// The history has no idea what it means. The editor uses it for the text
+/// caret, which belongs to the moment an edit was made rather than to the
+/// drawing: putting it in [`DocumentData`] would serialise it into the sidecar
+/// and make two identical annotations compare unequal because someone's cursor
+/// happened to be somewhere else.
+pub type Mark = u64;
+
+/// A recorded state and the caller's marker for it.
+#[derive(Debug, Clone)]
+struct Step {
+    data: DocumentData,
+    mark: Mark,
+}
+
 /// A bounded undo/redo stack over a document's editable state.
 ///
 /// The history does not own the document; it is handed one to snapshot and one
@@ -41,12 +57,42 @@ pub const DEFAULT_LIMIT: usize = 200;
 /// likes, and makes the history itself trivially testable.
 #[derive(Debug, Clone)]
 pub struct History {
-    past: Vec<DocumentData>,
-    present: DocumentData,
-    future: Vec<DocumentData>,
+    past: Vec<Step>,
+    present: Step,
+    future: Vec<Step>,
     /// The tag of the step in progress, if the last commit was coalescible.
     tag: Option<String>,
+    /// The rollback point of the edit in progress, if one was opened.
+    open: Option<Open>,
+    /// The marker the next recorded state will carry.
+    cursor: Mark,
+    /// How many steps have been dropped off the front of `past` to stay within
+    /// the limit, so a rollback point can be expressed as a depth that a later
+    /// eviction cannot silently move.
+    evicted: usize,
     limit: usize,
+}
+
+/// Where an edit in progress began, so it can be undone as though it never was.
+///
+/// This is deliberately not "the last step" or "steps sharing a tag". An edit
+/// the user might abandon is not one commit: placing a label and then changing
+/// its colour before typing anything is two, under two different tags. What
+/// makes it one thing is that the user started it and has not finished it, and
+/// only the caller who started it knows that.
+#[derive(Debug, Clone)]
+struct Open {
+    /// Undo depth at the moment the edit began, counted from the start of the
+    /// session so eviction cannot invalidate it.
+    depth: usize,
+    present: Step,
+    /// The redo branch as it stood before the edit began.
+    ///
+    /// It is moved here rather than copied: `push` would have cleared it
+    /// anyway, so while the edit is open there is nothing to redo, and if the
+    /// edit is abandoned it comes back untouched.
+    future: Vec<Step>,
+    tag: Option<String>,
 }
 
 impl History {
@@ -64,9 +110,15 @@ impl History {
     pub fn with_limit(document: &Document, limit: usize) -> Self {
         Self {
             past: Vec::new(),
-            present: document.data(),
+            present: Step {
+                data: document.data(),
+                mark: 0,
+            },
             future: Vec::new(),
             tag: None,
+            open: None,
+            cursor: 0,
+            evicted: 0,
             limit,
         }
     }
@@ -78,7 +130,7 @@ impl History {
     /// started — never costs an undo the user has to press twice.
     pub fn commit(&mut self, document: &Document) {
         let data = document.data();
-        if data == self.present {
+        if data == self.present.data {
             return;
         }
         self.tag = None;
@@ -96,13 +148,16 @@ impl History {
     /// rather than a merged two.
     pub fn commit_coalesced(&mut self, document: &Document, tag: &str) {
         let data = document.data();
-        if data == self.present {
+        if data == self.present.data {
             return;
         }
         if self.tag.as_deref() == Some(tag) {
             // Extend the step already in progress: the past keeps the state
             // from before the gesture began, so one undo still reverts it all.
-            self.present = data;
+            self.present = Step {
+                data,
+                mark: self.cursor,
+            };
             self.future.clear();
             return;
         }
@@ -110,7 +165,37 @@ impl History {
         self.tag = Some(tag.to_owned());
     }
 
-    /// Discards the open coalescing group, restoring `document` to before it.
+    /// Marks the start of an edit the caller may decide never happened.
+    ///
+    /// Call it *before* making the change — before the annotation is added, not
+    /// after. Everything committed from here until [`Self::finish`] or
+    /// [`Self::abandon`] belongs to one reversible unit, however many commits
+    /// or tags it turns out to span.
+    ///
+    /// Opening a second edit finishes the first, which is the only sane reading
+    /// of starting something new while something is unfinished.
+    pub fn begin(&mut self) {
+        self.finish();
+        self.open = Some(Open {
+            depth: self.evicted + self.past.len(),
+            present: self.present.clone(),
+            // Taking it leaves the redo stack empty, which is exactly what the
+            // first commit of this edit would have done. If the edit is
+            // abandoned it goes back, and nothing the user could redo was lost
+            // to a click they took back.
+            future: std::mem::take(&mut self.future),
+            tag: self.tag.clone(),
+        });
+    }
+
+    /// Accepts the edit in progress, making it permanent.
+    ///
+    /// Harmless when no edit is open.
+    pub fn finish(&mut self) {
+        self.open = None;
+    }
+
+    /// Discards the edit in progress, restoring `document` to before it began.
     ///
     /// # Why this is not [`undo`](Self::undo)
     ///
@@ -121,29 +206,36 @@ impl History {
     /// something they never made comes back. There is nothing to redo either,
     /// because nothing happened.
     ///
-    /// Only the open group is discarded. Anything sealed before it is untouched,
-    /// so this cannot swallow an edit the user did finish.
+    /// Everything sealed before the edit began is untouched, including the redo
+    /// branch: abandoning something the user never did must not cost them
+    /// something they did.
     ///
-    /// Returns `false` when there is no open group to abandon — the caller
-    /// still has to clean up the document itself in that case.
+    /// Returns `false` when there is no edit to abandon, or when the point it
+    /// began has since been evicted from a full history — the caller still has
+    /// to clean up the document itself in those cases.
+    ///
     /// # Errors
     ///
     /// Returns an error only if the recorded state cannot be applied to this
     /// document, for the same reason [`undo`](Self::undo) can.
     pub fn abandon(&mut self, document: &mut Document) -> Result<bool> {
-        if self.tag.is_none() {
-            return Ok(false);
-        }
-        let Some(previous) = self.past.last().cloned() else {
-            // A zero-limit history keeps no past, so there is nothing to go back
-            // to and the caller has to undo the change by hand.
-            self.tag = None;
+        let Some(open) = self.open.take() else {
             return Ok(false);
         };
-        document.restore(previous.clone())?;
-        self.past.pop();
-        self.present = previous;
-        self.tag = None;
+        // A history so short that the beginning of this edit has already fallen
+        // off the back of it. Nothing sensible to roll back to.
+        let Some(target) = open.depth.checked_sub(self.evicted) else {
+            return Ok(false);
+        };
+        if target > self.past.len() {
+            return Ok(false);
+        }
+        document.restore(open.present.data.clone())?;
+        self.past.truncate(target);
+        self.cursor = open.present.mark;
+        self.present = open.present;
+        self.future = open.future;
+        self.tag = open.tag;
         Ok(true)
     }
 
@@ -194,11 +286,15 @@ impl History {
         let Some(previous) = self.past.pop() else {
             return Ok(false);
         };
-        match document.restore(previous.clone()) {
+        match document.restore(previous.data.clone()) {
             Ok(()) => {
+                self.cursor = previous.mark;
                 let current = std::mem::replace(&mut self.present, previous);
                 self.future.push(current);
                 self.tag = None;
+                // Navigating the history makes the edit in progress part of it:
+                // its rollback point no longer describes where the document is.
+                self.finish();
                 Ok(true)
             }
             Err(error) => {
@@ -219,11 +315,13 @@ impl History {
         let Some(next) = self.future.pop() else {
             return Ok(false);
         };
-        match document.restore(next.clone()) {
+        match document.restore(next.data.clone()) {
             Ok(()) => {
+                self.cursor = next.mark;
                 let current = std::mem::replace(&mut self.present, next);
                 self.past.push(current);
                 self.tag = None;
+                self.finish();
                 Ok(true)
             }
             Err(error) => {
@@ -233,22 +331,50 @@ impl History {
         }
     }
 
+    /// Records the caller's marker for wherever the document now stands.
+    ///
+    /// The editor calls this as the caret moves, so the marker travels with the
+    /// state rather than with the keystroke that happened to commit it. Undo and
+    /// redo then put the caret back where it was when that state was on screen,
+    /// instead of leaving it wherever the user last was and hoping it still
+    /// points at something sensible.
+    pub const fn mark(&mut self, mark: Mark) {
+        self.cursor = mark;
+        self.present.mark = mark;
+    }
+
+    /// The marker belonging to the state the document is at.
+    #[must_use]
+    pub const fn current_mark(&self) -> Mark {
+        self.present.mark
+    }
+
     /// Forgets every step, keeping the document's current state as the origin.
     pub fn reset(&mut self, document: &Document) {
         self.past.clear();
         self.future.clear();
-        self.present = document.data();
+        self.present = Step {
+            data: document.data(),
+            mark: self.cursor,
+        };
         self.tag = None;
+        self.open = None;
+        self.evicted = 0;
     }
 
     /// Pushes `data` as the new present, discarding any redo branch.
     fn push(&mut self, data: DocumentData) {
-        let previous = std::mem::replace(&mut self.present, data);
+        let step = Step {
+            data,
+            mark: self.cursor,
+        };
+        let previous = std::mem::replace(&mut self.present, step);
         self.past.push(previous);
         self.future.clear();
         if self.past.len() > self.limit {
             let excess = self.past.len() - self.limit;
             self.past.drain(..excess);
+            self.evicted += excess;
         }
     }
 }

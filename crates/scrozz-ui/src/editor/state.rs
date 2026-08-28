@@ -451,6 +451,15 @@ pub struct EditorState {
     /// Whether [`editing_text`](Self::editing_text) was created by the click
     /// that opened it. See [`EditorState::finish_text`].
     text_is_new: bool,
+    /// Whether the platform must be told to drop any composition in flight.
+    ///
+    /// Clearing our own idea of the preedit is not enough. The IME lives in
+    /// another process and still believes it is composing; the next Preedit or
+    /// Commit it sends would splice glyphs from an undone edit into text that no
+    /// longer has room for them. egui carries the instruction in `IMEOutput`,
+    /// and it has to be sent exactly once — repeating it would cancel every
+    /// composition the user starts afterwards.
+    interrupt_ime: bool,
     caret: usize,
     preedit: Option<Range<usize>>,
     zoom: f32,
@@ -475,6 +484,7 @@ impl EditorState {
             drag: Drag::Idle,
             editing_text: None,
             text_is_new: false,
+            interrupt_ime: false,
             caret: 0,
             preedit: None,
             zoom: 1.0,
@@ -732,6 +742,7 @@ impl EditorState {
 
         self.set_text_buffer(&next);
         self.caret = caret.min(next.len());
+        self.mark_caret();
         self.preedit = preedit;
     }
 
@@ -771,6 +782,7 @@ impl EditorState {
         self.text_is_new = fresh;
         self.caret = self.text_buffer().map_or(0, str::len);
         self.preedit = None;
+        self.mark_caret();
     }
 
     /// Finishes text entry, removing the annotation if nothing was typed.
@@ -800,6 +812,7 @@ impl EditorState {
         // means on any platform.
         self.preedit = None;
         self.caret = 0;
+        self.mark_caret();
         let empty = matches!(
             self.document.get(id).map(|o| &o.annotation),
             Some(Annotation::Text { content, .. }) if content.trim().is_empty()
@@ -819,6 +832,9 @@ impl EditorState {
             }
             self.document.remove(id);
         }
+        // Whatever the label turned out to be, it is now the user's: there is
+        // no longer a click to take back.
+        self.history.finish();
         self.history.seal();
         self.commit();
         self.touch();
@@ -1040,7 +1056,14 @@ impl EditorState {
                     },
                 };
             }
-            Drag::Panning { grab, start } => self.drag = Drag::Panning { grab, start },
+            Drag::Panning { grab, start } => {
+                // The pan itself arrives through `pan_to`, which is view-only.
+                // Restoring the state and returning keeps it that way even if a
+                // host feeds pan gestures through the ordinary drag path.
+                self.drag = Drag::Panning { grab, start };
+                self.touch_view();
+                return;
+            }
         }
         self.touch();
     }
@@ -1048,6 +1071,14 @@ impl EditorState {
     /// Handles the primary button being released.
     pub fn pointer_released(&mut self) {
         let drag = std::mem::replace(&mut self.drag, Drag::Idle);
+        // Letting go of a pan changes nothing the renderer has to redraw: the
+        // same picture is simply somewhere else. Falling through to the commit
+        // and the content touch below would spend a document revision, and the
+        // preview would be rasterised and re-uploaded at 2400px for a mouse-up.
+        if matches!(drag, Drag::Panning { .. }) {
+            self.touch_view();
+            return;
+        }
         match drag {
             Drag::Creating { id: Some(id), .. } => {
                 self.selection = Some(id);
@@ -1308,6 +1339,10 @@ impl EditorState {
     fn place(&mut self, tool: Tool, point: LogicalPoint) {
         let id = match tool {
             Tool::Text => {
+                // The rollback point has to predate the annotation, so this
+                // must happen before the document is touched: abandoning is
+                // "the click never happened", and the click added this.
+                self.history.begin();
                 let id = self.document.add(
                     Annotation::Text {
                         at: point,
@@ -1433,17 +1468,46 @@ impl EditorState {
         // its byte range would leave `text_edit` addressing text that no longer
         // exists, and the platform IME has no idea the document moved under it.
         self.preedit = None;
+        self.interrupt_ime = true;
 
-        // The caret is a byte offset into text the history just replaced. After
-        // undoing past a multi-byte character the old offset can land *inside* a
-        // code point, and the next insert or delete would slice a `String` off a
-        // character boundary and panic. Clamp it to the restored text.
+        // The caret goes back to where it was when this state was last on
+        // screen, not wherever the user happened to leave it. Typing "a", then
+        // "é", then undoing and redoing must leave the caret after the "é" — a
+        // clamp alone would leave it at 1 and the next character would land in
+        // the middle. The clamp is still applied on top, because a marker
+        // recorded against different text can point inside a code point and
+        // slicing there would panic.
+        let mark = usize::try_from(self.history.current_mark()).unwrap_or(usize::MAX);
         self.caret = match self.editing_text.and_then(|id| self.text_of(id)) {
-            Some(text) => clamp_boundary(text, self.caret),
+            Some(text) => clamp_boundary(text, mark),
             None => 0,
         };
 
         self.dirty = true;
+    }
+
+    /// Records the caret against the state the history is about to keep.
+    fn mark_caret(&mut self) {
+        self.history
+            .mark(u64::try_from(self.caret).unwrap_or(u64::MAX));
+    }
+
+    /// Takes the pending instruction to interrupt the platform's composition.
+    ///
+    /// One-shot: the flag is cleared by reading it, because the instruction has
+    /// to reach the IME exactly once. Leaving it set would cancel the next
+    /// composition the user starts, which is indistinguishable from the IME
+    /// being broken.
+    pub const fn take_ime_interrupt(&mut self) -> bool {
+        let pending = self.interrupt_ime;
+        self.interrupt_ime = false;
+        pending
+    }
+
+    /// Whether an interruption is still waiting to be sent.
+    #[must_use]
+    pub const fn ime_interrupt_pending(&self) -> bool {
+        self.interrupt_ime
     }
 
     /// The content of `id`, if it is a text annotation.

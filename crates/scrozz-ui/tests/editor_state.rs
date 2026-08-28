@@ -1664,3 +1664,405 @@ fn a_pan_that_goes_nowhere_costs_nothing() {
     state.pan_to((100.0, 100.0));
     assert_eq!(state.view_revision(), view);
 }
+
+#[test]
+fn abandoning_an_empty_label_does_not_cost_a_pending_redo() {
+    // The user drew something, took it back, then thought about a label and
+    // thought better of that too. The rectangle is still theirs to bring back:
+    // a click they cancelled cannot spend an undo they had banked.
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    state.pointer_pressed(at(10.0, 10.0));
+    state.pointer_dragged(at(90.0, 90.0), false);
+    state.pointer_released();
+
+    state.command(Command::Undo).expect("undo");
+    assert_eq!(state.document().annotations().len(), 0);
+    assert!(state.can_redo(), "the rectangle should be redoable");
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.command(Command::Escape).expect("escape");
+
+    assert!(
+        state.can_redo(),
+        "abandoning a label the user never typed into destroyed their redo"
+    );
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the rectangle did not come back"
+    );
+}
+
+#[test]
+fn abandoning_an_empty_label_after_changing_its_colour_leaves_nothing() {
+    // Placing a label and then picking a colour for it is still a label the
+    // user never typed into. The colour change is not an edit they made to the
+    // document; it is part of the same unfinished thought.
+    let mut state = state();
+    let before = state.undo_depth();
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(40.0, 40.0));
+    state.pointer_released();
+    state.set_stroke_color(Color::rgb(200, 30, 30));
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(
+        state.document().annotations().len(),
+        0,
+        "a ghost label survived, invisible and selectable"
+    );
+    assert_eq!(
+        state.undo_depth(),
+        before,
+        "the colour change left an undoable step for something that does not exist"
+    );
+}
+
+#[test]
+fn abandoning_an_empty_label_after_changing_its_width_leaves_nothing() {
+    let mut state = state();
+    let before = state.undo_depth();
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(40.0, 40.0));
+    state.pointer_released();
+    state.set_stroke_width(9.0);
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(state.document().annotations().len(), 0);
+    assert_eq!(state.undo_depth(), before);
+}
+
+#[test]
+fn a_style_change_while_a_fresh_label_is_open_does_not_cost_a_pending_redo() {
+    // The two failures compounded: a style edit before abandoning used to both
+    // strand the label and take the redo branch with it.
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    state.pointer_pressed(at(10.0, 10.0));
+    state.pointer_dragged(at(90.0, 90.0), false);
+    state.pointer_released();
+    state.command(Command::Undo).expect("undo");
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.set_stroke_color(Color::rgb(10, 200, 10));
+    state.set_stroke_width(7.0);
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(state.document().annotations().len(), 0);
+    assert!(state.can_redo(), "the rectangle is no longer redoable");
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(state.document().annotations().len(), 1);
+}
+
+#[test]
+fn a_label_the_user_did_type_into_is_a_real_edit_that_ends_the_redo_branch() {
+    // The mirror of the tests above: once there are glyphs in it, the label is
+    // a genuine edit, and a genuine edit is what redo is supposed to lose.
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    state.pointer_pressed(at(10.0, 10.0));
+    state.pointer_dragged(at(90.0, 90.0), false);
+    state.pointer_released();
+    state.command(Command::Undo).expect("undo");
+    assert!(state.can_redo());
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.text_edit(&TextEdit::Insert("hello".to_owned()));
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(state.document().annotations().len(), 1);
+    assert!(
+        !state.can_redo(),
+        "a real edit must retire the redo branch it replaced"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Panning is a view change, from the first press to the last release
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_whole_pan_gesture_never_touches_the_content_revision() {
+    // The preview is rasterised at 2400px and uploaded to the GPU whenever the
+    // content revision moves. A pan must cost none of that: the picture has not
+    // changed, only where it sits.
+    let mut state = state();
+    let content = state.revision();
+    let view = state.view_revision();
+
+    state.begin_pan((100.0, 100.0));
+    state.pan_to((140.0, 90.0));
+    state.pan_to((180.0, 70.0));
+    state.pointer_released();
+
+    assert_eq!(
+        state.revision(),
+        content,
+        "panning rerasterised the preview"
+    );
+    assert!(
+        state.view_revision() > view,
+        "the viewport moved but nothing was asked to redraw"
+    );
+}
+
+#[test]
+fn releasing_a_pan_leaves_the_pan_where_the_gesture_put_it() {
+    let mut state = state();
+    state.begin_pan((100.0, 100.0));
+    state.pan_to((160.0, 120.0));
+    let panned = state.pan();
+    state.pointer_released();
+
+    assert_eq!(state.pan(), panned, "the release snapped the view back");
+}
+
+#[test]
+fn a_pan_fed_through_the_ordinary_drag_path_is_still_view_only() {
+    // Some hosts route every pointer move through `pointer_dragged` rather than
+    // calling `pan_to`. That must not turn a pan into a document edit.
+    let mut state = state();
+    let content = state.revision();
+
+    state.begin_pan((100.0, 100.0));
+    state.pointer_dragged(at(140.0, 90.0), false);
+    state.pointer_released();
+
+    assert_eq!(state.revision(), content);
+}
+
+#[test]
+fn a_real_edit_still_spends_a_content_revision() {
+    // The guard above must not have made every gesture free.
+    let mut state = state();
+    let content = state.revision();
+
+    state.set_tool(Tool::Rectangle);
+    state.pointer_pressed(at(10.0, 10.0));
+    state.pointer_dragged(at(90.0, 90.0), false);
+    state.pointer_released();
+
+    assert!(
+        state.revision() > content,
+        "drawing a rectangle did not ask for a redraw"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// History restores the caret that belonged to the state
+// ---------------------------------------------------------------------------
+
+/// A label holding `text`, closed, then clicked back into with the caret at
+/// the end — the state a user is in when they edit something they made earlier.
+///
+/// Placing a label and typing into it is deliberately one undo step, so a
+/// second visit is what it takes to have history *inside* a label at all.
+/// `text` needs at least two characters: a narrower box is entirely covered by
+/// its own resize handles, so a click lands on a handle rather than the glyphs.
+fn reentered(text: &str) -> EditorState {
+    let mut state = typed(text);
+    state.command(Command::Escape).expect("escape");
+
+    let box_of = state.document().annotations()[0].bounds();
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(at(
+        box_of.origin.x + box_of.size.width / 2.0,
+        box_of.origin.y + box_of.size.height / 2.0,
+    ));
+    state.pointer_released();
+    assert!(
+        state.editing_text().is_some(),
+        "clicking a label should reopen it"
+    );
+    state
+}
+
+#[test]
+fn redo_puts_the_caret_after_the_character_it_brought_back() {
+    // The review's case: append "é" to a label, undo, redo, then type "x".
+    // The caret has to come back after the "é" — clamping the old byte offset
+    // would leave it at 2 and the "x" would land inside the word.
+    let mut state = reentered("ha");
+    state.text_edit(&TextEdit::Insert("é".to_owned()));
+    assert_eq!(state.text_buffer(), Some("haé"));
+
+    state.command(Command::Undo).expect("undo");
+    assert_eq!(state.text_buffer(), Some("ha"));
+    assert_eq!(state.text_caret(), 2, "the caret should be after the 'a'");
+
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(state.text_buffer(), Some("haé"));
+    assert_eq!(
+        state.text_caret(),
+        4,
+        "the caret did not come back with the character"
+    );
+
+    state.text_edit(&TextEdit::Insert("x".to_owned()));
+    assert_eq!(state.text_buffer(), Some("haéx"));
+}
+
+#[test]
+fn undo_puts_the_caret_where_it_was_when_that_state_was_on_screen() {
+    let mut state = reentered("ab");
+    state.text_edit(&TextEdit::Insert("cd".to_owned()));
+
+    state.command(Command::Undo).expect("undo");
+
+    assert_eq!(state.text_buffer(), Some("ab"));
+    assert_eq!(state.text_caret(), 2);
+    state.text_edit(&TextEdit::Insert("!".to_owned()));
+    assert_eq!(state.text_buffer(), Some("ab!"));
+}
+
+#[test]
+fn a_middle_insertion_survives_a_round_trip_through_the_history() {
+    // Typing into the middle, taking it back, and putting it back again must
+    // leave the caret at the site of the edit — not at the end of the string.
+    let mut state = reentered("aé");
+    state.text_edit(&TextEdit::Caret(Caret::LineStart));
+    state.text_edit(&TextEdit::Insert("z".to_owned()));
+    assert_eq!(state.text_buffer(), Some("zaé"));
+    assert_eq!(state.text_caret(), 1);
+
+    state.command(Command::Undo).expect("undo");
+    assert_eq!(state.text_buffer(), Some("aé"));
+    assert_eq!(state.text_caret(), 0, "the caret left the site of the edit");
+
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(state.text_buffer(), Some("zaé"));
+    assert_eq!(state.text_caret(), 1);
+
+    state.text_edit(&TextEdit::Insert("y".to_owned()));
+    assert_eq!(state.text_buffer(), Some("zyaé"));
+}
+
+#[test]
+fn a_composition_interrupted_by_undo_does_not_resurrect_on_redo() {
+    // An IME is mid-composition when the user undoes. The preedit belongs to
+    // keystrokes that no longer exist, and redo must not bring it back as if it
+    // had been committed.
+    let mut state = reentered("ab");
+    state.text_edit(&TextEdit::Insert("cd".to_owned()));
+    state.text_edit(&TextEdit::Preedit("にほ".to_owned()));
+
+    state.command(Command::Undo).expect("undo");
+    assert!(state.take_ime_interrupt(), "the IME was not told to stop");
+    assert_eq!(state.text_buffer(), Some("ab"));
+
+    // Composition is composited into the document so it draws, so redo does
+    // restore those glyphs — but as ordinary text, exactly as committing them
+    // would have. What must not survive is the *range*: if the editor still
+    // believed a composition were open there, the next keystroke would replace
+    // the glyphs instead of following them.
+    state.command(Command::Redo).expect("redo");
+    state.text_edit(&TextEdit::Insert("!".to_owned()));
+    assert_eq!(
+        state.text_buffer(),
+        Some("abcdにほ!"),
+        "the restored text was still treated as an open composition"
+    );
+}
+
+#[test]
+fn a_restored_caret_is_still_clamped_to_a_character_boundary() {
+    // The marker is recorded against one string and restored into another, so
+    // it can still point inside a code point. Slicing there would panic.
+    let mut state = typed("aébc");
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+
+    for _ in 0..4 {
+        state.command(Command::Undo).expect("undo");
+        let len = state.text_buffer().map_or(0, str::len);
+        assert!(state.text_caret() <= len);
+        if let Some(text) = state.text_buffer() {
+            assert!(text.is_char_boundary(state.text_caret()));
+        }
+    }
+    // And the editor is still usable afterwards.
+    state.text_edit(&TextEdit::Insert("ü".to_owned()));
+}
+
+// ---------------------------------------------------------------------------
+// Interrupting the platform's composition
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undo_asks_the_platform_to_drop_a_composition_in_flight() {
+    let mut state = typed("hello");
+    assert!(
+        !state.ime_interrupt_pending(),
+        "nothing has moved the text yet"
+    );
+
+    state.command(Command::Undo).expect("undo");
+
+    assert!(
+        state.ime_interrupt_pending(),
+        "the IME was left composing against text the undo replaced"
+    );
+}
+
+#[test]
+fn redo_asks_the_platform_to_drop_a_composition_in_flight() {
+    let mut state = typed("hello");
+    state.command(Command::Undo).expect("undo");
+    let _ = state.take_ime_interrupt();
+
+    state.command(Command::Redo).expect("redo");
+
+    assert!(state.ime_interrupt_pending());
+}
+
+#[test]
+fn the_interruption_is_sent_once_and_then_forgotten() {
+    // Left set, it would cancel every composition the user starts afterwards,
+    // which looks exactly like a broken IME.
+    let mut state = typed("hello");
+    state.command(Command::Undo).expect("undo");
+
+    assert!(state.take_ime_interrupt(), "the first frame must carry it");
+    assert!(
+        !state.take_ime_interrupt(),
+        "the instruction was still queued a frame later"
+    );
+    assert!(!state.ime_interrupt_pending());
+}
+
+#[test]
+fn ordinary_typing_never_interrupts_a_composition() {
+    let mut state = typing();
+    state.text_edit(&TextEdit::Preedit("にほ".to_owned()));
+    state.text_edit(&TextEdit::Insert("日本".to_owned()));
+    state.text_edit(&TextEdit::Caret(Caret::Left));
+
+    assert!(
+        !state.ime_interrupt_pending(),
+        "the user's own typing cancelled their own composition"
+    );
+}
+
+#[test]
+fn an_undo_that_removes_the_label_still_interrupts() {
+    // The composition has to be cancelled even though there is no longer a
+    // caret to draw, or the IME commits into a label that no longer exists.
+    let mut state = typing();
+    state.text_edit(&TextEdit::Insert("hi".to_owned()));
+    state.command(Command::Escape).expect("escape");
+    state.command(Command::Undo).expect("undo");
+    state.command(Command::Undo).expect("undo");
+
+    assert!(state.ime_interrupt_pending());
+}

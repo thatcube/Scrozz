@@ -277,7 +277,11 @@ pub fn draw_canvas(
     let chrome = ui.painter_at(area);
     draw_crop_scrim(&chrome, state, &view, palette);
     draw_selection(&chrome, state, &view, palette);
-    draw_caret(ui, &chrome, state, &view, palette);
+    // Taken before drawing, so it is consumed whether or not there is still a
+    // caret to draw: an undo that removed the label outright must not leave the
+    // instruction queued for the next label the user makes.
+    let interrupt = state.take_ime_interrupt();
+    draw_caret(ui, &chrome, state, &view, palette, interrupt);
     cursor(ui, state, &response);
     view
 }
@@ -293,6 +297,7 @@ fn draw_caret(
     state: &EditorState,
     view: &CanvasView,
     palette: &Palette,
+    interrupt: bool,
 ) {
     let Some(id) = state.editing_text() else {
         return;
@@ -336,9 +341,11 @@ fn draw_caret(
             rect: caret.expand(2.0),
             cursor_rect: caret,
             purpose: egui::IMEPurpose::Normal,
-            // The caret only ever moves here by the user's own action, so a
-            // composition in flight is never stale enough to need interrupting.
-            should_interrupt_composition: false,
+            // Set only when the history moved the text under the IME. The IME
+            // is in another process and would otherwise keep composing against
+            // a string that no longer exists, committing glyphs from an edit the
+            // user already took back.
+            should_interrupt_composition: interrupt,
         });
     });
 }

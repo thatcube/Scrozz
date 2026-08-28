@@ -95,9 +95,8 @@ impl Scaled {
     }
 }
 
-/// A solid-colour paint with `opacity` folded into its alpha.
+/// An annotation colour moved into the working space.
 ///
-/// `into` converts the colour into the working space before it is painted.
 /// Annotation colours are authored in sRGB — the swatch the user picked is an
 /// sRGB triple — but the canvas is in the *capture's* space, which for a modern
 /// Mac screenshot is Display P3. Writing sRGB bytes into a P3 buffer paints a
@@ -106,6 +105,19 @@ impl Scaled {
 /// The conversion is a no-op for an sRGB or unknown source, which is the common
 /// case, and costs a handful of operations per *annotation* either way — this is
 /// nowhere near the per-pixel path.
+///
+/// Everything that puts a user-chosen colour onto the canvas goes through here,
+/// including the ones that bypass [`paint`] because they write pixels directly.
+#[must_use]
+pub fn working(color: Color, into: ColorTransform) -> Color {
+    let [r, g, b] = into.convert_u8([color.r, color.g, color.b]);
+    Color::rgba(r, g, b, color.a)
+}
+
+/// A solid-colour paint with `opacity` folded into its alpha.
+///
+/// `into` converts the colour into the working space before it is painted; see
+/// [`working`].
 #[must_use]
 pub fn paint(
     color: Color,
@@ -113,14 +125,13 @@ pub fn paint(
     blend_mode: BlendMode,
     into: ColorTransform,
 ) -> Paint<'static> {
-    let c = color.scaled_alpha(opacity);
-    let [r, g, b] = into.convert_u8([c.r, c.g, c.b]);
+    let c = working(color.scaled_alpha(opacity), into);
     let mut paint = Paint {
         anti_alias: true,
         blend_mode,
         ..Paint::default()
     };
-    paint.shader = Shader::SolidColor(tiny_skia::Color::from_rgba8(r, g, b, c.a));
+    paint.shader = Shader::SolidColor(tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a));
     paint
 }
 

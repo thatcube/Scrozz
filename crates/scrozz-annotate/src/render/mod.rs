@@ -253,13 +253,18 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled, into:
                 RedactStyle::Blur => redact::blur(canvas, region),
                 RedactStyle::Pixelate => redact::pixelate(canvas, region),
                 RedactStyle::Solid => {
+                    // A solid redaction writes its pixels directly rather than
+                    // going through a `Paint`, so it has to be moved into the
+                    // working space by hand — otherwise a custom redaction
+                    // colour is the one annotation colour that comes out wrong
+                    // on a wide-gamut capture.
                     let color = object
                         .style
                         .fill
                         .or(Some(object.style.stroke))
                         .filter(|c| !c.is_invisible())
                         .unwrap_or(Color::BLACK);
-                    redact::solid(canvas, region, color);
+                    redact::solid(canvas, region, shapes::working(color, into));
                 }
             }
         }
