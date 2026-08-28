@@ -40,6 +40,10 @@ pub trait CaptureSelector: RegionSelector {
     }
 
     /// Runs selection with the pointer policy that the following capture uses.
+    ///
+    /// A selector that owns picker surfaces must snapshot native targets as its
+    /// first operation, before it asks the host to raise, resize, show, or create
+    /// any of those surfaces. The snapshot belongs to this call only.
     fn select_for_capture(
         &self,
         options: &SelectionOptions,
@@ -146,6 +150,7 @@ impl CaptureSelector for UnsupportedSelector {
 pub struct ClientOverlaySelector {
     events: Sender<BridgeEvent>,
     gate: Arc<(Mutex<Gate>, Condvar)>,
+    snapshot: Arc<SnapshotFn>,
     prepare: Arc<PrepareFn>,
 }
 
@@ -169,7 +174,16 @@ struct Gate {
     next_id: u64,
 }
 
-type PrepareFn = dyn Fn(SelectionOptions, CursorMode) -> Result<PreparedSelection> + Send + Sync;
+type SnapshotFn = dyn Fn(&SelectionOptions) -> Result<NativeTargetSnapshot> + Send + Sync;
+type PrepareFn = dyn Fn(SelectionOptions, CursorMode, NativeTargetSnapshot) -> Result<PreparedSelection>
+    + Send
+    + Sync;
+
+#[derive(Debug)]
+struct NativeTargetSnapshot {
+    displays: Vec<Display>,
+    windows: Vec<Window>,
+}
 
 struct FrozenSource {
     display: Display,
@@ -323,7 +337,12 @@ impl ClientOverlaySelector {
     /// Creates the worker and main-thread halves for the long-running app.
     #[must_use]
     pub fn managed(cards: OverlayGeometry) -> (Arc<Self>, ClientOverlayController) {
-        Self::pair(cards, Completion::RestoreCards, Arc::new(prepare_native))
+        Self::pair(
+            cards,
+            Completion::RestoreCards,
+            Arc::new(snapshot_native),
+            Arc::new(prepare_native),
+        )
     }
 
     /// Creates the two halves for a one-shot interactive CLI window.
@@ -332,6 +351,7 @@ impl ClientOverlaySelector {
         Self::pair(
             OverlayGeometry::default(),
             Completion::CloseWindow,
+            Arc::new(snapshot_native),
             Arc::new(prepare_native),
         )
     }
@@ -339,12 +359,14 @@ impl ClientOverlaySelector {
     fn pair(
         cards: OverlayGeometry,
         completion: Completion,
+        snapshot: Arc<SnapshotFn>,
         prepare: Arc<PrepareFn>,
     ) -> (Arc<Self>, ClientOverlayController) {
         let (events, receiver) = channel();
         let selector = Arc::new(Self {
             events,
             gate: Arc::new((Mutex::new(Gate::default()), Condvar::new())),
+            snapshot,
             prepare,
         });
         let controller = ClientOverlayController {
@@ -450,6 +472,18 @@ impl ClientOverlaySelector {
             return Err(error);
         }
 
+        // The target snapshot is the first native action for an invocation.
+        // Nothing is sent to the main thread until this finishes, so Scrozz
+        // cannot raise, resize, or create selector surfaces ahead of the OS
+        // window list whose z-order the picker must preserve.
+        let snapshot = match (self.snapshot)(options) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.events.send(BridgeEvent::PreparationFailed { id });
+                return Err(error);
+            }
+        };
+
         let (hidden_tx, hidden_rx) = channel();
         self.events
             .send(BridgeEvent::Begin {
@@ -464,7 +498,7 @@ impl ClientOverlaySelector {
             "the selector window closed before confirming it was hidden",
         )?;
 
-        let mut prepared = match (self.prepare)(options.clone(), cursor) {
+        let mut prepared = match (self.prepare)(options.clone(), cursor, snapshot) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = self.events.send(BridgeEvent::PreparationFailed { id });
@@ -1001,10 +1035,9 @@ fn activate_selection(
     }
 }
 
-fn prepare_native(options: SelectionOptions, cursor: CursorMode) -> Result<PreparedSelection> {
+fn snapshot_native(options: &SelectionOptions) -> Result<NativeTargetSnapshot> {
     let backend = scrozz_capture::backend()?;
     let displays = backend.displays()?;
-    let viewports = selector_viewports(&displays)?;
     let needs_windows = options.hud || options.mode == scrozz_core::SelectionMode::Window;
     let windows = if needs_windows {
         match backend.windows() {
@@ -1018,11 +1051,25 @@ fn prepare_native(options: SelectionOptions, cursor: CursorMode) -> Result<Prepa
     } else {
         Vec::new()
     };
-    require_visible_window(&options, &windows)?;
+    require_visible_window(options, &windows)?;
 
+    Ok(NativeTargetSnapshot { displays, windows })
+}
+
+fn prepare_native(
+    options: SelectionOptions,
+    cursor: CursorMode,
+    snapshot: NativeTargetSnapshot,
+) -> Result<PreparedSelection> {
+    let NativeTargetSnapshot { displays, windows } = snapshot;
+    let viewports = selector_viewports(&displays)?;
     let mut frozen = Vec::new();
     let mut frozen_sources = Vec::new();
     if options.freeze || options.needs_magnifier_frame() {
+        // Presentation pixels are deliberately prepared only after Scrozz has
+        // yielded its card surface. They never participate in target
+        // enumeration: `windows` came from the pre-overlay native snapshot.
+        let backend = scrozz_capture::backend()?;
         frozen.reserve(displays.len());
         if options.freeze {
             frozen_sources.reserve(displays.len());
@@ -1443,6 +1490,39 @@ mod tests {
         }
     }
 
+    fn test_target_snapshot(bounds: LogicalRect) -> NativeTargetSnapshot {
+        NativeTargetSnapshot {
+            displays: vec![Display {
+                id: DisplayId("main".to_owned()),
+                name: "Main".to_owned(),
+                bounds,
+                work_area: bounds,
+                scale: ScaleFactor::new(2.0),
+                is_primary: true,
+            }],
+            windows: Vec::new(),
+        }
+    }
+
+    fn test_snapshotter(bounds: LogicalRect) -> Arc<SnapshotFn> {
+        Arc::new(move |_| Ok(test_target_snapshot(bounds)))
+    }
+
+    fn prepare_test_snapshot(
+        options: SelectionOptions,
+        snapshot: NativeTargetSnapshot,
+    ) -> Result<PreparedSelection> {
+        let NativeTargetSnapshot { displays, windows } = snapshot;
+        Ok(PreparedSelection {
+            viewports: selector_viewports_for(&displays, false)?,
+            options,
+            displays,
+            windows,
+            frozen: Vec::new(),
+            frozen_sources: Vec::new(),
+        })
+    }
+
     #[test]
     fn native_hosts_choose_the_client_overlay() {
         for server in [
@@ -1810,34 +1890,25 @@ mod tests {
     }
 
     #[test]
-    fn bridge_clears_cards_before_preparing_and_holds_the_gate_through_capture() {
+    fn bridge_snapshots_before_picker_presentation_and_holds_the_gate_through_capture() {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let timeline = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_timeline = Arc::clone(&timeline);
+        let snapshot: Arc<SnapshotFn> = Arc::new(move |_| {
+            snapshot_timeline.lock().unwrap().push("snapshot");
+            Ok(test_target_snapshot(bounds))
+        });
         let preparations = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&preparations);
-        let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor| {
+        let prepare_timeline = Arc::clone(&timeline);
+        let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor, snapshot| {
             counted.fetch_add(1, Ordering::SeqCst);
-            let bounds =
-                LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
-            let displays = vec![Display {
-                id: DisplayId("main".to_owned()),
-                name: "Main".to_owned(),
-                bounds,
-                work_area: bounds,
-                scale: ScaleFactor::new(2.0),
-                is_primary: true,
-            }];
-            Ok(PreparedSelection {
-                viewports: selector_viewports_for(&displays, false)
-                    .expect("test display has geometry"),
-                options,
-                displays,
-                windows: Vec::new(),
-                frozen: Vec::new(),
-                frozen_sources: Vec::new(),
-            })
+            prepare_timeline.lock().unwrap().push("presentation");
+            prepare_test_snapshot(options, snapshot)
         });
         let cards = OverlayGeometry::default();
         let (selector, mut controller) =
-            ClientOverlaySelector::pair(cards, Completion::RestoreCards, prepare);
+            ClientOverlaySelector::pair(cards, Completion::RestoreCards, snapshot, prepare);
         let options = SelectionOptions {
             remembered: Some(LogicalRect::new(
                 LogicalPoint::new(20.0, 30.0),
@@ -1874,6 +1945,11 @@ mod tests {
             0,
             "preparation must wait until a transparent card-free frame has elapsed"
         );
+        assert_eq!(
+            *timeline.lock().unwrap(),
+            ["snapshot"],
+            "native targets must be frozen before Scrozz changes its surface"
+        );
 
         controller.logic(&ctx, &native);
         wait_until(|| {
@@ -1881,6 +1957,7 @@ mod tests {
             matches!(&controller.phase, ControllerPhase::Selecting { .. })
         });
         assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(*timeline.lock().unwrap(), ["snapshot", "presentation"]);
         assert_eq!(
             *behavior_log.borrow(),
             vec![
@@ -2177,11 +2254,14 @@ mod tests {
 
     #[test]
     fn fixed_capture_hides_and_reserves_the_surface_until_completion() {
+        let snapshot: Arc<SnapshotFn> =
+            Arc::new(|_| panic!("a fixed capture must not snapshot selector targets"));
         let prepare: Arc<PrepareFn> =
-            Arc::new(|_, _| panic!("a fixed capture must not prepare a selector"));
+            Arc::new(|_, _, _| panic!("a fixed capture must not prepare a selector"));
         let (selector, mut controller) = ClientOverlaySelector::pair(
             OverlayGeometry::default(),
             Completion::RestoreCards,
+            snapshot,
             prepare,
         );
         let (begun_tx, begun_rx) = channel();
@@ -2223,11 +2303,14 @@ mod tests {
 
     #[test]
     fn fixed_capture_keeps_cards_visible_when_the_backend_excludes_them() {
+        let snapshot: Arc<SnapshotFn> =
+            Arc::new(|_| panic!("a fixed capture must not snapshot selector targets"));
         let prepare: Arc<PrepareFn> =
-            Arc::new(|_, _| panic!("a fixed capture must not prepare a selector"));
+            Arc::new(|_, _, _| panic!("a fixed capture must not prepare a selector"));
         let (selector, mut controller) = ClientOverlaySelector::pair(
             OverlayGeometry::default(),
             Completion::RestoreCards,
+            snapshot,
             prepare,
         );
         let (begun_tx, begun_rx) = channel();
@@ -2273,31 +2356,15 @@ mod tests {
     fn interactive_selection_hides_cards_even_when_exclusion_is_supported() {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let prepare_barrier = Arc::clone(&barrier);
-        let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor| {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let prepare: Arc<PrepareFn> = Arc::new(move |options, _cursor, snapshot| {
             prepare_barrier.wait();
-            let bounds =
-                LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
-            let displays = vec![Display {
-                id: DisplayId("main".to_owned()),
-                name: "Main".to_owned(),
-                bounds,
-                work_area: bounds,
-                scale: ScaleFactor::new(2.0),
-                is_primary: true,
-            }];
-            Ok(PreparedSelection {
-                viewports: selector_viewports_for(&displays, false)
-                    .expect("test display has geometry"),
-                options,
-                displays,
-                windows: Vec::new(),
-                frozen: Vec::new(),
-                frozen_sources: Vec::new(),
-            })
+            prepare_test_snapshot(options, snapshot)
         });
         let (selector, mut controller) = ClientOverlaySelector::pair(
             OverlayGeometry::default(),
             Completion::RestoreCards,
+            test_snapshotter(bounds),
             prepare,
         );
         let worker_selector = Arc::clone(&selector);

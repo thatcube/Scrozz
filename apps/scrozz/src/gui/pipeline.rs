@@ -307,6 +307,10 @@ impl Worker {
                         ),
                     }));
                 }
+                // `select_for_capture` owns the timing boundary: its native
+                // target snapshot completes before the selector bridge is
+                // allowed to mutate any Scrozz surface. Keep selection as the
+                // first picker operation on this job.
                 let outcome = self.selector.select_for_capture(
                     &capabilities.honour(&options),
                     CursorMode::Hidden,

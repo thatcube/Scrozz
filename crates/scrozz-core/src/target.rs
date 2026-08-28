@@ -82,8 +82,10 @@ impl CaptureTarget {
 
 /// Enumeration of what is currently capturable.
 ///
-/// Implementations must treat this as a snapshot: windows close and displays are
-/// unplugged between enumeration and capture, which surfaces as
+/// Every call is a fresh, invocation-scoped snapshot. Callers must not reuse a
+/// window list for a later capture command: windows close, move, and change
+/// stacking order continuously, while displays can be unplugged between
+/// enumeration and capture. A selected target that disappears surfaces as
 /// [`crate::Error::TargetGone`].
 pub trait TargetEnumerator {
     /// Lists connected displays.
@@ -93,7 +95,20 @@ pub trait TargetEnumerator {
     /// Returns an error if the platform refuses access.
     fn displays(&self) -> crate::Result<Vec<Display>>;
 
-    /// Lists capturable windows, front-most first.
+    /// Lists capturable windows in the native desktop's exact front-to-back
+    /// stacking order at the time of this call.
+    ///
+    /// Current-process windows and other application-internal selection,
+    /// thumbnail, settings, and overlay surfaces must be excluded. A
+    /// visibility-aware pointer picker selects the first eligible visible window
+    /// whose frame contains the pointer; preserving this order is therefore what
+    /// prevents a fully occluded window from being selected through the window
+    /// above it. Implementations may omit minimised/off-desktop windows or retain
+    /// them with [`Window::is_visible`] set to `false`.
+    ///
+    /// Platform privacy controls may redact titles, omit protected windows, or
+    /// refuse their pixels. Implementations report those limits honestly rather
+    /// than fabricating metadata or falling back to a different target.
     ///
     /// # Errors
     ///

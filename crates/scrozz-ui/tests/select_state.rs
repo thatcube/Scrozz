@@ -245,6 +245,93 @@ fn frontmost_visible_window_wins_hit_testing() {
 }
 
 #[test]
+fn underlying_window_is_selectable_only_through_an_exposed_region() {
+    let front_bounds = LogicalRect::new(
+        LogicalPoint::new(120.0, 80.0),
+        LogicalSize::new(180.0, 160.0),
+    );
+    let back_bounds = LogicalRect::new(
+        LogicalPoint::new(60.0, 40.0),
+        LogicalSize::new(300.0, 240.0),
+    );
+    let mut state = state_with_windows(
+        SelectionOptions::for_mode(SelectionMode::Window),
+        vec![display("main", 0.0, 0.0, 500.0, 360.0, 2.0, true)],
+        vec![
+            window(
+                "front",
+                Some("Front"),
+                Some("Editor"),
+                front_bounds,
+                "main",
+                true,
+            ),
+            window(
+                "back",
+                Some("Back"),
+                Some("Browser"),
+                back_bounds,
+                "main",
+                true,
+            ),
+        ],
+    );
+
+    state.hover(LogicalPoint::new(180.0, 140.0));
+    assert_eq!(
+        state.commit().unwrap().target,
+        CaptureTarget::Window(WindowId("front".to_owned()))
+    );
+
+    state.hover(LogicalPoint::new(80.0, 60.0));
+    assert_eq!(
+        state.commit().unwrap().target,
+        CaptureTarget::Window(WindowId("back".to_owned()))
+    );
+}
+
+#[test]
+fn a_fully_occluded_window_never_wins_and_fresh_order_changes_do() {
+    let bounds = LogicalRect::new(
+        LogicalPoint::new(80.0, 60.0),
+        LogicalSize::new(220.0, 180.0),
+    );
+    let displays = vec![display("main", 0.0, 0.0, 500.0, 360.0, 2.0, true)];
+    let first = window("first", Some("First"), Some("Editor"), bounds, "main", true);
+    let second = window(
+        "second",
+        Some("Second"),
+        Some("Browser"),
+        bounds,
+        "main",
+        true,
+    );
+    let point = LogicalPoint::new(140.0, 120.0);
+
+    let mut first_invocation = state_with_windows(
+        SelectionOptions::for_mode(SelectionMode::Window),
+        displays.clone(),
+        vec![first.clone(), second.clone()],
+    );
+    first_invocation.hover(point);
+    assert_eq!(
+        first_invocation.commit().unwrap().target,
+        CaptureTarget::Window(WindowId("first".to_owned()))
+    );
+
+    let mut second_invocation = state_with_windows(
+        SelectionOptions::for_mode(SelectionMode::Window),
+        displays,
+        vec![second, first],
+    );
+    second_invocation.hover(point);
+    assert_eq!(
+        second_invocation.commit().unwrap().target,
+        CaptureTarget::Window(WindowId("second".to_owned()))
+    );
+}
+
+#[test]
 fn window_commit_uses_the_owning_display_scale() {
     let mut state = state_with_windows(
         SelectionOptions::for_mode(SelectionMode::Window),
@@ -657,6 +744,41 @@ fn an_empty_overlapping_viewport_cannot_select_another_displays_window() {
     state.hover_on(&hidpi, LogicalPoint::new(1450.0, 130.0));
 
     assert!(state.commit().is_none());
+}
+
+#[test]
+fn a_window_spanning_adjacent_displays_is_selectable_from_either_viewport() {
+    let left = DisplayId("left".to_owned());
+    let right = DisplayId("right".to_owned());
+    let mut state = state_with_windows(
+        SelectionOptions::for_mode(SelectionMode::Window),
+        vec![
+            display("left", 0.0, 0.0, 400.0, 300.0, 2.0, true),
+            display("right", 400.0, 0.0, 400.0, 300.0, 1.0, false),
+        ],
+        vec![window(
+            "straddling",
+            Some("Straddling"),
+            Some("Editor"),
+            LogicalRect::new(
+                LogicalPoint::new(320.0, 40.0),
+                LogicalSize::new(160.0, 180.0),
+            ),
+            &left.0,
+            true,
+        )],
+    );
+
+    state.hover_on(&right, LogicalPoint::new(440.0, 100.0));
+
+    let outcome = state
+        .commit()
+        .expect("the exposed right-display portion should select");
+    assert_eq!(
+        outcome.target,
+        CaptureTarget::Window(WindowId("straddling".to_owned()))
+    );
+    assert_eq!(outcome.display, Some(left));
 }
 
 #[test]

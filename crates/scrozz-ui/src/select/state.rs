@@ -936,9 +936,25 @@ impl SelectionState {
         point: LogicalPoint,
         display: Option<&DisplayId>,
     ) -> Option<&Window> {
+        let display_coordinates_are_ambiguous = display.is_some()
+            && self
+                .layout
+                .displays()
+                .iter()
+                .filter(|candidate| geom::contains_point(candidate.bounds, point))
+                .nth(1)
+                .is_some();
+        // `windows` is an invocation-scoped native z-order snapshot. Finding
+        // the first eligible frame makes occlusion fall out naturally: an
+        // underlying window wins only where every eligible window above it is
+        // absent. A window spanning adjacent displays remains selectable from
+        // either viewport. We restrict by owning display only where mixed-DPI
+        // logical layouts overlap and the same numeric point is genuinely
+        // ambiguous between two native viewports.
         self.windows.iter().find(|window| {
             window.is_visible
-                && display.is_none_or(|display| window.display == *display)
+                && (!display_coordinates_are_ambiguous
+                    || display.is_none_or(|display| window.display == *display))
                 && geom::contains_point(window.bounds, point)
         })
     }
