@@ -302,3 +302,86 @@ fn reset_forgets_every_step() {
     assert!(!history.can_undo());
     assert!(!history.can_redo());
 }
+
+/// Adds a rectangle at `x` and seals it as its own undo step.
+fn step(doc: &mut Document, history: &mut History, x: f64) {
+    doc.add(
+        Annotation::Rectangle(rect(x, 0.0, 5.0, 5.0)),
+        Style::stroked(),
+    );
+    history.commit(doc);
+}
+
+#[test]
+fn a_refused_abandon_takes_nothing_so_a_later_one_can_still_roll_back() {
+    // Two edits and an undo, so there is a redo branch worth protecting.
+    let mut doc = document(200, 200);
+    let mut history = History::new(&doc);
+    step(&mut doc, &mut history, 10.0);
+    step(&mut doc, &mut history, 20.0);
+    history.undo(&mut doc).unwrap();
+    assert!(history.can_redo(), "the branch this test is about");
+    let before = doc.len();
+
+    // An edit opens, and the user then undoes back behind where it began.
+    history.begin();
+    step(&mut doc, &mut history, 30.0);
+    history.undo(&mut doc).unwrap();
+    history.undo(&mut doc).unwrap();
+
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the rollback point is behind us, so there is nothing to roll back to"
+    );
+
+    // Redo brings the rollback point back within reach. If the refusal above
+    // had consumed the open edit, this would be impossible.
+    history.redo(&mut doc).unwrap();
+    assert!(
+        history.abandon(&mut doc).unwrap(),
+        "a refusal must not have thrown the open edit away"
+    );
+
+    assert_eq!(doc.len(), before, "rolled back to where the edit began");
+    assert!(
+        history.can_redo(),
+        "and the redo branch from before the edit came back with it"
+    );
+    history.redo(&mut doc).unwrap();
+    assert_eq!(
+        doc.len(),
+        before + 1,
+        "redoing follows the branch that existed before the edit, not the abandoned one"
+    );
+}
+
+#[test]
+fn a_refused_abandon_leaves_a_full_history_exactly_as_it_found_it() {
+    // A history small enough that a handful of edits pushes the rollback point
+    // off the back of it, with a redo branch open when the edit begins.
+    let mut doc = document(200, 200);
+    let mut history = History::with_limit(&doc, 2);
+    step(&mut doc, &mut history, 10.0);
+    step(&mut doc, &mut history, 20.0);
+    history.undo(&mut doc).unwrap();
+    assert!(history.can_redo());
+
+    history.begin();
+    for x in 0..5 {
+        step(&mut doc, &mut history, f64::from(x) * 3.0);
+    }
+
+    let depth = history.undo_depth();
+    let len = doc.len();
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the point the edit began has fallen off the back of the history"
+    );
+    assert_eq!(history.undo_depth(), depth, "a refusal is not an edit");
+    assert_eq!(doc.len(), len, "and it does not touch the document either");
+
+    // Refusing twice must say the same thing, which it can only do if the first
+    // refusal left the open edit where it was.
+    assert!(!history.abandon(&mut doc).unwrap());
+    assert_eq!(history.undo_depth(), depth);
+}

@@ -448,6 +448,15 @@ pub struct EditorState {
     selection: Option<AnnotationId>,
     drag: Drag,
     editing_text: Option<AnnotationId>,
+    /// A label that was being edited until an undo took it out of the document.
+    ///
+    /// Editing cannot continue while the annotation does not exist, but the
+    /// undo that removed it is redoable, and a redo brings back a label that is
+    /// empty and invisible. Without somewhere to remember it, that label would
+    /// come back with nobody editing it: unreachable, uncancellable, and
+    /// exactly the empty annotation [`finish_text`](Self::finish_text) exists
+    /// to prevent. Held here so a redo can put the user back where they were.
+    suspended_text: Option<AnnotationId>,
     /// Whether [`editing_text`](Self::editing_text) was created by the click
     /// that opened it. See [`EditorState::finish_text`].
     text_is_new: bool,
@@ -483,6 +492,7 @@ impl EditorState {
             selection: None,
             drag: Drag::Idle,
             editing_text: None,
+            suspended_text: None,
             text_is_new: false,
             interrupt_ime: false,
             caret: 0,
@@ -779,6 +789,8 @@ impl EditorState {
     /// see [`finish_text`](Self::finish_text) for why that distinction matters.
     fn begin_text(&mut self, id: AnnotationId, fresh: bool) {
         self.editing_text = Some(id);
+        // Whatever label an undo set aside, the user has moved on from it.
+        self.suspended_text = None;
         self.text_is_new = fresh;
         self.caret = self.text_buffer().map_or(0, str::len);
         self.preedit = None;
@@ -803,6 +815,7 @@ impl EditorState {
     /// deleted text that was really there, and undo must bring it back — so that
     /// one commits normally. `text_is_new` is what tells them apart.
     pub fn finish_text(&mut self) {
+        self.suspended_text = None;
         let Some(id) = self.editing_text.take() else {
             return;
         };
@@ -1463,11 +1476,27 @@ impl EditorState {
         {
             self.selection = None;
         }
-        if self
-            .editing_text
-            .is_some_and(|id| self.document.get(id).is_none())
-        {
-            self.editing_text = None;
+        // Editing follows the annotation. Undoing the click that made a label
+        // takes the label out of the document, so editing has to stop — but the
+        // undo is redoable, and a redo puts an empty, invisible label back. If
+        // nothing remembered which one it was, it would come back with nobody
+        // editing it: unreachable by typing, and impossible to cancel, because
+        // `finish_text` has no annotation to abandon. So the id is set aside on
+        // the way down and picked up again on the way back.
+        match self.editing_text {
+            Some(id) if self.document.get(id).is_none() => {
+                self.suspended_text = Some(id);
+                self.editing_text = None;
+            }
+            Some(_) => {}
+            None => {
+                if let Some(id) = self.suspended_text
+                    && self.document.get(id).is_some()
+                {
+                    self.editing_text = Some(id);
+                    self.suspended_text = None;
+                }
+            }
         }
 
         // A composition belongs to the keystrokes that were just undone. Keeping

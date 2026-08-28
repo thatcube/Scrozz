@@ -2286,3 +2286,89 @@ fn a_real_undo_still_interrupts_the_composition_exactly_once() {
         "and it must say so exactly once"
     );
 }
+
+// Undoing and redoing the click that placed a label.
+
+#[test]
+fn redoing_a_fresh_labels_creation_puts_the_user_back_in_it() {
+    // Place a label, take the click back, then change your mind again. The
+    // label that comes back is empty and invisible, so if nobody is editing it
+    // there is no way to reach it: typing goes nowhere and Escape has nothing
+    // to cancel, and it sits in the document for good.
+    let mut state = typing();
+    let id = state
+        .editing_text()
+        .expect("placing a label starts editing it");
+
+    state.command(Command::Undo).expect("undo the placement");
+    assert!(
+        state.document().annotations().is_empty(),
+        "the label is gone"
+    );
+    assert_eq!(state.editing_text(), None, "so nothing is being edited");
+
+    state.command(Command::Redo).expect("redo the placement");
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the label is back in the document"
+    );
+    assert_eq!(
+        state.editing_text(),
+        Some(id),
+        "and the user is back inside it, not staring at an unreachable ghost"
+    );
+}
+
+#[test]
+fn typing_works_again_after_redoing_a_labels_creation() {
+    let mut state = typing();
+    state.command(Command::Undo).expect("undo the placement");
+    state.command(Command::Redo).expect("redo the placement");
+
+    type_str(&mut state, "hi");
+    assert_eq!(
+        content(&state),
+        "hi",
+        "the keystrokes have somewhere to land"
+    );
+}
+
+#[test]
+fn escaping_after_redoing_a_labels_creation_still_leaves_nothing_behind() {
+    // The redone label is still one the user never filled in, so escaping it
+    // has to take the placement back with it.
+    let mut state = typing();
+    state.command(Command::Undo).expect("undo the placement");
+    state.command(Command::Redo).expect("redo the placement");
+
+    state.command(Command::Escape).expect("escape");
+    assert!(
+        state.document().annotations().is_empty(),
+        "an empty label the user walked away from leaves nothing behind"
+    );
+
+    state.command(Command::Undo).expect("undo after escaping");
+    assert!(
+        state.document().annotations().is_empty(),
+        "and there is no invisible label one undo away"
+    );
+}
+
+#[test]
+fn redoing_the_creation_of_a_label_that_was_typed_into_does_not_reopen_it() {
+    // A label with text in it was closed deliberately. Undoing and redoing that
+    // work must not drop the user back into a field they had finished with.
+    let mut state = typed("hello");
+    state.command(Command::Escape).expect("leave the label");
+    assert_eq!(state.editing_text(), None);
+
+    state.command(Command::Undo).expect("undo the label");
+    state.command(Command::Redo).expect("redo the label");
+    assert_eq!(
+        state.editing_text(),
+        None,
+        "redo restores the document, not a text cursor the user had dismissed"
+    );
+    assert_eq!(content(&state), "hello");
+}

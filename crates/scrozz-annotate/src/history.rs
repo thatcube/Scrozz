@@ -227,16 +227,29 @@ impl History {
     /// branch: abandoning something the user never did must not cost them
     /// something they did.
     ///
-    /// Returns `false` when there is no edit to abandon, or when the point it
-    /// began has since been evicted from a full history — the caller still has
-    /// to clean up the document itself in those cases.
+    /// Returns `false` when there is no edit to abandon, when the point it
+    /// began has since been evicted from a full history, or when navigation has
+    /// taken the document behind that point — the caller still has to clean up
+    /// the document itself in those cases.
+    ///
+    /// A `false` is a true no-op: the open edit and everything it is holding
+    /// are left exactly as they were, so a caller that gives up on cancelling
+    /// can close the edit with [`finish`](Self::finish) on its own terms. This
+    /// is not a nicety. `false` used to be returned *after* consuming the open
+    /// edit, which threw away the saved redo branch while reporting that
+    /// nothing had happened.
     ///
     /// # Errors
     ///
     /// Returns an error only if the recorded state cannot be applied to this
     /// document, for the same reason [`undo`](Self::undo) can.
     pub fn abandon(&mut self, document: &mut Document) -> Result<bool> {
-        let Some(open) = self.open.take() else {
+        // Looked at, not taken. Both of the refusals below are reachable, and
+        // the open edit is holding the redo branch `begin` moved into
+        // safekeeping — consuming it before the rollback is certain would
+        // answer "no, I could not roll back" while destroying the very thing
+        // the caller is about to carry on with.
+        let Some(open) = self.open.as_ref() else {
             return Ok(false);
         };
         // A history so short that the beginning of this edit has already fallen
@@ -247,7 +260,12 @@ impl History {
         if target > self.past.len() {
             return Ok(false);
         }
+
+        // The document goes first for the same reason: it is the last thing
+        // here that can fail, and it can still fail with the open edit intact.
         document.restore(open.present.data.clone())?;
+
+        let open = self.open.take().expect("inspected as present just above");
         self.past.truncate(target);
         self.cursor = open.present.mark;
         self.present = open.present;
