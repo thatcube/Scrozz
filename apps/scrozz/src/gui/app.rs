@@ -28,9 +28,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use scrozz_core::SelectionCapabilities;
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
-    ScreenshotSound, Session, SystemPermissions, Tray, TrayAction, play_screenshot_sound,
+    Accelerator, Capability, GlobalHotkeys, KeyState, Permissions, ScreenshotSound, Session,
+    SystemPermissions, Tray, TrayAction,
+    hotkey::{DesiredBinding, Rejection},
+    play_screenshot_sound,
 };
 
 use crate::{
@@ -45,19 +48,26 @@ use crate::{
     },
     json::Json,
     report::Report,
+    shortcuts::{ShortcutAction, ShortcutStore, Shortcuts},
 };
+use scrozz_ui::settings::{ShortcutEdit, ShortcutRow};
 
-/// What a hotkey is bound to unless the environment says otherwise.
+/// The binding table a set of configured shortcuts asks for.
 ///
-/// Deliberately **not** `Cmd+Shift+3/4/5`: those belong to macOS's own capture
-/// service, and `RegisterEventHotKey` returns success for them while never
-/// delivering an event — a trap `scrozz-shell` already knows about and refuses
-/// up front. These three are unclaimed on a default install.
-pub const DEFAULT_BINDINGS: &[(&str, Action)] = &[
-    ("Cmd+Shift+7", Action::Capture(CaptureKind::Fullscreen)),
-    ("Cmd+Shift+8", Action::Capture(CaptureKind::Region)),
-    ("Cmd+Shift+9", Action::Capture(CaptureKind::Window)),
-];
+/// The defaults themselves live in [`crate::shortcuts`], which is also what the
+/// settings pane edits and what the CLI reports, so there is exactly one table
+/// and the three surfaces cannot disagree about what `Cmd+Shift+8` does.
+#[must_use]
+pub fn bindings_from(shortcuts: &Shortcuts) -> Vec<(String, Action)> {
+    ShortcutAction::ALL
+        .into_iter()
+        .filter_map(|shortcut| {
+            shortcuts
+                .get(shortcut)
+                .map(|accelerator| (accelerator.to_owned(), shortcut.action()))
+        })
+        .collect()
+}
 
 /// Overrides the whole binding table, as `accelerator=action-id` pairs.
 ///
@@ -84,6 +94,13 @@ pub const AUTOCAPTURE_ENV: &str = "SCROZZ_GUI_CAPTURE_ON_START";
 /// How the GUI was asked to run.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The configured shortcuts, as the settings pane shows them.
+    ///
+    /// Kept beside `bindings` rather than replacing it because the two answer
+    /// different questions: this is what the user chose, `bindings` is what will
+    /// actually be registered on this run, and `SCROZZ_GUI_HOTKEYS` can make them
+    /// differ.
+    pub shortcuts: Shortcuts,
     /// Accelerator and action, in registration order.
     pub bindings: Vec<(String, Action)>,
     /// Whether to put an item in the menu bar.
@@ -100,11 +117,10 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let shortcuts = Shortcuts::default();
         Self {
-            bindings: DEFAULT_BINDINGS
-                .iter()
-                .map(|(accel, action)| ((*accel).to_owned(), *action))
-                .collect(),
+            bindings: bindings_from(&shortcuts),
+            shortcuts,
             tray: true,
             ipc: true,
             deadline: None,
@@ -124,6 +140,11 @@ impl Config {
     #[must_use]
     pub fn from_cli(_cli: &Cli) -> Self {
         let mut config = Self::default();
+
+        // What the user stored wins over what this build ships with. A missing
+        // or unreadable file is the first run, which is the defaults.
+        config.shortcuts = crate::settings::stored_shortcuts();
+        config.bindings = bindings_from(&config.shortcuts);
 
         if let Ok(raw) = std::env::var(HOTKEYS_ENV) {
             config.bindings = parse_bindings(&raw);
@@ -162,6 +183,7 @@ impl Config {
     #[must_use]
     pub fn sealed() -> Self {
         Self {
+            shortcuts: Shortcuts::default(),
             bindings: Vec::new(),
             tray: false,
             ipc: false,
@@ -183,6 +205,73 @@ fn parse_bindings(raw: &str) -> Vec<(String, Action)> {
             Some((accel.trim().to_owned(), action))
         })
         .collect()
+}
+
+/// The rows worth asking the OS for, recording why the others were dropped.
+///
+/// A shortcut for something this session cannot do is not a failure to report to
+/// the user as a hotkey problem — the hotkey is fine, the capability is missing —
+/// so it is filtered out here and explained in its own words.
+fn wanted(
+    bindings: &[(String, Action)],
+    available: &dyn Fn(Action) -> bool,
+    notes: &mut Vec<String>,
+) -> Vec<DesiredBinding> {
+    let mut desired = Vec::new();
+    for (accelerator, action) in bindings {
+        if available(*action) {
+            desired.push(DesiredBinding::new(accelerator.clone(), action.id()));
+        } else {
+            notes.push(format!(
+                "{accelerator} not bound: {} is unavailable in this session",
+                action.id()
+            ));
+        }
+    }
+    desired
+}
+
+/// Registers as much of a set as the system will accept.
+///
+/// [`GlobalHotkeys::apply`] is all-or-nothing on purpose, which is what an edit
+/// wants and what startup does not: a file written months ago may name a
+/// combination some newly installed application has since taken, and refusing to
+/// bind anything because of it would be a puzzling total failure. So a rejected
+/// row is reported and dropped, and the rest is retried.
+fn install_forgivingly(
+    hotkeys: &mut GlobalHotkeys,
+    mut desired: Vec<DesiredBinding>,
+    notes: &mut Vec<String>,
+) {
+    for _ in 0..desired.len().max(1) {
+        if desired.is_empty() {
+            return;
+        }
+        match hotkeys.apply(&desired) {
+            Ok(()) => {
+                for want in &desired {
+                    notes.push(format!("{} → {}", want.accelerator, want.action));
+                }
+                return;
+            }
+            Err(rejections) => {
+                for rejection in &rejections {
+                    // Wayland answers with the compositor config line to paste,
+                    // which is the actual remedy (D11); keeping the whole message
+                    // is the point of reporting it at all.
+                    notes.push(format!(
+                        "{} not bound: {}",
+                        rejection.accelerator, rejection.reason
+                    ));
+                }
+                desired.retain(|want| {
+                    !rejections
+                        .iter()
+                        .any(|rejection| rejection.action == want.action)
+                });
+            }
+        }
+    }
 }
 
 /// Whether the host should keep going.
@@ -209,6 +298,12 @@ pub struct App {
     sound_warning_shown: bool,
     settings_requested: bool,
     notes: Vec<String>,
+    shortcuts: Shortcuts,
+    shortcut_store: Option<ShortcutStore>,
+    rejected: Vec<(ShortcutAction, String)>,
+    session: Session,
+    selection_capabilities: SelectionCapabilities,
+    capture_backend_ready: bool,
 }
 
 impl App {
@@ -267,23 +362,9 @@ impl App {
             None
         };
 
-        let available_bindings: Vec<_> = config
-            .bindings
-            .iter()
-            .filter(|(_, action)| action_available(*action))
-            .collect();
-        for (accelerator, action) in config
-            .bindings
-            .iter()
-            .filter(|(_, action)| !action_available(*action))
-        {
-            notes.push(format!(
-                "{accelerator} not bound: {} is unavailable in this session",
-                action.id()
-            ));
-        }
+        let desired = wanted(&config.bindings, &action_available, &mut notes);
 
-        let mut hotkeys = if available_bindings.is_empty() {
+        let mut hotkeys = if desired.is_empty() {
             // Nothing to bind means nothing should touch the keyboard. The
             // detached backend does the bookkeeping without an OS registration.
             GlobalHotkeys::detached()
@@ -298,19 +379,21 @@ impl App {
         };
         hotkeys.set_command("scrozz");
 
-        for (accelerator, action) in available_bindings {
-            let hotkey = Hotkey {
-                accelerator: accelerator.clone(),
-            };
-            match hotkeys.register(&hotkey, action.id()) {
-                Ok(()) => notes.push(format!("{accelerator} → {}", action.id())),
-                // Wayland answers `Unsupported` carrying the compositor config
-                // line to paste, which is the actual remedy (D11). Losing it in
-                // a generic "hotkey failed" would be the wrong trade.
-                Err(err) => notes.push(format!("{accelerator} not bound: {err}")),
-            }
-        }
+        // Startup is forgiving where an edit is not: one unusable row in a file
+        // that has been sitting on disk for months must not cost the user every
+        // other shortcut they rely on. Each casualty is recorded so the reason
+        // is visible in the panel rather than merely felt.
+        install_forgivingly(&mut hotkeys, desired, &mut notes);
 
+        let shortcut_store = match ShortcutStore::default_location() {
+            Ok(store) => Some(store),
+            Err(err) => {
+                notes.push(format!("shortcut changes cannot be saved: {err}"));
+                None
+            }
+        };
+
+        let shortcuts = config.shortcuts.clone();
         let mut app = Self {
             config,
             surface,
@@ -325,7 +408,14 @@ impl App {
             sound_warning_shown: false,
             settings_requested: false,
             notes,
+            shortcuts,
+            shortcut_store,
+            rejected: Vec::new(),
+            session,
+            selection_capabilities,
+            capture_backend_ready,
         };
+        app.refresh_tray_shortcuts();
 
         if let Some(kind) = app.config.capture_on_start {
             app.begin_capture(kind);
@@ -580,6 +670,221 @@ impl App {
         self.notes.push(what);
     }
 
+    /// The shortcuts as configured, for the settings pane to edit.
+    #[must_use]
+    pub fn shortcuts(&self) -> &Shortcuts {
+        &self.shortcuts
+    }
+
+    /// The editable shortcut table, as the settings pane needs to see it.
+    #[must_use]
+    pub fn shortcut_rows(&self) -> Vec<ShortcutRow> {
+        let problems = self.shortcuts.problems();
+        ShortcutAction::ALL
+            .into_iter()
+            .map(|action| {
+                let accelerator = self.shortcuts.get(action).unwrap_or_default();
+                // A stored value that will not parse is shown back verbatim,
+                // because "that is not a combination" is only useful next to what
+                // the user actually typed.
+                let symbols = Accelerator::parse(accelerator)
+                    .map_or_else(|_| accelerator.to_owned(), |parsed| parsed.symbols());
+                let problem = problems
+                    .iter()
+                    .find(|(offender, _)| *offender == action)
+                    .map(|(_, why)| why.to_string())
+                    .or_else(|| {
+                        self.rejected
+                            .iter()
+                            .find(|(offender, _)| *offender == action)
+                            .map(|(_, why)| why.clone())
+                    });
+                ShortcutRow {
+                    id: action.id().to_owned(),
+                    label: action.label().to_owned(),
+                    accelerator: accelerator.to_owned(),
+                    symbols,
+                    is_default: self.shortcuts.is_default(action),
+                    usable: self.shortcut_is_usable(action),
+                    problem,
+                }
+            })
+            .collect()
+    }
+
+    /// Applies what the settings pane asked for, reporting anything refused.
+    ///
+    /// Validation happens on a *copy*, so a rejected edit leaves both the live
+    /// registrations and the file on disk exactly as they were — the alternative,
+    /// mutating first and rolling back on failure, is where "my other shortcuts
+    /// stopped working" comes from.
+    pub fn edit_shortcuts(&mut self, edits: &[ShortcutEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        let mut candidate = self.shortcuts.clone();
+        let mut touched = Vec::new();
+        for edit in edits {
+            match edit {
+                ShortcutEdit::ResetAll => {
+                    candidate.reset_all();
+                    touched.extend(ShortcutAction::ALL);
+                }
+                ShortcutEdit::Set { id, accelerator } => {
+                    let Some(action) = ShortcutAction::from_id(id) else {
+                        continue;
+                    };
+                    candidate.set(action, Some(accelerator));
+                    touched.push(action);
+                }
+                ShortcutEdit::Clear { id } => {
+                    let Some(action) = ShortcutAction::from_id(id) else {
+                        continue;
+                    };
+                    candidate.set(action, None);
+                    touched.push(action);
+                }
+                ShortcutEdit::Reset { id } => {
+                    let Some(action) = ShortcutAction::from_id(id) else {
+                        continue;
+                    };
+                    candidate.reset(action);
+                    touched.push(action);
+                }
+            }
+        }
+
+        // Each touched row is checked against the whole candidate table rather
+        // than reading `problems()` and filtering: a duplicate is a property of
+        // the *pair*, and `problems()` blames whichever row it reaches second.
+        // Filtering that by "rows this edit touched" silently dropped the
+        // collision whenever the row being edited happened to sort first, and
+        // let the duplicate through. `check` skips the row it is checking, so it
+        // blames the row the user actually just changed and names the other one.
+        //
+        // A duplicate already sitting in the file is still not this edit's
+        // fault; untouched rows are left to `shortcut_rows` to mark.
+        let mut problems = Vec::new();
+        for action in &touched {
+            let Some(raw) = candidate.get(*action) else {
+                continue;
+            };
+            if let Err(problem) = candidate.check(*action, raw) {
+                problems.push((*action, problem));
+            }
+        }
+        if !problems.is_empty() {
+            self.rejected = problems
+                .iter()
+                .map(|(action, why)| (*action, why.to_string()))
+                .collect();
+            for (action, why) in &problems {
+                self.note(format!("{action} not changed: {why}"));
+            }
+            return;
+        }
+
+        match self.apply_shortcuts(&candidate) {
+            Ok(()) => self.rejected.clear(),
+            Err(rejections) => {
+                self.rejected = rejections
+                    .iter()
+                    .filter_map(|rejection| {
+                        Some((
+                            ShortcutAction::from_id(&rejection.action)?,
+                            rejection.reason.clone(),
+                        ))
+                    })
+                    .collect();
+                for rejection in &rejections {
+                    self.note(format!(
+                        "{} not bound: {}",
+                        rejection.accelerator, rejection.reason
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Whether an action can be triggered at all in this session.
+    ///
+    /// The pane greys out a row rather than hiding it: an unbindable action that
+    /// simply vanished would look like a bug in the settings window rather than a
+    /// capability this platform does not have.
+    #[must_use]
+    pub fn shortcut_is_usable(&self, shortcut: ShortcutAction) -> bool {
+        shortcut.action().is_available(
+            self.selection_capabilities,
+            &self.session,
+            self.capture_backend_ready,
+        )
+    }
+
+    /// Puts an edited set of shortcuts in force, saving it if it takes.
+    ///
+    /// Atomic by construction: [`GlobalHotkeys::apply`] validates the whole set
+    /// before touching the OS and restores the previous registrations if the OS
+    /// refuses one, so a rejected edit leaves the shortcuts that were working
+    /// still working — and, because nothing is written until registration
+    /// succeeds, the file on disk keeps matching what the keyboard does.
+    ///
+    /// # Errors
+    ///
+    /// Returns one [`Rejection`] per offending row so the pane can mark each of
+    /// them, rather than reporting only the first and sending the user round the
+    /// loop again.
+    pub fn apply_shortcuts(&mut self, next: &Shortcuts) -> std::result::Result<(), Vec<Rejection>> {
+        let session = self.session.clone();
+        let capabilities = self.selection_capabilities;
+        let ready = self.capture_backend_ready;
+        let available = move |action: Action| action.is_available(capabilities, &session, ready);
+
+        let mut skipped = Vec::new();
+        let desired = wanted(&bindings_from(next), &available, &mut skipped);
+
+        self.hotkeys.apply(&desired)?;
+
+        self.shortcuts = next.clone();
+        self.config.shortcuts = next.clone();
+        self.config.bindings = bindings_from(next);
+        for note in skipped {
+            self.note(note);
+        }
+        for want in &desired {
+            self.note(format!("{} → {}", want.accelerator, want.action));
+        }
+
+        // Saving last, and only on success, so the stored set is always one the
+        // app was able to put in force.
+        if let Some(store) = self.shortcut_store.clone()
+            && let Err(err) = store.save(next)
+        {
+            self.note(format!("shortcuts not saved: {err}"));
+        }
+        self.refresh_tray_shortcuts();
+        Ok(())
+    }
+
+    /// Relabels the menu with the shortcuts that are actually registered.
+    ///
+    /// Reads back from the registrar rather than from the configured set: a menu
+    /// naming a combination the app is not listening for is worse than a menu
+    /// naming none, because the user blames the key rather than the binding.
+    fn refresh_tray_shortcuts(&mut self) {
+        let Some(tray) = self.tray.as_ref() else {
+            return;
+        };
+        let live: Vec<(TrayAction, String)> = self
+            .hotkeys
+            .bindings()
+            .filter_map(|(accelerator, action)| {
+                let shortcut = ShortcutAction::from_id(action)?;
+                Some((shortcut.tray(), accelerator.symbols()))
+            })
+            .collect();
+        tray.set_shortcuts(live);
+    }
+
     /// Takes a pending request to open or focus Settings.
     pub fn take_settings_request(&mut self) -> bool {
         std::mem::take(&mut self.settings_requested)
@@ -703,6 +1008,148 @@ mod tests {
         (app, handle)
     }
 
+    /// A sealed app with a shortcut set it can actually edit.
+    ///
+    /// `Config::sealed` deliberately binds nothing, so the edit path has to be
+    /// given a starting set explicitly rather than inheriting one.
+    fn app_with_shortcuts(shortcuts: Shortcuts) -> App {
+        let (mut app, _) = app();
+        app.shortcuts = shortcuts.clone();
+        app.config.shortcuts = shortcuts;
+        app
+    }
+
+    #[test]
+    fn a_recorded_combination_replaces_the_old_one() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: "Ctrl+Shift+F9".to_owned(),
+        }]);
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            Some("Ctrl+Shift+F9")
+        );
+    }
+
+    #[test]
+    fn a_duplicate_is_refused_and_changes_nothing() {
+        // The failure this prevents: an edit that half-lands, leaving the file
+        // and the keyboard disagreeing about what is bound.
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let taken = app
+            .shortcuts
+            .get(ShortcutAction::CaptureWindow)
+            .expect("window ships bound")
+            .to_owned();
+        let before = app
+            .shortcuts
+            .get(ShortcutAction::CaptureRegion)
+            .map(str::to_owned);
+
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: taken,
+        }]);
+
+        assert_eq!(
+            app.shortcuts
+                .get(ShortcutAction::CaptureRegion)
+                .map(str::to_owned),
+            before,
+            "a refused edit must leave the row exactly as it was"
+        );
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is always listed");
+        assert!(
+            row.problem.is_some(),
+            "the user must be told why nothing happened"
+        );
+    }
+
+    #[test]
+    fn clearing_then_resetting_returns_the_shipped_combination() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let shipped = ShortcutAction::CaptureRegion.default_accelerator();
+
+        app.edit_shortcuts(&[ShortcutEdit::Clear {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+        }]);
+        assert_eq!(app.shortcuts.get(ShortcutAction::CaptureRegion), None);
+
+        app.edit_shortcuts(&[ShortcutEdit::Reset {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+        }]);
+        assert_eq!(app.shortcuts.get(ShortcutAction::CaptureRegion), shipped);
+    }
+
+    #[test]
+    fn reset_all_undoes_every_change_at_once() {
+        let mut shortcuts = Shortcuts::default();
+        shortcuts.set(ShortcutAction::CaptureRegion, Some("Ctrl+Shift+F9"));
+        shortcuts.set(ShortcutAction::CaptureWindow, None);
+        let mut app = app_with_shortcuts(shortcuts);
+
+        app.edit_shortcuts(&[ShortcutEdit::ResetAll]);
+        assert!(app.shortcuts.is_all_default());
+    }
+
+    #[test]
+    fn an_unparseable_recording_is_refused_with_a_reason() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: "Ctrl+Shift+NotAKey".to_owned(),
+        }]);
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is always listed");
+        assert!(row.problem.is_some());
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            ShortcutAction::CaptureRegion.default_accelerator(),
+            "a rejected recording must not overwrite the working combination"
+        );
+    }
+
+    #[test]
+    fn every_action_gets_a_row_whether_or_not_it_is_usable() {
+        // Hiding an unavailable action would read as a missing feature rather
+        // than an unavailable one.
+        let app = app_with_shortcuts(Shortcuts::default());
+        let rows = app.shortcut_rows();
+        assert_eq!(rows.len(), ShortcutAction::ALL.len());
+        for action in ShortcutAction::ALL {
+            assert!(rows.iter().any(|row| row.id == action.id()));
+        }
+    }
+
+    #[test]
+    fn a_row_shows_the_platform_spelling_of_its_combination() {
+        let app = app_with_shortcuts(Shortcuts::default());
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is always listed");
+        let expected = Accelerator::parse(&row.accelerator)
+            .expect("the shipped default parses")
+            .symbols();
+        assert_eq!(row.symbols, expected);
+        if cfg!(target_os = "macos") {
+            assert!(
+                !row.symbols.contains('+'),
+                "a macOS label spells modifiers as glyphs: {}",
+                row.symbols
+            );
+        }
+    }
+
     #[test]
     fn a_sealed_app_touches_nothing() {
         let (app, _) = app();
@@ -818,8 +1265,8 @@ mod tests {
     fn the_default_bindings_avoid_the_shortcuts_macos_owns() {
         // The trap: `RegisterEventHotKey` returns success for these and the
         // handler never fires, so the failure is invisible.
-        for (accelerator, _) in DEFAULT_BINDINGS {
-            let conflict = describe_conflict(accelerator)
+        for (accelerator, _) in bindings_from(&Shortcuts::default()) {
+            let conflict = describe_conflict(&accelerator)
                 .unwrap_or_else(|e| panic!("{accelerator} should parse: {e}"));
             assert!(
                 conflict.is_none(),
@@ -862,9 +1309,46 @@ mod tests {
 
     #[test]
     fn every_default_binding_names_a_real_action() {
-        for (_, action) in DEFAULT_BINDINGS {
-            assert_eq!(Action::from_id(action.id()), Some(*action));
+        for (_, action) in bindings_from(&Shortcuts::default()) {
+            assert_eq!(Action::from_id(action.id()), Some(action));
         }
+    }
+
+    #[test]
+    fn the_default_bindings_are_the_configured_shortcuts() {
+        // The two used to be separate literals, and drifted: the settings said
+        // `Super+Shift+4` while macOS was actually listening on `Cmd+Shift+8`.
+        let bindings = bindings_from(&Shortcuts::default());
+        for shortcut in ShortcutAction::ALL {
+            match shortcut.default_accelerator() {
+                Some(expected) => assert!(
+                    bindings
+                        .iter()
+                        .any(|(accelerator, action)| accelerator == expected
+                            && *action == shortcut.action()),
+                    "{shortcut:?} defaults to {expected} but is not in the binding table"
+                ),
+                None => assert!(
+                    !bindings
+                        .iter()
+                        .any(|(_, action)| *action == shortcut.action()),
+                    "{shortcut:?} ships unassigned and must not be registered"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unassigned_shortcut_is_simply_not_registered() {
+        let mut shortcuts = Shortcuts::default();
+        shortcuts.set(ShortcutAction::CaptureRegion, None);
+        let bindings = bindings_from(&shortcuts);
+        assert!(
+            !bindings
+                .iter()
+                .any(|(_, action)| *action == Action::Capture(CaptureKind::Region)),
+            "clearing a row must remove it from the table, not blank its accelerator"
+        );
     }
 
     #[test]

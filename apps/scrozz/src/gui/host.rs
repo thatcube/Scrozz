@@ -598,13 +598,18 @@ impl eframe::App for Driver {
         } else {
             self.overlay.ui(ui, frame);
         }
-        self.settings.show(
+        // Drawn from the app's own view of the shortcuts, and edits are handed
+        // straight back to it: the pane reports intent, the app decides whether
+        // the OS will accept it.
+        let edits = self.settings.show(
             ui.ctx(),
             scrozz_ui::settings::BuildInfo {
                 version: crate::build_info::VERSION,
                 build: crate::build_info::BUILD,
             },
+            &self.app.shortcut_rows(),
         );
+        self.app.edit_shortcuts(&edits);
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
