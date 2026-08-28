@@ -341,7 +341,7 @@ impl Default for StackLayout {
     fn default() -> Self {
         Self {
             card: LogicalSize::new(210.0, 150.0),
-            margin: 8.0,
+            margin: 2.0,
             left_margin: 40.0,
             gap: 8.0,
             max_slots: 6,

@@ -56,6 +56,7 @@
 //! [`Activity::apply`](crate::motion::Activity::apply) turns it into the right
 //! call — including a timed wake when something is merely waiting.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -66,7 +67,7 @@ use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
-use crate::stack::{CaptureStack, CardId, Intent, dock};
+use crate::stack::{CaptureStack, CardFrame, CardId, CardState, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
@@ -191,32 +192,56 @@ pub enum Passthrough {
 pub struct OverlayGeometry {
     /// The display's work area: bounds minus the menu bar and the Dock.
     pub work_area: Rect,
+    /// The transparent native viewport. It may extend beyond [`Self::work_area`]
+    /// so shadows can fade without moving cards into reserved system UI.
+    viewport: Rect,
 }
 
 impl OverlayGeometry {
     /// A geometry covering `work_area`.
     #[must_use]
     pub const fn new(work_area: Rect) -> Self {
-        Self { work_area }
+        Self {
+            work_area,
+            viewport: work_area,
+        }
+    }
+
+    /// A geometry whose transparent viewport can bleed beyond the safe area.
+    ///
+    /// The viewport is expanded to include `work_area` if necessary, so malformed
+    /// platform geometry cannot clip the cards themselves.
+    #[must_use]
+    pub fn with_viewport(work_area: Rect, viewport: Rect) -> Self {
+        Self {
+            work_area,
+            viewport: viewport.union(work_area),
+        }
     }
 
     /// The window's outer position.
     #[must_use]
     pub fn position(self) -> Pos2 {
-        self.work_area.min
+        self.viewport.min
     }
 
     /// The window's size.
     #[must_use]
     pub fn size(self) -> Vec2 {
-        self.work_area.size()
+        self.viewport.size()
+    }
+
+    /// The complete transparent native viewport in global coordinates.
+    #[must_use]
+    pub fn viewport(self) -> Rect {
+        self.viewport
     }
 
     /// The work area expressed in the window's own coordinates, which is what
     /// the stack lays out in.
     #[must_use]
     pub fn local(self) -> Rect {
-        Rect::from_min_size(Pos2::ZERO, self.size())
+        self.work_area.translate(-self.viewport.min.to_vec2())
     }
 }
 
@@ -1057,6 +1082,21 @@ impl OverlayApp {
     }
 }
 
+/// Paints settled residents from top to bottom. The card below consequently
+/// covers the downward shadow of the card above instead of that shadow muddying
+/// its thumbnail. Transient cards stay above the settled pile.
+fn sort_card_frames_for_painting(frames: &mut [CardFrame]) {
+    frames.sort_by_key(|frame| {
+        let layer = match frame.state {
+            CardState::Entering | CardState::Resting | CardState::Falling => 0,
+            CardState::Departing => 1,
+            CardState::Returning => 2,
+            CardState::Dragging => 3,
+        };
+        (layer, Reverse(frame.slot))
+    });
+}
+
 impl eframe::App for OverlayApp {
     /// Fully transparent. eframe's default is a dark translucent wash, which on
     /// an overlay is a grey sheet over the entire work area.
@@ -1077,7 +1117,8 @@ impl eframe::App for OverlayApp {
         let dock_was = self.stack.dock().is_collapsed();
 
         let surface = Surface::new(&self.theme, &self.icons, m);
-        let frames = self.stack.frame(&m);
+        let mut frames = self.stack.frame(&m);
+        sort_card_frames_for_painting(&mut frames);
 
         let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
         let mut hovered = None;
@@ -1208,6 +1249,48 @@ mod tests {
         assert_eq!(g.size(), Vec2::new(1440.0, 850.0));
         assert_eq!(g.local().min, Pos2::ZERO);
         assert_eq!(g.local().size(), g.size());
+    }
+
+    #[test]
+    fn geometry_keeps_shadow_bleed_outside_the_card_safe_area() {
+        let work_area = rect(80.0, 25.0, 1360.0, 800.0);
+        let viewport = rect(0.0, 25.0, 1440.0, 848.0);
+        let g = OverlayGeometry::with_viewport(work_area, viewport);
+
+        assert_eq!(g.position(), viewport.min);
+        assert_eq!(g.size(), viewport.size());
+        assert_eq!(g.viewport(), viewport);
+        assert_eq!(g.local(), rect(80.0, 0.0, 1360.0, 800.0));
+    }
+
+    #[test]
+    fn lower_residents_paint_above_upper_card_shadows() {
+        let frame = |id, slot, state| CardFrame {
+            id: CardId(id),
+            slot,
+            rect: rect(40.0, slot as f32 * 158.0, 210.0, 150.0),
+            alpha: 1.0,
+            reveal: 0.0,
+            lift: 0.0,
+            angle: 0.0,
+            state,
+        };
+        let mut frames = vec![
+            frame(1, 0, CardState::Resting),
+            frame(2, 1, CardState::Resting),
+            frame(3, 2, CardState::Resting),
+            frame(4, 0, CardState::Departing),
+            frame(5, 2, CardState::Returning),
+            frame(6, 1, CardState::Dragging),
+        ];
+
+        sort_card_frames_for_painting(&mut frames);
+
+        assert_eq!(
+            frames.iter().map(|frame| frame.id.0).collect::<Vec<_>>(),
+            vec![3, 2, 1, 4, 5, 6],
+            "residents paint top-to-bottom, then transient cards paint above the pile"
+        );
     }
 
     #[test]

@@ -45,6 +45,11 @@ const ICON_BTN: f32 = 28.0;
 const CHROME_INSET: f32 = Space::SM;
 /// Peak alpha of the hover scrim.
 const HOVER_SCRIM: f32 = 132.0;
+/// Transparent viewport room needed for a fully lifted card shadow to fade.
+///
+/// The deepest card shadow offsets 16 points and blurs 44 points. Forty-eight
+/// points clears that complete falloff with a little rounding tolerance.
+pub const SHADOW_BLEED: f32 = 48.0;
 /// Width below which primary actions collapse to icon-only controls.
 const COMPACT_CHROME_W: f32 = 154.0;
 /// Height below which the two-row chrome collapses to icon-only controls.

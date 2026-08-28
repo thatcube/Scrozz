@@ -624,9 +624,9 @@ fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
 
 /// Where the overlay window goes.
 ///
-/// The work area, not the display bounds: anchoring a card to the bottom-left
-/// of the *bounds* puts it behind the Dock. Falls back to a sensible default
-/// rather than failing, because a card in a slightly wrong place beats no card.
+/// The card layout uses the work area, not the display bounds: anchoring a card
+/// to the bottom-left of the *bounds* puts it behind the Dock. The transparent
+/// viewport may extend below that safe area solely so shadows can fade naturally.
 fn work_area() -> (OverlayGeometry, Option<DisplayId>) {
     #[cfg(target_os = "macos")]
     {
@@ -698,14 +698,21 @@ fn display_by_id<'a>(displays: &'a [Display], id: &DisplayId) -> Option<&'a Disp
 
 fn geometry_for_display(display: &Display) -> OverlayGeometry {
     let area = display.work_area;
-    OverlayGeometry::new(egui::Rect::from_min_size(
+    let work_area = egui::Rect::from_min_size(
         egui::pos2(area.origin.x as f32, area.origin.y as f32),
         egui::vec2(area.size.width as f32, area.size.height as f32),
-    ))
+    );
+    let bounds_bottom = (display.bounds.origin.y + display.bounds.size.height) as f32;
+    let viewport_bottom = (work_area.bottom() + scrozz_ui::card::SHADOW_BLEED).min(bounds_bottom);
+    let viewport = egui::Rect::from_min_max(
+        work_area.min,
+        egui::pos2(work_area.right(), viewport_bottom),
+    );
+    OverlayGeometry::with_viewport(work_area, viewport)
 }
 
 fn logical_frame(geometry: OverlayGeometry) -> scrozz_core::LogicalRect {
-    let area = geometry.work_area;
+    let area = geometry.viewport();
     scrozz_core::LogicalRect::new(
         scrozz_core::LogicalPoint::new(f64::from(area.min.x), f64::from(area.min.y)),
         scrozz_core::LogicalSize::new(f64::from(area.width()), f64::from(area.height())),
@@ -809,17 +816,57 @@ mod tests {
     }
 
     #[test]
-    fn native_frame_matches_the_complete_global_work_area() {
-        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
-            egui::pos2(120.0, 85.0),
-            egui::vec2(1728.0, 999.0),
-        ));
+    fn native_frame_matches_the_complete_transparent_viewport() {
+        let work_area =
+            egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1728.0, 951.0));
+        let viewport =
+            egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1728.0, 999.0));
+        let geometry = OverlayGeometry::with_viewport(work_area, viewport);
         assert_eq!(
             logical_frame(geometry),
             LogicalRect::new(
                 LogicalPoint::new(120.0, 85.0),
                 LogicalSize::new(1728.0, 999.0),
             )
+        );
+    }
+
+    #[test]
+    fn mac_card_geometry_reserves_the_dock_but_not_the_shadow() {
+        let display = Display {
+            id: DisplayId("main".to_owned()),
+            name: "Main".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1728.0, 1117.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 33.0),
+                LogicalSize::new(1728.0, 950.0),
+            ),
+            scale: ScaleFactor::new(2.0),
+            is_primary: true,
+        };
+
+        let geometry = geometry_for_display(&display);
+        let layout = scrozz_ui::stack::StackLayout::new(
+            geometry.local(),
+            scrozz_ui::stack::CardMetrics::default(),
+        );
+        let bottom_card = layout.slot_rect(0);
+
+        assert_eq!(geometry.position(), egui::pos2(0.0, 33.0));
+        assert_eq!(geometry.viewport().bottom(), 1031.0);
+        assert_eq!(geometry.work_area.bottom(), 983.0);
+        assert_eq!(
+            geometry.position().y + bottom_card.bottom(),
+            981.0,
+            "the card itself stays two points above the inferred Dock"
+        );
+        assert_eq!(
+            geometry.size().y - bottom_card.bottom(),
+            50.0,
+            "the viewport leaves the two-point gap plus the full shadow bleed"
         );
     }
 

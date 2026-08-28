@@ -908,10 +908,14 @@ comparable tools. It must clamp sensibly on small displays.
 
 **Settled geometry is exact:** every card is 210 × 150 points, adjacent cards
 have an 8-point visible gap, the shared left edge is 40 points from the work
-area, and the bottom card is 8 points above the Dock or taskbar. The native
-overlay window is re-anchored to the operating system's live work area after any
-selector or display transition; window-manager placement hints are not accepted
-as proof that the Dock has been excluded.
+area, and the bottom card is 2 points above the Dock or taskbar. The card layout
+remains constrained to that safe work area, while the transparent native
+viewport extends up to 48 points into available reserved space so the shadow
+fades naturally instead of clipping at the work-area boundary. Cards paint from
+top to bottom, putting each lower thumbnail above the downward shadow of its
+neighbour. The native overlay window is re-anchored after any selector or display
+transition; window-manager placement hints are not accepted as proof that the
+Dock has been excluded.
 
 **Why bottom-anchored.** Position encodes recency, and a bottom anchor makes the
 pile physical: things accumulate on top of each other and settle downward under

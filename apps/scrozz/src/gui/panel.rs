@@ -55,11 +55,11 @@ pub struct BehaviorController {
 }
 
 impl BehaviorController {
-    /// Re-anchors the retained native window to an exact OS work-area frame.
+    /// Re-anchors the retained native window to its exact transparent viewport.
     ///
     /// Eframe's viewport position is only a window-manager hint. The native
-    /// frame is authoritative on macOS and keeps the transparent overlay clipped
-    /// above the Dock after creation, selection and display changes.
+    /// frame is authoritative on macOS and keeps cards above the Dock while
+    /// retaining room below them for shadows.
     pub fn set_frame(&self, frame: LogicalRect) {
         #[cfg(target_os = "macos")]
         if let Some(overlay) = self.overlay.borrow_mut().as_mut()
