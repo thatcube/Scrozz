@@ -814,7 +814,26 @@ impl EditorState {
     /// Emptying a label that already existed is the opposite case — the user
     /// deleted text that was really there, and undo must bring it back — so that
     /// one commits normally. `text_is_new` is what tells them apart.
+    ///
+    /// # Why a label nobody is editing can still need finishing
+    ///
+    /// Undoing the click that placed a label takes it out of the document, so
+    /// there is nothing to edit and the editing session is set aside rather than
+    /// ended — the undo is redoable, and a redo has to put the user back in the
+    /// label they were typing into. Walking away at that moment is still walking
+    /// away from an unfinished label, and the click that made it still has to be
+    /// taken back. Forgetting it here instead left the creation on the redo
+    /// stack with nothing holding its editing session, so redoing produced an
+    /// empty label that could not be seen, typed into, or escaped from.
     pub fn finish_text(&mut self) {
+        // Deliberately before the `take` below: the set-aside label has no
+        // `editing_text` to find, and clearing it first is how it was lost.
+        if self.editing_text.is_none()
+            && let Some(id) = self.suspended_text
+        {
+            self.finish_suspended_text(id);
+            return;
+        }
         self.suspended_text = None;
         let Some(id) = self.editing_text.take() else {
             return;
@@ -851,6 +870,44 @@ impl EditorState {
         self.history.seal();
         self.commit();
         self.touch();
+    }
+
+    /// Ends an editing session whose annotation an undo took out of the
+    /// document.
+    ///
+    /// A label the user placed and then undid their way out of is cancelled
+    /// outright, which also drops the redo branch that would have brought it
+    /// back — the click is taken back, so there is nothing left to redo it into.
+    ///
+    /// When the rollback is refused, the cancellation is left pending instead of
+    /// being faked. Refusing means the history has moved somewhere the creation
+    /// can no longer be lifted out of; closing the group here would leave the
+    /// creation on the redo stack with nobody holding its editing session, which
+    /// is the ghost this exists to prevent. Left open, a redo puts the user back
+    /// in the label and the next Escape cancels it properly.
+    fn finish_suspended_text(&mut self, id: AnnotationId) {
+        if !self.text_is_new {
+            // A label that was already there before this session. It is not this
+            // editor's to un-create, and it is visible when it comes back.
+            self.suspended_text = None;
+            self.preedit = None;
+            return;
+        }
+        if self
+            .history
+            .abandon(&mut self.document)
+            .expect("the document has not changed provenance mid-edit")
+        {
+            self.suspended_text = None;
+            self.text_is_new = false;
+            self.preedit = None;
+            self.caret = 0;
+            if self.selection == Some(id) {
+                self.selection = None;
+            }
+            self.mark_caret();
+            self.touch();
+        }
     }
 
     /// The current zoom factor.
@@ -1304,7 +1361,10 @@ impl EditorState {
     /// nothing left to back out of. Closing straight away would throw away a
     /// half-drawn shape *and* the window, when the user meant only the shape.
     fn escape(&mut self) -> Intent {
-        if self.editing_text.is_some() {
+        // The set-aside case counts as editing: the label is unfinished even
+        // though an undo has taken it out of the document, and Escape is how the
+        // user says they are done with it.
+        if self.editing_text.is_some() || self.suspended_text.is_some() {
             self.finish_text();
         } else if self.is_dragging() {
             self.cancel_drag();

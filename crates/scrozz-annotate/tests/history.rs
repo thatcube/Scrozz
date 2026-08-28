@@ -385,3 +385,78 @@ fn a_refused_abandon_leaves_a_full_history_exactly_as_it_found_it() {
     assert!(!history.abandon(&mut doc).unwrap());
     assert_eq!(history.undo_depth(), depth);
 }
+
+#[test]
+fn an_abandon_refuses_when_its_place_in_the_history_was_taken_by_other_work() {
+    // Three drawings, then a label started on top of the third.
+    let mut doc = document(200, 200);
+    let mut history = History::new(&doc);
+    step(&mut doc, &mut history, 10.0);
+    step(&mut doc, &mut history, 20.0);
+    step(&mut doc, &mut history, 30.0);
+    history.begin();
+    step(&mut doc, &mut history, 40.0);
+
+    // The user undoes their way back behind the point the label was started at.
+    for _ in 0..3 {
+        history.undo(&mut doc).unwrap();
+    }
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the rollback point is above where the document now stands"
+    );
+
+    // Then draws something else, which discards the branch the label was on and
+    // builds a different past to exactly the same depth.
+    step(&mut doc, &mut history, 50.0);
+    step(&mut doc, &mut history, 60.0);
+    assert_eq!(
+        history.undo_depth(),
+        3,
+        "the same depth the label was started at, reached by different work"
+    );
+
+    let depth = history.undo_depth();
+    let len = doc.len();
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the depth fits but the history under it is somebody else's"
+    );
+    assert_eq!(history.undo_depth(), depth, "a refusal is not an edit");
+    assert_eq!(doc.len(), len, "and it does not touch the document either");
+
+    // The point of refusing: undoing the new work must give back the new work,
+    // not a document from the branch that was discarded.
+    history.undo(&mut doc).unwrap();
+    assert_eq!(doc.len(), 2);
+    let after_one = doc.data();
+    history.undo(&mut doc).unwrap();
+    history.redo(&mut doc).unwrap();
+    assert_eq!(
+        doc.data(),
+        after_one,
+        "the history still describes the work that is actually in it"
+    );
+}
+
+#[test]
+fn an_abandon_still_works_after_navigating_within_the_edit() {
+    // Undoing and redoing *inside* the edit does not replace anything, so the
+    // rollback must still be offered: this is the ⌘Z-then-Escape case the open
+    // edit exists for, and refusing it would be the bug it was built to stop.
+    let mut doc = document(200, 200);
+    let mut history = History::new(&doc);
+    step(&mut doc, &mut history, 10.0);
+    let before = doc.len();
+
+    history.begin();
+    step(&mut doc, &mut history, 20.0);
+    step(&mut doc, &mut history, 30.0);
+    history.undo(&mut doc).unwrap();
+
+    assert!(
+        history.abandon(&mut doc).unwrap(),
+        "nothing outside the edit changed, so it can still be taken back"
+    );
+    assert_eq!(doc.len(), before);
+}

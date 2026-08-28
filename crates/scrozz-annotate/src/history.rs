@@ -43,11 +43,24 @@ pub const DEFAULT_LIMIT: usize = 200;
 /// happened to be somewhere else.
 pub type Mark = u64;
 
+/// Identity for a recorded state, distinct from its position in the stack.
+///
+/// Two states can sit at the same depth and hold the same data and still not be
+/// the same step: undoing behind a point and editing forward again replaces the
+/// history from there on, and the replacements are somebody else's work. Depth
+/// alone cannot tell those apart, so each state is stamped once and carries the
+/// stamp wherever undo and redo move it.
+type Serial = u64;
+
 /// A recorded state and the caller's marker for it.
 #[derive(Debug, Clone)]
 struct Step {
     data: DocumentData,
     mark: Mark,
+    /// Set when the step is recorded and never reused. Moving a step between
+    /// the stacks keeps it, because undo and redo do not make a new state; they
+    /// travel back to one that already existed.
+    serial: Serial,
 }
 
 /// A bounded undo/redo stack over a document's editable state.
@@ -70,6 +83,8 @@ pub struct History {
     /// the limit, so a rollback point can be expressed as a depth that a later
     /// eviction cannot silently move.
     evicted: usize,
+    /// The stamp the next recorded state will carry.
+    next_serial: Serial,
     limit: usize,
 }
 
@@ -85,6 +100,12 @@ struct Open {
     /// Undo depth at the moment the edit began, counted from the start of the
     /// session so eviction cannot invalidate it.
     depth: usize,
+    /// The stamp of the step immediately below `depth`, or `None` when the edit
+    /// began with nothing to undo.
+    ///
+    /// Depth says *where* to roll back to; this says whether that place is
+    /// still the same place. See [`abandon`](History::abandon).
+    parent: Option<Serial>,
     present: Step,
     /// The redo branch as it stood before the edit began.
     ///
@@ -113,12 +134,14 @@ impl History {
             present: Step {
                 data: document.data(),
                 mark: 0,
+                serial: 0,
             },
             future: Vec::new(),
             tag: None,
             open: None,
             cursor: 0,
             evicted: 0,
+            next_serial: 1,
             limit,
         }
     }
@@ -154,9 +177,12 @@ impl History {
         if self.tag.as_deref() == Some(tag) {
             // Extend the step already in progress: the past keeps the state
             // from before the gesture began, so one undo still reverts it all.
+            // A new stamp, because this is a different state from the one that
+            // was there a moment ago and nothing may mistake it for that one.
             self.present = Step {
                 data,
                 mark: self.cursor,
+                serial: self.mint(),
             };
             self.future.clear();
             return;
@@ -195,6 +221,7 @@ impl History {
         self.finish();
         self.open = Some(Open {
             depth: self.evicted + self.past.len(),
+            parent: self.past.last().map(|step| step.serial),
             present: self.present.clone(),
             // Taking it leaves the redo stack empty, which is exactly what the
             // first commit of this edit would have done. If the edit is
@@ -228,9 +255,26 @@ impl History {
     /// something they did.
     ///
     /// Returns `false` when there is no edit to abandon, when the point it
-    /// began has since been evicted from a full history, or when navigation has
-    /// taken the document behind that point — the caller still has to clean up
-    /// the document itself in those cases.
+    /// began has since been evicted from a full history, when navigation has
+    /// taken the document behind that point, or when the history that point
+    /// stood on has been replaced by different work — the caller still has to
+    /// clean up the document itself in those cases.
+    ///
+    /// # Why a depth is not enough
+    ///
+    /// A depth says where to roll back to, and after undoing behind that point
+    /// and editing forward again the same number says somewhere else entirely.
+    /// Draw A, B and C, start a label, undo back past A, then draw X and Y: the
+    /// stack is three deep again, so the depth still fits, but it is three
+    /// steps of *different* work. Rolling back to it would restore the document
+    /// to C while leaving X underneath it, and the next undo would produce a
+    /// drawing the user never made from a click they took back.
+    ///
+    /// So the rollback point also remembers which step it stood on, and refuses
+    /// when that step is no longer the one below it. Checking only the step
+    /// immediately below is enough: replacing anything deeper clears the redo
+    /// branch that held everything above it, so nothing deeper can change
+    /// without this one changing too.
     ///
     /// A `false` is a true no-op: the open edit and everything it is holding
     /// are left exactly as they were, so a caller that gives up on cancelling
@@ -244,11 +288,11 @@ impl History {
     /// Returns an error only if the recorded state cannot be applied to this
     /// document, for the same reason [`undo`](Self::undo) can.
     pub fn abandon(&mut self, document: &mut Document) -> Result<bool> {
-        // Looked at, not taken. Both of the refusals below are reachable, and
-        // the open edit is holding the redo branch `begin` moved into
-        // safekeeping — consuming it before the rollback is certain would
-        // answer "no, I could not roll back" while destroying the very thing
-        // the caller is about to carry on with.
+        // Looked at, not taken. Every refusal below is reachable, and the open
+        // edit is holding the redo branch `begin` moved into safekeeping —
+        // consuming it before the rollback is certain would answer "no, I could
+        // not roll back" while destroying the very thing the caller is about to
+        // carry on with.
         let Some(open) = self.open.as_ref() else {
             return Ok(false);
         };
@@ -258,6 +302,10 @@ impl History {
             return Ok(false);
         };
         if target > self.past.len() {
+            return Ok(false);
+        }
+        // Right depth, wrong history: somebody built a different past up to it.
+        if self.past[..target].last().map(|step| step.serial) != open.parent {
             return Ok(false);
         }
 
@@ -387,6 +435,7 @@ impl History {
         self.present = Step {
             data: document.data(),
             mark: self.cursor,
+            serial: self.mint(),
         };
         self.tag = None;
         self.open = None;
@@ -398,6 +447,7 @@ impl History {
         let step = Step {
             data,
             mark: self.cursor,
+            serial: self.mint(),
         };
         let previous = std::mem::replace(&mut self.present, step);
         self.past.push(previous);
@@ -407,5 +457,12 @@ impl History {
             self.past.drain(..excess);
             self.evicted += excess;
         }
+    }
+
+    /// Hands out the next never-reused stamp.
+    fn mint(&mut self) -> Serial {
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
+        serial
     }
 }

@@ -534,6 +534,16 @@ pub enum Conflict {
         /// The platform's own words.
         detail: String,
     },
+    /// A binding that was working before a refused edit could not be taken back.
+    ///
+    /// The row is still the user's configuration, and Scrozz will keep trying
+    /// it, but between the release and the failed rollback something else took
+    /// the combination. Reported so a caller is never told an edit was refused
+    /// *and* everything is as it was, when it is not.
+    NotRestored {
+        /// The platform's own words.
+        detail: String,
+    },
 }
 
 impl fmt::Display for Conflict {
@@ -551,6 +561,10 @@ impl fmt::Display for Conflict {
             Self::NotReleased { detail } => write!(
                 f,
                 "the system would not release the combination it already holds: {detail}"
+            ),
+            Self::NotRestored { detail } => write!(
+                f,
+                "it stopped working while the change was being undone: {detail}"
             ),
         }
     }
@@ -1545,8 +1559,17 @@ impl GlobalHotkeys {
     /// # Errors
     ///
     /// Returns every [`Rejection`] in the set, so a settings pane can mark each
-    /// offending row rather than reporting only the first. Nothing has changed
-    /// when this returns `Err`.
+    /// offending row rather than reporting only the first.
+    ///
+    /// The configuration is unchanged when this returns `Err`. What is in force
+    /// may not be: releasing the old set and putting it back is not atomic, and
+    /// another application can take a combination in between. Any row that did
+    /// not come back is in the returned list too — with the action it belongs
+    /// to, which is not necessarily one the caller was editing — so "your change
+    /// was refused" is never reported as "and nothing else moved" when something
+    /// did. Those rows stay configured and are retried by the next
+    /// [`resume`](Self::resume) or `apply`; [`inactive`](Self::inactive) lists
+    /// them in the meantime.
     pub fn apply(&mut self, desired: &[DesiredBinding]) -> ApplyResult {
         let mut rejections = Vec::new();
         let mut resolved: Vec<(Accelerator, &DesiredBinding)> = Vec::new();
@@ -1606,15 +1629,19 @@ impl GlobalHotkeys {
             .iter()
             .map(|(accelerator, binding)| (*accelerator, binding.action.clone()))
             .collect();
+        // What is actually working right now, so a rollback can tell a row that
+        // stopped working apart from one that already was not.
+        let was_in_force: HashSet<Accelerator> = self.active.iter().copied().collect();
 
         // Before anything is cleared: if the OS will not let go of what is
         // already bound, the edit cannot be honoured. Reporting success here
         // would leave the refused combination firing with no row behind it.
         if let Err(stuck) = self.rebind_from_scratch() {
-            let rejections = self.not_released(&stuck, &previous);
+            let mut rejections = self.not_released(&stuck, &previous, &resolved);
             // The rows that *did* come free are put back, so a refused edit is
-            // still the no-op this promises to be.
-            self.restore(previous);
+            // still the no-op this promises to be — and any that would not go
+            // back is reported rather than left to be discovered by pressing it.
+            rejections.extend(self.restore(previous, &was_in_force));
             return Err(rejections);
         }
 
@@ -1624,13 +1651,14 @@ impl GlobalHotkeys {
                 // the same reason: the caller must not be told its edit failed
                 // cleanly when part of the old set is stranded.
                 if let Err(stuck) = self.rebind_from_scratch() {
-                    let mut rejections = self.not_released(&stuck, &previous);
-                    self.restore(previous);
+                    let mut rejections = self.not_released(&stuck, &previous, &resolved);
+                    rejections.extend(self.restore(previous, &was_in_force));
                     rejections.push(Rejection::new(want, refusal(&detail).to_string()));
                     return Err(rejections);
                 }
-                self.restore(previous);
-                return Err(vec![Rejection::new(want, refusal(&detail).to_string())]);
+                let mut rejections = vec![Rejection::new(want, refusal(&detail).to_string())];
+                rejections.extend(self.restore(previous, &was_in_force));
+                return Err(rejections);
             }
             self.remember(*accelerator, want.action.clone());
         }
@@ -1642,18 +1670,46 @@ impl GlobalHotkeys {
     ///
     /// The row is the *old* action, not one the caller is editing: the user
     /// asked for that shortcut to go away, and the answer is that it has not.
+    ///
+    /// # Why three places to look
+    ///
+    /// A stuck grab is not always one that was there before. Rolling back a
+    /// half-applied set releases combinations this very call registered, and one
+    /// of those can refuse too — so the row that owns it is the *new* one, which
+    /// is nowhere in `previous`. Attributing it to nothing produced a rejection
+    /// with an empty action, which the settings pane could not match to a row and
+    /// dropped on the floor, leaving a live grab nobody could see or unbind.
+    ///
+    /// The retained bookkeeping is asked first because it is the state as it
+    /// actually stands: `rebind_from_scratch` keeps exactly the stuck rows, old
+    /// or new. The other two are fallbacks for a caller that reaches here by some
+    /// other route.
     fn not_released(
         &self,
         stuck: &[(Accelerator, String)],
         previous: &[(Accelerator, String)],
+        resolved: &[(Accelerator, &DesiredBinding)],
     ) -> Vec<Rejection> {
         stuck
             .iter()
             .map(|(accelerator, detail)| Rejection {
-                action: previous
-                    .iter()
-                    .find(|(bound, _)| bound == accelerator)
-                    .map_or_else(String::new, |(_, action)| action.clone()),
+                action: self
+                    .bindings
+                    .get(accelerator)
+                    .map(|binding| binding.action.clone())
+                    .or_else(|| {
+                        previous
+                            .iter()
+                            .find(|(bound, _)| bound == accelerator)
+                            .map(|(_, action)| action.clone())
+                    })
+                    .or_else(|| {
+                        resolved
+                            .iter()
+                            .find(|(bound, _)| bound == accelerator)
+                            .map(|(_, want)| want.action.clone())
+                    })
+                    .unwrap_or_default(),
                 accelerator: accelerator.to_string(),
                 reason: Conflict::NotReleased {
                     detail: detail.clone(),
@@ -1831,13 +1887,37 @@ impl GlobalHotkeys {
     /// dropping it here would let a failed edit silently delete a row the user
     /// never touched. Only a successful grab enters `active`, which `grab`
     /// already handles.
-    fn restore(&mut self, previous: Vec<(Accelerator, String)>) {
+    ///
+    /// Returns a rejection for every row that was in force before and is not in
+    /// force now, so the caller can say which ones. Between the release and the
+    /// rollback the combination is nobody's, and another application can take it
+    /// in that window; reporting only the row the user was editing would tell
+    /// them their change was refused and everything is as it was, while a
+    /// shortcut that worked a moment ago has quietly stopped working.
+    ///
+    /// Rows that were already configured-but-not-held before the edit are not
+    /// reported: nothing changed for them, and repeating a refusal the caller is
+    /// already being told about would bury the one thing that is news.
+    fn restore(
+        &mut self,
+        previous: Vec<(Accelerator, String)>,
+        was_in_force: &HashSet<Accelerator>,
+    ) -> Vec<Rejection> {
+        let mut lost = Vec::new();
         for (accelerator, action) in previous {
             if let Err(err) = self.grab(accelerator) {
                 tracing::error!(hotkey = %accelerator, action = %action, %err, "could not restore a hotkey after a failed edit");
+                if was_in_force.contains(&accelerator) {
+                    lost.push(Rejection {
+                        action: action.clone(),
+                        accelerator: accelerator.to_string(),
+                        reason: Conflict::NotRestored { detail: err }.to_string(),
+                    });
+                }
             }
             self.remember(accelerator, action);
         }
+        lost
     }
 }
 
@@ -2906,5 +2986,130 @@ mod tests {
             1,
             "and the one the OS refuses is still only configured"
         );
+    }
+
+    #[test]
+    fn a_shortcut_stranded_by_a_rollback_is_named_by_the_action_that_owns_it() {
+        // The row does not have to be one that existed before. Rolling back a
+        // half-applied set releases what this very call just registered, and the
+        // OS can refuse *that* too — so the action behind the stuck grab is the
+        // new one, which is nowhere in the old configuration. A rejection that
+        // cannot name its action is one a settings pane cannot show, which is
+        // how a live grab becomes unreachable.
+        let mut keys = GlobalHotkeys::observable();
+        keys.set_command("scrozz");
+
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        // The second row of the new set is contested, so the edit fails after
+        // the first row is already grabbed.
+        os.refuse.insert(acc(THIRD_FREE));
+        // And the OS will not give the first row back during the rollback.
+        os.refuse_release.borrow_mut().insert(acc(FREE));
+
+        let refused = keys
+            .apply(&[
+                want(FREE, "capture.region"),
+                want(THIRD_FREE, "capture.screen"),
+            ])
+            .expect_err("the second row is taken");
+
+        let stranded = refused
+            .iter()
+            .find(|rejection| rejection.accelerator == acc(FREE).to_string())
+            .expect("the grab the OS would not release must be reported");
+        assert_eq!(
+            stranded.action, "capture.region",
+            "a stranded grab must name the action that owns it, or nothing can \
+             offer the user a way to deal with it"
+        );
+        assert!(
+            !stranded.action.is_empty(),
+            "an unattributable rejection is dropped by the settings pane"
+        );
+    }
+
+    #[test]
+    fn a_shortcut_lost_while_a_failed_edit_was_undone_is_reported() {
+        // The transaction is not atomic: between releasing the old set and
+        // putting it back, the combination belongs to nobody, and another
+        // application can take it. Saying only "your change was refused" would
+        // imply the previous state is working, when one of its rows has just
+        // stopped.
+        let mut keys = GlobalHotkeys::observable();
+        keys.set_command("scrozz");
+        keys.apply(&[
+            want(FREE, "capture.region"),
+            want(ALSO_FREE, "capture.window"),
+        ])
+        .expect("both are free to begin with");
+        assert_eq!(keys.inactive().count(), 0, "both are in force");
+
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        // The edit itself is refused...
+        os.refuse.insert(acc(THIRD_FREE));
+        // ...and the row the edit was retiring is snatched by somebody else in
+        // the moment between it being released and the rollback wanting it back.
+        os.refuse.insert(acc(ALSO_FREE));
+
+        let refused = keys
+            .apply(&[
+                want(FREE, "capture.region"),
+                want(THIRD_FREE, "capture.screen"),
+            ])
+            .expect_err("the new row is contested");
+
+        let lost = refused
+            .iter()
+            .find(|rejection| rejection.accelerator == acc(ALSO_FREE).to_string())
+            .expect("a shortcut that was working and now is not must be reported");
+        assert_eq!(lost.action, "capture.window");
+        assert!(
+            lost.reason.contains("undone"),
+            "the reason must say the row was lost to the rollback, not that the \
+             user's edit was rejected: {}",
+            lost.reason
+        );
+
+        // It is still the user's configuration, and still retried.
+        assert_eq!(keys.bindings().count(), 2);
+        assert_eq!(
+            keys.inactive().count(),
+            1,
+            "the lost row is configured but not in force"
+        );
+    }
+
+    #[test]
+    fn a_row_that_was_already_only_configured_is_not_reported_again() {
+        // Guard against turning every failed edit into a pile of duplicates: a
+        // row the OS was already refusing has not changed state, and repeating
+        // it would bury the one rejection that is news.
+        let mut keys = GlobalHotkeys::observable();
+        keys.set_command("scrozz");
+        keys.apply(&[want(ALSO_FREE, "capture.window")])
+            .expect("free to begin with");
+
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        os.refuse.insert(acc(FREE));
+
+        // FREE is contested, so this edit fails and nothing about ALSO_FREE moves.
+        let refused = keys
+            .apply(&[
+                want(ALSO_FREE, "capture.window"),
+                want(FREE, "capture.region"),
+            ])
+            .expect_err("FREE is taken");
+        assert_eq!(
+            refused.len(),
+            1,
+            "only the row the user was editing changed state: {refused:?}"
+        );
+        assert_eq!(refused[0].accelerator, acc(FREE).to_string());
     }
 }

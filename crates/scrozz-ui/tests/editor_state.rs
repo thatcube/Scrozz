@@ -2372,3 +2372,106 @@ fn redoing_the_creation_of_a_label_that_was_typed_into_does_not_reopen_it() {
     );
     assert_eq!(content(&state), "hello");
 }
+
+#[test]
+fn escaping_a_label_whose_placement_was_undone_takes_the_placement_back() {
+    // Place a label, undo the click that made it, then walk away. Nobody is
+    // editing anything at that point — the label is not even in the document —
+    // but the placement is still unfinished and still has to be cancelled.
+    let mut state = typing();
+    state.command(Command::Undo).expect("undo the placement");
+    assert!(state.document().annotations().is_empty());
+
+    state.command(Command::Escape).expect("escape");
+
+    state.command(Command::Redo).expect("redo after escaping");
+    assert!(
+        state.document().annotations().is_empty(),
+        "the placement was taken back, so there is nothing left to redo it into"
+    );
+    assert_eq!(
+        state.editing_text(),
+        None,
+        "and nothing invisible is being edited"
+    );
+}
+
+#[test]
+fn switching_tools_after_undoing_a_placement_takes_the_placement_back() {
+    // The same cancellation, reached the other way the editor offers: picking a
+    // different tool ends whatever the last one had open.
+    let mut state = typing();
+    state.command(Command::Undo).expect("undo the placement");
+
+    state.set_tool(Tool::Rectangle);
+
+    state.command(Command::Redo).expect("redo after switching");
+    assert!(
+        state.document().annotations().is_empty(),
+        "switching away from an unfinished label cancels it too"
+    );
+}
+
+#[test]
+fn a_label_cancelled_from_the_undone_state_leaves_no_ghost_to_click_on() {
+    // The failure this guards against was not just an extra undo step: the
+    // redone annotation was in the document, empty, so it could be hit-tested
+    // and selected while being impossible to see or type into.
+    let mut state = typing();
+    state.command(Command::Undo).expect("undo the placement");
+    state.command(Command::Escape).expect("escape");
+    state.command(Command::Redo).expect("redo after escaping");
+
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(at(80.0, 80.0));
+    state.pointer_released();
+    assert_eq!(
+        state.selection(),
+        None,
+        "there is nothing at the click, because there is nothing there"
+    );
+    assert!(state.document().annotations().is_empty());
+}
+
+#[test]
+fn cancelling_a_placement_from_the_undone_state_keeps_earlier_work() {
+    // The cancellation must cost the user only the click they took back.
+    let mut state = with_a_rectangle();
+    let before = state.document().annotations().len();
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(120.0, 120.0));
+    state.pointer_released();
+
+    state.command(Command::Undo).expect("undo the placement");
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(
+        state.document().annotations().len(),
+        before,
+        "the rectangle drawn beforehand is untouched"
+    );
+    state.command(Command::Undo).expect("undo the rectangle");
+    assert!(state.document().annotations().is_empty());
+    state.command(Command::Redo).expect("redo the rectangle");
+    assert_eq!(
+        state.document().annotations().len(),
+        before,
+        "and it is still redoable afterwards"
+    );
+}
+
+#[test]
+fn redoing_a_pre_existing_label_that_an_undo_removed_still_shows_it() {
+    // The set-aside path must not be turned into a cancellation for a label the
+    // user did not place: undoing a deletion has to give the text back.
+    let mut state = pre_existing_label();
+    type_str(&mut state, "c");
+    state.command(Command::Undo).expect("undo the typing");
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(
+        content(&state),
+        "ab",
+        "a label that was there before this session is still there"
+    );
+}
