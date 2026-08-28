@@ -510,6 +510,7 @@ impl MacOverlay {
         window.setCollectionBehavior(collection_behavior(behavior));
         window.setHidesOnDeactivate(behavior.hides_on_deactivate);
         window.setIgnoresMouseEvents(behavior.click_through);
+        window.setAcceptsMouseMovedEvents(!behavior.click_through);
         window.setOpaque(behavior.opaque);
         window.setHasShadow(behavior.has_shadow);
         window.setMovable(behavior.movable);
@@ -617,9 +618,14 @@ impl MacOverlay {
     /// }
     /// .expect("adopting a live NSWindow never fails");
     ///
+    /// window.setAcceptsMouseMovedEvents(false);
     /// overlay
     ///     .set_cursor(OverlayCursor::Crosshair)
     ///     .expect("the doctest runs on the main thread");
+    /// assert!(
+    ///     window.acceptsMouseMovedEvents(),
+    ///     "pinning the crosshair must also take ownership of pointer motion"
+    /// );
     /// assert!(
     ///     !window.areCursorRectsEnabled(),
     ///     "the crosshair must pin the window so winit's own cursor rect cannot revert it"
@@ -651,6 +657,10 @@ impl MacOverlay {
         let _mtm = main_thread("setting the overlay window cursor")?;
         match cursor {
             OverlayCursor::Crosshair => {
+                // A non-activating panel does not reliably receive mouseMoved
+                // until opted in. Without those events, the application under
+                // the transparent selector keeps restoring its own arrow.
+                self.window.setAcceptsMouseMovedEvents(true);
                 // Disabling first and setting second means the window can
                 // never observe a rect-driven reset in between: no code here
                 // yields to the run loop before the crosshair is current.
@@ -696,6 +706,7 @@ impl MacOverlay {
             can_become_main: self.window.canBecomeMainWindow(),
             level: self.window.level(),
             collection_behavior: self.window.collectionBehavior().0,
+            accepts_mouse_moved_events: self.window.acceptsMouseMovedEvents(),
             is_visible: self.window.isVisible(),
         })
     }
@@ -719,6 +730,8 @@ pub struct OverlayDiagnostics {
     pub level: NSWindowLevel,
     /// The raw `NSWindowCollectionBehavior` bits.
     pub collection_behavior: usize,
+    /// Whether pointer motion is delivered while the panel is not active.
+    pub accepts_mouse_moved_events: bool,
     /// Whether the window is currently on screen.
     pub is_visible: bool,
 }
@@ -748,6 +761,7 @@ impl OverlayWindow for MacOverlay {
         // hit region: once `ignoresMouseEvents` is YES the window receives no
         // mouse events at all and cannot notice the pointer returning.
         self.window.setIgnoresMouseEvents(passthrough);
+        self.window.setAcceptsMouseMovedEvents(!passthrough);
         Ok(())
     }
 }
