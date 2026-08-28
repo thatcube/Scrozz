@@ -173,22 +173,55 @@ by Windows-gated tests that a human on Windows still has to run.
 Three things about `FORMATETC` are easy to get wrong, and each one silently
 hands a receiver the wrong bytes rather than failing.
 
-**The target device is part of the identity.** `ptd` points at a
-`DVTARGETDEVICE` describing the printer or screen a representation was rendered
-for, and the documentation is explicit that a null `ptd` means the data is
-*independent of any device* — not that any device will do. Two entries differing
-only by `ptd` are two representations; keying them the same makes the second
-overwrite the first, and then answers a request naming either device with
-whichever survived. So the device's bytes are copied into the key and compared,
-and a null device is a distinct key rather than a wildcard.
+**The target device is part of the identity, but not of matching.** `ptd` points
+at a `DVTARGETDEVICE` describing the printer or screen a representation was
+rendered for. Two entries differing only by `ptd` are two representations;
+keying them the same makes the second overwrite the first, and then answers a
+request naming either device with whichever survived. So the device's bytes are
+copied into the key, compared by value, and used for storage, replacement and
+enumeration.
+
+*Matching* is a different question, and exact equality gets it wrong in both
+directions. The `FORMATETC` reference says a null `ptd` is used
+
+> whenever the specified data format is independent of the target device or when
+> the caller doesn't care what device is used. In the latter case, if the data
+> requires a target device, the object should pick an appropriate default device
+> (often the display for visual components). Data obtained from an object with a
+> **NULL** target device, such as most metafiles, is independent of the target
+> device.
+
+So null means two different things depending on which side it is on. A stored
+null is device-*independent* data, which is by definition valid for whatever
+printer a request names. A null in a request is an indifferent caller, and the
+object is told to pick a default rather than report that the format does not
+exist. Matching therefore ranks candidates instead of filtering them:
+
+| stored `ptd` | requested `ptd` | result |
+| --- | --- | --- |
+| same device, or both null | — | best match |
+| null | a device | matches: the data depends on no device |
+| a device | null | matches last: the object picks a default |
+| device A | device B | never matches |
+
+Ties are broken by insertion order, so a target that calls `QueryGetData` and
+then `GetData` gets the same representation twice. Two *different* devices are
+still never interchangeable — a page composed for one printer is not the other's.
 
 The blob is copied by reading `tdSize` from *inside* the blob being copied, out
-of another process's memory, so `target_device_size` validates the header first:
+of another process's memory, so `target_device_size` validates the header first.
 `tdSize` must be at least the twelve-byte header and no larger than a sane
-bound, and each non-zero name offset must land inside the structure. A header
-that could not describe a real device earns `DV_E_DVTARGETDEVICE`, not a
-best-effort copy and not a quiet downgrade to "device independent" — that
-downgrade would collide with the device-free key.
+bound, and each non-zero offset must not merely be in range but leave room for
+something to be there: an offset equal to `tdSize` addresses the byte after the
+structure and points at nothing. A name needs at least its NUL terminator; the
+`tdExtDevmodeOffset` needs at least the forty bytes of an ANSI `DEVMODE` up to
+`dmDriverExtra`, because the `DVTARGETDEVICE` remarks say a consumer sizes the
+device mode as *"the sum of **dmSize** + **dmDriverExtra**"* and so has to be
+able to read both. Forty is the smaller of the ANSI and wide prefixes on
+purpose: the check is there to catch an offset that cannot be a device mode, not
+to guess which build wrote it. A header that could not describe a real device
+earns `DV_E_DVTARGETDEVICE`, not a best-effort copy and not a quiet downgrade to
+"device independent" — that downgrade would collide with the device-free key.
 
 **`lindex` does not always count.** The `FORMATETC` reference says of it: *"For
 the aspects DVASPECT_THUMBNAIL and DVASPECT_ICON, lindex is ignored."* An icon
@@ -200,9 +233,20 @@ answered with page 1. Matching is aspect-aware for exactly that reason.
 what the caller will accept; `STGMEDIUM::tymed` names what the medium in hand
 actually is. Keying an entry by the mask makes it advertise media it cannot
 supply — `QueryGetData` promises a stream, `GetData` returns a global handle,
-and the receiver dereferences the wrong union arm. `stored_medium` therefore
-requires the medium to name exactly one documented `TYMED` that the format
-offered, keys the entry by *that*, and answers `DV_E_TYMED` otherwise.
+and the receiver dereferences the wrong union arm. `SetData`'s remarks state the rule
+without qualification — *"The type of medium specified in the pformatetc and
+pmedium parameters must be the same. For example, one cannot be a global handle
+and the other a stream."* `stored_medium` therefore requires the medium to name
+exactly one documented `TYMED` that the format offered, keys the entry by
+*that*, and answers `DV_E_TYMED` otherwise.
+
+`TYMED_NULL` is refused rather than stored. It is documented as *"No data is
+being passed"*, so pairing it with a format that names a real medium is exactly
+the disagreement above, and pairing it with a format that names no medium either
+describes data no request can ever ask for. No Microsoft documentation gives
+`SetData` a null medium another meaning; in particular none establishes it as a
+request to *delete* a stored format, so it is reported rather than accepted into
+a store where it would silently do nothing.
 
 ### Duplicating a medium depends on what it is
 
@@ -231,6 +275,16 @@ media sharing one path means the first release deletes the file out from under
 the second. The duplicate is a real `std::fs::copy` into the drag scratch
 directory. This never happens in Scrozz's own flavours — it exists so a shell
 that stores one cannot be corrupted by it.
+
+That copy is guarded from before it starts until the `STGMEDIUM` around it
+exists, because in between there are two ways to leak a file with nothing left
+to name it: `std::fs::copy` can create the destination and then fail partway,
+and the task allocation for the path string can fail after a perfectly good
+copy. `ScratchFile` is an ordinary RAII guard — armed before the copy, disarmed
+only by `release`, deleting the path on drop otherwise — and it lives in
+portable code so its behaviour is tested on every platform rather than only
+compiled on Windows. It refuses a path that already exists rather than adopting
+and later deleting a file it did not create.
 
 `pUnkForRelease` changes all of the above. When it is present the provider still
 owns the storage, so the copy aliases the handle and carries an `AddRef`ed

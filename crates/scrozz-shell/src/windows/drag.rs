@@ -117,7 +117,7 @@ use windows::core::{
 
 use scrozz_core::{Error, Result};
 
-use crate::drag::artifact::artifact_root;
+use crate::drag::artifact::{ScratchFile, artifact_root};
 use crate::drag::formats::{
     FormatKey, FormatStore, TARGET_DEVICE_HEADER, stored_medium, target_device_size,
 };
@@ -545,6 +545,12 @@ fn dup_gdi(handle: HGDIOBJ) -> WinResult<HANDLE> {
 /// under every other holder. The copy therefore gets its own file, and the
 /// blocking write that costs is affordable because `TYMED_FILE` never appears
 /// on this path in practice.
+///
+/// The new file is guarded from before the copy starts until the moment the
+/// medium is built around it. Everything in between can fail — a copy can die
+/// after creating a partial destination, and the task allocation for the path
+/// can die after a perfectly good copy — and an unguarded failure would leave a
+/// temporary file that nothing in the process still knows about.
 fn dup_file_medium(src: &STGMEDIUM) -> WinResult<STGMEDIUM> {
     // SAFETY: `TYMED_FILE` means `lpszFileName` is the live arm.
     let Some(text) = (unsafe { file_name_of(src) }) else {
@@ -558,10 +564,13 @@ fn dup_file_medium(src: &STGMEDIUM) -> WinResult<STGMEDIUM> {
     };
 
     let from = PathBuf::from(OsString::from_wide(text));
-    let to = scratch_path(&from);
-    std::fs::copy(&from, &to).map_err(|_| WinError::from(E_FAIL))?;
+    let scratch =
+        ScratchFile::copy(&from, scratch_path(&from)).map_err(|_| WinError::from(E_FAIL))?;
 
-    let name = task_wide(&wide(&to))?;
+    let name = task_wide(&wide(scratch.path()))?;
+    // Ownership passes here and not before: `release` is what stops the guard
+    // deleting the file, and nothing between it and the return can fail.
+    let _kept = scratch.release();
     Ok(STGMEDIUM {
         tymed: bits(TYMED_FILE),
         u: STGMEDIUM_0 { lpszFileName: name },
@@ -1996,8 +2005,10 @@ mod tests {
     }
 
     #[test]
-    fn a_device_specific_entry_does_not_answer_a_device_free_request() {
-        // A null device means "independent of any device", not "any device".
+    fn a_device_specific_entry_answers_an_indifferent_request() {
+        // A null ptd in a *request* means "the caller doesn't care what device
+        // is used", and the object "should pick an appropriate default device"
+        // rather than report that the format does not exist.
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
         let device = target_device(7);
         let specific = with_device(drag_image_bits(), &device);
@@ -2011,10 +2022,39 @@ mod tests {
 
         let anywhere = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
         // SAFETY: live object; a plain query.
-        assert_eq!(
-            unsafe { data.QueryGetData(&raw const anywhere) },
-            DV_E_FORMATETC
-        );
+        assert!(unsafe { data.QueryGetData(&raw const anywhere) }.is_ok());
+
+        // And the data it hands back is the device-specific entry's.
+        // SAFETY: live object; the query above says it answers.
+        let mut got = unsafe { data.GetData(&raw const anywhere) }.expect("it answers");
+        assert_eq!(read_global(&got, 3), b"dev");
+        // SAFETY: ours to free.
+        unsafe { ReleaseStgMedium(&raw mut got) };
+    }
+
+    #[test]
+    fn a_null_medium_is_refused_rather_than_stored() {
+        // "The type of medium specified in the pformatetc and pmedium
+        // parameters must be the same": a format naming global memory and a
+        // medium naming nothing do not agree.
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let fmt = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let empty = STGMEDIUM {
+            tymed: 0,
+            u: STGMEDIUM_0 {
+                hGlobal: HGLOBAL(std::ptr::null_mut()),
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+
+        // SAFETY: live object; the medium carries nothing to leak.
+        let err = unsafe { data.SetData(&raw const fmt, &raw const empty, false) }
+            .map_err(|err| err.code())
+            .expect_err("a null medium is not data");
+
+        assert_eq!(err, DV_E_TYMED);
+        // SAFETY: live object; nothing was stored, so nothing answers.
+        assert_eq!(unsafe { data.QueryGetData(&raw const fmt) }, DV_E_FORMATETC);
     }
 
     // -----------------------------------------------------------------------

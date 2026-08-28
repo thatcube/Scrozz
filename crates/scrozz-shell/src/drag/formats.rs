@@ -45,9 +45,25 @@ use std::sync::Arc;
 /// silently overwriting the first, and a request naming a device would be
 /// handed whichever survived.
 ///
-/// So the device is held here as its raw bytes and compared byte for byte,
-/// which is what every reference implementation does. `None` is a null `ptd`,
-/// and a null `ptd` is a distinct key from any device — not a wildcard.
+/// So the device is held here as its raw bytes, and two devices that differ are
+/// two entries. But *matching* is not the same question as identity, and the
+/// documentation is explicit that a null `ptd` is not simply a fifth device:
+///
+/// > A **NULL** value is used whenever the specified data format is independent
+/// > of the target device or when the caller doesn't care what device is used.
+/// > In the latter case, if the data requires a target device, the object should
+/// > pick an appropriate default device (often the display for visual
+/// > components). Data obtained from an object with a **NULL** target device,
+/// > such as most metafiles, is independent of the target device.
+///
+/// So null means one thing in a stored entry — *this data does not depend on a
+/// device* — and a different thing in a request — *any device will do*. Exact
+/// equality gets both wrong: it makes device-independent data refuse a request
+/// naming a printer, though by definition that data is valid for it, and it
+/// makes an indifferent caller refuse the only representation there is, though
+/// the object is told to pick a default rather than fail. [`DeviceFit`] is how
+/// the two are told apart without ever letting one printer's rendering pass as
+/// another's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FormatKey {
     /// The clipboard format id — `CF_HDROP`, or whatever `RegisterClipboardFormatW` returned.
@@ -80,12 +96,12 @@ impl FormatKey {
         }
     }
 
-    /// Whether an entry stored under this key may answer `request`.
+    /// How well an entry stored under this key answers `request`, if at all.
     ///
-    /// Format, aspect and device must be *equal*; the medium need only
-    /// *intersect*; the index is compared only for the aspects it means
-    /// anything for. The asymmetry is the whole subtlety of `FORMATETC` and
-    /// none of it is arbitrary.
+    /// Format and aspect must be *equal*; the medium need only *intersect*; the
+    /// index is compared only for the aspects it means anything for; the device
+    /// is matched by [`DeviceFit`]. The asymmetry is the whole subtlety of
+    /// `FORMATETC` and none of it is arbitrary.
     ///
     /// `tymed` is a bitmask of the media the caller will accept, so a caller
     /// asking for `TYMED_HGLOBAL | TYMED_ISTREAM` is saying "either will do",
@@ -103,22 +119,73 @@ impl FormatKey {
     /// index *is* significant — `CFSTR_FILECONTENTS` uses it as the zero-based
     /// index of the file wanted — so it is compared there.
     ///
-    /// Being lenient about aspect, device or a significant index would return
-    /// the wrong data rather than an error, which is the failure that is hard
-    /// to notice.
+    /// Being lenient about aspect or a significant index would return the wrong
+    /// data rather than an error, which is the failure that is hard to notice.
+    /// Two *different* devices are equally never interchangeable — a page
+    /// composed for one printer is not the other's — so that stays a mismatch.
+    #[must_use]
+    pub fn fit(&self, request: &Self) -> Option<DeviceFit> {
+        if self.format != request.format
+            || self.aspect != request.aspect
+            || (!aspect_ignores_index(self.aspect) && self.index != request.index)
+            || self.tymed & request.tymed == 0
+        {
+            return None;
+        }
+        if self.device == request.device {
+            return Some(DeviceFit::Exact);
+        }
+        match (&self.device, &request.device) {
+            (None, Some(_)) => Some(DeviceFit::Independent),
+            (Some(_), None) => Some(DeviceFit::Default),
+            // Two different devices, or the equality above would have fired.
+            _ => None,
+        }
+    }
+
+    /// Whether an entry stored under this key may answer `request` at all.
+    ///
+    /// The predicate behind [`Self::fit`], for callers that do not need to rank
+    /// one candidate against another.
     #[must_use]
     pub fn answers(&self, request: &Self) -> bool {
-        self.format == request.format
-            && self.aspect == request.aspect
-            && self.device == request.device
-            && (aspect_ignores_index(self.aspect) || self.index == request.index)
-            && self.tymed & request.tymed != 0
+        self.fit(request).is_some()
     }
+}
+
+/// How closely a stored entry's target device answers a request's.
+///
+/// Ordered best first, so ranking candidates is `min`. The order is not a
+/// preference this crate invented; it falls out of what a null `ptd` means on
+/// each side, quoted in full on [`FormatKey`].
+///
+/// * [`Exact`](Self::Exact) — the same device, or both device-free. Nothing
+///   beats a representation composed for precisely the device asked about.
+/// * [`Independent`](Self::Independent) — a device-free entry answering a
+///   request that names a device. Device-independent data "is independent of
+///   the target device", so it is genuinely valid for that device; it is second
+///   only because an entry made for the device itself is more specific.
+/// * [`Default`](Self::Default) — a device-specific entry answering a request
+///   that names none. The caller "doesn't care what device is used" and the
+///   object "should pick an appropriate default device", so answering is right;
+///   it ranks last so that a device-free entry is the default when one exists.
+///
+/// Two entries reaching the same rank are broken by insertion order, which is
+/// the order the offering code wrote them in, so repeated requests never
+/// oscillate between representations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeviceFit {
+    /// Same device, or neither names one.
+    Exact,
+    /// Device-independent data answering a device-specific request.
+    Independent,
+    /// Device-specific data answering a caller that is indifferent.
+    Default,
 }
 
 /// Whether `lindex` carries no meaning for this aspect.
 ///
-/// See the quotation in [`FormatKey::answers`].
+/// See the quotation in [`FormatKey::fit`].
 #[must_use]
 pub const fn aspect_ignores_index(aspect: u32) -> bool {
     aspect == DVASPECT_THUMBNAIL || aspect == DVASPECT_ICON
@@ -168,17 +235,23 @@ pub const fn is_single_medium(tymed: u32) -> bool {
 /// a type confusion the receiver has no way to detect before it dereferences.
 ///
 /// So the answer is `actual`, and only when `actual` names a single documented
-/// medium that the format offered.
+/// medium that the format offered. `IDataObject::SetData` states the rule
+/// without qualification:
 ///
-/// A medium of `TYMED_NULL` is the one exception. It names nothing, so there is
-/// nothing to disagree with, and it is kept as given under a `tymed` of zero —
-/// which, since a request must name at least one medium to be satisfiable, then
-/// answers nothing.
+/// > The type of medium specified in the *pformatetc* and *pmedium* parameters
+/// > must be the same. For example, one cannot be a global handle and the other
+/// > a stream.
+///
+/// A medium of `TYMED_NULL` is refused rather than stored. It is documented as
+/// "No data is being passed", so a format offering a real medium alongside it
+/// is exactly the disagreement the sentence above forbids, and a format
+/// offering `TYMED_NULL` too describes data that nothing can ever ask for. No
+/// Microsoft documentation gives `SetData` a null medium any other meaning —
+/// in particular none establishes it as a request to delete a stored format —
+/// so it is reported as `DV_E_TYMED`, "The tymed value is not valid", instead
+/// of being accepted into a store where it would silently do nothing.
 #[must_use]
 pub const fn stored_medium(offered: u32, actual: u32) -> Option<u32> {
-    if actual == 0 {
-        return Some(0);
-    }
     if !is_single_medium(actual) || offered & actual == 0 {
         return None;
     }
@@ -195,6 +268,20 @@ pub const TARGET_DEVICE_HEADER: usize = 12;
 /// a refusal rather than a 4 GiB allocation.
 pub const TARGET_DEVICE_MAX: usize = 16 << 20;
 
+/// The least a nonzero `DVTARGETDEVICE` name offset must leave behind it.
+///
+/// One byte: the terminator of the shortest possible NUL-terminated string.
+pub const TARGET_DEVICE_NAME_MIN: usize = 1;
+
+/// The least a nonzero `tdExtDevmodeOffset` must leave behind it.
+///
+/// Forty bytes: an ANSI `DEVMODE` up to and including `dmDriverExtra`
+/// (`dmDeviceName[32]`, then `dmSpecVersion`, `dmDriverVersion`, `dmSize` and
+/// `dmDriverExtra`, two bytes each). The wide layout's prefix is longer, at 72,
+/// so the smaller of the two is used: the point is to catch an offset that
+/// cannot possibly be a device mode, not to guess which build wrote it.
+pub const TARGET_DEVICE_DEVMODE_MIN: usize = 40;
+
 /// Validates a `DVTARGETDEVICE` header and returns the whole structure's size.
 ///
 /// `header` must be the first [`TARGET_DEVICE_HEADER`] bytes, little-endian, as
@@ -206,9 +293,21 @@ pub const TARGET_DEVICE_MAX: usize = 16 << 20;
 /// the very structure being copied. Reading `tdSize` and trusting it is how a
 /// buffer overrun happens; every field it could be is checked first.
 ///
-/// The four offsets are checked to be within the structure. They do not affect
-/// the copy, which is byte-for-byte, but an offset pointing outside is proof
-/// the blob is malformed and worth refusing before it is passed on.
+/// The four offsets are checked to be within the structure, with room for
+/// something to actually be there. They do not affect the copy, which is
+/// byte-for-byte, but an offset pointing outside — or exactly one past the end —
+/// is proof the blob is malformed and worth refusing before it is passed on.
+///
+/// The minima are deliberately the smallest a conforming structure could use,
+/// so nothing valid is turned away. A name offset must leave at least one byte,
+/// because the fields are documented as pointing at "a NULL-terminated string in
+/// the tdData buffer" and a string is at least its terminator; asserting two
+/// would assume a character width the structure never states. The devmode
+/// offset must leave [`TARGET_DEVICE_DEVMODE_MIN`] bytes, because a consumer has
+/// to read the `dmSize` and `dmDriverExtra` fields to learn the real length:
+///
+/// > The number of bytes to be allocated should be the sum of **dmSize** +
+/// > **dmDriverExtra**.
 #[must_use]
 pub fn target_device_size(header: &[u8]) -> Option<usize> {
     let header: &[u8; TARGET_DEVICE_HEADER] =
@@ -220,11 +319,20 @@ pub fn target_device_size(header: &[u8]) -> Option<usize> {
     if !(TARGET_DEVICE_HEADER..=TARGET_DEVICE_MAX).contains(&size) {
         return None;
     }
-    // Offset zero is the documented "this name is absent"; anything else must
-    // land inside the blob, past the header it would otherwise overlap.
-    for at in [4, 6, 8, 10] {
+    // Offset zero is the documented "this field is absent"; anything else must
+    // land inside the blob, past the header it would otherwise overlap, with
+    // room left for the smallest thing it could be pointing at.
+    for (at, least) in [
+        (4, TARGET_DEVICE_NAME_MIN),
+        (6, TARGET_DEVICE_NAME_MIN),
+        (8, TARGET_DEVICE_NAME_MIN),
+        (10, TARGET_DEVICE_DEVMODE_MIN),
+    ] {
         let offset = field(at);
-        if offset != 0 && !(TARGET_DEVICE_HEADER..=size).contains(&offset) {
+        if offset == 0 {
+            continue;
+        }
+        if offset < TARGET_DEVICE_HEADER || offset.checked_add(least)? > size {
             return None;
         }
     }
@@ -285,14 +393,10 @@ impl<T> FormatStore<T> {
 
     /// The value that answers `request`, if one does.
     ///
-    /// First match in insertion order, so an earlier entry is preferred exactly
-    /// as [`Self::keys`] would suggest.
+    /// Best [`DeviceFit`] wins, insertion order breaks ties.
     #[must_use]
     pub fn get(&self, request: &FormatKey) -> Option<&T> {
-        self.entries
-            .iter()
-            .find(|(key, _)| key.answers(request))
-            .map(|(_, value)| value)
+        self.best(request).map(|(_, value)| value)
     }
 
     /// The key an entry answering `request` is stored under.
@@ -300,13 +404,25 @@ impl<T> FormatStore<T> {
     /// Needed because the stored key, not the request, describes the medium the
     /// value actually is — a request for `HGLOBAL | ISTREAM` is answered by an
     /// entry that is one or the other, and a caller about to duplicate it has
-    /// to know which.
+    /// to know which. Same for the device: a request naming none can be
+    /// answered by an entry that names one.
     #[must_use]
     pub fn key_for(&self, request: &FormatKey) -> Option<FormatKey> {
+        self.best(request).map(|(key, _)| key.clone())
+    }
+
+    /// The entry that best answers `request`.
+    ///
+    /// `min_by_key` keeps the first of several equal minima, so two entries of
+    /// the same [`DeviceFit`] resolve to the one stored first — the same answer
+    /// every time, which matters because a target may query a format and then
+    /// fetch it as two separate calls.
+    fn best(&self, request: &FormatKey) -> Option<&(FormatKey, T)> {
         self.entries
             .iter()
-            .find(|(key, _)| key.answers(request))
-            .map(|(key, _)| key.clone())
+            .filter_map(|entry| entry.0.fit(request).map(|fit| (fit, entry)))
+            .min_by_key(|(fit, _)| *fit)
+            .map(|(_, entry)| entry)
     }
 
     /// Every key, in insertion order.
@@ -705,13 +821,15 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_medium_is_kept_but_answers_nothing() {
-        // Storing it preserves whatever a caller meant by it; keying it under
-        // zero means no request, which must name a medium, can ever match.
-        assert_eq!(stored_medium(1, 0), Some(0));
-        let mut store = FormatStore::new();
-        store.set(FormatKey::content(9, 0), "nothing");
-        assert_eq!(store.get(&FormatKey::content(9, u32::MAX)), None);
+    fn an_absent_medium_is_refused() {
+        // "The type of medium specified in the pformatetc and pmedium
+        // parameters must be the same" — a format naming global memory does not
+        // agree with a medium naming nothing, and TYMED_NULL is "No data is
+        // being passed", so there is nothing to store either way.
+        assert_eq!(stored_medium(TYMED_HGLOBAL, 0), None);
+        assert_eq!(stored_medium(u32::MAX, 0), None);
+        assert_eq!(stored_medium(0, 0), None);
+        assert_eq!(stored_medium(0, TYMED_HGLOBAL), None);
     }
 
     // -----------------------------------------------------------------------
@@ -746,21 +864,137 @@ mod tests {
     }
 
     #[test]
-    fn a_device_specific_entry_does_not_answer_a_device_independent_request() {
-        // A null ptd is its own key, not a wildcard: a caller that did not name
-        // a device must not be handed one printer's idea of the data.
+    fn one_printer_never_answers_for_another() {
+        // The leniency below is about null, never about two real devices.
         let mut store = FormatStore::new();
         store.set(for_device(9, Some(b"inkjet")), "inkjet");
 
-        assert_eq!(store.get(&for_device(9, None)), None);
+        assert_eq!(store.get(&for_device(9, Some(b"laser"))), None);
+        assert_eq!(
+            for_device(9, Some(b"inkjet")).fit(&for_device(9, Some(b"laser"))),
+            None
+        );
     }
 
     #[test]
-    fn a_device_independent_entry_does_not_answer_a_device_specific_request() {
+    fn a_device_specific_entry_answers_an_indifferent_request_as_a_default() {
+        // "when the caller doesn't care what device is used ... the object
+        // should pick an appropriate default device" — refusing would deny the
+        // caller the only representation there is.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, Some(b"inkjet")), "inkjet");
+
+        assert_eq!(store.get(&for_device(9, None)), Some(&"inkjet"));
+        assert_eq!(
+            for_device(9, Some(b"inkjet")).fit(&for_device(9, None)),
+            Some(DeviceFit::Default)
+        );
+    }
+
+    #[test]
+    fn a_device_independent_entry_answers_a_device_specific_request() {
+        // "Data obtained from an object with a NULL target device ... is
+        // independent of the target device", so it is valid for the printer the
+        // caller named.
         let mut store = FormatStore::new();
         store.set(for_device(9, None), "any");
 
-        assert_eq!(store.get(&for_device(9, Some(b"inkjet"))), None);
+        assert_eq!(store.get(&for_device(9, Some(b"inkjet"))), Some(&"any"));
+        assert_eq!(
+            for_device(9, None).fit(&for_device(9, Some(b"inkjet"))),
+            Some(DeviceFit::Independent)
+        );
+    }
+
+    #[test]
+    fn the_named_device_beats_the_device_independent_entry() {
+        // Both answer; the one composed for that printer is more specific, and
+        // wins however the entries were ordered.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, None), "any");
+        store.set(for_device(9, Some(b"inkjet")), "inkjet");
+
+        assert_eq!(store.get(&for_device(9, Some(b"inkjet"))), Some(&"inkjet"));
+
+        let mut reversed = FormatStore::new();
+        reversed.set(for_device(9, Some(b"inkjet")), "inkjet");
+        reversed.set(for_device(9, None), "any");
+
+        assert_eq!(
+            reversed.get(&for_device(9, Some(b"inkjet"))),
+            Some(&"inkjet")
+        );
+    }
+
+    #[test]
+    fn an_indifferent_request_prefers_the_device_independent_entry() {
+        // Ranking, not insertion order: the device-specific entry was stored
+        // first and still loses, because a caller that named no device is best
+        // served by data that depends on none.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, Some(b"inkjet")), "inkjet");
+        store.set(for_device(9, None), "any");
+
+        assert_eq!(store.get(&for_device(9, None)), Some(&"any"));
+    }
+
+    #[test]
+    fn an_indifferent_request_picks_the_same_default_every_time() {
+        // Two printers, no device-free entry: something must be chosen, and it
+        // has to be the same something each call, because a target queries a
+        // format and fetches it as two separate trips.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, Some(b"inkjet")), "inkjet");
+        store.set(for_device(9, Some(b"laser")), "laser");
+
+        assert_eq!(store.get(&for_device(9, None)), Some(&"inkjet"));
+        assert_eq!(store.get(&for_device(9, None)), Some(&"inkjet"));
+        assert_eq!(
+            store.key_for(&for_device(9, None)),
+            Some(for_device(9, Some(b"inkjet")))
+        );
+    }
+
+    #[test]
+    fn the_key_reported_for_an_indifferent_request_is_the_stored_one() {
+        // The caller duplicates what it was handed, so it must be told the
+        // device the entry really carries, not the null it asked with.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, Some(b"inkjet")), "inkjet");
+
+        let found = store.key_for(&for_device(9, None)).expect("it answers");
+
+        assert_eq!(found.device.as_deref(), Some(&b"inkjet"[..]));
+    }
+
+    #[test]
+    fn fit_ranks_exact_above_independent_above_default() {
+        assert!(DeviceFit::Exact < DeviceFit::Independent);
+        assert!(DeviceFit::Independent < DeviceFit::Default);
+        assert_eq!(
+            for_device(9, None).fit(&for_device(9, None)),
+            Some(DeviceFit::Exact)
+        );
+        assert_eq!(
+            for_device(9, Some(b"inkjet")).fit(&for_device(9, Some(b"inkjet"))),
+            Some(DeviceFit::Exact)
+        );
+    }
+
+    #[test]
+    fn device_leniency_never_crosses_a_format_or_a_medium() {
+        // Everything else is still compared exactly; only the device is ranked.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, None), "any");
+
+        assert_eq!(store.get(&for_device(10, Some(b"inkjet"))), None);
+        assert_eq!(
+            store.get(&FormatKey {
+                device: Some(Arc::from(&b"inkjet"[..])),
+                ..FormatKey::content(9, 4)
+            }),
+            None
+        );
     }
 
     #[test]
@@ -781,7 +1015,8 @@ mod tests {
     // Trusting a length that lives inside the buffer it measures
     // -----------------------------------------------------------------------
 
-    /// A `DVTARGETDEVICE` header: `tdSize` then the four name offsets.
+    /// A `DVTARGETDEVICE` header: `tdSize`, the three name offsets, then
+    /// `tdExtDevmodeOffset`.
     fn device_header(size: u32, offsets: [u16; 4]) -> Vec<u8> {
         let mut header = size.to_le_bytes().to_vec();
         for offset in offsets {
@@ -792,9 +1027,11 @@ mod tests {
 
     #[test]
     fn an_ordinary_target_device_measures_itself() {
-        let header = device_header(64, [12, 20, 28, 36]);
+        // Three short names after the header, then a device mode with room for
+        // the fields a consumer has to read to size it.
+        let header = device_header(128, [12, 20, 28, 36]);
 
-        assert_eq!(target_device_size(&header), Some(64));
+        assert_eq!(target_device_size(&header), Some(128));
     }
 
     #[test]
@@ -827,7 +1064,78 @@ mod tests {
 
     #[test]
     fn a_name_pointing_past_the_end_is_refused() {
-        let header = device_header(64, [12, 20, 28, 65]);
+        let header = device_header(64, [65, 0, 0, 0]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_name_starting_one_past_the_end_is_refused() {
+        // The boundary this pins: an offset equal to `tdSize` addresses the
+        // byte after the structure, so the string it claims to point at is not
+        // in the blob at all. An inclusive bound calls this well formed.
+        let header = device_header(64, [64, 0, 0, 0]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_name_that_is_only_its_terminator_is_accepted() {
+        // One byte left is enough for the empty string, and nothing in the
+        // structure states a character width, so this is not ours to refuse.
+        let header = device_header(64, [63, 0, 0, 0]);
+
+        assert_eq!(target_device_size(&header), Some(64));
+    }
+
+    #[test]
+    fn a_devmode_with_no_room_for_its_own_length_is_refused() {
+        // A consumer reads `dmSize` and `dmDriverExtra` to learn how long the
+        // device mode really is. An offset that leaves fewer bytes than those
+        // fields need cannot be pointing at one.
+        let short = TARGET_DEVICE_DEVMODE_MIN as u16 - 1;
+        let header = device_header(64, [0, 0, 0, 64 - short]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_devmode_with_exactly_enough_room_is_accepted() {
+        let least = TARGET_DEVICE_DEVMODE_MIN as u16;
+        let header = device_header(64, [0, 0, 0, 64 - least]);
+
+        assert_eq!(target_device_size(&header), Some(64));
+    }
+
+    #[test]
+    fn a_devmode_starting_one_past_the_end_is_refused() {
+        let header = device_header(64, [0, 0, 0, 64]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn the_devmode_floor_is_the_ansi_prefix_through_its_own_lengths() {
+        // Spelled out rather than derived from the constant, so that the number
+        // stays tied to the structure it came from: `dmDeviceName[32]` plus
+        // `dmSpecVersion`, `dmDriverVersion`, `dmSize` and `dmDriverExtra` at
+        // two bytes each. A consumer needs all of those to size the device mode
+        // as `dmSize + dmDriverExtra`, so anything shorter cannot be one.
+        let ansi_prefix = 32 + 2 + 2 + 2 + 2;
+        assert_eq!(TARGET_DEVICE_DEVMODE_MIN, ansi_prefix);
+
+        let just_short = device_header(64, [0, 0, 0, 64 - ansi_prefix as u16 + 1]);
+        let exactly_enough = device_header(64, [0, 0, 0, 64 - ansi_prefix as u16]);
+
+        assert_eq!(target_device_size(&just_short), None);
+        assert_eq!(target_device_size(&exactly_enough), Some(64));
+    }
+
+    #[test]
+    fn an_offset_that_would_overflow_when_bounded_is_refused() {
+        // `tdSize` is capped well below u16::MAX, so a maximal offset is out of
+        // range on its own; the arithmetic must not wrap on the way to saying so.
+        let header = device_header(64, [u16::MAX, 0, 0, 0]);
 
         assert_eq!(target_device_size(&header), None);
     }

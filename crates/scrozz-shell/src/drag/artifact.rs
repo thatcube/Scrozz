@@ -39,6 +39,7 @@
 //! forever.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -271,6 +272,88 @@ impl Drop for DragArtifact {
     }
 }
 
+/// A file that deletes itself unless it is explicitly handed on.
+///
+/// The narrow problem this solves lives in the Windows data object, where a
+/// `TYMED_FILE` medium is duplicated by physically copying the file: the copy
+/// belongs to nobody until a `STGMEDIUM` is successfully built around its path,
+/// and every step between the two can fail. `std::fs::copy` can create the
+/// destination and *then* fail partway, leaving a truncated file; the task
+/// allocation for the path string can fail after a perfectly good copy. Neither
+/// failure has anywhere to report the file it left behind, so without a guard
+/// each one leaks a temporary file for the lifetime of the machine.
+///
+/// It lives here, in portable code, for two reasons: the logic is `std::fs` and
+/// nothing else, and putting it here means its behaviour is exercised by tests
+/// that run on every platform rather than only compiled on Windows.
+#[derive(Debug)]
+pub struct ScratchFile {
+    /// `None` once ownership has been given away by [`Self::release`].
+    path: Option<PathBuf>,
+}
+
+impl ScratchFile {
+    /// Takes responsibility for `to` before anything is written there.
+    ///
+    /// The seam that makes the ordering testable, and the reason a copy that
+    /// dies halfway does not leak: from here on the path belongs to the guard
+    /// whether or not any bytes ever arrive.
+    ///
+    /// Refuses if something is already at `to` rather than guarding a file it
+    /// did not create — the paths used here are unique per process and serial,
+    /// so a collision means an assumption is wrong, and deleting a stranger's
+    /// file on the way out would be the worse failure. That refusal also keeps
+    /// the ordering honest: claiming *after* writing would find the path
+    /// occupied by its own output and fail.
+    pub fn claim(to: PathBuf) -> Result<Self> {
+        if to.exists() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("scratch path is already occupied: {}", to.display()),
+            )));
+        }
+        Ok(Self { path: Some(to) })
+    }
+
+    /// Claims `to`, then copies `from` into it.
+    ///
+    /// The guard is armed *before* the copy is attempted, so a copy that fails
+    /// halfway still takes its partial output with it.
+    pub fn copy(from: &Path, to: PathBuf) -> Result<Self> {
+        let guard = Self::claim(to)?;
+        fs::copy(from, guard.path())?;
+        Ok(guard)
+    }
+
+    /// The guarded path.
+    ///
+    /// # Panics
+    ///
+    /// Never: the path is only taken by [`Self::release`], which consumes the
+    /// guard.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.path.as_deref().expect("a live guard owns its path")
+    }
+
+    /// Gives the file up, so that dropping this guard no longer deletes it.
+    ///
+    /// Called once the receiving structure has taken responsibility for the
+    /// file — and not a moment earlier, which is the whole point.
+    #[must_use]
+    pub fn release(mut self) -> PathBuf {
+        self.path.take().expect("a live guard owns its path")
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Deletes artifacts left behind by a previous run.
 ///
 /// Returns how many directories were removed. Errors are swallowed
@@ -416,5 +499,114 @@ mod tests {
         let err = DragArtifact::materialise(&root().join("nameless"), "", b"bytes")
             .expect_err("an empty file name must be refused");
         assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // A copied file belongs to nobody until somebody takes it
+    // -----------------------------------------------------------------------
+
+    /// A directory with one readable file in it, plus a free path beside it.
+    fn scratch_pair() -> (PathBuf, PathBuf, PathBuf) {
+        let dir = root();
+        fs::create_dir_all(&dir).expect("a temp dir");
+        let source = dir.join("source.png");
+        fs::write(&source, b"pretend png").expect("a source file");
+        let dest = dir.join("copy.png");
+        (dir, source, dest)
+    }
+
+    #[test]
+    fn a_guarded_copy_exists_while_the_guard_does() {
+        let (dir, source, dest) = scratch_pair();
+
+        let guard = ScratchFile::copy(&source, dest.clone()).expect("the copy succeeds");
+
+        assert_eq!(guard.path(), dest);
+        assert_eq!(fs::read(&dest).expect("readable"), b"pretend png");
+        drop(guard);
+
+        assert!(!dest.exists(), "dropping the guard takes the file with it");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_released_copy_outlives_its_guard() {
+        // The success path: something else has taken responsibility, so the
+        // guard must stop being one.
+        let (dir, source, dest) = scratch_pair();
+        let guard = ScratchFile::copy(&source, dest.clone()).expect("the copy succeeds");
+
+        let kept = guard.release();
+
+        assert_eq!(kept, dest);
+        assert!(dest.exists(), "a released file is no longer the guard's");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failure_after_the_copy_still_takes_the_file() {
+        // This is the leak the guard exists for: in the Windows data object the
+        // task allocation for the path string happens *after* the copy, and can
+        // fail. Standing in for it here is any early return that drops the
+        // guard without releasing it.
+        let (dir, source, dest) = scratch_pair();
+
+        let outcome: Result<PathBuf> = (|| {
+            let guard = ScratchFile::copy(&source, dest.clone())?;
+            assert!(guard.path().exists(), "the copy landed");
+            Err(Error::Platform("allocating the path failed".into()))
+        })();
+
+        assert!(outcome.is_err());
+        assert!(!dest.exists(), "the abandoned copy was cleaned up");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_partial_copy_is_still_the_guards_responsibility() {
+        // The failure the ordering exists for: bytes land at the destination
+        // and *then* the copy dies. Writing through the claimed path stands in
+        // for a copy that got halfway, which is not something a test can ask
+        // the filesystem to do on demand.
+        let (dir, _source, dest) = scratch_pair();
+
+        let guard = ScratchFile::claim(dest.clone()).expect("the path is free");
+        fs::write(guard.path(), b"half a fi").expect("a partial write");
+        drop(guard);
+
+        assert!(!dest.exists(), "the half-written file went with the guard");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_copy_that_never_starts_leaves_nothing_behind() {
+        // `fs::copy` can create the destination and then fail; guarding before
+        // the attempt is what makes a partial file somebody's responsibility.
+        let (dir, _source, dest) = scratch_pair();
+        let missing = dir.join("not-there.png");
+
+        let err = ScratchFile::copy(&missing, dest.clone()).expect_err("no such source");
+
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        assert!(!dest.exists(), "nothing was left at the destination");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_occupied_path_is_refused_rather_than_adopted() {
+        // Deleting a file this code did not create would be a worse failure
+        // than refusing to copy.
+        let (dir, source, dest) = scratch_pair();
+        fs::write(&dest, b"somebody else's").expect("an occupant");
+
+        let err = ScratchFile::copy(&source, dest.clone()).expect_err("occupied");
+
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        assert_eq!(
+            fs::read(&dest).expect("still there"),
+            b"somebody else's",
+            "the stranger's file survived untouched"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }
