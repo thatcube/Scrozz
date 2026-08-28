@@ -832,10 +832,26 @@ impl EditorState {
     ///
     /// `fresh` says whether `id` was created by the click that started this —
     /// see [`finish_text`](Self::finish_text) for why that distinction matters.
+    ///
+    /// # Why this must never run over a pending label
+    ///
+    /// A label that has been set aside is still holding the rollback point for
+    /// the click that placed it, and the id in `suspended_text` is the only
+    /// thing that will pick it back up when a redo returns it to the document.
+    /// Starting another editing session over the top of that drops the id while
+    /// leaving the rollback point open, so the click stays on the redo stack
+    /// with nobody holding it — the same ghost
+    /// [`finish_suspended_text`](Self::finish_suspended_text) exists to prevent,
+    /// reached from the other end. Callers settle first, and refuse the press
+    /// when settling is refused; the assertion is here so that stays true of
+    /// callers added later.
     fn begin_text(&mut self, id: AnnotationId, fresh: bool) {
+        debug_assert!(
+            self.suspended_text.is_none(),
+            "a label the user has not finished is still waiting to come back; \
+             starting a second editing session over it strands the first"
+        );
         self.editing_text = Some(id);
-        // Whatever label an undo set aside, the user has moved on from it.
-        self.suspended_text = None;
         self.text_is_new = fresh;
         self.caret = self.text_buffer().map_or(0, str::len);
         self.preedit = None;
@@ -937,6 +953,20 @@ impl EditorState {
     /// is the ghost this exists to prevent. Left open, a redo puts the user back
     /// in the label and the next Escape cancels it properly.
     ///
+    /// # Why a refusal cannot be waited out forever
+    ///
+    /// Waiting only makes sense while there is something to wait for. Once the
+    /// click that placed the label has gone from the history for good — because
+    /// work committed since truncated the branch it sat in, or because it fell
+    /// off the back of a full history — no redo will ever bring the label back,
+    /// so there is no ghost left to guard against and nothing left to cancel.
+    /// Holding on past that point was its own bug: the pending label could never
+    /// be settled, and every later attempt to place one was refused on its
+    /// behalf, which left the text tool dead for the rest of the session. So the
+    /// stale rollback point is closed and the label let go of. The document is
+    /// not touched — the label is already out of it, and the history says it is
+    /// not coming back.
+    ///
     /// Returns whether it was dealt with, so a refusal does not read as success.
     /// A caller that keeps asking the same question and keeps being told nothing
     /// happened has to be free to do something else — Escape that only ever
@@ -950,12 +980,15 @@ impl EditorState {
             self.preedit = None;
             return true;
         }
-        if !self
+        let cancelled = self
             .history
             .abandon(&mut self.document)
-            .expect("the document has not changed provenance mid-edit")
-        {
-            return false;
+            .expect("the document has not changed provenance mid-edit");
+        if !cancelled {
+            if self.history.abandon_is_still_reachable() {
+                return false;
+            }
+            self.history.finish();
         }
         self.suspended_text = None;
         self.text_is_new = false;
@@ -979,23 +1012,28 @@ impl EditorState {
     /// # What a refusal means
     ///
     /// `false` says the history has moved somewhere the label's placement can
-    /// no longer be lifted out of, so the label stays pending rather than being
-    /// faked away. Work committed after that is safe: it lands above a rollback
-    /// point that has already been ruled out, and the cancellation stays
-    /// refused, so nothing the user does next can be rolled back underneath
-    /// them.
+    /// no longer be lifted out of *yet*, so the label stays pending rather than
+    /// being faked away. Work committed after that is safe: it lands above a
+    /// rollback point that has already been ruled out, and the cancellation
+    /// stays refused, so nothing the user does next can be rolled back
+    /// underneath them.
     ///
-    /// One thing is not safe, and only one: starting a *second* unfinished
-    /// label. Opening a rollback point closes the one already open and moves
-    /// the redo branch into its own safekeeping, so the pending label's
-    /// creation ends up stranded in a branch nothing is holding — and redoing
-    /// far enough put an invisible, unselectable, uncancellable label back in
-    /// the document. [`pointer_pressed`](Self::pointer_pressed) is where that
-    /// is refused.
+    /// What is not safe is beginning a second editing session, whether by
+    /// placing a new label or by clicking into one that is already there. The
+    /// pending label's id is the only thing that will pick it back up when a
+    /// redo returns it, and its rollback point is still open; starting another
+    /// session drops the id and leaves the click stranded in a branch nothing is
+    /// holding, so redoing far enough put an invisible, unselectable,
+    /// uncancellable label back in the document.
+    /// [`press_opens_a_label`](Self::press_opens_a_label) is where that is
+    /// refused, for both routes.
     ///
-    /// The state is rare and recoverable either way: one Redo returns to the
-    /// label and hands it back to the user, and Escape still unwinds normally
-    /// because it does not stop at this gate.
+    /// The state is rare and recoverable: one Redo returns to the label and
+    /// hands it back to the user, and Escape still unwinds normally because it
+    /// does not stop at this gate. And if the placement is ever put beyond
+    /// recovery — by work that truncates the branch it sat in — the label is let
+    /// go of rather than waited on forever, which is what
+    /// [`finish_suspended_text`](Self::finish_suspended_text) decides.
     fn settle_text(&mut self) -> bool {
         if self.editing_text.is_none() && self.suspended_text.is_none() {
             return true;
@@ -1106,14 +1144,40 @@ impl EditorState {
     // Pointer
     // -----------------------------------------------------------------------
 
+    /// Whether a press at `point` would start editing a label — by placing a
+    /// new one, or by re-entering one that is already in the document.
+    ///
+    /// This is the single place the rule about not opening a second label while
+    /// one is still pending is decided, so it has to agree with every route to
+    /// [`begin_text`](Self::begin_text): the text tool, and a select click that
+    /// lands on a label rather than on a resize handle. A route added without a
+    /// matching arm here would be caught by the assertion in `begin_text`.
+    fn press_opens_a_label(&self, point: LogicalPoint) -> bool {
+        match self.tool {
+            Tool::Text => true,
+            Tool::Select => {
+                // A press on a resize handle never reaches the hit test.
+                if self.handle_at(point).is_some() && self.selection_bounds().is_some() {
+                    return false;
+                }
+                self.document
+                    .hit_test(point)
+                    .and_then(|id| self.document.get(id))
+                    .is_some_and(|object| matches!(object.annotation, Annotation::Text { .. }))
+            }
+            _ => false,
+        }
+    }
+
     /// Handles a primary-button press at `point`, in document coordinates.
     ///
     /// Settles an unfinished label first, so that a drawing never lands on top
-    /// of one still waiting to be dealt with. A press that would start a
-    /// *second* unfinished label when the first one will not settle does
-    /// nothing at all: see [`settle_text`](Self::settle_text).
+    /// of one still waiting to be dealt with. When that is refused, a press that
+    /// would open *another* label does nothing at all — see
+    /// [`press_opens_a_label`](Self::press_opens_a_label). Anything else carries
+    /// on: see [`settle_text`](Self::settle_text) for why that is safe.
     pub fn pointer_pressed(&mut self, point: LogicalPoint) {
-        if !self.settle_text() && self.tool == Tool::Text {
+        if !self.settle_text() && self.press_opens_a_label(point) {
             return;
         }
         match self.tool {

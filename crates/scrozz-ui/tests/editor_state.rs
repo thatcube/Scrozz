@@ -2862,3 +2862,254 @@ fn drawing_is_still_allowed_while_a_label_refuses_to_be_cancelled() {
         "and escaping the pending label did not take it back"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Letting go of a pending label the history can no longer give back
+// ---------------------------------------------------------------------------
+
+/// The text of the only text annotation in the document, if there is one.
+fn only_label(state: &EditorState) -> Option<String> {
+    let mut found = None;
+    for object in state.document().annotations() {
+        if let Annotation::Text { content, .. } = &object.annotation {
+            assert!(found.is_none(), "expected at most one label");
+            found = Some(content.clone());
+        }
+    }
+    found
+}
+
+#[test]
+fn the_text_tool_works_again_once_a_pending_label_is_beyond_recovery() {
+    // Refusing to cancel a set-aside label is a wait, and a wait needs an end.
+    // Draw, place a label, undo the label, undo the drawing — the cancellation
+    // is refused but still reachable. Then draw something else: committing it
+    // discards the branch the label's placement was stranded in, so no redo can
+    // ever bring the label back.
+    //
+    // The refusal used to stand anyway. `finish_suspended_text` could never
+    // clear the pending label, so every later press of the text tool was
+    // refused on its behalf and the tool was dead for the rest of the session.
+    let mut state = a_drawing_and_a_set_aside_label();
+    state.command(Command::Undo).expect("undo the drawing");
+
+    state.set_tool(Tool::Ellipse);
+    drag(&mut state, at(150.0, 150.0), at(260.0, 240.0));
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the ellipse landed"
+    );
+
+    // Exactly the user's next move: choose the text tool and click.
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(300.0, 240.0));
+    state.pointer_released();
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "a new label was placed rather than refused on a dead one's behalf"
+    );
+    assert!(
+        state.editing_text().is_some(),
+        "and the user is in it, not stranded outside it"
+    );
+
+    type_str(&mut state, "ok");
+    assert_eq!(
+        only_label(&state).as_deref(),
+        Some("ok"),
+        "the keystrokes reached the new label"
+    );
+
+    state.command(Command::Escape).expect("leave the label");
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "a label with text in it is kept"
+    );
+    assert_eq!(only_label(&state).as_deref(), Some("ok"));
+
+    // And letting go of the dead one resurrected nothing.
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "there was no stranded placement left to redo into the document"
+    );
+}
+
+#[test]
+fn a_press_lets_go_of_a_pending_label_the_history_has_discarded() {
+    // The same rule reached through the press itself rather than through
+    // choosing a tool, so it holds even when the text tool never leaves the
+    // user's hand. The stranding commit here is a keyboard nudge.
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 90.0));
+    drag(&mut state, at(200.0, 20.0), at(300.0, 90.0));
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(60.0, 200.0));
+    state.pointer_released();
+    state.command(Command::Undo).expect("set the label aside");
+    state.command(Command::Undo).expect("undo the second shape");
+    assert_eq!(state.document().annotations().len(), 1);
+
+    // A press right now is refused: the label is still coming back.
+    state.pointer_pressed(at(300.0, 240.0));
+    state.pointer_released();
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "no second label while the first can still return"
+    );
+
+    // The nudge commits, which discards the branch holding the placement.
+    state.command(Command::SelectAll).expect("select the shape");
+    state
+        .command(Command::Nudge { dx: 9.0, dy: 4.0 })
+        .expect("nudge it");
+
+    state.pointer_pressed(at(300.0, 240.0));
+    state.pointer_released();
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "now that the placement is gone for good, the press places a label"
+    );
+    assert!(state.editing_text().is_some());
+    type_str(&mut state, "x");
+    assert_eq!(only_label(&state).as_deref(), Some("x"));
+}
+
+// ---------------------------------------------------------------------------
+// Not opening a second editing session over a pending label
+// ---------------------------------------------------------------------------
+
+/// A finished label, a rectangle drawn after it, and a second label placed and
+/// then set aside by two undos — leaving its cancellation refused but still
+/// reachable, with both it and the rectangle sitting on the redo branch.
+fn a_finished_label_a_shape_and_a_pending_label() -> (EditorState, LogicalPoint) {
+    let mut state = state();
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(60.0, 60.0));
+    state.pointer_released();
+    type_str(&mut state, "hi");
+    state.command(Command::Escape).expect("finish the label");
+
+    let bounds = state.document().annotations()[0].bounds();
+    let centre = at(
+        bounds.origin.x + bounds.size.width / 2.0,
+        bounds.origin.y + bounds.size.height / 2.0,
+    );
+
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(150.0, 150.0), at(260.0, 240.0));
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(320.0, 60.0));
+    state.pointer_released();
+    state.command(Command::Undo).expect("set the label aside");
+    state.command(Command::Undo).expect("undo the rectangle");
+
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "only the finished label is in the document"
+    );
+    (state, centre)
+}
+
+#[test]
+fn clicking_an_existing_label_is_refused_while_another_one_is_pending() {
+    // Re-entering a label that is already there starts an editing session just
+    // as placing a new one does, and the pending label's id is the only thing
+    // that will pick it back up when a redo returns it. Overwriting that id
+    // left the placement on the redo stack with nobody holding it: two redos
+    // put an empty label into the document while the editing session belonged
+    // to a different one, and escaping then committed the orphan for good.
+    let (mut state, existing) = a_finished_label_a_shape_and_a_pending_label();
+
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(existing);
+    state.pointer_released();
+    assert!(
+        state.editing_text().is_none(),
+        "the click did not open a second editing session"
+    );
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "and it changed nothing"
+    );
+
+    // The pending label is still the one the history will hand back.
+    state.command(Command::Redo).expect("redo the rectangle");
+    state.command(Command::Redo).expect("redo the placement");
+    assert_eq!(state.document().annotations().len(), 3);
+    assert!(
+        state.editing_text().is_some(),
+        "the label that came back is the one being edited"
+    );
+
+    state.command(Command::Escape).expect("cancel it");
+    assert_eq!(
+        state.document().annotations().len(),
+        2,
+        "escaping cancelled the empty label rather than committing an orphan"
+    );
+    assert_eq!(
+        only_label(&state).as_deref(),
+        Some("hi"),
+        "and the label left standing is the one with text in it"
+    );
+}
+
+#[test]
+fn selecting_a_shape_that_is_not_a_label_is_still_allowed_while_one_is_pending() {
+    // The refusal is about starting a second editing session, not about the
+    // pointer. Selecting and moving an ordinary shape opens nothing, so it goes
+    // ahead — refusing every click would leave the editor feeling broken.
+    let (mut state, _) = a_finished_label_a_shape_and_a_pending_label();
+    state.command(Command::Redo).expect("redo the rectangle");
+    let shape = state.document().annotations()[1].bounds();
+    // A hollow rectangle is grabbed by its outline, not its empty middle.
+    let edge = at(shape.origin.x + shape.size.width / 2.0, shape.origin.y);
+
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(edge);
+    assert!(state.selection().is_some(), "the shape was selected");
+    state.pointer_dragged(at(edge.x + 30.0, edge.y), false);
+    state.pointer_released();
+    assert_ne!(
+        state.document().annotations()[1].bounds().origin.x,
+        shape.origin.x,
+        "and dragging it moved it"
+    );
+}
+
+#[test]
+fn a_resize_handle_still_works_while_a_label_is_pending() {
+    // A press on a handle never reaches the hit test, so it can never open a
+    // label — the refusal must not swallow it just because a label happens to
+    // be sitting under the handle's corner.
+    let (mut state, _) = a_finished_label_a_shape_and_a_pending_label();
+    state.command(Command::Redo).expect("redo the rectangle");
+
+    let shape = state.document().annotations()[1].bounds();
+    let edge = at(shape.origin.x + shape.size.width / 2.0, shape.origin.y);
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(edge);
+    state.pointer_released();
+    assert!(state.selection().is_some(), "the shape has handles now");
+
+    let corner = at(shape.origin.x, shape.origin.y);
+    state.pointer_pressed(corner);
+    state.pointer_dragged(at(corner.x - 20.0, corner.y - 20.0), false);
+    state.pointer_released();
+    assert!(
+        state.document().annotations()[1].bounds().size.width > shape.size.width,
+        "the handle resized the shape"
+    );
+}

@@ -278,6 +278,11 @@ impl History {
     /// stood on has been replaced by different work — the caller still has to
     /// clean up the document itself in those cases.
     ///
+    /// Only one of those refusals can be waited out: navigating back to the
+    /// point makes it work again. The rest are permanent, and
+    /// [`abandon_is_still_reachable`](Self::abandon_is_still_reachable) is how a
+    /// caller tells the difference rather than retrying forever.
+    ///
     /// # Why a depth is not enough
     ///
     /// A depth says where to roll back to, and after undoing behind that point
@@ -319,33 +324,31 @@ impl History {
         // consuming it before the rollback is certain would answer "no, I could
         // not roll back" while destroying the very thing the caller is about to
         // carry on with.
-        let Some(open) = self.open.as_ref() else {
+        //
+        // Whether the point is still in the chain at all is asked once, in
+        // `rollback_point`, so that the refusal here and the answer given to
+        // `abandon_is_still_reachable` cannot drift apart.
+        let Some(target) = self.rollback_point() else {
             return Ok(false);
         };
-        // A history so short that the beginning of this edit has already fallen
-        // off the back of it. Nothing sensible to roll back to.
-        let Some(target) = open.depth.checked_sub(self.evicted) else {
-            return Ok(false);
-        };
+        // Navigation has taken the document behind the point the edit began at.
+        // Restoring from here would quietly redo the steps in between, so this
+        // waits: the point is still in the chain, and a redo back to it makes
+        // this work again.
         if target > self.past.len() {
-            return Ok(false);
-        }
-        // Right depth, wrong history: somebody built a different past up to it.
-        // `past ++ [present]` is the chain of states leading to where the
-        // document stands, so the state this edit began at has to still be
-        // sitting at `target` in that chain.
-        let standing_here = if target < self.past.len() {
-            self.past[target].serial
-        } else {
-            self.present.serial
-        };
-        if standing_here != open.present.serial {
             return Ok(false);
         }
 
         // The document goes first for the same reason: it is the last thing
         // here that can fail, and it can still fail with the open edit intact.
-        document.restore(open.present.data.clone())?;
+        let data = self
+            .open
+            .as_ref()
+            .expect("`rollback_point` found one")
+            .present
+            .data
+            .clone();
+        document.restore(data)?;
 
         let open = self.open.take().expect("inspected as present just above");
         self.past.truncate(target);
@@ -354,6 +357,61 @@ impl History {
         self.future = open.future;
         self.tag = open.tag;
         Ok(true)
+    }
+
+    /// Whether [`abandon`](Self::abandon) could still succeed — now, or after
+    /// undoing or redoing back to where the open edit began.
+    ///
+    /// `false` says the state the edit began at has gone from this history for
+    /// good, so the edit will never be cancellable however the user navigates.
+    /// A caller holding an unfinished edit open on the chance that it might yet
+    /// be taken back has to be able to tell those two apart: one is worth
+    /// waiting for, and the other is a wait that never ends.
+    ///
+    /// # Why a refusal is not always final
+    ///
+    /// Undo and redo only move where the document sits in the chain of states;
+    /// they never change the chain. So a rollback point the document has merely
+    /// wandered away from is still there to come back to. Only [`push`] can
+    /// take it out of the chain — by truncating the redo branch it sat in, or
+    /// by evicting it off the back of a full history — and neither can be
+    /// undone.
+    ///
+    /// [`push`]: Self::commit
+    #[must_use]
+    pub fn abandon_is_still_reachable(&self) -> bool {
+        self.rollback_point().is_some()
+    }
+
+    /// Where the open edit's rollback point sits in the chain, if it is still
+    /// there at all.
+    ///
+    /// Right depth is not enough — see [`abandon`](Self::abandon) for why the
+    /// state that began the edit has to still be standing at it.
+    fn rollback_point(&self) -> Option<usize> {
+        let open = self.open.as_ref()?;
+        // A history so short that the beginning of this edit has already fallen
+        // off the back of it. Nothing sensible to roll back to.
+        let target = open.depth.checked_sub(self.evicted)?;
+        (self.chain(target)?.serial == open.present.serial).then_some(target)
+    }
+
+    /// The state standing at `index` in the chain of states this history holds,
+    /// oldest first.
+    ///
+    /// `past`, `present` and `future` are three views of one unbroken line:
+    /// undo and redo only move the boundary between them. `future` is a stack,
+    /// so it runs backwards — its last element is the step immediately after
+    /// `present`.
+    fn chain(&self, index: usize) -> Option<&Step> {
+        if index < self.past.len() {
+            return self.past.get(index);
+        }
+        if index == self.past.len() {
+            return Some(&self.present);
+        }
+        let newest = self.past.len() + self.future.len();
+        self.future.get(newest.checked_sub(index)?)
     }
 
     /// Abandons any open coalescing group.

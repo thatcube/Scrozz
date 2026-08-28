@@ -603,3 +603,156 @@ fn an_edit_kept_inside_a_coalescing_group_becomes_its_own_step() {
     assert!(history.undo(&mut doc).unwrap());
     assert_eq!(doc.len(), 1, "and the gesture before it is still one step");
 }
+
+// ---------------------------------------------------------------------------
+// Telling a refusal that will pass from one that never will
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_history_with_no_open_edit_has_no_rollback_point_to_reach() {
+    let (_, history) = started();
+    assert!(
+        !history.abandon_is_still_reachable(),
+        "nothing is open, so there is nothing waiting to become cancellable"
+    );
+}
+
+#[test]
+fn an_open_edit_the_document_has_not_left_is_reachable() {
+    let (mut doc, mut history) = started();
+    history.begin();
+    step(&mut doc, &mut history, 40.0);
+    assert!(history.abandon_is_still_reachable());
+    assert!(history.abandon(&mut doc).unwrap(), "and it really can be");
+}
+
+#[test]
+fn a_rollback_point_the_document_only_wandered_away_from_is_still_reachable() {
+    // Undoing behind the point refuses, but the point is still in the chain:
+    // one redo brings the document back to it and the rollback works again.
+    let (mut doc, mut history) = started();
+    step(&mut doc, &mut history, 20.0);
+    history.begin();
+    step(&mut doc, &mut history, 40.0);
+
+    history.undo(&mut doc).unwrap();
+    history.undo(&mut doc).unwrap();
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the document is behind the point, so not yet"
+    );
+    assert!(
+        history.abandon_is_still_reachable(),
+        "but the point itself is still there to come back to"
+    );
+
+    history.redo(&mut doc).unwrap();
+    assert!(
+        history.abandon(&mut doc).unwrap(),
+        "and coming back to it makes the rollback work"
+    );
+}
+
+#[test]
+fn a_rollback_point_whose_branch_was_truncated_is_gone_for_good() {
+    // The refusal that can never be waited out: committing new work discards
+    // the branch the rollback point was sitting in, and nothing brings a
+    // discarded branch back.
+    let (mut doc, mut history) = started();
+    step(&mut doc, &mut history, 20.0);
+    history.begin();
+    step(&mut doc, &mut history, 40.0);
+
+    history.undo(&mut doc).unwrap();
+    history.undo(&mut doc).unwrap();
+    assert!(history.abandon_is_still_reachable(), "still there for now");
+
+    step(&mut doc, &mut history, 60.0);
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the point is not in the history any more"
+    );
+    assert!(
+        !history.abandon_is_still_reachable(),
+        "and no amount of undoing or redoing will put it back"
+    );
+
+    // Whatever the caller does next, the refusal stands.
+    history.undo(&mut doc).unwrap();
+    assert!(!history.abandon_is_still_reachable());
+    history.redo(&mut doc).unwrap();
+    assert!(!history.abandon_is_still_reachable());
+}
+
+#[test]
+fn a_rollback_point_evicted_from_a_full_history_is_gone_for_good() {
+    let (mut doc, mut history) = (
+        document(200, 200),
+        History::with_limit(&document(200, 200), 2),
+    );
+    history.begin();
+    step(&mut doc, &mut history, 10.0);
+    assert!(history.abandon_is_still_reachable());
+
+    for x in 2..8 {
+        step(&mut doc, &mut history, f64::from(x) * 10.0);
+    }
+    assert!(
+        !history.abandon_is_still_reachable(),
+        "the state the edit began at has fallen off the back of the history"
+    );
+    assert!(!history.abandon(&mut doc).unwrap());
+}
+
+#[test]
+fn a_rollback_point_replaced_by_different_work_is_gone_for_good() {
+    // The lineage case: the same depth, rebuilt out of somebody else's steps.
+    let mut doc = document(200, 200);
+    let mut history = History::new(&doc);
+    step(&mut doc, &mut history, 10.0);
+    step(&mut doc, &mut history, 20.0);
+    history.begin();
+    step(&mut doc, &mut history, 30.0);
+
+    for _ in 0..3 {
+        history.undo(&mut doc).unwrap();
+    }
+    step(&mut doc, &mut history, 40.0);
+    step(&mut doc, &mut history, 50.0);
+    assert_eq!(history.undo_depth(), 2, "the same depth, different work");
+    assert!(
+        !history.abandon_is_still_reachable(),
+        "depth alone is not the point: that state is not in this history"
+    );
+}
+
+#[test]
+fn finishing_a_stranded_edit_leaves_the_history_it_found() {
+    // What the editor does once it learns the wait is over: close the edit and
+    // let go. Nothing the user actually did may move.
+    let (mut doc, mut history) = started();
+    step(&mut doc, &mut history, 20.0);
+    history.begin();
+    step(&mut doc, &mut history, 40.0);
+    history.undo(&mut doc).unwrap();
+    history.undo(&mut doc).unwrap();
+    step(&mut doc, &mut history, 60.0);
+
+    let depth = history.undo_depth();
+    let data = doc.data();
+    history.finish();
+    assert!(
+        !history.abandon_is_still_reachable(),
+        "there is no open edit left at all"
+    );
+    assert_eq!(history.undo_depth(), depth, "closing it is not an edit");
+    assert_eq!(doc.data(), data, "and it does not touch the document");
+
+    history.undo(&mut doc).unwrap();
+    history.redo(&mut doc).unwrap();
+    assert_eq!(
+        doc.data(),
+        data,
+        "the work committed over the stranded point is still the user's"
+    );
+}
