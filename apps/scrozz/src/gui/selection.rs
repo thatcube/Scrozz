@@ -333,6 +333,24 @@ enum ControllerPhase {
     },
 }
 
+impl ControllerPhase {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Cards => "cards",
+            Self::HideBeforeCapture { .. } => "hide-before-capture",
+            Self::HideBeforePreparation { .. } => "hide-before-preparation",
+            Self::WaitingForPreparation { .. } => "waiting-for-preparation",
+            Self::PreparingWithCards { .. } => "preparing-with-cards",
+            Self::ReadyToSelect { .. } => "ready-to-select",
+            Self::Selecting { .. } => "selecting",
+            Self::ReleaseBeforeHide { .. } => "release-before-hide",
+            Self::HideAfterDecision { .. } => "hide-after-decision",
+            Self::AwaitingCapture { .. } => "awaiting-capture",
+            Self::RestoringCards { .. } => "restoring-cards",
+        }
+    }
+}
+
 impl ClientOverlaySelector {
     /// Creates the worker and main-thread halves for the long-running app.
     #[must_use]
@@ -680,9 +698,14 @@ impl ClientOverlayController {
 
     /// Advances lifecycle handshakes and applies viewport/native behavior.
     pub fn logic(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
+        let before = self.phase.label();
         self.advance(ctx, native);
         while let Ok(event) = self.events.try_recv() {
             self.handle_event(ctx, native, event);
+        }
+        let after = self.phase.label();
+        if before != after {
+            tracing::debug!(from = before, to = after, "selector lifecycle advanced");
         }
         native.refresh();
         if let Some(cursor) = self.pending_selection_cursor() {
@@ -1473,10 +1496,15 @@ pub fn for_current_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        gui::action::{Action, CaptureKind, CaptureOrigin},
+        shortcuts::ShortcutAction,
+    };
     use scrozz_core::{
         DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScaleFactor, TargetEnumerator,
     };
-    use scrozz_shell::{Compositor, DisplayServer};
+    use scrozz_shell::{Compositor, DisplayServer, TrayAction};
+    use scrozz_ui::Theme;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1521,6 +1549,318 @@ mod tests {
             frozen: Vec::new(),
             frozen_sources: Vec::new(),
         })
+    }
+
+    fn action_for_route(origin: CaptureOrigin) -> Action {
+        match origin {
+            CaptureOrigin::MenuBar => Action::from_tray(TrayAction::CaptureWindow),
+            CaptureOrigin::GlobalHotkey => ShortcutAction::CaptureWindow.action(),
+            CaptureOrigin::Startup | CaptureOrigin::Direct => {
+                panic!("{origin:?} is not one of the two interactive regression routes")
+            }
+        }
+    }
+
+    fn window_options_for_route(origin: CaptureOrigin) -> SelectionOptions {
+        let action = action_for_route(origin);
+        assert_eq!(action, Action::Capture(CaptureKind::Window));
+        SelectionOptions::for_mode(scrozz_core::SelectionMode::Window)
+    }
+
+    fn test_window(id: &str, bounds: LogicalRect) -> Window {
+        Window {
+            id: scrozz_core::WindowId(id.to_owned()),
+            title: Some(id.to_owned()),
+            application: Some("Test".to_owned()),
+            bounds,
+            display: DisplayId("main".to_owned()),
+            is_visible: true,
+        }
+    }
+
+    fn test_window_snapshot(bounds: LogicalRect) -> NativeTargetSnapshot {
+        let mut snapshot = test_target_snapshot(bounds);
+        snapshot.windows.push(test_window(
+            "target",
+            LogicalRect::new(
+                LogicalPoint::new(40.0, 30.0),
+                LogicalSize::new(180.0, 140.0),
+            ),
+        ));
+        snapshot
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HighlightTransition {
+        target: Option<scrozz_core::WindowId>,
+        state_revision: u64,
+        rendered_revision: u64,
+        completed_passes: usize,
+    }
+
+    fn highlight_trace(origin: CaptureOrigin) -> Vec<HighlightTransition> {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(360.0, 240.0));
+        let display = test_target_snapshot(bounds).displays.remove(0);
+        let mut selector =
+            SelectionUi::new(window_options_for_route(origin), vec![display], Vec::new())
+                .with_windows(vec![
+                    test_window(
+                        "left",
+                        LogicalRect::new(
+                            LogicalPoint::new(20.0, 30.0),
+                            LogicalSize::new(120.0, 160.0),
+                        ),
+                    ),
+                    test_window(
+                        "right",
+                        LogicalRect::new(
+                            LogicalPoint::new(180.0, 30.0),
+                            LogicalSize::new(120.0, 160.0),
+                        ),
+                    ),
+                ]);
+        let ctx = egui::Context::default();
+        scrozz_ui::theme::install_fonts(&ctx);
+        scrozz_ui::theme::install_style(&ctx, &Theme::dark());
+
+        let input = |events| egui::RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 240.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut warm = ctx.run_ui(input(Vec::new()), |ui| {
+            assert_eq!(selector.update(ui), SelectionDecision::Pending);
+        });
+        warm.textures_delta.clear();
+
+        [
+            egui::pos2(60.0, 80.0),
+            egui::pos2(220.0, 80.0),
+            egui::pos2(240.0, 100.0),
+            egui::pos2(340.0, 220.0),
+        ]
+        .into_iter()
+        .map(|point| {
+            let mut output = ctx.run_ui(input(vec![egui::Event::PointerMoved(point)]), |ui| {
+                assert_eq!(selector.update(ui), SelectionDecision::Pending);
+            });
+            output.textures_delta.clear();
+            HighlightTransition {
+                target: selector
+                    .state()
+                    .hovered_window()
+                    .map(|window| window.id.clone()),
+                state_revision: selector.state().highlight_revision(),
+                rendered_revision: selector.rendered_highlight_revision(),
+                completed_passes: output.platform_output.num_completed_passes,
+            }
+        })
+        .collect()
+    }
+
+    #[test]
+    fn menu_and_hotkey_window_picker_routes_render_identical_highlight_transitions() {
+        let menu = highlight_trace(CaptureOrigin::MenuBar);
+        let hotkey = highlight_trace(CaptureOrigin::GlobalHotkey);
+
+        assert_eq!(menu, hotkey);
+        assert_eq!(
+            menu,
+            vec![
+                HighlightTransition {
+                    target: Some(scrozz_core::WindowId("left".to_owned())),
+                    state_revision: 1,
+                    rendered_revision: 1,
+                    completed_passes: 2,
+                },
+                HighlightTransition {
+                    target: Some(scrozz_core::WindowId("right".to_owned())),
+                    state_revision: 2,
+                    rendered_revision: 2,
+                    completed_passes: 2,
+                },
+                HighlightTransition {
+                    target: Some(scrozz_core::WindowId("right".to_owned())),
+                    state_revision: 2,
+                    rendered_revision: 2,
+                    completed_passes: 1,
+                },
+                HighlightTransition {
+                    target: None,
+                    state_revision: 3,
+                    rendered_revision: 3,
+                    completed_passes: 2,
+                },
+            ]
+        );
+    }
+
+    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn root_requested_pointer_release(output: &egui::FullOutput) -> bool {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|viewport| {
+                viewport
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::MousePassthrough(true)))
+            })
+    }
+
+    fn run_escape_lifecycle(origin: CaptureOrigin) {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let snapshot_count = Arc::clone(&snapshots);
+        let snapshot: Arc<SnapshotFn> = Arc::new(move |_| {
+            snapshot_count.fetch_add(1, Ordering::SeqCst);
+            Ok(test_window_snapshot(bounds))
+        });
+        let prepare: Arc<PrepareFn> =
+            Arc::new(|options, _cursor, snapshot| prepare_test_snapshot(options, snapshot));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            snapshot,
+            prepare,
+        );
+        let options = window_options_for_route(origin);
+        let first_selector = Arc::clone(&selector);
+        let first_options = options.clone();
+        let first = std::thread::spawn(move || {
+            let result =
+                first_selector.select_for_capture(&first_options, CursorMode::Hidden, false);
+            first_selector.capture_finished();
+            result
+        });
+        let ctx = egui::Context::default();
+        let (native, behavior_log) = crate::gui::panel::BehaviorController::recording();
+
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(
+                &controller.phase,
+                ControllerPhase::HideBeforePreparation { .. }
+            )
+        });
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1);
+        controller.logic(&ctx, &native);
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Selecting { .. })
+        });
+
+        let mut escape = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                events: vec![key_event(egui::Key::Escape, true)],
+                ..Default::default()
+            },
+            |ui| controller.ui(ui),
+        );
+        escape.textures_delta.clear();
+        assert!(
+            root_requested_pointer_release(&escape),
+            "{origin:?} Escape must release pointer input in its own UI pass"
+        );
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::ReleaseBeforeHide { .. }
+        ));
+
+        controller.logic(&ctx, &native);
+        assert!(
+            matches!(&controller.phase, ControllerPhase::ReleaseBeforeHide { .. }),
+            "{origin:?} must retain invisible terminal-key ownership until Escape is released"
+        );
+        assert_ne!(
+            behavior_log.borrow().last(),
+            Some(&scrozz_shell::OverlayBehavior::hidden_surface()),
+            "{origin:?} must not leak Escape key-up to the previous application"
+        );
+
+        let mut released = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                events: vec![key_event(egui::Key::Escape, false)],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        released.textures_delta.clear();
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::HideAfterDecision { .. }
+        ));
+        assert_eq!(
+            behavior_log.borrow().last(),
+            Some(&scrozz_shell::OverlayBehavior::hidden_surface()),
+            "{origin:?} must release focus and hide on the first pass after Escape key-up"
+        );
+        assert_eq!(
+            native.recorded_cursors().last(),
+            Some(&OverlayCursor::Arrow),
+            "{origin:?} cancellation must restore the ordinary cursor"
+        );
+
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::AwaitingCapture { .. }
+        ));
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::RestoringCards { .. })
+        });
+        controller.logic(&ctx, &native);
+        assert!(matches!(&controller.phase, ControllerPhase::Cards));
+        assert!(matches!(first.join().unwrap(), Err(Error::Cancelled)));
+
+        let second_selector = Arc::clone(&selector);
+        let second = std::thread::spawn(move || {
+            second_selector.select_for_capture(&options, CursorMode::Hidden, false)
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(
+                &controller.phase,
+                ControllerPhase::HideBeforePreparation { .. }
+            )
+        });
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            2,
+            "{origin:?} must permit an immediate second invocation"
+        );
+
+        selector.cancel();
+        controller.logic(&ctx, &native);
+        assert!(matches!(second.join().unwrap(), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn escape_lifecycle_is_bounded_and_reentrant_for_menu_and_hotkey_routes() {
+        for origin in [CaptureOrigin::MenuBar, CaptureOrigin::GlobalHotkey] {
+            run_escape_lifecycle(origin);
+        }
     }
 
     #[test]

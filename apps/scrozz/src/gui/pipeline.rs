@@ -43,7 +43,7 @@ use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        action::CaptureKind,
+        action::{CaptureKind, CaptureOrigin},
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
         selection::CaptureSelector,
     },
@@ -57,6 +57,8 @@ pub enum Job {
     Capture {
         /// What to capture.
         kind: CaptureKind,
+        /// Where the request entered the app.
+        origin: CaptureOrigin,
         /// The identity the resulting card will carry, allocated up front so the
         /// main thread can correlate the answer with the request.
         card: CardId,
@@ -240,7 +242,7 @@ impl Worker {
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
             match job {
-                Job::Capture { kind, card } => self.capture(kind, card),
+                Job::Capture { kind, card, origin } => self.capture(kind, card, origin),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
                 Job::Release(card) => {
@@ -252,7 +254,13 @@ impl Worker {
         tracing::debug!("capture worker stopped");
     }
 
-    fn capture(&mut self, kind: CaptureKind, card: CardId) {
+    fn capture(&mut self, kind: CaptureKind, card: CardId, origin: CaptureOrigin) {
+        tracing::debug!(
+            %card,
+            capture = kind.label(),
+            origin = origin.label(),
+            "capture job started"
+        );
         let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
         let result = self.take(kind, card, &mut lifecycle);
         match result {
@@ -260,10 +268,10 @@ impl Worker {
                 let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
             }
             Err(error) if error.is_cancellation() => {
-                tracing::debug!(%card, "capture selection cancelled");
+                tracing::debug!(%card, origin = origin.label(), "capture selection cancelled");
             }
             Err(error) => {
-                tracing::warn!(%card, "capture failed: {error}");
+                tracing::warn!(%card, origin = origin.label(), "capture failed: {error}");
                 let _ = self.outcomes.send(Outcome::Failed { card, error });
             }
         }

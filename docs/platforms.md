@@ -136,6 +136,14 @@ eligible frame containing the pointer, so an underlying window is reachable only
 through an exposed portion and a fully covered window is not reachable. The
 Finder desktop, when ScreenCaptureKit exposes it as a normal window, remains
 behind ranked application windows and is reachable only on exposed desktop.
+Pointer interaction is resolved after the HUD is laid out so controls can exclude
+the canvas underneath them. When that changes a window/display target, the
+selector compares a monotonic highlight revision with the revision just painted
+and discards exactly that stale pass. Egui immediately paints one replacement
+pass in the same rendered frame; movement within the same target advances no
+revision and schedules no replacement. This avoids relying on a later event-loop
+wake after a native menu closes, without turning the picker into a continuous
+repaint loop.
 
 Mixed-DPI desktops stay in logical coordinates while the user selects. A region
 wholly contained by one display retains that display's measured scale for exact
@@ -162,6 +170,11 @@ with `SetInputFocus` after the window becomes viewable, and restore the prior
 focus before capture begins unless the user has already focused somewhere else.
 The selector consumes terminal key, modifier and pointer releases before
 restoring focus, so no half of the finishing gesture reaches the prior app.
+Escape releases pointer input in the handling pass. The transparent selector
+retains terminal-key ownership only until Escape key-up, then restores the arrow,
+hides, releases native focus, completes the cancellation handshake, and frees the
+single-selection gate. Menu and global-hotkey routes share this state machine and
+can begin another invocation immediately after restoration.
 
 Shortcut settings and runtime actions are separate names:
 `hotkey.capture-region` persists the accelerator, while `capture.region` is the

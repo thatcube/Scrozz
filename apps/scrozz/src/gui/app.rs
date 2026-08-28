@@ -40,7 +40,7 @@ use crate::{
     cli::Cli,
     fault::{CliError, CliResult},
     gui::{
-        action::{Action, CaptureKind},
+        action::{Action, CaptureKind, CaptureOrigin},
         card::{CardEvent, CardSurface},
         pipeline::{Job, Outcome, Pipeline},
         selection::CaptureSelector,
@@ -418,7 +418,7 @@ impl App {
         app.refresh_tray_shortcuts();
 
         if let Some(kind) = app.config.capture_on_start {
-            app.begin_capture(kind);
+            app.begin_capture(CaptureOrigin::Startup, kind);
         }
 
         Ok(app)
@@ -465,7 +465,7 @@ impl App {
         }
 
         for entry in pending {
-            if self.perform(Action::from_tray(entry)) == Tick::Stop {
+            if self.perform_from(CaptureOrigin::MenuBar, Action::from_tray(entry)) == Tick::Stop {
                 return Tick::Stop;
             }
         }
@@ -484,7 +484,7 @@ impl App {
 
         for id in pending {
             if let Some(action) = Action::from_id(&id) {
-                self.perform(action);
+                self.perform_from(CaptureOrigin::GlobalHotkey, action);
             } else {
                 tracing::warn!(action = %id, "a hotkey fired for an action this build does not know");
             }
@@ -615,10 +615,14 @@ impl App {
 
     /// Carries out one action.
     fn perform(&mut self, action: Action) -> Tick {
-        tracing::debug!(action = action.id(), "performing");
+        self.perform_from(CaptureOrigin::Direct, action)
+    }
+
+    fn perform_from(&mut self, origin: CaptureOrigin, action: Action) -> Tick {
+        tracing::debug!(action = action.id(), origin = origin.label(), "performing");
         match action {
             Action::Capture(kind) => {
-                self.begin_capture(kind);
+                self.begin_capture(origin, kind);
                 Tick::Continue
             }
             Action::ToggleRecording => {
@@ -644,7 +648,7 @@ impl App {
         }
     }
 
-    fn begin_capture(&mut self, kind: CaptureKind) {
+    fn begin_capture(&mut self, origin: CaptureOrigin, kind: CaptureKind) {
         // D15: ask at first use, not at launch. This must happen on the main
         // thread before the capture job is posted: the missing piece that made
         // Scrozz report PermissionDenied in an invisible log without ever
@@ -659,7 +663,13 @@ impl App {
         }
 
         let card = self.pipeline.allocate();
-        if !self.pipeline.post(Job::Capture { kind, card }) {
+        tracing::debug!(
+            %card,
+            capture = kind.label(),
+            origin = origin.label(),
+            "posting capture job"
+        );
+        if !self.pipeline.post(Job::Capture { kind, card, origin }) {
             self.note("the capture worker has gone");
         }
     }

@@ -44,6 +44,7 @@ pub struct SelectionUi {
     hud: HudModel,
     textures: BTreeMap<String, TextureHandle>,
     immediate: Option<SelectionDecision>,
+    rendered_highlight_revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +84,7 @@ impl SelectionUi {
             hud,
             textures: BTreeMap::new(),
             immediate,
+            rendered_highlight_revision: 0,
         }
     }
 
@@ -103,6 +105,12 @@ impl SelectionUi {
     #[must_use]
     pub const fn state(&self) -> &SelectionState {
         &self.state
+    }
+
+    /// Highlight revision represented by the latest completed paint pass.
+    #[must_use]
+    pub const fn rendered_highlight_revision(&self) -> u64 {
+        self.rendered_highlight_revision
     }
 
     #[must_use]
@@ -183,6 +191,7 @@ impl SelectionUi {
                 primary_modifier,
             },
         );
+        self.rendered_highlight_revision = self.state.highlight_revision();
         if self.state.mode() == SelectionMode::Region {
             ui.ctx().set_cursor_icon(if paint.pointer_over_controls {
                 CursorIcon::PointingHand
@@ -208,9 +217,6 @@ impl SelectionUi {
             surface,
             surface_display,
         );
-        if pointer.changed {
-            ui.ctx().request_repaint();
-        }
         if let Some(decision) = pointer.decision {
             return decision;
         }
@@ -221,7 +227,26 @@ impl SelectionUi {
         {
             self.immediate = Some(SelectionDecision::Selected(outcome));
         }
-        self.immediate.take().unwrap_or(SelectionDecision::Pending)
+        let decision = self.immediate.take().unwrap_or(SelectionDecision::Pending);
+        if decision == SelectionDecision::Pending {
+            if self.rendered_highlight_revision != self.state.highlight_revision() {
+                // Pointer input is intentionally handled after painting so HUD
+                // controls can exclude the canvas beneath them. A changed
+                // window/display target therefore needs one replacement pass
+                // in this same rendered frame. Depending on a future event-loop
+                // wake leaves the old outline visible after a native menu closes.
+                ui.ctx()
+                    .request_discard("selection target highlight changed after paint");
+                if !ui.ctx().will_discard() {
+                    // Another component already consumed the frame's extra pass.
+                    // Ask for one later frame rather than losing this transition.
+                    ui.ctx().request_repaint();
+                }
+            } else if pointer.changed && self.state.mode() == SelectionMode::Region {
+                ui.ctx().request_repaint();
+            }
+        }
+        decision
     }
 
     #[must_use]
