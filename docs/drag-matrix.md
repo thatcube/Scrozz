@@ -161,12 +161,87 @@ registered formats and Scrozz offers `CF_HDROP`, `"PNG"` and `CF_UNICODETEXT`.
 
 The matching rules and the ownership bookkeeping live in
 `crates/scrozz-shell/src/drag/formats.rs`, with no `windows` types and no `cfg`,
-for the same reason `hdrop.rs` does: which entry answers which request, and who
-releases what when an entry is displaced, are decidable without an operating
-system, and their tests therefore run on every platform on every push. The COM
-edges that genuinely need Windows — `fRelease` ownership transfer, duplication
-per `tymed`, enumeration through `SHCreateStdEnumFmtEtc` — are covered by
-Windows-gated tests that a human on Windows still has to run.
+for the same reason `hdrop.rs` does: which entry answers which request, who
+releases what when an entry is displaced, and whether a medium may be stored at
+all are decidable without an operating system, and their tests therefore run on
+every platform on every push. The COM edges that genuinely need Windows —
+`fRelease` ownership transfer, duplication per `tymed`, enumeration — are covered
+by Windows-gated tests that a human on Windows still has to run.
+
+### What identifies a stored entry
+
+Three things about `FORMATETC` are easy to get wrong, and each one silently
+hands a receiver the wrong bytes rather than failing.
+
+**The target device is part of the identity.** `ptd` points at a
+`DVTARGETDEVICE` describing the printer or screen a representation was rendered
+for, and the documentation is explicit that a null `ptd` means the data is
+*independent of any device* — not that any device will do. Two entries differing
+only by `ptd` are two representations; keying them the same makes the second
+overwrite the first, and then answers a request naming either device with
+whichever survived. So the device's bytes are copied into the key and compared,
+and a null device is a distinct key rather than a wildcard.
+
+The blob is copied by reading `tdSize` from *inside* the blob being copied, out
+of another process's memory, so `target_device_size` validates the header first:
+`tdSize` must be at least the twelve-byte header and no larger than a sane
+bound, and each non-zero name offset must land inside the structure. A header
+that could not describe a real device earns `DV_E_DVTARGETDEVICE`, not a
+best-effort copy and not a quiet downgrade to "device independent" — that
+downgrade would collide with the device-free key.
+
+**`lindex` does not always count.** The `FORMATETC` reference says of it: *"For
+the aspects DVASPECT_THUMBNAIL and DVASPECT_ICON, lindex is ignored."* An icon
+request carrying a stale `lindex` must still be answered, while a
+`DVASPECT_CONTENT` or `DVASPECT_DOCPRINT` request naming page 3 must not be
+answered with page 1. Matching is aspect-aware for exactly that reason.
+
+**A stored medium is one thing, not a set.** `FORMATETC::tymed` is a bitmask of
+what the caller will accept; `STGMEDIUM::tymed` names what the medium in hand
+actually is. Keying an entry by the mask makes it advertise media it cannot
+supply — `QueryGetData` promises a stream, `GetData` returns a global handle,
+and the receiver dereferences the wrong union arm. `stored_medium` therefore
+requires the medium to name exactly one documented `TYMED` that the format
+offered, keys the entry by *that*, and answers `DV_E_TYMED` otherwise.
+
+### Duplicating a medium depends on what it is
+
+`GetData` transfers ownership to the caller, so every read hands out a copy, and
+each `TYMED` has its own idea of what a copy is. Two of these are outright
+hazards.
+
+`OleDuplicateData` dispatches on the **clipboard format id**, not the medium:
+its remarks say `CF_METAFILEPICT`, `CF_PALETTE` and `CF_BITMAP` get special
+handling and *"all other formats are duplicated byte-wise"*. The shell's private
+drag formats are registered ids, so a GDI bitmap stored under
+`CFSTR_DRAGIMAGEBITS` would be "duplicated" by copying the handle's bit pattern
+— two owners of one `HBITMAP`, and a double `DeleteObject` when both release.
+`CF_ENHMETAFILE` is not in the special-cased list at all. So duplication
+dispatches on `tymed`: `GlobalAlloc`/copy for `TYMED_HGLOBAL`, `GetObjectType`
+followed by the matching standard format for `TYMED_GDI`, `OleDuplicateData`
+with a literal `CF_METAFILEPICT` for `TYMED_MFPICT`, `CopyEnhMetaFileW` for
+`TYMED_ENHMF`, and `AddRef` for `TYMED_ISTREAM`/`TYMED_ISTORAGE` — which is what
+`ReleaseStgMedium` undoes, and therefore the matching independent reference. A
+GDI handle that is neither a bitmap nor a palette is refused with `DV_E_TYMED`
+rather than copied by a guessed algorithm.
+
+`TYMED_FILE` copies the **file**, not the path. `ReleaseStgMedium`'s table says
+a receiver-owned `TYMED_FILE` *"frees the disk file by deleting it"*, so two
+media sharing one path means the first release deletes the file out from under
+the second. The duplicate is a real `std::fs::copy` into the drag scratch
+directory. This never happens in Scrozz's own flavours — it exists so a shell
+that stores one cannot be corrupted by it.
+
+`pUnkForRelease` changes all of the above. When it is present the provider still
+owns the storage, so the copy aliases the handle and carries an `AddRef`ed
+controller; when it is absent the copy must be genuinely independent. Both paths
+are implemented; the second is the one that runs.
+
+`EnumFormatEtc` is a hand-written `IEnumFORMATETC` rather than
+`SHCreateStdEnumFmtEtc`, because each enumerated `FORMATETC` must carry its own
+task-allocated `ptd` for the caller to free, and whether that helper deep-copies
+the pointer is undocumented — the two possibilities being "copies it" and "hands
+out a pointer that dangles once this object dies".
 
 ### The drag image must be straight alpha
 
@@ -194,9 +269,10 @@ Explorer / Edge / Slack / Discord / Office:
   now a warning rather than a debug note: with the data object accepting private
   formats, the remaining reasons to fail are environmental, and worth reading.
 - `cargo test -p scrozz-shell --lib windows::drag` on a real Windows machine.
-  Those tests allocate real global memory and exercise `SetData`/`GetData`
-  ownership, duplication and enumeration; they compile on every platform but
-  have only ever run on none.
+  Those tests allocate real global memory and real temp files, and exercise
+  `SetData`/`GetData` ownership transfer, borrowed-medium lifetime, per-`tymed`
+  duplication, target-device identity and enumeration. They compile on every
+  platform but have only ever run on none.
 - The `DoDragDrop` modal loop does not visibly stall the overlay.
 - Right-click and Escape both cancel cleanly, leaving no temp file behind.
 

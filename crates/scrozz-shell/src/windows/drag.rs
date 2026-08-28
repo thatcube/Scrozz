@@ -74,38 +74,53 @@
 //!
 //! See `docs/drag-matrix.md` for what a human on Windows still has to check.
 
+use std::cell::Cell;
+use std::ffi::OsString;
 use std::ffi::c_void;
-use std::path::Path;
+use std::mem::ManuallyDrop;
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{
-    DATA_S_SAMEFORMATETC, DV_E_FORMATETC, DV_E_TYMED, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY,
-    HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
+    DATA_S_SAMEFORMATETC, DV_E_DVTARGETDEVICE, DV_E_FORMATETC, DV_E_TYMED, E_FAIL, E_INVALIDARG,
+    E_NOTIMPL, E_OUTOFMEMORY, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE,
+    S_OK,
+};
+use windows::Win32::Graphics::Gdi::{
+    CopyEnhMetaFileW, GetObjectType, HENHMETAFILE, HGDIOBJ, OBJ_BITMAP, OBJ_PAL, OBJ_TYPE,
 };
 use windows::Win32::System::Com::{
-    CoTaskMemAlloc, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
-    IEnumSTATDATA, STGMEDIUM, TYMED, TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL,
-    TYMED_ISTORAGE, TYMED_ISTREAM, TYMED_MFPICT, TYMED_NULL,
+    CoTaskMemAlloc, CoTaskMemFree, DVTARGETDEVICE, FORMATETC, IAdviseSink, IDataObject,
+    IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
+    TYMED, TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL, TYMED_ISTORAGE, TYMED_ISTREAM,
+    TYMED_MFPICT, TYMED_NULL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{
-    GHND, GLOBAL_ALLOC_FLAGS, GlobalAlloc, GlobalLock, GlobalUnlock,
+    GHND, GLOBAL_ALLOC_FLAGS, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{
+    CF_BITMAP, CF_HDROP, CF_METAFILEPICT, CF_PALETTE, CF_UNICODETEXT,
+};
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, DoDragDrop, IDropSource, IDropSource_Impl,
     OleDuplicateData, OleInitialize, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::Win32::UI::Shell::{
-    CLSID_DragDropHelper, IDragSourceHelper, SHCreateStdEnumFmtEtc, SHDRAGIMAGE,
+use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDragSourceHelper, SHDRAGIMAGE};
+use windows::core::{
+    BOOL, Error as WinError, HRESULT, IUnknown, PCWSTR, PWSTR, Result as WinResult, implement,
 };
-use windows::core::{BOOL, Error as WinError, HRESULT, PCWSTR, Result as WinResult, implement};
 
 use scrozz_core::{Error, Result};
 
 use crate::drag::artifact::artifact_root;
-use crate::drag::formats::{FormatKey, FormatStore};
+use crate::drag::formats::{
+    FormatKey, FormatStore, TARGET_DEVICE_HEADER, stored_medium, target_device_size,
+};
 use crate::drag::{
     DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragSession, DragSource,
     check_origin,
@@ -231,124 +246,405 @@ impl Drop for OwnedMedium {
 /// handle at offset zero, so the bits written are the bits meant, and picking
 /// the arm by `tymed` would need a match that produced identical code.
 fn handle_medium(tymed: u32, handle: HANDLE) -> STGMEDIUM {
+    handle_medium_owned_by(tymed, handle, None)
+}
+
+/// The same, for a medium whose provider stays responsible for the handle.
+///
+/// `controller` becomes `pUnkForRelease`, which switches `ReleaseStgMedium`
+/// from "free this handle" to "leave the handle alone and release this
+/// interface".
+fn handle_medium_owned_by(tymed: u32, handle: HANDLE, controller: Option<IUnknown>) -> STGMEDIUM {
     STGMEDIUM {
         tymed,
-        u: windows::Win32::System::Com::STGMEDIUM_0 {
+        u: STGMEDIUM_0 {
             hGlobal: HGLOBAL(handle.0),
         },
-        pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        pUnkForRelease: ManuallyDrop::new(controller),
     }
 }
 
 /// Copies a medium, so the copy can be owned and released independently.
 ///
-/// # Why every `tymed` and not just `TYMED_HGLOBAL`
+/// # The two kinds of copy
 ///
-/// The shell's drag-image helper only ever stores global memory, so a
-/// memory-only implementation would work today. It would also silently corrupt
-/// the first time anything stored anything else: reading `hGlobal` out of a
-/// medium that is really a `PWSTR` and handing it to `GlobalFree` is not an
-/// error anyone sees, it is a crash somewhere later. Every documented medium is
-/// handled, and an undocumented one is refused rather than guessed at.
+/// `ReleaseStgMedium` frees a medium by two different tables depending on
+/// whether `pUnkForRelease` is set, so there are two different right answers
+/// here.
+///
+/// When it is set, the *provider* owns the data and release only drops a
+/// reference to it. A copy is then an alias: it carries the same controller,
+/// `AddRef`ed, and independently owns nothing but the few things table one
+/// still frees. When it is null the receiver owns the data outright, release
+/// destroys it, and a copy has to be a genuinely separate thing — a second
+/// allocation, a second GDI object, a second file.
 ///
 /// # Errors
 ///
-/// `DV_E_TYMED` for a medium that is not one of the documented kinds, and
-/// `E_OUTOFMEMORY` if the copy cannot be allocated.
-fn dup_medium(src: &STGMEDIUM, format: u16) -> WinResult<STGMEDIUM> {
-    let tymed = src.tymed;
+/// `DV_E_TYMED` for a medium that is not one of the documented kinds, or a GDI
+/// handle that is not a kind this can safely duplicate; `E_OUTOFMEMORY` if the
+/// copy cannot be allocated; `E_FAIL` if a `TYMED_FILE` copy cannot be written.
+fn dup_medium(src: &STGMEDIUM) -> WinResult<STGMEDIUM> {
+    // Cloning is an `AddRef` if a controller is set, and nothing if not; the
+    // original is left untouched either way.
+    let controller: Option<IUnknown> = (*src.pUnkForRelease).clone();
 
-    if tymed == bits(TYMED_NULL) {
-        // Nothing to copy. Not an error: a caller may legitimately store a
-        // format with no medium behind it.
-        return Ok(handle_medium(tymed, HANDLE(std::ptr::null_mut())));
+    match controller {
+        Some(controller) => alias_medium(src, controller),
+        None => own_medium(src),
     }
+}
 
-    if tymed == bits(TYMED_HGLOBAL)
+/// A second reference to a medium whose provider retains ownership.
+///
+/// With `pUnkForRelease` set, `ReleaseStgMedium` frees this much and no more:
+///
+/// | Medium | Freed |
+/// | --- | --- |
+/// | `HGLOBAL`, `GDI`, `MFPICT`, `ENHMF` | nothing |
+/// | `FILE` | the name string — *not* the file |
+/// | `ISTREAM`, `ISTORAGE` | one interface reference |
+///
+/// and then releases the controller once. So this copy aliases the handles,
+/// takes its own allocation of the name string, `AddRef`s the interfaces, and
+/// carries its own reference to the controller to balance the `Release` it will
+/// eventually cause.
+fn alias_medium(src: &STGMEDIUM, controller: IUnknown) -> WinResult<STGMEDIUM> {
+    let tymed = src.tymed;
+    let controller = Some(controller);
+
+    if tymed == bits(TYMED_NULL)
+        || tymed == bits(TYMED_HGLOBAL)
         || tymed == bits(TYMED_GDI)
         || tymed == bits(TYMED_MFPICT)
         || tymed == bits(TYMED_ENHMF)
     {
-        // SAFETY: every one of these media is a handle at the union's offset
-        // zero, so reading `hGlobal` reads the handle whichever arm is live.
+        // SAFETY: each of these arms is one pointer-sized handle at the union's
+        // offset zero, so reading `hGlobal` reads the handle that is live.
         let raw = unsafe { src.u.hGlobal };
-        // SAFETY: `OleDuplicateData` takes a handle and the clipboard format it
-        // belongs to, and special-cases the GDI formats itself. A null return
-        // is its documented failure signal.
-        let copy = unsafe {
-            OleDuplicateData(
-                HANDLE(raw.0),
-                windows::Win32::System::Ole::CLIPBOARD_FORMAT(format),
-                GLOBAL_ALLOC_FLAGS(0),
-            )
-        };
-        if copy.is_invalid() {
-            return Err(WinError::from(E_OUTOFMEMORY));
-        }
-        return Ok(handle_medium(tymed, copy));
+        return Ok(handle_medium_owned_by(tymed, HANDLE(raw.0), controller));
     }
 
     if tymed == bits(TYMED_FILE) {
-        // SAFETY: `TYMED_FILE` means `lpszFileName` is a NUL-terminated wide
-        // string allocated with `CoTaskMemAlloc`.
-        let name = unsafe { src.u.lpszFileName };
-        if name.is_null() {
-            return Ok(handle_medium(tymed, HANDLE(std::ptr::null_mut())));
-        }
-        // SAFETY: as above — a live NUL-terminated wide string.
-        let text = unsafe { name.as_wide() };
-        let bytes = (text.len() + 1) * std::mem::size_of::<u16>();
-        // SAFETY: a non-zero size, and the result is checked before use. The
-        // copy must come from the task allocator because `ReleaseStgMedium`
-        // frees a `TYMED_FILE` name with `CoTaskMemFree`.
-        let dst = unsafe { CoTaskMemAlloc(bytes) }.cast::<u16>();
-        if dst.is_null() {
-            return Err(WinError::from(E_OUTOFMEMORY));
-        }
-        // SAFETY: `dst` addresses `text.len() + 1` writable `u16`s, and cannot
-        // overlap `text` because it was just allocated.
-        unsafe {
-            std::ptr::copy_nonoverlapping(text.as_ptr(), dst, text.len());
-            *dst.add(text.len()) = 0;
-        }
+        // SAFETY: `TYMED_FILE` means `lpszFileName` is the live arm.
+        let name = match unsafe { file_name_of(src) } {
+            Some(text) => task_wide(text)?,
+            None => PWSTR(std::ptr::null_mut()),
+        };
         return Ok(STGMEDIUM {
             tymed,
-            u: windows::Win32::System::Com::STGMEDIUM_0 {
-                lpszFileName: windows::core::PWSTR(dst),
-            },
-            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            u: STGMEDIUM_0 { lpszFileName: name },
+            pUnkForRelease: ManuallyDrop::new(controller),
         });
     }
 
     if tymed == bits(TYMED_ISTREAM) {
-        // SAFETY: `TYMED_ISTREAM` means `pstm` is the live arm. Cloning the
-        // `Option<IStream>` calls `AddRef`, which is exactly the copy wanted:
-        // the reference this object owns, released by `ReleaseStgMedium`.
+        // SAFETY: `TYMED_ISTREAM` means `pstm` is the live arm.
         let stream = unsafe { (*src.u.pstm).clone() };
         return Ok(STGMEDIUM {
             tymed,
-            u: windows::Win32::System::Com::STGMEDIUM_0 {
-                pstm: std::mem::ManuallyDrop::new(stream),
+            u: STGMEDIUM_0 {
+                pstm: ManuallyDrop::new(stream),
             },
-            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            pUnkForRelease: ManuallyDrop::new(controller),
         });
     }
 
     if tymed == bits(TYMED_ISTORAGE) {
-        // SAFETY: as above, for the storage arm.
+        // SAFETY: `TYMED_ISTORAGE` means `pstg` is the live arm.
         let storage = unsafe { (*src.u.pstg).clone() };
         return Ok(STGMEDIUM {
             tymed,
-            u: windows::Win32::System::Com::STGMEDIUM_0 {
-                pstg: std::mem::ManuallyDrop::new(storage),
+            u: STGMEDIUM_0 {
+                pstg: ManuallyDrop::new(storage),
             },
-            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            pUnkForRelease: ManuallyDrop::new(controller),
         });
     }
 
     // Several bits at once, or a value that is not a `TYMED` at all. Either way
     // the medium cannot be identified, and guessing would free the wrong thing.
     Err(WinError::from(DV_E_TYMED))
+}
+
+/// A genuinely independent copy of a medium the receiver owns outright.
+///
+/// Every arm here produces something that can be destroyed without touching the
+/// original, because `ReleaseStgMedium` with a null `pUnkForRelease` destroys:
+/// global memory with `GlobalFree`, GDI objects with `DeleteObject`, metafiles
+/// with `DeleteMetaFile`/`DeleteEnhMetaFile`, interfaces with `Release`, and
+/// files by *deleting them from disk*. Two owners of one file name is two
+/// deletions of one file.
+fn own_medium(src: &STGMEDIUM) -> WinResult<STGMEDIUM> {
+    let tymed = src.tymed;
+
+    if tymed == bits(TYMED_NULL) {
+        return Ok(handle_medium(tymed, HANDLE(std::ptr::null_mut())));
+    }
+
+    if tymed == bits(TYMED_HGLOBAL) {
+        // SAFETY: `TYMED_HGLOBAL` means `hGlobal` is the live arm.
+        let source = unsafe { src.u.hGlobal };
+        let copy = dup_hglobal(source)?;
+        return Ok(handle_medium(tymed, HANDLE(copy.0)));
+    }
+
+    if tymed == bits(TYMED_GDI) {
+        // SAFETY: the union's handle arms coincide, so this reads the GDI
+        // handle the medium claims to hold.
+        let source = unsafe { src.u.hGlobal };
+        let copy = dup_gdi(HGDIOBJ(source.0))?;
+        return Ok(handle_medium(tymed, copy));
+    }
+
+    if tymed == bits(TYMED_MFPICT) {
+        // SAFETY: as above — the metafile-picture handle.
+        let source = unsafe { src.u.hGlobal };
+        // `CF_METAFILEPICT` is one of the three formats `OleDuplicateData`
+        // deep-copies, and it is being named because the medium *is* a metafile
+        // picture, not because the clipboard format happens to say so.
+        // SAFETY: a live `METAFILEPICT` handle; the result is checked.
+        let copy =
+            unsafe { OleDuplicateData(HANDLE(source.0), CF_METAFILEPICT, GLOBAL_ALLOC_FLAGS(0)) };
+        if copy.is_invalid() {
+            return Err(WinError::from(E_OUTOFMEMORY));
+        }
+        return Ok(handle_medium(tymed, copy));
+    }
+
+    if tymed == bits(TYMED_ENHMF) {
+        // SAFETY: as above — the enhanced-metafile handle.
+        let source = unsafe { src.u.hGlobal };
+        // `OleDuplicateData` does *not* special-case `CF_ENHMETAFILE`; it would
+        // copy the handle's bytes. `CopyEnhMetaFileW` with a null name is the
+        // documented way to clone one in memory.
+        // SAFETY: a live `HENHMETAFILE`; the result is checked.
+        let copy = unsafe { CopyEnhMetaFileW(HENHMETAFILE(source.0), PCWSTR::null()) };
+        if copy.is_invalid() {
+            return Err(WinError::from(E_OUTOFMEMORY));
+        }
+        return Ok(handle_medium(tymed, HANDLE(copy.0)));
+    }
+
+    if tymed == bits(TYMED_FILE) {
+        return dup_file_medium(src);
+    }
+
+    if tymed == bits(TYMED_ISTREAM) {
+        // SAFETY: `TYMED_ISTREAM` means `pstm` is the live arm.
+        let stream = unsafe { (*src.u.pstm).clone() };
+        // A reference, not a `Clone()` of the stream. Release frees exactly one
+        // reference, so one `AddRef` is the matching independent ownership; an
+        // `IStream::Clone` would additionally give a separate seek pointer,
+        // which nothing here needs and which is allowed to fail.
+        return Ok(STGMEDIUM {
+            tymed,
+            u: STGMEDIUM_0 {
+                pstm: ManuallyDrop::new(stream),
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        });
+    }
+
+    if tymed == bits(TYMED_ISTORAGE) {
+        // SAFETY: `TYMED_ISTORAGE` means `pstg` is the live arm.
+        let storage = unsafe { (*src.u.pstg).clone() };
+        return Ok(STGMEDIUM {
+            tymed,
+            u: STGMEDIUM_0 {
+                pstg: ManuallyDrop::new(storage),
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        });
+    }
+
+    // Several bits at once, or a value that is not a `TYMED` at all.
+    Err(WinError::from(DV_E_TYMED))
+}
+
+/// Copies the bytes behind a global handle into a fresh one.
+///
+/// # Why not `OleDuplicateData`
+///
+/// Because it dispatches on the *clipboard format*, and the format here is
+/// whatever private value the caller registered:
+///
+/// > The CF_METAFILEPICT, CF_PALETTE, or CF_BITMAP formats receive special
+/// > handling. They are GDI handles and a new GDI object must be created
+/// > instead of just copying the bytes. All other formats are duplicated
+/// > byte-wise.
+///
+/// A private format is safe there — byte-wise is what global memory wants — but
+/// only by luck, and the same call is wrong for the other media. Doing it here
+/// makes every arm dispatch on the medium and none on the format.
+fn dup_hglobal(handle: HGLOBAL) -> WinResult<HGLOBAL> {
+    if handle.is_invalid() {
+        return Err(WinError::from(E_INVALIDARG));
+    }
+
+    // SAFETY: a live global handle, as `TYMED_HGLOBAL` promises.
+    let size = unsafe { GlobalSize(handle) };
+
+    // SAFETY: as above; a null result means it could not be locked.
+    let locked = unsafe { GlobalLock(handle) };
+    if locked.is_null() {
+        return Err(WinError::from(E_INVALIDARG));
+    }
+
+    // SAFETY: `GlobalSize` bytes are readable through the lock, and the slice
+    // is dropped before the matching unlock.
+    let copy = to_hglobal(unsafe { std::slice::from_raw_parts(locked.cast::<u8>(), size) });
+
+    // SAFETY: balances the lock above. The documented failure return also means
+    // "the lock count reached zero", so the result carries no error to report.
+    let _ = unsafe { GlobalUnlock(handle) };
+
+    copy
+}
+
+/// Copies a GDI object, working out what it is rather than being told.
+///
+/// `OleDuplicateData` picks its algorithm from the clipboard format, so a
+/// private registered format on `TYMED_GDI` would take the byte-wise path:
+/// `GlobalSize` on an `HBITMAP`, which is not a global handle. Asking GDI what
+/// the object actually is, and naming the standard format that matches, makes
+/// the call correct for any format id.
+///
+/// # Errors
+///
+/// `DV_E_TYMED` for a handle that is not live, or is a kind with no defined
+/// clipboard duplication — refusing is the only honest answer, because copying
+/// it by the wrong algorithm produces a handle that crashes on release.
+fn dup_gdi(handle: HGDIOBJ) -> WinResult<HANDLE> {
+    // SAFETY: a handle from a medium claiming `TYMED_GDI`. `GetObjectType`
+    // returns zero for anything that is not a live GDI object, which is exactly
+    // the check being made.
+    let kind = OBJ_TYPE(unsafe { GetObjectType(handle) }.cast_signed());
+
+    let format = if kind == OBJ_BITMAP {
+        CF_BITMAP
+    } else if kind == OBJ_PAL {
+        CF_PALETTE
+    } else {
+        return Err(WinError::from(DV_E_TYMED));
+    };
+
+    // SAFETY: a live GDI object of the kind just named, so the special-cased
+    // duplication path applies; the result is checked.
+    let copy = unsafe { OleDuplicateData(HANDLE(handle.0), format, GLOBAL_ALLOC_FLAGS(0)) };
+    if copy.is_invalid() {
+        return Err(WinError::from(E_OUTOFMEMORY));
+    }
+    Ok(copy)
+}
+
+/// Copies a file medium — including the file.
+///
+/// Release deletes the file, so a copy that shared the path would be a second
+/// deletion of it: the first `ReleaseStgMedium` would take the file out from
+/// under every other holder. The copy therefore gets its own file, and the
+/// blocking write that costs is affordable because `TYMED_FILE` never appears
+/// on this path in practice.
+fn dup_file_medium(src: &STGMEDIUM) -> WinResult<STGMEDIUM> {
+    // SAFETY: `TYMED_FILE` means `lpszFileName` is the live arm.
+    let Some(text) = (unsafe { file_name_of(src) }) else {
+        return Ok(STGMEDIUM {
+            tymed: bits(TYMED_FILE),
+            u: STGMEDIUM_0 {
+                lpszFileName: PWSTR(std::ptr::null_mut()),
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        });
+    };
+
+    let from = PathBuf::from(OsString::from_wide(text));
+    let to = scratch_path(&from);
+    std::fs::copy(&from, &to).map_err(|_| WinError::from(E_FAIL))?;
+
+    let name = task_wide(&wide(&to))?;
+    Ok(STGMEDIUM {
+        tymed: bits(TYMED_FILE),
+        u: STGMEDIUM_0 { lpszFileName: name },
+        pUnkForRelease: ManuallyDrop::new(None),
+    })
+}
+
+/// A unique temporary path, keeping the extension so type sniffing still works.
+fn scratch_path(like: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+
+    let mut name = format!("scrozz-stg-{}-{serial}", std::process::id());
+    if let Some(ext) = like.extension().and_then(|ext| ext.to_str()) {
+        name.push('.');
+        name.push_str(ext);
+    }
+    std::env::temp_dir().join(name)
+}
+
+/// The file name a `TYMED_FILE` medium carries, without its terminator.
+///
+/// # Safety
+///
+/// `src` must be a live medium whose `lpszFileName` arm is the live one.
+unsafe fn file_name_of(src: &STGMEDIUM) -> Option<&[u16]> {
+    // SAFETY: the caller promises `lpszFileName` is live.
+    let name = unsafe { src.u.lpszFileName };
+    if name.is_null() {
+        return None;
+    }
+
+    // Measured and rebuilt by hand rather than through `PWSTR::as_wide`,
+    // because that borrows the local `PWSTR` and the slice has to live as long
+    // as the medium instead.
+    let mut len = 0usize;
+    // SAFETY: a NUL-terminated wide string, so the scan stops inside it.
+    while unsafe { name.0.add(len).read() } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` units precede the terminator just found, and they live for
+    // as long as `src` does.
+    Some(unsafe { std::slice::from_raw_parts(name.0, len) })
+}
+
+/// Copies a wide string into task memory, NUL-terminated.
+///
+/// `ReleaseStgMedium` frees a `TYMED_FILE` name with the standard allocator, so
+/// the copy has to come from the matching one.
+fn task_wide(text: &[u16]) -> WinResult<PWSTR> {
+    let bytes = text
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(size_of::<u16>()))
+        .ok_or_else(|| WinError::from(E_OUTOFMEMORY))?;
+
+    // SAFETY: a non-zero size, and the result is checked before it is written.
+    let dst = unsafe { CoTaskMemAlloc(bytes) }.cast::<u16>();
+    if dst.is_null() {
+        return Err(WinError::from(E_OUTOFMEMORY));
+    }
+
+    // SAFETY: `dst` addresses `text.len() + 1` writable `u16`s and was just
+    // allocated, so it cannot overlap `text`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), dst, text.len());
+        dst.add(text.len()).write(0);
+    }
+    Ok(PWSTR(dst))
+}
+
+/// Copies bytes into task memory, for a `FORMATETC` the caller will free.
+fn task_bytes(bytes: &[u8]) -> WinResult<*mut u8> {
+    // SAFETY: the size is non-zero — every target device is at least a header —
+    // and the result is checked before it is written.
+    let dst = unsafe { CoTaskMemAlloc(bytes.len().max(1)) }.cast::<u8>();
+    if dst.is_null() {
+        return Err(WinError::from(E_OUTOFMEMORY));
+    }
+    // SAFETY: `dst` addresses `bytes.len()` writable bytes and was just
+    // allocated, so it cannot overlap `bytes`.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+    Ok(dst)
 }
 
 /// A `TYMED` as the unsigned bitmask every structure field stores it in.
@@ -360,11 +656,13 @@ const fn bits(tymed: TYMED) -> u32 {
 // The data object
 // ---------------------------------------------------------------------------
 
-/// A request, reduced to the four fields that decide what answers it.
+/// A request, reduced to the fields that decide what answers it.
 ///
 /// # Errors
 ///
-/// `E_INVALIDARG` for a null pointer, which is the documented answer.
+/// `E_INVALIDARG` for a null pointer, which is the documented answer, and
+/// `DV_E_DVTARGETDEVICE` for a target device whose header does not describe a
+/// structure that could exist.
 fn key_of(request: *const FORMATETC) -> WinResult<FormatKey> {
     if request.is_null() {
         return Err(WinError::from(E_INVALIDARG));
@@ -376,19 +674,183 @@ fn key_of(request: *const FORMATETC) -> WinResult<FormatKey> {
         aspect: request.dwAspect,
         index: request.lindex,
         tymed: request.tymed,
+        // SAFETY: `ptd` is null or a live `DVTARGETDEVICE`, as `FORMATETC`
+        // requires; the copy is taken while the caller still owns it.
+        device: unsafe { device_bytes(request.ptd) }?,
     })
+}
+
+/// A private copy of a target device, taken out of the caller's memory.
+///
+/// The blob is copied rather than aliased because the caller owns it only for
+/// the duration of the call, and it is *part of the key* rather than an
+/// ignorable extra: a null `ptd` means
+///
+/// > whenever the specified data format is independent of the target device or
+/// > when the caller doesn't care what device is used
+///
+/// which is a representation in its own right, not a wildcard matching every
+/// device. Dropping it would let two device-specific entries overwrite each
+/// other and answer each other's requests.
+///
+/// # Safety
+///
+/// `ptd` must be null or address a live `DVTARGETDEVICE`.
+///
+/// # Errors
+///
+/// `DV_E_DVTARGETDEVICE` if `tdSize` or any of the four offsets is outside the
+/// structure it claims to describe.
+unsafe fn device_bytes(ptd: *const DVTARGETDEVICE) -> WinResult<Option<Arc<[u8]>>> {
+    if ptd.is_null() {
+        return Ok(None);
+    }
+
+    let base = ptd.cast::<u8>();
+    // SAFETY: a live `DVTARGETDEVICE` is at least its own fixed header, which
+    // is the only part read before `tdSize` has been validated.
+    let header = unsafe { std::slice::from_raw_parts(base, TARGET_DEVICE_HEADER) };
+    let size = target_device_size(header).ok_or_else(|| WinError::from(DV_E_DVTARGETDEVICE))?;
+
+    // SAFETY: `tdSize` has been checked to be at least the header and within a
+    // sane bound, and a well-formed structure is that many bytes long.
+    let all = unsafe { std::slice::from_raw_parts(base, size) };
+    Ok(Some(Arc::from(all)))
 }
 
 /// The reverse, for enumeration.
 ///
-/// `ptd` is null because this object is device-independent — see [`FormatKey`].
-fn formatetc_of(key: FormatKey) -> FORMATETC {
-    FORMATETC {
+/// The target device is handed back as a fresh task allocation, because the
+/// receiver of an enumerated `FORMATETC` is required to free it and must not be
+/// given a pointer into this object.
+///
+/// # Errors
+///
+/// `E_OUTOFMEMORY` if the target device copy cannot be allocated.
+fn formatetc_of(key: &FormatKey) -> WinResult<FORMATETC> {
+    let ptd = match &key.device {
+        None => std::ptr::null_mut(),
+        Some(device) => task_bytes(device)?.cast::<DVTARGETDEVICE>(),
+    };
+    Ok(FORMATETC {
         cfFormat: key.format,
-        ptd: std::ptr::null_mut(),
+        ptd,
         dwAspect: key.aspect,
         lindex: key.index,
         tymed: key.tymed,
+    })
+}
+
+/// Frees the target device of a `FORMATETC` that [`formatetc_of`] produced.
+///
+/// # Safety
+///
+/// `at` must address a `FORMATETC` written by [`formatetc_of`] and not yet
+/// handed to anyone else.
+unsafe fn free_formatetc(at: *mut FORMATETC) {
+    // SAFETY: the caller promises a live `FORMATETC` of this object's making.
+    let ptd = unsafe { (*at).ptd };
+    if !ptd.is_null() {
+        // SAFETY: allocated by `CoTaskMemAlloc` in `formatetc_of`, and freed
+        // exactly once because the caller promises it was not handed on.
+        unsafe { CoTaskMemFree(Some(ptd.cast())) };
+    }
+}
+
+/// An enumerator over a fixed list of formats.
+///
+/// # Why not `SHCreateStdEnumFmtEtc`
+///
+/// The shell's ready-made enumerator takes an array of `FORMATETC` and copies
+/// it. What it does with `ptd` — a pointer into memory this object owns — is
+/// not documented, and the two possibilities are "deep-copies it" and "keeps
+/// the pointer and hands out a dangling one once this object dies". A page of
+/// code removes the question, and lets every enumerated entry carry its own
+/// task-allocated device for the caller to free.
+#[implement(IEnumFORMATETC)]
+struct FormatEnum {
+    /// The formats, in the order [`CaptureData::format_list`] chose.
+    keys: Vec<FormatKey>,
+    /// How far through `keys` this enumerator has been walked.
+    at: Cell<usize>,
+}
+
+impl FormatEnum {
+    /// A new enumerator, positioned at `at`, as the interface OLE wants.
+    fn make(keys: Vec<FormatKey>, at: usize) -> IEnumFORMATETC {
+        Self {
+            keys,
+            at: Cell::new(at),
+        }
+        .into()
+    }
+}
+
+#[allow(non_snake_case, reason = "COM vtable method names")]
+impl IEnumFORMATETC_Impl for FormatEnum_Impl {
+    fn Next(&self, count: u32, out: *mut FORMATETC, fetched: *mut u32) -> HRESULT {
+        if !fetched.is_null() {
+            // SAFETY: checked non-null; the caller owns writable storage here.
+            unsafe { fetched.write(0) };
+        }
+        if out.is_null() {
+            return E_INVALIDARG;
+        }
+        // Only the one-at-a-time form may omit the count-out, because only then
+        // is the return value enough to say how many were written.
+        if count != 1 && fetched.is_null() {
+            return E_INVALIDARG;
+        }
+
+        let start = self.at.get();
+        let wanted = count as usize;
+        let take = wanted.min(self.keys.len().saturating_sub(start));
+
+        for step in 0..take {
+            let Ok(entry) = formatetc_of(&self.keys[start + step]) else {
+                // Undo what has been written: the caller is told nothing was
+                // fetched, so it will free nothing.
+                for done in 0..step {
+                    // SAFETY: `done < step`, so this entry was written by the
+                    // loop above and has not been handed anywhere.
+                    unsafe { free_formatetc(out.add(done)) };
+                }
+                return E_OUTOFMEMORY;
+            };
+            // SAFETY: the caller promises `count` writable entries at `out`,
+            // and `step < take <= count`.
+            unsafe { out.add(step).write(entry) };
+        }
+
+        self.at.set(start + take);
+        if !fetched.is_null() {
+            // SAFETY: checked non-null; the caller owns writable storage here.
+            unsafe { fetched.write(take.try_into().unwrap_or(u32::MAX)) };
+        }
+        if take == wanted { S_OK } else { S_FALSE }
+    }
+
+    fn Skip(&self, count: u32) -> WinResult<()> {
+        let start = self.at.get();
+        let wanted = count as usize;
+        let take = wanted.min(self.keys.len().saturating_sub(start));
+        self.at.set(start + take);
+
+        if take == wanted {
+            Ok(())
+        } else {
+            // S_FALSE: fewer elements than asked for were skipped.
+            Err(WinError::from(S_FALSE))
+        }
+    }
+
+    fn Reset(&self) -> WinResult<()> {
+        self.at.set(0);
+        Ok(())
+    }
+
+    fn Clone(&self) -> WinResult<IEnumFORMATETC> {
+        Ok(FormatEnum::make(self.keys.clone(), self.at.get()))
     }
 }
 
@@ -493,21 +955,19 @@ impl CaptureData {
             extras
                 .key_for(request)
                 .zip(extras.get(request))
-                .map(|(stored, medium)| {
+                .map(|(_stored, medium)| {
                     // SAFETY: a bitwise read used only as a source to copy
                     // from. `STGMEDIUM` has no destructor — every owning field
                     // is a `ManuallyDrop` — so this local is not a second owner
                     // and releases nothing when it goes out of scope.
-                    (stored.format, unsafe {
-                        std::ptr::read(&raw const medium.0)
-                    })
+                    unsafe { std::ptr::read(&raw const medium.0) }
                 })
         };
 
-        let Some((format, source)) = found else {
+        let Some(source) = found else {
             return Ok(None);
         };
-        Ok(Some(dup_medium(&source, format)?))
+        Ok(Some(dup_medium(&source)?))
     }
 
     /// Whether anything here can answer `request`.
@@ -515,20 +975,16 @@ impl CaptureData {
         self.extras.borrow().get(request).is_some() || self.offered.get(request).is_some()
     }
 
-    /// The formats available, in the shape `SHCreateStdEnumFmtEtc` wants.
+    /// The formats available, in enumeration order.
     ///
     /// Scrozz's own first, so a target walking the enumeration in order meets
     /// the file before anything private. The shell's entries follow because
     /// `EnumFormatEtc` is documented to list what `GetData` can supply, and an
     /// object that answers a request it would not enumerate is inconsistent in
     /// a way that is nobody's job to debug.
-    fn format_list(&self) -> Vec<FORMATETC> {
+    fn format_list(&self) -> Vec<FormatKey> {
         let extras = self.extras.borrow();
-        self.offered
-            .keys()
-            .chain(extras.keys())
-            .map(formatetc_of)
-            .collect()
+        self.offered.keys().chain(extras.keys()).collect()
     }
 }
 
@@ -567,7 +1023,7 @@ impl IDataObject_Impl for CaptureData_Impl {
         // the caller that asking differently would work.
         let any_medium = FormatKey {
             tymed: u32::MAX,
-            ..key
+            ..key.clone()
         };
         if self.serves(&any_medium) {
             DV_E_TYMED
@@ -595,12 +1051,22 @@ impl IDataObject_Impl for CaptureData_Impl {
         medium: *const STGMEDIUM,
         release: BOOL,
     ) -> WinResult<()> {
-        let key = key_of(format)?;
+        let requested = key_of(format)?;
         if medium.is_null() {
             return Err(WinError::from(E_INVALIDARG));
         }
         // SAFETY: checked non-null; OLE passes a valid medium for the call.
         let source = unsafe { &*medium };
+
+        // `FORMATETC::tymed` is a *set* — the media the caller is willing to
+        // use — while `STGMEDIUM::tymed` names the one thing this medium
+        // actually is. The rule for reconciling them lives in the portable
+        // format layer, where it can be exercised without a Windows host; see
+        // [`stored_medium`] for why the answer is the medium and not the set.
+        let Some(tymed) = stored_medium(requested.tymed, source.tymed) else {
+            return Err(WinError::from(DV_E_TYMED));
+        };
+        let key = FormatKey { tymed, ..requested };
 
         let owned = if release.as_bool() {
             // `fRelease == TRUE` hands ownership over as-is, so the medium is
@@ -614,7 +1080,7 @@ impl IDataObject_Impl for CaptureData_Impl {
         } else {
             // The caller keeps its medium, so this object needs one of its own
             // that will outlive the call.
-            OwnedMedium(dup_medium(source, key.format)?)
+            OwnedMedium(dup_medium(source)?)
         };
 
         // The displaced entry — if any — is released here, *after* the borrow
@@ -634,10 +1100,7 @@ impl IDataObject_Impl for CaptureData_Impl {
         if direction != 1 {
             return Err(WinError::from(E_NOTIMPL));
         }
-        let formats = self.format_list();
-        // SAFETY: `formats` is a live slice for the duration of the call, and
-        // `SHCreateStdEnumFmtEtc` is documented to copy it.
-        unsafe { SHCreateStdEnumFmtEtc(&formats) }
+        Ok(FormatEnum::make(self.format_list(), 0))
     }
 
     fn DAdvise(
@@ -1047,9 +1510,45 @@ mod tests {
     #[test]
     fn a_key_survives_the_trip_through_a_formatetc() {
         let key = FormatKey::content(CF_HDROP.0, bits(TYMED_HGLOBAL));
-        let as_formatetc = formatetc_of(key);
+        let mut as_formatetc = fmt_of(&key);
         let round_tripped = key_of(&raw const as_formatetc).expect("not null");
         assert_eq!(round_tripped, key);
+        // SAFETY: produced by `formatetc_of` above and handed nowhere else.
+        unsafe { free_formatetc(&raw mut as_formatetc) };
+    }
+
+    #[test]
+    fn a_target_device_survives_the_trip_too() {
+        // And as a *copy*: the enumerated entry must not point into this object,
+        // because its receiver is required to free what it is given.
+        let device = target_device(0xAB);
+        let request = with_device(CF_HDROP.0, &device);
+        let key = key_of(&raw const request).expect("not null");
+        assert!(key.device.is_some(), "the device is part of the identity");
+
+        let mut out = fmt_of(&key);
+        assert!(!out.ptd.is_null());
+        assert_ne!(out.ptd.cast::<u8>().cast_const(), device.as_ptr());
+        // SAFETY: `formatetc_of` copied the whole validated blob.
+        let seen = unsafe { std::slice::from_raw_parts(out.ptd.cast::<u8>(), device.len()) };
+        assert_eq!(seen, device.as_slice());
+
+        assert_eq!(key_of(&raw const out).expect("not null"), key);
+        // SAFETY: produced by `formatetc_of` above and handed nowhere else.
+        unsafe { free_formatetc(&raw mut out) };
+    }
+
+    #[test]
+    fn a_target_device_that_could_not_exist_is_refused() {
+        // Degrading it to "no device" would be worse than failing: the entry
+        // would collide with the device-independent one.
+        let mut broken = target_device(1);
+        broken[0..4].copy_from_slice(&4u32.to_le_bytes());
+        let request = with_device(CF_HDROP.0, &broken);
+        assert_eq!(
+            key_of(&raw const request).map_err(|err| err.code()),
+            Err(DV_E_DVTARGETDEVICE)
+        );
     }
 
     #[test]
@@ -1080,10 +1579,10 @@ mod tests {
         let listed = data.format_list();
         assert_eq!(listed.len(), data.offered.len());
         for (entry, key) in listed.iter().zip(data.offered.keys()) {
-            assert_eq!(entry.cfFormat, key.format);
+            assert_eq!(entry.format, key.format);
             assert_eq!(entry.tymed, bits(TYMED_HGLOBAL));
-            assert_eq!(entry.lindex, -1);
-            assert!(entry.ptd.is_null(), "this object is device-independent");
+            assert_eq!(entry.index, -1);
+            assert!(entry.device.is_none(), "the file flavours want no device");
         }
     }
 
@@ -1120,6 +1619,34 @@ mod tests {
         }
     }
 
+    /// A `FORMATETC` for `key`, for a test that will not run out of memory.
+    fn fmt_of(key: &FormatKey) -> FORMATETC {
+        formatetc_of(key).expect("allocate")
+    }
+
+    /// A minimal well-formed `DVTARGETDEVICE`, tagged so two differ.
+    fn target_device(tag: u8) -> Vec<u8> {
+        let mut blob = vec![0u8; TARGET_DEVICE_HEADER + 4];
+        let size: u32 = blob.len().try_into().expect("small");
+        blob[0..4].copy_from_slice(&size.to_le_bytes());
+        blob[TARGET_DEVICE_HEADER] = tag;
+        blob
+    }
+
+    /// A request for `format` on global memory, aimed at `device`.
+    ///
+    /// The returned structure borrows `device`, which is what OLE does too: the
+    /// caller owns the blob for the duration of the call.
+    fn with_device(format: u16, device: &[u8]) -> FORMATETC {
+        FORMATETC {
+            cfFormat: format,
+            ptd: device.as_ptr().cast::<DVTARGETDEVICE>().cast_mut(),
+            dwAspect: 1,
+            lindex: -1,
+            tymed: bits(TYMED_HGLOBAL),
+        }
+    }
+
     /// A medium owning a fresh copy of `bytes`, as a caller would hand over.
     fn global_of(bytes: &[u8]) -> STGMEDIUM {
         let handle = to_hglobal(bytes).expect("allocate");
@@ -1145,7 +1672,7 @@ mod tests {
         // itself — it puts it here and reads it back during the drag — so a
         // data object that cannot do this has no drag image at all.
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
-        let format = formatetc_of(FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
         let payload = b"thumbnail pixels".as_slice();
 
         // SAFETY: a live object and a live medium; ownership passes to the
@@ -1170,7 +1697,7 @@ mod tests {
         // GetData transfers ownership. Returning the stored handle itself would
         // leave the receiver and this object both believing they must free it.
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
-        let format = formatetc_of(FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
         let medium = global_of(b"pixels");
         // SAFETY: the union arm is HGLOBAL, matching the tymed just set.
         let stored_handle = unsafe { medium.u.hGlobal };
@@ -1209,7 +1736,7 @@ mod tests {
         // fRelease == FALSE means the caller keeps its medium. Storing it as-is
         // would free memory that is still the caller's.
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
-        let format = formatetc_of(FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
         let mut mine = global_of(b"still mine");
 
         // SAFETY: live object and medium; ownership is explicitly retained.
@@ -1238,7 +1765,7 @@ mod tests {
         let inner = CaptureData::new(Path::new(r"C:\a.png"), b"png");
         let offered = inner.offered.len();
         let data: IDataObject = inner.into();
-        let format = formatetc_of(FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
 
         // SAFETY: live object and medium, ownership passed on.
         let handed_over = global_of(b"px");
@@ -1277,8 +1804,8 @@ mod tests {
         // differently would have worked.
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
 
-        let wrong_medium = formatetc_of(FormatKey::content(CF_HDROP.0, bits(TYMED_ISTREAM)));
-        let wrong_format = formatetc_of(FormatKey::content(0xBEEF, bits(TYMED_HGLOBAL)));
+        let wrong_medium = fmt_of(&FormatKey::content(CF_HDROP.0, bits(TYMED_ISTREAM)));
+        let wrong_format = fmt_of(&FormatKey::content(0xBEEF, bits(TYMED_HGLOBAL)));
 
         // SAFETY: live object, live requests.
         unsafe {
@@ -1291,7 +1818,7 @@ mod tests {
     #[test]
     fn storing_a_format_twice_replaces_it() {
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
-        let format = formatetc_of(FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
 
         // SAFETY: live object and media; ownership passes on both times.
         let first = global_of(b"first ");
@@ -1321,14 +1848,14 @@ mod tests {
             },
             pUnkForRelease: std::mem::ManuallyDrop::new(None),
         };
-        let refused = dup_medium(&ambiguous, CF_HDROP.0).map_err(|err| err.code());
+        let refused = dup_medium(&ambiguous).map_err(|err| err.code());
         assert_eq!(refused.err(), Some(DV_E_TYMED));
     }
 
     #[test]
     fn a_null_medium_is_rejected_before_it_is_read() {
         let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
-        let format = formatetc_of(FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
         // SAFETY: live object; the null is the thing under test.
         let err = unsafe { data.SetData(&raw const format, std::ptr::null(), true) }
             .expect_err("a null medium is not storable");
@@ -1347,5 +1874,317 @@ mod tests {
             DragOperation::Copy,
             "a receiver offering both is taking a copy"
         );
+    }
+    // -----------------------------------------------------------------------
+    // The format and the medium must agree
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_medium_that_is_not_what_the_format_promised_is_refused() {
+        // `FORMATETC::tymed` is what the caller will accept; `STGMEDIUM::tymed`
+        // is what this actually is. Storing the promise rather than the fact
+        // makes `QueryGetData` offer a stream and `GetData` hand over a handle.
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let stream_promised = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_ISTREAM)));
+        let really_global = global_of(b"pixels");
+
+        // SAFETY: a live object and a live medium; the call is expected to
+        // refuse, so ownership does not pass and the medium is released below.
+        let refused =
+            unsafe { data.SetData(&raw const stream_promised, &raw const really_global, true) };
+        assert_eq!(refused.map_err(|err| err.code()), Err(DV_E_TYMED));
+
+        let mut medium = really_global;
+        // SAFETY: still owned here, because the call refused it.
+        unsafe { ReleaseStgMedium(&raw mut medium) };
+    }
+
+    #[test]
+    fn a_medium_claiming_two_kinds_at_once_is_refused() {
+        // Release has to pick one arm of the union, so a medium that is both a
+        // handle and a stream cannot be freed correctly by anyone.
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let format = fmt_of(&FormatKey::content(
+            drag_image_bits(),
+            bits(TYMED_HGLOBAL) | bits(TYMED_ISTREAM),
+        ));
+        let mut ambiguous = global_of(b"pixels");
+        ambiguous.tymed = bits(TYMED_HGLOBAL) | bits(TYMED_ISTREAM);
+
+        // SAFETY: live object, live medium; expected to refuse.
+        let refused = unsafe { data.SetData(&raw const format, &raw const ambiguous, true) };
+        assert_eq!(refused.map_err(|err| err.code()), Err(DV_E_TYMED));
+
+        ambiguous.tymed = bits(TYMED_HGLOBAL);
+        // SAFETY: still owned here; corrected back to its real kind so release
+        // frees the right thing.
+        unsafe { ReleaseStgMedium(&raw mut ambiguous) };
+    }
+
+    #[test]
+    fn an_entry_answers_for_the_medium_it_is_not_the_media_offered() {
+        // A caller may say "global memory or a stream, either will do". What is
+        // stored is one of them, and only that one may be promised back.
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let either = fmt_of(&FormatKey::content(
+            drag_image_bits(),
+            bits(TYMED_HGLOBAL) | bits(TYMED_ISTREAM),
+        ));
+        let global = global_of(b"pixels");
+
+        // SAFETY: live object and medium; ownership passes on success.
+        unsafe {
+            data.SetData(&raw const either, &raw const global, true)
+                .expect("global memory was one of the media offered");
+        }
+
+        let stream_only = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_ISTREAM)));
+        let global_only = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+
+        // SAFETY: live object; both are plain queries.
+        unsafe {
+            assert_eq!(
+                data.QueryGetData(&raw const stream_only),
+                DV_E_TYMED,
+                "a stream was never stored, only offered"
+            );
+            assert_eq!(data.QueryGetData(&raw const global_only), S_OK);
+        }
+
+        // SAFETY: owned here once handed over.
+        let mut back = unsafe { data.GetData(&raw const global_only) }.expect("read");
+        assert_eq!(back.tymed, bits(TYMED_HGLOBAL));
+        // SAFETY: as above.
+        unsafe { ReleaseStgMedium(&raw mut back) };
+    }
+
+    // -----------------------------------------------------------------------
+    // The target device is part of the identity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_devices_do_not_overwrite_each_other() {
+        // A device-specific representation is a representation, not a variant
+        // of one. Dropping the device would make the second write replace the
+        // first and then answer both requests with it.
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let first_device = target_device(1);
+        let second_device = target_device(2);
+        let first = with_device(drag_image_bits(), &first_device);
+        let second = with_device(drag_image_bits(), &second_device);
+
+        let one_bytes = global_of(b"one");
+        let two_bytes = global_of(b"two");
+        // SAFETY: live object and media; ownership passes on success.
+        unsafe {
+            data.SetData(&raw const first, &raw const one_bytes, true)
+                .expect("accepted");
+            data.SetData(&raw const second, &raw const two_bytes, true)
+                .expect("accepted");
+        }
+
+        // SAFETY: live object; the returned media are owned and released here.
+        let mut one = unsafe { data.GetData(&raw const first) }.expect("read one");
+        let mut two = unsafe { data.GetData(&raw const second) }.expect("read two");
+        assert_eq!(read_global(&one, 3), b"one");
+        assert_eq!(read_global(&two, 3), b"two");
+        // SAFETY: both owned here.
+        unsafe {
+            ReleaseStgMedium(&raw mut one);
+            ReleaseStgMedium(&raw mut two);
+        }
+    }
+
+    #[test]
+    fn a_device_specific_entry_does_not_answer_a_device_free_request() {
+        // A null device means "independent of any device", not "any device".
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let device = target_device(7);
+        let specific = with_device(drag_image_bits(), &device);
+
+        let bytes = global_of(b"dev");
+        // SAFETY: live object and medium; ownership passes on success.
+        unsafe {
+            data.SetData(&raw const specific, &raw const bytes, true)
+                .expect("accepted");
+        }
+
+        let anywhere = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        // SAFETY: live object; a plain query.
+        assert_eq!(
+            unsafe { data.QueryGetData(&raw const anywhere) },
+            DV_E_FORMATETC
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Enumeration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_enumerator_walks_skips_resets_and_clones() {
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"png");
+        let all = data.format_list();
+        let total = all.len();
+        assert!(total >= 3, "the offered flavours are the fixture here");
+
+        let enumerator = FormatEnum::make(all.clone(), 0);
+        let mut one = [FORMATETC::default()];
+        let mut fetched = 0u32;
+
+        // SAFETY: a live enumerator and writable storage for one entry.
+        unsafe {
+            assert_eq!(
+                enumerator.Next(&mut one, Some(&raw mut fetched)),
+                S_OK,
+                "one entry is available"
+            );
+            assert_eq!(fetched, 1);
+            assert_eq!(one[0].cfFormat, all[0].format);
+            free_formatetc(&raw mut one[0]);
+
+            enumerator.Skip(1).expect("a second entry exists to skip");
+
+            let mut rest = vec![FORMATETC::default(); total];
+            assert_eq!(
+                enumerator.Next(&mut rest, Some(&raw mut fetched)),
+                S_FALSE,
+                "fewer remain than were asked for"
+            );
+            assert_eq!(fetched as usize, total - 2);
+            for entry in &mut rest[..fetched as usize] {
+                free_formatetc(&raw mut *entry);
+            }
+
+            // Exhausted, and a clone starts from where this one stands.
+            let clone = enumerator.Clone().expect("clone");
+            assert_eq!(clone.Next(&mut one, Some(&raw mut fetched)), S_FALSE);
+            assert_eq!(fetched, 0);
+
+            enumerator.Reset().expect("reset");
+            assert_eq!(enumerator.Next(&mut one, Some(&raw mut fetched)), S_OK);
+            assert_eq!(fetched, 1);
+            free_formatetc(&raw mut one[0]);
+        }
+    }
+
+    #[test]
+    fn the_enumerator_insists_on_a_count_when_asked_for_several() {
+        // With one entry the return value says how many were written. With more
+        // than one it cannot, so refusing is the only safe answer.
+        let data = CaptureData::new(Path::new(r"C:\a.png"), b"png");
+        let enumerator = FormatEnum::make(data.format_list(), 0);
+        let mut several = [FORMATETC::default(); 2];
+
+        // SAFETY: a live enumerator and writable storage for two entries.
+        assert_eq!(unsafe { enumerator.Next(&mut several, None) }, E_INVALIDARG);
+    }
+
+    #[test]
+    fn each_enumerated_device_is_the_callers_to_free() {
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let device = target_device(9);
+        let specific = with_device(drag_image_bits(), &device);
+        let bytes = global_of(b"dev");
+        // SAFETY: live object and medium; ownership passes on success.
+        unsafe {
+            data.SetData(&raw const specific, &raw const bytes, true)
+                .expect("accepted");
+        }
+
+        // SAFETY: DATADIR_GET.
+        let enumerator = unsafe { data.EnumFormatEtc(1) }.expect("enumerate");
+        let mut seen = Vec::new();
+        let mut one = [FORMATETC::default()];
+        let mut fetched = 0u32;
+        // SAFETY: a live enumerator and storage for one entry at a time.
+        unsafe {
+            while enumerator.Next(&mut one, Some(&raw mut fetched)) == S_OK && fetched == 1 {
+                seen.push((one[0].cfFormat, one[0].ptd));
+                free_formatetc(&raw mut one[0]);
+            }
+        }
+
+        let device_entry = seen
+            .iter()
+            .find(|(format, _)| *format == drag_image_bits())
+            .expect("the stored format is enumerated");
+        assert!(!device_entry.1.is_null(), "its device came with it");
+        assert_ne!(
+            device_entry.1.cast::<u8>().cast_const(),
+            device.as_ptr(),
+            "and it is a copy, not a pointer into the caller's blob"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifetimes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_borrowed_medium_outlives_the_callers_release() {
+        // fRelease == FALSE leaves the caller owning its medium, and the caller
+        // is entitled to release it the moment the call returns.
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), b"png").into();
+        let format = fmt_of(&FormatKey::content(drag_image_bits(), bits(TYMED_HGLOBAL)));
+        let mut theirs = global_of(b"pixels!!");
+
+        // SAFETY: live object and medium; ownership stays with the caller.
+        unsafe {
+            data.SetData(&raw const format, &raw const theirs, false)
+                .expect("accepted");
+            ReleaseStgMedium(&raw mut theirs);
+        }
+
+        // SAFETY: live object; the returned medium is owned and released here.
+        let mut back = unsafe { data.GetData(&raw const format) }.expect("still there");
+        assert_eq!(read_global(&back, 8), b"pixels!!");
+        // SAFETY: owned here.
+        unsafe { ReleaseStgMedium(&raw mut back) };
+    }
+
+    #[test]
+    fn a_file_medium_is_copied_rather_than_shared() {
+        // Release *deletes the file*, so a copy that shared the path would let
+        // the first release take it away from everyone else.
+        let original = scratch_path(Path::new("fixture.bin"));
+        std::fs::write(&original, b"contents").expect("write fixture");
+
+        let name = task_wide(&wide(&original)).expect("allocate");
+        let mut source = STGMEDIUM {
+            tymed: bits(TYMED_FILE),
+            u: STGMEDIUM_0 { lpszFileName: name },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+
+        let mut copy = dup_medium(&source).expect("duplicate");
+        // SAFETY: both are TYMED_FILE, so `lpszFileName` is the live arm.
+        let copied_path = unsafe {
+            let text = file_name_of(&copy).expect("a name");
+            PathBuf::from(OsString::from_wide(text))
+        };
+        assert_ne!(copied_path, original, "a second file, not a second name");
+        assert_eq!(
+            std::fs::read(&copied_path).expect("readable"),
+            b"contents",
+            "with the same contents"
+        );
+
+        // SAFETY: owned here; this is the release that deletes the copy.
+        unsafe { ReleaseStgMedium(&raw mut copy) };
+        assert!(!copied_path.exists(), "release deletes its own file");
+        assert!(original.exists(), "and not anyone else's");
+
+        // SAFETY: owned here; deletes the fixture.
+        unsafe { ReleaseStgMedium(&raw mut source) };
+        assert!(!original.exists());
+    }
+
+    #[test]
+    fn a_gdi_handle_that_cannot_be_identified_is_refused() {
+        // Copying it by the wrong algorithm produces a handle that crashes on
+        // release, which is strictly worse than declining.
+        let refused = dup_gdi(HGDIOBJ(std::ptr::null_mut())).map_err(|err| err.code());
+        assert_eq!(refused, Err(DV_E_TYMED));
     }
 }

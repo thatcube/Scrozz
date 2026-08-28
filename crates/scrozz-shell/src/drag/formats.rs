@@ -30,34 +30,45 @@
 //! cannot be portable — an owned `STGMEDIUM` that releases itself — and gets
 //! the matching and the replacement semantics already tested.
 
+use std::sync::Arc;
+
 /// The parts of a `FORMATETC` that decide whether an entry answers a request.
 ///
-/// # What is deliberately not here
+/// # The target device is part of the identity
 ///
-/// `FORMATETC` also carries `ptd`, a `DVTARGETDEVICE*` describing a specific
-/// rendering device. It exists so a document can be asked for "this content, as
-/// it would print on *that* printer", and it is not meaningful for a dragged
-/// screenshot: there is one rendering, and it is the file. Every reference
-/// implementation of a shell data object matches device-independently, and so
-/// does this. A caller that passes a target device gets the same bytes it would
-/// have got with a null one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// `FORMATETC` carries `ptd`, a `DVTARGETDEVICE*` describing a specific
+/// rendering device, so a document can be asked for "this content, as it would
+/// print on *that* printer". It is tempting to drop it — a dragged screenshot
+/// has exactly one rendering — but dropping it from the *key* is a different
+/// claim from ignoring it in the *answer*, and a much worse one: two entries
+/// stored under formats that differ only by device would collide, the second
+/// silently overwriting the first, and a request naming a device would be
+/// handed whichever survived.
+///
+/// So the device is held here as its raw bytes and compared byte for byte,
+/// which is what every reference implementation does. `None` is a null `ptd`,
+/// and a null `ptd` is a distinct key from any device — not a wildcard.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FormatKey {
     /// The clipboard format id — `CF_HDROP`, or whatever `RegisterClipboardFormatW` returned.
     pub format: u16,
     /// `DVASPECT_*`: which view of the data. Almost always `DVASPECT_CONTENT`.
     pub aspect: u32,
     /// Which page of a multi-page format, or `-1` for the whole thing.
+    ///
+    /// Meaningless for two of the four aspects — see [`Self::answers`].
     pub index: i32,
-    /// A *set* of `TYMED_*` bits, not a single one. See [`Self::answers`].
+    /// A *set* of `TYMED_*` bits in a request; a single one in a stored key.
     pub tymed: u32,
+    /// The `DVTARGETDEVICE` blob, verbatim, or `None` for a null `ptd`.
+    pub device: Option<Arc<[u8]>>,
 }
 
 impl FormatKey {
     /// A key for one storage medium of one format, in its ordinary aspect.
     ///
     /// The shape every flavour this crate offers itself takes: whole content,
-    /// no paging.
+    /// no paging, no target device.
     #[must_use]
     pub const fn content(format: u16, tymed: u32) -> Self {
         Self {
@@ -65,29 +76,52 @@ impl FormatKey {
             aspect: DVASPECT_CONTENT,
             index: -1,
             tymed,
+            device: None,
         }
     }
 
     /// Whether an entry stored under this key may answer `request`.
     ///
-    /// Format, aspect and index must be *equal*; the medium need only
-    /// *intersect*. That asymmetry is the whole subtlety of `FORMATETC` and it
-    /// is not arbitrary: `tymed` is a bitmask of the media the caller is
-    /// willing to accept, so a caller asking for `TYMED_HGLOBAL | TYMED_ISTREAM`
-    /// is saying "either will do", and an entry that can supply one of them
-    /// answers. `dwAspect` and `lindex` are single values naming *which data* is
-    /// wanted, and a mismatch there means a different thing was asked for, not
-    /// a different way of carrying the same thing.
+    /// Format, aspect and device must be *equal*; the medium need only
+    /// *intersect*; the index is compared only for the aspects it means
+    /// anything for. The asymmetry is the whole subtlety of `FORMATETC` and
+    /// none of it is arbitrary.
     ///
-    /// Being lenient about aspect or index would return the wrong data rather
-    /// than an error, which is the failure that is hard to notice.
+    /// `tymed` is a bitmask of the media the caller will accept, so a caller
+    /// asking for `TYMED_HGLOBAL | TYMED_ISTREAM` is saying "either will do",
+    /// and an entry supplying one of them answers.
+    ///
+    /// `lindex` is not always significant. The documentation is explicit:
+    ///
+    /// > For the aspects DVASPECT_THUMBNAIL and DVASPECT_ICON, lindex is
+    /// > ignored.
+    ///
+    /// Comparing it anyway is a real bug rather than harmless strictness: a
+    /// caller asking for an icon with `lindex` left at `0` would be told the
+    /// format does not exist, because the icon was stored with the `-1` that
+    /// means "all of it". For `DVASPECT_CONTENT` and `DVASPECT_DOCPRINT` the
+    /// index *is* significant — `CFSTR_FILECONTENTS` uses it as the zero-based
+    /// index of the file wanted — so it is compared there.
+    ///
+    /// Being lenient about aspect, device or a significant index would return
+    /// the wrong data rather than an error, which is the failure that is hard
+    /// to notice.
     #[must_use]
-    pub const fn answers(&self, request: &Self) -> bool {
+    pub fn answers(&self, request: &Self) -> bool {
         self.format == request.format
             && self.aspect == request.aspect
-            && self.index == request.index
+            && self.device == request.device
+            && (aspect_ignores_index(self.aspect) || self.index == request.index)
             && self.tymed & request.tymed != 0
     }
+}
+
+/// Whether `lindex` carries no meaning for this aspect.
+///
+/// See the quotation in [`FormatKey::answers`].
+#[must_use]
+pub const fn aspect_ignores_index(aspect: u32) -> bool {
+    aspect == DVASPECT_THUMBNAIL || aspect == DVASPECT_ICON
 }
 
 /// `DVASPECT_CONTENT`, spelled out so this module needs no Windows import.
@@ -95,8 +129,107 @@ impl FormatKey {
 /// Asserted against the real constant in the Windows backend's tests.
 pub const DVASPECT_CONTENT: u32 = 1;
 
+/// `DVASPECT_THUMBNAIL`, likewise.
+pub const DVASPECT_THUMBNAIL: u32 = 2;
+
+/// `DVASPECT_ICON`, likewise.
+pub const DVASPECT_ICON: u32 = 4;
+
+/// `DVASPECT_DOCPRINT`, likewise.
+pub const DVASPECT_DOCPRINT: u32 = 8;
+
 /// `TYMED_HGLOBAL`, likewise.
 pub const TYMED_HGLOBAL: u32 = 1;
+
+/// Every documented medium, or'd together.
+///
+/// `TYMED_NULL` is absent because it is zero: the absence of a medium rather
+/// than one of them.
+pub const TYMED_ANY: u32 = 1 | 2 | 4 | 8 | 16 | 32 | 64;
+
+/// Whether `tymed` names exactly one documented medium.
+///
+/// A stored medium is one thing. `ReleaseStgMedium` frees it by switching on
+/// this field to choose both which arm of the union is live and which of seven
+/// quite different release actions to take, so a medium naming two media at
+/// once cannot be freed correctly by anybody, and one naming none of them
+/// cannot be freed at all.
+#[must_use]
+pub const fn is_single_medium(tymed: u32) -> bool {
+    tymed & TYMED_ANY == tymed && tymed.count_ones() == 1
+}
+
+/// The `tymed` an entry should be keyed by, or `None` if it must be refused.
+///
+/// `offered` is a `FORMATETC::tymed`: a *set*, the media the caller is willing
+/// to use. `actual` is a `STGMEDIUM::tymed`: the one thing the medium in hand
+/// really is. Keying an entry by the set would make it claim media it cannot
+/// supply, so that a query promising a stream is answered by a global handle —
+/// a type confusion the receiver has no way to detect before it dereferences.
+///
+/// So the answer is `actual`, and only when `actual` names a single documented
+/// medium that the format offered.
+///
+/// A medium of `TYMED_NULL` is the one exception. It names nothing, so there is
+/// nothing to disagree with, and it is kept as given under a `tymed` of zero —
+/// which, since a request must name at least one medium to be satisfiable, then
+/// answers nothing.
+#[must_use]
+pub const fn stored_medium(offered: u32, actual: u32) -> Option<u32> {
+    if actual == 0 {
+        return Some(0);
+    }
+    if !is_single_medium(actual) || offered & actual == 0 {
+        return None;
+    }
+    Some(actual)
+}
+
+/// The fixed part of a `DVTARGETDEVICE`: one `u32` and four `u16`s.
+pub const TARGET_DEVICE_HEADER: usize = 12;
+
+/// The largest target device this code will copy, as a sanity bound.
+///
+/// A `DVTARGETDEVICE` is a printer driver's `DEVMODE` plus three names. Real
+/// ones are a few kilobytes. The bound exists so a malformed `tdSize` asks for
+/// a refusal rather than a 4 GiB allocation.
+pub const TARGET_DEVICE_MAX: usize = 16 << 20;
+
+/// Validates a `DVTARGETDEVICE` header and returns the whole structure's size.
+///
+/// `header` must be the first [`TARGET_DEVICE_HEADER`] bytes, little-endian, as
+/// they appear in memory. The returned size counts those bytes, so a caller
+/// copies exactly that many from the start of the structure.
+///
+/// This exists because `ptd` arrives as a bare pointer from another process's
+/// idea of what a device is, and the length used to copy it comes from inside
+/// the very structure being copied. Reading `tdSize` and trusting it is how a
+/// buffer overrun happens; every field it could be is checked first.
+///
+/// The four offsets are checked to be within the structure. They do not affect
+/// the copy, which is byte-for-byte, but an offset pointing outside is proof
+/// the blob is malformed and worth refusing before it is passed on.
+#[must_use]
+pub fn target_device_size(header: &[u8]) -> Option<usize> {
+    let header: &[u8; TARGET_DEVICE_HEADER] =
+        header.get(..TARGET_DEVICE_HEADER)?.try_into().ok()?;
+
+    let field = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]) as usize;
+    let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+
+    if !(TARGET_DEVICE_HEADER..=TARGET_DEVICE_MAX).contains(&size) {
+        return None;
+    }
+    // Offset zero is the documented "this name is absent"; anything else must
+    // land inside the blob, past the header it would otherwise overlap.
+    for at in [4, 6, 8, 10] {
+        let offset = field(at);
+        if offset != 0 && !(TARGET_DEVICE_HEADER..=size).contains(&offset) {
+            return None;
+        }
+    }
+    Some(size)
+}
 
 /// An ordered, replace-on-set collection of `(key, value)` entries.
 ///
@@ -173,12 +306,12 @@ impl<T> FormatStore<T> {
         self.entries
             .iter()
             .find(|(key, _)| key.answers(request))
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key.clone())
     }
 
     /// Every key, in insertion order.
     pub fn keys(&self) -> impl Iterator<Item = FormatKey> + '_ {
-        self.entries.iter().map(|(key, _)| *key)
+        self.entries.iter().map(|(key, _)| key.clone())
     }
 
     /// How many entries are held.
@@ -212,8 +345,6 @@ mod tests {
 
     /// `TYMED_ISTREAM`, for the intersection tests.
     const TYMED_ISTREAM: u32 = 4;
-    /// `DVASPECT_THUMBNAIL`.
-    const DVASPECT_THUMBNAIL: u32 = 2;
 
     /// A value that reports its own destruction.
     ///
@@ -464,5 +595,255 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
         assert_eq!(store.keys().count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The index is only part of the question for two of the four aspects
+    // -----------------------------------------------------------------------
+
+    /// A key in `aspect`, at `index`, on global memory.
+    fn aspected(aspect: u32, index: i32) -> FormatKey {
+        FormatKey {
+            format: 42,
+            aspect,
+            index,
+            tymed: TYMED_HGLOBAL,
+            device: None,
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_ignores_the_index_it_was_asked_for() {
+        // "For the aspects DVASPECT_THUMBNAIL and DVASPECT_ICON, lindex is
+        // ignored." A caller leaving it at zero must still find the thumbnail
+        // stored under the -1 that means "all of it".
+        let stored = aspected(DVASPECT_THUMBNAIL, -1);
+
+        assert!(stored.answers(&aspected(DVASPECT_THUMBNAIL, 0)));
+        assert!(stored.answers(&aspected(DVASPECT_THUMBNAIL, 7)));
+    }
+
+    #[test]
+    fn an_icon_ignores_the_index_it_was_asked_for() {
+        let stored = aspected(DVASPECT_ICON, -1);
+
+        assert!(stored.answers(&aspected(DVASPECT_ICON, 0)));
+    }
+
+    #[test]
+    fn content_still_cares_which_page_was_asked_for() {
+        // The other half of the rule, and the reason this is not just
+        // "ignore lindex": CFSTR_FILECONTENTS indexes the file wanted, so
+        // being lenient here would hand back the wrong file.
+        let stored = aspected(DVASPECT_CONTENT, 0);
+
+        assert!(stored.answers(&aspected(DVASPECT_CONTENT, 0)));
+        assert!(!stored.answers(&aspected(DVASPECT_CONTENT, 1)));
+    }
+
+    #[test]
+    fn a_print_rendering_still_cares_which_page_was_asked_for() {
+        let stored = aspected(DVASPECT_DOCPRINT, 2);
+
+        assert!(!stored.answers(&aspected(DVASPECT_DOCPRINT, 3)));
+    }
+
+    #[test]
+    fn ignoring_the_index_does_not_leak_across_aspects() {
+        // The lenience is per-aspect, not global: a thumbnail must not answer
+        // a request for content just because indices stopped mattering.
+        let thumbnail = aspected(DVASPECT_THUMBNAIL, -1);
+
+        assert!(!thumbnail.answers(&aspected(DVASPECT_CONTENT, -1)));
+    }
+
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // A stored medium is one thing, not a set of possibilities
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_medium_is_kept_under_what_it_is_not_what_was_offered() {
+        // "Global memory or a stream, either will do" is answered by whichever
+        // one actually arrived, and the entry may only promise that one.
+        assert_eq!(stored_medium(1 | 4, 1), Some(1));
+        assert_eq!(stored_medium(1 | 4, 4), Some(4));
+    }
+
+    #[test]
+    fn a_medium_the_format_never_offered_is_refused() {
+        assert_eq!(stored_medium(1, 4), None);
+        assert_eq!(stored_medium(0, 1), None);
+    }
+
+    #[test]
+    fn a_medium_claiming_two_kinds_at_once_is_refused() {
+        // Release picks one arm of the union; a medium that is both a handle
+        // and a stream cannot be freed correctly by anyone.
+        assert_eq!(stored_medium(u32::MAX, 1 | 4), None);
+        assert_eq!(stored_medium(u32::MAX, TYMED_ANY), None);
+    }
+
+    #[test]
+    fn a_medium_naming_something_undocumented_is_refused() {
+        // A bit outside the seven has no release action, so nothing could free
+        // it even if it were stored.
+        assert_eq!(stored_medium(u32::MAX, 128), None);
+        assert_eq!(stored_medium(u32::MAX, 1 << 31), None);
+    }
+
+    #[test]
+    fn each_documented_medium_is_a_single_medium() {
+        for tymed in [1, 2, 4, 8, 16, 32, 64] {
+            assert!(is_single_medium(tymed), "TYMED {tymed} is one of the seven");
+            assert_eq!(stored_medium(u32::MAX, tymed), Some(tymed));
+        }
+        assert!(
+            !is_single_medium(0),
+            "TYMED_NULL is the absence of a medium"
+        );
+    }
+
+    #[test]
+    fn an_absent_medium_is_kept_but_answers_nothing() {
+        // Storing it preserves whatever a caller meant by it; keying it under
+        // zero means no request, which must name a medium, can ever match.
+        assert_eq!(stored_medium(1, 0), Some(0));
+        let mut store = FormatStore::new();
+        store.set(FormatKey::content(9, 0), "nothing");
+        assert_eq!(store.get(&FormatKey::content(9, u32::MAX)), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The target device is part of the identity
+    // -----------------------------------------------------------------------
+
+    /// A key for `format` on global memory, rendered for `device`.
+    fn for_device(format: u16, device: Option<&[u8]>) -> FormatKey {
+        FormatKey {
+            device: device.map(Arc::from),
+            ..FormatKey::content(format, TYMED_HGLOBAL)
+        }
+    }
+
+    #[test]
+    fn two_devices_are_two_entries_not_one_overwritten() {
+        // The bug this pins: with the device dropped from the key, the second
+        // store would displace the first and both requests would get the
+        // laser printer's rendering.
+        let mut store = FormatStore::new();
+
+        assert!(
+            store
+                .set(for_device(9, Some(b"inkjet")), "inkjet")
+                .is_none()
+        );
+        assert!(store.set(for_device(9, Some(b"laser")), "laser").is_none());
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get(&for_device(9, Some(b"inkjet"))), Some(&"inkjet"));
+        assert_eq!(store.get(&for_device(9, Some(b"laser"))), Some(&"laser"));
+    }
+
+    #[test]
+    fn a_device_specific_entry_does_not_answer_a_device_independent_request() {
+        // A null ptd is its own key, not a wildcard: a caller that did not name
+        // a device must not be handed one printer's idea of the data.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, Some(b"inkjet")), "inkjet");
+
+        assert_eq!(store.get(&for_device(9, None)), None);
+    }
+
+    #[test]
+    fn a_device_independent_entry_does_not_answer_a_device_specific_request() {
+        let mut store = FormatStore::new();
+        store.set(for_device(9, None), "any");
+
+        assert_eq!(store.get(&for_device(9, Some(b"inkjet"))), None);
+    }
+
+    #[test]
+    fn the_same_device_by_value_is_the_same_key() {
+        // Equality is over the bytes, not the pointer — the blob is copied out
+        // of the caller's memory, so two equal devices arrive at different
+        // addresses and must still collide.
+        let mut store = FormatStore::new();
+        store.set(for_device(9, Some(b"inkjet")), "first");
+
+        let displaced = store.set(for_device(9, Some(b"inkjet")), "second");
+
+        assert_eq!(displaced, Some("first"));
+        assert_eq!(store.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Trusting a length that lives inside the buffer it measures
+    // -----------------------------------------------------------------------
+
+    /// A `DVTARGETDEVICE` header: `tdSize` then the four name offsets.
+    fn device_header(size: u32, offsets: [u16; 4]) -> Vec<u8> {
+        let mut header = size.to_le_bytes().to_vec();
+        for offset in offsets {
+            header.extend_from_slice(&offset.to_le_bytes());
+        }
+        header
+    }
+
+    #[test]
+    fn an_ordinary_target_device_measures_itself() {
+        let header = device_header(64, [12, 20, 28, 36]);
+
+        assert_eq!(target_device_size(&header), Some(64));
+    }
+
+    #[test]
+    fn a_device_with_no_names_is_still_a_device() {
+        // Zero is the documented "absent", not an out-of-range offset.
+        let header = device_header(TARGET_DEVICE_HEADER as u32, [0, 0, 0, 0]);
+
+        assert_eq!(
+            target_device_size(&header),
+            Some(TARGET_DEVICE_HEADER),
+            "a header and nothing else is a legitimate, if empty, device"
+        );
+    }
+
+    #[test]
+    fn a_device_smaller_than_its_own_header_is_refused() {
+        let header = device_header(8, [0, 0, 0, 0]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_device_claiming_four_gigabytes_is_refused() {
+        // The whole point of the check: `tdSize` is attacker-controlled and is
+        // the length used to copy the very structure it lives in.
+        let header = device_header(u32::MAX, [0, 0, 0, 0]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_name_pointing_past_the_end_is_refused() {
+        let header = device_header(64, [12, 20, 28, 65]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_name_pointing_into_the_header_is_refused() {
+        let header = device_header(64, [11, 0, 0, 0]);
+
+        assert_eq!(target_device_size(&header), None);
+    }
+
+    #[test]
+    fn a_truncated_header_is_refused_rather_than_read_past() {
+        let header = device_header(64, [12, 20, 28, 36]);
+
+        assert_eq!(target_device_size(&header[..11]), None);
+        assert_eq!(target_device_size(&[]), None);
     }
 }
