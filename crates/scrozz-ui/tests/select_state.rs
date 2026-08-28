@@ -360,7 +360,7 @@ fn shift_axis_lock_is_live_and_reversible_mid_drag() {
         ))
     );
 
-    state.pointer_moved(LogicalPoint::new(160.0, 140.0));
+    state.pointer_moved(LogicalPoint::new(160.0, 90.0));
     assert_eq!(
         state.region(),
         Some(LogicalRect::new(
@@ -374,7 +374,28 @@ fn shift_axis_lock_is_live_and_reversible_mid_drag() {
         state.region(),
         Some(LogicalRect::new(
             LogicalPoint::new(20.0, 20.0),
-            LogicalSize::new(140.0, 120.0)
+            LogicalSize::new(140.0, 70.0)
+        ))
+    );
+}
+
+#[test]
+fn shift_locks_vertically_when_vertical_motion_comes_first() {
+    let mut state = state(SelectionOptions::region());
+    state.pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    state.pointer_moved(LogicalPoint::new(120.0, 80.0));
+
+    state.set_drag_modifiers(DragModifiers {
+        shift: true,
+        ..DragModifiers::default()
+    });
+    state.pointer_moved(LogicalPoint::new(130.0, 140.0));
+
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(20.0, 20.0),
+            LogicalSize::new(100.0, 120.0)
         ))
     );
 }

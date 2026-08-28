@@ -498,6 +498,36 @@ pub fn icon_button(
     response
 }
 
+/// A flat neutral icon button used over capture thumbnails.
+#[allow(clippy::too_many_arguments)]
+pub fn card_icon_button(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: Id,
+    icon: Icon,
+    label: &str,
+    reveal: Reveal,
+) -> Response {
+    let state = ControlState::new();
+    let response = ui.interact(rect, id, sense_for(state));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+
+    let pointer = pointer_state(surface, &response, state, reveal);
+    let rect = scaled_control_rect(rect.translate(reveal.offset), pointer);
+    let painter = ui.painter();
+    let opacity = reveal.opacity;
+    paint_card_control_frame(painter, rect, Radius::BUTTON, pointer, opacity);
+    surface.icons.draw(
+        painter,
+        icon,
+        rect.center(),
+        crate::icons::SIZE,
+        fade(card_control_foreground(), opacity),
+    );
+    response
+}
+
 /// A labelled pill button — the primary affordance in revealed card chrome.
 ///
 /// `accent` picks the filled treatment. There is exactly one accent pill in any
@@ -636,6 +666,97 @@ pub fn pill_button_with_state(
         fg,
     );
     response
+}
+
+/// A flat neutral labelled button used for equally weighted card actions.
+#[allow(clippy::too_many_arguments)]
+pub fn card_pill_button(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: Id,
+    icon: Icon,
+    label: &str,
+    reveal: Reveal,
+) -> Response {
+    let state = ControlState::new();
+    let response = ui.interact(rect, id, sense_for(state));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+
+    let pointer = pointer_state(surface, &response, state, reveal);
+    let rect = scaled_control_rect(rect.translate(reveal.offset), pointer);
+    let radius = Radius::pill(rect.height());
+    let painter = ui.painter();
+    let opacity = reveal.opacity;
+    paint_card_control_frame(painter, rect, radius, pointer, opacity);
+
+    let foreground = fade(card_control_foreground(), opacity);
+    let galley = painter.layout_no_wrap(label.to_owned(), surface.font(Text::Button), foreground);
+    let icon_width = 15.0;
+    let total = icon_width + Space::SM - 2.0 + galley.size().x;
+    let x = rect.center().x - total / 2.0;
+    surface.icons.draw(
+        painter,
+        icon,
+        pos2(x + icon_width / 2.0, rect.center().y),
+        icon_width,
+        foreground,
+    );
+    painter.galley(
+        pos2(
+            x + icon_width + Space::SM - 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        foreground,
+    );
+    response
+}
+
+fn scaled_control_rect(rect: Rect, pointer: Pointer) -> Rect {
+    let scale = if pointer.pressed {
+        0.98
+    } else if pointer.hovered {
+        1.03
+    } else {
+        1.0
+    };
+    Rect::from_center_size(rect.center(), rect.size() * scale)
+}
+
+fn paint_card_control_frame(
+    painter: &egui::Painter,
+    rect: Rect,
+    radius: f32,
+    pointer: Pointer,
+    opacity: f32,
+) {
+    let fill = if pointer.pressed {
+        Color32::from_rgb(0xE7, 0xE7, 0xE5)
+    } else if pointer.hovered {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(0xF5, 0xF5, 0xF3)
+    };
+    if pointer.focused {
+        painter.rect_stroke(
+            rect.expand(3.0),
+            corner(radius + 3.0),
+            Stroke::new(2.0, fade(Color32::WHITE, opacity)),
+            StrokeKind::Inside,
+        );
+    }
+    painter.rect_filled(rect, corner(radius), fade(fill, opacity));
+    painter.rect_stroke(
+        rect,
+        corner(radius),
+        Stroke::new(1.0, fade(Color32::from_black_alpha(34), opacity)),
+        StrokeKind::Inside,
+    );
+}
+
+const fn card_control_foreground() -> Color32 {
+    Color32::from_rgb(0x14, 0x14, 0x13)
 }
 
 /// A colour swatch, for the annotation palette.
@@ -1178,6 +1299,36 @@ pub fn dashed_path(painter: &egui::Painter, pts: &[Pos2], stroke: Stroke, dash: 
         while t < len {
             painter.line_segment([a + dir * t, a + dir * (t + dash).min(len)], stroke);
             t += step;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn card_controls_use_exact_hover_and_press_scales() {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 30.0));
+            let hovered = scaled_control_rect(
+                rect,
+                Pointer {
+                    hovered: true,
+                    ..Pointer::default()
+                },
+            );
+            let pressed = scaled_control_rect(
+                rect,
+                Pointer {
+                    hovered: true,
+                    pressed: true,
+                    ..Pointer::default()
+                },
+            );
+
+            assert_eq!(hovered.size(), rect.size() * 1.03);
+            assert_eq!(pressed.size(), rect.size() * 0.98);
+            assert_eq!(hovered.center(), rect.center());
+            assert_eq!(pressed.center(), rect.center());
         }
     }
 }

@@ -298,16 +298,17 @@ more intuitive than copying to clipboard."*
 
 **Chrome model — at rest the capture is the only interface.** A card at rest
 shows the image and nothing else: no icons, no buttons, no handle. **On hover** a
-scrim fades in with **Copy above Save in a vertical pair of prominent pill
-buttons** plus four small secondary icons at the corners (pin, close, annotate,
-upload). Close follows the host convention: top-left on macOS and top-right on
-Windows and Linux.
+scrim fades in with **Copy above Save as equal-priority secondary buttons** plus
+four smaller corner buttons using the same flat neutral fill (pin, close,
+annotate, upload). Card controls never use the product accent. Close follows the
+host convention: top-left on macOS and top-right on Windows and Linux. Every
+button scales to 1.03× on hover and 0.98× while pressed.
 
 This resolves cleanly against drag-first rather than conflicting with it: **the
 card itself is the drag handle**, so the hero interaction needs no chrome at all.
 Grabbability is communicated through cursor change and a subtle lift on press,
-never a visible handle. Copy and Save are the primary *buttons*; drag is the
-primary *gesture*; they occupy different channels and do not compete.
+never a visible handle. Copy and Save are equally weighted secondary actions;
+drag is the primary gesture.
 
 ---
 
@@ -594,7 +595,8 @@ written to disk can still be dropped into another application.
    spring back on cancel.
 5. **Dock collapse and expand** (D20).
 
-**Button press animation is explicitly optional** and lowest priority.
+**Button feedback is immediate:** every card button scales to 1.03× on hover and
+0.98× while pressed, without easing.
 
 **The mental model is phone notifications:** discrete cards that accumulate, get
 swiped away individually, and can be collapsed out of the way.
@@ -1105,10 +1107,11 @@ drags may span displays.
 Drag modifiers are live and reversible:
 
 1. **Space** moves the current rectangle without resizing it.
-2. **Shift** locks creation or Space-driven movement to the dominant horizontal
-   or vertical axis only while held. Engaging it during creation preserves the
-   rectangle's current orthogonal dimension; it never collapses that dimension
-   into a one-pixel strip.
+2. **Shift** locks creation to the first axis the pointer follows after Shift is
+   engaged. Horizontal motion freezes the current height; vertical motion freezes
+   the current width. The lock remains perfectly horizontal or vertical while
+   held and never collapses the other dimension into a one-pixel strip. With
+   Space held, Shift likewise constrains translation to one axis.
 3. **Option** on macOS and **Alt** elsewhere grows the selection symmetrically
    from its starting point. It has no effect while Space is held.
 

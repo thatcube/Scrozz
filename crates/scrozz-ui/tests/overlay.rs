@@ -223,6 +223,24 @@ fn hover_changes_the_card() {
 }
 
 #[test]
+fn card_actions_share_one_flat_neutral_treatment() {
+    let hover = render(CardScene::hovered(Provenance::Display));
+    let copy_fill = hover.pixel(px(90.0), px(80.0));
+    let corner_fill = hover.pixel(px(45.0), px(45.0));
+
+    assert_eq!(
+        copy_fill, corner_fill,
+        "large and corner actions must use the same background"
+    );
+    assert!(
+        copy_fill[0] > 220
+            && copy_fill[0].abs_diff(copy_fill[1]) <= 2
+            && copy_fill[1].abs_diff(copy_fill[2]) <= 2,
+        "card controls should be flat neutral white, got {copy_fill:?}"
+    );
+}
+
+#[test]
 fn the_probe_points_are_inside_the_rendered_image() {
     // Every D9 assertion below reads a specific pixel. If the render were
     // smaller than the coordinates being probed, `Image::pixel` would hand back

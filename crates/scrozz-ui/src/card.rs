@@ -7,10 +7,10 @@
 //! # What a card is made of
 //!
 //! At rest a card is only the capture (D12). On hover a scrim fades in carrying
-//! a vertical pair of prominent pills — **Copy** and **Save**, the two things
-//! people actually do with a screenshot — and four quiet corner icons for pin,
-//! close, annotate and upload (D21). The card body *is* the drag handle; there
-//! is no separate grab affordance.
+//! a vertical pair of equally weighted neutral pills — **Copy** and **Save** —
+//! and four smaller corner buttons with the same treatment for pin, close,
+//! annotate and upload (D21). The card body *is* the drag handle; there is no
+//! separate grab affordance.
 //!
 //! # Motion applies to the card, not to its buttons
 //!
@@ -33,7 +33,7 @@ use scrozz_core::Provenance;
 
 use crate::icons::Icon;
 use crate::motion::fade;
-use crate::paint::{self, ControlState, Reveal, Surface};
+use crate::paint::{self, Reveal, Surface};
 use crate::stack::{CardFrame, CardId, MAX_LEAN};
 use crate::theme::{Radius, Space, corner};
 
@@ -193,9 +193,9 @@ impl<'a> CardContent<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CardAction {
-    /// Copy the capture to the clipboard. Primary (D21).
+    /// Copy the capture to the clipboard.
     Copy,
-    /// Save the capture to disk. Primary (D21).
+    /// Save the capture to disk.
     Save,
     /// Open the annotation editor.
     Annotate,
@@ -423,7 +423,7 @@ fn draw_capture(
     }
 }
 
-/// The hover chrome: a scrim, two primary pills, four quiet corner icons.
+/// The hover chrome: a scrim, two equal neutral pills, four matching corner buttons.
 ///
 /// Returns the action pressed this frame. The controls themselves are drawn by
 /// [`paint`], which contains no animation — the fade lives entirely in the
@@ -461,14 +461,13 @@ fn draw_chrome(
     if inner.width() < COMPACT_CHROME_W || inner.height() < COMPACT_CHROME_H {
         let rects = compact_primary_rects(inner)?;
         for (rect, action) in rects.into_iter().zip([CardAction::Copy, CardAction::Save]) {
-            let response = paint::icon_button(
+            let response = paint::card_icon_button(
                 ui,
                 surface,
                 rect,
                 control_id(frame.id, action),
                 action.icon(),
                 action.label(),
-                ControlState::new(),
                 lift,
             );
             if response.clicked() {
@@ -478,19 +477,18 @@ fn draw_chrome(
         return pressed;
     }
 
-    // Primary: Copy above Save in one centred action spine.
+    // Copy and Save share one equal-priority treatment.
     for (r, action) in primary_pill_rects(inner)?
         .into_iter()
         .zip([CardAction::Copy, CardAction::Save])
     {
-        let resp = paint::pill_button(
+        let resp = paint::card_pill_button(
             ui,
             surface,
             r,
             control_id(frame.id, action),
             action.icon(),
             action.label(),
-            action == CardAction::Copy,
             lift,
         );
         if resp.clicked() {
@@ -498,8 +496,8 @@ fn draw_chrome(
         }
     }
 
-    // Secondary: four corners. Close follows native window convention: left on
-    // macOS, right on Windows and Linux.
+    // Smaller matching controls occupy the corners. Close follows native window
+    // convention: left on macOS, right on Windows and Linux.
     let size = vec2(ICON_BTN, ICON_BTN);
     let corners = corner_actions();
     let origins = [
@@ -510,14 +508,13 @@ fn draw_chrome(
     ];
     for (action, origin) in corners.into_iter().zip(origins) {
         let r = Rect::from_min_size(origin, size);
-        let resp = paint::icon_button(
+        let resp = paint::card_icon_button(
             ui,
             surface,
             r,
             control_id(frame.id, action),
             action.icon(),
             action.label(),
-            ControlState::new(),
             settle,
         );
         if resp.clicked() {

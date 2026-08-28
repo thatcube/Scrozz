@@ -95,8 +95,17 @@ struct SpaceMove {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AxisLock {
-    Horizontal { dy: f64 },
-    Vertical { dx: f64 },
+    Pending {
+        pointer: LogicalPoint,
+        dx: f64,
+        dy: f64,
+    },
+    Horizontal {
+        dy: f64,
+    },
+    Vertical {
+        dx: f64,
+    },
 }
 
 impl SelectionState {
@@ -265,7 +274,7 @@ impl SelectionState {
         }
 
         if !previous.shift && modifiers.shift {
-            self.axis_lock = axis_lock(anchor, pointer);
+            self.axis_lock = pending_axis_lock(anchor, pointer);
         } else if previous.shift && !modifiers.shift {
             self.axis_lock = None;
         }
@@ -468,7 +477,10 @@ impl SelectionState {
                         return;
                     };
                     if self.drag_modifiers.shift && self.axis_lock.is_none() {
-                        self.axis_lock = axis_lock(anchor, point);
+                        self.axis_lock = pending_axis_lock(anchor, point);
+                    }
+                    if self.drag_modifiers.shift {
+                        self.axis_lock = resolve_axis_lock(self.axis_lock, point);
                     }
                     let Some(raw) = dragged_region(
                         bounds,
@@ -1078,6 +1090,7 @@ fn dragged_region(
     let (mut dx, mut dy) = (point.x - anchor.x, point.y - anchor.y);
     if modifiers.shift {
         match axis_lock {
+            Some(AxisLock::Pending { .. }) => {}
             Some(AxisLock::Horizontal { dy: locked }) => dy = locked,
             Some(AxisLock::Vertical { dx: locked }) => dx = locked,
             None => {}
@@ -1119,11 +1132,28 @@ fn dragged_region(
     Some(geom::clamp_rect(bounds, rect))
 }
 
-fn axis_lock(anchor: LogicalPoint, point: LogicalPoint) -> Option<AxisLock> {
+fn pending_axis_lock(anchor: LogicalPoint, point: LogicalPoint) -> Option<AxisLock> {
     let (dx, dy) = (point.x - anchor.x, point.y - anchor.y);
     if dx.abs() <= f64::EPSILON && dy.abs() <= f64::EPSILON {
         None
-    } else if dx.abs() >= dy.abs() {
+    } else {
+        Some(AxisLock::Pending {
+            pointer: point,
+            dx,
+            dy,
+        })
+    }
+}
+
+fn resolve_axis_lock(lock: Option<AxisLock>, point: LogicalPoint) -> Option<AxisLock> {
+    let Some(AxisLock::Pending { pointer, dx, dy }) = lock else {
+        return lock;
+    };
+    let movement_x = point.x - pointer.x;
+    let movement_y = point.y - pointer.y;
+    if movement_x.abs() <= f64::EPSILON && movement_y.abs() <= f64::EPSILON {
+        lock
+    } else if movement_x.abs() >= movement_y.abs() {
         Some(AxisLock::Horizontal { dy })
     } else {
         Some(AxisLock::Vertical { dx })
