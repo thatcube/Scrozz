@@ -1693,15 +1693,20 @@ impl GlobalHotkeys {
         stuck
             .iter()
             .map(|(accelerator, detail)| Rejection {
-                action: self
-                    .bindings
-                    .get(accelerator)
-                    .map(|binding| binding.action.clone())
+                // Whoever held it *before* the change names it. A rollback puts
+                // the old action back on the key, so naming the action the
+                // rejected change wanted to move there would tell the user their
+                // shortcut is stuck on something it will not do when pressed.
+                // Rows that only exist because of the rollback are not in
+                // `previous`, so those fall through to what is configured now.
+                action: previous
+                    .iter()
+                    .find(|(bound, _)| bound == accelerator)
+                    .map(|(_, action)| action.clone())
                     .or_else(|| {
-                        previous
-                            .iter()
-                            .find(|(bound, _)| bound == accelerator)
-                            .map(|(_, action)| action.clone())
+                        self.bindings
+                            .get(accelerator)
+                            .map(|binding| binding.action.clone())
                     })
                     .or_else(|| {
                         resolved
@@ -3088,21 +3093,46 @@ mod tests {
         // Guard against turning every failed edit into a pile of duplicates: a
         // row the OS was already refusing has not changed state, and repeating
         // it would bury the one rejection that is news.
+        //
+        // Getting there needs a row that is configured but *not* working, and
+        // whose re-grab during the rollback fails too — otherwise the rollback
+        // succeeds, nothing is reported either way, and this proves nothing.
         let mut keys = GlobalHotkeys::observable();
         keys.set_command("scrozz");
         keys.apply(&[want(ALSO_FREE, "capture.window")])
             .expect("free to begin with");
+
+        // Set aside for an editor, and taken by somebody else in the meantime.
+        keys.suspend();
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        os.refuse.insert(acc(ALSO_FREE));
+        os.grabbed.borrow_mut().insert(acc(ALSO_FREE));
+        let stranded = keys.resume().expect_err("somebody else has ALSO_FREE now");
+        assert_eq!(
+            stranded.len(),
+            1,
+            "the row that stopped working: {stranded:?}"
+        );
+        assert_eq!(
+            keys.inactive().count(),
+            1,
+            "so it is configured and not in force"
+        );
 
         let Backend::Fake(os) = &mut keys.backend else {
             panic!("an observable manager has a stand-in backend");
         };
         os.refuse.insert(acc(FREE));
 
-        // FREE is contested, so this edit fails and nothing about ALSO_FREE moves.
+        // FREE is contested, so this edit fails. ALSO_FREE cannot be re-grabbed
+        // by the rollback either — but it was already dead, so saying so again
+        // would tell the user something stopped working when nothing did.
         let refused = keys
             .apply(&[
-                want(ALSO_FREE, "capture.window"),
                 want(FREE, "capture.region"),
+                want(ALSO_FREE, "capture.window"),
             ])
             .expect_err("FREE is taken");
         assert_eq!(
@@ -3111,5 +3141,62 @@ mod tests {
             "only the row the user was editing changed state: {refused:?}"
         );
         assert_eq!(refused[0].accelerator, acc(FREE).to_string());
+    }
+
+    #[test]
+    fn a_stuck_release_is_named_by_the_action_the_key_will_actually_fire() {
+        // Moving a shortcut from one action to another, where some *other* row
+        // fails and forces a rollback. The release of the reassigned key can
+        // stick — and the rollback puts the old action back on it, so the key
+        // fires the old action. Naming the rejection after the action the user
+        // was trying to move there told them their shortcut is stuck on
+        // something it will not do.
+        let mut keys = GlobalHotkeys::observable();
+        keys.set_command("scrozz");
+        keys.apply(&[want(FREE, "capture.region")])
+            .expect("free to begin with");
+
+        // Set aside and taken in the meantime, so FREE is configured but not in
+        // force. That is what lets the edit get as far as re-registering it to
+        // the new action before the row after it fails: the reassignment has to
+        // actually happen for the rollback to have something to undo.
+        keys.suspend();
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        os.refuse.insert(acc(FREE));
+        os.grabbed.borrow_mut().insert(acc(FREE));
+        keys.resume().expect_err("somebody else has FREE now");
+
+        let Backend::Fake(os) = &mut keys.backend else {
+            panic!("an observable manager has a stand-in backend");
+        };
+        // They give it back, but it will not come free again once taken, and the
+        // row that follows it in the edit cannot be had at all.
+        os.refuse.remove(&acc(FREE));
+        os.grabbed.borrow_mut().remove(&acc(FREE));
+        os.refuse_release.borrow_mut().insert(acc(FREE));
+        os.refuse.insert(acc(THIRD_FREE));
+
+        let refused = keys
+            .apply(&[
+                want(FREE, "capture.window"),
+                want(THIRD_FREE, "capture.screen"),
+            ])
+            .expect_err("THIRD_FREE is taken");
+
+        let stuck = refused
+            .iter()
+            .find(|rejection| rejection.accelerator == acc(FREE).to_string())
+            .expect("the key that would not come free is reported");
+        assert_eq!(
+            stuck.action, "capture.region",
+            "the rejection names the action the key still belongs to: {refused:?}"
+        );
+        assert_eq!(
+            keys.action_for(&acc(FREE)),
+            Some("capture.region"),
+            "and that is the action pressing it will fire"
+        );
     }
 }

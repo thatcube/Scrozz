@@ -100,12 +100,10 @@ struct Open {
     /// Undo depth at the moment the edit began, counted from the start of the
     /// session so eviction cannot invalidate it.
     depth: usize,
-    /// The stamp of the step immediately below `depth`, or `None` when the edit
-    /// began with nothing to undo.
+    /// The state the document stood at when the edit began.
     ///
-    /// Depth says *where* to roll back to; this says whether that place is
-    /// still the same place. See [`abandon`](History::abandon).
-    parent: Option<Serial>,
+    /// Its stamp is what proves `depth` still points at the same place: see
+    /// [`abandon`](History::abandon).
     present: Step,
     /// The redo branch as it stood before the edit began.
     ///
@@ -221,7 +219,6 @@ impl History {
         self.finish();
         self.open = Some(Open {
             depth: self.evicted + self.past.len(),
-            parent: self.past.last().map(|step| step.serial),
             present: self.present.clone(),
             // Taking it leaves the redo stack empty, which is exactly what the
             // first commit of this edit would have done. If the edit is
@@ -270,11 +267,19 @@ impl History {
     /// to C while leaving X underneath it, and the next undo would produce a
     /// drawing the user never made from a click they took back.
     ///
-    /// So the rollback point also remembers which step it stood on, and refuses
-    /// when that step is no longer the one below it. Checking only the step
-    /// immediately below is enough: replacing anything deeper clears the redo
-    /// branch that held everything above it, so nothing deeper can change
-    /// without this one changing too.
+    /// So the rollback point also remembers the state it began at, and refuses
+    /// unless that exact state is still sitting at `depth` in the chain of
+    /// states leading to where the document now stands — `past` followed by
+    /// `present`, which `push` keeps as one unbroken line.
+    ///
+    /// It is not enough to check the step *below* the rollback point. Undo does
+    /// not destroy the step it moves past; it moves it into `present`, and the
+    /// next `push` puts that very step back where it was, stamp and all. Draw A,
+    /// start a label, undo the label, undo A, then draw B: A's parent is back
+    /// underneath, so a check that looked only downwards was satisfied, and
+    /// abandoning restored A over B and threw B away with no redo. Looking at
+    /// the rollback point itself catches it, because what is standing there now
+    /// is B, not the state the edit began at.
     ///
     /// A `false` is a true no-op: the open edit and everything it is holding
     /// are left exactly as they were, so a caller that gives up on cancelling
@@ -305,7 +310,15 @@ impl History {
             return Ok(false);
         }
         // Right depth, wrong history: somebody built a different past up to it.
-        if self.past[..target].last().map(|step| step.serial) != open.parent {
+        // `past ++ [present]` is the chain of states leading to where the
+        // document stands, so the state this edit began at has to still be
+        // sitting at `target` in that chain.
+        let standing_here = if target < self.past.len() {
+            self.past[target].serial
+        } else {
+            self.present.serial
+        };
+        if standing_here != open.present.serial {
             return Ok(false);
         }
 

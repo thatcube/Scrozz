@@ -2475,3 +2475,183 @@ fn redoing_a_pre_existing_label_that_an_undo_removed_still_shows_it() {
         "a label that was there before this session is still there"
     );
 }
+
+/// Where a rectangle in the document sits, so a test can tell one drawing apart
+/// from another that replaced it.
+fn rect_at(state: &EditorState, index: usize) -> LogicalRect {
+    match &state.document().annotations()[index].annotation {
+        Annotation::Rectangle(rect) => *rect,
+        other => panic!("expected a rectangle, found {other:?}"),
+    }
+}
+
+#[test]
+fn drawing_after_undoing_a_placement_is_not_swallowed_by_escaping_later() {
+    // The sequence that lost work: draw something, place a label, undo the
+    // label, undo the drawing, draw something else, then press Escape. Escape
+    // cancels the label — but the place it wanted to roll back to now holds the
+    // second drawing, and rolling back to it deleted that drawing outright with
+    // nothing left to redo.
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 90.0)); // A
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+
+    state.command(Command::Undo).expect("undo the label");
+    state.command(Command::Undo).expect("undo the rectangle");
+    assert!(state.document().annotations().is_empty());
+
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(150.0, 150.0), at(260.0, 240.0)); // B
+    let b = rect_at(&state, 0);
+
+    state.command(Command::Escape).expect("escape");
+
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "the second drawing is still there"
+    );
+    assert_eq!(rect_at(&state, 0), b, "and it is still the second drawing");
+
+    state.command(Command::Undo).expect("undo B");
+    assert!(state.document().annotations().is_empty());
+    state.command(Command::Redo).expect("redo B");
+    assert_eq!(rect_at(&state, 0), b, "B never stopped being redoable");
+}
+
+#[test]
+fn placing_a_second_label_settles_the_one_left_set_aside() {
+    // Place a label, undo the click, then click somewhere else. Starting the
+    // second placement replaces the first one's rollback point, and the first
+    // one had swallowed the redo stack — so the click that was never taken back
+    // came back as an empty label nobody could see, type into, or escape from.
+    let mut state = state();
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(80.0, 80.0));
+    state.pointer_released();
+    state
+        .command(Command::Undo)
+        .expect("undo the first placement");
+
+    state.pointer_pressed(at(220.0, 200.0));
+    state.pointer_released();
+    state
+        .command(Command::Escape)
+        .expect("leave the second label");
+
+    assert!(
+        state.document().annotations().is_empty(),
+        "both empty labels were cancelled, so the document is untouched"
+    );
+    state.command(Command::Redo).expect("redo");
+    assert!(
+        state.document().annotations().is_empty(),
+        "and neither of them is waiting on the redo stack to come back invisible"
+    );
+
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(at(80.0, 80.0));
+    state.pointer_released();
+    assert_eq!(
+        state.selection(),
+        None,
+        "nothing to click on at the first spot"
+    );
+}
+
+#[test]
+fn escape_still_works_when_a_placement_refuses_to_be_cancelled() {
+    // The history can decline the rollback — the place it points at belongs to
+    // work done since. Declining is right, but Escape has to keep meaning
+    // something: retrying the same refusal forever left the key dead, so the
+    // tool could not be reset and the window could not be closed.
+    let mut state = state();
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 90.0));
+
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(200.0, 200.0));
+    state.pointer_released();
+    state.command(Command::Undo).expect("undo the label");
+    state.command(Command::Undo).expect("undo the rectangle");
+
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(150.0, 150.0), at(260.0, 240.0));
+    let b = rect_at(&state, 0);
+
+    // However many layers of state there are to unwind, Escape has to unwind
+    // them and then close. Before the fix every press was consumed by the
+    // refusal, so the answer was always `None` and the editor could not be left.
+    let mut intents = Vec::new();
+    for _ in 0..4 {
+        intents.push(state.command(Command::Escape).expect("escape"));
+    }
+
+    assert!(
+        intents.contains(&Intent::Close),
+        "Escape never got past the refused cancellation: {intents:?}"
+    );
+    assert_eq!(
+        state.tool(),
+        Tool::Select,
+        "and it reset the tool on the way"
+    );
+    assert_eq!(
+        rect_at(&state, 0),
+        b,
+        "none of those presses cost the user their drawing"
+    );
+    assert_eq!(
+        state.document().annotations().len(),
+        1,
+        "and none of them left a ghost behind either"
+    );
+}
+
+#[test]
+fn finishing_a_label_that_history_removed_does_not_un_create_it() {
+    // A label the user finished, reopened, and then undid away. Undo took it out
+    // of the document, so nothing is being edited — but it is not an abandoned
+    // click either, and treating it as one would delete work the redo stack is
+    // still holding.
+    let mut state = typed("hello");
+    state.command(Command::Escape).expect("finish the label");
+
+    let box_of = state.document().annotations()[0].bounds();
+    state.set_tool(Tool::Select);
+    state.pointer_pressed(at(
+        box_of.origin.x + box_of.size.width / 2.0,
+        box_of.origin.y + box_of.size.height / 2.0,
+    ));
+    state.pointer_released();
+    assert!(state.editing_text().is_some(), "the label reopened");
+
+    state.command(Command::Undo).expect("undo the label away");
+    assert!(
+        state.document().annotations().is_empty(),
+        "the label really did leave the document"
+    );
+    assert_eq!(state.editing_text(), None, "so nothing is being edited");
+
+    assert_eq!(
+        state.command(Command::Escape).expect("escape"),
+        Intent::None,
+        "Escape settles the set-aside label rather than falling through"
+    );
+
+    state.command(Command::Redo).expect("redo");
+    assert_eq!(
+        content(&state),
+        "hello",
+        "the label came back with what the user wrote in it"
+    );
+    assert_eq!(
+        state.editing_text(),
+        None,
+        "and it came back finished, not reopened"
+    );
+}

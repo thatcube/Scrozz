@@ -825,18 +825,23 @@ impl EditorState {
     /// taken back. Forgetting it here instead left the creation on the redo
     /// stack with nothing holding its editing session, so redoing produced an
     /// empty label that could not be seen, typed into, or escaped from.
-    pub fn finish_text(&mut self) {
+    ///
+    /// Returns whether the unfinished label was dealt with. Only one case
+    /// answers `false`: a set-aside label whose placement the history will not
+    /// take back. It stays pending — the alternative is a ghost — so the caller
+    /// must be able to tell that its request went unserved and carry on rather
+    /// than assume the state is now clean.
+    pub fn finish_text(&mut self) -> bool {
         // Deliberately before the `take` below: the set-aside label has no
         // `editing_text` to find, and clearing it first is how it was lost.
         if self.editing_text.is_none()
             && let Some(id) = self.suspended_text
         {
-            self.finish_suspended_text(id);
-            return;
+            return self.finish_suspended_text(id);
         }
         self.suspended_text = None;
         let Some(id) = self.editing_text.take() else {
-            return;
+            return true;
         };
         let fresh = std::mem::take(&mut self.text_is_new);
         // Any composition in flight becomes ordinary text. Dropping it would
@@ -860,7 +865,7 @@ impl EditorState {
                     .expect("the document has not changed provenance mid-edit")
             {
                 self.touch();
-                return;
+                return true;
             }
             self.document.remove(id);
         }
@@ -870,6 +875,7 @@ impl EditorState {
         self.history.seal();
         self.commit();
         self.touch();
+        true
     }
 
     /// Ends an editing session whose annotation an undo took out of the
@@ -885,29 +891,37 @@ impl EditorState {
     /// creation on the redo stack with nobody holding its editing session, which
     /// is the ghost this exists to prevent. Left open, a redo puts the user back
     /// in the label and the next Escape cancels it properly.
-    fn finish_suspended_text(&mut self, id: AnnotationId) {
+    ///
+    /// Returns whether it was dealt with, so a refusal does not read as success.
+    /// A caller that keeps asking the same question and keeps being told nothing
+    /// happened has to be free to do something else — Escape that only ever
+    /// retried a rollback the history had already ruled out could not reset the
+    /// tool or close the editor, and there is no key that undoes being stuck.
+    fn finish_suspended_text(&mut self, id: AnnotationId) -> bool {
         if !self.text_is_new {
             // A label that was already there before this session. It is not this
             // editor's to un-create, and it is visible when it comes back.
             self.suspended_text = None;
             self.preedit = None;
-            return;
+            return true;
         }
-        if self
+        if !self
             .history
             .abandon(&mut self.document)
             .expect("the document has not changed provenance mid-edit")
         {
-            self.suspended_text = None;
-            self.text_is_new = false;
-            self.preedit = None;
-            self.caret = 0;
-            if self.selection == Some(id) {
-                self.selection = None;
-            }
-            self.mark_caret();
-            self.touch();
+            return false;
         }
+        self.suspended_text = None;
+        self.text_is_new = false;
+        self.preedit = None;
+        self.caret = 0;
+        if self.selection == Some(id) {
+            self.selection = None;
+        }
+        self.mark_caret();
+        self.touch();
+        true
     }
 
     /// The current zoom factor.
@@ -1015,7 +1029,11 @@ impl EditorState {
 
     /// Handles a primary-button press at `point`, in document coordinates.
     pub fn pointer_pressed(&mut self, point: LogicalPoint) {
-        if self.editing_text.is_some() {
+        // The set-aside case counts too. Starting a drawing is walking away from
+        // an unfinished label just as surely as clicking elsewhere is, and
+        // leaving its rollback point open means the next thing committed sits
+        // above a group the editor still believes it may cancel.
+        if self.editing_text.is_some() || self.suspended_text.is_some() {
             self.finish_text();
         }
         match self.tool {
@@ -1364,9 +1382,10 @@ impl EditorState {
         // The set-aside case counts as editing: the label is unfinished even
         // though an undo has taken it out of the document, and Escape is how the
         // user says they are done with it.
-        if self.editing_text.is_some() || self.suspended_text.is_some() {
-            self.finish_text();
-        } else if self.is_dragging() {
+        if (self.editing_text.is_some() || self.suspended_text.is_some()) && self.finish_text() {
+            return Intent::None;
+        }
+        if self.is_dragging() {
             self.cancel_drag();
         } else if self.selection.is_some() {
             self.select(None);

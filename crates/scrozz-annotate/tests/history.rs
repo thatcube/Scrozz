@@ -460,3 +460,43 @@ fn an_abandon_still_works_after_navigating_within_the_edit() {
     );
     assert_eq!(doc.len(), before);
 }
+
+#[test]
+fn an_abandon_refuses_after_its_rollback_point_was_undone_past_and_rebuilt() {
+    // The step below the rollback point is a liar. Undoing does not destroy it,
+    // it moves it into the present, and the next commit puts that same step back
+    // where it was — same identity, same stamp. A guard that only looked
+    // downwards saw its parent and agreed, then restored the abandoned work over
+    // the top of whatever had been drawn since and dropped it with no redo.
+    let mut doc = document(200, 200);
+    let mut history = History::new(&doc);
+    step(&mut doc, &mut history, 10.0); // A
+
+    history.begin();
+    step(&mut doc, &mut history, 20.0); // the edit
+    history.undo(&mut doc).unwrap(); // the edit is set aside
+    history.undo(&mut doc).unwrap(); // and so is A: the rollback point is gone
+
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "the rollback point is below where the history now stands"
+    );
+
+    step(&mut doc, &mut history, 30.0); // B, pushed onto A's old place
+    let b = doc.data();
+    assert_eq!(doc.len(), 1);
+
+    assert!(
+        !history.abandon(&mut doc).unwrap(),
+        "A's stamp is back underneath, but what stands at the rollback point is B"
+    );
+    assert_eq!(doc.data(), b, "B is untouched");
+
+    // And B is still the thing the history describes, not a survivor of a
+    // branch that was thrown away.
+    history.undo(&mut doc).unwrap();
+    assert_eq!(doc.len(), 0);
+    history.redo(&mut doc).unwrap();
+    assert_eq!(doc.data(), b, "B is still redoable");
+    assert!(!history.can_redo(), "and nothing else is hiding above it");
+}
