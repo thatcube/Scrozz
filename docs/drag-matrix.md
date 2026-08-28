@@ -225,13 +225,16 @@ of another process's memory, so `target_device_size` validates the header first.
 bound, and each non-zero offset must not merely be in range but leave room for
 something to be there: an offset equal to `tdSize` addresses the byte after the
 structure and points at nothing. A name needs at least its NUL terminator; the
-`tdExtDevmodeOffset` needs at least the forty bytes of an ANSI `DEVMODE` up to
-`dmDriverExtra`, because the `DVTARGETDEVICE` remarks say a consumer sizes the
-device mode as *"the sum of **dmSize** + **dmDriverExtra**"* and so has to be
-able to read both. Forty is the smaller of the ANSI and wide prefixes on
-purpose: the check is there to catch an offset that cannot be a device mode, not
-to guess which build wrote it. A header that could not describe a real device
-earns `DV_E_DVTARGETDEVICE`, not a best-effort copy and not a quiet downgrade to
+`tdExtDevmodeOffset` needs at least the forty bytes it takes to *read the
+lengths* of an ANSI `DEVMODE` — `dmDeviceName[32]`, then `dmSpecVersion`,
+`dmDriverVersion`, `dmSize` and `dmDriverExtra` — because the `DVTARGETDEVICE`
+remarks say a consumer sizes the device mode as *"the sum of **dmSize** +
+**dmDriverExtra**"* and so has to be able to read both. Forty is the smaller of
+the ANSI and wide prefixes on purpose: the check is there to catch an offset
+that cannot be a device mode, not to guess which build wrote it. It is emphatically
+not a claim that a device mode ends at `dmDriverExtra` — the floor for that is
+below, and much higher. A header that could not describe a real device earns
+`DV_E_DVTARGETDEVICE`, not a best-effort copy and not a quiet downgrade to
 "device independent" — that downgrade would collide with the device-free key.
 
 A valid header is not a valid structure, though, and the header check cannot see
@@ -246,6 +249,26 @@ validated, not just its first twelve bytes:
   in the tdData buffer"*;
 - the device mode, if present, must declare a `dmSize` that covers its own
   public members and a `dmSize + dmDriverExtra` that fits inside `tdSize`.
+
+Fitting is not sufficient for the second one, and this is worth being precise
+about because getting it wrong is easy. `dmSize` is documented as the size of
+the structure *"not including any private driver-specific data that might follow
+the structure's public members"*, set to `sizeof (DEVMODE)`. Those public
+members do **not** stop at `dmDriverExtra`: that field sits at offset 38 of an
+ANSI layout whose last member, `dmPanningHeight`, ends at 156. So a blob can
+declare `dmSize` of 40, fit inside its own `tdSize` perfectly honestly, and
+still be read a hundred bytes past its allocation by a consumer that believes
+the `DEVMODEA` it was handed.
+
+The floor is therefore the smallest layout the structure has ever had — the
+original Windows 3.0 `DEVMODE`, ending after `dmDuplex`, at 64 bytes for ANSI
+and 96 for wide. From `dmSize` that is twenty-eight bytes either way, because
+every member between `dmSize` and `dmDuplex` is a fixed width and the two
+character arrays that differ, `dmDeviceName` and `dmFormName`, fall before and
+after that span. `sizeof(DEVMODEA)` is deliberately *not* the floor: the
+structure grew through `dmDisplayFrequency`, then `dmReserved2`, then
+`dmPanningHeight`, and a driver still reporting an older size is reporting a
+valid one. Requiring the newest would refuse structures that are correct.
 
 Two things are deliberately not decided. The reference never states a character
 width for the names — and links `tdExtDevmodeOffset` to the ANSI `DEVMODEA` even

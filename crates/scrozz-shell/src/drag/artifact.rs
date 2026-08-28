@@ -759,6 +759,24 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_makes_the_directory_it_needs() {
+        // A machine that has never run a drag has no artifact root, and the
+        // first thing that wants one is a claim. Nothing else creates it, so a
+        // claim that assumed the parent existed would fail on exactly the
+        // machines that matter — a fresh CI runner, or a user's first drag.
+        let dir = root();
+        let missing = dir.join("never").join("existed");
+        assert!(!missing.exists(), "the point of the test");
+
+        let guard = ScratchFile::claim(missing.join("copy.png")).expect("a claim");
+
+        assert!(guard.path().exists(), "the claim reserved a real file");
+
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_scratch_path_lives_where_the_sweeper_will_look() {
         // The other half of the cleanup story: a delete that fails has to leave
         // the file somewhere something retries. That somewhere is the swept root.

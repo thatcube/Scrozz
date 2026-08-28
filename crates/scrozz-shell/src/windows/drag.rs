@@ -856,6 +856,15 @@ impl IEnumFORMATETC_Impl for FormatEnum_Impl {
     }
 }
 
+/// Which half of a [`CaptureData`] answers a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    /// Put here by `SetData`, owned as a medium.
+    Extras,
+    /// Scrozz's own flavour, rendered from bytes on demand.
+    Offered,
+}
+
 /// What the drop target reads from — and what the shell writes into.
 ///
 /// # Not a read-only bag
@@ -891,15 +900,6 @@ impl IEnumFORMATETC_Impl for FormatEnum_Impl {
 /// registered `"PNG"`, so both halves survive intact.
 ///
 /// [`IDragSourceHelper::InitializeFromBitmap`]: https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-idragsourcehelper-initializefrombitmap
-/// Which half of a [`CaptureData`] answers a request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Source {
-    /// Put here by `SetData`, owned as a medium.
-    Extras,
-    /// Scrozz's own flavour, rendered from bytes on demand.
-    Offered,
-}
-
 #[implement(IDataObject)]
 struct CaptureData {
     /// Scrozz's own flavours: format, and the bytes to render on demand.
@@ -2310,7 +2310,15 @@ mod tests {
     fn a_file_medium_is_copied_rather_than_shared() {
         // Release *deletes the file*, so a copy that shared the path would let
         // the first release take it away from everyone else.
+        // The fixture stands in for a file a caller already owns, so it is
+        // written directly rather than claimed — which means creating the
+        // directory too. `scratch_path` names a file under the swept artifact
+        // root, and on a machine that has never run a drag that root does not
+        // exist yet. `ScratchFile::claim` makes it, but this fixture is written
+        // before any claim happens.
         let original = scratch_path(Path::new("fixture.bin"));
+        std::fs::create_dir_all(original.parent().expect("a named parent"))
+            .expect("the swept root, which a fresh machine has never made");
         std::fs::write(&original, b"contents").expect("write fixture");
 
         let name = task_wide(&wide(&original)).expect("allocate");

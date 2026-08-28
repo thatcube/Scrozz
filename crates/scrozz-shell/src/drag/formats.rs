@@ -275,11 +275,18 @@ pub const TARGET_DEVICE_NAME_MIN: usize = 1;
 
 /// The least a nonzero `tdExtDevmodeOffset` must leave behind it.
 ///
-/// Forty bytes: an ANSI `DEVMODE` up to and including `dmDriverExtra`
-/// (`dmDeviceName[32]`, then `dmSpecVersion`, `dmDriverVersion`, `dmSize` and
-/// `dmDriverExtra`, two bytes each). The wide layout's prefix is longer, at 72,
-/// so the smaller of the two is used: the point is to catch an offset that
-/// cannot possibly be a device mode, not to guess which build wrote it.
+/// Forty bytes, which is what it takes to *read the lengths*: an ANSI
+/// `dmDeviceName[32]`, then `dmSpecVersion`, `dmDriverVersion`, `dmSize` and
+/// `dmDriverExtra` at two bytes each. The wide layout needs 72 for the same
+/// four fields, so the smaller is used — the point is to catch an offset with
+/// no room to hold a device mode's own dimensions, not to guess which build
+/// wrote it.
+///
+/// This is not the floor for the structure being a plausible `DEVMODE`; it is
+/// only enough to find out what it claims to be. Everything past that —
+/// whether the declared `dmSize` describes a layout that ever existed, and
+/// whether `dmSize + dmDriverExtra` lands inside the blob — needs the whole
+/// blob and lives in [`target_device_valid`].
 pub const TARGET_DEVICE_DEVMODE_MIN: usize = 40;
 
 /// Validates a `DVTARGETDEVICE` header and returns the whole structure's size.
@@ -348,6 +355,35 @@ pub fn target_device_size(header: &[u8]) -> Option<usize> {
 /// `DocumentProperties`", and that call has an A and a W form.
 const DEVMODE_SIZE_AT: [usize; 2] = [36, 68];
 
+/// How far past `dmSize` the shortest real `DEVMODE` reaches.
+///
+/// `dmSize` is documented as the size of the structure "not including any
+/// private driver-specific data that might follow the structure's public
+/// members", set to `sizeof (DEVMODE)`. So a reading is only credible if it
+/// names at least as many bytes as some real version of the structure has.
+///
+/// The public members do not stop at `dmDriverExtra` — that field is near the
+/// front, at offset 38 of an ANSI layout whose last member, `dmPanningHeight`,
+/// ends at 156. A floor drawn just past the two length fields therefore admits
+/// a `dmSize` of 40, and a consumer handed that blob and treating it as the
+/// `DEVMODEA` it claims to be reads `dmPelsWidth` at offset 108 — a hundred
+/// bytes past what was allocated.
+///
+/// The floor used instead is the *smallest layout the structure has ever had*:
+/// the original Windows 3.0 `DEVMODE`, which ends after `dmDuplex`. Counting
+/// from `dmSize`: `dmDriverExtra` (2), `dmFields` (4), the sixteen-byte union
+/// through `dmPrintQuality`, then `dmColor` and `dmDuplex` (2 each) — twenty-
+/// eight bytes, putting the end at 64 for ANSI and 96 for wide. The same number
+/// serves both because every member between `dmSize` and `dmDuplex` is a fixed
+/// width; the character arrays that differ, `dmDeviceName` and `dmFormName`,
+/// fall before and after that span.
+///
+/// Deliberately not `sizeof(DEVMODEA)`. Later versions grew the structure —
+/// through `dmDisplayFrequency`, then `dmReserved2`, then `dmPanningHeight` —
+/// and a driver that still reports an older size is reporting a valid one.
+/// Requiring the newest would refuse structures that are correct.
+const DEVMODE_PUBLIC_MIN: usize = 28;
+
 /// Validates the parts of a `DVTARGETDEVICE` that only the whole blob can show.
 ///
 /// [`target_device_size`] sees twelve bytes and can only ask whether the offsets
@@ -382,6 +418,12 @@ const DEVMODE_SIZE_AT: [usize; 2] = [36, 68];
 /// is self-consistent and lands inside the blob. Requiring both would reject
 /// every real device mode, since only one of the two readings is the true one
 /// and the other lands on unrelated bytes.
+///
+/// Fitting is not enough on its own, because `dmSize` describes the structure
+/// and not merely a length: a blob can honestly declare forty bytes and still
+/// be read as a `DEVMODEA` whose members run to 156. So a reading must also
+/// name at least [`DEVMODE_PUBLIC_MIN`] bytes past `dmSize` — the shortest
+/// layout the structure has ever had — before its arithmetic is believed.
 #[must_use]
 pub fn target_device_valid(blob: &[u8]) -> bool {
     let Some(size) = target_device_size(blob) else {
@@ -431,7 +473,7 @@ fn devmode_fits(blob: &[u8], start: usize, at: usize) -> bool {
     let declared = read(size_at);
     let extra = read(size_at + 2);
 
-    if declared < at + 4 {
+    if declared < at + DEVMODE_PUBLIC_MIN {
         return false;
     }
     declared
@@ -1452,5 +1494,75 @@ mod blob_tests {
 
         assert_eq!(target_device_size(&blob), None);
         assert!(!target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_devmode_too_small_to_be_any_real_layout_is_refused() {
+        // The whole blob is fifty-two bytes and the device mode starts at
+        // twelve, leaving forty. Declaring exactly forty is arithmetically
+        // honest — nothing runs past the end — and it still has to be refused,
+        // because no version of `DEVMODE` was ever forty bytes long. A consumer
+        // handed this and told it is a `DEVMODEA` reads `dmPelsWidth` at offset
+        // 108, sixty-eight bytes past the allocation.
+        let blob = device_blob(52, [0, 0, 0, 12], &[], Some((12, 36, 40, 0)));
+
+        assert_eq!(
+            target_device_size(&blob),
+            Some(52),
+            "the header leaves room for the forty bytes it claims"
+        );
+        assert!(
+            !target_device_valid(&blob),
+            "but forty bytes is not a device mode"
+        );
+    }
+
+    #[test]
+    fn the_oldest_ansi_layout_is_still_accepted() {
+        // Sixty-four bytes: the original Windows 3.0 `DEVMODE`, ending after
+        // `dmDuplex`. A driver reporting this is reporting a real size, and
+        // refusing it would mean demanding the newest SDK's 156.
+        let blob = device_blob(128, [0, 0, 0, 12], &[], Some((12, 36, 64, 0)));
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn one_byte_under_the_oldest_ansi_layout_is_refused() {
+        let blob = device_blob(128, [0, 0, 0, 12], &[], Some((12, 36, 63, 0)));
+
+        assert!(!target_device_valid(&blob));
+    }
+
+    #[test]
+    fn the_oldest_wide_layout_is_still_accepted() {
+        // The same structure with a wide `dmDeviceName`: ninety-six bytes, and
+        // `dmSize` thirty-two further along. The span from `dmSize` to
+        // `dmDuplex` is identical, which is why one floor covers both widths.
+        let blob = device_blob(256, [0, 0, 0, 12], &[], Some((12, 68, 96, 0)));
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn one_byte_under_the_oldest_wide_layout_is_refused() {
+        let blob = device_blob(256, [0, 0, 0, 12], &[], Some((12, 68, 95, 0)));
+
+        assert!(!target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_devmode_growing_past_the_oldest_layout_is_accepted_at_every_size() {
+        // The versions the structure actually shipped as: Windows 3.0, then the
+        // display fields, then ICM, then panning. All are valid `dmSize`
+        // readings and none may be refused for being older than the newest.
+        for declared in [64u16, 124, 148, 156] {
+            let blob = device_blob(256, [0, 0, 0, 12], &[], Some((12, 36, declared, 0)));
+
+            assert!(
+                target_device_valid(&blob),
+                "dmSize {declared} is a real historical size"
+            );
+        }
     }
 }
