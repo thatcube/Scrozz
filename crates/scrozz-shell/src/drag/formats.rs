@@ -339,6 +339,107 @@ pub fn target_device_size(header: &[u8]) -> Option<usize> {
     Some(size)
 }
 
+/// The offset of `dmSize` within a `DEVMODE`, for each character width.
+///
+/// `dmDeviceName` is 32 characters, then `dmSpecVersion` and `dmDriverVersion`
+/// at two bytes each. Narrow characters put `dmSize` at 36, wide ones at 68.
+/// Both are listed because `DVTARGETDEVICE` never says which was written: the
+/// field is documented only as "the `DEVMODE` structure retrieved by calling
+/// `DocumentProperties`", and that call has an A and a W form.
+const DEVMODE_SIZE_AT: [usize; 2] = [36, 68];
+
+/// Validates the parts of a `DVTARGETDEVICE` that only the whole blob can show.
+///
+/// [`target_device_size`] sees twelve bytes and can only ask whether the offsets
+/// point *somewhere*. This asks whether what they point at is there, which
+/// matters because the blob does not stop at this process: it is copied into
+/// keys, handed back out of `EnumFormatEtc` as a fresh allocation, and passed to
+/// whatever the receiver does with a target device. An offset that survives the
+/// header check but references nothing turns into a read past the allocation in
+/// somebody else's address space.
+///
+/// Two things are checked, both the weakest form that cannot reject a
+/// conforming structure:
+///
+/// A name offset must reach a terminator inside the blob. The three name fields
+/// are documented as "a NULL-terminated string in the tdData buffer" and the
+/// structure never states a character width, so the scan looks for a single
+/// zero byte. That is right under either reading: a narrow terminator *is* one
+/// zero byte, and a wide terminator contains two, so a byte scan always finds a
+/// valid string's end at or before the real one. It refuses only the case that
+/// is malformed either way — no zero byte anywhere from the offset to the end,
+/// which is exactly the read-past-the-end the check exists for.
+///
+/// The device mode must fit. Its remarks are explicit that a consumer sizes it
+/// as
+///
+/// > the sum of **dmSize** + **dmDriverExtra**
+///
+/// and warn that getting this wrong is how a printer driver "tries to access the
+/// additional bytes and unpredictable results can occur" — the bug being
+/// described from the other side. Since the width is unknown, `dmSize` is read
+/// at both candidate offsets and the structure is accepted if *either* reading
+/// is self-consistent and lands inside the blob. Requiring both would reject
+/// every real device mode, since only one of the two readings is the true one
+/// and the other lands on unrelated bytes.
+#[must_use]
+pub fn target_device_valid(blob: &[u8]) -> bool {
+    let Some(size) = target_device_size(blob) else {
+        return false;
+    };
+    if size != blob.len() {
+        return false;
+    }
+
+    let field = |at: usize| u16::from_le_bytes([blob[at], blob[at + 1]]) as usize;
+
+    for at in [4, 6, 8] {
+        let offset = field(at);
+        if offset != 0 && !blob[offset..].contains(&0) {
+            return false;
+        }
+    }
+
+    let devmode = field(10);
+    if devmode == 0 {
+        return true;
+    }
+    DEVMODE_SIZE_AT
+        .iter()
+        .any(|&at| devmode_fits(blob, devmode, at))
+}
+
+/// Whether a device mode at `start` describes itself consistently and in bounds.
+///
+/// `at` is where `dmSize` sits for one of the two character widths. `dmSize`
+/// covers the structure's public members, which end with `dmDriverExtra`, so a
+/// reading that claims less than that cannot be the right one — that floor is
+/// what stops an arbitrary pair of bytes from passing as a device mode.
+fn devmode_fits(blob: &[u8], start: usize, at: usize) -> bool {
+    let Some(size_at) = start.checked_add(at) else {
+        return false;
+    };
+    // `dmSize` and `dmDriverExtra` are adjacent, so four bytes are needed.
+    let Some(end) = size_at.checked_add(4) else {
+        return false;
+    };
+    if end > blob.len() {
+        return false;
+    }
+
+    let read = |at: usize| u16::from_le_bytes([blob[at], blob[at + 1]]) as usize;
+    let declared = read(size_at);
+    let extra = read(size_at + 2);
+
+    if declared < at + 4 {
+        return false;
+    }
+    declared
+        .checked_add(extra)
+        .and_then(|total| start.checked_add(total))
+        .is_some_and(|past| past <= blob.len())
+}
+
 /// An ordered, replace-on-set collection of `(key, value)` entries.
 ///
 /// Insertion-ordered rather than a map, because enumeration order is part of
@@ -409,6 +510,18 @@ impl<T> FormatStore<T> {
     #[must_use]
     pub fn key_for(&self, request: &FormatKey) -> Option<FormatKey> {
         self.best(request).map(|(key, _)| key.clone())
+    }
+
+    /// How well the best entry answers `request`, if anything does.
+    ///
+    /// Exposed so a caller holding more than one store can rank across all of
+    /// them rather than taking whichever it happens to consult first.
+    #[must_use]
+    pub fn fit(&self, request: &FormatKey) -> Option<DeviceFit> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.0.fit(request))
+            .min()
     }
 
     /// The entry that best answers `request`.
@@ -968,6 +1081,28 @@ mod tests {
     }
 
     #[test]
+    fn a_stores_fit_is_the_best_of_its_entries() {
+        // What a caller holding two stores compares. Reporting the first
+        // entry's fit rather than the best would make the comparison meaningless.
+        let deaths = Rc::new(Cell::new(0));
+        let mut store = FormatStore::default();
+        store.set(for_device(9, Some(b"printer")), Counted::new(&deaths));
+        store.set(for_device(9, None), Counted::new(&deaths));
+
+        assert_eq!(store.fit(&for_device(9, None)), Some(DeviceFit::Exact));
+        assert_eq!(
+            store.fit(&for_device(9, Some(b"printer"))),
+            Some(DeviceFit::Exact)
+        );
+        assert_eq!(
+            store.fit(&for_device(9, Some(b"other"))),
+            Some(DeviceFit::Independent),
+            "only the device-free entry can answer an unknown printer"
+        );
+        assert_eq!(store.fit(&for_device(10, None)), None);
+    }
+
+    #[test]
     fn fit_ranks_exact_above_independent_above_default() {
         assert!(DeviceFit::Exact < DeviceFit::Independent);
         assert!(DeviceFit::Independent < DeviceFit::Default);
@@ -1153,5 +1288,169 @@ mod tests {
 
         assert_eq!(target_device_size(&header[..11]), None);
         assert_eq!(target_device_size(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::*;
+
+    /// A whole `DVTARGETDEVICE`, not just the twelve bytes at the front.
+    ///
+    /// `names` are `(offset, bytes)` written verbatim, so a test can put an
+    /// unterminated string somewhere and see it refused. `devmode` is
+    /// `(offset, dm_size_at, dmSize, dmDriverExtra)`, letting a test declare a
+    /// length that does not match the room actually left.
+    fn device_blob(
+        size: usize,
+        offsets: [u16; 4],
+        names: &[(usize, &[u8])],
+        devmode: Option<(usize, usize, u16, u16)>,
+    ) -> Vec<u8> {
+        let mut blob = vec![0xAA; size];
+        blob[..4].copy_from_slice(&(size as u32).to_le_bytes());
+        for (i, offset) in offsets.iter().enumerate() {
+            let at = 4 + i * 2;
+            blob[at..at + 2].copy_from_slice(&offset.to_le_bytes());
+        }
+        for (at, bytes) in names {
+            blob[*at..*at + bytes.len()].copy_from_slice(bytes);
+        }
+        if let Some((start, size_at, declared, extra)) = devmode {
+            let at = start + size_at;
+            blob[at..at + 2].copy_from_slice(&declared.to_le_bytes());
+            blob[at + 2..at + 4].copy_from_slice(&extra.to_le_bytes());
+        }
+        blob
+    }
+
+    #[test]
+    fn a_whole_ordinary_device_is_accepted() {
+        let blob = device_blob(
+            256,
+            [12, 20, 28, 64],
+            &[(12, b"driver\0"), (20, b"device\0"), (28, b"port\0")],
+            Some((64, 36, 156, 32)),
+        );
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_name_with_no_terminator_before_the_end_is_refused() {
+        // The case the header check cannot see: the offset is in bounds and
+        // leaves a byte, but that byte is not a terminator and neither is
+        // anything after it, so a consumer scanning for one runs off the end.
+        let mut blob = device_blob(64, [63, 0, 0, 0], &[], None);
+        blob[63] = b'X';
+
+        assert_eq!(target_device_size(&blob), Some(64), "the header looks fine");
+        assert!(!target_device_valid(&blob), "but there is no terminator");
+    }
+
+    #[test]
+    fn a_name_terminated_by_its_very_last_byte_is_accepted() {
+        let blob = device_blob(64, [63, 0, 0, 0], &[(63, b"\0")], None);
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn every_name_offset_is_checked_not_just_the_first() {
+        for at in 0..3 {
+            let mut offsets = [0u16; 4];
+            offsets[at] = 63;
+            let mut blob = device_blob(64, offsets, &[], None);
+            blob[63] = b'X';
+
+            assert!(
+                !target_device_valid(&blob),
+                "an unterminated name at field {at} was let through"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_name_is_accepted_by_the_byte_scan() {
+        // `DVTARGETDEVICE` never states a character width, so the check has to
+        // pass a UTF-16 name. Its terminator contains zero bytes, which is why
+        // scanning for one byte is right under either reading.
+        let wide: Vec<u8> = "hp\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let blob = device_blob(64, [12, 0, 0, 0], &[(12, &wide)], None);
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_devmode_declaring_more_than_the_blob_holds_is_refused() {
+        // The other case the header check cannot see: forty bytes of room, so
+        // the prefix fits, but the length it declares runs past the end. A
+        // consumer that allocates `dmSize + dmDriverExtra` reads past it.
+        let blob = device_blob(128, [0, 0, 0, 80], &[], Some((80, 36, 156, 0)));
+
+        assert_eq!(
+            target_device_size(&blob),
+            Some(128),
+            "the header looks fine"
+        );
+        assert!(
+            !target_device_valid(&blob),
+            "but the device mode does not fit"
+        );
+    }
+
+    #[test]
+    fn a_devmode_whose_driver_extra_runs_past_the_end_is_refused() {
+        // `dmSize` alone fits. It is the extra bytes, which the remarks say a
+        // consumer must add, that do not.
+        let fits = device_blob(256, [0, 0, 0, 64], &[], Some((64, 36, 156, 36)));
+        let overruns = device_blob(256, [0, 0, 0, 64], &[], Some((64, 36, 156, 40)));
+
+        assert!(target_device_valid(&fits));
+        assert!(!target_device_valid(&overruns));
+    }
+
+    #[test]
+    fn a_wide_devmode_is_accepted_at_its_own_offset() {
+        // Written by a Unicode caller: `dmSize` sits at 68, not 36. Reading it
+        // at the narrow offset finds unrelated bytes, so accepting the
+        // structure requires trying both.
+        let blob = device_blob(512, [0, 0, 0, 64], &[], Some((64, 68, 220, 64)));
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_devmode_too_small_to_describe_itself_is_refused() {
+        // `dmSize` covers the public members, which end with `dmDriverExtra`.
+        // A reading claiming less than that is not a device mode, whichever
+        // width it is read at.
+        let blob = device_blob(256, [0, 0, 0, 64], &[], Some((64, 36, 39, 0)));
+
+        assert!(!target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_blob_that_is_not_the_length_it_claims_is_refused() {
+        let mut blob = device_blob(64, [0, 0, 0, 0], &[], None);
+        blob.truncate(32);
+
+        assert!(!target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_device_with_no_offsets_at_all_is_accepted() {
+        // Every field zero is the documented "absent", not a malformed blob.
+        let blob = device_blob(TARGET_DEVICE_HEADER, [0, 0, 0, 0], &[], None);
+
+        assert!(target_device_valid(&blob));
+    }
+
+    #[test]
+    fn a_header_the_size_check_refuses_is_refused_here_too() {
+        let blob = device_blob(64, [0, 0, 0, 64], &[], None);
+
+        assert_eq!(target_device_size(&blob), None);
+        assert!(!target_device_valid(&blob));
     }
 }

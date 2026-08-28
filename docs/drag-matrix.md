@@ -208,6 +208,17 @@ Ties are broken by insertion order, so a target that calls `QueryGetData` and
 then `GetData` gets the same representation twice. Two *different* devices are
 still never interchangeable — a page composed for one printer is not the other's.
 
+The ranking has to run across *both* stores at once. Scrozz's own formats and the
+entries the shell writes through `SetData` are kept separately, and consulting
+one before the other means the loser's exact match never gets compared against
+the winner's approximate one: a printer-specific private format would answer a
+request naming no device, beating a device-independent entry that is an exact
+answer to it. So both stores are ranked together and the better fit wins wherever
+it lives. Store order survives only as the tie-break, and the tie goes to the
+shell's entries, because `SetData` is a promise that what went in comes back out.
+`QueryGetData` and `GetData` share that decision rather than each making it, so
+the promise and the delivery cannot disagree.
+
 The blob is copied by reading `tdSize` from *inside* the blob being copied, out
 of another process's memory, so `target_device_size` validates the header first.
 `tdSize` must be at least the twelve-byte header and no larger than a sane
@@ -222,6 +233,30 @@ purpose: the check is there to catch an offset that cannot be a device mode, not
 to guess which build wrote it. A header that could not describe a real device
 earns `DV_E_DVTARGETDEVICE`, not a best-effort copy and not a quiet downgrade to
 "device independent" — that downgrade would collide with the device-free key.
+
+A valid header is not a valid structure, though, and the header check cannot see
+past itself. An offset one byte short of the end leaves room for a terminator
+without there being one; a device mode prefix can fit while the length it
+*declares* runs off the end. Either one is read past the allocation by whatever
+consumes the `ptd` the enumeration hands out, so the whole copied blob is
+validated, not just its first twelve bytes:
+
+- every non-zero name offset must reach a zero byte somewhere before the end,
+  because the reference says each name is *"stored as a NULL-terminated string
+  in the tdData buffer"*;
+- the device mode, if present, must declare a `dmSize` that covers its own
+  public members and a `dmSize + dmDriverExtra` that fits inside `tdSize`.
+
+Two things are deliberately not decided. The reference never states a character
+width for the names — and links `tdExtDevmodeOffset` to the ANSI `DEVMODEA` even
+though a Unicode caller writes `DEVMODEW` — so scanning for a *single* zero byte
+is the strongest check that cannot reject a conforming structure: a narrow
+terminator is one zero byte and a wide one contains two. For the same reason
+`dmSize` is read at both candidate offsets, 36 for `DEVMODEA` and 68 for
+`DEVMODEW`, and the blob is accepted if *either* reading is self-consistent and
+in bounds. Requiring both would reject every real device mode, since only one
+reading is the true one and the other lands on unrelated bytes. This is a weaker
+check than one that knew the width, and it is weaker on purpose.
 
 **`lindex` does not always count.** The `FORMATETC` reference says of it: *"For
 the aspects DVASPECT_THUMBNAIL and DVASPECT_ICON, lindex is ignored."* An icon
@@ -283,8 +318,25 @@ and the task allocation for the path string can fail after a perfectly good
 copy. `ScratchFile` is an ordinary RAII guard — armed before the copy, disarmed
 only by `release`, deleting the path on drop otherwise — and it lives in
 portable code so its behaviour is tested on every platform rather than only
-compiled on Windows. It refuses a path that already exists rather than adopting
-and later deleting a file it did not create.
+compiled on Windows.
+
+Refusing a path that is already taken is part of that guard, and *checking*
+whether it is taken is not enough: between the check and the create, another
+process — or another drag in this one — can take it, and the guard then adopts a
+file it did not create and deletes it on the way out. So the reservation and the
+creation are one operation, `File::create_new`, which is `O_EXCL` on Unix and
+`CREATE_NEW` on Windows; the loser of a race gets an error rather than a guard
+over somebody else's file. The copy is then written through that same handle,
+so nothing reopens the path by name and there is no second window to lose.
+
+A delete can still fail — on Windows a receiver holding the file open is the
+ordinary case — and a failed delete must leave the file somewhere that something
+retries. Scratch files therefore live directly under the swept artifact root,
+and the orphan sweep ages loose files as well as directories, so a stranded
+scratch file is reclaimed on a later pass. Failures are counted rather than
+discarded, so "this never happens" and "this is happening silently" are
+distinguishable. A live scratch file is seconds old and the orphan window is an
+hour, so the sweep cannot take one out from under a drag in progress.
 
 `pUnkForRelease` changes all of the above. When it is present the provider still
 owns the storage, so the copy aliases the handle and carries an `AddRef`ed

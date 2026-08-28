@@ -41,7 +41,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use scrozz_core::{Error, Result};
@@ -290,38 +290,59 @@ impl Drop for DragArtifact {
 pub struct ScratchFile {
     /// `None` once ownership has been given away by [`Self::release`].
     path: Option<PathBuf>,
+    /// The handle the path was created through, closed before any deletion.
+    ///
+    /// Held so the file is written through the same handle that reserved it,
+    /// rather than by a second open that could land on a different file.
+    handle: Option<fs::File>,
 }
 
 impl ScratchFile {
-    /// Takes responsibility for `to` before anything is written there.
+    /// Creates `to`, exclusively, and takes responsibility for it.
     ///
     /// The seam that makes the ordering testable, and the reason a copy that
     /// dies halfway does not leak: from here on the path belongs to the guard
     /// whether or not any bytes ever arrive.
     ///
-    /// Refuses if something is already at `to` rather than guarding a file it
-    /// did not create — the paths used here are unique per process and serial,
-    /// so a collision means an assumption is wrong, and deleting a stranger's
-    /// file on the way out would be the worse failure. That refusal also keeps
-    /// the ordering honest: claiming *after* writing would find the path
-    /// occupied by its own output and fail.
+    /// The reservation is the creation. Asking whether the path exists and then
+    /// writing to it is two operations with a gap in between, and in that gap
+    /// another process can take the name — after which this guard would either
+    /// overwrite a file it did not create or delete one on the way out. There is
+    /// no portable way to close that gap by checking harder, so the check is
+    /// replaced by an exclusive create, which the filesystem resolves atomically
+    /// and which fails outright if the name is taken.
+    ///
+    /// A taken name is refused rather than adopted. The paths used here are
+    /// unique per process and serial, so a collision means an assumption is
+    /// wrong, and deleting a stranger's file would be the worse failure. That
+    /// refusal also keeps the ordering honest: claiming *after* writing would
+    /// find the path occupied by its own output and fail.
     pub fn claim(to: PathBuf) -> Result<Self> {
-        if to.exists() {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("scratch path is already occupied: {}", to.display()),
-            )));
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
         }
-        Ok(Self { path: Some(to) })
+        let handle = fs::File::create_new(&to)?;
+        Ok(Self {
+            path: Some(to),
+            handle: Some(handle),
+        })
     }
 
     /// Claims `to`, then copies `from` into it.
     ///
     /// The guard is armed *before* the copy is attempted, so a copy that fails
-    /// halfway still takes its partial output with it.
+    /// halfway still takes its partial output with it. The bytes go through the
+    /// handle the claim already holds, so nothing reopens the path and no second
+    /// lookup can resolve it to something else.
     pub fn copy(from: &Path, to: PathBuf) -> Result<Self> {
-        let guard = Self::claim(to)?;
-        fs::copy(from, guard.path())?;
+        let mut guard = Self::claim(to)?;
+        let mut source = fs::File::open(from)?;
+        let into = guard
+            .handle
+            .as_mut()
+            .expect("a freshly claimed guard holds its handle");
+        io::copy(&mut source, into)?;
+        into.sync_all()?;
         Ok(guard)
     }
 
@@ -342,16 +363,69 @@ impl ScratchFile {
     /// file — and not a moment earlier, which is the whole point.
     #[must_use]
     pub fn release(mut self) -> PathBuf {
+        // Closed here rather than left to the guard's own drop, so the file is
+        // not still open by this process when the receiver goes to read it.
+        self.handle = None;
         self.path.take().expect("a live guard owns its path")
     }
 }
 
 impl Drop for ScratchFile {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+        // The handle goes first. On Windows an open handle is exactly what makes
+        // a delete fail, and this process holding one would be a self-inflicted
+        // sharing violation.
+        self.handle = None;
+
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if fs::remove_file(&path).is_ok() {
+            return;
         }
+        // The delete can fail for a reason that is nobody's fault and will not
+        // last: on Windows a receiver still holding the file open makes the
+        // unlink fail until it lets go. Losing the path here would strand the
+        // file forever, so the deletion is not the only chance to reclaim it —
+        // scratch files live under the swept root, where `sweep_orphans` finds
+        // them by age and tries again. The count is what makes that visible to
+        // a test, and to anyone wondering whether it is happening.
+        CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// How many scratch files could not be deleted by their guard.
+///
+/// Each one is left for [`sweep_orphans`] to reclaim on a later run. A number
+/// that climbs during a session is not a leak on its own — a Windows receiver
+/// holding a dragged file open is the ordinary cause — but a number that climbs
+/// without the sweeper ever bringing it back down would be.
+#[must_use]
+pub fn scratch_cleanup_failures() -> usize {
+    CLEANUP_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Counts deletions the guard could not perform. See [`scratch_cleanup_failures`].
+static CLEANUP_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// A scratch path under the swept root, for a copy of `like`.
+///
+/// Under [`artifact_root`] rather than the bare temp directory, because that is
+/// the one place [`sweep_orphans`] looks: a file left behind by a delete that
+/// failed is only retryable if it is somewhere something will retry it. The
+/// extension is carried over so a receiver that reads the copy sees the same
+/// kind of file it was offered.
+#[must_use]
+pub fn scratch_path(like: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+
+    let mut name = format!("scrozz-stg-{}-{serial}", std::process::id());
+    if let Some(ext) = like.extension().and_then(|ext| ext.to_str()) {
+        name.push('.');
+        name.push_str(ext);
+    }
+    artifact_root().join(name)
 }
 
 /// Deletes artifacts left behind by a previous run.
@@ -366,16 +440,25 @@ pub fn sweep_orphans(root: &Path, now: SystemTime, max_age: Duration) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
         let old = entry
             .metadata()
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= max_age);
-        if old && fs::remove_dir_all(&path).is_ok() {
+        if !old {
+            continue;
+        }
+        // Directories are drags; loose files are scratch copies whose guard
+        // could not delete them — a Windows receiver still holding one open
+        // makes the unlink fail, and this is the retry. Both are reclaimed by
+        // their own age, so a live scratch file, seconds old, is never touched.
+        let gone = if path.is_dir() {
+            fs::remove_dir_all(&path).is_ok()
+        } else {
+            fs::remove_file(&path).is_ok()
+        };
+        if gone {
             removed += 1;
         }
     }
@@ -606,6 +689,160 @@ mod tests {
             fs::read(&dest).expect("still there"),
             b"somebody else's",
             "the stranger's file survived untouched"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_claim_creates_the_file_it_reserves() {
+        // The reservation and the creation are the same operation, which is
+        // what makes it atomic: there is no window between deciding the name is
+        // free and taking it.
+        let (dir, _source, dest) = scratch_pair();
+
+        let guard = ScratchFile::claim(dest.clone()).expect("the path is free");
+
+        assert!(dest.exists(), "the claim itself put the file there");
+        drop(guard);
+        assert!(!dest.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_second_claim_on_a_live_path_loses() {
+        // Stands in for the race: two claimants, one name. The exclusive create
+        // decides it in the filesystem, so exactly one wins however the two are
+        // interleaved — and the loser gets an error rather than a guard over a
+        // file somebody else is writing.
+        let (dir, _source, dest) = scratch_pair();
+
+        let first = ScratchFile::claim(dest.clone()).expect("the first claim wins");
+        let second = ScratchFile::claim(dest.clone());
+
+        assert!(second.is_err(), "the second claim was refused");
+        assert!(dest.exists(), "and the refusal did not disturb the first");
+        drop(first);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_claim_does_not_delete_the_file_it_lost_to() {
+        // The failure mode the refusal exists to prevent: adopting a stranger's
+        // file and then deleting it on the way out.
+        let (dir, _source, dest) = scratch_pair();
+        fs::write(&dest, b"somebody else's work").expect("a stranger's file");
+
+        drop(ScratchFile::claim(dest.clone()));
+
+        assert_eq!(
+            fs::read(&dest).expect("still there"),
+            b"somebody else's work",
+            "the refused claim left it alone"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_copy_goes_through_the_handle_that_reserved_the_path() {
+        let (dir, source, dest) = scratch_pair();
+
+        let guard = ScratchFile::copy(&source, dest.clone()).expect("the copy succeeds");
+
+        assert_eq!(
+            fs::read(guard.path()).expect("readable"),
+            b"pretend png",
+            "the bytes arrived through the claimed handle"
+        );
+        let kept = guard.release();
+        assert_eq!(fs::read(&kept).expect("readable"), b"pretend png");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_scratch_path_lives_where_the_sweeper_will_look() {
+        // The other half of the cleanup story: a delete that fails has to leave
+        // the file somewhere something retries. That somewhere is the swept root.
+        let path = scratch_path(Path::new("shot.png"));
+
+        assert_eq!(
+            path.parent(),
+            Some(artifact_root().as_path()),
+            "a scratch file outside the root would never be retried"
+        );
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+    }
+
+    #[test]
+    fn two_scratch_paths_are_never_the_same() {
+        let first = scratch_path(Path::new("a.png"));
+        let second = scratch_path(Path::new("a.png"));
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_sweeper_reclaims_a_stranded_scratch_file() {
+        // What happens after a delete fails: the file is a loose, old entry
+        // under the root, and the sweep is the retry.
+        let dir = root();
+        fs::create_dir_all(&dir).expect("a temp dir");
+        let stranded = dir.join("scrozz-stg-1-0.png");
+        fs::write(&stranded, b"could not be deleted").expect("a stranded file");
+
+        let later = SystemTime::now() + Duration::from_secs(7200);
+        let removed = sweep_orphans(&dir, later, Duration::from_secs(3600));
+
+        assert_eq!(removed, 1);
+        assert!(!stranded.exists(), "the retry got it");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_sweeper_leaves_a_live_scratch_file_alone() {
+        // The risk of sweeping files as well as directories: a drag in progress
+        // has a scratch file that is seconds old, and it must survive.
+        let dir = root();
+        fs::create_dir_all(&dir).expect("a temp dir");
+        let live = dir.join("scrozz-stg-1-1.png");
+        fs::write(&live, b"in use").expect("a live file");
+
+        let removed = sweep_orphans(&dir, SystemTime::now(), Duration::from_secs(3600));
+
+        assert_eq!(removed, 0);
+        assert!(live.exists(), "a young file is not an orphan");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deletion_that_fails_is_counted_rather_than_forgotten() {
+        // The seam. A guard whose delete fails must not swallow it, because the
+        // file is then somebody else's problem — the sweeper's — and a count
+        // that never moves is the difference between "this never happens" and
+        // "this is happening silently". A read-only directory produces the
+        // failure here; on Windows an open handle in the receiver does.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, _source, dest) = scratch_pair();
+        let guard = ScratchFile::claim(dest.clone()).expect("the path is free");
+
+        let before = scratch_cleanup_failures();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).expect("sealed");
+        drop(guard);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("unsealed");
+
+        assert_eq!(
+            scratch_cleanup_failures(),
+            before + 1,
+            "the failed delete was recorded"
+        );
+        assert!(dest.exists(), "and the file is still there to be retried");
+
+        let later = SystemTime::now() + Duration::from_secs(7200);
+        assert_eq!(
+            sweep_orphans(&dir, later, Duration::from_secs(3600)),
+            2,
+            "the sweeper reclaims it, and the source beside it"
         );
         let _ = fs::remove_dir_all(dir);
     }

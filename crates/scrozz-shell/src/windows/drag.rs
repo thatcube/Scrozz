@@ -81,7 +81,6 @@ use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::GlobalFree;
 use windows::Win32::Foundation::{
@@ -117,9 +116,10 @@ use windows::core::{
 
 use scrozz_core::{Error, Result};
 
-use crate::drag::artifact::{ScratchFile, artifact_root};
+use crate::drag::artifact::{ScratchFile, artifact_root, scratch_path};
 use crate::drag::formats::{
     FormatKey, FormatStore, TARGET_DEVICE_HEADER, stored_medium, target_device_size,
+    target_device_valid,
 };
 use crate::drag::{
     DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragSession, DragSource,
@@ -578,19 +578,6 @@ fn dup_file_medium(src: &STGMEDIUM) -> WinResult<STGMEDIUM> {
     })
 }
 
-/// A unique temporary path, keeping the extension so type sniffing still works.
-fn scratch_path(like: &Path) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-
-    let mut name = format!("scrozz-stg-{}-{serial}", std::process::id());
-    if let Some(ext) = like.extension().and_then(|ext| ext.to_str()) {
-        name.push('.');
-        name.push_str(ext);
-    }
-    std::env::temp_dir().join(name)
-}
-
 /// The file name a `TYMED_FILE` medium carries, without its terminator.
 ///
 /// # Safety
@@ -724,6 +711,12 @@ unsafe fn device_bytes(ptd: *const DVTARGETDEVICE) -> WinResult<Option<Arc<[u8]>
     // SAFETY: `tdSize` has been checked to be at least the header and within a
     // sane bound, and a well-formed structure is that many bytes long.
     let all = unsafe { std::slice::from_raw_parts(base, size) };
+    // Only now can the offsets be checked against what they point at. A blob
+    // that fails here would be handed on — into a key, out of `EnumFormatEtc`
+    // as a fresh allocation — and read past its end by whoever trusted it.
+    if !target_device_valid(all) {
+        return Err(WinError::from(DV_E_DVTARGETDEVICE));
+    }
     Ok(Some(Arc::from(all)))
 }
 
@@ -889,13 +882,24 @@ impl IEnumFORMATETC_Impl for FormatEnum_Impl {
 ///
 /// # Which wins
 ///
-/// A stored entry is preferred over an offered one for the same request. That
-/// is the `IDataObject` contract — `SetData` sets the data — and it is what
-/// every reference implementation does. In practice the two never collide: the
-/// helper writes private registered formats, and Scrozz offers `CF_HDROP`,
-/// `CF_UNICODETEXT` and a registered `"PNG"`, so both halves survive intact.
+/// A stored entry is preferred over an offered one *for an equally good match*.
+/// That is the `IDataObject` contract — `SetData` sets the data — but it is a
+/// tie-break, not a precedence: the device fit is compared first, so a stored
+/// entry composed for some printer does not beat an offered one that needs no
+/// device at all. In practice the two never collide: the helper writes private
+/// registered formats, and Scrozz offers `CF_HDROP`, `CF_UNICODETEXT` and a
+/// registered `"PNG"`, so both halves survive intact.
 ///
 /// [`IDragSourceHelper::InitializeFromBitmap`]: https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-idragsourcehelper-initializefrombitmap
+/// Which half of a [`CaptureData`] answers a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    /// Put here by `SetData`, owned as a medium.
+    Extras,
+    /// Scrozz's own flavour, rendered from bytes on demand.
+    Offered,
+}
+
 #[implement(IDataObject)]
 struct CaptureData {
     /// Scrozz's own flavours: format, and the bytes to render on demand.
@@ -981,7 +985,35 @@ impl CaptureData {
 
     /// Whether anything here can answer `request`.
     fn serves(&self, request: &FormatKey) -> bool {
-        self.extras.borrow().get(request).is_some() || self.offered.get(request).is_some()
+        self.best_source(request).is_some()
+    }
+
+    /// Which store answers `request` best.
+    ///
+    /// Both stores rank their candidates by [`DeviceFit`], and a store consulted
+    /// first would otherwise win with a worse one: a private format set by the
+    /// drag helper for some printer would beat Scrozz's own device-independent
+    /// entry for a request naming no device, even though the second is an exact
+    /// match and the first only a picked default. Fit decides; the store only
+    /// breaks a tie.
+    ///
+    /// Ties go to the shell's entries, because `SetData` is a promise that what
+    /// was put in comes back out. Nothing Scrozz offers shares a format with the
+    /// helper's private ones, so the tie is theoretical — but it has to resolve
+    /// the same way in both callers, which is why they share this.
+    fn best_source(&self, request: &FormatKey) -> Option<Source> {
+        let extras = self.extras.borrow().fit(request);
+        let offered = self.offered.fit(request);
+        match (extras, offered) {
+            (Some(extras), Some(offered)) => Some(if extras <= offered {
+                Source::Extras
+            } else {
+                Source::Offered
+            }),
+            (Some(_), None) => Some(Source::Extras),
+            (None, Some(_)) => Some(Source::Offered),
+            (None, None) => None,
+        }
     }
 
     /// The formats available, in enumeration order.
@@ -1002,16 +1034,20 @@ impl IDataObject_Impl for CaptureData_Impl {
     fn GetData(&self, request: *const FORMATETC) -> WinResult<STGMEDIUM> {
         let key = key_of(request)?;
 
-        if let Some(medium) = self.stored_copy(&key)? {
-            return Ok(medium);
+        match self.best_source(&key) {
+            Some(Source::Extras) => self
+                .stored_copy(&key)?
+                .ok_or_else(|| WinError::from(DV_E_FORMATETC)),
+            Some(Source::Offered) => {
+                let bytes = self
+                    .offered
+                    .get(&key)
+                    .ok_or_else(|| WinError::from(DV_E_FORMATETC))?;
+                let handle = to_hglobal(bytes)?;
+                Ok(handle_medium(bits(TYMED_HGLOBAL), HANDLE(handle.0)))
+            }
+            None => Err(WinError::from(DV_E_FORMATETC)),
         }
-
-        let bytes = self
-            .offered
-            .get(&key)
-            .ok_or_else(|| WinError::from(DV_E_FORMATETC))?;
-        let handle = to_hglobal(bytes)?;
-        Ok(handle_medium(bits(TYMED_HGLOBAL), HANDLE(handle.0)))
     }
 
     fn GetDataHere(&self, _request: *const FORMATETC, _into: *mut STGMEDIUM) -> WinResult<()> {
@@ -1906,6 +1942,93 @@ mod tests {
         let mut medium = really_global;
         // SAFETY: still owned here, because the call refused it.
         unsafe { ReleaseStgMedium(&raw mut medium) };
+    }
+
+    #[test]
+    fn the_better_device_fit_wins_across_both_stores() {
+        // The bug: `GetData` asked the shell's entries first and took whatever
+        // they had, so a printer-specific private format answered a request that
+        // named no device at all — beating Scrozz's own device-independent
+        // entry, which is an exact answer to that request. Ranking has to run
+        // across both stores, not inside each one separately.
+        let png = b"\x89PNG\r\n\x1a\n";
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), png).into();
+        let printer = target_device(1);
+        let mut for_printer = with_device(png_format(), &printer);
+        for_printer.tymed = bits(TYMED_HGLOBAL);
+        let printer_bytes = global_of(b"printer-specific");
+
+        // SAFETY: live object and medium; ownership passes on success.
+        unsafe {
+            data.SetData(&raw const for_printer, &raw const printer_bytes, true)
+                .expect("a private device-specific entry is storable");
+        }
+
+        let indifferent = fmt_of(&FormatKey::content(png_format(), bits(TYMED_HGLOBAL)));
+
+        // SAFETY: live object; both are ordinary reads, and each medium
+        // returned is owned by this caller and released below.
+        unsafe {
+            data.QueryGetData(&raw const indifferent)
+                .ok()
+                .expect("somebody can answer a device-indifferent request");
+            let mut answer = data.GetData(&raw const indifferent).expect("an answer");
+            assert_eq!(
+                read_global(&answer, png.len()),
+                png,
+                "the exact fit answered, not the printer's"
+            );
+            ReleaseStgMedium(&raw mut answer);
+
+            data.QueryGetData(&raw const for_printer)
+                .ok()
+                .expect("and the printer's request is still answerable");
+            let mut answer = data.GetData(&raw const for_printer).expect("an answer");
+            assert_eq!(
+                read_global(&answer, b"printer-specific".len()),
+                b"printer-specific",
+                "which is answered by the entry made for it"
+            );
+            ReleaseStgMedium(&raw mut answer);
+        }
+    }
+
+    #[test]
+    fn what_query_promises_is_what_get_hands_over() {
+        // The consistency the shared ranking buys: whichever store wins, both
+        // calls must reach the same one. An unknown printer can only be served
+        // by the device-independent entry, and that has to be true of the
+        // promise as well as the delivery.
+        let png = b"\x89PNG\r\n\x1a\n";
+        let data: IDataObject = CaptureData::new(Path::new(r"C:\a.png"), png).into();
+        let known = target_device(1);
+        let mut for_known = with_device(png_format(), &known);
+        for_known.tymed = bits(TYMED_HGLOBAL);
+        let stored = global_of(b"printer-specific");
+
+        // SAFETY: live object and medium; ownership passes on success.
+        unsafe {
+            data.SetData(&raw const for_known, &raw const stored, true)
+                .expect("storable");
+        }
+
+        let other = target_device(2);
+        let mut for_other = with_device(png_format(), &other);
+        for_other.tymed = bits(TYMED_HGLOBAL);
+
+        // SAFETY: live object; ordinary read, medium released below.
+        unsafe {
+            data.QueryGetData(&raw const for_other)
+                .ok()
+                .expect("the device-independent entry can stand in");
+            let mut answer = data.GetData(&raw const for_other).expect("an answer");
+            assert_eq!(
+                read_global(&answer, png.len()),
+                png,
+                "and it is the one that stood in"
+            );
+            ReleaseStgMedium(&raw mut answer);
+        }
     }
 
     #[test]
