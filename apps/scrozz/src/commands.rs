@@ -859,6 +859,7 @@ fn selection_json(options: &SelectionOptions, retake: bool) -> Json {
         ),
         ("freeze", Json::Bool(options.freeze)),
         ("retake", Json::Bool(retake)),
+        ("crosshair_mode", Json::str(options.crosshair_mode.slug())),
         ("magnifier", Json::Bool(options.magnifier)),
         ("crosshair", Json::Bool(options.crosshair)),
     ])

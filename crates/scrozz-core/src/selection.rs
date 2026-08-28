@@ -50,6 +50,41 @@ pub const MIN_SELECTION: f64 = 8.0;
 /// The default magnifier zoom, in screen pixels per magnified pixel.
 pub const DEFAULT_MAGNIFIER_ZOOM: u32 = 8;
 
+/// When the advanced crosshair guides and pixel loupe are active.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CrosshairMode {
+    /// Use the native crosshair pointer without additional guides or a loupe.
+    #[default]
+    Off,
+    /// Show the additional aids while the platform-primary modifier is held.
+    Modifier,
+    /// Always show the additional aids during region selection.
+    Always,
+}
+
+impl CrosshairMode {
+    /// The stable value used by settings and structured CLI output.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Modifier => "modifier",
+            Self::Always => "always",
+        }
+    }
+
+    /// Whether the mode is active for the current modifier state.
+    #[must_use]
+    pub const fn is_active(self, primary_modifier: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Modifier => primary_modifier,
+            Self::Always => true,
+        }
+    }
+}
+
 /// What the user is choosing.
 ///
 /// This is also the menu of the single heads-up display: one surface exposes
@@ -340,6 +375,9 @@ pub struct SelectionOptions {
     /// window capture and all-display composition stay live because their native
     /// output cannot be reconstructed faithfully from display snapshots.
     pub freeze: bool,
+    /// When the advanced region-selection aids are active.
+    #[serde(default)]
+    pub crosshair_mode: CrosshairMode,
     /// Draw full-width crosshair guides through the pointer.
     pub crosshair: bool,
     /// Show the pixel loupe.
@@ -361,8 +399,9 @@ impl Default for SelectionOptions {
             reuse_immediately: false,
             constraint: SizeConstraint::default(),
             freeze: true,
-            crosshair: true,
-            magnifier: true,
+            crosshair_mode: CrosshairMode::Off,
+            crosshair: false,
+            magnifier: false,
             magnifier_zoom: DEFAULT_MAGNIFIER_ZOOM,
             delay: None,
             hud: true,
@@ -377,14 +416,40 @@ impl SelectionOptions {
         Self::default()
     }
 
+    /// Enables the complete advanced crosshair experience with one activation policy.
+    #[must_use]
+    pub const fn with_crosshair_mode(mut self, mode: CrosshairMode) -> Self {
+        let enabled = !matches!(mode, CrosshairMode::Off);
+        self.crosshair_mode = mode;
+        self.crosshair = enabled;
+        self.magnifier = enabled;
+        self
+    }
+
+    /// Whether full-width pointer guides should be drawn right now.
+    #[must_use]
+    pub const fn draws_crosshair(&self, primary_modifier: bool) -> bool {
+        self.crosshair && self.crosshair_mode.is_active(primary_modifier)
+    }
+
+    /// Whether the pixel loupe should be drawn right now.
+    #[must_use]
+    pub const fn shows_magnifier(&self, primary_modifier: bool) -> bool {
+        self.magnifier && self.crosshair_mode.is_active(primary_modifier)
+    }
+
+    /// Whether selection preparation needs pixels for a potentially visible loupe.
+    #[must_use]
+    pub const fn needs_magnifier_frame(&self) -> bool {
+        self.magnifier && !matches!(self.crosshair_mode, CrosshairMode::Off)
+    }
+
     /// Options for a given mode, otherwise default.
     #[must_use]
     pub fn for_mode(mode: SelectionMode) -> Self {
         Self {
             mode,
             freeze: matches!(mode, SelectionMode::Region | SelectionMode::Display),
-            magnifier: mode == SelectionMode::Region,
-            crosshair: mode == SelectionMode::Region,
             ..Self::default()
         }
     }
@@ -576,6 +641,9 @@ impl SelectionCapabilities {
         if !self.magnifier {
             out.magnifier = false;
         }
+        if !out.crosshair && !out.magnifier {
+            out.crosshair_mode = CrosshairMode::Off;
+        }
         if !self.frozen_screen {
             out.freeze = false;
         }
@@ -602,10 +670,13 @@ impl SelectionCapabilities {
     #[must_use]
     pub fn downgrades(&self, options: &SelectionOptions) -> Vec<&'static str> {
         let mut lost = Vec::new();
-        if options.crosshair && !self.crosshair {
+        if options.crosshair
+            && !matches!(options.crosshair_mode, CrosshairMode::Off)
+            && !self.crosshair
+        {
             lost.push("crosshair");
         }
-        if options.magnifier && !self.magnifier {
+        if options.needs_magnifier_frame() && !self.magnifier {
             lost.push("magnifier");
         }
         if options.freeze && !self.frozen_screen {
@@ -890,8 +961,36 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_region_selection_uses_only_the_native_crosshair_pointer() {
+        let options = SelectionOptions::region();
+
+        assert_eq!(options.crosshair_mode, CrosshairMode::Off);
+        assert!(!options.crosshair);
+        assert!(!options.magnifier);
+        assert!(options.freeze);
+    }
+
+    #[test]
+    fn crosshair_mode_supports_off_modifier_and_always_activation() {
+        let off = SelectionOptions::region();
+        assert!(!off.draws_crosshair(false));
+        assert!(!off.shows_magnifier(true));
+
+        let modifier = SelectionOptions::region().with_crosshair_mode(CrosshairMode::Modifier);
+        assert!(!modifier.draws_crosshair(false));
+        assert!(modifier.draws_crosshair(true));
+        assert!(modifier.shows_magnifier(true));
+        assert!(modifier.needs_magnifier_frame());
+
+        let always = SelectionOptions::region().with_crosshair_mode(CrosshairMode::Always);
+        assert!(always.draws_crosshair(false));
+        assert!(always.shows_magnifier(false));
+    }
+
+    #[test]
     fn compositor_owned_selection_downgrades_and_says_which_parts() {
         let wanted = SelectionOptions {
+            crosshair_mode: CrosshairMode::Always,
             magnifier: true,
             crosshair: true,
             freeze: true,
@@ -922,6 +1021,7 @@ mod tests {
         let honoured = caps.honour(&wanted);
         assert!(!honoured.magnifier);
         assert!(!honoured.crosshair);
+        assert_eq!(honoured.crosshair_mode, CrosshairMode::Off);
         assert!(!honoured.freeze);
         assert!(!honoured.hud);
         assert!(honoured.remembered.is_none());
@@ -934,7 +1034,7 @@ mod tests {
         let wanted = SelectionOptions {
             remembered: Some(rect(0.0, 0.0, 10.0, 10.0)),
             constraint: SizeConstraint::free().with_aspect(AspectLock::ratio(3.0, 2.0).unwrap()),
-            ..SelectionOptions::default()
+            ..SelectionOptions::default().with_crosshair_mode(CrosshairMode::Modifier)
         };
         let caps = SelectionCapabilities::CLIENT_OVERLAY;
         assert!(caps.downgrades(&wanted).is_empty());

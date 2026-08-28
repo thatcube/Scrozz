@@ -83,6 +83,25 @@ fn dragging_up_and_left_still_produces_a_valid_rect() {
 }
 
 #[test]
+fn region_does_not_exist_until_the_pointer_moves_after_press() {
+    let mut state = state(SelectionOptions::region());
+
+    state.hover(LogicalPoint::new(100.0, 90.0));
+    assert!(state.region().is_none());
+    state.pointer_pressed(LogicalPoint::new(100.0, 90.0));
+    assert!(state.region().is_none());
+
+    state.pointer_moved(LogicalPoint::new(140.0, 120.0));
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(100.0, 90.0),
+            LogicalSize::new(40.0, 30.0)
+        ))
+    );
+}
+
+#[test]
 fn remembered_region_can_be_moved() {
     let mut state = state(SelectionOptions {
         remembered: Some(LogicalRect::new(

@@ -1,7 +1,8 @@
 #![allow(missing_docs)]
 
 use scrozz_core::selection::{
-    AspectLock, SelectionCapabilities, SelectionMode, SelectionOptions, SizeConstraint,
+    AspectLock, CrosshairMode, SelectionCapabilities, SelectionMode, SelectionOptions,
+    SizeConstraint,
 };
 use scrozz_core::{
     Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScaleFactor, Window, WindowId,
@@ -58,8 +59,22 @@ fn build_selector(fixture: &Fixture, seed: u64) -> SelectionUi {
 
 fn scenario_data(fixture: &Fixture) -> (SelectionOptions, Vec<Display>, Vec<Window>) {
     match fixture.scenario {
-        Scenario::SelectorIdle | Scenario::SelectorDragging | Scenario::SelectorMagnifier => (
+        Scenario::SelectorIdle | Scenario::SelectorDragging => (
             SelectionOptions::region(),
+            vec![display(
+                "main",
+                "Built-in Display",
+                LogicalRect::new(
+                    LogicalPoint::new(0.0, 0.0),
+                    LogicalSize::new(fixture.size_pt.0 as f64, fixture.size_pt.1 as f64),
+                ),
+                2.0,
+                true,
+            )],
+            Vec::new(),
+        ),
+        Scenario::SelectorMagnifier => (
+            SelectionOptions::region().with_crosshair_mode(CrosshairMode::Always),
             vec![display(
                 "main",
                 "Built-in Display",

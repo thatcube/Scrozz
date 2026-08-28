@@ -13,7 +13,10 @@ pub struct MagnifierConfig {
 
 impl Default for MagnifierConfig {
     fn default() -> Self {
-        Self { zoom: 8, radius: 5 }
+        Self {
+            zoom: 8,
+            radius: 12,
+        }
     }
 }
 

@@ -1084,6 +1084,36 @@ bookkeeping, communicates recency directly, and sorts correctly because every
 component is numeric. Keeping maturity out of the version also avoids feeding
 Apple an invalid `CFBundleShortVersionString`.
 
+## D33 — Capture Area is quiet by default; precision aids are one mode
+
+**Decision.** Capture Area always uses the operating system's native crosshair
+pointer. Moving the pointer alone draws no selection; the rectangle begins only
+after primary-button press and movement.
+
+The additional full-screen guides and pixel loupe form one user-facing
+**Crosshair Mode** in Screenshot settings. It has three states:
+
+1. **Off** — the default.
+2. **While holding the primary modifier** — Command on macOS and the equivalent
+   platform-primary modifier elsewhere.
+3. **Always**.
+
+When active, Crosshair Mode shows both the horizontal and vertical guides and a
+larger 25 × 25-source-pixel loupe. The lower-level CLI may still request either
+aid independently for scripting.
+
+**Freeze screen while selecting** is a separate Screenshot setting and defaults
+on. It freezes pixel-addressed region and display capture so transient content
+stays capturable; window selection remains live because a native window capture
+cannot be reconstructed faithfully from a frozen display image. A magnifier may
+still require a prepared display frame even when the visible backdrop is live.
+
+**Why.** A native crosshair communicates region selection without filling the
+screen with motion before the user acts. Guides and a loupe are precision tools,
+not baseline chrome, so they should appear only by explicit preference or a
+momentary modifier. Keeping freeze independent avoids coupling capture
+correctness to a visual aid.
+
 ---
 
 # Open questions

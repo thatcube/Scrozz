@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use egui::{Key, PointerButton, TextureHandle, Ui};
+use egui::{CursorIcon, Key, PointerButton, TextureHandle, Ui};
 use scrozz_core::selection::{
     SelectionCapabilities, SelectionMode, SelectionOptions, SelectionOutcome,
 };
@@ -153,6 +153,7 @@ impl SelectionUi {
         if focused && self.handle_keyboard(ui) {
             return SelectionDecision::Cancelled;
         }
+        let primary_modifier = ui.ctx().input(|input| input.modifiers.command);
         let paint = paint::draw_overlay(
             ui,
             &theme_for(ui),
@@ -165,8 +166,16 @@ impl SelectionUi {
                 surface,
                 display: surface_display,
                 show_hud,
+                primary_modifier,
             },
         );
+        if self.state.mode() == SelectionMode::Region {
+            ui.ctx().set_cursor_icon(if paint.pointer_over_controls {
+                CursorIcon::PointingHand
+            } else {
+                CursorIcon::Crosshair
+            });
+        }
         match paint.action {
             paint::OverlayAction::None => {}
             paint::OverlayAction::Mode(mode) => {
@@ -178,13 +187,15 @@ impl SelectionUi {
                 }
             }
         }
-        self.handle_pointer(
+        if self.handle_pointer(
             ui,
             &paint.canvas,
             paint.pointer_over_controls,
             surface,
             surface_display,
-        );
+        ) {
+            ui.ctx().request_repaint();
+        }
         if paint.canvas.clicked()
             && !self.state.gesture_changed()
             && let Some(outcome) = self.state.commit()
@@ -248,7 +259,7 @@ impl SelectionUi {
         pointer_over_hud: bool,
         surface: LogicalRect,
         surface_display: Option<&DisplayId>,
-    ) {
+    ) -> bool {
         let (latest, pressed, released, down) = ui.ctx().input(|input| {
             (
                 input.pointer.latest_pos(),
@@ -260,35 +271,40 @@ impl SelectionUi {
         let Some(point) =
             latest.filter(|point| canvas.rect.contains(*point) || self.state.is_interacting())
         else {
-            return;
+            return false;
         };
         let point = DisplayLayout::point_from_canvas_in(surface, point - canvas.rect.min.to_vec2());
         if pointer_over_hud && !self.state.is_interacting() {
-            return;
+            return false;
         }
+        let moved = self.state.pointer() != Some(point);
+        let mut changed = false;
         if pressed && canvas.rect.contains(latest.expect("latest exists")) {
             if let Some(display) = surface_display {
                 self.state.pointer_pressed_on(display, point);
             } else {
                 self.state.pointer_pressed(point);
             }
+            changed = true;
             if !self.state.mode().is_freehand()
                 && let Some(outcome) = self.state.commit()
             {
                 self.immediate = Some(SelectionDecision::Selected(outcome));
             }
-        } else if down {
+        } else if down && moved {
             if let Some(display) = surface_display {
                 self.state.pointer_moved_on(display, point);
             } else {
                 self.state.pointer_moved(point);
             }
-        } else {
+            changed = true;
+        } else if moved {
             if let Some(display) = surface_display {
                 self.state.hover_on(display, point);
             } else {
                 self.state.hover(point);
             }
+            changed = true;
         }
         if released {
             if let Some(display) = surface_display {
@@ -296,7 +312,9 @@ impl SelectionUi {
             } else {
                 self.state.pointer_released(point);
             }
+            changed = true;
         }
+        changed
     }
 
     fn handle_keyboard(&mut self, ui: &Ui) -> bool {
@@ -387,7 +405,7 @@ fn effective_capabilities(
     let has_frozen = frozen.frames().next().is_some();
     let has_visible_windows = windows.iter().any(|window| window.is_visible);
     SelectionCapabilities {
-        magnifier: requested.magnifier && options.magnifier && has_frozen,
+        magnifier: requested.magnifier && options.needs_magnifier_frame() && has_frozen,
         frozen_screen: requested.frozen_screen && has_frozen,
         hud: requested.hud && options.hud,
         window_picking: requested.window_picking && has_visible_windows,

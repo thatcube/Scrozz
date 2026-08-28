@@ -30,8 +30,8 @@ use std::{
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use scrozz_core::{
-    AspectLock, LogicalPoint, LogicalRect, LogicalSize, SelectionMode, SelectionOptions,
-    SizeConstraint,
+    AspectLock, CrosshairMode, LogicalPoint, LogicalRect, LogicalSize, SelectionMode,
+    SelectionOptions, SizeConstraint,
 };
 
 use crate::{
@@ -883,13 +883,21 @@ impl CaptureArgs {
         let delay = self.delay.map(checked_delay).transpose()?;
         let (remembered, remembered_display) =
             remembered.map_or((None, None), |(rect, display)| (Some(rect), display));
+        let crosshair = self.crosshair.unwrap_or(false);
+        let magnifier = self.magnifier.unwrap_or(false);
+        let crosshair_mode = if crosshair || magnifier {
+            CrosshairMode::Always
+        } else {
+            CrosshairMode::Off
+        };
         Ok(Some(SelectionOptions {
             remembered: self.retake.then_some(remembered).flatten(),
             remembered_display: self.retake.then_some(remembered_display).flatten(),
             constraint,
             freeze: self.freeze.unwrap_or(defaults.freeze),
-            crosshair: self.crosshair.unwrap_or(defaults.crosshair),
-            magnifier: self.magnifier.unwrap_or(defaults.magnifier),
+            crosshair_mode,
+            crosshair,
+            magnifier,
             delay,
             hud: mode.shows_hud(),
             ..defaults
@@ -1909,6 +1917,27 @@ mod tests {
         assert!(!options.freeze);
         assert!(!options.magnifier);
         assert!(!options.crosshair);
+        assert_eq!(options.crosshair_mode, CrosshairMode::Off);
+    }
+
+    #[test]
+    fn explicit_cli_selection_aids_activate_without_changing_gui_defaults() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--interactive",
+            "region",
+            "--crosshair",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        let options = args.selection_options(None).unwrap().unwrap();
+
+        assert_eq!(options.crosshair_mode, CrosshairMode::Always);
+        assert!(options.crosshair);
+        assert!(!options.magnifier);
     }
 
     #[test]

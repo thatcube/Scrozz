@@ -188,6 +188,18 @@ pub const SETTINGS: &[Setting] = &[
         description: "Include the mouse pointer in captures.",
     },
     Setting {
+        key: "capture.crosshair-mode",
+        kind: Kind::Choice(&["off", "modifier", "always"]),
+        default: "off",
+        description: "Show guides and a pixel loupe never, while holding the primary modifier, or always.",
+    },
+    Setting {
+        key: "capture.freeze-screen",
+        kind: Kind::Bool,
+        default: "true",
+        description: "Freeze screen contents while choosing a region or display.",
+    },
+    Setting {
         key: "capture.copy-to-clipboard",
         kind: Kind::Bool,
         default: "false",
@@ -424,6 +436,21 @@ mod tests {
             panic!("capture.format should be a choice")
         };
         assert_eq!(options, ["png", "jpeg", "webp"]);
+    }
+
+    #[test]
+    fn crosshair_mode_has_the_three_product_states_and_defaults_off() {
+        let setting = lookup("capture.crosshair-mode").unwrap();
+        let Kind::Choice(options) = setting.kind else {
+            panic!("capture.crosshair-mode should be a choice")
+        };
+        assert_eq!(options, ["off", "modifier", "always"]);
+        assert_eq!(setting.default, "off");
+    }
+
+    #[test]
+    fn frozen_selection_defaults_on() {
+        assert_eq!(lookup("capture.freeze-screen").unwrap().default, "true");
     }
 
     #[test]

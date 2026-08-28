@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use egui::{Context, Event, PointerButton, RawInput, Rect, pos2, vec2};
+use egui::{Context, CursorIcon, Event, PointerButton, RawInput, Rect, pos2, vec2};
 use scrozz_core::selection::{SelectionMode, SelectionOptions};
 use scrozz_core::{
     CaptureTarget, Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScaleFactor,
@@ -104,6 +104,24 @@ fn selection_ui(mode: SelectionMode, displays: Vec<Display>) -> SelectionUi {
         .map(|(index, display)| FrozenDisplayFrame::synthetic(display.clone(), index as u64 + 1))
         .collect();
     SelectionUi::new(SelectionOptions::for_mode(mode), displays, frames)
+}
+
+#[test]
+fn ordinary_region_selection_uses_the_native_crosshair_cursor() {
+    let displays = vec![display("main", 0.0, 0.0, 360.0, 240.0, 2.0, true)];
+    let mut selector = selection_ui(SelectionMode::Region, displays);
+    let mut driver = Driver::new();
+
+    let output = driver.step_output(
+        [360.0, 240.0],
+        vec![Event::PointerMoved(pos2(120.0, 150.0))],
+        |ui| {
+            let _ = selector.update(ui);
+        },
+    );
+
+    assert_eq!(output.platform_output.cursor_icon, CursorIcon::Crosshair);
+    assert!(selector.state().region().is_none());
 }
 
 #[test]

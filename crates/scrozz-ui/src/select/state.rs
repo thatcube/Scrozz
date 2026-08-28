@@ -711,7 +711,7 @@ impl SelectionState {
                 anchor: point,
                 display: display.clone(),
             };
-            self.region = Some(LogicalRect::new(point, LogicalSize::new(0.0, 0.0)));
+            self.region = None;
         }
     }
 

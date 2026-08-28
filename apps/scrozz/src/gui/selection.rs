@@ -970,7 +970,7 @@ fn prepare_native(options: SelectionOptions, cursor: CursorMode) -> Result<Prepa
 
     let mut frozen = Vec::new();
     let mut frozen_sources = Vec::new();
-    if options.freeze || options.magnifier {
+    if options.freeze || options.needs_magnifier_frame() {
         frozen.reserve(displays.len());
         if options.freeze {
             frozen_sources.reserve(displays.len());

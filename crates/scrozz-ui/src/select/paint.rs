@@ -48,6 +48,7 @@ pub(super) struct OverlayView<'a> {
     pub surface: LogicalRect,
     pub display: Option<&'a DisplayId>,
     pub show_hud: bool,
+    pub primary_modifier: bool,
 }
 
 struct HudPaintResult {
@@ -85,7 +86,7 @@ pub(super) fn draw_overlay(
         pointer_over_hud: false,
     };
     if state.mode() == SelectionMode::Region {
-        if state.options_ref().crosshair
+        if state.options_ref().draws_crosshair(view.primary_modifier)
             && (view.display.is_none() || state.pointer_display() == view.display)
             && let Some(pointer) = state.pointer()
         {
@@ -113,7 +114,7 @@ pub(super) fn draw_overlay(
     } else if paints_focus && let Some(rect) = state.focus_rect() {
         draw_target_highlight(&painter, canvas_rect, view.surface, rect, state, theme);
     }
-    if state.options_ref().magnifier
+    if state.options_ref().shows_magnifier(view.primary_modifier)
         && state.mode() == SelectionMode::Region
         && (view.display.is_none() || state.pointer_display() == view.display)
         && let Some(grid) = magnifier_grid(state, view.frozen)
