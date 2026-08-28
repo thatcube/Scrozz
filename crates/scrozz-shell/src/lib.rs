@@ -13,18 +13,21 @@ pub mod drag;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
+
 pub mod overlay;
 pub mod permissions;
 pub mod selection;
 pub mod sound;
 pub mod tray;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(target_os = "linux")]
 mod x11_focus;
 
 pub use drag::{
-    ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
-    DragPreview, DragSession, DragSource, NativeDragSource, NativeSurface, PromisedFile,
-    byte_source, native_drag_source,
+    ArtifactState, ByteSource, DragArtifact, DragCapability, DragFormat, DragOperation, DragOrigin,
+    DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
+    NativeSurface, PromisedFile, byte_source, native_drag_source,
 };
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,

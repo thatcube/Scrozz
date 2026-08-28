@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     annotation::{Annotation, AnnotationId, AnnotationObject},
+    geom,
     style::{Color, Style},
 };
 
@@ -94,6 +95,14 @@ pub struct DocumentData {
     pub annotations: Vec<AnnotationObject>,
     /// Framing, if permitted.
     pub beautification: Option<Beautification>,
+    /// The visible region of the source, if it has been cropped.
+    ///
+    /// In source-logical coordinates, and never applied to the pixels: the
+    /// source keeps every pixel it was captured with, so a crop can be widened
+    /// again — or cleared entirely — months later. Annotations outside it are
+    /// kept too, and simply fall outside the rendered area.
+    #[serde(default)]
+    pub crop: Option<LogicalRect>,
     /// The next identifier to hand out.
     ///
     /// Persisted so a reopened document cannot reissue an id that an undo stack
@@ -103,7 +112,7 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2;
 }
 
 impl Default for DocumentData {
@@ -112,6 +121,7 @@ impl Default for DocumentData {
             version: Self::VERSION,
             annotations: Vec::new(),
             beautification: None,
+            crop: None,
             next_id: 1,
         }
     }
@@ -133,6 +143,7 @@ pub struct Document {
     pub source: Capture,
     objects: Vec<AnnotationObject>,
     beautification: Option<Beautification>,
+    crop: Option<LogicalRect>,
     next_id: u64,
 }
 
@@ -144,6 +155,7 @@ impl Document {
             source,
             objects: Vec::new(),
             beautification: None,
+            crop: None,
             next_id: 1,
         }
     }
@@ -157,18 +169,8 @@ impl Document {
     /// a document that was hand-edited or that changed provenance must not be
     /// silently accepted and then quietly rendered wrong.
     pub fn from_data(source: Capture, data: DocumentData) -> Result<Self> {
-        if data.version > DocumentData::VERSION {
-            return Err(Error::InvalidRequest(format!(
-                "document format version {} is newer than supported version {}",
-                data.version,
-                DocumentData::VERSION
-            )));
-        }
-        if data.beautification.is_some() && source.provenance.forbids_compositing() {
-            return Err(Error::InvalidRequest(
-                "beautification is not permitted for window captures (decision D9)".to_owned(),
-            ));
-        }
+        Self::validate_data(&source, &data)?;
+        let crop = normalize_crop(capture_bounds(&source), data.crop)?;
         let highest = data
             .annotations
             .iter()
@@ -179,6 +181,7 @@ impl Document {
             source,
             objects: data.annotations,
             beautification: data.beautification,
+            crop,
             next_id: data.next_id.max(highest).max(1),
         };
         document.renumber_counters();
@@ -192,8 +195,51 @@ impl Document {
             version: DocumentData::VERSION,
             annotations: self.objects.clone(),
             beautification: self.beautification.clone(),
+            crop: self.crop,
             next_id: self.next_id,
         }
+    }
+
+    /// Replaces every editable part of this document at once.
+    ///
+    /// The source is untouched — a snapshot only ever travels between states of
+    /// the same document, so restoring one must not be able to swap the image
+    /// out from under it.
+    ///
+    /// # Errors
+    ///
+    /// The same conditions as [`Self::from_data`].
+    pub fn restore(&mut self, data: DocumentData) -> Result<()> {
+        Self::validate_data(&self.source, &data)?;
+        let crop = normalize_crop(self.logical_bounds(), data.crop)?;
+        let highest = data
+            .annotations
+            .iter()
+            .map(|object| object.id.0)
+            .max()
+            .map_or(0, |id| id + 1);
+        self.objects = data.annotations;
+        self.beautification = data.beautification;
+        self.crop = crop;
+        self.next_id = data.next_id.max(highest).max(1);
+        self.renumber_counters();
+        Ok(())
+    }
+
+    fn validate_data(source: &Capture, data: &DocumentData) -> Result<()> {
+        if data.version > DocumentData::VERSION {
+            return Err(Error::InvalidRequest(format!(
+                "document format version {} is newer than supported version {}",
+                data.version,
+                DocumentData::VERSION
+            )));
+        }
+        if data.beautification.is_some() && source.provenance.forbids_compositing() {
+            return Err(Error::InvalidRequest(
+                "beautification is not permitted for window captures (decision D9)".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Every annotation, bottom-most first.
@@ -219,17 +265,48 @@ impl Document {
     /// This, not the pixel size, is the space annotations are authored in.
     #[must_use]
     pub fn logical_size(&self) -> LogicalSize {
-        let scale = self.source.frame.scale.get();
-        LogicalSize::new(
-            self.source.frame.size.width / scale,
-            self.source.frame.size.height / scale,
-        )
+        capture_bounds(&self.source).size
     }
 
     /// The whole source image as a logical rectangle.
     #[must_use]
     pub fn logical_bounds(&self) -> LogicalRect {
         LogicalRect::new(LogicalPoint::new(0.0, 0.0), self.logical_size())
+    }
+
+    /// The crop, if the document has been cropped.
+    #[must_use]
+    pub fn crop(&self) -> Option<LogicalRect> {
+        self.crop
+    }
+
+    /// The region that renders: the crop if there is one, else the whole image.
+    #[must_use]
+    pub fn content_bounds(&self) -> LogicalRect {
+        self.crop.unwrap_or_else(|| self.logical_bounds())
+    }
+
+    /// The rendered size in logical points.
+    #[must_use]
+    pub fn content_size(&self) -> LogicalSize {
+        self.content_bounds().size
+    }
+
+    /// Crops the document to `area`, or clears the crop with `None`.
+    ///
+    /// The rectangle is clamped to the source: a crop dragged past the edge
+    /// trims to the edge rather than inventing transparent margin, which is
+    /// what the drag gesture visibly promises.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if the rectangle is not finite, or if
+    /// clamping leaves it with no area — an empty crop would render a
+    /// zero-pixel image, and silently ignoring the request would leave the
+    /// editor showing a selection the document does not have.
+    pub fn set_crop(&mut self, area: Option<LogicalRect>) -> Result<()> {
+        self.crop = normalize_crop(self.logical_bounds(), area)?;
+        Ok(())
     }
 
     /// Adds an annotation on top of everything else.
@@ -462,6 +539,49 @@ impl Document {
             }
         }
     }
+}
+
+fn capture_bounds(source: &Capture) -> LogicalRect {
+    let scale = source.frame.scale.get();
+    LogicalRect::new(
+        LogicalPoint::new(0.0, 0.0),
+        LogicalSize::new(
+            source.frame.size.width / scale,
+            source.frame.size.height / scale,
+        ),
+    )
+}
+
+fn normalize_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<Option<LogicalRect>> {
+    let Some(area) = area else {
+        return Ok(None);
+    };
+    if ![
+        area.origin.x,
+        area.origin.y,
+        area.size.width,
+        area.size.height,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        return Err(Error::InvalidRequest(
+            "crop rectangle must be finite".to_owned(),
+        ));
+    }
+    let left = area.origin.x.max(bounds.origin.x);
+    let top = area.origin.y.max(bounds.origin.y);
+    let right = geom::max_x(&area).min(geom::max_x(&bounds));
+    let bottom = geom::max_y(&area).min(geom::max_y(&bounds));
+    if right - left <= 0.0 || bottom - top <= 0.0 {
+        return Err(Error::InvalidRequest(
+            "crop rectangle does not overlap the capture".to_owned(),
+        ));
+    }
+    let clamped = geom::from_edges(left, top, right, bottom);
+    // A crop that covers everything is no crop: storing it would make `crop()`
+    // report a crop the user cannot see and cannot clear.
+    Ok((clamped != bounds).then_some(clamped))
 }
 
 /// A borrowed, invariant-preserving handle to one annotation.

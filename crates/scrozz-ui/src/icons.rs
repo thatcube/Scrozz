@@ -120,6 +120,7 @@ icons! {
     Palette => "palette",
     Pencil => "pencil",
     Pin => "pin",
+    Pointer => "pointer",
     Power => "power",
     Scan => "scan",
     Settings => "settings",

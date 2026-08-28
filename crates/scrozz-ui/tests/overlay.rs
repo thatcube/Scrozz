@@ -405,6 +405,11 @@ fn the_viewport_is_a_borderless_transparent_always_on_top_panel() {
     assert_eq!(builder.taskbar, Some(false), "no Dock or taskbar entry");
     assert_eq!(builder.resizable, Some(false));
     assert_eq!(
+        builder.drag_and_drop,
+        Some(false),
+        "the Windows source overlay must not register as its own inbound drop target"
+    );
+    assert_eq!(
         builder.active,
         Some(false),
         "the overlay must never take focus when it appears"

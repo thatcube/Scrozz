@@ -417,7 +417,26 @@ pub enum OverlayEvent {
         /// Where the pointer was, in window coordinates.
         at: Pos2,
     },
-    /// A drag committed to leaving the pile.
+    /// A drag committed to leaving the pile *while the button is still down*.
+    ///
+    /// This is the one the host acts on: it is the last moment at which a
+    /// native drag session can still be started. The overlay makes no further
+    /// claim about the card — it will spring back on release — and the platform
+    /// drag becomes the sole authority on what happens next. The host removes
+    /// the card only once the drop is accepted.
+    DragOutArmed {
+        /// The card.
+        id: CardId,
+        /// Where the card is on screen right now, in window coordinates. The
+        /// platform uses this as the drag image's starting frame.
+        card: Rect,
+        /// Where the pointer is right now, in window coordinates.
+        pointer: Pos2,
+    },
+    /// A drag committed to leaving the pile, observed at release.
+    ///
+    /// Emitted only when no host took over via [`OverlayEvent::DragOutArmed`],
+    /// so a platform without a native drag source still sees the gesture.
     DragOut {
         /// The card.
         id: CardId,
@@ -436,6 +455,7 @@ pub enum OverlayEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
     Dismiss(CardId),
+    SettleDrag { id: CardId, accepted: bool },
     DismissAll,
     Collapse,
     Expand,
@@ -477,6 +497,17 @@ impl OverlayHandle {
         self.wake();
     }
 
+    /// Places an event in the outbox as though the overlay had raised it.
+    ///
+    /// The renderer does not use this — it emits directly. This is for a host
+    /// that notices something natively which the renderer cannot see, and for
+    /// tests that need to drive a host's event translation without a window.
+    pub fn report(&self, event: OverlayEvent) {
+        if let Ok(mut q) = self.shared.outbox.lock() {
+            q.push(event);
+        }
+    }
+
     /// Take everything that has happened since the last call.
     #[must_use]
     pub fn drain_events(&self) -> Vec<OverlayEvent> {
@@ -490,6 +521,30 @@ impl OverlayHandle {
     /// Retire one card.
     pub fn dismiss(&self, id: CardId) {
         self.command(Command::Dismiss(id));
+    }
+
+    /// Reports that the native drag for `id` has finished.
+    ///
+    /// # Why the host has to tell the overlay this
+    ///
+    /// Once a drag-out is armed the platform owns the gesture, and every
+    /// platform runs it as a *modal* loop: AppKit's dragging session and
+    /// Windows' `DoDragDrop` both pump events themselves until the drop is
+    /// over. The mouse-up that ended the drag is consumed in there and never
+    /// reaches egui, so the surface's own `drag_stopped` may simply never fire.
+    ///
+    /// Left alone, the card stays held and displaced under a pointer that is no
+    /// longer pressing it, and — because a gesture is only armed once — it can
+    /// never be dragged again. The window looks broken and nothing has logged a
+    /// thing.
+    ///
+    /// So the outcome comes back the way it went out: explicitly. Call this for
+    /// **every** ending, not just the happy one. `accepted` distinguishes a
+    /// drop something took from one that was cancelled, refused, or failed; all
+    /// four release the gesture, and only the first is followed by the host
+    /// retiring the card.
+    pub fn settle_drag(&self, id: CardId, accepted: bool) {
+        self.command(Command::SettleDrag { id, accepted });
     }
 
     /// Retire every card.
@@ -576,7 +631,10 @@ pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
         .with_has_shadow(false)
         .with_taskbar(false)
         .with_resizable(false)
-        .with_drag_and_drop(true)
+        // Windows otherwise registers this full-work-area, always-on-top
+        // source window as an inbound OLE drop target. It can then accept its
+        // own outgoing CF_HDROP before the application underneath ever sees it.
+        .with_drag_and_drop(false)
         .with_always_on_top()
         // Do not take focus when the window opens. On macOS the real guarantee
         // is the `NSPanel` conversion; this is the portable half of it.
@@ -800,6 +858,11 @@ pub struct OverlayApp {
     hovered: Option<CardId>,
     dock_collapsed: bool,
     dragging: Option<CardId>,
+    /// The card whose drag-out a host has already been handed, if any.
+    ///
+    /// Set the instant the live gesture commits, so the release path knows the
+    /// platform now owns this drag and must not be told about it a second time.
+    armed: Option<CardId>,
 }
 
 impl OverlayApp {
@@ -856,6 +919,7 @@ impl OverlayApp {
             hovered: None,
             dock_collapsed: false,
             dragging: None,
+            armed: None,
         }
     }
 
@@ -951,6 +1015,20 @@ impl OverlayApp {
                             reason: DismissReason::Programmatic,
                         });
                     }
+                }
+                Command::SettleDrag { id, accepted } => {
+                    // Uniform on purpose: cancelled, refused and failed are
+                    // three ways of saying the card did not go anywhere, and
+                    // the card's answer to all three is to sit back down. Only
+                    // the arming state is per-card, so only that is guarded.
+                    let stuck = self.stack.settle_drag(id, m);
+                    if self.armed == Some(id) {
+                        self.armed = None;
+                    }
+                    if self.dragging == Some(id) {
+                        self.dragging = None;
+                    }
+                    tracing::debug!(card = id.0, accepted, stuck, "overlay: native drag settled");
                 }
                 Command::DismissAll => {
                     let ids: Vec<CardId> = self.stack.cards().iter().map(|c| c.id()).collect();
@@ -1221,13 +1299,37 @@ impl eframe::App for OverlayApp {
             && self.stack.begin_drag(id, pointer, &m)
         {
             self.dragging = Some(id);
+            self.armed = None;
             self.emit(OverlayEvent::DragStarted { id, at: pointer });
         }
         if let Some(p) = drag_to {
             self.stack.drag_to(p, &m);
         }
+        // Hand a committed drag-out over *before* the button comes up. AppKit
+        // will not start a dragging session from a released mouse, so waiting
+        // for `drag_stopped()` is waiting until it is too late — that is
+        // precisely the bug where the card animates away and nothing ever
+        // drops.
+        if self.armed.is_none()
+            && let Some(live) = self.stack.live_gesture(&m)
+            && live.intent == Intent::DragOut
+        {
+            self.armed = Some(live.id);
+            self.emit(OverlayEvent::DragOutArmed {
+                id: live.id,
+                card: live.rect,
+                pointer: live.pointer,
+            });
+        }
         if drag_end {
-            if let Some(release) = self.stack.release_drag(&m) {
+            if self.armed.is_some() {
+                // The platform owns this gesture now. The card springs back to
+                // its slot and stays there; it leaves the pile only if the drop
+                // is accepted, which the host reports separately. Re-emitting
+                // the drag-out here would race the native session and retire a
+                // capture that was never delivered (D14).
+                self.stack.cancel_drag(&m);
+            } else if let Some(release) = self.stack.release_drag(&m) {
                 let at = release.rect.center();
                 match release.intent {
                     Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
@@ -1236,15 +1338,12 @@ impl eframe::App for OverlayApp {
                     }),
                     Intent::DragOut => {
                         self.emit(OverlayEvent::DragOut { id: release.id, at });
-                        self.emit(OverlayEvent::Dismissed {
-                            id: release.id,
-                            reason: DismissReason::DragOut,
-                        });
                     }
                     Intent::Collapse | Intent::SpringBack => {}
                 }
             }
             self.dragging = None;
+            self.armed = None;
         }
         if let Some((id, a)) = action {
             self.handle_action(id, a, &m);

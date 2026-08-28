@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use scrozz_core::SelectionCapabilities;
+use scrozz_core::{Capture, SelectionCapabilities};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, KeyState, Permissions, ScreenshotSound, Session,
     SystemPermissions, Tray, TrayAction,
@@ -41,8 +41,9 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
-        card::{CardEvent, CardSurface},
-        pipeline::{Job, Outcome, Pipeline},
+        card::{CardEvent, CardId, CardSurface},
+        drag::{DragHost, DragSpot},
+        pipeline::{CaptureBytes, Job, Outcome, Pipeline},
         selection::CaptureSelector,
         server::{Forwarder, Server},
     },
@@ -50,7 +51,11 @@ use crate::{
     report::Report,
     shortcuts::{ShortcutAction, ShortcutStore, Shortcuts},
 };
-use scrozz_ui::settings::{ShortcutEdit, ShortcutRow};
+use scrozz_shell::DragOutcome;
+use scrozz_ui::{
+    editor::{EditorUi, RevisionedFrame},
+    settings::{ShortcutEdit, ShortcutRow},
+};
 
 /// The binding table a set of configured shortcuts asks for.
 ///
@@ -290,13 +295,23 @@ pub struct App {
     pipeline: Pipeline,
     tray: Option<Tray>,
     hotkeys: GlobalHotkeys,
+    /// Which surfaces currently hold the keyboard, as a bit per
+    /// [`KeyboardOwner`]. See [`App::set_keyboard_owner`].
+    keyboard_owners: u8,
     server: Option<Server>,
     forwarder: Option<Forwarder>,
     selector: Arc<dyn CaptureSelector>,
+    drag: DragHost,
     started: Instant,
     captures: u64,
     sound_warning_shown: bool,
     settings_requested: bool,
+    editor_request: Option<EditorRequest>,
+    /// The one editor revision currently being prepared on the worker.
+    editor_render_pending: Option<(CardId, u64, u64)>,
+    /// A failed version is not retried until the document or editor changes.
+    editor_render_failed: Option<(CardId, u64, u64)>,
+    next_editor_generation: u64,
     notes: Vec<String>,
     shortcuts: Shortcuts,
     shortcut_store: Option<ShortcutStore>,
@@ -304,6 +319,81 @@ pub struct App {
     session: Session,
     selection_capabilities: SelectionCapabilities,
     capture_backend_ready: bool,
+}
+
+/// A capture the annotation editor has been asked to open.
+#[derive(Debug)]
+pub struct EditorRequest {
+    /// The card it came from, so copy and save can be attributed and the
+    /// finished image can be sent back through the same worker.
+    pub card: CardId,
+    /// Uniquely identifies this opening of the editor.
+    pub generation: u64,
+    /// The decoded capture.
+    pub capture: Capture,
+}
+
+/// The live editor state available during one host pass.
+#[derive(Clone, Copy)]
+pub struct EditorSnapshot<'a> {
+    card: CardId,
+    generation: u64,
+    editor: &'a EditorUi,
+}
+
+impl<'a> EditorSnapshot<'a> {
+    /// Couples an editor with the card whose document it owns.
+    #[must_use]
+    pub const fn new(card: CardId, generation: u64, editor: &'a EditorUi) -> Self {
+        Self {
+            card,
+            generation,
+            editor,
+        }
+    }
+
+    fn for_card(self, card: CardId) -> Option<Self> {
+        (self.card == card).then_some(self)
+    }
+
+    fn render(self) -> CliResult<RevisionedFrame> {
+        self.editor.render().map_err(CliError::Core)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CardOutput {
+    Copy,
+    Save,
+}
+
+impl CardOutput {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Save => "save",
+        }
+    }
+}
+
+/// A surface that can take the keyboard away from the global hotkeys.
+///
+/// See [`App::set_keyboard_owner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyboardOwner {
+    /// The annotation editor window.
+    Editor,
+    /// A shortcut row in Settings that is armed and waiting for a chord.
+    ShortcutRecorder,
+}
+
+impl KeyboardOwner {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Editor => 1 << 0,
+            Self::ShortcutRecorder => 1 << 1,
+        }
+    }
 }
 
 impl App {
@@ -400,13 +490,19 @@ impl App {
             pipeline,
             tray,
             hotkeys,
+            keyboard_owners: 0,
             server,
             forwarder,
             selector,
+            drag: DragHost::new(),
             started: Instant::now(),
             captures: 0,
             sound_warning_shown: false,
             settings_requested: false,
+            editor_request: None,
+            editor_render_pending: None,
+            editor_render_failed: None,
+            next_editor_generation: 1,
             notes,
             shortcuts,
             shortcut_store,
@@ -416,6 +512,13 @@ impl App {
             capture_backend_ready,
         };
         app.refresh_tray_shortcuts();
+
+        // A drag that was in flight when a previous run ended left its file
+        // behind on purpose; nothing is ever coming back for it.
+        let swept = app.drag.sweep_orphans();
+        if swept > 0 {
+            tracing::debug!(files = swept, "removed drag files from a previous run");
+        }
 
         if let Some(kind) = app.config.capture_on_start {
             app.begin_capture(kind);
@@ -430,6 +533,17 @@ impl App {
     /// is already in flight before outcomes are drained, and card events last,
     /// so a card presented on this tick can be acted on immediately.
     pub fn tick(&mut self) -> Tick {
+        self.tick_with_editor(None)
+    }
+
+    /// Services every source once with the current editor document available to
+    /// card output actions.
+    ///
+    /// A card being edited must never fall back to its original cached pixels:
+    /// that would let Copy or Save bypass destructive redactions. The snapshot
+    /// is borrowed only for this pass and rendered into an immutable,
+    /// revision-tagged frame before it is sent to the worker.
+    pub fn tick_with_editor(&mut self, editor: Option<EditorSnapshot<'_>>) -> Tick {
         if self.expired() {
             self.note("the run deadline passed");
             return Tick::Stop;
@@ -443,7 +557,8 @@ impl App {
             return Tick::Stop;
         }
         self.drain_pipeline();
-        self.drain_cards();
+        self.drain_cards(editor);
+        self.drain_drags();
 
         Tick::Continue
     }
@@ -470,6 +585,97 @@ impl App {
             }
         }
         Tick::Continue
+    }
+
+    /// Steps the global hotkeys aside while something else owns the keyboard.
+    ///
+    /// Two surfaces need this, and they can be up at the same time. The
+    /// annotation editor binds ⌘C, ⌘S, ⌘Z and more, any of which the user may
+    /// also have bound to a capture. The shortcut recorder in Settings has the
+    /// sharper problem: its whole job is to *observe* a combination, so a global
+    /// hotkey firing on the very keystroke being recorded would take a
+    /// screenshot instead of recording it.
+    ///
+    /// Reserving a fixed list would be wrong twice over — the editor's
+    /// accelerators are not the only ones that can collide, and the capture
+    /// shortcuts are configurable, so the collision set is not known until
+    /// runtime. Suspending the whole set is the only rule that stays true
+    /// whatever either side is bound to.
+    ///
+    /// Ownership is a set rather than a flag because the two overlap: opening
+    /// the editor from the settings window while a row is armed must not hand
+    /// the keyboard back when the editor closes. The keys return when *nobody*
+    /// holds them.
+    ///
+    /// The bindings themselves are untouched throughout, so the menu-bar item
+    /// keeps showing the right shortcut beside each command, and a shortcut
+    /// edited while suspended is the one that comes back.
+    pub fn set_keyboard_owner(&mut self, owner: KeyboardOwner, owns: bool) {
+        let before = self.keyboard_owners;
+        self.keyboard_owners = if owns {
+            before | owner.bit()
+        } else {
+            before & !owner.bit()
+        };
+        if self.keyboard_owners == before {
+            if before != 0 && !self.hotkeys.is_suspended() {
+                // A previous release was partial. The host calls this owner sync
+                // every frame, so keep retrying without repeating the warning.
+                let _ = self.hotkeys.suspend();
+            }
+            return;
+        }
+
+        if self.keyboard_owners == 0 {
+            match self.hotkeys.resume() {
+                Ok(()) => tracing::debug!("global hotkeys resumed"),
+                Err(rejections) => {
+                    // Kept, not dropped: a combination another application took
+                    // while we had it released is still what the user
+                    // configured, and still what Settings should show.
+                    for rejection in &rejections {
+                        tracing::warn!(
+                            action = %rejection.action,
+                            accelerator = %rejection.accelerator,
+                            reason = %rejection.reason,
+                            "a global hotkey could not be re-grabbed"
+                        );
+                    }
+                    self.note(format!(
+                        "{} shortcut(s) could not be restored",
+                        rejections.len()
+                    ));
+                }
+            }
+        } else {
+            let report = self.hotkeys.suspend();
+            if !report.is_complete() {
+                for rejection in report.rejections() {
+                    tracing::warn!(
+                        action = %rejection.action,
+                        accelerator = %rejection.accelerator,
+                        reason = %rejection.reason,
+                        "a global hotkey remained active under an in-app keyboard owner"
+                    );
+                }
+                self.note(format!(
+                    "{} shortcut(s) could not be released for the active keyboard owner",
+                    report.rejections().len()
+                ));
+            }
+        }
+    }
+
+    /// Whether the global hotkeys are currently stood down.
+    #[must_use]
+    pub fn hotkeys_suspended(&self) -> bool {
+        self.hotkeys.is_suspended()
+    }
+
+    /// Whether `owner` currently holds the keyboard.
+    #[must_use]
+    pub const fn owns_keyboard(&self, owner: KeyboardOwner) -> bool {
+        self.keyboard_owners & owner.bit() != 0
     }
 
     fn drain_hotkeys(&mut self) {
@@ -574,6 +780,44 @@ impl App {
                 Outcome::Done { card, detail } => {
                     self.note(format!("{card} {detail}"));
                 }
+                Outcome::Opened { card, capture } => {
+                    let generation = self.next_editor_generation;
+                    self.next_editor_generation = self.next_editor_generation.wrapping_add(1);
+                    self.editor_request = Some(EditorRequest {
+                        card,
+                        generation,
+                        capture: *capture,
+                    });
+                }
+                Outcome::Prepared {
+                    card,
+                    generation,
+                    revision,
+                } => {
+                    let version = (card, generation, revision);
+                    if self.editor_render_pending == Some(version) {
+                        self.editor_render_pending = None;
+                    }
+                    if self.editor_render_failed == Some(version) {
+                        self.editor_render_failed = None;
+                    }
+                }
+                Outcome::PreparationFailed {
+                    card,
+                    generation,
+                    revision,
+                    error,
+                } => {
+                    let version = (card, generation, revision);
+                    if self.editor_render_pending == Some(version) {
+                        self.editor_render_pending = None;
+                    }
+                    self.editor_render_failed = Some(version);
+                    self.note(format!(
+                        "{card} editor {generation} revision {revision} could not be prepared for \
+                         drag: {error}"
+                    ));
+                }
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
@@ -581,7 +825,7 @@ impl App {
         }
     }
 
-    fn drain_cards(&mut self) {
+    fn drain_cards(&mut self, editor: Option<EditorSnapshot<'_>>) {
         let mut pending = Vec::new();
         while let Some(event) = self.surface.poll() {
             pending.push(event);
@@ -590,10 +834,10 @@ impl App {
         for event in pending {
             match event {
                 CardEvent::Copy(id) => {
-                    self.pipeline.post(Job::Copy(id));
+                    self.post_card_output(id, CardOutput::Copy, editor);
                 }
                 CardEvent::Save(id) => {
-                    self.pipeline.post(Job::Save(id));
+                    self.post_card_output(id, CardOutput::Save, editor);
                 }
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
@@ -602,12 +846,202 @@ impl App {
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
                 }
-                // Not yet routed. The drag payload is `scrozz-shell`'s
-                // `DragSource`, and collapsing into the dock is the capture
-                // stack's own animation — both belong to the surface that
-                // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
+                CardEvent::Open(id) => {
+                    // Decoding happens on the worker, so the click that opens
+                    // the editor never inflates a 6K PNG on the UI thread.
+                    self.pipeline.post(Job::Open(id));
+                }
+                CardEvent::Drag { card, at } => self.begin_drag(card, at, editor),
+                // Collapsing into the dock is the capture stack's own animation
+                // and belongs to the surface that raised the event once there
+                // is one that can perform it.
+                CardEvent::Collapse(id) => {
                     self.note(format!("{id}: {event:?} is not routed yet"));
+                }
+            }
+        }
+    }
+
+    fn post_card_output(
+        &mut self,
+        card: CardId,
+        output: CardOutput,
+        editor: Option<EditorSnapshot<'_>>,
+    ) {
+        let job = match Self::card_output_job(card, output, editor) {
+            Ok(job) => job,
+            Err(error) => {
+                self.note(format!(
+                    "{card} could not be rendered for {}: {error}",
+                    output.label()
+                ));
+                return;
+            }
+        };
+
+        if !self.pipeline.post(job) {
+            self.note(format!(
+                "{card} could not be queued for {}: the capture worker has gone",
+                output.label()
+            ));
+        }
+    }
+
+    fn card_output_job(
+        card: CardId,
+        output: CardOutput,
+        editor: Option<EditorSnapshot<'_>>,
+    ) -> CliResult<Job> {
+        let Some(editor) = editor.and_then(|editor| editor.for_card(card)) else {
+            return Ok(match output {
+                CardOutput::Copy => Job::Copy(card),
+                CardOutput::Save => Job::Save(card),
+            });
+        };
+
+        let rendered = Box::new(editor.render()?);
+        Ok(match output {
+            CardOutput::Copy => Job::CopyImage { card, rendered },
+            CardOutput::Save => Job::SaveImage { card, rendered },
+        })
+    }
+
+    /// Starts any native drag the surface armed during the frame just drawn.
+    ///
+    /// **Must be called from the UI pass, immediately after the surface has
+    /// drawn.** `beginDraggingSessionWithItems:` on macOS and `DoDragDrop` on
+    /// Windows both seize the mouse from where it is *now*, so they only work
+    /// while the button the user is holding is still down. [`Self::tick`] runs
+    /// in the host's logic pass, which precedes the UI pass that produces the
+    /// gesture — draining there means acting a whole frame late, on a button
+    /// that may already be up. That is the bug this method exists to close, and
+    /// it is why the drag path is the one thing that does not wait its turn.
+    ///
+    /// Returns how many drags were started, which is what the ordering test
+    /// asserts on.
+    pub fn pump_drag_starts(&mut self) -> usize {
+        self.pump_drag_starts_with_editor(None)
+    }
+
+    /// Starts native drags with the current editor document available.
+    ///
+    /// If the dragged card is being edited, the drag payload is rendered from
+    /// that exact revision. A failed render refuses the drag; it never falls
+    /// back to the vault's original pixels and risk exposing data under a
+    /// destructive redaction.
+    pub fn pump_drag_starts_with_editor(&mut self, editor: Option<EditorSnapshot<'_>>) -> usize {
+        let armed = self.surface.poll_drag_starts();
+        let mut started = 0;
+        for event in armed {
+            if let CardEvent::Drag { card, at } = event {
+                self.begin_drag(card, at, editor);
+                started += 1;
+            }
+        }
+        started
+    }
+
+    /// Hands a card to the platform's drag machinery.
+    ///
+    /// Called while the mouse button is still down — see [`crate::gui::drag`]
+    /// for why that is the only moment this can work. The card stays where it
+    /// is; [`Self::drain_drags`] removes it if and only if something accepts
+    /// the drop.
+    fn begin_drag(&mut self, card: CardId, at: DragSpot, editor: Option<EditorSnapshot<'_>>) {
+        if !self.drag.is_attached()
+            && let Some(surface) = self.surface.native_surface()
+        {
+            self.drag.attach(surface);
+        }
+
+        let bytes = match self.drag_bytes(card, editor) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.surface.settle_drag(card, false);
+                self.note(format!("{card} could not be rendered for drag: {error}"));
+                return;
+            }
+        };
+
+        match self.drag.begin(card, at, &bytes) {
+            Ok(()) => tracing::debug!(
+                %card,
+                revision = bytes.revision(),
+                "drag started from a rendered document revision"
+            ),
+            // Visible, not silent: a drag that quietly does nothing is exactly
+            // the failure this whole path exists to remove.
+            Err(why) => {
+                self.surface.settle_drag(card, false);
+                self.note(format!("{card} could not be dragged: {why}"));
+            }
+        }
+    }
+
+    fn drag_bytes(
+        &self,
+        card: CardId,
+        editor: Option<EditorSnapshot<'_>>,
+    ) -> CliResult<CaptureBytes> {
+        if let Some(editor) = editor.and_then(|editor| editor.for_card(card)) {
+            let revision = editor.editor.state().revision();
+            return self
+                .pipeline
+                .captures()
+                .get_revision(card, editor.generation, revision)
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "{card} editor {} revision {revision} is still being prepared for drag",
+                        editor.generation
+                    ))
+                });
+        }
+
+        self.pipeline
+            .captures()
+            .get(card)
+            .ok_or_else(|| CliError::usage(format!("{card} has no capture to drag")))
+    }
+
+    /// Services drags already under way.
+    ///
+    /// Three jobs: release the surface's gesture whatever happened, take a card
+    /// off the stack once its drop was accepted, and keep sweeping the
+    /// temporary file afterwards until the retention window closes.
+    ///
+    /// The gesture release is unconditional and comes first. The platform's
+    /// drag loop is modal and may have eaten the mouse-up the surface was
+    /// waiting for, so this is the only reliable moment the card is known to be
+    /// free — and a card left armed can never be dragged again.
+    fn drain_drags(&mut self) {
+        for (card, outcome) in self.drag.poll() {
+            let accepted = matches!(outcome, DragOutcome::Accepted { .. });
+            self.surface.settle_drag(card, accepted);
+
+            match outcome {
+                DragOutcome::Accepted { .. } => {
+                    self.surface.dismiss(card);
+                    self.pipeline.post(Job::Release(card));
+                    self.note(format!("{card} dropped"));
+                }
+                // The card stays. Said out loud rather than logged quietly:
+                // "I dragged it and nothing happened" is the complaint this
+                // whole path exists to answer, and the three reasons it can
+                // happen are worth telling apart.
+                DragOutcome::Cancelled => {
+                    tracing::debug!(%card, "drag cancelled");
+                }
+                DragOutcome::Rejected => {
+                    self.note(format!("{card} was not accepted there"));
+                }
+                DragOutcome::Failed(why) => {
+                    self.note(format!("{card} could not be dropped: {why}"));
+                }
+                // The enum is `#[non_exhaustive]`. A future outcome this build
+                // has never heard of still has to release the gesture, which it
+                // already did above — so the only thing left is to say so.
+                other => {
+                    tracing::warn!(%card, ?other, "drag ended in an unrecognised way");
                 }
             }
         }
@@ -890,6 +1324,68 @@ impl App {
         std::mem::take(&mut self.settings_requested)
     }
 
+    /// Takes a pending request to open the annotation editor.
+    pub fn take_editor_request(&mut self) -> Option<EditorRequest> {
+        self.editor_request.take()
+    }
+
+    /// Asks the worker to prepare the latest settled editor revision for drag.
+    ///
+    /// At most one full-resolution render is in flight, so a continuous drawing
+    /// gesture cannot fill the worker queue with obsolete documents. Once that
+    /// render returns, the next frame submits the newest revision if the editor
+    /// moved on. Drag refuses while the exact revision is unavailable.
+    pub fn prepare_editor(&mut self, editor: EditorSnapshot<'_>) {
+        let revision = editor.editor.state().revision();
+        let version = (editor.card, editor.generation, revision);
+        let captures = self.pipeline.captures();
+        if editor.editor.state().is_dragging()
+            || captures.get(editor.card).is_none()
+            || captures
+                .get_revision(editor.card, editor.generation, revision)
+                .is_some()
+            || self.editor_render_pending.is_some()
+            || self.editor_render_failed == Some(version)
+        {
+            return;
+        }
+
+        let job = Job::PrepareImage {
+            card: editor.card,
+            generation: editor.generation,
+            revision,
+            data: Box::new(editor.editor.document().data()),
+        };
+        if self.pipeline.post(job) {
+            self.editor_render_pending = Some(version);
+        } else {
+            self.note(format!(
+                "{} editor {} revision {revision} could not be queued for drag preparation: \
+                 the capture worker has gone",
+                editor.card, editor.generation
+            ));
+        }
+    }
+
+    /// Copies an image the editor has flattened.
+    ///
+    /// Routed through the worker so the PNG encode and the clipboard write stay
+    /// off the UI thread, exactly like a card's own copy.
+    pub fn copy_rendered(&mut self, card: CardId, rendered: RevisionedFrame) {
+        self.pipeline.post(Job::CopyImage {
+            card,
+            rendered: Box::new(rendered),
+        });
+    }
+
+    /// Saves an image the editor has flattened.
+    pub fn save_rendered(&mut self, card: CardId, rendered: RevisionedFrame) {
+        self.pipeline.post(Job::SaveImage {
+            card,
+            rendered: Box::new(rendered),
+        });
+    }
+
     /// How many cards are on screen.
     #[must_use]
     pub fn showing(&self) -> usize {
@@ -995,6 +1491,10 @@ mod tests {
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
+    use scrozz_core::{
+        CaptureTarget, ColorSpace, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
+        PixelFormat, Provenance, ScaleFactor,
+    };
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
@@ -1017,6 +1517,45 @@ mod tests {
         app.shortcuts = shortcuts.clone();
         app.config.shortcuts = shortcuts;
         app
+    }
+
+    fn redacted_editor() -> EditorUi {
+        let (width, height) = (64u32, 64u32);
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                data.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8, 255]);
+            }
+        }
+        let bounds = LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            LogicalSize::new(f64::from(width), f64::from(height)),
+        );
+        let capture = Capture {
+            frame: scrozz_core::Frame {
+                data,
+                size: PhysicalSize::new(f64::from(width), f64::from(height)),
+                stride: width as usize * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(bounds),
+        };
+        let mut editor = EditorUi::new(scrozz_annotate::Document::new(capture));
+        editor
+            .state_mut()
+            .set_tool(scrozz_ui::editor::Tool::Pixelate);
+        editor
+            .state_mut()
+            .pointer_pressed(LogicalPoint::new(8.0, 8.0));
+        editor
+            .state_mut()
+            .pointer_dragged(LogicalPoint::new(56.0, 56.0), false);
+        editor.state_mut().pointer_released();
+        assert!(editor.state().revision() > 0);
+        editor
     }
 
     #[test]
@@ -1151,6 +1690,134 @@ mod tests {
     }
 
     #[test]
+    fn a_new_app_has_its_hotkeys_live() {
+        let (app, _) = app();
+        assert!(!app.hotkeys_suspended());
+    }
+
+    #[test]
+    fn opening_the_editor_stands_the_hotkeys_down() {
+        let (mut app, _) = app();
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        assert!(
+            app.hotkeys_suspended(),
+            "the editor's own accelerators must be the only ones that fire"
+        );
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, false);
+        assert!(
+            !app.hotkeys_suspended(),
+            "closing the editor gives the capture shortcuts back"
+        );
+    }
+
+    #[test]
+    fn the_editor_lifecycle_is_idempotent() {
+        let (mut app, _) = app();
+
+        // A per-frame sync calls this with the same answer over and over.
+        for _ in 0..3 {
+            app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        }
+        assert!(app.hotkeys_suspended());
+        for _ in 0..3 {
+            app.set_keyboard_owner(KeyboardOwner::Editor, false);
+        }
+        assert!(!app.hotkeys_suspended());
+    }
+
+    #[test]
+    fn the_recorder_stands_the_hotkeys_down_on_its_own() {
+        // Pressing an existing binding while arming a new one must record it,
+        // not fire a capture.
+        let (mut app, _) = app();
+
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, true);
+        assert!(app.hotkeys_suspended());
+
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, false);
+        assert!(!app.hotkeys_suspended());
+    }
+
+    #[test]
+    fn two_owners_overlapping_keep_the_keyboard_until_both_let_go() {
+        // Settings can open the editor, so the two claims genuinely overlap.
+        // Releasing one while the other still holds it would hand the shortcuts
+        // back underneath whoever is left.
+        let (mut app, _) = app();
+
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, true);
+        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        assert!(app.hotkeys_suspended());
+
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, false);
+        assert!(app.hotkeys_suspended(), "the editor still has the keyboard");
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, false);
+        assert!(
+            !app.hotkeys_suspended(),
+            "nobody is left holding it, so the shortcuts come back"
+        );
+    }
+
+    #[test]
+    fn releasing_in_the_other_order_works_too() {
+        let (mut app, _) = app();
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, true);
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, false);
+        assert!(app.hotkeys_suspended(), "the recorder still has it");
+
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, false);
+        assert!(!app.hotkeys_suspended());
+    }
+
+    #[test]
+    fn each_owner_is_tracked_separately() {
+        let (mut app, _) = app();
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        assert!(app.owns_keyboard(KeyboardOwner::Editor));
+        assert!(!app.owns_keyboard(KeyboardOwner::ShortcutRecorder));
+
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, true);
+        assert!(app.owns_keyboard(KeyboardOwner::Editor));
+        assert!(app.owns_keyboard(KeyboardOwner::ShortcutRecorder));
+    }
+
+    #[test]
+    fn releasing_an_owner_that_never_held_it_changes_nothing() {
+        // The per-frame sync passes `false` on every frame the editor is shut.
+        let (mut app, _) = app();
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        for _ in 0..3 {
+            app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, false);
+        }
+        assert!(
+            app.hotkeys_suspended(),
+            "a release from a non-owner released somebody else's claim"
+        );
+    }
+
+    #[test]
+    fn suspension_does_not_disturb_the_configuration() {
+        let (mut app, _) = app();
+        let before = app.config.bindings.len();
+
+        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+
+        assert_eq!(
+            app.config.bindings.len(),
+            before,
+            "the configured shortcuts are what the tray and settings read"
+        );
+    }
+
+    #[test]
     fn a_sealed_app_touches_nothing() {
         let (app, _) = app();
         assert!(app.tray.is_none(), "no menu-bar item");
@@ -1230,15 +1897,195 @@ mod tests {
     }
 
     #[test]
+    fn card_copy_and_save_use_the_live_revision_when_the_editor_owns_the_card() {
+        let editor = redacted_editor();
+        let card = CardId(42);
+        let expected = editor.state().revision();
+        let snapshot = Some(EditorSnapshot::new(card, 1, &editor));
+
+        for output in [CardOutput::Copy, CardOutput::Save] {
+            let job = App::card_output_job(card, output, snapshot).expect("the document renders");
+            let rendered = match job {
+                Job::CopyImage {
+                    card: got,
+                    rendered,
+                }
+                | Job::SaveImage {
+                    card: got,
+                    rendered,
+                } => {
+                    assert_eq!(got, card);
+                    rendered
+                }
+                Job::Copy(_) | Job::Save(_) => {
+                    panic!("an edited card fell back to its original capture")
+                }
+                _ => panic!("the card output was routed to an unrelated job"),
+            };
+            assert_eq!(
+                rendered.revision(),
+                expected,
+                "the worker must receive the exact revision the user approved"
+            );
+            assert_ne!(
+                rendered.frame().data,
+                editor.document().source.frame.data,
+                "the destructive redaction was bypassed with the original pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_waits_for_the_live_redacted_revision_instead_of_using_the_card_cache() {
+        let (mut app, _) = app();
+        let editor = redacted_editor();
+        let card = CardId(7);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, &editor.document().source)
+            .expect("the original capture encodes");
+        let original = app
+            .pipeline
+            .captures()
+            .get(card)
+            .expect("the card capture is cached");
+        let generation = 7;
+        let snapshot = EditorSnapshot::new(card, generation, &editor);
+
+        let stale = match app.drag_bytes(card, Some(snapshot)) {
+            Ok(_) => panic!("the original bytes stood in for an edited revision"),
+            Err(error) => error,
+        };
+        assert!(
+            stale.to_string().contains("still being prepared"),
+            "the safe refusal should explain itself: {stale}"
+        );
+
+        app.prepare_editor(snapshot);
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if app
+                .pipeline
+                .captures()
+                .get_revision(card, generation, editor.state().revision())
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let bytes = app
+            .drag_bytes(card, Some(snapshot))
+            .expect("the prepared edited revision is ready");
+        let decoded = scrozz_export::decode(&bytes.full).expect("the drag payload is a PNG");
+
+        assert_eq!(bytes.generation(), Some(generation));
+        assert_eq!(bytes.revision(), editor.state().revision());
+        assert_ne!(
+            decoded.data,
+            editor.document().source.frame.data,
+            "drag exposed the original pixels under a destructive redaction"
+        );
+        let after = app
+            .pipeline
+            .captures()
+            .get(card)
+            .expect("preparing an edit must not replace the card capture");
+        assert_eq!(after.revision(), 0);
+        assert_eq!(
+            after.full, original.full,
+            "closing the editor must still expose the untouched card capture"
+        );
+
+        let reopened = EditorSnapshot::new(card, generation + 1, &editor);
+        assert!(
+            app.drag_bytes(card, Some(reopened)).is_err(),
+            "a new editor lifetime reused an old lifetime's matching revision"
+        );
+    }
+
+    #[test]
+    fn a_failed_editor_version_is_not_prepared_again_every_frame() {
+        let (mut app, _) = app();
+        let editor = redacted_editor();
+        let card = CardId(9);
+        let generation = 3;
+        app.pipeline
+            .captures()
+            .store_test_capture(card, &editor.document().source)
+            .expect("the original capture encodes");
+        let version = (card, generation, editor.state().revision());
+        app.editor_render_failed = Some(version);
+
+        app.prepare_editor(EditorSnapshot::new(card, generation, &editor));
+
+        assert_eq!(
+            app.editor_render_pending, None,
+            "an unchanged terminal failure was queued again"
+        );
+    }
+
+    #[test]
+    fn a_released_card_is_not_prepared_again_for_later_editor_frames() {
+        let (mut app, _) = app();
+        let editor = redacted_editor();
+
+        app.prepare_editor(EditorSnapshot::new(CardId(404), 1, &editor));
+
+        assert_eq!(
+            app.editor_render_pending, None,
+            "a missing card queued a render that can only fail"
+        );
+    }
+
+    #[test]
     fn an_unrouted_card_gesture_is_recorded_not_swallowed() {
         let (mut app, surface) = app();
-        surface.inject(CardEvent::Drag(CardId(5)));
+        surface.inject(CardEvent::Collapse(CardId(5)));
         app.tick();
         assert!(
             app.notes().iter().any(|n| n.contains("not routed yet")),
             "{:?}",
             app.notes()
         );
+    }
+
+    #[test]
+    fn a_drag_without_a_capture_is_refused_in_writing() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Drag {
+            card: CardId(5),
+            at: DragSpot {
+                card: [0.0, 0.0, 200.0, 140.0],
+                pointer: [100.0, 70.0],
+            },
+        });
+        app.tick();
+
+        // The recording surface has no window, and card 5 was never captured.
+        // Either way the user is told, because a drag that silently does
+        // nothing is the failure this path exists to remove.
+        assert!(
+            app.notes()
+                .iter()
+                .any(|n| n.contains("card:5 has no capture to drag")
+                    || n.contains("card:5 could not be dragged")),
+            "{:?}",
+            app.notes()
+        );
+        assert!(
+            surface.trace().contains(&SurfaceCall::Settle {
+                id: CardId(5),
+                accepted: false,
+            }),
+            "a refused native start left the overlay gesture armed"
+        );
+    }
+
+    #[test]
+    fn nothing_is_in_flight_before_a_drag_starts() {
+        let (app, _) = app();
+        assert_eq!(app.drag.in_flight(), 0);
     }
 
     #[test]
@@ -1381,5 +2228,216 @@ mod tests {
         assert_eq!(menu.len(), TrayAction::ALL.len());
         assert!(menu.contains(&Action::Quit));
         assert!(menu.contains(&Action::Capture(CaptureKind::Fullscreen)));
+    }
+
+    // -----------------------------------------------------------------------
+    // When the drag starts, not just that it starts
+    // -----------------------------------------------------------------------
+    //
+    // The original bug produced entirely correct events, one frame too late.
+    // `beginDraggingSessionWithItems:` and `DoDragDrop` both take the mouse
+    // from where it is *now*, so a drag armed during the UI pass and acted on
+    // during the next logic pass is acted on after the button came up — and
+    // the platform simply refuses. Tests that only assert the event was
+    // produced cannot see that, so these assert on the order of the calls.
+
+    use crate::gui::card::SurfaceCall;
+
+    fn drag_spot() -> DragSpot {
+        DragSpot {
+            card: [10.0, 20.0, 210.0, 150.0],
+            pointer: [60.0, 70.0],
+        }
+    }
+
+    #[test]
+    fn an_armed_drag_is_acted_on_without_waiting_for_a_tick() {
+        // The property, stated exactly: between the surface arming the drag and
+        // the app acting on it, nothing else runs. In particular no `tick`,
+        // which is the pass that used to own this and is a frame away.
+        let (mut app, surface) = app();
+        surface.arm(CardEvent::Drag {
+            card: CardId(1),
+            at: drag_spot(),
+        });
+        surface.clear_trace();
+
+        assert_eq!(app.pump_drag_starts(), 1, "the armed drag was not started");
+        assert_eq!(
+            surface.trace(),
+            vec![
+                SurfaceCall::PollDragStarts,
+                SurfaceCall::Settle {
+                    id: CardId(1),
+                    accepted: false,
+                },
+            ],
+            "the gesture frame may only drain the drag and settle an immediate refusal"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_drain_is_not_what_starts_a_drag() {
+        // If `tick` still started drags, moving the call would be cosmetic and
+        // the bug would survive. It must not: `tick` drains `poll`, and `poll`
+        // is a frame behind.
+        let (mut app, surface) = app();
+        surface.arm(CardEvent::Drag {
+            card: CardId(1),
+            at: drag_spot(),
+        });
+        surface.clear_trace();
+
+        app.tick();
+        assert!(
+            !surface.trace().contains(&SurfaceCall::PollDragStarts),
+            "the logic pass drained the armed drags: {:?}",
+            surface.trace()
+        );
+        assert_eq!(
+            app.pump_drag_starts(),
+            1,
+            "the drag was consumed by the wrong pass and is gone"
+        );
+    }
+
+    #[test]
+    fn pumping_drags_leaves_the_ordinary_events_alone() {
+        // The drag jumps the queue; nothing else may.
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Copy(CardId(2)));
+        surface.arm(CardEvent::Drag {
+            card: CardId(1),
+            at: drag_spot(),
+        });
+
+        assert_eq!(app.pump_drag_starts(), 1);
+        app.tick();
+        assert!(
+            surface.trace().contains(&SurfaceCall::Poll),
+            "the queued copy was never drained"
+        );
+    }
+
+    #[test]
+    fn a_drag_with_no_capture_behind_it_says_so_rather_than_failing_silently() {
+        let (mut app, surface) = app();
+        surface.arm(CardEvent::Drag {
+            card: CardId(77),
+            at: drag_spot(),
+        });
+
+        assert_eq!(app.pump_drag_starts(), 1, "the attempt still counts");
+        assert!(
+            app.notes().iter().any(|n| n.contains("no capture")),
+            "a drag that could not start said nothing: {:?}",
+            app.notes()
+        );
+        assert!(
+            surface.trace().contains(&SurfaceCall::Settle {
+                id: CardId(77),
+                accepted: false,
+            }),
+            "a pre-native refusal left the card held"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Every outcome reaches the card
+    // -----------------------------------------------------------------------
+    //
+    // The platform's drag loop is modal and can consume the mouse-up, so the
+    // surface may never learn the gesture ended. Whatever the outcome, the
+    // gesture is released — and only an accepted drop retires the card.
+
+    /// Runs `drain_drags` against a session that has already finished.
+    fn settle(outcome: DragOutcome) -> (Vec<SurfaceCall>, Vec<String>) {
+        let (mut app, surface) = app();
+        app.drag.adopt_finished(CardId(3), outcome);
+        surface.clear_trace();
+        app.drain_drags();
+        (surface.trace(), app.notes().to_vec())
+    }
+
+    #[test]
+    fn an_accepted_drop_releases_the_gesture_then_retires_the_card() {
+        let (trace, notes) = settle(DragOutcome::Accepted(scrozz_shell::DragOperation::Copy));
+        assert_eq!(
+            trace,
+            vec![
+                SurfaceCall::Settle {
+                    id: CardId(3),
+                    accepted: true
+                },
+                SurfaceCall::Dismiss(CardId(3)),
+            ],
+            "the card was retired before its gesture was released"
+        );
+        assert!(notes.iter().any(|n| n.contains("dropped")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_cancelled_drag_releases_the_gesture_and_keeps_the_card() {
+        let (trace, _) = settle(DragOutcome::Cancelled);
+        assert_eq!(
+            trace,
+            vec![SurfaceCall::Settle {
+                id: CardId(3),
+                accepted: false
+            }],
+            "a cancelled drag must release the gesture and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_rejected_drop_releases_the_gesture_and_says_so() {
+        let (trace, notes) = settle(DragOutcome::Rejected);
+        assert_eq!(
+            trace,
+            vec![SurfaceCall::Settle {
+                id: CardId(3),
+                accepted: false
+            }]
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("not accepted")),
+            "a refused drop was silent: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_drag_releases_the_gesture_and_reports_the_reason() {
+        let (trace, notes) = settle(DragOutcome::Failed("the pasteboard refused".to_owned()));
+        assert_eq!(
+            trace,
+            vec![SurfaceCall::Settle {
+                id: CardId(3),
+                accepted: false
+            }]
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("the pasteboard refused")),
+            "the reason a drag failed was swallowed: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_outcome_is_only_acted_on_once() {
+        // `drain_drags` runs every tick, and the session stays around while its
+        // file is being swept. Reporting twice would dismiss a card the user
+        // had since brought back.
+        let (mut app, surface) = app();
+        app.drag.adopt_finished(
+            CardId(3),
+            DragOutcome::Accepted(scrozz_shell::DragOperation::Copy),
+        );
+        app.drain_drags();
+        surface.clear_trace();
+        app.drain_drags();
+        assert!(
+            surface.trace().is_empty(),
+            "the same outcome was acted on twice: {:?}",
+            surface.trace()
+        );
     }
 }

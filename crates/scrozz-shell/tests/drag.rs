@@ -18,7 +18,7 @@ use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_shell::drag::{
     DragFormat, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, FALLBACK_STEM,
     MAX_FILE_NAME_BYTES, NativeSurface, PromisedFile, byte_source, card_rect_in_view, check_origin,
-    sanitise_stem,
+    preview_hotspot, sanitise_stem,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -410,6 +410,17 @@ fn a_payload_carries_its_preview_through() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_card_grab_maps_proportionally_into_a_smaller_preview() {
+    let hotspot = preview_hotspot(
+        LogicalSize::new(210.0, 150.0),
+        LogicalPoint::new(105.0, 75.0),
+        LogicalSize::new(168.0, 94.5),
+    );
+    assert!((hotspot.x - 84.0).abs() < f64::EPSILON);
+    assert!((hotspot.y - 47.25).abs() < f64::EPSILON);
+}
+
+#[test]
 fn a_flipped_view_needs_no_conversion() {
     // Scrozz and a flipped NSView agree: both measure downwards from the
     // top-left. Converting anyway would move the drag image.
@@ -560,7 +571,7 @@ fn a_backend_reports_what_it_can_do_without_being_asked_to_do_it() {
         match source {
             Ok(source) => {
                 let capability = source.capability();
-                assert!(capability.promised_files);
+                assert!(!capability.promised_files);
                 assert!(capability.image_data);
                 assert!(capability.can_drag);
             }
@@ -571,7 +582,16 @@ fn a_backend_reports_what_it_can_do_without_being_asked_to_do_it() {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let source = source.expect("the Windows OLE backend constructs");
+        let capability = source.capability();
+        assert!(!capability.promised_files);
+        assert!(capability.image_data);
+        assert!(capability.can_drag);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let source = source.expect("the planned backend always constructs");
         let capability = source.capability();
@@ -590,124 +610,546 @@ fn a_backend_reports_what_it_can_do_without_being_asked_to_do_it() {
 //
 // These need the main thread and a running AppKit, so they are opt-in. They do
 // not order a window front, do not begin a dragging session, and do not touch
-// the pointer. What they exercise is the promise delegate itself: the code a
-// drop target runs once the user has let go.
+// the pointer. What they exercise is the pasteboard item itself: the thing a
+// drop target reads once the user has let go.
 
 #[cfg(target_os = "macos")]
 mod appkit {
     use super::{DragPayload, byte_source, png_bytes};
-    use scrozz_core::Error;
-    use scrozz_shell::macos::drag::test_support::{PromiseHarness, view_can_begin_drags};
+    use scrozz_shell::drag::{ArtifactState, DragOperation, DragOutcome};
+    use scrozz_shell::macos::drag::test_support::{ItemHarness, view_can_begin_drags};
 
-    /// A scratch path inside cargo's own target directory.
+    /// A scratch root inside cargo's own target directory.
     ///
     /// `CARGO_TARGET_TMPDIR` exists for exactly this and is swept by
-    /// `cargo clean`. Deliberately not the system temp directory: the entire
-    /// point of a promised file is that Scrozz never writes one
-    /// speculatively, and a test that litters `/tmp` would be quietly
-    /// contradicting the thing it is testing.
+    /// `cargo clean`. Deliberately not the system temp directory, which is
+    /// where the real artifacts live: a test that wrote there could be swept by
+    /// the orphan reaper mid-run, or sweep a real drag out from under the app.
     fn scratch(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name)
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        root
     }
 
     #[test]
     #[ignore = "needs the main thread and a running AppKit"]
-    fn the_provider_names_the_file_the_way_the_payload_does() {
+    fn the_item_offers_a_file_url_first_and_an_image_beside_it() {
+        let root = scratch("item-flavours");
         let payload = DragPayload::png_capture("Design review", byte_source(|| Ok(png_bytes())));
-        let harness = PromiseHarness::new(&payload);
-        assert_eq!(harness.file_name(), "Design review.png");
-    }
+        let harness = ItemHarness::new(&payload, &root).expect("item");
 
-    #[test]
-    #[ignore = "needs the main thread and a running AppKit"]
-    fn the_promise_writes_the_promised_bytes_and_not_before() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        let payload = DragPayload::png_capture(
-            "Promise",
-            byte_source(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok(png_bytes())
-            }),
-        );
-
-        let harness = PromiseHarness::new(&payload);
+        let types = harness.types();
         assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "building the provider encoded the capture"
+            types.first().map(String::as_str),
+            Some("public.file-url"),
+            "a screenshot drag must offer its file before its pixels: {types:?}"
         );
-
-        let path = scratch("promise.png");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        harness.write_to(&path).expect("the promise should be kept");
-        assert_eq!(std::fs::read(&path).unwrap(), png_bytes());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    #[ignore = "needs the main thread and a running AppKit"]
-    fn a_broken_promise_reports_rather_than_writing_an_empty_file() {
-        let payload = DragPayload::new(scrozz_shell::drag::PromisedFile::new(
-            "Gone",
-            scrozz_shell::drag::DragFormat::Png,
-            byte_source(|| Err(Error::InvalidRequest("capture was evicted".to_owned()))),
-        ));
-        let harness = PromiseHarness::new(&payload);
-
-        let path = scratch("broken.png");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        let err = harness.write_to(&path).expect_err("failure must propagate");
-        assert!(err.to_string().contains("evicted"), "{err}");
         assert!(
-            !path.exists(),
-            "a failed promise left a file behind: {}",
-            path.display()
+            types.iter().any(|ty| ty == "public.png"),
+            "no image flavour was advertised: {types:?}"
         );
+        assert!(
+            types.iter().any(|ty| ty == "public.tiff"),
+            "no TIFF flavour was advertised: {types:?}"
+        );
+        harness.finish();
     }
 
     #[test]
     #[ignore = "needs the main thread and a running AppKit"]
-    fn the_pasteboard_offers_png_and_tiff_lazily() {
+    fn the_advertised_url_points_at_the_file_that_was_written() {
+        let root = scratch("item-url");
+        let payload = DragPayload::png_capture("Design #1 100%", byte_source(|| Ok(png_bytes())));
+        let harness = ItemHarness::new(&payload, &root).expect("item");
+
+        let resolved = harness
+            .file_url_path()
+            .expect("the item must advertise a resolvable file URL");
+        assert_eq!(
+            std::path::Path::new(&resolved),
+            harness.artifact().path(),
+            "the URL a receiver reads is not the file that was written"
+        );
+        assert_eq!(
+            std::fs::read(&resolved).expect("the advertised file must exist"),
+            png_bytes(),
+            "the advertised file does not hold the capture"
+        );
+        harness.finish();
+    }
+
+    #[test]
+    #[ignore = "needs the main thread and a running AppKit"]
+    fn the_pasteboard_offers_png_eagerly_and_tiff_lazily() {
+        let root = scratch("item-image");
         let payload = DragPayload::png_capture("Flavours", byte_source(|| Ok(png_bytes())));
-        let harness = PromiseHarness::new(&payload);
+        let harness = ItemHarness::new(&payload, &root).expect("item");
 
         let png = harness
-            .image_flavour("public.png")
+            .flavour("public.png")
             .expect("public.png must be offered");
         assert_eq!(png, png_bytes());
 
         // TIFF is what older AppKit receivers ask for. The bytes differ — they
         // are transcoded — so only presence and non-emptiness are checked.
-        let tiff = harness.image_flavour("public.tiff");
+        let tiff = harness.flavour("public.tiff");
         assert!(
             tiff.as_ref().is_none_or(|bytes| !bytes.is_empty()),
             "public.tiff was offered but produced nothing"
         );
 
         assert!(
-            harness.image_flavour("public.avif").is_none(),
+            harness.flavour("public.avif").is_none(),
             "an unrequested flavour must not be fabricated"
         );
+        harness.finish();
+    }
+
+    #[test]
+    #[ignore = "needs the main thread and a running AppKit"]
+    fn a_payload_with_no_image_advertises_no_image_flavours() {
+        // Both image types are withheld together. A registered `public.tiff`
+        // the provider cannot fill does not read to a receiver as an absent
+        // flavour — it reads as a failed drop.
+        let root = scratch("item-imageless");
+        let payload = super::file_only("Recording", super::DragFormat::Mp4, vec![0, 0, 0, 0x18]);
+        let harness = ItemHarness::new(&payload, &root).expect("item");
+
+        let types = harness.types();
+        assert!(
+            types.iter().any(|ty| ty == "public.file-url"),
+            "the file is the whole point of the drag and must still be offered: {types:?}"
+        );
+        assert!(
+            !types
+                .iter()
+                .any(|ty| ty == "public.png" || ty == "public.tiff"),
+            "an MP4 was advertised as an image: {types:?}"
+        );
+        harness.finish();
+    }
+
+    #[test]
+    #[ignore = "needs the main thread and a running AppKit"]
+    fn an_accepted_drop_leaves_the_file_where_the_receiver_can_read_it() {
+        let root = scratch("item-lifetime");
+        let payload = DragPayload::png_capture("Kept", byte_source(|| Ok(png_bytes())));
+        let mut harness = ItemHarness::new(&payload, &root).expect("item");
+
+        assert_eq!(harness.artifact().state(), ArtifactState::InFlight);
+        harness
+            .artifact_mut()
+            .settle(&DragOutcome::Accepted(DragOperation::Copy));
+        assert_eq!(harness.artifact().state(), ArtifactState::Retained);
+        assert!(
+            harness.artifact().exists(),
+            "an accepted drop deleted the file the receiver was told to read"
+        );
+        harness.finish();
     }
 
     #[test]
     #[ignore = "needs the main thread and a running AppKit"]
     fn an_nsview_can_start_a_dragging_session() {
         // A precondition for the whole feature. This does *not* prove a
-        // non-activating panel can be a drag source — see the module docs.
+        // non-activating panel can be a drag source — see docs/drag-matrix.md.
         assert!(
             view_can_begin_drags(),
             "NSView does not respond to beginDraggingSessionWithItems:event:source:"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact lifetime
+// ---------------------------------------------------------------------------
+//
+// The file a drop target is handed is a real file on disk with no owner but
+// us. Delete it a moment early and the receiver reads nothing — which is the
+// silent-failure shape this whole path exists to remove. Never delete it and
+// the temp directory grows without bound. These tests pin down exactly when it
+// goes.
+
+mod artifact_lifetime {
+    use super::png_bytes;
+    use scrozz_shell::drag::artifact::{
+        ArtifactState, DragArtifact, ORPHAN_MAX_AGE, RETENTION, artifact_root, state_after,
+        sweep_orphans,
+    };
+    use scrozz_shell::drag::{DragOperation, DragOutcome};
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// A private root per test, so parallel tests cannot sweep each other's
+    /// files. Never the shared `artifact_root()`.
+    fn root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "scrozz-artifact-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test root");
+        dir
+    }
+
+    fn artifact(tag: &str) -> (std::path::PathBuf, DragArtifact) {
+        let dir = root(tag);
+        let a = DragArtifact::materialise(&dir, "Screenshot.png", &png_bytes())
+            .expect("a temp file is writable");
+        (dir, a)
+    }
+
+    // -- the pure rule ------------------------------------------------------
+
+    #[test]
+    fn an_accepted_drop_is_retained_and_everything_else_is_removed() {
+        for (outcome, expected) in [
+            (
+                DragOutcome::Accepted(DragOperation::Copy),
+                ArtifactState::Retained,
+            ),
+            (DragOutcome::Cancelled, ArtifactState::Removed),
+            (DragOutcome::Failed("nope".into()), ArtifactState::Removed),
+        ] {
+            assert_eq!(
+                state_after(ArtifactState::InFlight, &outcome),
+                expected,
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_report_cannot_undo_a_settled_artifact() {
+        // AppKit can report `endedAtPoint:` and a failure for the same drag.
+        // A second opinion must not resurrect a deleted file, nor re-delete one
+        // a receiver is still reading.
+        for settled in [ArtifactState::Retained, ArtifactState::Removed] {
+            for outcome in [
+                DragOutcome::Accepted(DragOperation::Copy),
+                DragOutcome::Cancelled,
+                DragOutcome::Failed("late".into()),
+            ] {
+                assert_eq!(
+                    state_after(settled, &outcome),
+                    settled,
+                    "{settled:?} then {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_live_or_retained_artifact_expects_a_file() {
+        assert!(ArtifactState::InFlight.expects_file());
+        assert!(ArtifactState::Retained.expects_file());
+        assert!(!ArtifactState::Removed.expects_file());
+    }
+
+    // -- the file on disk ---------------------------------------------------
+
+    #[test]
+    fn a_materialised_artifact_is_a_real_readable_file() {
+        let (dir, a) = artifact("materialise");
+        assert_eq!(a.state(), ArtifactState::InFlight);
+        assert!(a.exists(), "the drop target has to be able to open it");
+        assert_eq!(
+            std::fs::read(a.path()).expect("readable"),
+            png_bytes(),
+            "byte-for-byte what was captured, not a re-encode"
+        );
+        assert_eq!(
+            a.path().file_name().and_then(|n| n.to_str()),
+            Some("Screenshot.png"),
+            "the receiver shows this name to the user"
+        );
+        assert!(a.expires_at().is_none(), "nothing expires mid-drag");
+        drop(a);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_artifacts_can_share_a_name_without_colliding() {
+        // Both drags are of "Screenshot.png" and both receivers should see that
+        // name. Private directories are what make that possible without
+        // appending `-1` to a filename the user will read.
+        let dir = root("collide");
+        let a = DragArtifact::materialise(&dir, "Screenshot.png", &png_bytes()).expect("a");
+        let b = DragArtifact::materialise(&dir, "Screenshot.png", &png_bytes()).expect("b");
+        assert_ne!(a.path(), b.path());
+        assert_eq!(a.path().file_name(), b.path().file_name());
+        assert!(a.exists() && b.exists());
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cancelled_drag_deletes_the_file_at_once() {
+        let (dir, mut a) = artifact("cancel");
+        let path = a.path().to_path_buf();
+        a.settle(&DragOutcome::Cancelled);
+        assert_eq!(a.state(), ArtifactState::Removed);
+        assert!(!path.exists(), "nothing read it, so nothing is waiting");
+        assert!(a.expires_at().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_accepted_drop_keeps_the_file_until_the_retention_window_passes() {
+        let (dir, mut a) = artifact("retain");
+        let path = a.path().to_path_buf();
+        let now = Instant::now();
+
+        a.settle_at(&DragOutcome::Accepted(DragOperation::Copy), now);
+        assert_eq!(a.state(), ArtifactState::Retained);
+        assert!(path.exists(), "the receiver may not have read it yet");
+
+        assert!(
+            !a.sweep_at(now + RETENTION - Duration::from_secs(1)),
+            "one second early is still too early"
+        );
+        assert!(path.exists());
+
+        assert!(a.sweep_at(now + RETENTION + Duration::from_secs(1)));
+        assert_eq!(a.state(), ArtifactState::Removed);
+        assert!(!path.exists());
+
+        // `sweep_at` answers "is this finished with?", not "did I delete
+        // something?" — so it keeps saying yes, and a caller polling every
+        // frame after the deadline does not have to remember it already asked.
+        assert!(a.sweep_at(now + RETENTION * 10));
+        assert!(!path.exists(), "and it is not recreated by asking twice");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_live_artifact_is_never_swept() {
+        // The drag is still happening. Sweeping here is exactly the bug.
+        let (dir, mut a) = artifact("live");
+        assert!(!a.sweep_at(Instant::now() + RETENTION * 100));
+        assert_eq!(a.state(), ArtifactState::InFlight);
+        assert!(a.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removing_an_artifact_is_idempotent() {
+        let (dir, mut a) = artifact("idempotent");
+        let path = a.path().to_path_buf();
+        a.remove();
+        a.remove();
+        assert_eq!(a.state(), ArtifactState::Removed);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_a_live_artifact_still_cleans_up() {
+        // A panic mid-drag must not leave a screenshot in the temp directory
+        // for the rest of the machine's uptime.
+        let dir = root("drop");
+        let path = {
+            let a = DragArtifact::materialise(&dir, "Screenshot.png", &png_bytes()).expect("a");
+            a.path().to_path_buf()
+        };
+        assert!(!path.exists(), "the guard ran on the way out");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_retained_artifact_survives_being_dropped() {
+        // The receiver is reading it. Dropping our handle is not permission to
+        // pull the file out from under them — the sweep decides that.
+        let dir = root("retained-drop");
+        let path = {
+            let mut a = DragArtifact::materialise(&dir, "Screenshot.png", &png_bytes()).expect("a");
+            a.settle(&DragOutcome::Accepted(DragOperation::Copy));
+            a.path().to_path_buf()
+        };
+        assert!(path.exists(), "still readable after the handle went away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- artifacts from a process that is gone ------------------------------
+
+    #[test]
+    fn an_old_orphan_is_swept_and_a_recent_one_is_left_alone() {
+        let dir = root("orphans");
+        let old = dir.join("stale");
+        let fresh = dir.join("fresh");
+        std::fs::create_dir_all(&old).expect("old");
+        std::fs::create_dir_all(&fresh).expect("fresh");
+        std::fs::write(old.join("a.png"), png_bytes()).expect("write");
+        std::fs::write(fresh.join("b.png"), png_bytes()).expect("write");
+
+        // Sweeping "now" ages nothing, so both survive.
+        assert_eq!(sweep_orphans(&dir, SystemTime::now(), ORPHAN_MAX_AGE), 0);
+        assert!(old.exists() && fresh.exists());
+
+        // Sweeping from an hour and a half in the future ages both past the
+        // window, so both go. Time is a parameter precisely so this is a test
+        // and not a sleep.
+        let later = SystemTime::now() + ORPHAN_MAX_AGE + Duration::from_secs(60);
+        assert_eq!(sweep_orphans(&dir, later, ORPHAN_MAX_AGE), 2);
+        assert!(!old.exists() && !fresh.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sweeping_a_root_that_does_not_exist_is_not_an_error() {
+        // First run on a clean machine. There is nothing to sweep and that is
+        // the normal case, not a failure.
+        let missing = std::env::temp_dir().join("scrozz-artifact-test-absent-xyzzy");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(
+            sweep_orphans(&missing, SystemTime::now(), ORPHAN_MAX_AGE),
+            0
+        );
+    }
+
+    #[test]
+    fn every_artifact_lives_under_one_known_root() {
+        // So a sweep can find them all, and so nothing is written somewhere a
+        // later version would not know to look.
+        let root = artifact_root();
+        assert!(root.starts_with(std::env::temp_dir()));
+        assert!(
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("scrozz")),
+            "{root:?} has to be identifiably ours"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which image flavours a payload is entitled to advertise
+// ---------------------------------------------------------------------------
+//
+// A drag advertises two independent things: a file, and — sometimes — an
+// image. Conflating them is the bug this section pins. The file always exists;
+// the image exists only when the payload was given an image producer. Labelling
+// an MP4's or a JPEG's file bytes `public.png` produces a drop that every
+// receiver accepts and then fails to decode, which is worse than offering no
+// image at all.
+
+/// A payload whose file is `format` and which was given no image producer.
+fn file_only(stem: &str, format: DragFormat, bytes: Vec<u8>) -> DragPayload {
+    DragPayload::new(PromisedFile::new(
+        stem,
+        format,
+        byte_source(move || Ok(bytes.clone())),
+    ))
+}
+
+#[test]
+fn a_screenshot_offers_its_file_bytes_as_the_image() {
+    // The common case, and the one that must stay free: a PNG capture has a
+    // single `Arc` behind both flavours, so the image costs no second encode.
+    let payload = DragPayload::png_capture("Capture", byte_source(|| Ok(png_bytes())));
+    assert!(
+        payload.image_is_file(),
+        "a PNG capture must recognise its own file bytes as the image"
+    );
+
+    let file = Arc::new(png_bytes());
+    let image = payload
+        .image_png(&file)
+        .expect("the image producer must not fail")
+        .expect("a PNG capture must offer an image");
+    assert!(
+        Arc::ptr_eq(&image, &file),
+        "the image was re-encoded instead of reusing the bytes already written"
+    );
+}
+
+#[test]
+fn a_jpeg_payload_offers_no_image() {
+    let payload = file_only("Photo", DragFormat::Jpeg, vec![0xff, 0xd8, 0xff]);
+    assert!(payload.image().is_none(), "no image producer was given");
+    assert!(!payload.image_is_file());
+    assert_eq!(
+        payload
+            .image_png(&Arc::new(vec![0xff, 0xd8, 0xff]))
+            .expect("asking must not fail"),
+        None,
+        "JPEG file bytes were about to be advertised as a PNG"
+    );
+}
+
+#[test]
+fn a_video_payload_offers_no_image() {
+    // The worst case if this regresses: an MP4 announced as `public.png`.
+    let payload = file_only("Recording", DragFormat::Mp4, vec![0, 0, 0, 0x18]);
+    assert_eq!(
+        payload
+            .image_png(&Arc::new(vec![0, 0, 0, 0x18]))
+            .expect("asking must not fail"),
+        None,
+        "MP4 bytes were about to be advertised as a PNG"
+    );
+}
+
+#[test]
+fn webp_and_gif_payloads_offer_no_image() {
+    // Both are images, and neither is a PNG. Being image-shaped is not the
+    // test — having an image *producer* is.
+    for (stem, format, bytes) in [
+        ("Sticker", DragFormat::Webp, vec![b'R', b'I', b'F', b'F']),
+        ("Loop", DragFormat::Gif, vec![b'G', b'I', b'F', b'8']),
+    ] {
+        let payload = file_only(stem, format, bytes.clone());
+        assert_eq!(
+            payload
+                .image_png(&Arc::new(bytes))
+                .expect("asking must not fail"),
+            None,
+            "{format:?} bytes were about to be advertised as a PNG"
+        );
+    }
+}
+
+#[test]
+fn a_png_file_with_its_own_image_producer_uses_the_producer() {
+    // The subtle case. Both flavours are genuinely PNG, so format alone would
+    // say "reuse the file bytes" — but the producers are different, and a
+    // cropped preview standing in for the full capture is a quieter bug than
+    // the one being fixed here. Pointer identity, not format, decides.
+    let cropped = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
+    let expect = cropped.clone();
+    let payload = file_only("Capture", DragFormat::Png, png_bytes())
+        .with_image(byte_source(move || Ok(cropped.clone())));
+
+    assert!(
+        !payload.image_is_file(),
+        "two different PNG producers were treated as one"
+    );
+
+    let file = Arc::new(png_bytes());
+    let image = payload
+        .image_png(&file)
+        .expect("the image producer must not fail")
+        .expect("an image producer was given");
+    assert_eq!(&*image, &expect, "the file bytes were served as the image");
+    assert!(!Arc::ptr_eq(&image, &file));
+}
+
+#[test]
+fn a_failing_image_producer_is_reported_not_swallowed() {
+    // If the image cannot be produced the drag must fail loudly rather than
+    // quietly advertising an empty PNG, which reads to a receiver as a
+    // successful drop of a corrupt file.
+    let payload =
+        file_only("Capture", DragFormat::Png, png_bytes()).with_image(byte_source(|| {
+            Err(Error::Unsupported {
+                what: "PNG encoding".into(),
+                why: "no encoder".into(),
+            })
+        }));
+
+    assert!(
+        payload.image_png(&Arc::new(png_bytes())).is_err(),
+        "a failing image producer was reported as 'no image'"
+    );
 }

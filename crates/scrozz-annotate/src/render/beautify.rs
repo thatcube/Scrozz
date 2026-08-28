@@ -13,7 +13,7 @@
 //! `inner_radius = outer_radius − padding`. See
 //! [`Beautification::nested_radius`](crate::Beautification::nested_radius).
 
-use scrozz_core::{Error, Result};
+use scrozz_core::{Result, Transform as ColorTransform};
 use tiny_skia::{
     BlendMode, FillRule, GradientStop, IntRect, LinearGradient, Paint, Pattern, Pixmap, Point,
     Rect, SpreadMode, Transform,
@@ -37,7 +37,12 @@ const SHADOW_DROP: f32 = 0.35;
 ///
 /// Returns [`Error::InvalidRequest`] if the framed canvas would be too large to
 /// allocate.
-pub fn apply(content: &Pixmap, beautification: &Beautification, scale: f64) -> Result<Pixmap> {
+pub fn apply(
+    content: &Pixmap,
+    beautification: &Beautification,
+    scale: f64,
+    into: ColorTransform,
+) -> Result<Pixmap> {
     if beautification.is_noop() {
         return Ok(content.clone());
     }
@@ -48,13 +53,9 @@ pub fn apply(content: &Pixmap, beautification: &Beautification, scale: f64) -> R
 
     let width = content.width() + pad * 2;
     let height = content.height() + pad * 2;
-    let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
-        Error::InvalidRequest(format!(
-            "beautified canvas {width}x{height} is not allocatable"
-        ))
-    })?;
+    let mut canvas = super::new_pixmap(width, height, "beautified canvas")?;
 
-    paint_background(&mut canvas, beautification.background);
+    paint_background(&mut canvas, beautification.background, into);
 
     let Some(image_rect) = Rect::from_xywh(
         pad as f32,
@@ -72,13 +73,18 @@ pub fn apply(content: &Pixmap, beautification: &Beautification, scale: f64) -> R
     Ok(canvas)
 }
 
-fn paint_background(canvas: &mut Pixmap, background: Background) {
+/// One backdrop colour, converted into the working space.
+fn converted(color: Color, into: ColorTransform) -> tiny_skia::Color {
+    let [r, g, b] = into.convert_u8([color.r, color.g, color.b]);
+    tiny_skia::Color::from_rgba8(r, g, b, color.a)
+}
+
+fn paint_background(canvas: &mut Pixmap, background: Background, into: ColorTransform) {
     match background {
         Background::Transparent => {}
         Background::Solid(color) => {
-            canvas.fill(tiny_skia::Color::from_rgba8(
-                color.r, color.g, color.b, color.a,
-            ));
+            let [r, g, b] = into.convert_u8([color.r, color.g, color.b]);
+            canvas.fill(tiny_skia::Color::from_rgba8(r, g, b, color.a));
         }
         Background::Gradient { start, end } => {
             let Some(rect) =
@@ -90,14 +96,8 @@ fn paint_background(canvas: &mut Pixmap, background: Background) {
                 Point::from_xy(0.0, 0.0),
                 Point::from_xy(0.0, canvas.height() as f32),
                 vec![
-                    GradientStop::new(
-                        0.0,
-                        tiny_skia::Color::from_rgba8(start.r, start.g, start.b, start.a),
-                    ),
-                    GradientStop::new(
-                        1.0,
-                        tiny_skia::Color::from_rgba8(end.r, end.g, end.b, end.a),
-                    ),
+                    GradientStop::new(0.0, converted(start, into)),
+                    GradientStop::new(1.0, converted(end, into)),
                 ],
                 SpreadMode::Pad,
                 Transform::identity(),
@@ -119,9 +119,7 @@ fn paint_background(canvas: &mut Pixmap, background: Background) {
 /// the corners instead of squaring them off — the exact mistake D9's field note
 /// records.
 fn draw_shadow(canvas: &mut Pixmap, image_rect: Rect, radius: f32, depth: f32) -> Result<()> {
-    let Some(mut layer) = Pixmap::new(canvas.width(), canvas.height()) else {
-        return Ok(());
-    };
+    let mut layer = super::new_pixmap(canvas.width(), canvas.height(), "shadow layer")?;
     let offset = depth * SHADOW_DROP;
     let Some(shadow_rect) = Rect::from_xywh(
         image_rect.left(),
@@ -134,7 +132,14 @@ fn draw_shadow(canvas: &mut Pixmap, image_rect: Rect, radius: f32, depth: f32) -
     let Some(path) = shapes::rounded_rect(shadow_rect, radius) else {
         return Ok(());
     };
-    let paint = shapes::paint(Color::rgba(0, 0, 0, 130), 1.0, BlendMode::SourceOver);
+    // Neutral black is the same triple in every space sharing a white point, so
+    // the shadow needs no conversion and this function needs no working space.
+    let paint = shapes::paint(
+        Color::rgba(0, 0, 0, 130),
+        1.0,
+        BlendMode::SourceOver,
+        ColorTransform::identity(),
+    );
     layer.fill_path(
         &path,
         &paint,
@@ -144,7 +149,7 @@ fn draw_shadow(canvas: &mut Pixmap, image_rect: Rect, radius: f32, depth: f32) -
     );
 
     if let Some(region) = IntRect::from_ltrb(0, 0, layer.width() as i32, layer.height() as i32) {
-        redact::blur_with_sigma(&mut layer, region, depth / 2.0);
+        redact::blur_with_sigma(&mut layer, region, depth / 2.0)?;
     }
 
     canvas.draw_pixmap(

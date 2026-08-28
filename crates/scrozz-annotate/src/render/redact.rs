@@ -15,11 +15,13 @@
 //! true at once. The redaction object stays editable; the *exported pixels* are
 //! gone.
 //!
-//! The blur is a real separable Gaussian with clamp-to-edge sampling. A box blur
-//! leaves recoverable structure, and zero-padding at the image border darkens
-//! the edge of the redaction — a visible artifact that also advertises exactly
-//! where the sensitive content was.
+//! The blur approximates a Gaussian with three bounded separable box passes.
+//! Each uses clamp-to-edge sampling and a sliding window, so work is linear in
+//! the region rather than in the blur radius. Zero-padding at the image border
+//! would darken the edge of the redaction — a visible artifact that also
+//! advertises where the content was.
 
+use scrozz_core::{Error, Result};
 use tiny_skia::{IntRect, Pixmap, PremultipliedColorU8};
 
 use crate::style::Color;
@@ -35,6 +37,7 @@ const MIN_SIGMA: f32 = 3.0;
 /// Well past the point of unrecoverability; beyond it a larger kernel buys no
 /// extra privacy, only time.
 const MAX_SIGMA: f32 = 16.0;
+const MAX_BLUR_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// Mosaic block size as a fraction of the region's shorter side.
 const PIXELATE_FRACTION: f32 = 1.0 / 8.0;
@@ -131,77 +134,129 @@ pub fn pixelate(pixmap: &mut Pixmap, region: IntRect) {
 /// dark or transparent border. Weights are normalised once and every sample is
 /// a real pixel, so a uniform image blurs to exactly itself — the canonical
 /// check that the edges are handled correctly.
-pub fn blur(pixmap: &mut Pixmap, region: IntRect) {
+pub fn blur(pixmap: &mut Pixmap, region: IntRect) -> Result<()> {
     let sigma = blur_sigma(region);
-    blur_with_sigma(pixmap, region, sigma);
+    blur_with_sigma(pixmap, region, sigma)
 }
 
 /// Blurs a region at an explicit sigma, in pixels.
-pub fn blur_with_sigma(pixmap: &mut Pixmap, region: IntRect, sigma: f32) {
+pub fn blur_with_sigma(pixmap: &mut Pixmap, region: IntRect, sigma: f32) -> Result<()> {
     if sigma <= 0.0 {
-        return;
+        return Ok(());
     }
-    let radius = (sigma * 3.0).ceil() as i32;
+    for radius in box_radii(sigma.min(MAX_SIGMA)) {
+        box_blur_once(pixmap, region, radius)?;
+    }
+    Ok(())
+}
+
+fn box_blur_once(pixmap: &mut Pixmap, region: IntRect, radius: i32) -> Result<()> {
     if radius < 1 {
-        return;
+        return Ok(());
     }
-    let weights = gaussian_kernel(sigma, radius);
 
     let img_w = pixmap.width() as i32;
     let img_h = pixmap.height() as i32;
     let rw = region.width() as usize;
     let rh = region.height() as usize;
     let tmp_h = rh + 2 * radius as usize;
+    let stride = rw.checked_mul(4).ok_or_else(|| {
+        Error::InvalidRequest("blur scratch row is too large to address".to_owned())
+    })?;
+    let scratch_len = stride.checked_mul(tmp_h).ok_or_else(|| {
+        Error::InvalidRequest("blur scratch buffer is too large to address".to_owned())
+    })?;
+    if scratch_len > MAX_BLUR_SCRATCH_BYTES {
+        return Err(Error::InvalidRequest(format!(
+            "blur scratch buffer of {scratch_len} bytes exceeds the 256 MiB render limit"
+        )));
+    }
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(scratch_len).map_err(|error| {
+        Error::InvalidRequest(format!(
+            "blur scratch buffer of {scratch_len} bytes is not allocatable: {error}"
+        ))
+    })?;
+    tmp.resize(scratch_len, 0u8);
+    let diameter = u64::try_from(2 * radius + 1).unwrap_or(1);
 
-    // Horizontal pass into a strip tall enough for the vertical pass to read
-    // `radius` rows above and below the region without going back to source.
-    let mut tmp = vec![[0f32; 4]; rw * tmp_h];
+    // Horizontal pass into a strip tall enough for the vertical pass to read its
+    // halo without returning to the source.
     {
         let pixels = pixmap.pixels();
         for ty in 0..tmp_h {
             let sy = (region.top() + ty as i32 - radius).clamp(0, img_h - 1);
             let src_row = sy as usize * img_w as usize;
+            let mut sum = [0u64; 4];
+            for dx in -radius..=radius {
+                let sx = (region.left() + dx).clamp(0, img_w - 1);
+                add_pixel(&mut sum, pixels[src_row + sx as usize]);
+            }
             for tx in 0..rw {
-                let cx = region.left() + tx as i32;
-                let mut acc = [0f32; 4];
-                for (k, w) in weights.iter().enumerate() {
-                    let sx = (cx + k as i32 - radius).clamp(0, img_w - 1);
-                    let p = pixels[src_row + sx as usize];
-                    acc[0] = f32::from(p.red()).mul_add(*w, acc[0]);
-                    acc[1] = f32::from(p.green()).mul_add(*w, acc[1]);
-                    acc[2] = f32::from(p.blue()).mul_add(*w, acc[2]);
-                    acc[3] = f32::from(p.alpha()).mul_add(*w, acc[3]);
+                write_average(&mut tmp[ty * stride + tx * 4..][..4], sum, diameter);
+                if tx + 1 < rw {
+                    let cx = region.left() + tx as i32;
+                    let remove = (cx - radius).clamp(0, img_w - 1);
+                    let add = (cx + radius + 1).clamp(0, img_w - 1);
+                    sub_pixel(&mut sum, pixels[src_row + remove as usize]);
+                    add_pixel(&mut sum, pixels[src_row + add as usize]);
                 }
-                tmp[ty * rw + tx] = acc;
             }
         }
     }
 
-    // Vertical pass, writing only inside the region.
+    // Vertical pass, writing only inside the redaction.
     let width = pixmap.width() as usize;
     let pixels = pixmap.pixels_mut();
-    for y in 0..rh {
-        let dst_row = (region.top() as usize + y) * width;
-        for x in 0..rw {
-            let mut acc = [0f32; 4];
-            for (k, w) in weights.iter().enumerate() {
-                let s = tmp[(y + k) * rw + x];
-                acc[0] = s[0].mul_add(*w, acc[0]);
-                acc[1] = s[1].mul_add(*w, acc[1]);
-                acc[2] = s[2].mul_add(*w, acc[2]);
-                acc[3] = s[3].mul_add(*w, acc[3]);
-            }
-            let to_u8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
-            let a = to_u8(acc[3]);
+    for x in 0..rw {
+        let mut sum = [0u64; 4];
+        for y in 0..=2 * radius as usize {
+            add_channels(&mut sum, &tmp[y * stride + x * 4..][..4]);
+        }
+        for y in 0..rh {
+            let channels = averaged(sum, diameter);
+            let a = channels[3];
+            let dst_row = (region.top() as usize + y) * width;
             pixels[dst_row + region.left() as usize + x] = PremultipliedColorU8::from_rgba(
-                to_u8(acc[0]).min(a),
-                to_u8(acc[1]).min(a),
-                to_u8(acc[2]).min(a),
+                channels[0].min(a),
+                channels[1].min(a),
+                channels[2].min(a),
                 a,
             )
             .unwrap_or_else(transparent);
+            if y + 1 < rh {
+                sub_channels(&mut sum, &tmp[y * stride + x * 4..][..4]);
+                add_channels(
+                    &mut sum,
+                    &tmp[(y + 2 * radius as usize + 1) * stride + x * 4..][..4],
+                );
+            }
         }
     }
+    Ok(())
+}
+
+fn box_radii(sigma: f32) -> [i32; 3] {
+    const PASSES: f32 = 3.0;
+    let ideal = (12.0f32.mul_add(sigma * sigma / PASSES, 1.0)).sqrt();
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
+    }
+    lower = lower.max(1);
+    let upper = lower + 2;
+    let lower_f = lower as f32;
+    let choose_lower = ((12.0 * sigma * sigma
+        - PASSES * lower_f * lower_f
+        - 4.0 * PASSES * lower_f
+        - 3.0 * PASSES)
+        / (-4.0 * lower_f - 4.0))
+        .round()
+        .clamp(0.0, PASSES) as usize;
+    std::array::from_fn(|index| {
+        let width = if index < choose_lower { lower } else { upper };
+        (width - 1) / 2
+    })
 }
 
 /// The blur strength used for a region of this size.
@@ -218,21 +273,42 @@ pub fn pixelate_block(region: IntRect) -> u32 {
     ((shorter * PIXELATE_FRACTION).round() as u32).max(MIN_BLOCK)
 }
 
-fn gaussian_kernel(sigma: f32, radius: i32) -> Vec<f32> {
-    let denom = 2.0 * sigma * sigma;
-    let mut weights: Vec<f32> = (-radius..=radius)
-        .map(|i| {
-            let x = i as f32;
-            (-(x * x) / denom).exp()
-        })
-        .collect();
-    let total: f32 = weights.iter().sum();
-    if total > 0.0 {
-        for w in &mut weights {
-            *w /= total;
-        }
+fn add_pixel(sum: &mut [u64; 4], pixel: PremultipliedColorU8) {
+    for (total, channel) in
+        sum.iter_mut()
+            .zip([pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()])
+    {
+        *total += u64::from(channel);
     }
-    weights
+}
+
+fn sub_pixel(sum: &mut [u64; 4], pixel: PremultipliedColorU8) {
+    for (total, channel) in
+        sum.iter_mut()
+            .zip([pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()])
+    {
+        *total -= u64::from(channel);
+    }
+}
+
+fn add_channels(sum: &mut [u64; 4], channels: &[u8]) {
+    for (total, channel) in sum.iter_mut().zip(channels) {
+        *total += u64::from(*channel);
+    }
+}
+
+fn sub_channels(sum: &mut [u64; 4], channels: &[u8]) {
+    for (total, channel) in sum.iter_mut().zip(channels) {
+        *total -= u64::from(*channel);
+    }
+}
+
+fn averaged(sum: [u64; 4], count: u64) -> [u8; 4] {
+    sum.map(|channel| ((channel + count / 2) / count) as u8)
+}
+
+fn write_average(output: &mut [u8], sum: [u64; 4], count: u64) {
+    output.copy_from_slice(&averaged(sum, count));
 }
 
 fn premultiply(color: Color) -> PremultipliedColorU8 {

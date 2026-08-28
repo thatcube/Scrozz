@@ -1,55 +1,69 @@
-//! macOS drag-out backend: a promised-file drag source built on AppKit.
+//! macOS drag-out backend: a real file drag built on AppKit.
 //!
-//! This is the real implementation behind [`crate::drag::DragSource`] on macOS.
-//! It exists so the hero interaction of decision **D12** — pull a capture card
-//! out of the stack and let go over Slack, Figma or a mail compose window —
-//! behaves like a native file drag rather than a screenshot-shaped approximation.
+//! This is the implementation behind [`crate::drag::DragSource`] on macOS. It
+//! exists so the hero interaction of decision **D12** — pull a capture card out
+//! of the stack and let go over Slack, Figma or a mail compose window — behaves
+//! like a native file drag rather than a screenshot-shaped approximation.
+//!
+//! # Why this drags a file URL and not a file promise
+//!
+//! `NSFilePromiseProvider` is the API Apple documents for exactly this, and it
+//! is the one this backend used first. Finder, Mail and TextEdit honour it.
+//! Chromium does not — it reads `public.file-url` and ignores promises — so
+//! every Electron application (Slack, Discord, VS Code, Notion) and every
+//! browser drop zone refuses a promise-only drag *silently*. Those are the
+//! destinations D12 names as the reason drag-out exists, so a promise-only
+//! drag is a drag that visibly does nothing in the places that matter.
+//!
+//! So one `NSPasteboardItem` is offered, carrying three flavours in preference
+//! order:
+//!
+//! | Type | When it is filled | Who reads it |
+//! |---|---|---|
+//! | `public.file-url` | eagerly, at drag start | Finder, Slack, Discord, browsers, VS Code, Mail |
+//! | `public.png` | eagerly, from the same bytes | Figma, Notes, Keynote, Preview, rich text |
+//! | `public.tiff` | lazily, transcoded on request | older AppKit receivers |
+//!
+//! **One item, not two.** A second dragging item for the image flavours would
+//! make Finder create two files from one drop.
+//!
+//! The file that URL points at is written once, at drag start, and its lifetime
+//! belongs to [`crate::drag::artifact::DragArtifact`] — which is also why this
+//! file does not delete anything in `draggingSession:endedAtPoint:operation:`.
 //!
 //! # The ownership chain (read this before changing anything)
 //!
-//! AppKit does *not* retain a drag source, and `NSFilePromiseProvider` holds its
-//! delegate **weakly**. Getting these lifetimes wrong produces a crash that only
-//! reproduces on a real drop, which is the worst possible bug to have in this
-//! file. The arrangement is therefore deliberate:
+//! AppKit does *not* retain a drag source, and an `NSPasteboardItem` does not
+//! documentably retain its data provider. Getting these lifetimes wrong
+//! produces a crash that only reproduces on a real drop, which is the worst
+//! possible bug to have in this file. The arrangement is therefore deliberate:
 //!
 //! ```text
-//! NSDraggingSession
-//!   └─ retains NSDraggingItem
-//!        └─ retains NSFilePromiseProvider        (its pasteboard writer)
-//!             └─ userInfo (STRONG) ──▶ ScrozzDragPromise   ← our delegate,
-//!                                       and the NSPasteboardItem data
-//!                                       provider for the image flavours
+//! LIVE (thread-local) ──▶ ScrozzDragSourceObject   ← AppKit holds this weakly
+//!                            └─ ivars: DragSession (outcome + artifact)
+//!                                      Retained<ScrozzImageProvider>
+//!
+//! PROVIDERS (thread-local) ──▶ ScrozzImageProvider ← the pasteboard item's
+//!                                                    data provider, which may
+//!                                                    be asked for bytes after
+//!                                                    the drag has ended
 //! ```
 //!
-//! One host object plays both roles — file-promise delegate *and* pasteboard
-//! data provider — and it is anchored by the promise provider's `userInfo`,
-//! which is a strong property. That anchor outlives
-//! `draggingSession:endedAtPoint:operation:`, which matters: a receiver may ask
-//! for the promised bytes *after* the drag has visually ended.
+//! `LIVE` is emptied in `draggingSession:endedAtPoint:operation:`.
+//! `PROVIDERS` is emptied in `pasteboardFinishedWithDataProvider:` and, as a
+//! backstop for a receiver that never triggers it, is capped at
+//! `MAX_LIVE_PROVIDERS` so nothing accumulates across a session.
 //!
-//! Separately, [`LIVE`] holds the `NSDraggingSource` object for the duration of
-//! the drag, because nothing else does. It is released in `endedAtPoint:`.
+//! Because `public.file-url` and `public.png` are both set *eagerly*, a lost
+//! provider degrades to "no TIFF flavour" rather than to a failed drop.
 //!
 //! # Threads
 //!
-//! Starting a drag is main-thread work, gated by [`crate::macos::main_thread`].
-//! The promise *write* is not: AppKit runs it on the queue returned by
-//! `operationQueueForFilePromiseProvider:`, so [`ScrozzDragPromise`]'s ivars are
-//! deliberately plain thread-safe data (`String`, `Arc<dyn Fn … + Send + Sync>`)
-//! plus an `NSOperationQueue`, which Foundation marks `Send + Sync`. Do not put
-//! a `Retained<NSString>` in there.
-//!
-//! # Blocks without `block2`
-//!
-//! `filePromiseProvider:writePromiseToURL:completionHandler:` hands us an
-//! Objective-C block. `scrozz-shell` does not depend on `block2` (see the crate
-//! `Cargo.toml`), so the completion handler is invoked through the documented,
-//! ABI-stable Blocks layout in [`invoke_completion`]. If `block2` is ever added
-//! as a dependency, replace that with a typed `&DynBlock` parameter and delete
-//! [`BlockHeader`].
+//! Starting a drag is main-thread work, gated by `crate::macos::main_thread`.
+//! A lazy flavour request is not guaranteed to arrive there, so
+//! `ScrozzImageProvider`'s ivars are deliberately plain thread-safe data.
 
 use core::cell::RefCell;
-use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use objc2::rc::Retained;
@@ -60,154 +74,59 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
-    NSDraggingSource, NSEvent, NSEventModifierFlags, NSEventType, NSFilePromiseProvider, NSImage,
-    NSPasteboard, NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardType,
+    NSDraggingSource, NSEvent, NSEventModifierFlags, NSEventType, NSImage, NSPasteboard,
+    NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardType, NSPasteboardTypeFileURL,
     NSPasteboardTypePNG, NSPasteboardTypeTIFF, NSPasteboardWriting, NSView,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSError, NSObject, NSObjectProtocol, NSOperationQueue, NSPoint, NSRect,
-    NSSize, NSString, NSURL,
+    NSArray, NSData, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
 };
 
 use scrozz_core::{Error, Result};
 
+use crate::drag::artifact::artifact_root;
 use crate::drag::{
-    ByteSource, DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragSession,
-    DragSource, card_rect_in_view, check_origin,
+    DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession,
+    DragSource, card_rect_in_view, check_origin, preview_hotspot,
 };
 use crate::overlay::AppKitRect;
 
-// ---------------------------------------------------------------------------
-// Blocks ABI
-// ---------------------------------------------------------------------------
-
-/// The public prefix of an Objective-C block, per Clang's Block ABI.
+/// How many finished image providers are kept alive as a backstop.
 ///
-/// Only these five fields are needed, and only `invoke` is read. The layout has
-/// been fixed since the ABI was published; `block2::ffi::Block` models it
-/// identically.
-#[repr(C)]
-struct BlockHeader {
-    _isa: *const c_void,
-    _flags: i32,
-    _reserved: i32,
-    invoke: Option<unsafe extern "C" fn(*mut c_void, *mut NSError)>,
-    _descriptor: *const c_void,
-}
-
-/// Invokes an AppKit-supplied `void (^)(NSError *)` completion handler.
-///
-/// A null `block` is tolerated on purpose: it lets the write path be exercised
-/// from a test without fabricating a block, and it is the right defensive
-/// behaviour if AppKit ever passes nil.
-///
-/// # Safety
-///
-/// `block` must be null or a valid Objective-C block whose signature is
-/// `void (^)(NSError * _Nullable)`. `error` must be null or a live `NSError`.
-unsafe fn invoke_completion(block: *mut AnyObject, error: *mut NSError) {
-    if block.is_null() {
-        return;
-    }
-    // SAFETY: the caller guarantees `block` points at a block, whose leading
-    // fields are the documented `BlockHeader` layout.
-    let header = unsafe { &*block.cast::<BlockHeader>() };
-    if let Some(invoke) = header.invoke {
-        // SAFETY: `invoke` is the block's own function pointer and, per the
-        // Blocks ABI, takes the block itself as its first argument.
-        unsafe { invoke(block.cast::<c_void>(), error) };
-    }
-}
-
-/// Builds an `NSError` in Scrozz's own domain so a failed promise surfaces a
-/// readable reason in the receiving application instead of a silent no-op.
-fn promise_error() -> Retained<NSError> {
-    let domain = NSString::from_str("com.thatcube.scrozz.drag");
-    // SAFETY: `errorWithDomain:code:userInfo:` accepts a nil userInfo; the
-    // generic parameter is unconstrained because no dictionary is passed.
-    unsafe { NSError::errorWithDomain_code_userInfo(&domain, 1, None) }
-}
+/// A receiver that reads a lazy flavour after the drop needs the provider to
+/// still exist; `pasteboardFinishedWithDataProvider:` is the documented signal
+/// that it no longer does, but a receiver that never asks for a lazy type never
+/// triggers it. Holding the last few is bounded, cheap, and removes an entire
+/// class of use-after-free from this file.
+const MAX_LIVE_PROVIDERS: usize = 4;
 
 // ---------------------------------------------------------------------------
-// The promise host
+// The image provider
 // ---------------------------------------------------------------------------
 
-/// Everything the promise callbacks need, in plain thread-safe Rust data.
-struct PromiseState {
-    /// Final base name including extension, e.g. `Scrozz 2026-02-11.png`.
-    file_name: String,
-    /// Bytes for the file itself. Called only when a receiver accepts the drop.
-    file_bytes: ByteSource,
-    /// Bytes for the pasteboard image flavour, when one was offered.
-    image_bytes: Option<ByteSource>,
-    /// Background queue AppKit writes on, so a large encode does not stall the
-    /// main thread at the moment of the drop.
-    queue: Retained<NSOperationQueue>,
+/// Everything the lazy flavour callback needs, in plain thread-safe Rust data.
+struct ProviderState {
+    /// PNG bytes of the capture, already produced for the file that was
+    /// written. Shared rather than re-encoded.
+    png: std::sync::Arc<Vec<u8>>,
 }
 
 define_class!(
-    /// File-promise delegate *and* lazy pasteboard data provider.
+    /// Lazy pasteboard data provider for the flavours that cost something to
+    /// make.
     ///
-    /// Both roles live on one object so a single strong anchor
-    /// (`NSFilePromiseProvider.userInfo`) keeps every lazy producer alive for
-    /// exactly as long as anything can still ask for bytes.
+    /// Only `public.tiff` is served here. `public.file-url` and `public.png`
+    /// are set eagerly on the item, because they are the two a drop actually
+    /// depends on and because eager data cannot dangle.
     #[unsafe(super(NSObject))]
-    #[ivars = PromiseState]
-    struct ScrozzDragPromise;
+    #[ivars = ProviderState]
+    struct ScrozzImageProvider;
 
-    unsafe impl NSObjectProtocol for ScrozzDragPromise {}
+    unsafe impl NSObjectProtocol for ScrozzImageProvider {}
 
-    /// `NSFilePromiseProviderDelegate`, implemented with raw selectors.
-    ///
-    /// The typed conformance cannot be used: its required
-    /// `writePromiseToURL:completionHandler:` method names `block2::DynBlock`,
-    /// and `block2` is not a dependency of this crate. AppKit dispatches
-    /// delegate messages by selector, so this is equivalent at runtime.
-    impl ScrozzDragPromise {
-        #[unsafe(method_id(filePromiseProvider:fileNameForType:))]
-        fn file_name_for_type(
-            &self,
-            _provider: &NSFilePromiseProvider,
-            _file_type: &NSString,
-        ) -> Retained<NSString> {
-            NSString::from_str(&self.ivars().file_name)
-        }
-
-        #[unsafe(method_id(operationQueueForFilePromiseProvider:))]
-        fn operation_queue(&self, _provider: &NSFilePromiseProvider) -> Retained<NSOperationQueue> {
-            self.ivars().queue.clone()
-        }
-
-        #[unsafe(method(filePromiseProvider:writePromiseToURL:completionHandler:))]
-        fn write_promise(
-            &self,
-            _provider: &NSFilePromiseProvider,
-            url: &NSURL,
-            completion: *mut AnyObject,
-        ) {
-            match self.write_to(url) {
-                Ok(()) => {
-                    // SAFETY: `completion` is AppKit's block (or null); a nil
-                    // NSError is the documented success signal.
-                    unsafe { invoke_completion(completion, core::ptr::null_mut()) };
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "drag: promised file could not be written");
-                    let ns_error = promise_error();
-                    // SAFETY: as above; `ns_error` is alive for the call.
-                    unsafe {
-                        invoke_completion(completion, Retained::as_ptr(&ns_error).cast_mut());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Lazy image flavours (`public.png`, `public.tiff`).
-    ///
     /// This protocol is block-free and not main-thread-only, so the typed
     /// conformance works and objc2 checks the signatures in debug builds.
-    unsafe impl NSPasteboardItemDataProvider for ScrozzDragPromise {
+    unsafe impl NSPasteboardItemDataProvider for ScrozzImageProvider {
         #[unsafe(method(pasteboard:item:provideDataForType:))]
         fn provide_data_for_type(
             &self,
@@ -217,74 +136,35 @@ define_class!(
         ) {
             self.provide_image(item, requested);
         }
+
+        #[unsafe(method(pasteboardFinishedWithDataProvider:))]
+        fn finished(&self, _pasteboard: &NSPasteboard) {
+            retire_provider(self);
+        }
     }
 );
 
-impl ScrozzDragPromise {
-    /// Builds the host. Not main-thread-bound.
-    fn new(
-        file_name: String,
-        file_bytes: ByteSource,
-        image_bytes: Option<ByteSource>,
-    ) -> Retained<Self> {
-        let queue = NSOperationQueue::new();
-        queue.setName(Some(&NSString::from_str(
-            "com.thatcube.scrozz.drag.promise",
-        )));
-        queue.setMaxConcurrentOperationCount(1);
-
-        let this = Self::alloc().set_ivars(PromiseState {
-            file_name,
-            file_bytes,
-            image_bytes,
-            queue,
-        });
+impl ScrozzImageProvider {
+    /// Builds the provider. Not main-thread-bound.
+    fn new(png: std::sync::Arc<Vec<u8>>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(ProviderState { png });
         // SAFETY: standard two-phase init of a class whose superclass is
         // NSObject; `set_ivars` has already populated our own storage.
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Produces the bytes and writes them at `url`. Runs on [`PromiseState::queue`].
-    ///
-    /// This is where "promise, don't pre-write" is actually honoured: nothing
-    /// has touched the filesystem until this function runs, and it only runs
-    /// because a receiving application accepted the drop and named a
-    /// destination.
-    fn write_to(&self, url: &NSURL) -> Result<()> {
-        let bytes = (self.ivars().file_bytes)()?;
-
-        let path = url
-            .path()
-            .ok_or_else(|| Error::Storage("drop destination has no filesystem path".into()))?
-            .to_string();
-
-        std::fs::write(&path, &bytes)?;
-        tracing::debug!(bytes = bytes.len(), path = %path, "drag: promise fulfilled");
-        Ok(())
-    }
-
     /// Fills in a lazily requested image flavour on the pasteboard item.
     fn provide_image(&self, item: &NSPasteboardItem, requested: &NSPasteboardType) {
-        let Some(source) = self.ivars().image_bytes.as_ref() else {
-            return;
-        };
-        let png = match source() {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::error!(error = %err, "drag: image flavour unavailable");
-                return;
-            }
-        };
+        let png = &self.ivars().png;
         if png.is_empty() {
-            tracing::error!("drag: image producer returned no bytes");
+            tracing::error!("drag: no capture bytes to transcode");
             return;
         }
-
-        let data = NSData::with_bytes(&png);
 
         // SAFETY: reading AppKit's pasteboard-type globals. They are immortal
         // `NSString` constants initialised before any application code runs.
         let (png_type, tiff_type) = unsafe { (NSPasteboardTypePNG, NSPasteboardTypeTIFF) };
+        let data = NSData::with_bytes(png);
 
         if requested == png_type {
             item.setData_forType(&data, requested);
@@ -293,7 +173,9 @@ impl ScrozzDragPromise {
 
         if requested == tiff_type {
             // Let AppKit transcode rather than adding an image codec to this
-            // crate; `NSImage` reads PNG natively.
+            // crate; `NSImage` reads PNG natively. Deliberately lazy: a 4K
+            // capture is roughly 30 MB as TIFF, which is not something to spend
+            // on the main thread at the instant a drag starts.
             let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
                 tracing::error!("drag: NSImage could not decode the PNG for TIFF conversion");
                 return;
@@ -306,6 +188,37 @@ impl ScrozzDragPromise {
             }
         }
     }
+}
+
+thread_local! {
+    /// Image providers that may still be asked for bytes.
+    ///
+    /// See `MAX_LIVE_PROVIDERS` for why this is a bounded queue rather than a
+    /// strict lifetime.
+    static PROVIDERS: RefCell<Vec<Retained<ScrozzImageProvider>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps `provider` alive, evicting the oldest once the cap is reached.
+fn hold_provider(provider: &Retained<ScrozzImageProvider>) {
+    PROVIDERS.with(|held| {
+        if let Ok(mut held) = held.try_borrow_mut() {
+            held.push(provider.clone());
+            while held.len() > MAX_LIVE_PROVIDERS {
+                held.remove(0);
+            }
+        }
+    });
+}
+
+/// Releases a provider AppKit has said it is finished with.
+fn retire_provider(finished: &ScrozzImageProvider) {
+    let target: *const ScrozzImageProvider = finished;
+    PROVIDERS.with(|held| {
+        if let Ok(mut held) = held.try_borrow_mut() {
+            held.retain(|item| !core::ptr::eq(Retained::as_ptr(item), target));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -322,12 +235,21 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// What one drag's source object owns.
+struct SourceState {
+    /// The handle the caller polls, which also owns the temporary file.
+    session: DragSession,
+    /// Kept so the provider outlives the drag even if AppKit does not retain
+    /// it; see the module header.
+    _provider: Retained<ScrozzImageProvider>,
+}
+
 define_class!(
     /// The `NSDraggingSource` for one drag, owning the [`DragSession`] handle
     /// the caller polls for an outcome.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[ivars = DragSession]
+    #[ivars = SourceState]
     struct ScrozzDragSourceObject;
 
     unsafe impl NSObjectProtocol for ScrozzDragSourceObject {}
@@ -357,15 +279,25 @@ define_class!(
             _point: NSPoint,
             operation: NSDragOperation,
         ) {
-            self.ivars().finish(outcome_for(operation));
+            // This records the outcome *and* decides the fate of the temporary
+            // file. It deliberately does not delete anything an accepted
+            // receiver may still be reading — see `DragArtifact`.
+            self.ivars().session.finish(outcome_for(operation));
             retire(self);
         }
     }
 );
 
 impl ScrozzDragSourceObject {
-    fn new(mtm: MainThreadMarker, session: DragSession) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(session);
+    fn new(
+        mtm: MainThreadMarker,
+        session: DragSession,
+        provider: Retained<ScrozzImageProvider>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SourceState {
+            session,
+            _provider: provider,
+        });
         // SAFETY: standard two-phase init; ivars are already in place.
         unsafe { msg_send![super(this), init] }
     }
@@ -399,6 +331,59 @@ fn retire(finished: &ScrozzDragSourceObject) {
             live.retain(|held| !core::ptr::eq(Retained::as_ptr(held), target));
         }
     });
+}
+
+/// Builds the one pasteboard item a capture drag offers.
+///
+/// Type order is preference order: a receiver that understands more than one
+/// flavour takes the first it recognises, and for a screenshot that should be
+/// the file.
+fn capture_item(
+    path: &std::path::Path,
+    png: &[u8],
+    provider: &Retained<ScrozzImageProvider>,
+) -> Result<Retained<NSPasteboardItem>> {
+    let item = NSPasteboardItem::new();
+
+    // SAFETY: reading AppKit's immortal pasteboard-type globals.
+    let (file_url_type, png_type, tiff_type) = unsafe {
+        (
+            NSPasteboardTypeFileURL,
+            NSPasteboardTypePNG,
+            NSPasteboardTypeTIFF,
+        )
+    };
+
+    let native_path = NSString::from_str(&path.to_string_lossy());
+    let url = NSURL::fileURLWithPath(&native_path);
+    let absolute = url.absoluteString().ok_or_else(|| {
+        Error::Platform("the drag file could not be expressed as a URL".to_owned())
+    })?;
+    if !item.setString_forType(&absolute, file_url_type) {
+        return Err(Error::Platform(
+            "the pasteboard refused the drag file URL".to_owned(),
+        ));
+    }
+
+    // Eager, from bytes that already exist: a receiver that wants image data
+    // gets it without a callback that could outlive its provider.
+    //
+    // Empty means the payload offered no image — an MP4 or a JPEG capture. Both
+    // image flavours are then withheld together, because a `public.tiff` the
+    // provider cannot fill is a type the receiver will ask for and get nothing
+    // from, which reads to it as a failed drop rather than an absent flavour.
+    if png.is_empty() {
+        return Ok(item);
+    }
+
+    item.setData_forType(&NSData::with_bytes(png), png_type);
+
+    let types = NSArray::from_slice(&[tiff_type]);
+    let as_protocol: &ProtocolObject<dyn NSPasteboardItemDataProvider> =
+        ProtocolObject::from_ref(&**provider);
+    item.setDataProvider_forTypes(as_protocol, &types);
+
+    Ok(item)
 }
 
 // ---------------------------------------------------------------------------
@@ -442,9 +427,11 @@ impl MacDragSource {
 
     /// The event a drag must be attached to.
     ///
-    /// AppKit wants the mouse event that initiated the gesture. `scrozz-ui`
-    /// classifies gestures itself, so the current event is used when it is a
-    /// mouse event, and one is synthesised at the pointer otherwise.
+    /// AppKit wants the mouse event that initiated the gesture, and it must
+    /// still be a *held* button: a session begun after the mouse came up ends
+    /// immediately, which is exactly what "the drag animates and nothing ever
+    /// drops" looks like. `scrozz-ui` therefore reports its drag-out intent
+    /// mid-gesture rather than at release.
     fn drag_event(&self, view: &NSView, pointer_in_view: NSPoint) -> Result<Retained<NSEvent>> {
         let app = NSApplication::sharedApplication(self.mtm);
         if let Some(current) = app.currentEvent()
@@ -470,7 +457,8 @@ impl MacDragSource {
         // documented, and all numeric arguments are in range. Synthesising is
         // the supported route to an event for
         // `beginDraggingSessionWithItems:event:source:` when the real one is
-        // unavailable.
+        // unavailable — for instance when the frame that noticed the gesture
+        // was driven by a timer rather than by the mouse event itself.
         let event =
             NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
                 NSEventType::LeftMouseDragged,
@@ -486,64 +474,16 @@ impl MacDragSource {
         event.ok_or_else(|| Error::Platform("could not synthesise a drag event".into()))
     }
 
-    /// The dragging item carrying the promised file.
-    fn promise_item(
-        &self,
-        payload: &DragPayload,
-        host: &Retained<ScrozzDragPromise>,
-        card: AppKitRect,
-    ) -> Retained<NSDraggingItem> {
-        let provider = NSFilePromiseProvider::new();
-        provider.setFileType(&NSString::from_str(payload.file().format().uti()));
-
-        // SAFETY: `setDelegate:` stores an *unretained* reference to our host,
-        // which is exactly why the strong `userInfo` anchor below is mandatory.
-        unsafe {
-            let _: () = msg_send![&*provider, setDelegate: &**host];
-        }
-        // SAFETY: `userInfo` is a strong `id` property. Storing the delegate in
-        // it is the ownership anchor described in this module's header.
-        unsafe {
-            let anchor: &AnyObject = host;
-            provider.setUserInfo(Some(anchor));
-        }
-
-        let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*provider);
-        let item = NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
-        self.decorate(&item, payload.preview_png(), card);
-        item
-    }
-
-    /// The dragging item carrying lazy image flavours.
-    fn image_item(
-        &self,
-        host: &Retained<ScrozzDragPromise>,
-        card: AppKitRect,
-    ) -> Retained<NSDraggingItem> {
-        let item = NSPasteboardItem::new();
-        // SAFETY: reading AppKit's immortal pasteboard-type globals.
-        let types = unsafe { NSArray::from_slice(&[NSPasteboardTypePNG, NSPasteboardTypeTIFF]) };
-        let provider: &ProtocolObject<dyn NSPasteboardItemDataProvider> =
-            ProtocolObject::from_ref(&**host);
-        item.setDataProvider_forTypes(provider, &types);
-
-        let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*item);
-        let dragging = NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
-        // Only the promise item shows a preview; this one rides invisibly.
-        self.decorate(&dragging, None, card);
-        dragging
-    }
-
     /// Gives a dragging item its on-screen frame and, when one was supplied, the
     /// preview image that follows the pointer.
-    fn decorate(&self, item: &NSDraggingItem, preview_png: Option<&[u8]>, card: AppKitRect) {
+    fn decorate(item: &NSDraggingItem, preview: Option<&DragPreview>, frame: AppKitRect) {
         let frame = NSRect::new(
-            NSPoint::new(card.x, card.y),
-            NSSize::new(card.width, card.height),
+            NSPoint::new(frame.x, frame.y),
+            NSSize::new(frame.width, frame.height),
         );
 
-        let contents = preview_png.and_then(|png| {
-            let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png));
+        let contents = preview.and_then(|preview| {
+            let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(preview.png()));
             if image.is_none() {
                 tracing::warn!("drag: preview PNG could not be decoded; dragging without an image");
             }
@@ -562,6 +502,37 @@ impl MacDragSource {
             }
         }
     }
+
+    fn preview_frame(
+        card: AppKitRect,
+        logical_card: scrozz_core::LogicalRect,
+        pointer: scrozz_core::LogicalPoint,
+        preview: &DragPreview,
+        flipped: bool,
+    ) -> AppKitRect {
+        let grab = scrozz_core::LogicalPoint::new(
+            pointer.x - logical_card.origin.x,
+            pointer.y - logical_card.origin.y,
+        );
+        let hotspot = preview_hotspot(logical_card.size, grab, preview.size());
+        let pointer_x = card.x + grab.x;
+        let pointer_y = if flipped {
+            card.y + grab.y
+        } else {
+            card.y + card.height - grab.y
+        };
+        let y = if flipped {
+            pointer_y - hotspot.y
+        } else {
+            pointer_y - (preview.size().height - hotspot.y)
+        };
+        AppKitRect::new(
+            pointer_x - hotspot.x,
+            y,
+            preview.size().width,
+            preview.size().height,
+        )
+    }
 }
 
 impl DragSource for MacDragSource {
@@ -570,7 +541,7 @@ impl DragSource for MacDragSource {
     }
 
     fn capability(&self) -> DragCapability {
-        DragCapability::FULL
+        DragCapability::EAGER_FILE_AND_IMAGE
     }
 
     fn begin(&self, payload: DragPayload, origin: DragOrigin) -> Result<DragSession> {
@@ -581,45 +552,126 @@ impl DragSource for MacDragSource {
         let view = unsafe { self.view_for(&origin)? };
 
         let bounds = view.bounds();
-        let card = card_rect_in_view(origin.card(), bounds.size.height, view.isFlipped());
+        let logical_card = origin.card();
+        let flipped = view.isFlipped();
+        let card = card_rect_in_view(logical_card, bounds.size.height, flipped);
 
-        let host = ScrozzDragPromise::new(
-            payload.file().file_name(),
-            payload.file().byte_source(),
-            payload.image().cloned(),
-        );
+        // The one encode this whole feature costs, and the only write. If it
+        // fails, nothing native has been touched yet.
+        let (artifact, bytes) = payload.materialise(&artifact_root())?;
+        let file_bytes = std::sync::Arc::new(bytes);
 
-        let mut items = Vec::with_capacity(2);
-        items.push(self.promise_item(&payload, &host, card));
-        if payload.image().is_some() {
-            items.push(self.image_item(&host, card));
-        }
-        let item_count = items.len();
+        // Image flavours come from the image producer, never from the file
+        // bytes. For a screenshot the two are the same `Arc` and this costs
+        // nothing; for an MP4 or a JPEG there is no image to offer and this is
+        // the difference between "no PNG flavour" and "a PNG flavour that is
+        // not a PNG".
+        let png = payload
+            .image_png(&file_bytes)?
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
 
         let session = DragSession::new();
-        let source = ScrozzDragSourceObject::new(self.mtm, session.clone());
+        // Attached before anything can fail, so every exit path from here has an
+        // owner that will delete the file.
+        session.attach_artifact(artifact);
+
+        let provider = ScrozzImageProvider::new(std::sync::Arc::clone(&png));
+        hold_provider(&provider);
+
+        let source = ScrozzDragSourceObject::new(self.mtm, session.clone(), provider.clone());
         LIVE.with(|live| live.borrow_mut().push(source.clone()));
 
-        let pointer = NSPoint::new(origin.pointer().x, origin.pointer().y);
-        let event = match self.drag_event(&view, pointer) {
-            Ok(event) => event,
-            Err(err) => {
-                retire(&source);
-                return Err(err);
-            }
-        };
+        let started = (|| -> Result<()> {
+            let path = session
+                .artifact_path()
+                .ok_or_else(|| Error::Platform("the drag file went missing".to_owned()))?;
+            let item = capture_item(&path, &png, &provider)?;
 
-        let array = NSArray::from_retained_slice(&items);
-        let protocol: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
-        let dragging = view.beginDraggingSessionWithItems_event_source(&array, &event, protocol);
-        dragging.setAnimatesToStartingPositionsOnCancelOrFail(true);
+            let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*item);
+            let dragging =
+                NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
+            let frame = payload.preview().map_or(card, |preview| {
+                Self::preview_frame(card, logical_card, origin.pointer(), preview, flipped)
+            });
+            Self::decorate(&dragging, payload.preview(), frame);
+
+            let pointer = NSPoint::new(origin.pointer().x, origin.pointer().y);
+            let event = self.drag_event(&view, pointer)?;
+
+            let array = NSArray::from_retained_slice(&[dragging]);
+            let protocol: &ProtocolObject<dyn NSDraggingSource> =
+                ProtocolObject::from_ref(&*source);
+            let native = view.beginDraggingSessionWithItems_event_source(&array, &event, protocol);
+            native.setAnimatesToStartingPositionsOnCancelOrFail(true);
+            Ok(())
+        })();
+
+        if let Err(err) = started {
+            // Nothing is in flight, so the file goes now rather than waiting for
+            // an outcome that will never arrive.
+            retire(&source);
+            retire_provider(&provider);
+            session.finish(DragOutcome::Failed(err.to_string()));
+            return Err(err);
+        }
 
         tracing::info!(
             file = %payload.file().file_name(),
-            items = item_count,
+            bytes = file_bytes.len(),
+            image = !png.is_empty(),
             "drag: session began"
         );
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+
+    #[test]
+    fn a_smaller_preview_preserves_the_grab_point_in_a_flipped_view() {
+        let logical = LogicalRect::new(
+            LogicalPoint::new(10.0, 20.0),
+            LogicalSize::new(210.0, 150.0),
+        );
+        let card = AppKitRect::new(10.0, 20.0, 210.0, 150.0);
+        let preview =
+            DragPreview::from_png(vec![1], LogicalSize::new(168.0, 96.0)).expect("preview");
+        let frame = MacDragSource::preview_frame(
+            card,
+            logical,
+            LogicalPoint::new(115.0, 95.0),
+            &preview,
+            true,
+        );
+
+        assert!((frame.x + 84.0 - 115.0).abs() < f64::EPSILON);
+        assert!((frame.y + 48.0 - 95.0).abs() < f64::EPSILON);
+        assert_eq!((frame.width, frame.height), (168.0, 96.0));
+    }
+
+    #[test]
+    fn an_unflipped_preview_keeps_the_pointer_over_the_same_content() {
+        let logical = LogicalRect::new(
+            LogicalPoint::new(10.0, 20.0),
+            LogicalSize::new(210.0, 150.0),
+        );
+        let card = AppKitRect::new(10.0, 673.0, 210.0, 150.0);
+        let preview =
+            DragPreview::from_png(vec![1], LogicalSize::new(168.0, 96.0)).expect("preview");
+        let frame = MacDragSource::preview_frame(
+            card,
+            logical,
+            LogicalPoint::new(115.0, 95.0),
+            &preview,
+            false,
+        );
+        let pointer_y = card.y + card.height - 75.0;
+
+        assert!((frame.x + 84.0 - 115.0).abs() < f64::EPSILON);
+        assert!((frame.y + (96.0 - 48.0) - pointer_y).abs() < f64::EPSILON);
     }
 }
 
@@ -627,76 +679,110 @@ impl DragSource for MacDragSource {
 // Test-only seams
 // ---------------------------------------------------------------------------
 
-/// Test seam: build the promise host and drive its callbacks without a drag.
+/// Test seam: build the pasteboard item a drag would carry, without a drag.
 ///
 /// This exists so the parts that *can* be verified on a machine whose mouse is
-/// in use — filename generation, the promise producing correct bytes, image
-/// flavour negotiation — actually are. Nothing here touches a window, the
-/// system pasteboard, or the pointer.
+/// in use — which flavours are advertised, in which order, that the file URL
+/// round-trips to the path that was written, that the image flavours produce
+/// real bytes — actually are. Nothing here touches a window, the system
+/// pasteboard, or the pointer.
 #[doc(hidden)]
 pub mod test_support {
     use super::{
-        ClassType, DragPayload, NSFilePromiseProvider, NSPasteboardItem, NSString, NSURL, NSView,
-        Result, Retained, ScrozzDragPromise, msg_send, sel,
+        ClassType, DragPayload, NSPasteboardItem, NSString, NSURL, NSView, Result, Retained,
+        ScrozzImageProvider, capture_item, hold_provider, retire_provider, sel,
     };
+    use crate::drag::artifact::DragArtifact;
 
-    /// A standalone promise host, exactly as [`super::MacDragSource::begin`]
+    /// One capture's pasteboard item, exactly as [`MacDragSource`](super::MacDragSource)`::begin`
     /// would build it.
-    pub struct PromiseHarness {
-        host: Retained<ScrozzDragPromise>,
+    pub struct ItemHarness {
+        item: Retained<NSPasteboardItem>,
+        provider: Retained<ScrozzImageProvider>,
+        artifact: DragArtifact,
     }
 
-    impl PromiseHarness {
-        /// Builds a harness for `payload`.
-        #[must_use]
-        pub fn new(payload: &DragPayload) -> Self {
-            Self {
-                host: ScrozzDragPromise::new(
-                    payload.file().file_name(),
-                    payload.file().byte_source(),
-                    payload.image().cloned(),
-                ),
-            }
-        }
-
-        /// The filename AppKit would be told to use, fetched through the real
-        /// Objective-C dispatch path.
-        #[must_use]
-        pub fn file_name(&self) -> String {
-            let uti = NSString::from_str("public.png");
-            let provider = NSFilePromiseProvider::new();
-            // SAFETY: messaging our own delegate method with live arguments. The
-            // selector matches the implementation's declared signature.
-            let name: Retained<NSString> = unsafe {
-                msg_send![&*self.host, filePromiseProvider: &*provider, fileNameForType: &*uti]
-            };
-            name.to_string()
-        }
-
-        /// Runs the promise write against `path`, as a drop would.
+    impl ItemHarness {
+        /// Materialises `payload` under `root` and builds its pasteboard item.
         ///
         /// # Errors
         ///
-        /// Propagates whatever the byte producer or the filesystem returned.
-        pub fn write_to(&self, path: &std::path::Path) -> Result<()> {
-            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-            self.host.write_to(&url)
+        /// Propagates whatever the byte producer, the filesystem or AppKit
+        /// returned.
+        pub fn new(payload: &DragPayload, root: &std::path::Path) -> Result<Self> {
+            // Mirrors `begin` exactly, including the split between the bytes
+            // written to disk and the bytes offered as an image. A harness that
+            // shortcut that split would report flavours the real drag does not
+            // advertise.
+            let (artifact, bytes) = payload.materialise(root)?;
+            let file_bytes = std::sync::Arc::new(bytes);
+            let png = payload
+                .image_png(&file_bytes)?
+                .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
+            let provider = ScrozzImageProvider::new(std::sync::Arc::clone(&png));
+            hold_provider(&provider);
+            let item = capture_item(artifact.path(), &png, &provider)?;
+            Ok(Self {
+                item,
+                provider,
+                artifact,
+            })
         }
 
-        /// Asks for one image flavour and reads back what landed on the item.
+        /// The flavours the item advertises, in the order AppKit will offer
+        /// them.
         #[must_use]
-        pub fn image_flavour(&self, uti: &str) -> Option<Vec<u8>> {
-            let item = NSPasteboardItem::new();
+        pub fn types(&self) -> Vec<String> {
+            self.item
+                .types()
+                .iter()
+                .map(|ty| ty.to_string())
+                .collect::<Vec<_>>()
+        }
+
+        /// The path the advertised `public.file-url` resolves back to.
+        #[must_use]
+        pub fn file_url_path(&self) -> Option<String> {
+            let ty = NSString::from_str("public.file-url");
+            let value = self.item.stringForType(&ty)?;
+            let url = NSURL::URLWithString(&value)?;
+            url.path().map(|path| path.to_string())
+        }
+
+        /// Reads one flavour, running the lazy provider when the item has no
+        /// eager data for it.
+        #[must_use]
+        pub fn flavour(&self, uti: &str) -> Option<Vec<u8>> {
             let requested = NSString::from_str(uti);
-            self.host.provide_image(&item, &requested);
-            item.dataForType(&requested).map(|data| data.to_vec())
+            if let Some(data) = self.item.dataForType(&requested) {
+                return Some(data.to_vec());
+            }
+            self.provider.provide_image(&self.item, &requested);
+            self.item.dataForType(&requested).map(|data| data.to_vec())
+        }
+
+        /// The artifact backing this item, so a test can assert its lifetime.
+        #[must_use]
+        pub fn artifact(&self) -> &DragArtifact {
+            &self.artifact
+        }
+
+        /// The artifact, mutably, so a test can drive its state transitions.
+        pub fn artifact_mut(&mut self) -> &mut DragArtifact {
+            &mut self.artifact
+        }
+
+        /// Releases the provider as `pasteboardFinishedWithDataProvider:` would.
+        pub fn finish(&self) {
+            retire_provider(&self.provider);
         }
     }
 
     /// Whether `NSView` implements the drag entry point at all.
     ///
     /// This answers only the part that is checkable without a mouse. Whether a
-    /// *non-activating* panel can host a real drop still needs a human.
+    /// *non-activating* panel can host a real drop still needs a human; see
+    /// `docs/drag-matrix.md`.
     #[must_use]
     pub fn view_can_begin_drags() -> bool {
         NSView::class().responds_to(sel!(beginDraggingSessionWithItems:event:source:))

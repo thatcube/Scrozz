@@ -24,6 +24,18 @@ pub enum Annotation {
         /// Head.
         to: LogicalPoint,
     },
+    /// A plain straight line, with no head at either end.
+    ///
+    /// Distinct from a headless [`Self::Arrow`] rather than a special case of
+    /// one: an arrow points, and a line connects or underlines. Collapsing the
+    /// two would mean a line silently grew a head the moment its stroke width
+    /// changed, because head size is derived from stroke width.
+    Line {
+        /// One end.
+        from: LogicalPoint,
+        /// The other.
+        to: LogicalPoint,
+    },
     /// A rectangle outline.
     Rectangle(LogicalRect),
     /// An ellipse inscribed in a rectangle.
@@ -85,6 +97,8 @@ pub enum RedactStyle {
 pub enum AnnotationKind {
     /// [`Annotation::Arrow`].
     Arrow,
+    /// [`Annotation::Line`].
+    Line,
     /// [`Annotation::Rectangle`].
     Rectangle,
     /// [`Annotation::Ellipse`].
@@ -107,6 +121,7 @@ impl Annotation {
     pub const fn kind(&self) -> AnnotationKind {
         match self {
             Self::Arrow { .. } => AnnotationKind::Arrow,
+            Self::Line { .. } => AnnotationKind::Line,
             Self::Rectangle(_) => AnnotationKind::Rectangle,
             Self::Ellipse(_) => AnnotationKind::Ellipse,
             Self::Freehand(_) => AnnotationKind::Freehand,
@@ -133,7 +148,9 @@ impl Annotation {
     #[must_use]
     pub fn bounds(&self) -> LogicalRect {
         match self {
-            Self::Arrow { from, to } => LogicalRect::from_corners(*from, *to),
+            Self::Arrow { from, to } | Self::Line { from, to } => {
+                LogicalRect::from_corners(*from, *to)
+            }
             Self::Rectangle(r)
             | Self::Ellipse(r)
             | Self::Highlight(r)
@@ -152,7 +169,7 @@ impl Annotation {
             p.y += dy;
         };
         match self {
-            Self::Arrow { from, to } => {
+            Self::Arrow { from, to } | Self::Line { from, to } => {
                 shift(from);
                 shift(to);
             }
@@ -176,7 +193,7 @@ impl Annotation {
     pub fn set_bounds(&mut self, to: LogicalRect) {
         let from = self.bounds();
         match self {
-            Self::Arrow { from: a, to: b } => {
+            Self::Arrow { from: a, to: b } | Self::Line { from: a, to: b } => {
                 *a = geom::remap(*a, &from, &to);
                 *b = geom::remap(*b, &from, &to);
             }
@@ -313,7 +330,9 @@ impl AnnotationObject {
         }
         let slack = self.style.effective_stroke_width() / 2.0 + Self::HIT_TOLERANCE;
         match &self.annotation {
-            Annotation::Arrow { from, to } => geom::distance_to_segment(point, *from, *to) <= slack,
+            Annotation::Arrow { from, to } | Annotation::Line { from, to } => {
+                geom::distance_to_segment(point, *from, *to) <= slack
+            }
             Annotation::Rectangle(r) => {
                 if self.style.fill.is_some_and(|f| !f.is_invisible()) {
                     geom::contains(&geom::inflate(r, slack), point)

@@ -864,8 +864,178 @@ fn a_swipe_right_or_up_begins_a_drag_out() {
 
         assert_eq!(release.intent, Intent::DragOut, "{dir:?}");
         assert_eq!(release.direction, Some(dir));
-        assert!(s.is_empty(), "the capture leaves the pile with the drag");
+        assert_eq!(
+            s.len(),
+            1,
+            "a release-time drag-out is too late to deliver and must spring back"
+        );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mid-gesture hand-off
+// ---------------------------------------------------------------------------
+//
+// A native drag has to be started while the button is still down: AppKit
+// refuses `beginDraggingSessionWithItems:` from a released mouse. So the stack
+// has to answer "is this already a drag-out?" *during* the gesture, not at
+// release. These tests pin that answer down.
+
+#[test]
+fn a_live_gesture_is_only_reported_once_it_has_travelled() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+
+    let origin = pos2(120.0, 900.0);
+    s.begin_drag(id, origin, &at(SETTLED));
+    assert!(
+        s.live_gesture(&at(SETTLED)).is_none(),
+        "a press that has not moved is not a drag-out"
+    );
+
+    s.drag_to(origin + vec2(12.0, 0.0), &at(SETTLED + 10));
+    assert!(
+        s.live_gesture(&at(SETTLED + 10)).is_none(),
+        "a twitch is not a drag-out"
+    );
+
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    let live = s
+        .live_gesture(&at(SETTLED + 60))
+        .expect("a committed sideways drag is a drag-out mid-gesture");
+    assert_eq!(live.id, id);
+    assert_eq!(live.intent, Intent::DragOut);
+}
+
+#[test]
+fn a_live_gesture_reports_where_the_card_and_pointer_are_now() {
+    // Both halves matter downstream: the rect places the drag image and the
+    // pointer fixes where inside it the cursor grabbed. Get the rect wrong and
+    // the thumbnail jumps to the wrong place the instant the drag starts.
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+
+    let home = frame_of(&s.frame(&at(SETTLED)), id).rect;
+    let origin = home.center();
+    let travel = vec2(240.0, 0.0);
+    let moved = origin + travel;
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(moved, &at(SETTLED + 60));
+
+    let live = s.live_gesture(&at(SETTLED + 60)).expect("drag-out");
+    assert_eq!(live.pointer, moved, "the drag image follows the pointer");
+    assert_eq!(
+        live.rect,
+        home.translate(travel),
+        "the card has moved with the pointer, not stayed in its slot"
+    );
+    assert!(
+        live.rect.contains(moved),
+        "the grab point is still inside the card: {:?} vs {moved:?}",
+        live.rect
+    );
+}
+
+#[test]
+fn a_live_gesture_ignores_flick_speed() {
+    // A short sharp flick clears the *velocity* threshold without clearing the
+    // distance one. At release that is a deliberate shortcut and counts as a
+    // drag-out. Mid-gesture it must not, because every drag is briefly fast as
+    // the pointer accelerates and the card has not actually been pulled clear
+    // of the pile yet — arming there would fire on an ordinary shove.
+    //
+    // 60 pt in the last 60 ms is 1000 pt/s against a 420 pt/s threshold, while
+    // 60 pt is comfortably under the 110 pt one, so the two rules genuinely
+    // disagree. The still sample at +40 ms is what puts a measurable interval
+    // inside the 80 ms velocity window; without it the flick reads as
+    // instantaneous and is discarded as noise.
+    let flick = vec2(60.0, 0.0);
+    let origin = pos2(120.0, 900.0);
+
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin, &at(SETTLED + 40));
+    s.drag_to(origin + flick, &at(SETTLED + 100));
+
+    assert!(
+        s.live_gesture(&at(SETTLED + 100)).is_none(),
+        "60 pt covered quickly is still only 60 pt"
+    );
+
+    // And the same gesture released right there *is* a drag-out, which is what
+    // makes the paragraph above a real distinction rather than a coincidence.
+    let release = s.release_drag(&at(SETTLED + 100)).expect("a live drag");
+    assert_eq!(release.intent, Intent::DragOut);
+    assert_eq!(
+        s.len(),
+        1,
+        "a velocity-only release cannot start a native drop and must keep the card"
+    );
+}
+
+#[test]
+fn a_downward_gesture_is_never_armed_as_a_drag_out() {
+    for delta in [vec2(-240.0, 0.0), vec2(0.0, 240.0)] {
+        let mut s = stack();
+        let id = s.push(&at(0));
+        s.advance(&at(SETTLED));
+
+        let origin = pos2(120.0, 900.0);
+        s.begin_drag(id, origin, &at(SETTLED));
+        s.drag_to(origin + delta, &at(SETTLED + 60));
+
+        let live = s.live_gesture(&at(SETTLED + 60)).expect("committed");
+        assert_ne!(
+            live.intent,
+            Intent::DragOut,
+            "{delta:?} is a dismiss or a collapse, not a drag-out"
+        );
+    }
+}
+
+#[test]
+fn cancelling_an_armed_drag_keeps_the_card() {
+    // The native session owns the capture from the moment it is armed. The
+    // pile must not also retire it, or a refused drop would lose the shot.
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+
+    let origin = pos2(120.0, 900.0);
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    assert!(s.live_gesture(&at(SETTLED + 60)).is_some());
+
+    s.cancel_drag(&at(SETTLED + 80));
+    assert!(
+        !s.is_empty(),
+        "the capture stays until the drop is accepted"
+    );
+    assert!(
+        s.departing().is_empty(),
+        "and it is not animating away either"
+    );
+}
+
+#[test]
+fn a_live_gesture_needs_a_live_drag() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    assert!(s.live_gesture(&at(SETTLED)).is_none(), "nothing is pressed");
+
+    let origin = pos2(120.0, 900.0);
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    s.cancel_drag(&at(SETTLED + 80));
+    assert!(
+        s.live_gesture(&at(SETTLED + 90)).is_none(),
+        "the gesture is over"
+    );
 }
 
 #[test]
@@ -1310,4 +1480,148 @@ fn reduced_timing_tokens_leave_the_state_machine_intact() {
     assert!(s.departing().is_empty(), "the exit finished instantly");
     assert_eq!(s.slot_of(ids[3]), Some(2), "and the pile still closed up");
     s.check_no_card_moved_up().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Settling a drag the platform ran
+// ---------------------------------------------------------------------------
+//
+// Once a native drag starts, the platform runs a *modal* event loop. AppKit's
+// dragging session and Windows' `DoDragDrop` both do, and both can consume the
+// mouse-up entirely. So the release this stack is waiting for may never arrive:
+// the card stays held and displaced under a pointer the user let go of, and —
+// because a gesture only arms when nothing else is held — no card can ever be
+// dragged again. `settle_drag` is how the host says "that one is over" without
+// having to know whether the release came through.
+
+/// A card lifted out of its slot and carried sideways, mid-gesture.
+///
+/// Returns the card and the slot it came from. The slot has to be read
+/// *before* the drag, because a frame taken during one already carries the
+/// displacement — a fixture that reads it afterwards is asserting the card
+/// returns to where the pointer left it, which it must not.
+fn dragged_out(s: &mut CaptureStack) -> (CardId, Rect) {
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let home = frame_of(&s.frame(&at(SETTLED)), id).rect;
+    let origin = home.center();
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+    assert!(
+        s.live_gesture(&at(SETTLED + 60)).is_some(),
+        "the fixture must be a committed drag-out"
+    );
+    assert_ne!(
+        frame_of(&s.frame(&at(SETTLED + 60)), id).rect,
+        home,
+        "the fixture must actually have moved the card off its slot"
+    );
+    (id, home)
+}
+
+#[test]
+fn a_rejected_drop_springs_the_card_back() {
+    let mut s = stack();
+    let (id, home) = dragged_out(&mut s);
+
+    assert!(
+        s.settle_drag(id, &at(SETTLED + 100)),
+        "the drag was still held, so settling must have changed something"
+    );
+
+    // The card is still on the pile — a refused drop loses nothing — and it is
+    // on its way home rather than stranded where the pointer left it.
+    assert_eq!(s.len(), 1, "a rejected drop must not discard the card");
+    s.advance(&at(SETTLED + 4_000));
+    assert_rect_eq(
+        frame_of(&s.frame(&at(SETTLED + 4_000)), id).rect,
+        home,
+        "the card did not return to its slot after a rejected drop",
+    );
+}
+
+#[test]
+fn settling_frees_the_stack_for_the_next_drag() {
+    // The failure this prevents is total: one stuck gesture and the pile is
+    // inert for the rest of the session.
+    let mut s = stack();
+    let (id, _) = dragged_out(&mut s);
+    s.settle_drag(id, &at(SETTLED + 100));
+
+    assert!(
+        s.live_gesture(&at(SETTLED + 100)).is_none(),
+        "the finished drag is still being reported as live"
+    );
+
+    // A second gesture on the same card must arm and commit exactly as the
+    // first one did.
+    s.advance(&at(SETTLED + 4_000));
+    let t = SETTLED + 4_000;
+    let origin = frame_of(&s.frame(&at(t)), id).rect.center();
+    s.begin_drag(id, origin, &at(t));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(t + 60));
+    assert!(
+        s.live_gesture(&at(t + 60)).is_some(),
+        "the stack never recovered enough to start a second drag"
+    );
+}
+
+#[test]
+fn settling_a_drag_that_already_ended_normally_is_harmless() {
+    // The other half of the modal-loop problem: sometimes the release *does*
+    // arrive, and the host cannot tell which happened. Settling anyway must be
+    // a no-op rather than disturbing whatever the stack is doing now.
+    let mut s = stack();
+    let (id, _) = dragged_out(&mut s);
+    s.cancel_drag(&at(SETTLED + 80));
+    s.advance(&at(SETTLED + 4_000));
+
+    assert!(
+        !s.settle_drag(id, &at(SETTLED + 4_000)),
+        "settling an already-finished drag reported a change it did not make"
+    );
+    assert_eq!(s.len(), 1);
+    assert!(s.live_gesture(&at(SETTLED + 4_000)).is_none());
+}
+
+#[test]
+fn settling_one_card_leaves_another_cards_gesture_alone() {
+    // Why this is not `cancel_drag`. A native session that finishes late must
+    // not cancel whatever the user is holding *now*.
+    let mut s = stack();
+    let (first, _) = dragged_out(&mut s);
+    s.settle_drag(first, &at(SETTLED + 100));
+    s.advance(&at(SETTLED + 4_000));
+
+    let t = SETTLED + 4_000;
+    let second = s.push(&at(t));
+    s.advance(&at(t + 4_000));
+    let t = t + 4_000;
+    let origin = frame_of(&s.frame(&at(t)), second).rect.center();
+    s.begin_drag(second, origin, &at(t));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(t + 60));
+
+    // The stale outcome for `first` arrives now.
+    assert!(
+        !s.settle_drag(first, &at(t + 60)),
+        "a stale outcome touched a card that was not dragging"
+    );
+    let live = s
+        .live_gesture(&at(t + 60))
+        .expect("the live gesture was cancelled by an unrelated card's outcome");
+    assert_eq!(live.id, second);
+}
+
+#[test]
+fn settling_an_unknown_card_changes_nothing() {
+    let mut s = stack();
+    let (id, _) = dragged_out(&mut s);
+    assert!(
+        !s.settle_drag(CardId(id.0.wrapping_add(999)), &at(SETTLED + 100)),
+        "an outcome for a card that is not here reported a change"
+    );
+    assert!(
+        s.live_gesture(&at(SETTLED + 100)).is_some(),
+        "the live gesture was disturbed by an unrelated card's outcome"
+    );
 }

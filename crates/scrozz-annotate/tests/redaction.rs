@@ -9,7 +9,7 @@ mod common;
 
 use common::{capture_with, checkerboard, flat, near, pixel, rect};
 use scrozz_annotate::{Annotation, Color, Document, RedactStyle, Renderer, SkiaRenderer, Style};
-use scrozz_core::{Frame, Provenance, ScaleFactor};
+use scrozz_core::{ColorSpace, Frame, Provenance, ScaleFactor};
 
 /// A document whose source is a black/white checkerboard.
 fn checkered(width: u32, height: u32) -> Document {
@@ -441,4 +441,73 @@ fn blur_and_pixelate_are_deterministic() {
         renderer.render(&doc).unwrap().data,
         renderer.render(&doc).unwrap().data
     );
+}
+
+/// A capture in `space`, so the renderer has a working space to convert into.
+fn wide(space: ColorSpace) -> Document {
+    let mut frame = flat(40, 40, [200, 200, 200, 255]);
+    frame.color_space = space;
+    Document::new(capture_with(frame, Provenance::Display))
+}
+
+/// The colour a stroke of `color` comes out as, which is by construction the
+/// right answer: strokes have gone through the working-space conversion since
+/// wide-gamut support landed.
+fn stroke_colour(space: ColorSpace, color: Color) -> [u8; 4] {
+    let mut doc = wide(space);
+    doc.add(
+        Annotation::Rectangle(rect(5.0, 5.0, 30.0, 30.0)),
+        Style::stroked().with_fill(Some(color)),
+    );
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    pixel(&out, 20, 20)
+}
+
+#[test]
+fn a_solid_redaction_uses_the_same_colour_a_stroke_of_that_colour_would() {
+    // A solid redaction writes its pixels itself instead of going through a
+    // `Paint`, and used to skip the sRGB-to-working conversion every other
+    // annotation colour gets. On a wide-gamut capture that made the *one*
+    // colour the user picked deliberately the one colour rendered wrong.
+    for space in [ColorSpace::DisplayP3, ColorSpace::Rec2020] {
+        // Deliberately non-neutral and saturated: a grey would convert to
+        // itself and prove nothing.
+        let chosen = Color::rgb(220, 40, 30);
+        let mut doc = wide(space);
+        doc.add(
+            Annotation::Redact {
+                area: rect(5.0, 5.0, 30.0, 30.0),
+                style: RedactStyle::Solid,
+            },
+            Style::redaction().with_fill(Some(chosen)),
+        );
+        let out = SkiaRenderer::new().render(&doc).unwrap();
+        let got = pixel(&out, 20, 20);
+        let want = stroke_colour(space, chosen);
+
+        assert_eq!(
+            got, want,
+            "{space:?}: redaction painted {got:?}, a stroke of the same colour paints {want:?}"
+        );
+        assert_ne!(
+            [got[0], got[1], got[2]],
+            [chosen.r, chosen.g, chosen.b],
+            "{space:?}: the sRGB bytes were written straight into a wider space"
+        );
+    }
+}
+
+#[test]
+fn a_solid_redaction_in_srgb_is_still_exactly_the_colour_chosen() {
+    // The conversion has to stay a no-op where there is nothing to convert.
+    let mut doc = wide(ColorSpace::Srgb);
+    doc.add(
+        Annotation::Redact {
+            area: rect(5.0, 5.0, 30.0, 30.0),
+            style: RedactStyle::Solid,
+        },
+        Style::redaction().with_fill(Some(Color::rgb(220, 40, 30))),
+    );
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(pixel(&out, 20, 20), [220, 40, 30, 255]);
 }

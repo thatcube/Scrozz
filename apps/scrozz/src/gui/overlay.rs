@@ -23,11 +23,13 @@
 use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
-use scrozz_ui::{
-    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
-};
+use scrozz_ui::{CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX};
 
-use crate::gui::card::{Card, CardEvent, CardId, CardSurface};
+use crate::gui::{
+    card::{Card, CardEvent, CardId, CardSurface},
+    drag::DragSpot,
+    panel::BehaviorController,
+};
 
 /// A [`CardSurface`] backed by a running `scrozz-ui` overlay.
 ///
@@ -36,6 +38,10 @@ use crate::gui::card::{Card, CardEvent, CardId, CardSurface};
 /// pile when the overlay opens rather than being lost.
 pub struct OverlayCards {
     handle: OverlayHandle,
+    /// The native window, once the creation hook has seen it. Only a drag needs
+    /// it, and a drag asked for before the window exists is refused rather than
+    /// guessing at a handle.
+    native: Option<BehaviorController>,
     /// Pushed, awaiting the overlay's identifier. Front is oldest.
     pending: VecDeque<CardId>,
     /// Overlay identifier to ours, for cards currently in the pile.
@@ -55,11 +61,19 @@ impl OverlayCards {
     pub fn new(handle: OverlayHandle) -> Self {
         Self {
             handle,
+            native: None,
             pending: VecDeque::new(),
             mapped: HashMap::new(),
             reverse: HashMap::new(),
             queued: VecDeque::new(),
         }
+    }
+
+    /// Also reports the native window, so drags can start from it.
+    #[must_use]
+    pub fn with_native(mut self, native: BehaviorController) -> Self {
+        self.native = Some(native);
+        self
     }
 
     /// A clone of the handle, for the window that draws it.
@@ -113,17 +127,70 @@ impl CardSurface for OverlayCards {
         self.forget(id);
     }
 
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        // Deliberately does *not* `forget` the card: a rejected drop leaves it
+        // on the pile, and an accepted one is retired by the separate dismiss
+        // that follows. Forgetting here would break the id mapping for both.
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .settle_drag(scrozz_ui::stack::CardId(theirs), accepted);
+        }
+    }
+
     fn poll(&mut self) -> Option<CardEvent> {
         // Anything left from the last batch first: the overlay's ordering is
         // the user's gesture order, and reordering it would let a dismiss
         // overtake the copy that preceded it.
-        if let Some(queued) = self.queued.pop_front() {
-            return Some(queued);
+        if self.queued.is_empty() {
+            self.translate_batch();
         }
+        self.queued.pop_front()
+    }
 
-        // `drain_events` empties the outbox, so the whole batch has to be
-        // translated at once even though the caller wants one at a time.
-        // Anything not translated here would be silently lost.
+    fn poll_drag_starts(&mut self) -> Vec<CardEvent> {
+        self.translate_batch();
+
+        // Everything drained stays in order; only the drags are lifted out.
+        let mut drags = Vec::new();
+        let mut rest = std::collections::VecDeque::with_capacity(self.queued.len());
+        for event in self.queued.drain(..) {
+            if matches!(event, CardEvent::Drag { .. }) {
+                drags.push(event);
+            } else {
+                rest.push_back(event);
+            }
+        }
+        self.queued = rest;
+        drags
+    }
+    fn len(&self) -> usize {
+        self.mapped.len() + self.pending.len()
+    }
+
+    fn native_surface(&self) -> Option<scrozz_shell::NativeSurface> {
+        self.native.as_ref()?.native_surface()
+    }
+
+    fn describe(&self) -> String {
+        if self.handle.is_attached() {
+            let panel = self
+                .handle
+                .panel_report()
+                .map_or_else(|| "no panel report".to_owned(), |r| r.detail);
+            format!("scrozz-ui overlay ({panel})")
+        } else {
+            "scrozz-ui overlay (no window yet)".to_owned()
+        }
+    }
+}
+
+impl OverlayCards {
+    /// Drains the overlay's outbox and appends the translation to `queued`.
+    ///
+    /// `drain_events` empties the outbox, so the whole batch must be translated
+    /// at once even though callers want them one at a time. Anything not
+    /// translated here is silently lost.
+    fn translate_batch(&mut self) {
         let batch = self.handle.drain_events();
         let mut out = Vec::new();
 
@@ -144,14 +211,13 @@ impl CardSurface for OverlayCards {
                 }
                 OverlayEvent::Dismissed { id, reason } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        // A drag that left the pile has already delivered the
-                        // file to wherever it was dropped. Treating it as a
-                        // plain dismissal would be right, but saying which it
-                        // was lets the pipeline release the bytes either way.
-                        out.push(match reason {
-                            DismissReason::DragOut => CardEvent::Drag(ours),
-                            _ => CardEvent::Dismiss(ours),
-                        });
+                        // Every reason ends the same way here: the card is gone
+                        // from the pile and its bytes can be released. A drag
+                        // that was handed to the platform never reaches this
+                        // arm — the overlay springs that card back and the host
+                        // dismisses it only once a drop is accepted.
+                        tracing::debug!(?reason, card = %ours, "card left the pile");
+                        out.push(CardEvent::Dismiss(ours));
                         self.forget(ours);
                     }
                 }
@@ -170,11 +236,25 @@ impl CardSurface for OverlayCards {
                         out.push(CardEvent::Open(ours));
                     }
                 }
-                OverlayEvent::DragStarted { id, .. } | OverlayEvent::DragOut { id, .. } => {
+                OverlayEvent::DragOutArmed { id, card, pointer } => {
+                    // The only event that starts a native drag, and the only
+                    // one that arrives while the mouse button is still down.
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Drag(ours));
+                        out.push(CardEvent::Drag {
+                            card: ours,
+                            at: DragSpot {
+                                card: [card.min.x, card.min.y, card.width(), card.height()],
+                                pointer: [pointer.x, pointer.y],
+                            },
+                        });
                     }
                 }
+                // `DragStarted` is the pointer merely moving with the button
+                // down — far too early to commit to anything. `DragOut` is the
+                // release-time report, which the overlay raises only when no
+                // host armed the gesture; this host always does, on every
+                // platform, and refuses visibly if it cannot.
+                OverlayEvent::DragStarted { .. } | OverlayEvent::DragOut { .. } => {}
                 OverlayEvent::DockCollapsed => {
                     // Collapsing is about the pile, not a card. The oldest one
                     // stands in for it so the event is not lost entirely.
@@ -193,30 +273,8 @@ impl CardSurface for OverlayCards {
             }
         }
 
-        // `drain_events` took everything, so what is not returned now must be
-        // kept. One is returned per call to match the trait; the rest wait.
-        let mut iter = out.into_iter();
-        let first = iter.next();
-        for leftover in iter {
-            self.queued.push_back(leftover);
-        }
-        first.or_else(|| self.queued.pop_front())
-    }
-
-    fn len(&self) -> usize {
-        self.mapped.len() + self.pending.len()
-    }
-
-    fn describe(&self) -> String {
-        if self.handle.is_attached() {
-            let panel = self
-                .handle
-                .panel_report()
-                .map_or_else(|| "no panel report".to_owned(), |r| r.detail);
-            format!("scrozz-ui overlay ({panel})")
-        } else {
-            "scrozz-ui overlay (no window yet)".to_owned()
-        }
+        // `drain_events` took everything, so nothing translated may be dropped.
+        self.queued.extend(out);
     }
 }
 
@@ -250,6 +308,7 @@ mod tests {
     use crate::gui::action::CaptureKind;
     use crate::gui::card::Thumbnail;
     use scrozz_core::Provenance;
+    use scrozz_ui::stack::CardId as UiCardId;
 
     fn card(id: u64) -> Card {
         Card::placeholder(CardId(id), CaptureKind::Fullscreen)
@@ -307,6 +366,141 @@ mod tests {
     fn dismissing_an_unknown_card_is_harmless() {
         let mut surface = OverlayCards::new(OverlayHandle::new());
         surface.dismiss(CardId(99));
+        assert_eq!(surface.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifting drags out of the batch
+    // -----------------------------------------------------------------------
+    //
+    // A native drag has to begin while the mouse button is still down. The
+    // ordinary event drain runs in the host's *logic* pass, which for a given
+    // gesture happens on the frame after the one that produced it — by then the
+    // button may be up and AppKit will refuse. So drags are drained separately,
+    // in the same frame, and everything else is left for the ordinary pass.
+
+    /// Announces `card` to the surface the way a real frame does, and returns
+    /// the overlay-side id the surface will be told about.
+    fn announce(surface: &mut OverlayCards, card: Card) -> u64 {
+        let id = card.id.0;
+        surface.present(card).expect("push never refuses");
+        surface
+            .handle
+            .report(OverlayEvent::Pushed { id: UiCardId(id) });
+        id
+    }
+
+    fn drag_event(id: u64) -> OverlayEvent {
+        OverlayEvent::DragOutArmed {
+            id: UiCardId(id),
+            card: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(210.0, 150.0)),
+            pointer: egui::pos2(60.0, 70.0),
+        }
+    }
+
+    #[test]
+    fn a_drag_is_lifted_out_of_the_batch_it_arrived_in() {
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let a = announce(&mut surface, card(1));
+        surface.poll();
+
+        surface.handle.report(drag_event(a));
+        let drags = surface.poll_drag_starts();
+        assert_eq!(drags.len(), 1, "the drag did not come out in its own frame");
+        assert!(matches!(drags[0], CardEvent::Drag { card, .. } if card == CardId(1)));
+    }
+
+    #[test]
+    fn everything_that_is_not_a_drag_waits_for_the_ordinary_drain() {
+        // Hoisting the drag ahead of a queued dismiss is deliberate; leaving
+        // the rest *reordered* would not be. The pile's event order is the
+        // user's gesture order.
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let a = announce(&mut surface, card(1));
+        let b = announce(&mut surface, card(2));
+        surface.poll();
+
+        surface
+            .handle
+            .report(OverlayEvent::CopyRequested { id: UiCardId(b) });
+        surface.handle.report(drag_event(a));
+        surface
+            .handle
+            .report(OverlayEvent::SaveRequested { id: UiCardId(b) });
+
+        let drags = surface.poll_drag_starts();
+        assert_eq!(drags.len(), 1, "only the drag may be lifted out");
+
+        assert_eq!(surface.poll(), Some(CardEvent::Copy(CardId(2))));
+        assert_eq!(surface.poll(), Some(CardEvent::Save(CardId(2))));
+        assert_eq!(surface.poll(), None, "the drag was drained twice");
+    }
+
+    #[test]
+    fn drags_are_drained_even_when_other_events_are_already_queued() {
+        // The distinguishing property. `poll` only translates a new batch once
+        // the queue empties, which is right for ordering and fatal for a drag:
+        // a copy queued ahead of it would hold the drag until a later frame,
+        // by which time the mouse is up.
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let a = announce(&mut surface, card(1));
+        surface.poll();
+
+        surface
+            .handle
+            .report(OverlayEvent::CopyRequested { id: UiCardId(a) });
+        surface.poll_drag_starts();
+        assert_eq!(surface.queued.len(), 1, "the copy should be waiting");
+
+        surface.handle.report(drag_event(a));
+        let drags = surface.poll_drag_starts();
+        assert_eq!(
+            drags.len(),
+            1,
+            "a queued event delayed the drag past its frame"
+        );
+        assert_eq!(surface.poll(), Some(CardEvent::Copy(CardId(1))));
+    }
+
+    #[test]
+    fn the_drag_carries_where_the_card_and_pointer_are() {
+        // Wrong geometry here and the drag image jumps somewhere else the
+        // instant the platform takes over.
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let a = announce(&mut surface, card(1));
+        surface.poll();
+        surface.handle.report(drag_event(a));
+
+        let drags = surface.poll_drag_starts();
+        let CardEvent::Drag { at, .. } = &drags[0] else {
+            panic!("expected a drag, got {:?}", drags[0]);
+        };
+        assert_eq!(at.card, [10.0, 20.0, 210.0, 150.0]);
+        assert_eq!(at.pointer, [60.0, 70.0]);
+    }
+
+    #[test]
+    fn a_settled_drag_is_reported_by_the_overlay_id_not_ours() {
+        // The two id spaces are different, and a settle sent under the wrong
+        // one silently does nothing — which looks exactly like the bug it is
+        // meant to fix.
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let a = announce(&mut surface, card(1));
+        surface.poll();
+        assert_eq!(surface.reverse.get(&CardId(1)).copied(), Some(a));
+
+        surface.settle_drag(CardId(1), false);
+        assert_eq!(
+            surface.len(),
+            1,
+            "settling a rejected drop must leave the card on the pile"
+        );
+    }
+
+    #[test]
+    fn settling_a_card_the_overlay_never_saw_is_harmless() {
+        let mut surface = OverlayCards::new(OverlayHandle::new());
+        surface.settle_drag(CardId(404), true);
         assert_eq!(surface.len(), 0);
     }
 }

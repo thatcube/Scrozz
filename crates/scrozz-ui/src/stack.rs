@@ -50,9 +50,9 @@
 //!
 //! # What is stubbed
 //!
-//! Painting, and the OS promised-file hand-off behind [`Intent::DragOut`]. The
-//! stack takes the drag-out to the point of launching the shared exit animation
-//! and reports the release; performing the platform drag is the shell's job.
+//! Painting, and the OS hand-off behind [`Intent::DragOut`]. The stack reports
+//! a committed live gesture while the button is still down; a drag-out first
+//! discovered at release springs back because no native session can start then.
 
 #[path = "dock.rs"]
 pub mod dock;
@@ -719,6 +719,28 @@ pub struct DragRelease {
     pub velocity: Vec2,
 }
 
+/// What a drag currently in progress would mean if the pointer stopped now.
+///
+/// This exists because one platform's drag-out cannot wait for the release.
+/// AppKit will only start a dragging session while a mouse button is still
+/// down; a session begun after the button comes up ends instantly, which is
+/// exactly what "the card animates away and nothing ever drops" looks like. So
+/// the host is told a drag-out has committed *during* the gesture, and takes
+/// over from there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveGesture {
+    /// The card being held.
+    pub id: CardId,
+    /// What the gesture means so far.
+    pub intent: Intent,
+    /// Which way it is going, if it has committed.
+    pub direction: Option<Dir>,
+    /// Where the card is right now, in window coordinates.
+    pub rect: Rect,
+    /// Where the pointer is right now, in window coordinates.
+    pub pointer: Pos2,
+}
+
 /// The card currently under the pointer.
 #[derive(Debug, Clone)]
 struct ActiveDrag {
@@ -1082,6 +1104,39 @@ impl CaptureStack {
         }
     }
 
+    /// What the drag in progress means so far, if it means anything yet.
+    ///
+    /// `None` covers both "nothing is held" and "held, but not yet committed
+    /// to any direction". Those are the same answer to the only question the
+    /// caller is asking — *should the platform take over now?* — and collapsing
+    /// them means a caller cannot arm a native drag off a gesture that is still
+    /// undecided by forgetting to check the intent.
+    ///
+    /// Deliberately scored on **distance only**. Speed is a statement made at
+    /// release — mid-gesture it is noise, and a fast pass through the commit
+    /// zone on the way somewhere else is not a drag-out. Requiring the travel
+    /// means the user has to actually pull the card clear before the operating
+    /// system takes over.
+    ///
+    /// See [`LiveGesture`] for why this is needed at all.
+    #[must_use]
+    pub fn live_gesture(&self, m: &Motion) -> Option<LiveGesture> {
+        let drag = self.drag.as_ref()?;
+        let travel = drag.latest - drag.origin;
+        let (intent, direction) = classify(travel, Vec2::ZERO, &self.gestures);
+        if intent == Intent::SpringBack {
+            return None;
+        }
+        let slot = self.slot_of(drag.id)?;
+        Some(LiveGesture {
+            id: drag.id,
+            intent,
+            direction,
+            rect: self.rect_of_resident(slot, m),
+            pointer: drag.latest,
+        })
+    }
+
     /// Lets go, and acts on what the gesture meant.
     ///
     /// Returns `None` if nothing was held.
@@ -1094,14 +1149,15 @@ impl CaptureStack {
         let rect = self.rect_of_resident(slot, m);
 
         match intent {
-            // Both remove the card from the pile, with the one shared exit
-            // animation (D21). What differs is what the shell does next: a
-            // dismiss is the end of the story, a drag-out hands the capture to
-            // the OS.
-            Intent::Dismiss | Intent::DragOut => {
+            Intent::Dismiss => {
                 let dir = direction.unwrap_or(Dir::Left);
                 self.retire_slot(slot, intent, dir, velocity, m);
             }
+            // Too late to begin a native session. A distance-committed drag-out
+            // was already handed off through `live_gesture`; reaching this arm
+            // means only release velocity crossed the threshold. Losing the card
+            // without delivering a drop is never an acceptable shortcut.
+            Intent::DragOut => self.spring_back(slot, m),
             Intent::Collapse => {
                 self.spring_back(slot, m);
                 self.dock.collapse(m);
@@ -1127,6 +1183,52 @@ impl CaptureStack {
         if let Some(slot) = self.slot_of(drag.id) {
             self.spring_back(slot, m);
         }
+    }
+
+    /// Ends `id`'s drag from outside the gesture, and springs the card back.
+    ///
+    /// # Why this is not [`Self::cancel_drag`]
+    ///
+    /// Two differences, and both matter.
+    ///
+    /// It names the card. `cancel_drag` ends whatever is held, which is right
+    /// when the pointer itself let go, and wrong when the caller is a native
+    /// drag session finishing: by then the user may already be holding a
+    /// different card, and cancelling *that* gesture because an older one
+    /// finished would yank a card out from under the pointer.
+    ///
+    /// It does not require a drag to be in progress. After a native drag the
+    /// platform runs a modal event loop that can swallow the mouse-up entirely,
+    /// so the release this surface was waiting for may never arrive — the card
+    /// is left held, displaced, and unable to be dragged again. Equally, the
+    /// release may have arrived normally and been handled already. This copes
+    /// with both, because the caller cannot know which happened and should not
+    /// have to.
+    ///
+    /// Returns whether anything actually changed, which is what lets a caller
+    /// tell "the gesture was still stuck" from "the release came through
+    /// normally" without inspecting private state.
+    pub fn settle_drag(&mut self, id: CardId, m: &Motion) -> bool {
+        let mut changed = false;
+
+        if self.drag.as_ref().is_some_and(|drag| drag.id == id) {
+            self.drag = None;
+            changed = true;
+        }
+
+        // Displacement outlives the drag record, so this is checked separately
+        // rather than only when a drag was found.
+        if let Some(slot) = self.slot_of(id)
+            && self
+                .cards
+                .get(slot)
+                .is_some_and(|card| card.drag.is_some() || card.lifted)
+        {
+            self.spring_back(slot, m);
+            changed = true;
+        }
+
+        changed
     }
 
     /// Sends a card back to its slot from wherever it is.

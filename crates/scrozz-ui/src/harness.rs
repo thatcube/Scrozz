@@ -2013,6 +2013,10 @@ impl SceneRegistry {
         ] {
             me.register(scenario, Box::new(crate::select::SelectionScene));
         }
+        me.register(
+            Scenario::EditorAnnotating,
+            Box::new(crate::editor::EditorScene),
+        );
         me
     }
 

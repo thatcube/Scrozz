@@ -534,3 +534,97 @@ fn column_thickness(frame: &Frame, x: u32) -> u32 {
     }
     best
 }
+
+#[test]
+fn a_line_has_no_head_at_either_end() {
+    let mut arrow_doc = white(120, 60);
+    arrow_doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(10.0, 30.0),
+            to: LogicalPoint::new(100.0, 30.0),
+        },
+        ink(Style::stroked().with_stroke_width(3.0)),
+    );
+    let mut line_doc = white(120, 60);
+    line_doc.add(
+        Annotation::Line {
+            from: LogicalPoint::new(10.0, 30.0),
+            to: LogicalPoint::new(100.0, 30.0),
+        },
+        ink(Style::stroked().with_stroke_width(3.0)),
+    );
+
+    let renderer = SkiaRenderer::new();
+    let arrow = renderer.render(&arrow_doc).unwrap();
+    let line = renderer.render(&line_doc).unwrap();
+    assert!(
+        ink_count(&line) < ink_count(&arrow),
+        "a line must be lighter than the same arrow: the head is real ink"
+    );
+
+    // Measure vertical spread near the destination end. The arrow flares there;
+    // a line stays exactly as thick as its stroke.
+    let spread = |frame: &Frame, x: u32| {
+        (0..frame.height())
+            .filter(|y| pixel(frame, x, *y)[0] < 128)
+            .count()
+    };
+    assert!(
+        spread(&line, 95) < spread(&arrow, 95),
+        "the arrow's head must be wider than the line at the same point"
+    );
+}
+
+#[test]
+fn a_line_spans_both_of_its_endpoints() {
+    let mut doc = white(120, 120);
+    doc.add(
+        Annotation::Line {
+            from: LogicalPoint::new(20.0, 20.0),
+            to: LogicalPoint::new(100.0, 100.0),
+        },
+        ink(Style::stroked().with_stroke_width(2.0)),
+    );
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    let (l, t, r, b) = ink_bounds(&frame).expect("the line drew nothing");
+    assert!(l <= 21 && t <= 21, "line starts short of its origin");
+    assert!(r >= 99 && b >= 99, "line stops short of its destination");
+}
+
+#[test]
+fn a_zero_length_line_draws_nothing_rather_than_a_dot() {
+    let mut doc = white(60, 60);
+    doc.add(
+        Annotation::Line {
+            from: LogicalPoint::new(30.0, 30.0),
+            to: LogicalPoint::new(30.0, 30.0),
+        },
+        ink(Style::stroked().with_stroke_width(6.0)),
+    );
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!(
+        ink_count(&frame),
+        0,
+        "a round cap on a zero-length stroke would leave a stray blob"
+    );
+}
+
+#[test]
+fn a_line_scales_with_the_export_scale() {
+    let mut doc = white(120, 60);
+    doc.add(
+        Annotation::Line {
+            from: LogicalPoint::new(10.0, 30.0),
+            to: LogicalPoint::new(100.0, 30.0),
+        },
+        ink(Style::stroked().with_stroke_width(3.0)),
+    );
+    let renderer = SkiaRenderer::new();
+    let one = ink_count(&renderer.render(&doc).unwrap());
+    let two = ink_count(&renderer.render_at(&doc, ScaleFactor::new(2.0)).unwrap());
+    let ratio = f64::from(two) / f64::from(one);
+    assert!(
+        (3.2..4.8).contains(&ratio),
+        "doubling the scale must roughly quadruple the ink, got {ratio}"
+    );
+}

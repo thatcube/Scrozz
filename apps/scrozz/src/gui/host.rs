@@ -25,7 +25,7 @@ use scrozz_ui::{
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, Tick},
+        app::{App, Config, EditorSnapshot, KeyboardOwner, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
         panel::BehaviorController,
@@ -267,6 +267,8 @@ impl Host for Windowed {
                     emit: Some(emit),
                     selection,
                     settings: scrozz_ui::settings::SettingsWindow::default(),
+                    editor: scrozz_ui::editor::EditorWindow::new(),
+                    editing: None,
                     native,
                     display_id,
                     pointer_geometry,
@@ -306,7 +308,7 @@ impl Host for Windowed {
     fn surface(&self) -> Box<dyn CardSurface> {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
-        Box::new(OverlayCards::new(self.handle.clone()))
+        Box::new(OverlayCards::new(self.handle.clone()).with_native(self.native.clone()))
     }
 
     fn selector(&self) -> Arc<dyn CaptureSelector> {
@@ -434,6 +436,12 @@ impl Drop for OneShotDriver {
 }
 
 /// The `eframe::App` that services this app and draws the overlay.
+struct Editing {
+    card: crate::gui::card::CardId,
+    generation: u64,
+    editor: scrozz_ui::editor::EditorUi,
+}
+
 struct Driver {
     app: App,
     overlay: OverlayApp,
@@ -442,6 +450,9 @@ struct Driver {
     emit: Option<Emit>,
     selection: ClientOverlayController,
     settings: scrozz_ui::settings::SettingsWindow,
+    editor: scrozz_ui::editor::EditorWindow,
+    /// The editor's document, and the card it came from.
+    editing: Option<Editing>,
     native: BehaviorController,
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
@@ -454,6 +465,70 @@ struct Driver {
 }
 
 impl Driver {
+    /// Draws the annotation editor's window while one is open.
+    ///
+    /// Copy and save go back through the worker rather than being written
+    /// here: encoding a full-resolution PNG on the UI thread would stall the
+    /// overlay, and the card's own copy already takes that route.
+    ///
+    /// The document lives on until the *window* closes, not until the editor
+    /// says it is done, so reopening after an accidental Escape is impossible
+    /// to distinguish from never having closed. Nothing is written back to the
+    /// card: per D14 a capture's own pixels are never replaced by an annotated
+    /// version unless the user explicitly saves one.
+    ///
+    /// **Known gap.** D14 also promises that history persists the editable
+    /// document, so a past capture reopens with its annotations intact. That
+    /// half is not built: closing this window discards the scene graph, and
+    /// reopening the card starts from the original pixels. There is no
+    /// dirty-state guard on the way out either, because a warning that offers
+    /// no way to keep the work is just an obstacle. Both wait on the storage
+    /// format decision D14 deliberately left open, which is a product call, not
+    /// something to invent here.
+    fn show_editor(&mut self, ctx: &egui::Context) {
+        use scrozz_ui::editor::Intent;
+
+        // Tied to the viewport's lifetime rather than to `editing`, so the keys
+        // come back even if the document is torn down by some other path.
+        self.app
+            .set_keyboard_owner(KeyboardOwner::Editor, self.editor.is_open());
+
+        let Some(editing) = self.editing.as_mut() else {
+            return;
+        };
+        let card = editing.card;
+        let generation = editing.generation;
+        let editor = &mut editing.editor;
+        let mut intent = Intent::None;
+        self.editor.show(ctx, |ui| {
+            let got = editor.update(ui);
+            if got != Intent::None {
+                intent = got;
+            }
+        });
+
+        match intent {
+            Intent::None => {}
+            Intent::Close => self.editor.close(),
+            Intent::Copy | Intent::Save => match editor.render() {
+                Ok(rendered) => {
+                    if intent == Intent::Copy {
+                        self.app.copy_rendered(card, rendered);
+                    } else {
+                        self.app.save_rendered(card, rendered);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "the annotated image could not be rendered"),
+            },
+        }
+
+        self.app
+            .prepare_editor(EditorSnapshot::new(card, generation, editor));
+        if !self.editor.is_open() {
+            self.editing = None;
+        }
+    }
+
     /// Says what the panel conversion did, the moment it is known.
     ///
     /// Logged on the first tick rather than left to the final report because
@@ -561,9 +636,24 @@ impl eframe::App for Driver {
             }
         }
 
-        let tick = self.app.tick();
+        let editor = self
+            .editing
+            .as_ref()
+            .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor));
+        let tick = self.app.tick_with_editor(editor);
         if self.app.take_settings_request() {
             self.settings.open();
+        }
+        if let Some(request) = self.app.take_editor_request() {
+            let title = format!("{}", request.card);
+            self.editing = Some(Editing {
+                card: request.card,
+                generation: request.generation,
+                editor: scrozz_ui::editor::EditorUi::new(scrozz_annotate::Document::new(
+                    request.capture,
+                )),
+            });
+            self.editor.open(title);
         }
         if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
@@ -593,11 +683,6 @@ impl eframe::App for Driver {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        if self.selection.owns_surface() {
-            self.selection.ui(ui);
-        } else {
-            self.overlay.ui(ui, frame);
-        }
         // Drawn from the app's own view of the shortcuts, and edits are handed
         // straight back to it: the pane reports intent, the app decides whether
         // the OS will accept it.
@@ -609,7 +694,38 @@ impl eframe::App for Driver {
             },
             &self.app.shortcut_rows(),
         );
+        // Order matters. Applying the edits can rebind every global hotkey, so
+        // the editor's claim on the keyboard has to be re-asserted *after* that
+        // — otherwise an edit made while the editor is open would leave the new
+        // combinations grabbed underneath it.
+        // An armed shortcut row is waiting to *see* a combination, so a global
+        // hotkey bound to it must not fire a capture underneath the recorder.
+        // Only while a row is actually armed: merely having Settings open is no
+        // reason to surrender the keyboard.
+        self.app.set_keyboard_owner(
+            KeyboardOwner::ShortcutRecorder,
+            self.settings.is_recording(),
+        );
         self.app.edit_shortcuts(&edits);
+        self.show_editor(ui.ctx());
+
+        if self.selection.owns_surface() {
+            self.selection.ui(ui);
+        } else {
+            self.overlay.ui(ui, frame);
+
+            // The editor pass comes first so a same-frame edit changes the
+            // revision this lookup asks for. The overlay draw and native call
+            // remain adjacent: once the card arms, nothing slow is allowed
+            // between that event and the platform taking the held pointer.
+            let editor = self.editing.as_ref().map(|editing| {
+                EditorSnapshot::new(editing.card, editing.generation, &editing.editor)
+            });
+            let started = self.app.pump_drag_starts_with_editor(editor);
+            if started > 0 {
+                tracing::debug!(started, "drag: began within the gesture frame");
+            }
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -635,9 +751,12 @@ fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
         tracing::warn!(
             "the panel conversion is disabled; capture cards will pull focus when clicked"
         );
-        return None;
     }
-    Some(crate::gui::panel::hook_with_controller(controller))
+    // Installed either way: the hook is also how the native window reaches the
+    // drag host, and that is not what this switch is about.
+    Some(crate::gui::panel::hook_with_controller_options(
+        controller, enabled,
+    ))
 }
 
 /// Where the overlay window goes.
@@ -747,6 +866,96 @@ pub fn headless_requested() -> bool {
 mod tests {
     use super::*;
     use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
+
+    /// Which frame pass a call sits in, read from this file's own source.
+    ///
+    /// `Driver` needs a live `eframe::Frame` and a window, so no test can
+    /// drive its two passes. But *which pass* starts a native drag is the
+    /// whole bug — a drain moved from `ui` back into `logic` produces
+    /// identical events one frame late, when the mouse button is already up
+    /// and AppKit will refuse. That is exactly the kind of regression a
+    /// reviewer would wave through, so it is pinned here rather than left to
+    /// the comment beside it.
+    fn driver_pass(name: &str) -> &'static str {
+        let src = include_str!("host.rs");
+        // The second `impl eframe::App` block in this file is `Driver`'s; the
+        // first belongs to `OneShotDriver`.
+        let driver = src
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .expect("Driver must implement eframe::App");
+        let logic = driver
+            .split_once("fn logic(")
+            .expect("Driver has a logic pass")
+            .1;
+        let (logic_body, after) = logic
+            .split_once("fn ui(")
+            .expect("the ui pass follows the logic pass");
+        let ui_body = after
+            .split_once("fn clear_color(")
+            .expect("clear_color follows the ui pass")
+            .0;
+
+        match (logic_body.contains(name), ui_body.contains(name)) {
+            (true, false) => "logic",
+            (false, true) => "ui",
+            (true, true) => "both",
+            (false, false) => "neither",
+        }
+    }
+
+    #[test]
+    fn native_drags_are_started_in_the_ui_pass() {
+        assert_eq!(
+            driver_pass("pump_drag_starts_with_editor"),
+            "ui",
+            "native drags must begin inside the frame that drew the gesture, \
+             while the mouse button is still down — not in the logic pass, \
+             which runs a frame earlier and would act on a released button"
+        );
+    }
+
+    #[test]
+    fn editor_input_and_shortcuts_settle_before_the_drag_revision_is_chosen() {
+        let src = include_str!("host.rs");
+        let ui = src
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .and_then(|driver| driver.split_once("fn ui("))
+            .and_then(|(_, ui)| ui.split_once("fn clear_color("))
+            .map(|(ui, _)| ui)
+            .expect("Driver has a UI pass");
+        let edits = ui
+            .find("self.app.edit_shortcuts(&edits)")
+            .expect("shortcut edits are applied");
+        let editor = ui
+            .find("self.show_editor(ui.ctx())")
+            .expect("the editor is updated");
+        let overlay = ui
+            .find("self.overlay.ui(ui, frame)")
+            .expect("cards are drawn");
+        let drag = ui
+            .find("pump_drag_starts_with_editor")
+            .expect("native drags are pumped");
+
+        assert!(
+            edits < editor && editor < overlay && overlay < drag,
+            "shortcut ownership must settle before editor input, and that input must advance the \
+             revision before an adjacent overlay draw and native drag start"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_event_drain_stays_in_the_logic_pass() {
+        // The other half. `tick` deliberately runs while the window is hidden,
+        // so a menu-bar app still notices hotkeys at rest; moving it into `ui`
+        // to "fix" drag timing would break that instead.
+        assert_eq!(
+            driver_pass("app.tick_with_editor"),
+            "logic",
+            "the app's ordinary tick must keep running in the logic pass"
+        );
+    }
 
     #[test]
     fn a_headless_run_ends_by_itself() {

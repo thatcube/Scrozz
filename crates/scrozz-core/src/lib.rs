@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capture;
+pub mod color;
 pub mod error;
 pub mod frame;
 pub mod geometry;
@@ -33,6 +34,7 @@ pub mod selection;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
+pub use color::Transform;
 pub use error::{Error, Result};
 pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{

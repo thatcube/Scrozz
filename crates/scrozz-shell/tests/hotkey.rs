@@ -756,3 +756,346 @@ fn the_generated_menu_bar_icon_is_a_well_formed_template_image() {
         "template images must be black with a shaped alpha channel"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Suspending while another window owns the keyboard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_fresh_manager_is_not_suspended() {
+    assert!(!GlobalHotkeys::detached().is_suspended());
+}
+
+#[test]
+fn suspending_keeps_every_binding() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.register(&hotkey("Cmd+Shift+F14"), "capture.window")
+        .expect("a free combination must bind");
+
+    keys.suspend();
+
+    assert!(keys.is_suspended());
+    assert_eq!(
+        keys.bindings().count(),
+        2,
+        "suspending releases the grab, not the configuration"
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region"),
+        "the settings pane and the menu bar still need to know what is bound"
+    );
+}
+
+#[test]
+fn resuming_restores_the_same_bindings() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    keys.suspend();
+    keys.resume().expect("a detached manager always re-grabs");
+
+    assert!(!keys.is_suspended());
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region")
+    );
+}
+
+#[test]
+fn suspending_and_resuming_are_idempotent() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    // Opening the editor twice without closing it, and closing it twice, are
+    // both things a real event loop does.
+    keys.suspend();
+    keys.suspend();
+    assert!(keys.is_suspended());
+
+    keys.resume().expect("a detached manager always re-grabs");
+    keys.resume().expect("a detached manager always re-grabs");
+    assert!(!keys.is_suspended());
+    assert_eq!(keys.bindings().count(), 1);
+}
+
+#[test]
+fn a_suspended_manager_still_reports_conflicts() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    let conflict = keys
+        .check(&hotkey("Cmd+Shift+F13"))
+        .expect("a parseable accelerator")
+        .expect("the combination is taken");
+
+    assert!(
+        matches!(conflict, Conflict::AlreadyBound { ref action } if action == "capture.region"),
+        "settings must not offer a combination that comes back on resume"
+    );
+}
+
+#[test]
+fn a_shortcut_changed_while_suspended_survives_the_resume() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    // The user re-binds capture while the editor is open.
+    keys.unregister(&hotkey("Cmd+Shift+F13"))
+        .expect("the binding exists");
+    keys.register(&hotkey("Cmd+Shift+F15"), "capture.region")
+        .expect("a free combination must bind");
+
+    keys.resume().expect("a detached manager always re-grabs");
+
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        None
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F15").expect("parses")),
+        Some("capture.region"),
+        "the new binding must be the one that comes back"
+    );
+}
+
+#[test]
+fn unregistering_everything_clears_the_suspension() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    keys.unregister_all();
+
+    assert!(
+        !keys.is_suspended(),
+        "a manager with nothing bound has nothing stood down"
+    );
+    assert_eq!(keys.bindings().count(), 0);
+}
+
+#[test]
+fn the_menu_labels_do_not_depend_on_suspension() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    let before: Vec<&str> = menu_model()
+        .iter()
+        .filter_map(|entry| match entry {
+            TrayEntry::Item(action) => Some(action.label()),
+            TrayEntry::Separator => None,
+        })
+        .collect();
+
+    keys.suspend();
+
+    let during: Vec<&str> = menu_model()
+        .iter()
+        .filter_map(|entry| match entry {
+            TrayEntry::Item(action) => Some(action.label()),
+            TrayEntry::Separator => None,
+        })
+        .collect();
+
+    assert_eq!(
+        before, during,
+        "the menu bar must read the same whether or not the editor is up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Applying a new set while the keyboard is on loan.
+//
+// Settings can be edited while the editor is open, so `apply` and `suspend`
+// overlap. Applying must update what is configured without quietly grabbing it
+// back out from under whoever holds the keyboard.
+// ---------------------------------------------------------------------------
+
+/// A desired binding, spelled the way the settings pane spells them.
+fn desired(accelerator: &str, action: &str) -> scrozz_shell::hotkey::DesiredBinding {
+    scrozz_shell::hotkey::DesiredBinding::new(accelerator, action)
+}
+
+#[test]
+fn applying_while_suspended_does_not_take_the_keyboard_back() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    keys.apply(&[desired("Cmd+Shift+F14", "capture.region")])
+        .expect("a valid set applies");
+
+    assert!(
+        keys.is_suspended(),
+        "applying an edit handed the keyboard back while the editor still had it"
+    );
+}
+
+#[test]
+fn applying_while_suspended_still_updates_the_configuration() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    keys.apply(&[desired("Cmd+Shift+F14", "capture.region")])
+        .expect("a valid set applies");
+
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        None,
+        "the old binding is still listed"
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F14").expect("parses")),
+        Some("capture.region"),
+        "the menu bar and settings pane must show what the user just chose"
+    );
+}
+
+#[test]
+fn the_set_applied_while_suspended_is_the_one_that_comes_back() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    keys.suspend();
+    keys.apply(&[
+        desired("Cmd+Shift+F14", "capture.region"),
+        desired("Cmd+Shift+F15", "capture.window"),
+    ])
+    .expect("a valid set applies");
+    keys.resume().expect("a detached manager always re-grabs");
+
+    assert!(!keys.is_suspended());
+    assert_eq!(keys.bindings().count(), 2);
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F14").expect("parses")),
+        Some("capture.region")
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F15").expect("parses")),
+        Some("capture.window")
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        None,
+        "the pre-suspension binding came back from the dead"
+    );
+}
+
+#[test]
+fn a_rejected_apply_while_suspended_leaves_suspension_alone() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    // Two actions on one combination: refused before anything is touched.
+    let rejected = keys
+        .apply(&[
+            desired("Cmd+Shift+F14", "capture.region"),
+            desired("Cmd+Shift+F14", "capture.window"),
+        ])
+        .expect_err("a set that collides with itself must be refused");
+
+    assert!(!rejected.is_empty());
+    assert!(
+        keys.is_suspended(),
+        "a failed apply must not hand the keyboard back either"
+    );
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region"),
+        "the rollback lost the previous configuration"
+    );
+}
+
+#[test]
+fn a_rollback_while_suspended_does_not_resume_underneath_the_editor() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    let _ = keys.apply(&[desired("not a real accelerator", "capture.region")]);
+
+    assert!(keys.is_suspended());
+    // And the restored set still comes back correctly afterwards.
+    keys.resume().expect("a detached manager always re-grabs");
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region")
+    );
+}
+
+#[test]
+fn applying_an_empty_set_while_suspended_clears_the_configuration() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+    keys.suspend();
+
+    keys.apply(&[]).expect("clearing everything is valid");
+
+    assert_eq!(keys.bindings().count(), 0);
+    assert!(keys.is_suspended());
+
+    keys.resume().expect("a detached manager always re-grabs");
+    assert_eq!(
+        keys.bindings().count(),
+        0,
+        "resume resurrected bindings the user had removed"
+    );
+}
+
+#[test]
+fn applying_without_suspension_still_grabs_immediately() {
+    // The ordinary path must not have been broken by making `grab` respect
+    // suspension.
+    let mut keys = GlobalHotkeys::detached();
+    keys.apply(&[desired("Cmd+Shift+F13", "capture.region")])
+        .expect("a valid set applies");
+
+    assert!(!keys.is_suspended());
+    assert_eq!(
+        keys.action_for(&Accelerator::parse("Cmd+Shift+F13").expect("parses")),
+        Some("capture.region")
+    );
+}
+
+#[test]
+fn resume_reports_success_for_a_set_it_can_grab() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.apply(&[desired("Cmd+Shift+F13", "capture.region")])
+        .expect("a valid set applies");
+    keys.suspend();
+
+    assert!(
+        keys.resume().is_ok(),
+        "nothing here should refuse to be grabbed"
+    );
+}
+
+#[test]
+fn resuming_a_manager_that_was_never_suspended_is_harmless() {
+    let mut keys = GlobalHotkeys::detached();
+    keys.register(&hotkey("Cmd+Shift+F13"), "capture.region")
+        .expect("a free combination must bind");
+
+    keys.resume().expect("a detached manager always re-grabs");
+
+    assert!(!keys.is_suspended());
+    assert_eq!(keys.bindings().count(), 1);
+}

@@ -28,7 +28,7 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_core::{Frame, Provenance};
+use scrozz_core::{ColorSpace, Frame, Provenance, Transform as ColorTransform};
 use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
@@ -104,12 +104,13 @@ impl Thumbnail {
     /// frame whose pixel format cannot be straightened.
     pub fn from_frame(frame: &Frame, max_edge: u32) -> scrozz_core::Result<Self> {
         let source = scrozz_export::to_straight_rgba8(frame)?;
-        Ok(Self::downscale(
-            source.width,
-            source.height,
-            &source.data,
-            max_edge,
-        ))
+        let mut thumbnail = Self::downscale(source.width, source.height, &source.data, max_edge);
+        let into_srgb = ColorTransform::new(frame.color_space, ColorSpace::Srgb);
+        for pixel in thumbnail.pixels.as_chunks_mut::<4>().0 {
+            let converted = into_srgb.convert_u8([pixel[0], pixel[1], pixel[2]]);
+            pixel[..3].copy_from_slice(&converted);
+        }
+        Ok(thumbnail)
     }
 
     fn downscale(width: u32, height: u32, rgba: &[u8], max_edge: u32) -> Self {
@@ -295,7 +296,7 @@ impl Card {
 /// to `scrozz-ui`, which knows the thresholds and the velocities. What crosses
 /// this seam is the *decision* — never a raw drag delta, because then two
 /// crates would be deciding what a swipe means.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CardEvent {
     /// Put this capture on the clipboard.
     Copy(CardId),
@@ -303,8 +304,19 @@ pub enum CardEvent {
     Save(CardId),
     /// Swiped left: throw it away.
     Dismiss(CardId),
-    /// Dragged right or up: a drag onto another application has begun.
-    Drag(CardId),
+    /// Dragged right or up far enough to mean it, **while the button is still
+    /// down**.
+    ///
+    /// This is the one card event that is not a report of something finished.
+    /// It is a request to start a native drag *now*, because every platform
+    /// refuses to start one after the mouse comes up. The geometry travels with
+    /// it because the drag image has to be placed where the card already is.
+    Drag {
+        /// Which card.
+        card: CardId,
+        /// Where the gesture was when it committed.
+        at: crate::gui::drag::DragSpot,
+    },
     /// Swiped down: collapse into the capture dock (D20).
     Collapse(CardId),
     /// Clicked: open it for editing.
@@ -319,9 +331,9 @@ impl CardEvent {
             Self::Copy(id)
             | Self::Save(id)
             | Self::Dismiss(id)
-            | Self::Drag(id)
             | Self::Collapse(id)
             | Self::Open(id) => *id,
+            Self::Drag { card, .. } => *card,
         }
     }
 }
@@ -346,12 +358,52 @@ pub trait CardSurface {
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
 
+    /// Reports that `id`'s native drag has finished, however it finished.
+    ///
+    /// The surface armed the gesture and then handed it to the platform; this
+    /// is how it learns the platform is done. It must be called for **every**
+    /// outcome, because a native drag loop can consume the mouse-up that the
+    /// surface would otherwise have used to notice — leaving a card held under
+    /// a pointer that has long since let go, and unable to be dragged again.
+    ///
+    /// `accepted` says whether something took the drop. Every outcome releases
+    /// the gesture; only an accepted one is followed by the card being retired.
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        let _ = (id, accepted);
+    }
+
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
     /// Polled rather than delivered through a callback, for the same reason
     /// `scrozz-shell` polls `muda`: a registered handler is a global the first
     /// caller wins.
     fn poll(&mut self) -> Option<CardEvent>;
+
+    /// Takes only the drag-outs, leaving every other event for [`Self::poll`].
+    ///
+    /// # Why this exists separately
+    ///
+    /// Every other card event can wait a frame. A drag-out cannot. AppKit's
+    /// `beginDraggingSessionWithItems:` and OLE's `DoDragDrop` both take over
+    /// the mouse from wherever it *currently* is, so they have to be called
+    /// while the button is still physically down — within the same input frame
+    /// that produced the gesture. One frame late is a drag that never starts,
+    /// or worse, one that starts under a released button and follows the cursor
+    /// until the user clicks something.
+    ///
+    /// The ordinary [`Self::poll`] is drained from the host's logic pass, which
+    /// runs *before* the UI pass that generates the gesture — so an event born
+    /// in frame N is not seen until frame N+1. This method is called straight
+    /// after the surface has drawn, inside the same frame, and returns only the
+    /// events that cannot survive that wait. Everything else it drains is
+    /// buffered and comes back out of `poll` in order.
+    ///
+    /// Returning drags ahead of buffered non-drag events is deliberate: the
+    /// alternative is holding a drag behind a dismiss for a frame, which is the
+    /// exact failure this exists to prevent.
+    fn poll_drag_starts(&mut self) -> Vec<CardEvent> {
+        Vec::new()
+    }
 
     /// How many cards are showing.
     fn len(&self) -> usize;
@@ -365,6 +417,17 @@ pub trait CardSurface {
     fn describe(&self) -> String {
         "card surface".to_owned()
     }
+
+    /// The native window this surface draws into, once there is one.
+    ///
+    /// Only a drag needs this, and only because every platform's drag API is
+    /// begun *from a window* rather than from an application. `None` is the
+    /// honest answer for a surface that has no window — the recording surface,
+    /// or a real one before it has opened — and callers refuse the drag rather
+    /// than guessing.
+    fn native_surface(&self) -> Option<scrozz_shell::NativeSurface> {
+        None
+    }
 }
 
 /// A surface that records instead of drawing.
@@ -377,6 +440,33 @@ pub trait CardSurface {
 pub struct Recording {
     log: Arc<Mutex<Vec<Card>>>,
     injected: Arc<Mutex<Vec<CardEvent>>>,
+    /// Events armed mid-gesture, answered by
+    /// [`CardSurface::poll_drag_starts`] rather than by `poll`.
+    armed: Arc<Mutex<Vec<CardEvent>>>,
+    /// Every surface call, in the order it happened.
+    ///
+    /// Ordering is the whole subject of the drag hand-off: producing the right
+    /// events in the wrong frame is exactly the bug, and a test that only reads
+    /// the events cannot see it.
+    trace: Arc<Mutex<Vec<SurfaceCall>>>,
+}
+
+/// One call into a [`Recording`], for tests that care when things happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceCall {
+    /// [`CardSurface::poll`] was drained.
+    Poll,
+    /// [`CardSurface::poll_drag_starts`] was drained.
+    PollDragStarts,
+    /// A card was dismissed.
+    Dismiss(CardId),
+    /// A native drag reported back.
+    Settle {
+        /// Which card's drag ended.
+        id: CardId,
+        /// Whether something took the drop.
+        accepted: bool,
+    },
 }
 
 impl Recording {
@@ -410,6 +500,54 @@ impl Recording {
             .push(event);
     }
 
+    /// Arms an event for the next [`CardSurface::poll_drag_starts`].
+    ///
+    /// Separate from [`Self::inject`] on purpose: the two are drained by
+    /// different passes of the frame, and a test that conflates them cannot
+    /// tell a drag started in the gesture frame from one started a frame late.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    pub fn arm(&self, event: CardEvent) {
+        self.armed
+            .lock()
+            .expect("armed events are poisoned")
+            .push(event);
+    }
+
+    /// Every surface call so far, in order.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    #[must_use]
+    pub fn trace(&self) -> Vec<SurfaceCall> {
+        self.trace
+            .lock()
+            .expect("surface trace is poisoned")
+            .clone()
+    }
+
+    /// Forgets the call trace, so a test can time one phase in isolation.
+    ///
+    /// # Panics
+    ///
+    /// If a previous caller panicked while holding the lock.
+    pub fn clear_trace(&self) {
+        self.trace
+            .lock()
+            .expect("surface trace is poisoned")
+            .clear();
+    }
+
+    fn record(&self, call: SurfaceCall) {
+        self.trace
+            .lock()
+            .expect("surface trace is poisoned")
+            .push(call);
+    }
+
     /// A handle sharing this recorder's state.
     #[must_use]
     pub fn handle(&self) -> Self {
@@ -425,13 +563,24 @@ impl CardSurface for Recording {
     }
 
     fn dismiss(&mut self, id: CardId) {
+        self.record(SurfaceCall::Dismiss(id));
         self.log
             .lock()
             .expect("card log is poisoned")
             .retain(|card| card.id != id);
     }
 
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        self.record(SurfaceCall::Settle { id, accepted });
+    }
+
+    fn poll_drag_starts(&mut self) -> Vec<CardEvent> {
+        self.record(SurfaceCall::PollDragStarts);
+        std::mem::take(&mut *self.armed.lock().expect("armed events are poisoned"))
+    }
+
     fn poll(&mut self) -> Option<CardEvent> {
+        self.record(SurfaceCall::Poll);
         let mut queue = self.injected.lock().expect("card events are poisoned");
         if queue.is_empty() {
             None
@@ -504,6 +653,26 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_gamut_thumbnail_is_converted_to_srgb() {
+        let source = [180, 100, 40, 200];
+        let frame = Frame {
+            data: source.to_vec(),
+            size: scrozz_core::PhysicalSize::new(1.0, 1.0),
+            stride: 4,
+            format: scrozz_core::PixelFormat::Rgba8,
+            color_space: ColorSpace::DisplayP3,
+            scale: scrozz_core::ScaleFactor::IDENTITY,
+        };
+        let thumbnail = Thumbnail::from_frame(&frame, 512).unwrap();
+        let expected = ColorTransform::new(ColorSpace::DisplayP3, ColorSpace::Srgb)
+            .convert_u8(source[..3].try_into().unwrap());
+
+        assert_eq!(&thumbnail.pixels()[..3], &expected);
+        assert_eq!(thumbnail.pixels()[3], source[3]);
+        assert_ne!(&thumbnail.pixels()[..3], &source[..3]);
+    }
+
+    #[test]
     fn downscaling_averages_across_a_boundary() {
         // Left half black, right half white, halved horizontally: each output
         // column must be the mean of the two it covers.
@@ -562,7 +731,13 @@ mod tests {
             CardEvent::Copy(id),
             CardEvent::Save(id),
             CardEvent::Dismiss(id),
-            CardEvent::Drag(id),
+            CardEvent::Drag {
+                card: id,
+                at: crate::gui::drag::DragSpot {
+                    card: [0.0, 0.0, 10.0, 10.0],
+                    pointer: [5.0, 5.0],
+                },
+            },
             CardEvent::Collapse(id),
             CardEvent::Open(id),
         ] {
