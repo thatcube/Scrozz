@@ -646,6 +646,12 @@ impl ClientOverlayController {
             self.handle_event(ctx, native, event);
         }
         native.refresh();
+        if let ControllerPhase::Selecting { ui, .. } = &self.phase
+            && ui.state().mode() == scrozz_core::SelectionMode::Region
+            && !ui.state().options_ref().hud
+        {
+            native.set_cursor(OverlayCursor::Crosshair);
+        }
     }
 
     /// Draws the selector when a prepared selection owns the window.
@@ -1811,10 +1817,22 @@ mod tests {
             ],
             "the hidden preparation window must release input before selection takes it"
         );
-        assert_eq!(
-            native.recorded_cursors(),
-            vec![OverlayCursor::Arrow, OverlayCursor::Crosshair],
-            "the hidden surface restores the arrow before region selection installs a crosshair"
+        let cursors = native.recorded_cursors();
+        assert_eq!(cursors.first(), Some(&OverlayCursor::Arrow));
+        assert_eq!(cursors.last(), Some(&OverlayCursor::Crosshair));
+        let pinned_count = cursors
+            .iter()
+            .filter(|cursor| **cursor == OverlayCursor::Crosshair)
+            .count();
+        controller.logic(&ctx, &native);
+        assert!(
+            native
+                .recorded_cursors()
+                .iter()
+                .filter(|cursor| **cursor == OverlayCursor::Crosshair)
+                .count()
+                > pinned_count,
+            "direct region selection must reassert the native crosshair every frame"
         );
 
         let mut output = ctx.run_ui(

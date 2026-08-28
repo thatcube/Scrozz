@@ -61,6 +61,7 @@ pub struct SelectionState {
     last_pointer: Option<LogicalPoint>,
     phase: Phase,
     drag_modifiers: DragModifiers,
+    axis_lock: Option<AxisLock>,
     gesture_changed: bool,
     announcement: Option<SelectionAnnouncement>,
 }
@@ -90,6 +91,12 @@ enum Phase {
 struct SpaceMove {
     pointer: LogicalPoint,
     region: LogicalRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AxisLock {
+    Horizontal { dy: f64 },
+    Vertical { dx: f64 },
 }
 
 impl SelectionState {
@@ -155,6 +162,7 @@ impl SelectionState {
             last_pointer: None,
             phase: Phase::Idle,
             drag_modifiers: DragModifiers::default(),
+            axis_lock: None,
             gesture_changed: false,
         };
         if !state.capabilities.supports(state.mode) {
@@ -251,8 +259,15 @@ impl SelectionState {
                 display,
                 space_move: None,
             };
+            self.axis_lock = None;
             self.pointer_moved_after_hover(pointer);
             return;
+        }
+
+        if !previous.shift && modifiers.shift {
+            self.axis_lock = axis_lock(anchor, pointer);
+        } else if previous.shift && !modifiers.shift {
+            self.axis_lock = None;
         }
 
         if self.is_interacting() {
@@ -452,9 +467,17 @@ impl SelectionState {
                     else {
                         return;
                     };
-                    let Some(raw) =
-                        dragged_region(bounds, anchor, point, scale, self.drag_modifiers)
-                    else {
+                    if self.drag_modifiers.shift && self.axis_lock.is_none() {
+                        self.axis_lock = axis_lock(anchor, point);
+                    }
+                    let Some(raw) = dragged_region(
+                        bounds,
+                        anchor,
+                        point,
+                        scale,
+                        self.drag_modifiers,
+                        self.axis_lock,
+                    ) else {
                         self.region = None;
                         self.region_display = None;
                         return;
@@ -532,6 +555,7 @@ impl SelectionState {
             )));
         }
         self.phase = Phase::Idle;
+        self.axis_lock = None;
     }
 
     pub fn keyboard_nudge(&mut self, direction: AxisDirection, fast: bool) {
@@ -686,6 +710,7 @@ impl SelectionState {
         }
         self.mode = mode;
         self.phase = Phase::Idle;
+        self.axis_lock = None;
         if mode == SelectionMode::Region && self.region.is_none() {
             let _ = self.restore_remembered();
         }
@@ -700,6 +725,7 @@ impl SelectionState {
     #[must_use]
     pub fn cancel(&mut self) -> bool {
         self.phase = Phase::Idle;
+        self.axis_lock = None;
         self.announcement = Some(SelectionAnnouncement("Selection cancelled".to_owned()));
         true
     }
@@ -761,6 +787,7 @@ impl SelectionState {
     }
 
     fn begin_region_gesture(&mut self, point: LogicalPoint, display: Option<&DisplayId>) {
+        self.axis_lock = None;
         let Some(display) = display
             .and_then(|id| self.layout.display(id))
             .map(|display| display.id.clone())
@@ -1046,8 +1073,16 @@ fn dragged_region(
     point: LogicalPoint,
     scale: ScaleFactor,
     modifiers: DragModifiers,
+    axis_lock: Option<AxisLock>,
 ) -> Option<LogicalRect> {
-    let (dx, dy) = constrained_delta(point.x - anchor.x, point.y - anchor.y, modifiers.shift);
+    let (mut dx, mut dy) = (point.x - anchor.x, point.y - anchor.y);
+    if modifiers.shift {
+        match axis_lock {
+            Some(AxisLock::Horizontal { dy: locked }) => dy = locked,
+            Some(AxisLock::Vertical { dx: locked }) => dx = locked,
+            None => {}
+        }
+    }
     if dx.abs() <= f64::EPSILON && dy.abs() <= f64::EPSILON {
         return None;
     }
@@ -1082,6 +1117,17 @@ fn dragged_region(
         rect.size.height = pixel;
     }
     Some(geom::clamp_rect(bounds, rect))
+}
+
+fn axis_lock(anchor: LogicalPoint, point: LogicalPoint) -> Option<AxisLock> {
+    let (dx, dy) = (point.x - anchor.x, point.y - anchor.y);
+    if dx.abs() <= f64::EPSILON && dy.abs() <= f64::EPSILON {
+        None
+    } else if dx.abs() >= dy.abs() {
+        Some(AxisLock::Horizontal { dy })
+    } else {
+        Some(AxisLock::Vertical { dx })
+    }
 }
 
 fn constrained_delta(dx: f64, dy: f64, axis_locked: bool) -> (f64, f64) {

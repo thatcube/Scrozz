@@ -356,7 +356,16 @@ fn shift_axis_lock_is_live_and_reversible_mid_drag() {
         state.region(),
         Some(LogicalRect::new(
             LogicalPoint::new(20.0, 20.0),
-            LogicalSize::new(100.0, 0.5)
+            LogicalSize::new(100.0, 60.0)
+        ))
+    );
+
+    state.pointer_moved(LogicalPoint::new(160.0, 140.0));
+    assert_eq!(
+        state.region(),
+        Some(LogicalRect::new(
+            LogicalPoint::new(20.0, 20.0),
+            LogicalSize::new(140.0, 60.0)
         ))
     );
 
@@ -365,7 +374,7 @@ fn shift_axis_lock_is_live_and_reversible_mid_drag() {
         state.region(),
         Some(LogicalRect::new(
             LogicalPoint::new(20.0, 20.0),
-            LogicalSize::new(100.0, 60.0)
+            LogicalSize::new(140.0, 120.0)
         ))
     );
 }

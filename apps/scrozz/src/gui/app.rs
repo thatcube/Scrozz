@@ -109,7 +109,7 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
-            screenshot_sound: ScreenshotSound::Shutter,
+            screenshot_sound: ScreenshotSound::EightBit,
         }
     }
 }

@@ -219,8 +219,15 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "capture.screenshot-sound",
-        kind: Kind::Choice(&["shutter", "soft-shutter", "camera", "custom", "off"]),
-        default: "shutter",
+        kind: Kind::Choice(&[
+            "8-bit",
+            "shutter",
+            "soft-shutter",
+            "camera",
+            "custom",
+            "off",
+        ]),
+        default: "8-bit",
         description: "Sound played after every successful screenshot.",
     },
     Setting {
@@ -384,6 +391,7 @@ pub fn screenshot_sound() -> CliResult<ScreenshotSound> {
 
 fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSound> {
     match selected {
+        "8-bit" => Ok(ScreenshotSound::EightBit),
         "shutter" => Ok(ScreenshotSound::Shutter),
         "soft-shutter" => Ok(ScreenshotSound::SoftShutter),
         "camera" => Ok(ScreenshotSound::Camera),
@@ -537,10 +545,17 @@ mod tests {
         };
         assert_eq!(
             options,
-            ["shutter", "soft-shutter", "camera", "custom", "off"]
+            [
+                "8-bit",
+                "shutter",
+                "soft-shutter",
+                "camera",
+                "custom",
+                "off"
+            ]
         );
-        assert_eq!(setting.default, "shutter");
-        assert_eq!(screenshot_sound().unwrap(), ScreenshotSound::Shutter);
+        assert_eq!(setting.default, "8-bit");
+        assert_eq!(screenshot_sound().unwrap(), ScreenshotSound::EightBit);
         assert_eq!(
             screenshot_sound_from("custom", "/tmp/shutter.wav").unwrap(),
             ScreenshotSound::Custom(PathBuf::from("/tmp/shutter.wav"))

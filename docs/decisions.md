@@ -1105,8 +1105,10 @@ drags may span displays.
 Drag modifiers are live and reversible:
 
 1. **Space** moves the current rectangle without resizing it.
-2. **Shift** constrains creation or Space-driven movement to the dominant
-   horizontal or vertical axis only while held.
+2. **Shift** locks creation or Space-driven movement to the dominant horizontal
+   or vertical axis only while held. Engaging it during creation preserves the
+   rectangle's current orthogonal dimension; it never collapses that dimension
+   into a one-pixel strip.
 3. **Option** on macOS and **Alt** elsewhere grows the selection symmetrically
    from its starting point. It has no effect while Space is held.
 
