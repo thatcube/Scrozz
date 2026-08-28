@@ -216,6 +216,13 @@ pub struct OverlayBehavior {
     /// up, which is right for the selection overlay and wrong for everything
     /// else.
     pub accepts_key: bool,
+    /// Whether macOS should make edge-triggered system UI unavailable.
+    ///
+    /// Region selection owns every screen pixel, including the Dock edge. A
+    /// topmost window intercepts clicks there, but macOS still reveals an
+    /// auto-hidden Dock from global pointer motion unless the active app uses
+    /// `NSApplicationPresentationHideDock`.
+    pub suppress_system_ui: bool,
     /// Whether the overlay hides when the app is deactivated.
     ///
     /// `false` for every Scrozz overlay: they exist precisely while the user is
@@ -247,6 +254,7 @@ impl Default for OverlayBehavior {
             stationary: false,
             ignore_cycle: false,
             accepts_key: true,
+            suppress_system_ui: false,
             hides_on_deactivate: false,
             opaque: true,
             has_shadow: true,
@@ -275,6 +283,7 @@ impl OverlayBehavior {
             stationary: true,
             ignore_cycle: true,
             accepts_key: false,
+            suppress_system_ui: false,
             hides_on_deactivate: false,
             opaque: false,
             has_shadow: false,
@@ -311,6 +320,7 @@ impl OverlayBehavior {
             stationary: true,
             ignore_cycle: true,
             accepts_key: true,
+            suppress_system_ui: true,
             hides_on_deactivate: false,
             opaque: false,
             has_shadow: false,
