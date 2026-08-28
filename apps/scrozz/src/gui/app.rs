@@ -28,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use scrozz_core::{Capture, Frame};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
     ScreenshotSound, Session, SystemPermissions, Tray, TrayAction, play_screenshot_sound,
@@ -38,7 +39,7 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
-        card::{CardEvent, CardSurface},
+        card::{CardEvent, CardId, CardSurface},
         pipeline::{Job, Outcome, Pipeline},
         selection::CaptureSelector,
         server::{Forwarder, Server},
@@ -208,7 +209,18 @@ pub struct App {
     captures: u64,
     sound_warning_shown: bool,
     settings_requested: bool,
+    editor_request: Option<EditorRequest>,
     notes: Vec<String>,
+}
+
+/// A capture the annotation editor has been asked to open.
+#[derive(Debug)]
+pub struct EditorRequest {
+    /// The card it came from, so copy and save can be attributed and the
+    /// finished image can be sent back through the same worker.
+    pub card: CardId,
+    /// The decoded capture.
+    pub capture: Capture,
 }
 
 impl App {
@@ -324,6 +336,7 @@ impl App {
             captures: 0,
             sound_warning_shown: false,
             settings_requested: false,
+            editor_request: None,
             notes,
         };
 
@@ -484,6 +497,12 @@ impl App {
                 Outcome::Done { card, detail } => {
                     self.note(format!("{card} {detail}"));
                 }
+                Outcome::Opened { card, capture } => {
+                    self.editor_request = Some(EditorRequest {
+                        card,
+                        capture: *capture,
+                    });
+                }
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
@@ -512,11 +531,16 @@ impl App {
                     self.pipeline.post(Job::Release(id));
                     self.note(format!("{id} dismissed"));
                 }
+                CardEvent::Open(id) => {
+                    // Decoding happens on the worker, so the click that opens
+                    // the editor never inflates a 6K PNG on the UI thread.
+                    self.pipeline.post(Job::Open(id));
+                }
                 // Not yet routed. The drag payload is `scrozz-shell`'s
                 // `DragSource`, and collapsing into the dock is the capture
                 // stack's own animation — both belong to the surface that
                 // raised the event, once there is one that can.
-                CardEvent::Drag(id) | CardEvent::Collapse(id) | CardEvent::Open(id) => {
+                CardEvent::Drag(id) | CardEvent::Collapse(id) => {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
             }
@@ -583,6 +607,30 @@ impl App {
     /// Takes a pending request to open or focus Settings.
     pub fn take_settings_request(&mut self) -> bool {
         std::mem::take(&mut self.settings_requested)
+    }
+
+    /// Takes a pending request to open the annotation editor.
+    pub fn take_editor_request(&mut self) -> Option<EditorRequest> {
+        self.editor_request.take()
+    }
+
+    /// Copies an image the editor has flattened.
+    ///
+    /// Routed through the worker so the PNG encode and the clipboard write stay
+    /// off the UI thread, exactly like a card's own copy.
+    pub fn copy_rendered(&mut self, card: CardId, frame: Frame) {
+        self.pipeline.post(Job::CopyImage {
+            card,
+            frame: Box::new(frame),
+        });
+    }
+
+    /// Saves an image the editor has flattened.
+    pub fn save_rendered(&mut self, card: CardId, frame: Frame) {
+        self.pipeline.post(Job::SaveImage {
+            card,
+            frame: Box::new(frame),
+        });
     }
 
     /// How many cards are on screen.

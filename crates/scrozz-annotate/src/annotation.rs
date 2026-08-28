@@ -293,7 +293,8 @@ impl AnnotationObject {
                 geom::inflate(&self.annotation.bounds(), self.arrow_head_half_width())
             }
             Annotation::Highlight(_) | Annotation::Redact { .. } => self.annotation.bounds(),
-            _ => geom::inflate(&self.annotation.bounds(), half_stroke),        }
+            _ => geom::inflate(&self.annotation.bounds(), half_stroke),
+        }
     }
 
     /// The radius of a counter marker, derived from its type size.

@@ -4,7 +4,8 @@ mod common;
 
 use common::{document, rect, window_capture};
 use scrozz_annotate::{
-    Annotation, Document, History, RedactStyle, Style, document::DocumentData, history::DEFAULT_LIMIT,
+    Annotation, Document, History, RedactStyle, Style, document::DocumentData,
+    history::DEFAULT_LIMIT,
 };
 use scrozz_core::LogicalPoint;
 
@@ -192,7 +193,7 @@ fn history_is_bounded_and_drops_the_oldest_step() {
 
 #[test]
 fn the_default_limit_is_deep_enough_to_be_invisible() {
-    assert!(DEFAULT_LIMIT >= 100);
+    const { assert!(DEFAULT_LIMIT >= 100) };
 }
 
 #[test]

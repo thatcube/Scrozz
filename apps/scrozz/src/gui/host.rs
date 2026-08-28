@@ -267,6 +267,8 @@ impl Host for Windowed {
                     emit: Some(emit),
                     selection,
                     settings: scrozz_ui::settings::SettingsWindow::default(),
+                    editor: scrozz_ui::editor::EditorWindow::new(),
+                    editing: None,
                     native,
                     display_id,
                     pointer_geometry,
@@ -442,6 +444,9 @@ struct Driver {
     emit: Option<Emit>,
     selection: ClientOverlayController,
     settings: scrozz_ui::settings::SettingsWindow,
+    editor: scrozz_ui::editor::EditorWindow,
+    /// The editor's document, and the card it came from.
+    editing: Option<(crate::gui::card::CardId, scrozz_ui::editor::EditorUi)>,
     native: BehaviorController,
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
@@ -454,6 +459,52 @@ struct Driver {
 }
 
 impl Driver {
+    /// Draws the annotation editor's window while one is open.
+    ///
+    /// Copy and save go back through the worker rather than being written
+    /// here: encoding a full-resolution PNG on the UI thread would stall the
+    /// overlay, and the card's own copy already takes that route.
+    ///
+    /// The document lives on until the *window* closes, not until the editor
+    /// says it is done, so reopening after an accidental Escape is impossible
+    /// to distinguish from never having closed. Nothing is written back to the
+    /// card: per D14 a capture's own pixels are never replaced by an annotated
+    /// version unless the user explicitly saves one.
+    fn show_editor(&mut self, ctx: &egui::Context) {
+        use scrozz_ui::editor::Intent;
+
+        let Some((card, editor)) = self.editing.as_mut() else {
+            return;
+        };
+        let card = *card;
+        let mut intent = Intent::None;
+        self.editor.show(ctx, |ui| {
+            let got = editor.update(ui);
+            if got != Intent::None {
+                intent = got;
+            }
+        });
+
+        match intent {
+            Intent::None => {}
+            Intent::Close => self.editor.close(),
+            Intent::Copy | Intent::Save => match editor.render() {
+                Ok(frame) => {
+                    if intent == Intent::Copy {
+                        self.app.copy_rendered(card, frame);
+                    } else {
+                        self.app.save_rendered(card, frame);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "the annotated image could not be rendered"),
+            },
+        }
+
+        if !self.editor.is_open() {
+            self.editing = None;
+        }
+    }
+
     /// Says what the panel conversion did, the moment it is known.
     ///
     /// Logged on the first tick rather than left to the final report because
@@ -565,6 +616,14 @@ impl eframe::App for Driver {
         if self.app.take_settings_request() {
             self.settings.open();
         }
+        if let Some(request) = self.app.take_editor_request() {
+            let title = format!("{}", request.card);
+            self.editing = Some((
+                request.card,
+                scrozz_ui::editor::EditorUi::new(scrozz_annotate::Document::new(request.capture)),
+            ));
+            self.editor.open(title);
+        }
         if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
             let report = self.app.report();
@@ -605,6 +664,7 @@ impl eframe::App for Driver {
                 build: crate::build_info::BUILD,
             },
         );
+        self.show_editor(ui.ctx());
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

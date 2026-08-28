@@ -34,8 +34,8 @@ use std::{
 
 use scrozz_annotate::Document;
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, SelectionMode,
-    SelectionOptions,
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
+    SelectionMode, SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
@@ -61,8 +61,31 @@ pub enum Job {
         /// main thread can correlate the answer with the request.
         card: CardId,
     },
+    /// Decode a card's capture so the annotation editor can open on it.
+    ///
+    /// The decode is the whole reason this is a job: a 6K PNG takes tens of
+    /// milliseconds to inflate, which is a visible stutter if it happens
+    /// between the click and the window.
+    Open(CardId),
     /// Put a card's capture on the clipboard.
     Copy(CardId),
+    /// Put an already-rendered image on the clipboard.
+    ///
+    /// Used by the editor, which has flattened its own annotations and must not
+    /// have the card's unannotated capture substituted for them.
+    CopyImage {
+        /// Which card the image came from, for the log line.
+        card: CardId,
+        /// The flattened image.
+        frame: Box<Frame>,
+    },
+    /// Write an already-rendered image to the configured folder.
+    SaveImage {
+        /// Which card the image came from, for the log line.
+        card: CardId,
+        /// The flattened image.
+        frame: Box<Frame>,
+    },
     /// Write a card's capture to the configured folder.
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
@@ -76,6 +99,13 @@ pub enum Job {
 pub enum Outcome {
     /// A capture succeeded and is ready to show.
     Ready(Box<Card>),
+    /// A card's capture was decoded and the editor can open on it.
+    Opened {
+        /// Which card.
+        card: CardId,
+        /// The decoded capture.
+        capture: Box<Capture>,
+    },
     /// A capture failed. The main thread says why and shows nothing.
     Failed {
         /// Which card was expected.
@@ -175,6 +205,15 @@ impl Drop for Pipeline {
 /// What the worker remembers about a card it produced.
 struct Cached {
     bytes: Vec<u8>,
+    /// Where the pixels came from, kept alongside them.
+    ///
+    /// The cached PNG cannot carry this, and decision D9 turns on it: a window
+    /// capture must refuse beautification wherever it is reconstructed. Losing
+    /// it on the way into the editor would silently hand a window capture the
+    /// backdrop it is not allowed to have.
+    provenance: Provenance,
+    /// What was aimed at, for the same reason.
+    target: CaptureTarget,
 }
 
 struct Worker {
@@ -241,7 +280,10 @@ impl Worker {
         while let Ok(job) = jobs.recv() {
             match job {
                 Job::Capture { kind, card } => self.capture(kind, card),
+                Job::Open(card) => self.open(card),
                 Job::Copy(card) => self.copy(card),
+                Job::CopyImage { card, frame } => self.copy_image(card, &frame),
+                Job::SaveImage { card, frame } => self.save_image(card, &frame),
                 Job::Save(card) => self.save(card),
                 Job::Release(card) => {
                     self.cache.remove(&card);
@@ -344,7 +386,14 @@ impl Worker {
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);
 
-        self.cache.insert(card, Cached { bytes });
+        self.cache.insert(
+            card,
+            Cached {
+                bytes,
+                provenance: capture.provenance,
+                target: capture.target.clone(),
+            },
+        );
 
         Ok(Card {
             id: card,
@@ -391,6 +440,52 @@ impl Worker {
                 None
             }
         }
+    }
+
+    /// Decodes a card's capture and hands it to the editor.
+    ///
+    /// The provenance travels with it, because decision D9 makes beautification
+    /// illegal for window captures and the editor must be told which kind it
+    /// holds rather than guess.
+    fn open(&mut self, card: CardId) {
+        let decoded = self.cached(card, "open").and_then(|cached| {
+            let frame = scrozz_export::decode(&cached.bytes)?;
+            Ok(Capture {
+                frame,
+                provenance: cached.provenance,
+                target: cached.target.clone(),
+            })
+        });
+        match decoded {
+            Ok(capture) => {
+                let _ = self.outcomes.send(Outcome::Opened {
+                    card,
+                    capture: Box::new(capture),
+                });
+            }
+            Err(error) => {
+                let _ = self.outcomes.send(Outcome::Refused { card, error });
+            }
+        }
+    }
+
+    fn copy_image(&mut self, card: CardId, frame: &Frame) {
+        let result = SystemClipboard::new()
+            .write_image_reporting(frame)
+            .map(|_report| "copied the annotated image".to_owned())
+            .map_err(CliError::from);
+        self.answer(card, result);
+    }
+
+    fn save_image(&mut self, card: CardId, frame: &Frame) {
+        let result = FrameEncoder::new()
+            .encode(frame, ImageFormat::Png)
+            .map_err(CliError::from)
+            .and_then(|bytes| {
+                let path = crate::output::export_default(&bytes)?;
+                Ok(format!("saved the annotated image to {}", path.display()))
+            });
+        self.answer(card, result);
     }
 
     fn copy(&mut self, card: CardId) {
@@ -474,6 +569,105 @@ mod tests {
 
     fn start_pipeline() -> Pipeline {
         Pipeline::start(Arc::new(RefusingSelector)).expect("the worker should start")
+    }
+
+    /// Builds a worker whose cache is seeded by hand.
+    ///
+    /// The real cache is filled by an actual capture, which a unit test has no
+    /// way to perform, so the reconstruction path is exercised directly.
+    fn worker_holding(card: CardId, cached: Cached) -> (Worker, Receiver<Outcome>) {
+        let (outcomes, inbox) = std::sync::mpsc::channel();
+        let mut cache = HashMap::new();
+        cache.insert(card, cached);
+        let worker = Worker {
+            outcomes,
+            selector: Arc::new(RefusingSelector),
+            store: None,
+            cache,
+        };
+        (worker, inbox)
+    }
+
+    fn one_pixel_png() -> Vec<u8> {
+        let frame = Frame {
+            data: vec![255, 255, 255, 255],
+            size: scrozz_core::PhysicalSize::new(1.0, 1.0),
+            stride: 4,
+            format: scrozz_core::PixelFormat::Rgba8,
+            color_space: scrozz_core::ColorSpace::Srgb,
+            scale: scrozz_core::ScaleFactor::new(1.0),
+        };
+        FrameEncoder::new()
+            .encode(&frame, ImageFormat::Png)
+            .expect("a one pixel frame should encode")
+    }
+
+    #[test]
+    fn opening_a_window_capture_keeps_it_a_window_capture() {
+        // D9: a window capture may not be beautified. The editor rebuilds its
+        // capture from a cached PNG, which carries no provenance of its own, so
+        // if the cache forgot it the editor would hand a window capture the
+        // backdrop it is forbidden. This is that guarantee, not a detail.
+        let card = CardId(1);
+        let (mut worker, inbox) = worker_holding(
+            card,
+            Cached {
+                bytes: one_pixel_png(),
+                provenance: Provenance::Window,
+                target: CaptureTarget::Window(scrozz_core::WindowId("test-window".to_owned())),
+            },
+        );
+        worker.open(card);
+
+        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+            panic!("opening a cached card should produce a capture");
+        };
+        assert_eq!(capture.provenance, Provenance::Window);
+        assert!(
+            !scrozz_annotate::Document::new(*capture).may_beautify(),
+            "a window capture must still refuse beautification after a round trip"
+        );
+    }
+
+    #[test]
+    fn opening_a_region_capture_still_allows_beautification() {
+        let card = CardId(1);
+        let bounds = scrozz_core::LogicalRect::new(
+            scrozz_core::LogicalPoint::new(0.0, 0.0),
+            scrozz_core::LogicalSize::new(1.0, 1.0),
+        );
+        let (mut worker, inbox) = worker_holding(
+            card,
+            Cached {
+                bytes: one_pixel_png(),
+                provenance: Provenance::Region,
+                target: CaptureTarget::Region(bounds),
+            },
+        );
+        worker.open(card);
+
+        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+            panic!("opening a cached card should produce a capture");
+        };
+        assert_eq!(capture.provenance, Provenance::Region);
+        assert!(scrozz_annotate::Document::new(*capture).may_beautify());
+    }
+
+    #[test]
+    fn opening_a_card_that_was_never_captured_is_refused() {
+        let (mut worker, inbox) = worker_holding(
+            CardId(1),
+            Cached {
+                bytes: one_pixel_png(),
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+            },
+        );
+        worker.open(CardId(9));
+        assert!(matches!(
+            inbox.try_iter().next(),
+            Some(Outcome::Refused { card, .. }) if card == CardId(9)
+        ));
     }
 
     #[test]

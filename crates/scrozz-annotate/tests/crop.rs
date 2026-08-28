@@ -102,7 +102,8 @@ fn crop_keeps_annotations_that_fall_outside_it() {
 #[test]
 fn crop_clamps_to_the_capture_rather_than_inventing_margin() {
     let mut doc = coded();
-    doc.set_crop(Some(rect(-50.0, -50.0, 120.0, 120.0))).unwrap();
+    doc.set_crop(Some(rect(-50.0, -50.0, 120.0, 120.0)))
+        .unwrap();
     assert_eq!(doc.content_bounds(), rect(0.0, 0.0, 70.0, 70.0));
 
     let frame = SkiaRenderer::new().render(&doc).unwrap();
@@ -112,7 +113,8 @@ fn crop_clamps_to_the_capture_rather_than_inventing_margin() {
 #[test]
 fn a_crop_covering_everything_is_no_crop() {
     let mut doc = coded();
-    doc.set_crop(Some(rect(-10.0, -10.0, 500.0, 500.0))).unwrap();
+    doc.set_crop(Some(rect(-10.0, -10.0, 500.0, 500.0)))
+        .unwrap();
     assert_eq!(
         doc.crop(),
         None,

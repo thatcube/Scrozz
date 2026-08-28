@@ -621,11 +621,7 @@ fn a_line_scales_with_the_export_scale() {
     );
     let renderer = SkiaRenderer::new();
     let one = ink_count(&renderer.render(&doc).unwrap());
-    let two = ink_count(
-        &renderer
-            .render_at(&doc, ScaleFactor::new(2.0))
-            .unwrap(),
-    );
+    let two = ink_count(&renderer.render_at(&doc, ScaleFactor::new(2.0)).unwrap());
     let ratio = f64::from(two) / f64::from(one);
     assert!(
         (3.2..4.8).contains(&ratio),
