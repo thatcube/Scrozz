@@ -27,7 +27,7 @@
 //! ```
 //! use scrozz_ui::motion::{Duration, Ease, Motion, Timeline};
 //!
-//! let entry = Timeline::starting_at(0.0, Duration::SLOW, Ease::SpringOvershoot);
+//! let entry = Timeline::starting_at(0.0, Duration::SLOW, Ease::InOutCubic);
 //! let a = entry.value(&Motion::at_ms(180));
 //! let b = entry.value(&Motion::at_ms(180));
 //! assert_eq!(a, b);

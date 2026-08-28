@@ -514,6 +514,7 @@ pub fn card_icon_button(
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
 
     let pointer = pointer_state(surface, &response, state, reveal);
+    let scale = card_control_scale(pointer);
     let rect = scaled_control_rect(rect.translate(reveal.offset), pointer);
     let painter = ui.painter();
     let opacity = reveal.opacity;
@@ -522,7 +523,7 @@ pub fn card_icon_button(
         painter,
         icon,
         rect.center(),
-        crate::icons::SIZE,
+        crate::icons::SIZE * scale,
         fade(card_control_foreground(), opacity),
     );
     response
@@ -684,6 +685,7 @@ pub fn card_pill_button(
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
 
     let pointer = pointer_state(surface, &response, state, reveal);
+    let scale = card_control_scale(pointer);
     let rect = scaled_control_rect(rect.translate(reveal.offset), pointer);
     let radius = Radius::pill(rect.height());
     let painter = ui.painter();
@@ -691,9 +693,12 @@ pub fn card_pill_button(
     paint_card_control_frame(painter, rect, radius, pointer, opacity);
 
     let foreground = fade(card_control_foreground(), opacity);
-    let galley = painter.layout_no_wrap(label.to_owned(), surface.font(Text::Button), foreground);
-    let icon_width = 15.0;
-    let total = icon_width + Space::SM - 2.0 + galley.size().x;
+    let mut font = surface.font(Text::Button);
+    font.size *= scale;
+    let galley = painter.layout_no_wrap(label.to_owned(), font, foreground);
+    let icon_width = 15.0 * scale;
+    let gap = (Space::SM - 2.0) * scale;
+    let total = icon_width + gap + galley.size().x;
     let x = rect.center().x - total / 2.0;
     surface.icons.draw(
         painter,
@@ -704,7 +709,7 @@ pub fn card_pill_button(
     );
     painter.galley(
         pos2(
-            x + icon_width + Space::SM - 2.0,
+            x + icon_width + gap,
             rect.center().y - galley.size().y / 2.0,
         ),
         galley,
@@ -713,15 +718,18 @@ pub fn card_pill_button(
     response
 }
 
-fn scaled_control_rect(rect: Rect, pointer: Pointer) -> Rect {
-    let scale = if pointer.pressed {
+fn card_control_scale(pointer: Pointer) -> f32 {
+    if pointer.pressed {
         0.98
     } else if pointer.hovered {
         1.03
     } else {
         1.0
-    };
-    Rect::from_center_size(rect.center(), rect.size() * scale)
+    }
+}
+
+fn scaled_control_rect(rect: Rect, pointer: Pointer) -> Rect {
+    Rect::from_center_size(rect.center(), rect.size() * card_control_scale(pointer))
 }
 
 fn paint_card_control_frame(
@@ -1301,34 +1309,32 @@ pub fn dashed_path(painter: &egui::Painter, pts: &[Pos2], stroke: Stroke, dash: 
             t += step;
         }
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        #[test]
-        fn card_controls_use_exact_hover_and_press_scales() {
-            let rect = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 30.0));
-            let hovered = scaled_control_rect(
-                rect,
-                Pointer {
-                    hovered: true,
-                    ..Pointer::default()
-                },
-            );
-            let pressed = scaled_control_rect(
-                rect,
-                Pointer {
-                    hovered: true,
-                    pressed: true,
-                    ..Pointer::default()
-                },
-            );
+    #[test]
+    fn card_controls_use_exact_hover_and_press_scales() {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 30.0));
+        let hovered_pointer = Pointer {
+            hovered: true,
+            ..Pointer::default()
+        };
+        let pressed_pointer = Pointer {
+            hovered: true,
+            pressed: true,
+            ..Pointer::default()
+        };
+        let hovered = scaled_control_rect(rect, hovered_pointer);
+        let pressed = scaled_control_rect(rect, pressed_pointer);
 
-            assert_eq!(hovered.size(), rect.size() * 1.03);
-            assert_eq!(pressed.size(), rect.size() * 0.98);
-            assert_eq!(hovered.center(), rect.center());
-            assert_eq!(pressed.center(), rect.center());
-        }
+        assert!((hovered.size() - rect.size() * 1.03).length() < 0.001);
+        assert!((pressed.size() - rect.size() * 0.98).length() < 0.001);
+        assert_eq!(hovered.center(), rect.center());
+        assert_eq!(pressed.center(), rect.center());
+        assert_eq!(card_control_scale(hovered_pointer), 1.03);
+        assert_eq!(card_control_scale(pressed_pointer), 0.98);
     }
 }

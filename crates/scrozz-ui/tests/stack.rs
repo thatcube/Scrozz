@@ -235,6 +235,29 @@ fn cards_enter_from_off_the_left_edge() {
     }
 }
 
+#[test]
+fn card_entry_glides_forward_and_lands_without_overshoot() {
+    let mut stack = stack();
+    let id = stack.push(&at(0));
+    let target = stack.layout().slot_rect(0);
+    let times = [0, 80, 160, 240, 320, 400, 440];
+    let positions: Vec<_> = times
+        .into_iter()
+        .map(|ms| stack.frame_of(id, &at(ms)).unwrap().rect.left())
+        .collect();
+
+    assert!(
+        positions.windows(2).all(|pair| pair[0] <= pair[1]),
+        "entry must move continuously toward its slot: {positions:?}"
+    );
+    assert!(
+        positions.iter().all(|x| *x <= target.left()),
+        "entry must never bounce past its resting slot: {positions:?}"
+    );
+    assert!((positions.last().unwrap() - target.left()).abs() < 0.01);
+    assert!(!Timing::default().enter_ease.overshoots());
+}
+
 // ---------------------------------------------------------------------------
 // Filling the pile
 // ---------------------------------------------------------------------------

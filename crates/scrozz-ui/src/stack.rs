@@ -479,8 +479,8 @@ impl DragVelocity {
 pub struct Timing {
     /// A card sliding in from the left.
     pub enter: Duration,
-    /// Easing for the entry. Overshoot is what makes the arrival read as an
-    /// object with mass rather than a fade.
+    /// Easing for the entry. This must land smoothly without overshoot: the
+    /// capture should glide into place rather than bounce against its slot.
     pub enter_ease: Ease,
     /// The shared departure animation (D21), at its longest.
     pub exit: Duration,
@@ -518,8 +518,8 @@ pub struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Self {
-            enter: Duration::SLOW,
-            enter_ease: Ease::SpringOvershoot,
+            enter: Duration::from_millis(440),
+            enter_ease: Ease::InOutCubic,
             exit: Duration::BASE,
             exit_min: Duration::from_millis(90),
             exit_ease: Ease::Linear,

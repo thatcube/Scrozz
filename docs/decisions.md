@@ -479,8 +479,8 @@ animation state — never ad-hoc interpolation scattered through drawing code.
 **The governing principle: motion belongs to objects that move through space;
 controls respond instantly.**
 
-- **Animate — the capture cards.** A new capture **slides in from the anchored
-  screen edge** and the list springs to make room. A card is **grabbable and
+- **Animate — the capture cards.** A new capture **glides in from the anchored
+  screen edge** with a fluid, non-overshooting arrival. A card is **grabbable and
   follows the pointer 1:1**, tilts while moving, and **flings off toward that
   edge with real momentum** past a velocity or distance threshold — or **springs
   back** below it. Neighbours settle when one leaves. Velocity tracking is
@@ -587,7 +587,8 @@ written to disk can still be dropped into another application.
 
 ### The animation set
 
-1. **Card enters** — slides in from off-screen left into the next slot up.
+1. **Card enters** — glides in from off-screen left over 440 ms with a smooth
+   in-out curve and no bounce or overshoot.
 2. **Card leaves** — via close, copy, save, or swipe-left. **One shared exit
    animation**, also used for overflow retirement.
 3. **Cards above fall down** to close the gap.
@@ -595,8 +596,9 @@ written to disk can still be dropped into another application.
    spring back on cancel.
 5. **Dock collapse and expand** (D20).
 
-**Button feedback is immediate:** every card button scales to 1.03× on hover and
-0.98× while pressed, without easing.
+**Button feedback is immediate:** every card button — background, icon, and
+label together — scales to 1.03× on hover and 0.98× while pressed, without
+easing.
 
 **The mental model is phone notifications:** discrete cards that accumulate, get
 swiped away individually, and can be collapsed out of the way.
