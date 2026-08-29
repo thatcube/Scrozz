@@ -136,7 +136,13 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
 pub fn start_recording(
     request: &scrozz_record::RecordingRequest,
 ) -> CliResult<Box<dyn scrozz_record::RecordingSession>> {
-    Ok(scrozz_record::start(request)?)
+    let mut settings = crate::settings::load_recording_settings()?;
+    settings.cursor = if request.show_cursor {
+        scrozz_core::CursorMode::Visible
+    } else {
+        scrozz_core::CursorMode::Hidden
+    };
+    Ok(scrozz_record::start_with_settings(request, &settings)?)
 }
 
 /// The capture history, at its default location.

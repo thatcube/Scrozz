@@ -52,7 +52,8 @@ use scrozz_shell::{
 use scrozz_store::{History as _, Page, Store as _};
 use scrozz_ui::{
     HistoryWindowAction, HistoryWindowSnapshot, RecordingHudAction, RecordingHudSnapshot,
-    RecordingPresentation, RecordingSurfaceAction, VideoEditorAction, VideoEditorSnapshot,
+    RecordingPresentation, RecordingSettingsAction, RecordingSurfaceAction, VideoEditorAction,
+    VideoEditorSnapshot,
 };
 
 use crate::{
@@ -307,6 +308,7 @@ pub struct App {
     recording_completion: Option<GuiRecordingCompletion>,
     recording_replies: Vec<Request>,
     recording_preflight: Option<RecordingHudSnapshot>,
+    recording_settings_panel: Option<RecordingSettings>,
     recording_selection: Option<PendingRecordingSelection>,
     pending_recording_start: Option<ArmedRecordingStart>,
     recording_editor: Option<ActiveVideoEditor>,
@@ -336,10 +338,10 @@ impl App {
         let mut notes = Vec::new();
         let mut recording_settings = RecordingSettings::shipped();
         if config.persisted_settings {
-            match settings::load_recording_after_capture() {
-                Ok(after_capture) => recording_settings.after_capture = after_capture,
+            match settings::load_recording_settings() {
+                Ok(settings) => recording_settings = settings,
                 Err(error) => notes.push(format!(
-                    "Could not load after-capture settings; using safe defaults: {error}"
+                    "Could not load recording settings; using safe defaults: {error}"
                 )),
             }
         }
@@ -465,6 +467,7 @@ impl App {
             recording_completion: None,
             recording_replies: Vec::new(),
             recording_preflight: None,
+            recording_settings_panel: None,
             recording_selection: None,
             pending_recording_start: None,
             recording_editor: None,
@@ -699,7 +702,18 @@ impl App {
                 Tick::Continue
             }
             Action::OpenSettings => {
-                self.note("the settings window is not built yet");
+                if self
+                    .recording
+                    .as_ref()
+                    .is_some_and(RecordingMachine::is_active)
+                {
+                    self.note("recording settings cannot change while a recording is active");
+                } else if let Some(machine) = &self.recording {
+                    self.recording_settings_panel = Some(*machine.settings());
+                    self.note("recording settings opened");
+                } else {
+                    self.note("recording settings are unavailable without a native engine");
+                }
                 Tick::Continue
             }
             Action::Quit => {
@@ -788,7 +802,19 @@ impl App {
             self.note("cancel the active export before starting another recording");
             return;
         }
+        if let Err(error) = self.persist_recording_settings_panel() {
+            self.present_recording_error(error);
+            return;
+        }
+        if let Err(error) = self.reload_recording_settings() {
+            self.present_recording_error(error);
+            return;
+        }
         if let Err(error) = (self.recording_permission)() {
+            self.present_recording_error(error);
+            return;
+        }
+        if let Err(error) = self.ensure_recording_input_permission() {
             self.present_recording_error(error);
             return;
         }
@@ -820,6 +846,7 @@ impl App {
         }
 
         self.release_video_editor();
+        self.recording_settings_panel = None;
         self.recording_preflight = None;
         self.recording_tick = Instant::now();
         self.recording_completion = None;
@@ -1035,41 +1062,16 @@ impl App {
             self.reply_recording_waiters();
             return;
         }
-        let after_capture = if self.config.persisted_settings {
-            match settings::load_recording_after_capture() {
-                Ok(settings) => settings,
-                Err(error) => {
-                    let error = CliError::Core(error);
-                    self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
-                    self.present_recording_error(error);
-                    self.reply_recording_waiters();
-                    return;
-                }
-            }
-        } else {
-            self.recording
-                .as_ref()
-                .expect("a pending start requires a recording machine")
-                .settings()
-                .after_capture
-        };
         let machine = self
             .recording
             .as_mut()
             .expect("a pending start requires a recording machine");
-        if let Err(error) = machine.set_after_capture_settings(after_capture) {
-            let error = CliError::Core(error);
-            self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
-            self.present_recording_error(error);
-            self.reply_recording_waiters();
-            return;
-        }
         let result = match pending.start {
             PendingRecordingStart::Settings {
                 target,
                 destination,
             } => machine.begin_with_destination(target, destination),
-            PendingRecordingStart::Request(request) => machine.begin_request(request),
+            PendingRecordingStart::Request(request) => machine.begin_request_with_settings(request),
         };
         if let Err(error) = result {
             let error = CliError::Core(error);
@@ -1176,12 +1178,14 @@ impl App {
     }
 
     fn dispatch_gui_recording_start(&mut self, args: &RecordArgs) -> CliResult<Report> {
+        self.reload_recording_settings()?;
         if let Err(error) = (self.recording_permission)() {
             return Err(CliError::Core(CoreError::PermissionDenied {
                 capability: "screen recording".into(),
                 remedy: error.to_string(),
             }));
         }
+        self.ensure_recording_input_permission()?;
         if self
             .recording_editor
             .as_ref()
@@ -1657,6 +1661,36 @@ impl App {
         Ok(())
     }
 
+    fn ensure_recording_input_permission(&self) -> CliResult<()> {
+        let permissions = SystemPermissions::new();
+        if self
+            .recording
+            .as_ref()
+            .is_some_and(|machine| machine.settings().needs_input_monitoring())
+            && !permissions.is_granted(Capability::InputMonitoring)
+        {
+            permissions.request(Capability::InputMonitoring)?;
+        }
+        Ok(())
+    }
+
+    fn reload_recording_settings(&mut self) -> CliResult<()> {
+        if !self.config.persisted_settings {
+            return Ok(());
+        }
+        let settings = settings::load_recording_settings()?;
+        self.recording
+            .as_mut()
+            .ok_or_else(|| {
+                CliError::Core(CoreError::Unsupported {
+                    what: "screen recording".into(),
+                    why: "no native recording engine is linked for this platform".into(),
+                })
+            })?
+            .set_settings(settings)?;
+        Ok(())
+    }
+
     fn active_recording_target() -> CliResult<CaptureTarget> {
         let backend = scrozz_capture::backend()?;
         let display = backend.active_display()?;
@@ -1666,6 +1700,29 @@ impl App {
     /// Recording state rendered by the shared overlay.
     #[must_use]
     pub fn recording_presentation(&self) -> Option<RecordingPresentation> {
+        if let Some(settings) = self.recording_settings_panel {
+            let capabilities = self
+                .recording
+                .as_ref()
+                .map(RecordingMachine::capabilities)
+                .unwrap_or_default();
+            return Some(RecordingPresentation {
+                hud: RecordingHudSnapshot {
+                    phase: RecordingPhase::Idle,
+                    elapsed: Duration::ZERO,
+                    capabilities,
+                    warning: None,
+                    drift: None,
+                    output: None,
+                    failure: None,
+                },
+                countdown: settings.countdown,
+                countdown_remaining: Duration::ZERO,
+                suppress_all_overlays: false,
+                settings,
+                settings_open: true,
+            });
+        }
         if self.recording_editor.is_some() {
             return None;
         }
@@ -1684,6 +1741,11 @@ impl App {
                 countdown: RecordingSettings::shipped().countdown,
                 countdown_remaining: Duration::ZERO,
                 suppress_all_overlays,
+                settings: self
+                    .recording
+                    .as_ref()
+                    .map_or_else(RecordingSettings::shipped, |machine| *machine.settings()),
+                settings_open: false,
             });
         }
         let machine = self.recording.as_ref()?;
@@ -1704,6 +1766,8 @@ impl App {
             countdown: machine.settings().countdown,
             countdown_remaining: machine.countdown_remaining(),
             suppress_all_overlays,
+            settings: *machine.settings(),
+            settings_open: false,
         })
     }
 
@@ -1743,9 +1807,59 @@ impl App {
         match action {
             RecordingSurfaceAction::Hud(action) => self.handle_recording_hud_action(action),
             RecordingSurfaceAction::Editor(action) => self.handle_video_editor_action(action),
+            RecordingSurfaceAction::Settings(action) => {
+                self.handle_recording_settings_action(action);
+            }
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
+    }
+
+    fn handle_recording_settings_action(&mut self, action: RecordingSettingsAction) {
+        match action {
+            RecordingSettingsAction::Changed(settings) => {
+                let result = self
+                    .recording
+                    .as_mut()
+                    .ok_or_else(|| CoreError::Unsupported {
+                        what: "screen recording".into(),
+                        why: "no native recording engine is linked for this platform".into(),
+                    })
+                    .and_then(|machine| machine.set_settings(settings));
+                match result {
+                    Ok(()) => {
+                        self.recording_settings_panel = Some(settings);
+                    }
+                    Err(error) => self.present_recording_error(CliError::Core(error)),
+                }
+            }
+            RecordingSettingsAction::Close => match self.persist_recording_settings_panel() {
+                Ok(()) => self.note(if self.config.persisted_settings {
+                    "recording settings saved"
+                } else {
+                    "recording settings closed"
+                }),
+                Err(error) => self.present_recording_error(error),
+            },
+            RecordingSettingsAction::StartRecording => {
+                if let Err(error) = self.persist_recording_settings_panel() {
+                    self.present_recording_error(error);
+                    return;
+                }
+                self.begin_recording();
+            }
+        }
+    }
+
+    fn persist_recording_settings_panel(&mut self) -> CliResult<()> {
+        let Some(settings) = self.recording_settings_panel else {
+            return Ok(());
+        };
+        if self.config.persisted_settings {
+            settings::save_recording_settings(settings)?;
+        }
+        self.recording_settings_panel = None;
+        Ok(())
     }
 
     fn handle_recording_hud_action(&mut self, action: RecordingHudAction) {
@@ -1999,6 +2113,11 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        if let Err(error) = self.persist_recording_settings_panel() {
+            self.note(format!(
+                "recording settings could not be saved during shutdown: {error}"
+            ));
+        }
         self.settle_video_export_before_shutdown();
         self.finalise_recording_before_shutdown();
         self.release_video_editor();
@@ -2025,6 +2144,9 @@ impl App {
         }
         if let Some(error) = storyboard_error {
             self.note(format!("recording timeline shutdown failed: {error}"));
+        }
+        if let Some(machine) = self.recording.as_mut() {
+            machine.discard_interactions();
         }
     }
 
@@ -2426,19 +2548,54 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_and_unwired_actions_say_so_rather_than_doing_nothing() {
+    fn unavailable_actions_explain_why_their_surface_cannot_open() {
         let (mut app, _) = app();
         app.recording = None;
         assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
         app.recording = None;
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
-        assert!(notes.contains("settings window"), "{notes}");
+        assert!(
+            notes.contains("recording settings are unavailable without a native engine"),
+            "{notes}"
+        );
         assert!(
             notes.contains("no native engine advertised video capture")
                 || notes.contains("recording countdown started"),
             "{notes}"
         );
+    }
+
+    #[test]
+    fn recording_settings_surface_applies_privacy_choices_without_starting_capture() {
+        let (mut app, _) = app();
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
+        let presentation = app.recording_presentation().expect("settings presentation");
+        assert!(presentation.settings_open);
+        assert!(!presentation.settings.needs_input_monitoring());
+
+        let mut changed = presentation.settings;
+        changed.keystrokes.enabled = true;
+        changed.keystrokes.scope = scrozz_record::settings::KeystrokeScope::All;
+        app.handle_recording_surface_action(RecordingSurfaceAction::Settings(
+            RecordingSettingsAction::Changed(changed),
+        ));
+        assert!(
+            app.recording
+                .as_ref()
+                .unwrap()
+                .settings()
+                .needs_input_monitoring()
+        );
+        assert_eq!(
+            app.recording.as_ref().unwrap().phase(),
+            RecordingPhase::Idle
+        );
+
+        app.handle_recording_surface_action(RecordingSurfaceAction::Settings(
+            RecordingSettingsAction::Close,
+        ));
+        assert!(app.recording_presentation().is_none());
     }
 
     #[test]

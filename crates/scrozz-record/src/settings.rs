@@ -260,16 +260,16 @@ impl OverlaySize {
     }
 }
 
-/// Light or dark chrome for an overlay, independent of the app's own theme.
+/// Light, dark, or contrast-adaptive chrome for an overlay.
 ///
 /// Independent because the overlay is composited into someone else's video: the
 /// right answer depends on what is being recorded, not on what appearance the
 /// person recording happens to run their desktop in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OverlayTheme {
-    /// Follow the operating system's appearance.
+    /// Use high-contrast chrome that remains legible over changing video.
     #[default]
-    System,
+    Adaptive,
     /// Dark chrome, light text.
     Dark,
     /// Light chrome, dark text.
@@ -278,13 +278,13 @@ pub enum OverlayTheme {
 
 impl OverlayTheme {
     /// Every theme, in a stable order.
-    pub const ALL: [Self; 3] = [Self::System, Self::Dark, Self::Light];
+    pub const ALL: [Self; 3] = [Self::Adaptive, Self::Dark, Self::Light];
 
     /// The stable settings slug.
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
-            Self::System => "system",
+            Self::Adaptive => "adaptive",
             Self::Dark => "dark",
             Self::Light => "light",
         }
@@ -296,23 +296,26 @@ impl OverlayTheme {
     ///
     /// Returns [`Error::InvalidRequest`] listing every valid slug.
     pub fn from_slug(slug: &str) -> Result<Self> {
+        if slug == "system" {
+            return Ok(Self::Adaptive);
+        }
         from_slug(&Self::ALL, Self::slug, slug, "overlay theme")
     }
 
-    /// Resolves [`Self::System`] against the OS appearance.
+    /// Resolves [`Self::Adaptive`] against a sampled background.
     #[must_use]
-    pub const fn resolve(self, os_is_dark: bool) -> Self {
+    pub const fn resolve(self, background_is_dark: bool) -> Self {
         match self {
-            Self::System if os_is_dark => Self::Dark,
-            Self::System => Self::Light,
+            Self::Adaptive if background_is_dark => Self::Light,
+            Self::Adaptive => Self::Dark,
             other => other,
         }
     }
 
     /// Whether this resolves to dark chrome.
     #[must_use]
-    pub const fn is_dark(self, os_is_dark: bool) -> bool {
-        matches!(self.resolve(os_is_dark), Self::Dark)
+    pub const fn is_dark(self, background_is_dark: bool) -> bool {
+        matches!(self.resolve(background_is_dark), Self::Dark)
     }
 }
 
@@ -585,6 +588,9 @@ pub struct KeystrokeSettings {
 }
 
 impl KeystrokeSettings {
+    /// Hard privacy and layout bound for retained display chips.
+    pub const MAX_VISIBLE: usize = 8;
+
     /// Validates the hold time and chip count.
     ///
     /// # Errors
@@ -604,6 +610,13 @@ impl KeystrokeSettings {
                     .to_owned(),
             ));
         }
+        if self.max_visible > Self::MAX_VISIBLE {
+            return Err(Error::InvalidRequest(format!(
+                "keystroke display count {} exceeds the hard limit of {}",
+                self.max_visible,
+                Self::MAX_VISIBLE
+            )));
+        }
         Ok(self)
     }
 }
@@ -614,7 +627,7 @@ impl Default for KeystrokeSettings {
             enabled: false,
             position: OverlayAnchor::BottomCenter,
             size: OverlaySize::Medium,
-            theme: OverlayTheme::System,
+            theme: OverlayTheme::Adaptive,
             scope: KeystrokeScope::ModifiersOnly,
             // Long enough to read a chord, short enough that a fast typist does
             // not build a wall of chips.
@@ -1018,6 +1031,8 @@ pub struct RecordingSettings {
     pub dim: DimSettings,
     /// Whether the pointer is drawn into the video (REC-08).
     pub cursor: CursorMode,
+    /// Apply deterministic bounded smoothing to rendered cursor motion.
+    pub cursor_smoothing: bool,
     /// Click highlights (REC-20/21).
     pub clicks: ClickSettings,
     /// Keystroke display (REC-22/23).
@@ -1045,6 +1060,11 @@ impl RecordingSettings {
         self.keystrokes.validate()?;
         self.camera.validate()?;
         self.video.validate()?;
+        if self.cursor_smoothing && !self.shows_cursor() {
+            return Err(Error::InvalidRequest(
+                "cursor smoothing requires the recording cursor to be visible".to_owned(),
+            ));
+        }
         Ok(self)
     }
 
@@ -1106,6 +1126,7 @@ impl RecordingSettings {
     pub fn shipped() -> Self {
         Self {
             cursor: CursorMode::Visible,
+            cursor_smoothing: false,
             remember_last_selection: true,
             ..Self::default()
         }
@@ -1282,6 +1303,13 @@ mod tests {
         let mut s = RecordingSettings::shipped();
         s.camera.size = 0.9;
         assert!(s.validate().is_err());
+        let mut s = RecordingSettings::shipped();
+        s.cursor = CursorMode::Hidden;
+        s.cursor_smoothing = true;
+        assert!(s.validate().is_err());
+        let mut s = RecordingSettings::shipped();
+        s.keystrokes.max_visible = KeystrokeSettings::MAX_VISIBLE + 1;
+        assert!(s.validate().is_err());
     }
 
     #[test]
@@ -1293,9 +1321,9 @@ mod tests {
     }
 
     #[test]
-    fn a_system_theme_resolves_both_ways() {
-        assert_eq!(OverlayTheme::System.resolve(true), OverlayTheme::Dark);
-        assert_eq!(OverlayTheme::System.resolve(false), OverlayTheme::Light);
+    fn an_adaptive_theme_resolves_against_the_background() {
+        assert_eq!(OverlayTheme::Adaptive.resolve(true), OverlayTheme::Light);
+        assert_eq!(OverlayTheme::Adaptive.resolve(false), OverlayTheme::Dark);
         assert_eq!(OverlayTheme::Dark.resolve(false), OverlayTheme::Dark);
     }
 }

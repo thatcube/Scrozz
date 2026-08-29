@@ -129,6 +129,8 @@ pub enum Capability {
     Microphone,
     /// Synthesising input and reading window metadata.
     Accessibility,
+    /// Listening to pointer and keyboard events during an active recording.
+    InputMonitoring,
 }
 
 /// Queries and requests OS permissions.

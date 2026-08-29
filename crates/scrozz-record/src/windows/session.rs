@@ -780,6 +780,7 @@ impl Worker {
             video_codec: Some(VideoCodec::H264),
             quality: Some(self.quality),
             resolution: Some(self.resolution),
+            interaction_editable: None,
         };
         let path = match promote_output(&mut self.output) {
             Ok(()) => self.output.final_path.clone(),

@@ -323,6 +323,7 @@ fn each_capability_has_its_own_settings_pane() {
     assert!(settings_pane_url(Capability::ScreenRecording).ends_with("Privacy_ScreenCapture"));
     assert!(settings_pane_url(Capability::Microphone).ends_with("Privacy_Microphone"));
     assert!(settings_pane_url(Capability::Accessibility).ends_with("Privacy_Accessibility"));
+    assert!(settings_pane_url(Capability::InputMonitoring).ends_with("Privacy_ListenEvent"));
 }
 
 #[test]
@@ -331,6 +332,7 @@ fn settings_urls_use_the_system_preferences_scheme() {
         Capability::ScreenRecording,
         Capability::Microphone,
         Capability::Accessibility,
+        Capability::InputMonitoring,
     ] {
         let url = settings_pane_url(capability);
         assert!(
@@ -345,9 +347,13 @@ fn settings_urls_are_distinct() {
     let screen = settings_pane_url(Capability::ScreenRecording);
     let microphone = settings_pane_url(Capability::Microphone);
     let accessibility = settings_pane_url(Capability::Accessibility);
+    let input = settings_pane_url(Capability::InputMonitoring);
     assert_ne!(screen, microphone);
     assert_ne!(microphone, accessibility);
     assert_ne!(screen, accessibility);
+    assert_ne!(input, screen);
+    assert_ne!(input, microphone);
+    assert_ne!(input, accessibility);
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +454,7 @@ mod permission_queries {
             Capability::ScreenRecording,
             Capability::Microphone,
             Capability::Accessibility,
+            Capability::InputMonitoring,
         ] {
             let granted = permissions.is_granted(capability);
             println!("{capability:?}: {granted}");

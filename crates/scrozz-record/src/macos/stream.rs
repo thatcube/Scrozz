@@ -3,6 +3,7 @@
 #![allow(non_snake_case)]
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -27,7 +28,9 @@ use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 
 use crate::{
     OverlaySource, Quality, Recording, RecordingMetadata, RecordingRequest, RecordingResolution,
-    RecordingSession, RecordingState, VideoCodec,
+    RecordingSession, RecordingSettings, RecordingState, VideoCodec,
+    interaction::{InteractionMapper, InteractionRecording, PrivateRecordingSource},
+    interaction_render::InteractionOverlaySource,
 };
 
 use super::audio::MicrophoneCapture;
@@ -43,7 +46,8 @@ const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
 pub(crate) fn start(
     request: &RecordingRequest,
-    overlays: Option<Box<dyn OverlaySource>>,
+    settings: Option<&RecordingSettings>,
+    mut overlays: Option<Box<dyn OverlaySource>>,
 ) -> Result<Box<dyn RecordingSession>> {
     if request.system_audio && !system_audio_available() {
         return Err(Error::Unsupported {
@@ -57,7 +61,35 @@ pub(crate) fn start(
         super::permission::ensure_microphone()?;
     }
 
+    if overlays.is_some() && settings.is_some() {
+        return Err(Error::InvalidRequest(
+            "custom and settings-driven recording overlays cannot be combined".to_owned(),
+        ));
+    }
+    if let Some(settings) = settings
+        && (settings.cursor_smoothing || settings.needs_input_monitoring())
+    {
+        let monitor = crate::platform_input::start(settings)?;
+        let mapper = InteractionMapper::new(content.interaction_canvas())?;
+        overlays = Some(Box::new(InteractionOverlaySource::new(
+            monitor,
+            mapper,
+            InteractionRecording::new(
+                settings.clicks,
+                settings.keystrokes,
+                settings.shows_cursor(),
+                settings.cursor_smoothing,
+            ),
+            settings.after_capture.open_editor,
+        )));
+    }
     let has_overlays = overlays.is_some();
+    let retains_interactions = overlays
+        .as_ref()
+        .is_some_and(|source| source.retains_interactions());
+    let composites_cursor = overlays
+        .as_ref()
+        .is_some_and(|source| source.composites_cursor());
     let plan = RecordingPlan::new(
         request,
         content.native_width,
@@ -78,6 +110,21 @@ pub(crate) fn start(
         request.system_audio,
         request.microphone,
     )?;
+    let raw_source = retains_interactions
+        .then(PrivateRecordingSource::create)
+        .transpose()?;
+    let raw_writer = raw_source
+        .as_ref()
+        .map(|source| {
+            Writer::new(
+                Some(source.path()),
+                &plan,
+                request.fps,
+                request.system_audio,
+                request.microphone,
+            )
+        })
+        .transpose()?;
     let output_width = plan.size.width.round() as u32;
     let output_height = plan.size.height.round() as u32;
     let compositor = if content.requires_composition() || has_overlays {
@@ -95,11 +142,15 @@ pub(crate) fn start(
     let queue = DispatchQueue::new("com.thatcube.scrozz.recording", None);
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
+        raw_writer: Mutex::new(raw_writer),
+        raw_source: Mutex::new(raw_source),
         compositor: Mutex::new(compositor),
         direct_frame: Mutex::new(None),
         clock: Mutex::new(SessionTimeline::new(Duration::ZERO)),
         overlays: Mutex::new(overlays),
         failure: Mutex::new(None),
+        warnings: Mutex::new(VecDeque::new()),
+        raw_complete: AtomicBool::new(true),
         accepting: AtomicBool::new(false),
         stop_requested: AtomicBool::new(false),
         first_frame: AtomicBool::new(false),
@@ -114,7 +165,14 @@ pub(crate) fn start(
     let mut delegates = Vec::with_capacity(content.sources.len());
     let mut native_microphone = false;
     for (source_index, source) in content.sources.iter().enumerate() {
-        let configuration = configure(&content, source, source_index, &plan, request);
+        let configuration = configure(
+            &content,
+            source,
+            source_index,
+            &plan,
+            request,
+            composites_cursor,
+        );
         let source_microphone = source_index == 0
             && request.microphone
             && configuration.respondsToSelector(sel!(setCaptureMicrophone:));
@@ -219,11 +277,15 @@ pub(crate) fn start(
 
 struct Shared {
     writer: Mutex<Writer>,
+    raw_writer: Mutex<Option<Writer>>,
+    raw_source: Mutex<Option<PrivateRecordingSource>>,
     compositor: Mutex<Option<Compositor>>,
     direct_frame: Mutex<Option<DirectFrame>>,
     clock: Mutex<SessionTimeline>,
     overlays: Mutex<Option<Box<dyn OverlaySource>>>,
     failure: Mutex<Option<String>>,
+    warnings: Mutex<VecDeque<String>>,
+    raw_complete: AtomicBool,
     accepting: AtomicBool,
     stop_requested: AtomicBool,
     first_frame: AtomicBool,
@@ -287,11 +349,37 @@ impl Shared {
         } else if state != RecordingState::Recording {
             Ok(())
         } else if output_type == SCStreamOutputType::Audio {
-            lock(&self.writer).append_audio(AudioTrack::System, sample)
+            self.append_audio(AudioTrack::System, sample)
         } else if output_type == SCStreamOutputType::Microphone {
-            lock(&self.writer).append_audio(AudioTrack::Microphone, sample)
+            self.append_audio(AudioTrack::Microphone, sample)
         } else {
             Ok(())
+        }
+    }
+
+    fn append_audio(&self, track: AudioTrack, sample: &CMSampleBuffer) -> Result<()> {
+        lock(&self.writer).append_audio(track, sample)?;
+        if !self.raw_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let raw_result = lock(&self.raw_writer)
+            .as_mut()
+            .map(|writer| writer.append_audio(track, sample));
+        if let Some(Err(error)) = raw_result {
+            self.abandon_raw_source(format!(
+                "private editable audio source stopped accepting samples: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn abandon_raw_source(&self, warning: String) {
+        if self.raw_complete.swap(false, Ordering::AcqRel) {
+            if let Some(mut writer) = lock(&self.raw_writer).take() {
+                let _ = writer.discard();
+            }
+            lock(&self.raw_source).take();
+            lock(&self.warnings).push_back(warning);
         }
     }
 
@@ -362,15 +450,45 @@ impl Shared {
         let elapsed = self.elapsed();
         let layers = {
             let mut overlays = lock(&self.overlays);
-            overlays
+            let layers = overlays
                 .as_mut()
-                .map_or_else(Vec::new, |source| source.layers(elapsed, self.size))
+                .map_or_else(Vec::new, |source| source.layers(elapsed, self.size));
+            if let Some(warning) = overlays.as_mut().and_then(|source| source.take_warning()) {
+                let mut warnings = lock(&self.warnings);
+                if warnings.back() != Some(&warning) {
+                    warnings.push_back(warning);
+                }
+            }
+            layers
         };
-        if !layers.is_empty() {
+        let rendered = if layers.is_empty() {
+            None
+        } else if self.raw_complete.load(Ordering::Acquire) && lock(&self.raw_writer).is_some() {
+            let rendered = super::compositor::clone_bgra_sample(sample)?;
+            super::overlay::composite(&rendered, &layers)?;
+            Some(rendered)
+        } else {
             super::overlay::composite(sample, &layers)?;
-        }
-        if lock(&self.writer).append_video(sample)? {
+            None
+        };
+        let final_sample = rendered.as_deref().unwrap_or(sample);
+        if lock(&self.writer).append_video(final_sample)? {
             self.first_frame.store(true, Ordering::Release);
+            if self.raw_complete.load(Ordering::Acquire) {
+                let raw_result = lock(&self.raw_writer)
+                    .as_mut()
+                    .map(|writer| writer.append_video(sample));
+                match raw_result {
+                    Some(Ok(true)) | None => {}
+                    Some(Ok(false)) => self.abandon_raw_source(
+                        "private editable source fell behind; the final recording is intact but interaction toggles are unavailable"
+                            .to_owned(),
+                    ),
+                    Some(Err(error)) => self.abandon_raw_source(format!(
+                        "private editable source failed; the final recording is intact: {error}"
+                    )),
+                }
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -564,7 +682,11 @@ impl RecordingSession for MacRecordingSession {
             && now >= self.next_window_check.get()
         {
             self.next_window_check.set(now + Duration::from_millis(250));
-            if !super::content::window_exists(window_id) {
+            if let Some(bounds) = super::content::window_frame(window_id) {
+                if let Some(overlays) = lock(&self.shared.overlays).as_mut() {
+                    let _ = overlays.update_source_bounds(bounds);
+                }
+            } else if !super::content::window_exists(window_id) {
                 self.shared
                     .fail(format!("recording target window {window_id} disappeared"));
                 return RecordingState::Stopped;
@@ -578,12 +700,21 @@ impl RecordingSession for MacRecordingSession {
     }
 
     fn pause(&mut self) -> Result<()> {
+        if let Some(overlays) = lock(&self.shared.overlays).as_mut() {
+            overlays.pause();
+        }
         lock(&self.shared.clock)
             .pause(self.shared.now())
             .map_err(|message| Error::InvalidRequest(message.to_owned()))?;
         if let Err(failure) = lock(&self.shared.writer).pause() {
             self.shared.fail(failure.to_string());
             return Err(failure);
+        }
+        let raw_pause = lock(&self.shared.raw_writer).as_mut().map(Writer::pause);
+        if let Some(Err(failure)) = raw_pause {
+            self.shared.abandon_raw_source(format!(
+                "private editable source could not pause; the final recording is intact: {failure}"
+            ));
         }
         Ok(())
     }
@@ -595,6 +726,12 @@ impl RecordingSession for MacRecordingSession {
                 .resume(self.shared.now())
                 .map_err(|message| Error::InvalidRequest(message.to_owned()))?;
             lock(&self.shared.writer).resume(paused);
+            if let Some(writer) = lock(&self.shared.raw_writer).as_mut() {
+                writer.resume(paused);
+            }
+        }
+        if let Some(overlays) = lock(&self.shared.overlays).as_mut() {
+            overlays.resume();
         }
         if let Err(failure) = self.shared.emit_direct_frame() {
             self.shared.fail(failure.to_string());
@@ -604,7 +741,9 @@ impl RecordingSession for MacRecordingSession {
     }
 
     fn poll(&mut self) -> Option<crate::SessionEvent> {
-        if !self.first_frame_emitted && self.shared.first_frame.load(Ordering::Acquire) {
+        if let Some(warning) = lock(&self.shared.warnings).pop_front() {
+            Some(crate::SessionEvent::Warning(warning))
+        } else if !self.first_frame_emitted && self.shared.first_frame.load(Ordering::Acquire) {
             self.first_frame_emitted = true;
             Some(crate::SessionEvent::FirstFrame)
         } else {
@@ -620,6 +759,9 @@ impl RecordingSession for MacRecordingSession {
         self.queue.exec_sync(|| {});
         self.shared.stop_requested.store(true, Ordering::Release);
         self.shared.accepting.store(false, Ordering::Release);
+        let interactions = lock(&self.shared.overlays)
+            .take()
+            .and_then(|mut source| source.finish());
         lock(&self.shared.clock).stop(self.shared.now());
         for stream in &self.streams {
             if let Err(failure) = wait_operation("stopping screen capture", |handler| {
@@ -637,7 +779,18 @@ impl RecordingSession for MacRecordingSession {
         self.queue.exec_sync(|| {});
         let elapsed = self.shared.elapsed();
         let interrupted = lock(&self.shared.failure).take();
-        let summary = lock(&self.shared.writer).finish(interrupted, elapsed)?;
+        let summary = lock(&self.shared.writer).finish(interrupted.clone(), elapsed)?;
+        let raw_summary = if self.shared.raw_complete.load(Ordering::Acquire) {
+            lock(&self.shared.raw_writer)
+                .as_mut()
+                .map(|writer| writer.finish(interrupted, elapsed))
+                .transpose()
+        } else {
+            if let Some(writer) = lock(&self.shared.raw_writer).as_mut() {
+                let _ = writer.discard();
+            }
+            Ok(None)
+        };
         self.finalized = true;
 
         let metadata = RecordingMetadata {
@@ -650,6 +803,7 @@ impl RecordingSession for MacRecordingSession {
             video_codec: Some(self.video_codec),
             quality: Some(self.quality),
             resolution: Some(self.resolution),
+            interaction_editable: None,
         };
         let mut recording = Recording::native(
             summary.path,
@@ -657,6 +811,30 @@ impl RecordingSession for MacRecordingSession {
             super::ENGINE_NAME,
         )?
         .with_native_details(self.target.clone(), metadata)?;
+        match (interactions, raw_summary) {
+            (Some(mut interactions), Ok(Some(raw))) => {
+                let source = lock(&self.shared.raw_source).take().ok_or_else(|| {
+                    Error::Platform(
+                        "interaction recording lost its private source ownership".to_owned(),
+                    )
+                })?;
+                if raw.path != source.path() {
+                    return Err(Error::Platform(
+                        "interaction recording source path changed during finalisation".to_owned(),
+                    ));
+                }
+                interactions.attach_source(source);
+                recording = recording.with_interactions(interactions);
+            }
+            (Some(_), Err(error)) => {
+                tracing::warn!(
+                    "private editable interaction source failed; the final recording is intact: {error}"
+                );
+                recording.metadata.interaction_editable = Some(false);
+            }
+            (Some(_), Ok(None)) => recording.metadata.interaction_editable = Some(false),
+            (None, _) => {}
+        }
         if let Some(reason) = summary.partial {
             recording = recording.into_partial_with_salvageability(
                 summary
@@ -676,6 +854,7 @@ impl Drop for MacRecordingSession {
         }
         self.shared.stop_requested.store(true, Ordering::Release);
         self.shared.accepting.store(false, Ordering::Release);
+        lock(&self.shared.overlays).take();
         // SAFETY: best-effort asynchronous shutdown during an abandoned session.
         for stream in &self.streams {
             unsafe {
@@ -689,6 +868,12 @@ impl Drop for MacRecordingSession {
         if let Err(failure) = lock(&self.shared.writer).discard() {
             tracing::error!("abandoned macOS recording cleanup failed: {failure}");
         }
+        if let Some(writer) = lock(&self.shared.raw_writer).as_mut()
+            && let Err(failure) = writer.discard()
+        {
+            tracing::error!("abandoned private recording cleanup failed: {failure}");
+        }
+        lock(&self.shared.raw_source).take();
         self.finalized = true;
     }
 }
@@ -699,6 +884,7 @@ fn configure(
     source_index: usize,
     plan: &RecordingPlan,
     request: &RecordingRequest,
+    composites_cursor: bool,
 ) -> Retained<SCStreamConfiguration> {
     // SAFETY: ordinary ScreenCaptureKit object construction.
     let configuration = unsafe { SCStreamConfiguration::new() };
@@ -717,7 +903,7 @@ fn configure(
             CapturePixelFormat::VideoRange420 => PIXEL_FORMAT_420_VIDEO_RANGE,
             CapturePixelFormat::Bgra => PIXEL_FORMAT_BGRA,
         });
-        configuration.setShowsCursor(request.show_cursor);
+        configuration.setShowsCursor(request.show_cursor && !composites_cursor);
         configuration.setQueueDepth(5);
         configuration.setScalesToFit(
             content.requires_composition()

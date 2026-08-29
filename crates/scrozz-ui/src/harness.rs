@@ -308,6 +308,8 @@ pub enum Scenario {
     SelectorMixedDpi,
     /// The editor collapsed into its narrow stacked arrangement.
     VideoEditingNarrow,
+    /// Recording interaction preferences with the high-risk all-keys warning.
+    RecordingSettings,
 }
 
 impl Scenario {
@@ -340,6 +342,7 @@ impl Scenario {
         Self::SelectorAllInOne,
         Self::SelectorMixedDpi,
         Self::VideoEditingNarrow,
+        Self::RecordingSettings,
     ];
 
     /// Every scenario, in stable declaration order.
@@ -365,6 +368,7 @@ impl Scenario {
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
             Self::RecordingIdle => "recording-idle",
+            Self::RecordingSettings => "recording-settings",
             Self::RecordingSelecting => "recording-selecting",
             Self::RecordingCountdown => "recording-countdown",
             Self::RecordingActive => "recording-active",
@@ -942,6 +946,17 @@ impl Fixture {
                     None,
                     Some(Self::hud_fixture(RecordingPhase::Idle)),
                 ),
+                Scenario::RecordingSettings => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Choose recording interactions",
+                    "Pointer, click and keystroke controls stay compact while the all-keys mode carries an explicit privacy warning.",
+                    instants::REST,
+                    None,
+                    None,
+                ),
                 Scenario::RecordingSelecting => (
                     Vec::new(),
                     Gesture::None,
@@ -1132,6 +1147,7 @@ impl Fixture {
             | Scenario::RecordingActive
             | Scenario::RecordingPaused
             | Scenario::RecordingFailedPartial => (460.0, 420.0),
+            Scenario::RecordingSettings => (620.0, 900.0),
             Scenario::RecordingSelecting => (680.0, 760.0),
             Scenario::RecordingCountdown => (720.0, 480.0),
             Scenario::VideoEditing
@@ -2429,6 +2445,10 @@ impl SceneRegistry {
         me.register(
             Scenario::RecordingSelecting,
             Box::new(crate::recording_overlay::RecordingOverlayScene),
+        );
+        me.register(
+            Scenario::RecordingSettings,
+            Box::new(crate::recording_settings::RecordingSettingsScene),
         );
         me.register(
             Scenario::RecordingCountdown,
@@ -4233,6 +4253,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::RecordingSettings,
         Scenario::VideoEditing,
         Scenario::VideoEditingNarrow,
     ] {

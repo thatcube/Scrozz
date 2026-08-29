@@ -121,17 +121,26 @@ Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.
 
 Native recording probes are explicitly opt-in. The window-disappearance probe
-uses a disposable window; the microphone probe builds a signed helper app with
-`NSMicrophoneUsageDescription` and may show privacy prompts. Ordinary tests
-never run either probe:
+uses a disposable window; microphone and interaction probes build a signed
+helper app with the required privacy descriptions and may show system prompts.
+Ordinary tests never run them:
 
 ```bash
 SCROZZ_RECORD_WINDOW_SMOKE=1 tools/run-macos-recording-smoke.sh window-disappearance
 tools/run-macos-recording-smoke.sh microphone-package # build/sign only; no prompt
 SCROZZ_RECORD_MIC_SMOKE=1 tools/run-macos-recording-smoke.sh microphone
+tools/run-macos-recording-smoke.sh interactions-package # build/sign only; no prompt
+SCROZZ_RECORD_INTERACTION_SMOKE=1 tools/run-macos-recording-smoke.sh interactions
 SCROZZ_PLAYBACK_SMOKE=1 tools/run-macos-playback-smoke.sh # plays a quiet A/V fixture
 cargo run -p scrozz-record --example macos_export_smoke -- source.mp4 output.mp4
 ```
+
+Recording interaction overlays are opt-in. `record.highlight-clicks` and
+`record.show-keystrokes` trigger Input Monitoring only when a recording starts;
+keystrokes default to `record.keystroke-scope=modifiers-only`. The `all` mode can
+expose typed content and is presented with an explicit privacy warning. Scrozz
+retains only display-ready labels in memory for an open editor session, never in
+history, logs, or event sidecars.
 
 ### From the command line
 

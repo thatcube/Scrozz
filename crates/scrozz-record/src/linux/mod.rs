@@ -1317,6 +1317,7 @@ mod native {
             video_codec: Some(report.codec),
             quality: Some(report.quality),
             resolution: Some(report.resolution),
+            interaction_editable: None,
         };
         let mut recording =
             Recording::native(report.path, report.duration_secs, report.engine_name)?;

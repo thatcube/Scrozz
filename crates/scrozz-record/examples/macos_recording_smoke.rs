@@ -15,11 +15,21 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 #[cfg(target_os = "macos")]
+use objc2_core_foundation::CGPoint;
+#[cfg(target_os = "macos")]
+use objc2_core_graphics::{
+    CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGMouseButton,
+};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 #[cfg(target_os = "macos")]
 use scrozz_core::{CaptureTarget, WindowId};
 #[cfg(target_os = "macos")]
-use scrozz_record::{RecordingRequest, RecordingState};
+use scrozz_record::{
+    RecordingRequest, RecordingSettings, RecordingState, active_input_monitors,
+    edit::VideoDocument, settings::KeystrokeScope,
+};
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -41,10 +51,100 @@ fn run() -> Result<(), Box<dyn Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("window-disappearance") => smoke_window_disappearance(),
         Some("microphone") => smoke_microphone(),
+        Some("interactions") => smoke_interactions(),
         _ => Err(invalid(
-            "usage: macos_recording_smoke <window-disappearance|microphone>",
+            "usage: macos_recording_smoke <window-disappearance|microphone|interactions>",
         )),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn smoke_interactions() -> Result<(), Box<dyn Error>> {
+    require_opt_in(
+        "SCROZZ_RECORD_INTERACTION_SMOKE",
+        "recording-interaction smoke",
+    )?;
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| invalid("interaction smoke must start on the process main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
+
+    let backend = scrozz_capture::backend()?;
+    let display = backend.active_display()?;
+    let output = TempRecording::new("scrozz-interaction-smoke");
+    let mut settings = RecordingSettings::shipped();
+    settings.countdown.enabled = false;
+    settings.clicks.enabled = true;
+    settings.keystrokes.enabled = true;
+    settings.keystrokes.scope = KeystrokeScope::ModifiersOnly;
+    settings.cursor_smoothing = true;
+    settings.after_capture.open_editor = true;
+    let mut request =
+        RecordingRequest::from_settings(CaptureTarget::Display(display.id), &settings);
+    request.destination = Some(output.path.clone());
+    if active_input_monitors() != 0 {
+        return Err(invalid(
+            "an input hook was active before the smoke recording",
+        ));
+    }
+    let session = scrozz_record::start_with_settings(&request, &settings)?;
+    if active_input_monitors() != 1 {
+        return Err(invalid(
+            "the recording did not install exactly one input hook",
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    post_interaction_smoke_events()?;
+    std::thread::sleep(Duration::from_secs(2));
+    let recording = session.stop()?;
+    if active_input_monitors() != 0 {
+        return Err(invalid("the input hook survived recording finalisation"));
+    }
+    let summary = recording
+        .interactions()
+        .ok_or_else(|| invalid("the recording retained no interaction timeline"))?
+        .summary();
+    if summary.clicks == 0 || summary.keystrokes == 0 || summary.cursor_samples == 0 {
+        return Err(invalid(&format!(
+            "native interaction capture was incomplete: {summary:?}"
+        )));
+    }
+    if !summary.editable || summary.truncated {
+        return Err(invalid(&format!(
+            "native interaction timeline is not safely editable: {summary:?}"
+        )));
+    }
+    let document = VideoDocument::open_native(recording.clone())?;
+    if document.duration().is_zero() {
+        return Err(invalid("the retained private source is not playable"));
+    }
+    println!(
+        "interaction smoke rendered clicks, modifiers, and cursor samples; hook count returned to zero: {summary:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn post_interaction_smoke_events() -> Result<(), Box<dyn Error>> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .ok_or_else(|| invalid("CoreGraphics did not create a smoke event source"))?;
+    let cursor = CGEvent::new(None)
+        .map(|event| CGEvent::location(Some(&event)))
+        .unwrap_or_else(|| CGPoint::new(32.0, 32.0));
+    for event_type in [CGEventType::LeftMouseDown, CGEventType::LeftMouseUp] {
+        let event =
+            CGEvent::new_mouse_event(Some(&source), event_type, cursor, CGMouseButton::Left)
+                .ok_or_else(|| invalid("CoreGraphics did not create a smoke mouse event"))?;
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+    for down in [true, false] {
+        let event = CGEvent::new_keyboard_event(Some(&source), 40, down)
+            .ok_or_else(|| invalid("CoreGraphics did not create a smoke key event"))?;
+        CGEvent::set_flags(Some(&event), CGEventFlags::MaskCommand);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

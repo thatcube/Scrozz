@@ -100,6 +100,21 @@ unsafe fn blend_layer(
     let opacity = layer.opacity.clamp(0.0, 1.0);
     let source_width = layer.content.width() as usize;
     let source_height = layer.content.height() as usize;
+    let invert = layer.adaptive_contrast
+        // SAFETY: `blend_layer`'s caller established this locked allocation and
+        // the helper only samples coordinates clipped to its dimensions.
+        && unsafe {
+            background_is_dark(
+                destination,
+                destination_width,
+                destination_height,
+                destination_stride,
+                origin_x,
+                origin_y,
+                source_width,
+                source_height,
+            )
+        };
 
     for source_y in 0..source_height {
         let destination_y = origin_y + source_y as i64;
@@ -114,7 +129,17 @@ unsafe fn blend_layer(
 
             let source_offset = source_y * layer.content.stride + source_x * 4;
             let source = &layer.content.data[source_offset..source_offset + 4];
-            let (red, green, blue, alpha) = channels(source, layer.content.format);
+            let (mut red, mut green, mut blue, alpha) = channels(source, layer.content.format);
+            if invert {
+                let ceiling = if layer.content.format.is_premultiplied() {
+                    alpha
+                } else {
+                    1.0
+                };
+                red = ceiling - red;
+                green = ceiling - green;
+                blue = ceiling - blue;
+            }
             let effective_alpha = alpha * opacity;
             let premultiplied = if layer.content.format.is_premultiplied() {
                 [blue * opacity, green * opacity, red * opacity]
@@ -140,11 +165,49 @@ unsafe fn blend_layer(
                     .mul_add(255.0, 0.0)
                     .round() as u8;
             }
+
             destination[3] = (effective_alpha + f32::from(destination[3]) / 255.0 * inverse)
                 .clamp(0.0, 1.0)
                 .mul_add(255.0, 0.0)
                 .round() as u8;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn background_is_dark(
+        destination: *mut u8,
+        destination_width: usize,
+        destination_height: usize,
+        destination_stride: usize,
+        origin_x: i64,
+        origin_y: i64,
+        source_width: usize,
+        source_height: usize,
+    ) -> bool {
+        let x0 = origin_x.max(0) as usize;
+        let y0 = origin_y.max(0) as usize;
+        let x1 = (origin_x + source_width as i64).clamp(0, destination_width as i64) as usize;
+        let y1 = (origin_y + source_height as i64).clamp(0, destination_height as i64) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return false;
+        }
+        let step_x = ((x1 - x0) / 16).max(1);
+        let step_y = ((y1 - y0) / 8).max(1);
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for y in (y0..y1).step_by(step_y) {
+            for x in (x0..x1).step_by(step_x) {
+                // SAFETY: caller's locked BGRA allocation contains every sampled
+                // coordinate and row stride.
+                let pixel = unsafe {
+                    std::slice::from_raw_parts(destination.add(y * destination_stride + x * 4), 3)
+                };
+                total +=
+                    u64::from(pixel[2]) * 54 + u64::from(pixel[1]) * 183 + u64::from(pixel[0]) * 19;
+                count += 256;
+            }
+        }
+        count > 0 && total / count < 116
     }
 }
 
@@ -196,6 +259,7 @@ mod tests {
             },
             origin: PhysicalPoint::new(0.0, 0.0),
             opacity: 1.0,
+            adaptive_contrast: false,
         };
         let mut destination = [0, 0, 0, 255];
 

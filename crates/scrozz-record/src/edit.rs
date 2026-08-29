@@ -6,7 +6,7 @@ use scrozz_core::{Error, Result};
 use scrozz_export::AnimationFormat;
 
 use crate::{
-    Recording,
+    InteractionEdits, InteractionRecording, Recording,
     media::NativeMediaSource,
     settings::{Quality, ResolutionCap},
 };
@@ -528,6 +528,8 @@ pub struct EditPlan {
     pub audio: AudioEdit,
     /// Video or animation output.
     pub output: EditOutput,
+    /// Non-destructive interaction layers rendered from the retained event stream.
+    pub interactions: InteractionEdits,
 }
 
 impl EditPlan {
@@ -544,6 +546,10 @@ impl EditPlan {
             custom_dimensions: None,
             audio: AudioEdit::default(),
             output: EditOutput::Video,
+            interactions: document.recording().interactions().map_or_else(
+                InteractionEdits::default,
+                InteractionRecording::default_edits,
+            ),
         })
     }
 
@@ -575,6 +581,11 @@ impl EditPlan {
         if !self.output.supports_audio() && metadata.audio_channels > 0 && !self.audio.mute {
             return Err(Error::InvalidRequest(
                 "GIF output cannot carry audio; set the edit plan to mute".to_owned(),
+            ));
+        }
+        if self.interactions.smooth_cursor && !self.interactions.cursor {
+            return Err(Error::InvalidRequest(
+                "cursor smoothing requires the cursor overlay to be enabled".to_owned(),
             ));
         }
         Ok(())

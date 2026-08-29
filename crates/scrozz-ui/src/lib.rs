@@ -91,6 +91,7 @@ pub mod paint;
 mod recording_controls;
 pub mod recording_hud;
 pub mod recording_overlay;
+pub mod recording_settings;
 pub mod select;
 pub mod stack;
 pub mod theme;
@@ -116,6 +117,9 @@ pub use recording_hud::{
 pub use recording_overlay::{
     RecordingOverlay, RecordingOverlayAction, RecordingOverlayControls, RecordingOverlayModel,
     RecordingOverlayResponse, RecordingSelectionState,
+};
+pub use recording_settings::{
+    RecordingSettingsAction, RecordingSettingsPanel, RecordingSettingsResponse,
 };
 pub use select::{
     AxisDirection, DisplayLayout, FrozenDesktop, FrozenDisplayFrame, FrozenPixel, HudEntry,

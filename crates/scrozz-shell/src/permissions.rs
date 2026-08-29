@@ -15,6 +15,7 @@
 //! | Screen Recording | `CGPreflightScreenCaptureAccess` | Captures return desktop wallpaper with no windows — silently, which is why it is preflighted rather than inferred from the image |
 //! | Microphone | `AVCaptureDevice.authorizationStatus(for:)` | Screen recordings have no voiceover track |
 //! | Accessibility | `AXIsProcessTrustedWithOptions` | No window titles, no synthesised input |
+//! | Input Monitoring | `IOHIDCheckAccess` | No click or keystroke recording overlays |
 //!
 //! # Why `request` opens Settings
 //!
@@ -46,6 +47,9 @@ pub const fn settings_pane_url(capability: Capability) -> &'static str {
         Capability::Accessibility => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
         }
+        Capability::InputMonitoring => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        }
     }
 }
 
@@ -60,6 +64,7 @@ pub const fn capability_name(capability: Capability) -> &'static str {
         Capability::ScreenRecording => "Screen Recording",
         Capability::Microphone => "Microphone",
         Capability::Accessibility => "Accessibility",
+        Capability::InputMonitoring => "Input Monitoring",
     }
 }
 
@@ -77,6 +82,9 @@ pub const fn remedy(capability: Capability) -> &'static str {
             }
             Capability::Microphone => "System Settings → Privacy & Security → Microphone",
             Capability::Accessibility => "System Settings → Privacy & Security → Accessibility",
+            Capability::InputMonitoring => {
+                "System Settings → Privacy & Security → Input Monitoring"
+            }
         }
     } else {
         "your system's privacy settings"

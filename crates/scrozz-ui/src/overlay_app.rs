@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
-use scrozz_record::settings::CountdownSettings;
+use scrozz_record::{RecordingSettings, settings::CountdownSettings};
 
 use crate::card::{self, CardAction, CardContent};
 use crate::countdown::Countdown;
@@ -70,6 +70,7 @@ use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
 use crate::recording_hud::{RecordingHud, RecordingHudAction, RecordingHudSnapshot};
+use crate::recording_settings::{RecordingSettingsAction, RecordingSettingsPanel};
 use crate::stack::{CaptureStack, CardId, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 use crate::video_editor::VideoEditorAction;
@@ -434,6 +435,10 @@ pub struct RecordingPresentation {
     pub countdown_remaining: Duration,
     /// Hide every Scrozz overlay while a backend cannot exclude its windows.
     pub suppress_all_overlays: bool,
+    /// Recording settings shown by status and preference controls.
+    pub settings: RecordingSettings,
+    /// Whether the editable preferences surface is open.
+    pub settings_open: bool,
 }
 
 /// Semantic recording action raised by the shared overlay.
@@ -443,6 +448,8 @@ pub enum RecordingSurfaceAction {
     Hud(RecordingHudAction),
     /// Action from the terminal video editor.
     Editor(VideoEditorAction),
+    /// Action from recording preferences.
+    Settings(RecordingSettingsAction),
 }
 
 #[derive(Default)]
@@ -1077,6 +1084,38 @@ impl OverlayApp {
         presentation: &RecordingPresentation,
         hits: &mut Vec<Rect>,
     ) {
+        if presentation.settings_open {
+            let work = ui.max_rect();
+            let width = 504.0_f32.min(work.width() - 32.0);
+            let rect = Rect::from_min_size(
+                Pos2::new(work.center().x - width / 2.0, work.top() + 24.0),
+                Vec2::new(width, (work.height() - 48.0).max(1.0)),
+            );
+            let shown = ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("recording-settings-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            RecordingSettingsPanel::new(
+                                presentation.settings,
+                                presentation.hud.capabilities,
+                                &self.theme,
+                            )
+                            .show(ui)
+                        })
+                        .inner
+                },
+            );
+            hits.push(shown.inner.response.rect);
+            for action in shown.inner.actions {
+                self.emit_recording_action(RecordingSurfaceAction::Settings(action));
+            }
+            return;
+        }
         if presentation.hud.phase == scrozz_record::machine::RecordingPhase::Countdown {
             let response = Countdown::new(presentation.countdown, presentation.countdown_remaining)
                 .show(ui, &self.theme);
@@ -1104,7 +1143,17 @@ impl OverlayApp {
                 egui::UiBuilder::new()
                     .max_rect(rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
-                |ui| RecordingHud::new(presentation.hud.model(), &self.theme).show(ui),
+                |ui| {
+                    let response =
+                        RecordingHud::new(presentation.hud.model(), &self.theme).show(ui);
+                    ui.add_space(crate::theme::Space::SM);
+                    crate::recording_settings::recording_indicator(
+                        ui,
+                        &self.theme,
+                        presentation.settings,
+                    );
+                    response
+                },
             );
             hits.push(shown.inner.response.rect);
             if let Some(action) = shown.inner.action {

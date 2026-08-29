@@ -11,6 +11,8 @@ Usage:
   SCROZZ_RECORD_WINDOW_SMOKE=1 tools/run-macos-recording-smoke.sh window-disappearance
   tools/run-macos-recording-smoke.sh microphone-package
   SCROZZ_RECORD_MIC_SMOKE=1 tools/run-macos-recording-smoke.sh microphone
+  tools/run-macos-recording-smoke.sh interactions-package
+  SCROZZ_RECORD_INTERACTION_SMOKE=1 tools/run-macos-recording-smoke.sh interactions
 
 The window probe runs as a terminal child and closes its own disposable window.
 
@@ -31,9 +33,14 @@ case "$MODE" in
     fi
     cargo run -p scrozz-record --example macos_recording_smoke -- window-disappearance
     ;;
-  microphone|microphone-package)
+  microphone|microphone-package|interactions|interactions-package)
     if [[ "$MODE" == "microphone" && "${SCROZZ_RECORD_MIC_SMOKE:-0}" != "1" ]]; then
       echo "Refusing to run without SCROZZ_RECORD_MIC_SMOKE=1." >&2
+      usage >&2
+      exit 2
+    fi
+    if [[ "$MODE" == "interactions" && "${SCROZZ_RECORD_INTERACTION_SMOKE:-0}" != "1" ]]; then
+      echo "Refusing to run without SCROZZ_RECORD_INTERACTION_SMOKE=1." >&2
       usage >&2
       exit 2
     fi
@@ -68,22 +75,30 @@ case "$MODE" in
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Scrozz records microphone audio only for this explicitly requested native smoke test.</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>Scrozz observes clicks and display-ready shortcuts only for this explicitly requested native smoke test.</string>
 </dict>
 </plist>
 PLIST
     codesign --force --sign - --identifier com.thatcube.Scrozz.RecordingSmoke "$APP"
     codesign --verify --strict "$APP"
-    if [[ "$MODE" == "microphone-package" ]]; then
-      echo "Packaged microphone smoke app at $APP (not launched; no permission requested)."
+    if [[ "$MODE" == "microphone-package" || "$MODE" == "interactions-package" ]]; then
+      echo "Packaged recording smoke app at $APP (not launched; no permission requested)."
       exit 0
     fi
     echo
-    echo "This explicit probe may request both permissions:"
+    echo "This explicit probe may request recording permissions:"
     echo "  System Settings > Privacy & Security > Screen & System Audio Recording"
     echo "  System Settings > Privacy & Security > Microphone"
+    echo "  System Settings > Privacy & Security > Input Monitoring"
+    echo "  System Settings > Privacy & Security > Accessibility (synthetic smoke events only)"
     echo "Relaunch this command after granting Screen & System Audio Recording."
     echo
-    SCROZZ_RECORD_MIC_SMOKE=1 "$APP/Contents/MacOS/ScrozzRecordingSmoke" microphone
+    if [[ "$MODE" == "microphone" ]]; then
+      SCROZZ_RECORD_MIC_SMOKE=1 "$APP/Contents/MacOS/ScrozzRecordingSmoke" microphone
+    else
+      SCROZZ_RECORD_INTERACTION_SMOKE=1 "$APP/Contents/MacOS/ScrozzRecordingSmoke" interactions
+    fi
     ;;
   -h|--help|"")
     usage

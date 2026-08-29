@@ -79,6 +79,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <string>Scrozz uses the camera for webcam overlays while recording.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Scrozz records microphone audio when you ask it to narrate a recording.</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>Scrozz observes clicks and display-ready shortcuts only while you record with interaction overlays enabled.</string>
 </dict>
 </plist>
 PLIST

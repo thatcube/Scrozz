@@ -164,7 +164,10 @@ pub fn policy(command: &Command) -> Forwarding {
         Command::Capture(_) | Command::Record(_) => Forwarding::Prefer,
         Command::History(_) => Forwarding::Prefer,
         Command::Ocr(_) => Forwarding::Prefer,
-        Command::Settings(args) if args.is_write() => Forwarding::Prefer,
+        // Settings are atomically locked on disk. Keeping writes local also
+        // prevents the long-lived GUI (which may hold Input Monitoring) from
+        // becoming a confused deputy for privacy-sensitive recording options.
+        Command::Settings(args) if args.is_write() => Forwarding::Never,
 
         // Pure reads and pure functions. `list` asks the compositor, not Scrozz;
         // `hotkey generate-config` is string formatting; `gui` is the thing that
@@ -563,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn writing_a_setting_forwards_but_reading_one_does_not() {
+    fn settings_stay_local_instead_of_using_the_privileged_gui() {
         assert_eq!(
             policy(&command_of(&[
                 "scrozz",
@@ -572,7 +575,7 @@ mod tests {
                 "capture.format",
                 "png"
             ])),
-            Forwarding::Prefer
+            Forwarding::Never
         );
         assert_eq!(
             policy(&command_of(&["scrozz", "settings", "get"])),

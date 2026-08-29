@@ -2,10 +2,10 @@
 //!
 //! # Why the schema lives here and not in the store
 //!
-//! Most settings are still schema-only. The independent Recording after-capture
-//! actions are persisted now because both the GUI startup path and the CLI need
+//! Most settings remain schema-only. Recording interaction and after-capture
+//! options are durable because the settings surface and recording engine need
 //! one authoritative policy. Unknown or malformed state is an error rather than
-//! a reason to silently open a window the user disabled.
+//! a reason to silently enable an input-monitoring feature.
 //!
 //! # Naming
 //!
@@ -19,8 +19,12 @@ use crate::{
     json::Json,
 };
 use fs2::FileExt as _;
+use scrozz_core::CursorMode;
 use scrozz_core::{Error, Result};
-use scrozz_record::AfterCaptureSettings;
+use scrozz_record::{
+    AfterCaptureSettings, RecordingSettings,
+    settings::{ClickStyle, KeystrokeScope, OverlayAnchor, OverlaySize, OverlayTheme, Rgba8},
+};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
@@ -40,6 +44,18 @@ const RECORDING_OVERLAY_KEY: &str = "record.show-recent-captures-overlay";
 const RECORDING_EDITOR_KEY: &str = "record.open-editor";
 const RECORDING_OVERLAY_FIELD: &str = "show-recent-captures-overlay";
 const RECORDING_EDITOR_FIELD: &str = "open-editor";
+const RECORDING_CURSOR_KEY: &str = "record.cursor";
+const RECORDING_CURSOR_SMOOTHING_KEY: &str = "record.cursor-smoothing";
+const RECORDING_CLICKS_KEY: &str = "record.highlight-clicks";
+const RECORDING_CLICK_COLOR_KEY: &str = "record.click-color";
+const RECORDING_CLICK_SIZE_KEY: &str = "record.click-size";
+const RECORDING_CLICK_STYLE_KEY: &str = "record.click-style";
+const RECORDING_CLICK_ANIMATION_KEY: &str = "record.click-animation";
+const RECORDING_KEYS_KEY: &str = "record.show-keystrokes";
+const RECORDING_KEY_SCOPE_KEY: &str = "record.keystroke-scope";
+const RECORDING_KEY_POSITION_KEY: &str = "record.keystroke-position";
+const RECORDING_KEY_SIZE_KEY: &str = "record.keystroke-size";
+const RECORDING_KEY_THEME_KEY: &str = "record.keystroke-theme";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct LoadedSettings {
@@ -466,6 +482,8 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// A key combination, validated by the same parser the hotkey commands use.
     Accelerator,
+    /// An RGB or RGBA hexadecimal color.
+    Color,
 }
 
 impl Kind {
@@ -478,6 +496,7 @@ impl Kind {
             Self::Path => "path",
             Self::Choice(_) => "choice",
             Self::Accelerator => "accelerator",
+            Self::Color => "color",
         }
     }
 }
@@ -577,6 +596,7 @@ impl Setting {
                 }
             }
             Kind::Accelerator => Accelerator::parse(value).map(|_| ()),
+            Kind::Color => Rgba8::parse(value).map(|_| ()).map_err(CliError::Core),
         }
     }
 }
@@ -593,6 +613,128 @@ pub fn load_recording_after_capture() -> Result<AfterCaptureSettings> {
         .map(|(value, _)| value)
 }
 
+/// Loads every persisted recording preference.
+///
+/// Interaction defaults are deliberately permission-free: pointer visible,
+/// click/key capture disabled, and modifiers-only if the key display is enabled.
+pub fn load_recording_settings() -> Result<RecordingSettings> {
+    let store = AfterCaptureStore::default_location()?;
+    load_recording_settings_from(&store)
+}
+
+fn load_recording_settings_from(store: &AfterCaptureStore) -> Result<RecordingSettings> {
+    store.with_lock(|| {
+        let loaded = store.load_unlocked()?;
+        let mut settings = RecordingSettings::shipped();
+        settings.after_capture = loaded.actions;
+        let value = |key: &str| {
+            loaded
+                .document
+                .get("values")
+                .and_then(Value::as_object)
+                .and_then(|values| values.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| lookup(key).ok().map(|setting| setting.default.to_owned()))
+                .ok_or_else(|| Error::Storage(format!("recording setting {key:?} is not declared")))
+        };
+        settings.cursor = if value(RECORDING_CURSOR_KEY)? == "true" {
+            CursorMode::Visible
+        } else {
+            CursorMode::Hidden
+        };
+        settings.cursor_smoothing = parse_bool(&value(RECORDING_CURSOR_SMOOTHING_KEY)?)?;
+        settings.clicks.enabled = parse_bool(&value(RECORDING_CLICKS_KEY)?)?;
+        settings.clicks.color = Rgba8::parse(&value(RECORDING_CLICK_COLOR_KEY)?)?;
+        settings.clicks.size = OverlaySize::from_slug(&value(RECORDING_CLICK_SIZE_KEY)?)?;
+        settings.clicks.style = ClickStyle::from_slug(&value(RECORDING_CLICK_STYLE_KEY)?)?;
+        settings.clicks.animate = parse_bool(&value(RECORDING_CLICK_ANIMATION_KEY)?)?;
+        settings.keystrokes.enabled = parse_bool(&value(RECORDING_KEYS_KEY)?)?;
+        settings.keystrokes.scope = KeystrokeScope::from_slug(&value(RECORDING_KEY_SCOPE_KEY)?)?;
+        settings.keystrokes.position =
+            OverlayAnchor::from_slug(&value(RECORDING_KEY_POSITION_KEY)?)?;
+        settings.keystrokes.size = OverlaySize::from_slug(&value(RECORDING_KEY_SIZE_KEY)?)?;
+        settings.keystrokes.theme = OverlayTheme::from_slug(&value(RECORDING_KEY_THEME_KEY)?)?;
+        settings.validate()
+    })
+}
+
+/// Atomically persists every recording setting represented by the settings UI.
+pub fn save_recording_settings(settings: RecordingSettings) -> Result<()> {
+    settings.validate()?;
+    let store = AfterCaptureStore::default_location()?;
+    save_recording_settings_to(&store, settings)
+}
+
+fn save_recording_settings_to(
+    store: &AfterCaptureStore,
+    settings: RecordingSettings,
+) -> Result<()> {
+    store.with_lock(|| {
+        let mut loaded = store.load_unlocked()?;
+        loaded.actions = settings.after_capture;
+        let values = loaded
+            .document
+            .get_mut("values")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                Error::Storage("settings document has no writable values object".to_owned())
+            })?;
+        for (key, value) in [
+            (RECORDING_CURSOR_KEY, settings.shows_cursor().to_string()),
+            (
+                RECORDING_CURSOR_SMOOTHING_KEY,
+                settings.cursor_smoothing.to_string(),
+            ),
+            (RECORDING_CLICKS_KEY, settings.clicks.enabled.to_string()),
+            (RECORDING_CLICK_COLOR_KEY, settings.clicks.color.to_hex()),
+            (
+                RECORDING_CLICK_SIZE_KEY,
+                settings.clicks.size.slug().to_owned(),
+            ),
+            (
+                RECORDING_CLICK_STYLE_KEY,
+                settings.clicks.style.slug().to_owned(),
+            ),
+            (
+                RECORDING_CLICK_ANIMATION_KEY,
+                settings.clicks.animate.to_string(),
+            ),
+            (RECORDING_KEYS_KEY, settings.keystrokes.enabled.to_string()),
+            (
+                RECORDING_KEY_SCOPE_KEY,
+                settings.keystrokes.scope.slug().to_owned(),
+            ),
+            (
+                RECORDING_KEY_POSITION_KEY,
+                settings.keystrokes.position.slug().to_owned(),
+            ),
+            (
+                RECORDING_KEY_SIZE_KEY,
+                settings.keystrokes.size.slug().to_owned(),
+            ),
+            (
+                RECORDING_KEY_THEME_KEY,
+                settings.keystrokes.theme.slug().to_owned(),
+            ),
+        ] {
+            values.insert(key.to_owned(), Value::String(value));
+        }
+        write_actions(&mut loaded.document, loaded.actions)?;
+        store.save_document_unlocked(&loaded.document)
+    })
+}
+
+fn parse_bool(value: &str) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(Error::Storage(format!(
+            "persisted recording boolean must be true or false, got {other:?}"
+        ))),
+    }
+}
+
 /// Persists one setting when this narrow store owns it.
 ///
 /// Returns `false` for settings that remain schema-only.
@@ -606,21 +748,35 @@ pub fn persist(setting: &Setting, value: &str) -> CliResult<bool> {
 }
 
 fn persist_to(store: &AfterCaptureStore, setting: &Setting, value: &str) -> CliResult<bool> {
-    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+    setting.validate(value)?;
+    if !is_persisted_setting(setting.key) {
         return Ok(false);
     }
-    setting.validate(value)?;
-    let enabled = value == "true";
-    store.update(|actions| match setting.key {
-        RECORDING_OVERLAY_KEY => actions.recent_captures_overlay = enabled,
-        RECORDING_EDITOR_KEY => actions.open_editor = enabled,
-        _ => unreachable!("persisted settings were filtered above"),
+    store.with_lock(|| {
+        let mut loaded = store.load_unlocked()?;
+        let enabled = value == "true";
+        match setting.key {
+            RECORDING_OVERLAY_KEY => loaded.actions.recent_captures_overlay = enabled,
+            RECORDING_EDITOR_KEY => loaded.actions.open_editor = enabled,
+            _ => {
+                let values = loaded
+                    .document
+                    .get_mut("values")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        Error::Storage("settings document has no writable values object".to_owned())
+                    })?;
+                values.insert(setting.key.to_owned(), Value::String(value.to_owned()));
+            }
+        }
+        write_actions(&mut loaded.document, loaded.actions)?;
+        store.save_document_unlocked(&loaded.document)
     })?;
     Ok(true)
 }
 
 fn resolved_value(setting: &Setting) -> CliResult<(String, &'static str)> {
-    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+    if !is_persisted_setting(setting.key) {
         return Ok((setting.default.to_owned(), "default"));
     }
     let store = AfterCaptureStore::default_location()?;
@@ -631,19 +787,57 @@ fn resolved_value_from(
     store: &AfterCaptureStore,
     setting: &Setting,
 ) -> CliResult<(String, &'static str)> {
-    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+    if !is_persisted_setting(setting.key) {
         return Ok((setting.default.to_owned(), "default"));
     }
-    let (actions, persisted) = store.load()?;
-    let value = match setting.key {
-        RECORDING_OVERLAY_KEY => actions.recent_captures_overlay,
-        RECORDING_EDITOR_KEY => actions.open_editor,
-        _ => unreachable!("persisted settings were filtered above"),
-    };
-    Ok((
-        value.to_string(),
-        if persisted { "user" } else { "default" },
-    ))
+    Ok(store.with_lock(|| {
+        let loaded = store.load_unlocked()?;
+        if let Some(value) = loaded
+            .document
+            .get("values")
+            .and_then(Value::as_object)
+            .and_then(|values| values.get(setting.key))
+            .and_then(Value::as_str)
+        {
+            return Ok((value.to_owned(), "user"));
+        }
+
+        let value = match setting.key {
+            RECORDING_OVERLAY_KEY => loaded.actions.recent_captures_overlay.to_string(),
+            RECORDING_EDITOR_KEY => loaded.actions.open_editor.to_string(),
+            _ => setting.default.to_owned(),
+        };
+        Ok((
+            value,
+            if loaded.persisted
+                && matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY)
+            {
+                "user"
+            } else {
+                "default"
+            },
+        ))
+    })?)
+}
+
+fn is_persisted_setting(key: &str) -> bool {
+    matches!(
+        key,
+        RECORDING_OVERLAY_KEY
+            | RECORDING_EDITOR_KEY
+            | RECORDING_CURSOR_KEY
+            | RECORDING_CURSOR_SMOOTHING_KEY
+            | RECORDING_CLICKS_KEY
+            | RECORDING_CLICK_COLOR_KEY
+            | RECORDING_CLICK_SIZE_KEY
+            | RECORDING_CLICK_STYLE_KEY
+            | RECORDING_CLICK_ANIMATION_KEY
+            | RECORDING_KEYS_KEY
+            | RECORDING_KEY_SCOPE_KEY
+            | RECORDING_KEY_POSITION_KEY
+            | RECORDING_KEY_SIZE_KEY
+            | RECORDING_KEY_THEME_KEY
+    )
 }
 
 /// One setting as JSON with its current persisted value.
@@ -735,6 +929,85 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "false",
         description: "Record system audio output.",
+    },
+    Setting {
+        key: RECORDING_CURSOR_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Show the pointer in recordings.",
+    },
+    Setting {
+        key: RECORDING_CURSOR_SMOOTHING_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Smooth pointer movement without changing captured event timing.",
+    },
+    Setting {
+        key: RECORDING_CLICKS_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Render click highlights while recording.",
+    },
+    Setting {
+        key: RECORDING_CLICK_COLOR_KEY,
+        kind: Kind::Color,
+        default: "#7c6cf6",
+        description: "Click highlight color as #RRGGBB or #RRGGBBAA.",
+    },
+    Setting {
+        key: RECORDING_CLICK_SIZE_KEY,
+        kind: Kind::Choice(&["small", "medium", "large"]),
+        default: "medium",
+        description: "Click highlight size.",
+    },
+    Setting {
+        key: RECORDING_CLICK_STYLE_KEY,
+        kind: Kind::Choice(&["outline", "filled"]),
+        default: "outline",
+        description: "Click highlight drawing style.",
+    },
+    Setting {
+        key: RECORDING_CLICK_ANIMATION_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Animate click highlights instead of showing a brief static mark.",
+    },
+    Setting {
+        key: RECORDING_KEYS_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Show filtered keystrokes while recording.",
+    },
+    Setting {
+        key: RECORDING_KEY_SCOPE_KEY,
+        kind: Kind::Choice(&["modifiers-only", "all"]),
+        default: "modifiers-only",
+        description: "Choose shortcut-only display or privacy-sensitive all-keys display.",
+    },
+    Setting {
+        key: RECORDING_KEY_POSITION_KEY,
+        kind: Kind::Choice(&[
+            "top-left",
+            "top-center",
+            "top-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right",
+        ]),
+        default: "bottom-center",
+        description: "Position of the keystroke display.",
+    },
+    Setting {
+        key: RECORDING_KEY_SIZE_KEY,
+        kind: Kind::Choice(&["small", "medium", "large"]),
+        default: "medium",
+        description: "Keystroke display size.",
+    },
+    Setting {
+        key: RECORDING_KEY_THEME_KEY,
+        kind: Kind::Choice(&["adaptive", "dark", "light"]),
+        default: "adaptive",
+        description: "Keystroke display contrast style.",
     },
     Setting {
         key: RECORDING_OVERLAY_KEY,
@@ -917,6 +1190,35 @@ mod tests {
             resolved_value_from(&store, overlay).unwrap(),
             ("false".to_owned(), "user")
         );
+    }
+
+    #[test]
+    fn recording_interaction_options_round_trip_without_plaintext_events() {
+        let root = scratch("recording-interactions");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join(SETTINGS_FILE));
+        let mut expected = RecordingSettings::shipped();
+        expected.cursor = CursorMode::Hidden;
+        expected.cursor_smoothing = false;
+        expected.clicks.enabled = true;
+        expected.clicks.color = Rgba8::rgba(12, 34, 56, 200);
+        expected.clicks.size = OverlaySize::Large;
+        expected.clicks.style = ClickStyle::Filled;
+        expected.clicks.animate = false;
+        expected.keystrokes.enabled = true;
+        expected.keystrokes.scope = KeystrokeScope::All;
+        expected.keystrokes.position = OverlayAnchor::TopRight;
+        expected.keystrokes.size = OverlaySize::Small;
+        expected.keystrokes.theme = OverlayTheme::Light;
+
+        save_recording_settings_to(&store, expected).unwrap();
+        assert_eq!(load_recording_settings_from(&store).unwrap(), expected);
+
+        let encoded = fs::read_to_string(root.join(SETTINGS_FILE)).unwrap();
+        assert!(encoded.contains(RECORDING_CLICKS_KEY));
+        assert!(encoded.contains(RECORDING_KEY_SCOPE_KEY));
+        assert!(!encoded.contains("keycode"));
+        assert!(!encoded.contains("events"));
     }
 
     #[test]

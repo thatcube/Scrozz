@@ -14,6 +14,8 @@
 //! - **Accessibility** — `AXIsProcessTrustedWithOptions` is both the query and
 //!   the request depending on whether you pass the prompt option, and unlike
 //!   the other two it never prompts again once the user has been asked.
+//! - **Input Monitoring** — `IOHIDCheckAccess` is a pure query and
+//!   `IOHIDRequestAccess` prompts only when click/keystroke capture is enabled.
 //!
 //! # The Info.plist hazard
 //!
@@ -49,6 +51,15 @@ unsafe extern "C" {
     /// `AVMediaTypeAudio`, an `NSString *` constant whose value is `@"soun"`.
     static AVMediaTypeAudio: *const NSString;
 }
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOHIDCheckAccess(request_type: u32) -> u32;
+    fn IOHIDRequestAccess(request_type: u32) -> u8;
+}
+
+const IO_HID_LISTEN_EVENT: u32 = 1;
+const IO_HID_ACCESS_GRANTED: u32 = 0;
 
 // `AXIsProcessTrusted` and friends live in HIServices, which is re-exported by
 // the ApplicationServices umbrella framework.
@@ -114,6 +125,10 @@ pub fn is_granted(capability: Capability) -> bool {
         // SAFETY: a nullary C query with no arguments, no allocation and no
         // thread requirement.
         Capability::Accessibility => (unsafe { AXIsProcessTrusted() }) != 0,
+        // SAFETY: read-only process permission query available since macOS 10.15.
+        Capability::InputMonitoring => {
+            (unsafe { IOHIDCheckAccess(IO_HID_LISTEN_EVENT) }) == IO_HID_ACCESS_GRANTED
+        }
     }
 }
 
@@ -166,7 +181,21 @@ pub fn request(capability: Capability) -> Result<()> {
         Capability::ScreenRecording => request_screen_recording(capability),
         Capability::Microphone => request_microphone(capability),
         Capability::Accessibility => request_accessibility(capability),
+        Capability::InputMonitoring => request_input_monitoring(capability),
     }
+}
+
+fn request_input_monitoring(capability: Capability) -> Result<()> {
+    if is_granted(capability) {
+        return Ok(());
+    }
+    // SAFETY: the documented listen-event request is made only after a user
+    // explicitly enables a recording interaction feature.
+    if unsafe { IOHIDRequestAccess(IO_HID_LISTEN_EVENT) } != 0 {
+        return Ok(());
+    }
+    open_settings_pane(capability)?;
+    Err(crate::permissions::denied(capability))
 }
 
 fn request_screen_recording(capability: Capability) -> Result<()> {

@@ -119,6 +119,25 @@ pub trait RecordingEngine: Send + Sync {
     /// Returns an actionable platform, permission, request, or capability error.
     fn start(&self, request: &RecordingRequest) -> Result<Box<dyn RecordingSession>>;
 
+    /// Starts with the validated product settings in force.
+    ///
+    /// Engines override this when settings require native resources beyond the
+    /// basic request, such as a lifetime-scoped input monitor.
+    fn start_with_settings(
+        &self,
+        request: &RecordingRequest,
+        settings: &RecordingSettings,
+    ) -> Result<Box<dyn RecordingSession>> {
+        if settings.needs_input_monitoring() || settings.cursor_smoothing {
+            return Err(Error::Unsupported {
+                what: "recording interaction overlays".to_owned(),
+                why: "the selected recording engine does not provide a native interaction source"
+                    .to_owned(),
+            });
+        }
+        self.start(request)
+    }
+
     /// Starts with native pull-based overlays when the engine supports them.
     ///
     /// The default is an explicit unsupported result rather than silently
@@ -405,6 +424,14 @@ impl RecordingEngine for MockEngine {
         &self,
         request: &RecordingRequest,
         _overlays: Box<dyn OverlaySource>,
+    ) -> Result<Box<dyn RecordingSession>> {
+        self.start(request)
+    }
+
+    fn start_with_settings(
+        &self,
+        request: &RecordingRequest,
+        _settings: &RecordingSettings,
     ) -> Result<Box<dyn RecordingSession>> {
         self.start(request)
     }
