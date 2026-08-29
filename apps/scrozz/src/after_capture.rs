@@ -289,11 +289,14 @@ impl AfterCaptureSettings {
         }
     }
 
-    /// Behavior from before After Capture settings existed.
+    /// Defaults for a document written before After Capture settings existed.
+    ///
+    /// Scrozz is unreleased, so an absent value takes the confirmed product
+    /// default. Explicit legacy values are applied over this seed while parsing.
     #[must_use]
     pub fn legacy() -> Self {
         Self {
-            sets: [ActionSet::overlay_only(), ActionSet::overlay_only()],
+            sets: [ActionSet::fresh_screenshot(), ActionSet::overlay_only()],
             values: BTreeMap::new(),
             unknown_values: BTreeMap::new(),
             document_version: SETTINGS_VERSION,
@@ -554,7 +557,7 @@ pub const fn current_availability(
 pub enum InstallProfile {
     /// No prior Scrozz configuration can be inferred.
     Fresh,
-    /// A Scrozz config directory already exists, so preserve prior behavior.
+    /// A Scrozz config directory already exists and may need legacy migration.
     Existing,
 }
 
@@ -1001,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_existing_profiles_have_deliberately_different_defaults() {
+    fn every_unset_profile_uses_the_confirmed_screenshot_default() {
         let fresh = AfterCaptureSettings::fresh();
         assert!(fresh.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
         assert!(fresh.is_enabled(
@@ -1021,11 +1024,16 @@ mod tests {
         );
 
         let existing = AfterCaptureSettings::legacy();
-        assert!(!existing.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        assert!(existing.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
         assert!(existing.is_enabled(
             MediaKind::Screenshot,
             AfterCaptureAction::ShowRecentCapturesOverlay
         ));
+        assert!(existing.is_enabled(
+            MediaKind::Recording,
+            AfterCaptureAction::ShowRecentCapturesOverlay
+        ));
+        assert!(!existing.is_enabled(MediaKind::Recording, AfterCaptureAction::CopyToClipboard));
     }
 
     #[test]
@@ -1142,7 +1150,7 @@ mod tests {
         let fresh = fresh_store.load(InstallProfile::Fresh).unwrap();
         let existing = existing_store.load(InstallProfile::Existing).unwrap();
         assert!(fresh.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
-        assert!(!existing.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        assert!(existing.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
         assert!(fresh_store.path().is_file());
         assert!(existing_store.path().is_file());
         fs::remove_dir_all(root).unwrap();
@@ -1163,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_config_directory_infers_overlay_only_migration() {
+    fn unrelated_existing_state_still_gets_copy_and_overlay_when_policy_is_absent() {
         let root = scratch("inferred-existing");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("shortcuts.json"), "{}").unwrap();
@@ -1174,7 +1182,66 @@ mod tests {
             MediaKind::Screenshot,
             AfterCaptureAction::ShowRecentCapturesOverlay
         ));
-        assert!(!settings.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        assert!(settings.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_document_with_only_unrelated_settings_gets_copy_and_overlay() {
+        let root = scratch("legacy-unrelated-settings");
+        let path = root.join("settings.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "values": {
+    "capture.format": "webp",
+    "capture.cursor": true
+  }
+}"#,
+        )
+        .unwrap();
+
+        let store = AfterCaptureStore::new(&path);
+        let migrated = store.load(InstallProfile::Existing).unwrap();
+        assert_eq!(migrated.value("capture.format"), Some("webp"));
+        assert_eq!(migrated.value("capture.cursor"), Some("true"));
+        assert!(migrated.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        assert!(migrated.is_enabled(
+            MediaKind::Screenshot,
+            AfterCaptureAction::ShowRecentCapturesOverlay
+        ));
+        assert!(!migrated.is_enabled(MediaKind::Recording, AfterCaptureAction::CopyToClipboard));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_legacy_copy_false_remains_false() {
+        let root = scratch("legacy-explicit-false");
+        let path = root.join("settings.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "values": {
+    "capture.copy-to-clipboard": false
+  }
+}"#,
+        )
+        .unwrap();
+
+        let store = AfterCaptureStore::new(&path);
+        let migrated = store.load(InstallProfile::Existing).unwrap();
+        assert!(!migrated.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        assert!(migrated.is_enabled(
+            MediaKind::Screenshot,
+            AfterCaptureAction::ShowRecentCapturesOverlay
+        ));
+
+        let restarted = store.load(InstallProfile::Existing).unwrap();
+        assert!(!restarted.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
         fs::remove_dir_all(root).unwrap();
     }
 

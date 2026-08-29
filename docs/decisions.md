@@ -1164,13 +1164,14 @@ clipboard, Save automatically, Upload and copy link, Open Editor, and Pin to
 Screen. Pin to Screen is screenshot-only. A cell without a real implementation
 is an explicitly described unavailable state, never an inert checkbox.
 
-Fresh profiles enable **Copy to clipboard** and **Show Recent Captures Overlay**
-for screenshots. Recordings keep the conservative overlay-only default. When an
-existing Scrozz configuration can be inferred but has no After Capture document,
-the migration preserves the prior screenshot behavior—overlay only—rather than
-silently adding a clipboard write. The versioned settings document is replaced
-atomically, preserves unknown newer fields across a downgrade, and keeps
-screenshot and recording action sets independent.
+Every profile without an explicit screenshot After Capture policy enables
+**Copy to clipboard** and **Show Recent Captures Overlay**. This includes legacy
+profiles with unrelated settings or history: Scrozz is unreleased, so an
+accidental earlier behavior is not a compatibility default. An explicitly stored
+value—including `false` for Copy—remains authoritative through migration and
+restart. Recordings keep the conservative overlay-only default. The versioned
+settings document is replaced atomically, preserves unknown newer fields across
+a downgrade, and keeps screenshot and recording action sets independent.
 
 **Execution.** The capture backend finalizes one immutable artifact before any
 action runs. Actions then run exactly once in this order:
