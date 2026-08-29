@@ -111,7 +111,50 @@ impl Frame {
     /// otherwise discovered as a panic deep inside an encoder.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        let min_stride = self.width() as usize * self.format.bytes_per_pixel();
-        self.stride >= min_stride && self.data.len() >= self.stride * self.height() as usize
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(min_stride) = width.checked_mul(self.format.bytes_per_pixel()) else {
+            return false;
+        };
+        let Some(required) = self.stride.checked_mul(height) else {
+            return false;
+        };
+        self.stride >= min_stride && self.data.len() >= required
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(size: PhysicalSize, stride: usize, data: Vec<u8>) -> Frame {
+        Frame {
+            data,
+            size,
+            stride,
+            format: PixelFormat::Rgba8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn empty_or_short_frames_are_not_well_formed() {
+        assert!(!frame(PhysicalSize::new(0.0, 1.0), 0, vec![]).is_well_formed());
+        assert!(!frame(PhysicalSize::new(2.0, 2.0), 8, vec![0; 15]).is_well_formed());
+        assert!(frame(PhysicalSize::new(2.0, 2.0), 8, vec![0; 16]).is_well_formed());
+    }
+
+    #[test]
+    fn impossible_buffer_arithmetic_is_rejected() {
+        let impossible = frame(
+            PhysicalSize::new(1.0, f64::from(u32::MAX)),
+            usize::MAX,
+            vec![],
+        );
+        assert!(!impossible.is_well_formed());
     }
 }

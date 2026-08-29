@@ -63,6 +63,15 @@ pub enum TrayAction {
     Quit,
 }
 
+/// Whether the process-global menu channel has work waiting.
+///
+/// This observes without consuming so a window host can wake its main-thread
+/// owner without racing the sole [`Tray::poll`] consumer.
+#[must_use]
+pub fn events_pending() -> bool {
+    !MenuEvent::receiver().is_empty()
+}
+
 impl TrayAction {
     /// Every action, in menu order.
     pub const ALL: [Self; 10] = [

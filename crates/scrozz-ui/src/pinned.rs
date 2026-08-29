@@ -39,6 +39,8 @@ pub struct PinFrame<'a> {
     pub name: &'a str,
     /// Uploaded capture texture, when ready.
     pub texture: Option<TextureId>,
+    /// Explicit source-pixel failure; never rendered as a success-shaped blank.
+    pub content_error: Option<&'a str>,
     /// Pure geometry and display state.
     pub surface: &'a mut PinnedSurface,
     /// Displays currently known to the process.
@@ -76,13 +78,9 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
     let opacity = state.opacity.get() as f32;
     let content_alpha = if frame.native_opacity { 1.0 } else { opacity };
     let radius = state.chrome.corner_radius as f32;
-    let body_rect = if radius > 0.0 {
-        rect
-    } else {
-        // Cover the raster target edge so a frameless pin cannot expose
-        // subpixel-clear seams at the native window boundary.
-        rect.expand(1.0)
-    };
+    // A window capture's outermost pixels contain its native antialiasing and
+    // shadow. Drawing beyond the viewport clips exactly those D9 edges.
+    let body_rect = rect;
 
     let body = if let Some(texture) = frame.texture {
         let mut image =
@@ -111,6 +109,15 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
         );
         ui.painter()
             .rect_filled(body_rect, CornerRadius::same(radius.round() as u8), fill);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            frame
+                .content_error
+                .unwrap_or("Capture pixels are unavailable"),
+            FontId::proportional(13.0),
+            alpha(frame.theme.palette.text, content_alpha),
+        );
         response
     };
     body.widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, frame.name));
@@ -487,7 +494,8 @@ impl crate::harness::Scene for PinnedScene {
             &display,
             policy,
             vec![scrozz_core::LockEscape::TrayMenu],
-        );
+        )
+        .expect("golden pin dimensions");
         surface.set_opacity(0.88);
         if self.locked {
             let _ = surface.set_locked(true);
@@ -508,6 +516,7 @@ impl crate::harness::Scene for PinnedScene {
             PinFrame {
                 name: "Quarterly plan",
                 texture,
+                content_error: None,
                 surface: &mut surface,
                 displays: &displays,
                 positioning: true,
@@ -616,7 +625,8 @@ mod tests {
             &set.displays()[0],
             PinChromePolicy::Allowed,
             vec![LockEscape::TrayMenu],
-        );
+        )
+        .expect("pin dimensions");
         let context = egui::Context::default();
         context.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {

@@ -62,10 +62,10 @@
 //! *behind the Dock*, which is the single most common way a bottom-anchored
 //! overlay goes wrong.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use std::ffi::c_void;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use scrozz_core::{Error, Result};
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Opacity};
 
@@ -462,20 +462,24 @@ pub struct OverlayReport {
     pub detail: String,
 }
 
+#[cfg(target_os = "linux")]
+pub use crate::linux::x11::overlay::X11Overlay as NativeOverlay;
 #[cfg(target_os = "macos")]
 pub use crate::macos::overlay::MacOverlay as NativeOverlay;
+#[cfg(target_os = "windows")]
+pub use crate::windows::overlay::WindowsOverlay as NativeOverlay;
 
 /// A native overlay window on a platform Scrozz does not yet retrofit.
 ///
 /// Present so that call sites compile everywhere; every method reports
 /// [`Error::Unsupported`] rather than silently doing nothing.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 #[derive(Debug)]
 pub struct NativeOverlay {
     _private: (),
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl NativeOverlay {
     /// Adopts a native window handle.
     ///
@@ -502,7 +506,7 @@ impl NativeOverlay {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl crate::OverlayWindow for NativeOverlay {
     fn set_frame(&mut self, frame: LogicalRect) -> Result<()> {
         let _ = frame;
@@ -516,7 +520,7 @@ impl crate::OverlayWindow for NativeOverlay {
 }
 
 /// The error every not-yet-implemented platform returns.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn unsupported() -> Error {
     Error::Unsupported {
         what: "native overlay window".into(),

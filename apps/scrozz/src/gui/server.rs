@@ -32,19 +32,29 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use crate::{
     cli::{Cli, Command},
     commands,
     fault::{CliError, CliResult},
+    gui::card::SurfaceWaker,
     gui::selection::CaptureSelector,
     ipc::{self, DIRECT_AFTER_CAPTURE_POLICY, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };
+
+#[cfg(unix)]
+const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+#[cfg(unix)]
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const REQUEST_READ_POLL: Duration = Duration::from_millis(100);
 
 /// A request from another process, waiting for its answer.
 pub struct Request {
@@ -326,7 +336,11 @@ fn json(code: u8, body: String) -> Response {
 pub struct Server {
     path: PathBuf,
     #[cfg(unix)]
-    listener: std::os::unix::net::UnixListener,
+    requests: Receiver<Request>,
+    #[cfg(unix)]
+    stop: Arc<AtomicBool>,
+    #[cfg(unix)]
+    worker: Option<JoinHandle<()>>,
 }
 
 impl Server {
@@ -341,7 +355,12 @@ impl Server {
     /// Spelled by full path rather than by the short name because the `CliError`
     /// import above is `cfg(unix)`, and this doc comment is not.
     pub fn bind() -> CliResult<Self> {
-        Self::bind_at(ipc::endpoint())
+        Self::bind_with_waker(None)
+    }
+
+    /// Binds the default endpoint and wakes the window only when a request arrives.
+    pub fn bind_with_waker(waker: Option<SurfaceWaker>) -> CliResult<Self> {
+        Self::bind_at_with_waker(ipc::endpoint(), waker)
     }
 
     /// Binds a specific path.
@@ -354,6 +373,11 @@ impl Server {
     /// As [`Server::bind`].
     #[cfg(unix)]
     pub fn bind_at(path: PathBuf) -> CliResult<Self> {
+        Self::bind_at_with_waker(path, None)
+    }
+
+    #[cfg(unix)]
+    fn bind_at_with_waker(path: PathBuf, waker: Option<SurfaceWaker>) -> CliResult<Self> {
         use std::os::unix::net::UnixListener;
 
         if let Some(parent) = path.parent() {
@@ -373,8 +397,48 @@ impl Server {
             CliError::ipc(format!("could not make the instance socket pollable: {e}"))
         })?;
 
+        let (request_tx, requests) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("scrozz-ipc-listener".into())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if let Some(request) = read_request(stream) {
+                                if request_tx.send(request).is_err() {
+                                    break;
+                                }
+                                if let Some(waker) = &waker {
+                                    waker();
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(8));
+                        }
+                        Err(error) => {
+                            tracing::warn!("could not accept a forwarded command: {error}");
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                CliError::ipc(format!(
+                    "could not start the instance listener for {}: {error}",
+                    path.display()
+                ))
+            })?;
+
         tracing::debug!(path = %path.display(), "listening for forwarded commands");
-        Ok(Self { path, listener })
+        Ok(Self {
+            path,
+            requests,
+            stop,
+            worker: Some(worker),
+        })
     }
 
     /// Named-pipe support is not built yet, so there is nothing to listen on.
@@ -385,6 +449,11 @@ impl Server {
     /// refusing to start over it.
     #[cfg(not(unix))]
     pub fn bind_at(path: PathBuf) -> CliResult<Self> {
+        Self::bind_at_with_waker(path, None)
+    }
+
+    #[cfg(not(unix))]
+    fn bind_at_with_waker(path: PathBuf, _waker: Option<SurfaceWaker>) -> CliResult<Self> {
         tracing::warn!(
             "this build has no named-pipe listener, so `scrozz capture` from a \
              terminal will run in its own process"
@@ -395,53 +464,7 @@ impl Server {
     /// Takes one pending request, if there is one. Never blocks.
     #[cfg(unix)]
     pub fn poll(&self) -> Option<Request> {
-        use std::io::{ErrorKind, Read};
-
-        let (mut stream, _) = match self.listener.accept() {
-            Ok(pair) => pair,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return None,
-            Err(e) => {
-                tracing::warn!("could not accept a forwarded command: {e}");
-                return None;
-            }
-        };
-
-        // An accepted socket does not inherit non-blocking on every platform,
-        // and the client half-closes after writing, so a blocking read to EOF is
-        // bounded and correct.
-        let _ = stream.set_nonblocking(false);
-        let mut raw = Vec::new();
-        if let Err(e) = stream.read_to_end(&mut raw) {
-            tracing::warn!("could not read a forwarded command: {e}");
-            return None;
-        }
-
-        let line = String::from_utf8_lossy(&raw);
-        let schema = integer_field(&line, "schema")?;
-        if schema != ipc::REQUEST_SCHEMA {
-            tracing::warn!(
-                schema,
-                expected = ipc::REQUEST_SCHEMA,
-                "refusing a forwarded request with an unsupported schema"
-            );
-            return None;
-        }
-        let argv = string_array(&line, "argv")?;
-        let cwd = string_field(&line, "cwd").map(PathBuf::from);
-        let after_capture_policy = string_field(&line, "after_capture_policy")?;
-        if after_capture_policy != DIRECT_AFTER_CAPTURE_POLICY {
-            tracing::warn!(
-                policy = %after_capture_policy,
-                "refusing a forwarded request with an unknown After Capture policy"
-            );
-            return None;
-        }
-        Some(Request {
-            argv,
-            cwd,
-            after_capture_policy,
-            stream,
-        })
+        self.requests.try_recv().ok()
     }
 
     /// Nothing arrives without a listener.
@@ -460,10 +483,88 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
         // Otherwise the next launch finds a socket file with nothing behind it
         // and has to decide whether it is stale — solvable, but this is free.
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn read_request(mut stream: std::os::unix::net::UnixStream) -> Option<Request> {
+    use std::io::{ErrorKind, Read};
+
+    if let Err(error) = stream.set_nonblocking(false) {
+        tracing::warn!("could not make an accepted command socket blocking: {error}");
+        return None;
+    }
+    if let Err(error) = stream.set_read_timeout(Some(REQUEST_READ_POLL)) {
+        tracing::warn!("could not bound a forwarded-command read: {error}");
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        if started.elapsed() >= REQUEST_READ_TIMEOUT {
+            tracing::warn!("forwarded command exceeded the one-second read deadline");
+            return None;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if raw.len() as u64 + read as u64 > MAX_REQUEST_BYTES {
+                    tracing::warn!(
+                        bytes = raw.len() + read,
+                        "forwarded command exceeded the one-megabyte request limit"
+                    );
+                    return None;
+                }
+                raw.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!("could not read a forwarded command: {error}");
+                return None;
+            }
+        }
+    }
+
+    let line = String::from_utf8_lossy(&raw);
+    let schema = integer_field(&line, "schema")?;
+    if schema != ipc::REQUEST_SCHEMA {
+        tracing::warn!(
+            schema,
+            expected = ipc::REQUEST_SCHEMA,
+            "refusing a forwarded request with an unsupported schema"
+        );
+        return None;
+    }
+    let argv = string_array(&line, "argv")?;
+    let cwd = string_field(&line, "cwd").map(PathBuf::from);
+    let after_capture_policy = string_field(&line, "after_capture_policy")?;
+    if after_capture_policy != DIRECT_AFTER_CAPTURE_POLICY {
+        tracing::warn!(
+            policy = %after_capture_policy,
+            "refusing a forwarded request with an unknown After Capture policy"
+        );
+        return None;
+    }
+    Some(Request {
+        argv,
+        cwd,
+        after_capture_policy,
+        stream,
+    })
 }
 
 /// Removes a socket file left behind by a crash.
@@ -821,6 +922,85 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_stalled_local_client_cannot_block_server_shutdown_forever() {
+        let dir = scratch("stalled-client");
+        let path = dir.join("stalled.sock");
+        let server = Server::bind_at(path.clone()).expect("binding");
+        let _stalled =
+            std::os::unix::net::UnixStream::connect(&path).expect("connect without sending");
+        std::thread::sleep(Duration::from_millis(30));
+
+        let started = std::time::Instant::now();
+        drop(server);
+        assert!(
+            started.elapsed() < REQUEST_READ_TIMEOUT + Duration::from_secs(1),
+            "listener shutdown exceeded its bounded read timeout"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_forwarded_requests_are_rejected_before_unbounded_allocation() {
+        use std::io::Write;
+        use std::net::Shutdown;
+
+        let (mut writer, reader) =
+            std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        let sending = std::thread::spawn(move || {
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = MAX_REQUEST_BYTES + 1;
+            while remaining > 0 {
+                let count = usize::try_from(remaining.min(chunk.len() as u64)).expect("bounded");
+                writer.write_all(&chunk[..count]).expect("write request");
+                remaining -= count as u64;
+            }
+            writer.shutdown(Shutdown::Write).expect("finish request");
+        });
+
+        assert!(read_request(reader).is_none());
+        sending.join().expect("writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_that_never_finishes_is_bounded_by_the_read_timeout() {
+        let (_writer, reader) = std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        let started = std::time::Instant::now();
+        assert!(read_request(reader).is_none());
+        assert!(
+            started.elapsed() < REQUEST_READ_TIMEOUT + Duration::from_secs(1),
+            "socket read exceeded its configured timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_drip_cannot_restart_the_wall_clock_deadline() {
+        use std::io::Write;
+
+        let (mut writer, reader) =
+            std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        let sending = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if writer.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let started = std::time::Instant::now();
+        assert!(read_request(reader).is_none());
+        assert!(
+            started.elapsed() < REQUEST_READ_TIMEOUT + Duration::from_secs(1),
+            "partial reads restarted the wall-clock deadline"
+        );
+        sending.join().expect("slow writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_second_server_on_a_live_endpoint_is_refused() {
         // This is what stops `scrozz gui` twice producing two menu-bar items.
         let dir = scratch("dup");
@@ -841,7 +1021,12 @@ mod tests {
         // server half here, over a real socket.
         let dir = scratch("round-trip");
         let path = dir.join("live.sock");
-        let server = Server::bind_at(path.clone()).expect("binding");
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let server = Server::bind_at_with_waker(path.clone(), Some(waker)).expect("binding");
 
         // No program name: `try_forward` sends `env::args().skip(1)`, and the
         // server is the side that has to know that.
@@ -863,6 +1048,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         assert_eq!(request.argv.first().map(String::as_str), Some("capture"));
+        assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
         let command = request.serve_with(|_| {
             assert!(
                 !client.is_finished(),
@@ -882,6 +1068,44 @@ mod tests {
             "the forwarded output must match a local run"
         );
 
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_may_pause_after_accept_before_sending_its_request() {
+        use std::io::Write;
+        use std::net::Shutdown;
+
+        let dir = scratch("delayed-write");
+        let path = dir.join("delayed.sock");
+        let server = Server::bind_at(path.clone()).expect("binding");
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut stream = std::os::unix::net::UnixStream::connect(path).expect("connect");
+                std::thread::sleep(Duration::from_millis(50));
+                let request = ipc::encode_request(&argv(&["capture", "--dry-run"]), None);
+                stream.write_all(request.as_bytes()).expect("delayed write");
+                stream.shutdown(Shutdown::Write).expect("finish request");
+            }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let request = loop {
+            if let Some(request) = server.poll() {
+                break request;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delayed request never reached the listener"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(request.argv, argv(&["capture", "--dry-run"]));
+        drop(request);
+        client.join().expect("client");
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

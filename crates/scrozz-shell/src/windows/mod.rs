@@ -3,3 +3,4 @@
 //! Everything here is `cfg(target_os = "windows")` and compiles nowhere else.
 
 pub mod drag;
+pub mod overlay;

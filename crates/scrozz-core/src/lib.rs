@@ -45,9 +45,9 @@ pub use geometry::{
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
 pub use pin::{
-    Direction as PinDirection, DisplaySet, LockEscape, LockEscapeRequired, MAX_OPACITY,
-    MIN_OPACITY, NudgeStep, Opacity, PinBorder, PinChrome, PinChromePolicy, PinId, PinScale,
-    PinState, PinnedSurface,
+    Direction as PinDirection, DisplaySet, InvalidPinSize, LockEscape, LockEscapeRequired,
+    MAX_OPACITY, MAX_PIN_PHYSICAL_EDGE, MAX_PIN_PHYSICAL_PIXELS, MIN_OPACITY, NudgeStep, Opacity,
+    PinBorder, PinChrome, PinChromePolicy, PinId, PinScale, PinState, PinnedSurface,
 };
 pub use selection::{
     AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, DimensionLabelMode, MIN_SELECTION,

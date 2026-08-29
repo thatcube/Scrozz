@@ -121,6 +121,15 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
     Ok(scrozz_capture::backend()?)
 }
 
+/// Native display geometry for window placement.
+///
+/// Unlike capture, querying monitor metrics neither reads pixels nor needs the
+/// unstable-backend opt-in. A backend that cannot report real topology returns
+/// its explicit platform/compositor error; callers must not invent a desktop.
+pub fn display_topology() -> CliResult<Box<dyn TargetEnumerator>> {
+    Ok(scrozz_capture::backend()?)
+}
+
 /// Starts a screen recording.
 ///
 /// # Errors

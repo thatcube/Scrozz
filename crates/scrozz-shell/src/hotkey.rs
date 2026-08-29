@@ -225,6 +225,15 @@ const PRIMARY: Modifiers = if cfg!(target_os = "macos") {
     Modifiers::CONTROL
 };
 
+/// Whether the process-global hotkey channel has work waiting.
+///
+/// This observes without consuming so a window host can wake its main-thread
+/// owner without stealing an event from [`GlobalHotkeys::poll`].
+#[must_use]
+pub fn events_pending() -> bool {
+    !GlobalHotKeyEvent::receiver().is_empty()
+}
+
 fn parse_modifier(token: &str) -> Option<Modifiers> {
     match token.to_ascii_uppercase().as_str() {
         // Interchangeable spellings of the primary modifier. `Cmd` maps to

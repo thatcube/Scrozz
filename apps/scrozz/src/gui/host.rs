@@ -15,8 +15,7 @@ use std::{
 
 use scrozz_core::{
     Capture, CaptureRequest, CursorMode, Display, DisplayId, DisplaySet, Error as CoreError,
-    LogicalPoint, LogicalRect, LogicalSize, RegionSelector, ScaleFactor, SelectionHost,
-    SelectionOptions, SelectionOutcome,
+    RegionSelector, SelectionHost, SelectionOptions, SelectionOutcome,
 };
 use scrozz_ui::{
     OverlayHandle,
@@ -41,11 +40,7 @@ use crate::{
 /// Set to `1` to run without a window.
 pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 
-/// How long a tick may sleep before the next one.
-///
-/// 60 Hz. Fast enough that a hotkey feels instant, slow enough that an idle
-/// menu-bar app is not a busy loop — which matters, because this process is
-/// meant to sit there all day.
+/// Headless polling cadence when there is no native event loop to wake.
 const IDLE: Duration = Duration::from_millis(16);
 const WORK_AREA_REFRESH: Duration = Duration::from_millis(250);
 
@@ -202,7 +197,10 @@ impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
-        let (geometry, display_id) = work_area();
+        let (geometry, display_id) = work_area().unwrap_or_else(|error| {
+            tracing::warn!(%error, "native work area is not ready; deferring the required check until launch");
+            (OverlayGeometry::default(), None)
+        });
         let pointer_geometry = Arc::new(Mutex::new(geometry));
         let native = BehaviorController::default();
         let (client, selection) = ClientOverlaySelector::managed(geometry);
@@ -238,13 +236,18 @@ impl Host for Windowed {
         let Self {
             handle,
             emit,
-            geometry,
-            display_id,
+            geometry: _,
+            display_id: _,
             pointer_geometry,
             selector: _,
-            selection,
+            mut selection,
             native,
         } = *self;
+        let (geometry, display_id) = work_area()?;
+        if let Ok(mut current) = pointer_geometry.lock() {
+            *current = geometry;
+        }
+        selection.set_cards_geometry(geometry);
         let (displays, active_display) = pin_displays(geometry);
         let pin_support = pin_support(&displays);
         let pin_lock_escapes = app.pin_lock_escapes().to_vec();
@@ -800,10 +803,9 @@ impl eframe::App for Driver {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // An idle overlay must still be woken, or a hotkey pressed while
-        // nothing is on screen would not be noticed until something else woke
-        // the window — which, for a window that is empty at rest, may be never.
-        ctx.request_repaint_after(IDLE);
+        if let Some(remaining) = self.app.remaining_deadline() {
+            ctx.request_repaint_after(remaining);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -864,8 +866,15 @@ impl eframe::App for Driver {
                 tracing::debug!(started, "drag: began within the gesture frame");
             }
         }
-        self.pin_panels
+        let native = self
+            .pin_panels
             .reconcile(&self.handle.native_pin_requests());
+        if native.pending_adoption {
+            ui.ctx().request_repaint_after(Duration::from_millis(32));
+        }
+        for failure in native.failures {
+            self.handle.native_pin_failure(failure.pin, failure.reason);
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -904,50 +913,70 @@ fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
 /// The card layout uses the work area, not the display bounds: anchoring a card
 /// to the bottom-left of the *bounds* puts it behind the Dock. The transparent
 /// viewport may extend below that safe area solely so shadows can fade naturally.
-fn work_area() -> (OverlayGeometry, Option<DisplayId>) {
+fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>)> {
     #[cfg(target_os = "macos")]
     {
-        match scrozz_shell::macos::display::active_display() {
-            Ok(display) => {
-                let geometry = geometry_for_display(&display);
-                return (geometry, Some(display.id));
-            }
-
-            Err(err) => {
-                tracing::warn!(%err, "no work area; using the default overlay geometry");
-            }
-        }
+        let display = scrozz_shell::macos::display::active_display().map_err(CliError::from)?;
+        let id = display.id.clone();
+        return Ok((geometry_from_display(&display)?, Some(id)));
     }
 
-    (OverlayGeometry::default(), None)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let backend = crate::platform::display_topology()?;
+        let active = backend.active_display().ok();
+        let displays = backend.displays()?;
+        let display = active
+            .as_ref()
+            .and_then(|active| displays.iter().find(|display| display.id == active.id))
+            .or_else(|| displays.iter().find(|display| display.is_primary))
+            .or_else(|| displays.first())
+            .ok_or_else(|| {
+                CliError::Core(CoreError::Unsupported {
+                    what: "opening the capture-card overlay".into(),
+                    why: "the platform reported no native display work area".into(),
+                })
+            })?;
+        let id = display.id.clone();
+        Ok((geometry_from_display(display)?, Some(id)))
+    }
 }
 
-fn pin_displays(geometry: OverlayGeometry) -> (DisplaySet, Option<DisplayId>) {
+fn geometry_from_display(display: &Display) -> CliResult<OverlayGeometry> {
+    let area = display.work_area;
+    if !area.origin.x.is_finite()
+        || !area.origin.y.is_finite()
+        || !area.size.width.is_finite()
+        || !area.size.height.is_finite()
+        || area.size.is_empty()
+    {
+        return Err(CliError::Core(CoreError::Platform(format!(
+            "display {} reported an invalid native work area",
+            display.id.0
+        ))));
+    }
+    Ok(geometry_for_display(display))
+}
+
+fn pin_displays(_geometry: OverlayGeometry) -> (DisplaySet, Option<DisplayId>) {
     if let Some(topology) = query_pin_topology() {
         return (topology.displays, topology.active_display);
     }
 
-    let rect = geometry.work_area;
-    let logical = LogicalRect::new(
-        LogicalPoint::new(f64::from(rect.min.x), f64::from(rect.min.y)),
-        LogicalSize::new(f64::from(rect.width()), f64::from(rect.height())),
+    tracing::warn!(
+        "native display metrics are unavailable; Pin to Screen is disabled rather than using fabricated geometry"
     );
-    let id = DisplayId("overlay-work-area".into());
-    (
-        DisplaySet::new(vec![Display {
-            id: id.clone(),
-            name: "Overlay work area".into(),
-            bounds: logical,
-            work_area: logical,
-            scale: ScaleFactor::IDENTITY,
-            is_primary: true,
-        }]),
-        Some(id),
-    )
+    (DisplaySet::new(Vec::new()), None)
 }
 
 fn query_pin_topology() -> Option<PinTopology> {
-    let backend = crate::platform::capture_backend().ok()?;
+    let backend = match crate::platform::display_topology() {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!("native pin display topology is unavailable: {error}");
+            return None;
+        }
+    };
     let active_display = backend.active_display().ok().map(|display| display.id);
     let displays = DisplaySet::new(backend.displays().ok()?);
     if displays.displays().is_empty() {
@@ -977,15 +1006,28 @@ fn pin_support_from(
                 .iter()
                 .any(|display| (display.scale.get() - first.scale.get()).abs() > f64::EPSILON)
         });
-    let positioning = capabilities.positioning.available() && !mixed_dpi_windows;
+    let has_native_geometry = !displays.displays().is_empty();
+    let positioning =
+        capabilities.positioning.available() && !mixed_dpi_windows && has_native_geometry;
     let mut gaps = Vec::new();
     append_support_gap("global positioning", &capabilities.positioning, &mut gaps);
     append_support_gap("always on top", &capabilities.always_on_top, &mut gaps);
+    append_support_gap(
+        "non-activating input",
+        &capabilities.non_activating,
+        &mut gaps,
+    );
     if mixed_dpi_windows {
         gaps.push(
             "global positioning: mixed-DPI Windows desktops need a native Win32 coordinate \
              adapter; Windows will place this pin until that adapter lands, or matching display \
              scales can be used"
+                .into(),
+        );
+    }
+    if !has_native_geometry {
+        gaps.push(
+            "display geometry: the platform did not report native monitor metrics; Pin to Screen is disabled"
                 .into(),
         );
     }
@@ -995,12 +1037,16 @@ fn pin_support_from(
         gaps.join("; ")
     };
     PinSupport {
-        windows: capabilities.pin_window.available(),
+        windows: capabilities.pin_window.available() && has_native_geometry,
         positioning,
         always_on_top: capabilities.always_on_top.available(),
         native_opacity: matches!(capabilities.native_opacity, Support::Yes),
         click_through: capabilities.click_through.available(),
         non_activating: matches!(capabilities.non_activating, Support::Yes),
+        native_adoption: matches!(
+            capabilities.backend,
+            PinBackend::MacPanel | PinBackend::WindowsToolWindow | PinBackend::X11ManagedDock
+        ),
         x11_managed_dock: matches!(capabilities.backend, PinBackend::X11ManagedDock),
         detail,
     }
@@ -1272,6 +1318,34 @@ mod tests {
         ]);
         assert!(pin_support_from(capabilities, &uniform).positioning);
         assert!(WINDOW_GAP.contains("SCROZZ_GUI_HEADLESS"));
+    }
+
+    #[test]
+    fn missing_native_geometry_disables_pins_instead_of_inventing_a_display() {
+        let session = scrozz_shell::Session {
+            server: scrozz_shell::DisplayServer::Windows,
+            compositor: scrozz_shell::Compositor::Other,
+            desktop: String::new(),
+        };
+        let support = pin_support_from(
+            scrozz_shell::pin::PinCapabilities::for_session(&session),
+            &DisplaySet::new(Vec::new()),
+        );
+
+        assert!(!support.windows);
+        assert!(!support.positioning);
+        assert!(support.detail.contains("native monitor metrics"));
+    }
+
+    #[test]
+    fn overlay_geometry_requires_a_real_nonempty_native_work_area() {
+        let valid = display("primary", -1_920.0, 2.0);
+        let geometry = geometry_from_display(&valid).expect("native geometry");
+        assert_eq!(geometry.work_area.min.x, -1_920.0);
+
+        let mut invalid = valid;
+        invalid.work_area.size = LogicalSize::new(0.0, 1_080.0);
+        assert!(geometry_from_display(&invalid).is_err());
     }
 
     #[test]

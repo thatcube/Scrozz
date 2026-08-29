@@ -33,6 +33,9 @@ use scrozz_store::CaptureId;
 
 use crate::gui::action::CaptureKind;
 
+/// Thread-safe request for the window host to process newly queued work.
+pub type SurfaceWaker = Arc<dyn Fn() + Send + Sync>;
+
 /// Identifies one card within a session.
 ///
 /// Distinct from [`CaptureId`], and deliberately so: a card exists from the
@@ -48,6 +51,14 @@ impl std::fmt::Display for CardId {
     }
 }
 
+/// Process-local generation of one durable pin identity.
+///
+/// A capture can be pinned, closed, and pinned again while worker results from
+/// the first attempt are still in flight. Pairing identity with this generation
+/// keeps those old settlements from mutating the new pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PinGeneration(pub u64);
+
 /// The longest edge of a card thumbnail, in pixels.
 ///
 /// The largest density token is 320 pt wide and normally drawn at up to 2×, so
@@ -55,7 +66,8 @@ impl std::fmt::Display for CardId {
 pub const THUMBNAIL_MAX_EDGE: u32 = 640;
 
 /// Longest texture edge retained for a native pinned window.
-pub const PIN_TEXTURE_MAX_EDGE: u32 = 2_048;
+pub const PIN_TEXTURE_MAX_EDGE: u32 = scrozz_ui::overlay_app::PIN_TEXTURE_PX;
+const MAX_TEXTURE_PIXELS: u64 = (PIN_TEXTURE_MAX_EDGE as u64) * (PIN_TEXTURE_MAX_EDGE as u64);
 
 /// Straight-alpha RGBA8 pixels, ready to upload as a texture.
 #[derive(Clone, PartialEq, Eq)]
@@ -83,9 +95,7 @@ impl Thumbnail {
     /// some drivers and a garbage card on others.
     #[must_use]
     pub fn from_rgba(width: u32, height: u32, pixels: Vec<u8>) -> Option<Self> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)?
-            .checked_mul(4)?;
+        let expected = Self::checked_texture_len(width, height)?;
         (expected == pixels.len() && width > 0 && height > 0).then_some(Self {
             width,
             height,
@@ -106,7 +116,13 @@ impl Thumbnail {
     /// frame whose pixel format cannot be straightened.
     pub fn from_frame(frame: &Frame, max_edge: u32) -> scrozz_core::Result<Self> {
         let source = scrozz_export::to_straight_rgba8(frame)?;
-        let mut thumbnail = Self::downscale(source.width, source.height, &source.data, max_edge);
+        let mut thumbnail = Self::downscale(source.width, source.height, &source.data, max_edge)
+            .ok_or_else(|| {
+                scrozz_core::Error::InvalidRequest(format!(
+                    "cannot create a bounded texture from {}x{} RGBA pixels",
+                    source.width, source.height
+                ))
+            })?;
         let into_srgb = ColorTransform::new(frame.color_space, ColorSpace::Srgb);
         for pixel in thumbnail.pixels.as_chunks_mut::<4>().0 {
             let converted = into_srgb.convert_u8([pixel[0], pixel[1], pixel[2]]);
@@ -115,23 +131,30 @@ impl Thumbnail {
         Ok(thumbnail)
     }
 
-    fn downscale(width: u32, height: u32, rgba: &[u8], max_edge: u32) -> Self {
+    fn downscale(width: u32, height: u32, rgba: &[u8], max_edge: u32) -> Option<Self> {
+        let source_len = Self::checked_rgba_len(width, height)?;
+        if rgba.len() != source_len || max_edge == 0 || max_edge > PIN_TEXTURE_MAX_EDGE {
+            return None;
+        }
         let longest = width.max(height).max(1);
-        if longest <= max_edge || width == 0 || height == 0 {
-            return Self {
+        if longest <= max_edge {
+            return Some(Self {
                 width,
                 height,
                 pixels: rgba.to_vec(),
-            };
+            });
         }
 
-        let ratio = f64::from(max_edge) / f64::from(longest);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let out_w = ((f64::from(width) * ratio).round() as u32).max(1);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let out_h = ((f64::from(height) * ratio).round() as u32).max(1);
+        let rounded_scale = |value: u32| {
+            u64::from(value)
+                .checked_mul(u64::from(max_edge))
+                .map(|scaled| ((scaled + u64::from(longest) / 2) / u64::from(longest)).max(1))
+                .and_then(|scaled| u32::try_from(scaled).ok())
+        };
+        let out_w = rounded_scale(width)?;
+        let out_h = rounded_scale(height)?;
 
-        let mut pixels = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+        let mut pixels = vec![0u8; Self::checked_texture_len(out_w, out_h)?];
         for y in 0..out_h {
             let (y0, y1) = span(y, out_h, height);
             for x in 0..out_w {
@@ -166,11 +189,29 @@ impl Thumbnail {
             }
         }
 
-        Self {
+        Some(Self {
             width: out_w,
             height: out_h,
             pixels,
+        })
+    }
+
+    fn checked_rgba_len(width: u32, height: u32) -> Option<usize> {
+        if width == 0 || height == 0 {
+            return None;
         }
+        let pixels = u64::from(width).checked_mul(u64::from(height))?;
+        usize::try_from(pixels.checked_mul(4)?).ok()
+    }
+
+    fn checked_texture_len(width: u32, height: u32) -> Option<usize> {
+        if width > PIN_TEXTURE_MAX_EDGE || height > PIN_TEXTURE_MAX_EDGE {
+            return None;
+        }
+        let pixels = u64::from(width).checked_mul(u64::from(height))?;
+        (pixels <= MAX_TEXTURE_PIXELS)
+            .then(|| usize::try_from(pixels.checked_mul(4)?).ok())
+            .flatten()
     }
 
     /// Width in pixels.
@@ -212,7 +253,7 @@ pub struct Card {
     pub capture_id: Option<CaptureId>,
     /// What kind of capture produced it.
     pub kind: CaptureKind,
-    /// What source shape the captured pixels actually represent.
+    /// Authoritative capture provenance used by pin chrome and fidelity rules.
     pub provenance: Provenance,
     /// Source width in pixels, before thumbnailing.
     pub source_width: u32,
@@ -247,6 +288,8 @@ pub struct PinnedCapture {
     pub state: PinState,
     /// Display texture, bounded independently from card thumbnails.
     pub texture: Option<Thumbnail>,
+    /// Explicit reason pixels could not be loaded, if the durable state survives.
+    pub content_error: Option<String>,
 }
 
 impl Card {
@@ -433,6 +476,16 @@ pub trait CardSurface {
         texture: Thumbnail,
     ) -> scrozz_core::Result<()>;
 
+    /// Commit a successfully persisted provisional pin and retire its source card.
+    fn commit_pin(
+        &mut self,
+        capture: &CaptureId,
+        texture: Option<Thumbnail>,
+    ) -> scrozz_core::Result<()>;
+
+    /// Roll a provisional pin back to its still-recoverable source card.
+    fn fail_pin(&mut self, capture: &CaptureId, reason: String);
+
     /// Remove a live pin without emitting another persistence mutation.
     fn discard_pin(&mut self, capture: &CaptureId);
 
@@ -478,6 +531,11 @@ pub trait CardSurface {
     /// Whether the stack is empty — which, per D27, is Scrozz's resting state.
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Event-loop wake hook for worker and IPC producers.
+    fn waker(&self) -> Option<SurfaceWaker> {
+        None
     }
 
     /// A human-readable name for this surface, for diagnostics.
@@ -664,6 +722,19 @@ impl CardSurface for Recording {
         })
     }
 
+    fn commit_pin(
+        &mut self,
+        _capture: &CaptureId,
+        _texture: Option<Thumbnail>,
+    ) -> scrozz_core::Result<()> {
+        Err(scrozz_core::Error::Unsupported {
+            what: "native pinned capture windows".into(),
+            why: "the recording card surface has no window host".into(),
+        })
+    }
+
+    fn fail_pin(&mut self, _capture: &CaptureId, _reason: String) {}
+
     fn discard_pin(&mut self, _capture: &CaptureId) {}
     fn unlock_pins(&mut self) {}
 
@@ -711,7 +782,7 @@ mod tests {
         // A box filter over one colour must return that colour, exactly. If it
         // does not, the averaging is wrong somewhere.
         let source = solid(64, 64, [10, 200, 30, 255]);
-        let thumb = Thumbnail::downscale(64, 64, &source, 8);
+        let thumb = Thumbnail::downscale(64, 64, &source, 8).expect("bounded thumbnail");
         assert_eq!(thumb.width(), 8);
         assert_eq!(thumb.height(), 8);
         for px in thumb.pixels().as_chunks::<4>().0 {
@@ -723,7 +794,8 @@ mod tests {
     fn downscaling_keeps_the_aspect_ratio() {
         // The real case: a 3456×2234 Retina capture on this machine.
         let source = solid(3456, 2234, [1, 2, 3, 255]);
-        let thumb = Thumbnail::downscale(3456, 2234, &source, THUMBNAIL_MAX_EDGE);
+        let thumb = Thumbnail::downscale(3456, 2234, &source, THUMBNAIL_MAX_EDGE)
+            .expect("bounded thumbnail");
         assert_eq!(thumb.width(), THUMBNAIL_MAX_EDGE);
         assert_eq!(thumb.height(), 414);
         assert_eq!(
@@ -735,7 +807,7 @@ mod tests {
     #[test]
     fn an_image_smaller_than_the_target_is_left_alone() {
         let source = solid(10, 4, [9, 9, 9, 255]);
-        let thumb = Thumbnail::downscale(10, 4, &source, 512);
+        let thumb = Thumbnail::downscale(10, 4, &source, 512).expect("bounded thumbnail");
         assert_eq!((thumb.width(), thumb.height()), (10, 4));
         assert_eq!(thumb.pixels(), source.as_slice());
     }
@@ -769,18 +841,22 @@ mod tests {
             let v = if x < 2 { 0 } else { 255 };
             source[x * 4..x * 4 + 4].copy_from_slice(&[v, v, v, 255]);
         }
-        let thumb = Thumbnail::downscale(4, 1, &source, 2);
+        let thumb = Thumbnail::downscale(4, 1, &source, 2).expect("bounded thumbnail");
         assert_eq!(thumb.width(), 2);
         assert_eq!(&thumb.pixels()[0..4], &[0, 0, 0, 255]);
         assert_eq!(&thumb.pixels()[4..8], &[255, 255, 255, 255]);
     }
 
     #[test]
-    fn a_truncated_buffer_does_not_panic() {
-        // Corrupt input from a backend must degrade, not abort the pipeline.
+    fn a_truncated_buffer_is_rejected_instead_of_becoming_a_blank_texture() {
         let short = vec![0u8; 10];
-        let thumb = Thumbnail::downscale(64, 64, &short, 4);
-        assert_eq!(thumb.width(), 4);
+        assert!(Thumbnail::downscale(64, 64, &short, 4).is_none());
+    }
+
+    #[test]
+    fn texture_dimensions_are_rejected_before_upload_when_they_exceed_the_cap() {
+        assert!(Thumbnail::from_rgba(PIN_TEXTURE_MAX_EDGE + 1, 1, vec![]).is_none());
+        assert!(Thumbnail::downscale(1, 1, &[0; 4], PIN_TEXTURE_MAX_EDGE + 1).is_none());
     }
 
     #[test]

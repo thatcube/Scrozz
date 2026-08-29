@@ -27,7 +27,7 @@ use scrozz_store::CaptureId;
 use scrozz_ui::{CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX};
 
 use crate::gui::{
-    card::{Card, CardEvent, CardId, CardSurface, PinnedCapture, Thumbnail},
+    card::{Card, CardEvent, CardId, CardSurface, PinnedCapture, SurfaceWaker, Thumbnail},
     drag::DragSpot,
     panel::BehaviorController,
 };
@@ -142,6 +142,9 @@ impl CardSurface for OverlayCards {
         }
         .with_pin_id(pin.id.0.clone())
         .with_source_scale(pin.scale);
+        if let Some(error) = pin.content_error {
+            request = request.with_content_error(error);
+        }
         request.source_px = (pin.source_width, pin.source_height);
         self.handle.restore_pin(request, pin.state);
         Ok(())
@@ -158,6 +161,26 @@ impl CardSurface for OverlayCards {
         );
         self.handle.refresh_pin_texture(capture.0.clone(), image);
         Ok(())
+    }
+
+    fn commit_pin(
+        &mut self,
+        capture: &CaptureId,
+        texture: Option<Thumbnail>,
+    ) -> scrozz_core::Result<()> {
+        if let Some(texture) = texture {
+            self.refresh_pin_texture(capture, texture)?;
+        }
+        self.handle.commit_pin(capture.0.clone());
+        if let Some(card) = self.pinned.remove(&capture.0) {
+            self.forget(card);
+        }
+        Ok(())
+    }
+
+    fn fail_pin(&mut self, capture: &CaptureId, reason: String) {
+        self.handle.fail_pin(capture.0.clone(), reason);
+        self.pinned.remove(&capture.0);
     }
 
     fn discard_pin(&mut self, capture: &CaptureId) {
@@ -197,6 +220,11 @@ impl CardSurface for OverlayCards {
     }
     fn len(&self) -> usize {
         self.mapped.len() + self.pending.len()
+    }
+
+    fn waker(&self) -> Option<SurfaceWaker> {
+        let handle = self.handle.clone();
+        Some(std::sync::Arc::new(move || handle.wake()))
     }
 
     fn native_surface(&self) -> Option<scrozz_shell::NativeSurface> {
@@ -303,7 +331,6 @@ impl OverlayCards {
                 OverlayEvent::PinRequested { id, pin, state } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         self.pinned.insert(pin.0.clone(), ours);
-                        self.forget(ours);
                         out.push(CardEvent::Pin(ours, CaptureId(pin.0), state));
                     }
                 }
@@ -460,7 +487,7 @@ mod tests {
         let mut card = card(1);
         card.kind = CaptureKind::AllInOne;
         card.provenance = Provenance::Window;
-        assert_eq!(card.provenance, Provenance::Window);
+        assert_eq!(request_for_card(&card).provenance, Provenance::Window);
     }
 
     #[test]

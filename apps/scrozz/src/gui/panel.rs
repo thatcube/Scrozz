@@ -27,38 +27,113 @@
 //! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
 //! `detail` string rather than being a bool.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::collections::{HashMap, HashSet};
 use std::{cell::RefCell, ffi::c_void, rc::Rc};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use scrozz_core::LogicalRect;
-#[cfg(target_os = "macos")]
 use scrozz_shell::OverlayWindow;
 use scrozz_shell::{NativeOverlay, NativeSurface, OverlayBehavior, OverlayCursor};
 use scrozz_ui::{PanelReport, overlay_app::NativePinRequest};
+
+#[derive(Clone, Debug, PartialEq)]
+struct AppliedPin {
+    frame: scrozz_core::LogicalRect,
+    positioning: bool,
+    display_scale: scrozz_core::ScaleFactor,
+    locked: bool,
+    opacity: scrozz_core::Opacity,
+    shadow: bool,
+}
+
+impl From<&NativePinRequest> for AppliedPin {
+    fn from(request: &NativePinRequest) -> Self {
+        Self {
+            frame: request.state.frame,
+            positioning: request.positioning,
+            display_scale: request.display_scale,
+            locked: request.state.locked,
+            opacity: request.state.opacity,
+            shadow: request.shadow,
+        }
+    }
+}
+
+impl AppliedPin {
+    fn behavior_changed(&self, previous: Option<&Self>) -> bool {
+        previous.is_none_or(|previous| {
+            self.locked != previous.locked
+                || self.opacity != previous.opacity
+                || self.shadow != previous.shadow
+        })
+    }
+
+    fn frame_changed(&self, previous: Option<&Self>) -> bool {
+        previous.is_none_or(|previous| {
+            self.frame != previous.frame || self.display_scale != previous.display_scale
+        })
+    }
+
+    fn should_set_frame(&self, previous: Option<&Self>) -> bool {
+        self.positioning && self.frame_changed(previous)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+struct RetainedPin {
+    window: NativeOverlay,
+    applied: Option<AppliedPin>,
+}
+
+/// Native pin adoption/mutation failure to show inside the affected viewport.
+pub struct PinPanelFailure {
+    pub pin: scrozz_core::PinId,
+    pub reason: String,
+}
+
+/// Result of one native child-window reconciliation pass.
+#[derive(Default)]
+pub struct PinPanelReport {
+    pub failures: Vec<PinPanelFailure>,
+    pub pending_adoption: bool,
+}
+
+const ADOPTION_RETRY_LIMIT: u8 = 60;
 
 /// Native child-window adapters retained for the lifetime of pinned viewports.
 #[derive(Default)]
 pub struct PinPanels {
     #[cfg(target_os = "macos")]
-    windows: HashMap<String, NativeOverlay>,
-    #[cfg(target_os = "macos")]
+    windows: HashMap<String, RetainedPin>,
+    #[cfg(target_os = "windows")]
+    windows: HashMap<String, RetainedPin>,
+    #[cfg(target_os = "linux")]
+    windows: HashMap<String, RetainedPin>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pending_logged: HashSet<String>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    failures: HashMap<String, String>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    adoption_attempts: HashMap<String, u8>,
 }
 
 impl PinPanels {
     /// Adopt newly-created pin viewports and apply their current native state.
-    pub fn reconcile(&mut self, requests: &[NativePinRequest]) {
-        #[cfg(target_os = "macos")]
-        self.reconcile_macos(requests);
+    pub fn reconcile(&mut self, requests: &[NativePinRequest]) -> PinPanelReport {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        return self.reconcile_native(requests);
 
-        #[cfg(not(target_os = "macos"))]
-        let _ = requests;
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = requests;
+            PinPanelReport::default()
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    fn reconcile_macos(&mut self, requests: &[NativePinRequest]) {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn reconcile_native(&mut self, requests: &[NativePinRequest]) -> PinPanelReport {
+        let mut report = PinPanelReport::default();
         let live: HashSet<&str> = requests
             .iter()
             .map(|request| request.title.as_str())
@@ -70,22 +145,42 @@ impl PinPanels {
             .cloned()
             .collect();
         for title in stale {
-            if let Some(mut overlay) = self.windows.remove(&title)
-                && let Err(err) = overlay.restore_native_class()
+            if let Some(mut retained) = self.windows.remove(&title)
+                && let Err(err) = retained.window.restore_native_class()
             {
                 tracing::warn!(window = %title, "could not restore pin window before close: {err}");
             }
             self.pending_logged.remove(&title);
+            self.failures.remove(&title);
+            self.adoption_attempts.remove(&title);
         }
 
         for request in requests {
             if !self.windows.contains_key(&request.title) {
                 match NativeOverlay::find_by_title(&request.title) {
                     Ok(Some(window)) => {
-                        self.windows.insert(request.title.clone(), window);
+                        self.windows.insert(
+                            request.title.clone(),
+                            RetainedPin {
+                                window,
+                                applied: None,
+                            },
+                        );
                         self.pending_logged.remove(&request.title);
+                        self.adoption_attempts.remove(&request.title);
                     }
                     Ok(None) => {
+                        if !should_retry_adoption(&mut self.adoption_attempts, &request.title) {
+                            record_failure(
+                                &mut self.failures,
+                                request,
+                                "the native pin window did not become discoverable within the bounded adoption window"
+                                    .into(),
+                                &mut report.failures,
+                            );
+                            continue;
+                        }
+                        report.pending_adoption = true;
                         if self.pending_logged.insert(request.title.clone()) {
                             tracing::debug!(
                                 window = %request.title,
@@ -95,6 +190,14 @@ impl PinPanels {
                         continue;
                     }
                     Err(err) => {
+                        record_failure(
+                            &mut self.failures,
+                            request,
+                            err.to_string(),
+                            &mut report.failures,
+                        );
+                        report.pending_adoption |=
+                            should_retry_adoption(&mut self.adoption_attempts, &request.title);
                         tracing::warn!(
                             window = %request.title,
                             "could not discover pin child viewport: {err}"
@@ -104,27 +207,89 @@ impl PinPanels {
                 }
             }
 
-            let Some(window) = self.windows.get_mut(&request.title) else {
+            let Some(retained) = self.windows.get_mut(&request.title) else {
                 continue;
             };
-            let mut behavior = OverlayBehavior::pinned_capture(request.state.locked);
-            behavior.opacity = request.state.opacity;
-            behavior.has_shadow = request.shadow;
-            if let Err(err) = window.apply(&behavior) {
-                tracing::warn!(window = %request.title, "could not apply native pin behavior: {err}");
+            let desired = AppliedPin::from(request);
+            if retained.applied.as_ref() == Some(&desired) {
+                continue;
             }
-            if let Err(err) = window.set_frame(request.state.frame) {
+            let mut non_activation_warning = None;
+            if desired.behavior_changed(retained.applied.as_ref()) {
+                let mut behavior = OverlayBehavior::pinned_capture(desired.locked);
+                behavior.opacity = desired.opacity;
+                behavior.has_shadow = desired.shadow;
+                match retained.window.apply(&behavior) {
+                    Ok(report) if !report.non_activating => {
+                        non_activation_warning = Some(report.detail);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        record_failure(
+                            &mut self.failures,
+                            request,
+                            err.to_string(),
+                            &mut report.failures,
+                        );
+                        tracing::warn!(window = %request.title, "could not apply native pin behavior: {err}");
+                        continue;
+                    }
+                }
+            }
+            if desired.should_set_frame(retained.applied.as_ref())
+                && let Err(err) = retained
+                    .window
+                    .set_frame_with_scale(desired.frame, desired.display_scale)
+            {
+                record_failure(
+                    &mut self.failures,
+                    request,
+                    err.to_string(),
+                    &mut report.failures,
+                );
                 tracing::warn!(window = %request.title, "could not apply native pin geometry: {err}");
+                continue;
+            }
+            retained.applied = Some(desired);
+            if let Some(reason) = non_activation_warning {
+                record_failure(&mut self.failures, request, reason, &mut report.failures);
+            } else {
+                self.failures.remove(&request.title);
             }
         }
+        report
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn should_retry_adoption(attempts: &mut HashMap<String, u8>, title: &str) -> bool {
+    let attempts = attempts.entry(title.to_owned()).or_default();
+    *attempts = attempts.saturating_add(1);
+    *attempts <= ADOPTION_RETRY_LIMIT
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn record_failure(
+    seen: &mut HashMap<String, String>,
+    request: &NativePinRequest,
+    reason: String,
+    failures: &mut Vec<PinPanelFailure>,
+) {
+    if seen.get(&request.title) == Some(&reason) {
+        return;
+    }
+    seen.insert(request.title.clone(), reason.clone());
+    failures.push(PinPanelFailure {
+        pin: request.pin.clone(),
+        reason,
+    });
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 impl Drop for PinPanels {
     fn drop(&mut self) {
-        for (title, window) in &mut self.windows {
-            if let Err(err) = window.restore_native_class() {
+        for (title, retained) in &mut self.windows {
+            if let Err(err) = retained.window.restore_native_class() {
                 tracing::warn!(window = %title, "could not restore pin window during teardown: {err}");
             }
         }
@@ -318,6 +483,7 @@ impl BehaviorController {
 /// alive, and this must be called on the main thread. Both hold inside the
 /// `eframe` app creator, which is the only caller.
 #[must_use]
+#[cfg(target_os = "macos")]
 pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
     // SAFETY: forwarded from this function's own contract.
     unsafe { convert_and_retain_ns_view(ns_view) }.0
@@ -364,6 +530,16 @@ unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Opti
         PanelReport::unsupported("only the macOS native overlay adapter is retained by this hook"),
         None,
     )
+}
+
+#[must_use]
+#[cfg(not(target_os = "macos"))]
+pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
+    if ns_view.is_null() {
+        PanelReport::unsupported("the window handle carried a null NSView")
+    } else {
+        PanelReport::unsupported("NSView conversion is only meaningful on macOS")
+    }
 }
 
 /// The hook `scrozz-ui` runs while the overlay window is being created.
@@ -569,5 +745,76 @@ mod tests {
         // start-up, long before `eframe` has a window to hand it.
         let hook = hook();
         drop(hook);
+    }
+
+    fn request() -> NativePinRequest {
+        NativePinRequest {
+            pin: scrozz_core::PinId("pin".into()),
+            title: "pin".into(),
+            state: scrozz_core::PinState::new(
+                scrozz_core::LogicalRect::new(
+                    scrozz_core::LogicalPoint::new(10.0, 20.0),
+                    scrozz_core::LogicalSize::new(320.0, 180.0),
+                ),
+                scrozz_core::PinScale::ORIGINAL,
+                None,
+            ),
+            positioning: true,
+            display_scale: scrozz_core::ScaleFactor::new(2.0),
+            shadow: true,
+        }
+    }
+
+    #[test]
+    fn identical_static_pin_state_requires_no_native_mutation() {
+        let request = request();
+        let applied = AppliedPin::from(&request);
+        assert!(!applied.behavior_changed(Some(&applied)));
+        assert!(!applied.frame_changed(Some(&applied)));
+        assert!(applied.should_set_frame(None));
+    }
+
+    #[test]
+    fn native_pin_deltas_separate_frame_and_behavior_mutations() {
+        let base = AppliedPin::from(&request());
+
+        let mut moved_request = request();
+        moved_request.state.frame.origin.x += 1.0;
+        let moved = AppliedPin::from(&moved_request);
+        assert!(moved.frame_changed(Some(&base)));
+        assert!(moved.should_set_frame(Some(&base)));
+        assert!(!moved.behavior_changed(Some(&base)));
+
+        let mut locked_request = request();
+        locked_request.state.locked = true;
+        let locked = AppliedPin::from(&locked_request);
+        assert!(!locked.frame_changed(Some(&base)));
+        assert!(locked.behavior_changed(Some(&base)));
+    }
+
+    #[test]
+    fn unavailable_positioning_never_requests_native_geometry() {
+        let mut request = request();
+        request.positioning = false;
+        let desired = AppliedPin::from(&request);
+        assert!(!desired.should_set_frame(None));
+    }
+
+    #[test]
+    fn native_adoption_retries_are_bounded() {
+        let mut attempts = HashMap::new();
+        for _ in 0..ADOPTION_RETRY_LIMIT {
+            assert!(should_retry_adoption(&mut attempts, "pin"));
+        }
+        assert!(!should_retry_adoption(&mut attempts, "pin"));
+        assert!(!should_retry_adoption(&mut attempts, "pin"));
+    }
+
+    #[test]
+    fn one_exhausted_pin_cannot_cancel_another_pins_retry_wake() {
+        let mut attempts = HashMap::from([("exhausted".to_owned(), ADOPTION_RETRY_LIMIT)]);
+        let mut pending = true;
+        pending |= should_retry_adoption(&mut attempts, "exhausted");
+        assert!(pending);
     }
 }
