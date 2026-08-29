@@ -15,7 +15,7 @@ use std::{
 
 use scrozz_core::{
     Capture, CaptureRequest, CursorMode, Display, DisplayId, DisplaySet, Error as CoreError,
-    RegionSelector, SelectionHost, SelectionOptions, SelectionOutcome,
+    RegionSelector, ScaleFactor, SelectionHost, SelectionOptions, SelectionOutcome,
 };
 use scrozz_shell::{
     DragOrigin, DragSession, DragSource, NativeDragSource, native_drag_source,
@@ -233,6 +233,7 @@ pub struct Windowed {
     base_geometry: OverlayGeometry,
     geometry: OverlayGeometry,
     display_id: Option<DisplayId>,
+    display_scale: Option<ScaleFactor>,
     pointer_geometry: SharedGeometry,
     selector: Arc<dyn CaptureSelector>,
     selection: ClientOverlayController,
@@ -243,9 +244,9 @@ impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
-        let (base_geometry, display_id) = work_area().unwrap_or_else(|error| {
+        let (base_geometry, display_id, display_scale) = work_area().unwrap_or_else(|error| {
             tracing::warn!(%error, "native work area is not ready; deferring the required check until launch");
-            (OverlayGeometry::default(), None)
+            (OverlayGeometry::default(), None, None)
         });
         let geometry = card_surface_geometry(base_geometry, 1);
         let pointer_geometry = Arc::new(Mutex::new(geometry));
@@ -265,6 +266,7 @@ impl Windowed {
             base_geometry,
             geometry,
             display_id,
+            display_scale,
             pointer_geometry,
             selector,
             selection,
@@ -287,12 +289,13 @@ impl Host for Windowed {
             base_geometry: _,
             geometry: _,
             display_id: _,
+            display_scale: _,
             pointer_geometry,
             selector: _,
             mut selection,
             native,
         } = *self;
-        let (base_geometry, display_id) = work_area()?;
+        let (base_geometry, display_id, display_scale) = work_area()?;
         let geometry = card_surface_geometry(base_geometry, 1);
         if let Ok(mut current) = pointer_geometry.lock() {
             *current = geometry;
@@ -368,11 +371,13 @@ impl Host for Windowed {
                     native,
                     display_id,
                     base_geometry,
+                    display_scale,
                     pointer_geometry,
                     next_work_area_refresh: Instant::now(),
-                    pending_native_frame: None,
                     pin_panels: crate::gui::panel::PinPanels::default(),
                     root_mode: RootSurfaceMode::Hidden,
+                    card_arm: None,
+                    shown_card_target: None,
                     startup_rehide: true,
                     announced: false,
                     stopped: false,
@@ -424,6 +429,7 @@ impl Host for Windowed {
 }
 
 fn initialize_one_shot_context(ctx: &egui::Context) {
+    scrozz_ui::overlay_app::install_native_point_scale(ctx);
     scrozz_ui::theme::install_fonts(ctx);
 }
 
@@ -571,14 +577,17 @@ struct Driver {
     display_id: Option<DisplayId>,
     /// Complete display work-area geometry card slots are anchored against.
     base_geometry: OverlayGeometry,
+    /// Native pixels per logical point on the display owning the card root.
+    display_scale: Option<ScaleFactor>,
     pointer_geometry: SharedGeometry,
     next_work_area_refresh: Instant,
-    /// Work-area frame to apply natively on the pass after queued viewport
-    /// commands have reached winit.
-    pending_native_frame: Option<OverlayGeometry>,
     pin_panels: crate::gui::panel::PinPanels,
     /// Last presentation role applied to the shared native root window.
     root_mode: RootSurfaceMode,
+    /// Hidden resize/scale barrier before the next first visible card frame.
+    card_arm: Option<CardArm>,
+    /// Geometry and scale used by the currently visible card framebuffer.
+    shown_card_target: Option<CardSurfaceTarget>,
     /// Eframe orders the root in after its first rendered frame regardless of
     /// its initial visibility; reassert hidden once after that pass.
     startup_rehide: bool,
@@ -751,6 +760,119 @@ impl Driver {
             .is_some_and(|report| report.non_activating)
     }
 
+    fn desired_card_target(&self) -> CardSurfaceTarget {
+        let count = self
+            .app
+            .showing()
+            .max(self.handle.visible_card_count())
+            .max(1);
+        CardSurfaceTarget {
+            geometry: card_surface_geometry(self.base_geometry, count),
+            scale: self.display_scale,
+        }
+    }
+
+    fn prepare_card_surface(&mut self, ctx: &egui::Context, target: CardSurfaceTarget) {
+        // Order out before changing position, size, or scale. A parked or old
+        // card framebuffer must never be visible during this transition.
+        self.startup_rehide = false;
+        self.native
+            .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+        self.native.set_cursor(scrozz_shell::OverlayCursor::Arrow);
+        self.native.set_visible(false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+
+        self.overlay.set_geometry(
+            target.geometry,
+            ctx,
+            &scrozz_ui::motion::Motion::from_context(ctx),
+        );
+        self.native.set_frame(logical_frame(target.geometry));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+            target.geometry.position(),
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.geometry.size()));
+        self.selection.set_cards_geometry(target.geometry);
+        if let Ok(mut current) = self.pointer_geometry.lock() {
+            *current = target.geometry;
+        }
+
+        self.card_arm = Some(CardArm::new(target));
+        self.shown_card_target = None;
+        self.root_mode = RootSurfaceMode::ArmingCards;
+        tracing::debug!(
+            position = ?target.geometry.position(),
+            size = ?target.geometry.size(),
+            scale = ?target.scale.map(ScaleFactor::get),
+            "arming hidden card surface"
+        );
+        ctx.request_repaint();
+    }
+
+    fn sync_card_visibility(&mut self, ctx: &egui::Context) {
+        if self.handle.geometry_locked() && self.root_mode == RootSurfaceMode::Cards {
+            return;
+        }
+
+        let target = self.desired_card_target();
+        if self.root_mode == RootSurfaceMode::Cards
+            && self.shown_card_target.is_some_and(|shown| {
+                shown_card_surface_matches(target, shown, root_viewport_measurement(ctx))
+            })
+        {
+            return;
+        }
+
+        if self
+            .card_arm
+            .as_ref()
+            .is_none_or(|arm| arm.target != target)
+        {
+            self.prepare_card_surface(ctx, target);
+            return;
+        }
+
+        let measurement = root_viewport_measurement(ctx);
+        // Wayland exposes neither absolute outer nor inner rectangles. Its root
+        // is created at the final card size (only macOS uses the 1×1 parked
+        // bootstrap), so two hidden event-loop turns are the strongest honest
+        // barrier available there.
+        let ready = self.card_arm.as_mut().is_some_and(|arm| {
+            if measurement.is_none() && cfg!(target_os = "linux") {
+                arm.observe_ready(true)
+            } else {
+                arm.observe(measurement)
+            }
+        });
+        if !ready {
+            ctx.request_repaint();
+            return;
+        }
+        let resolved_target = self
+            .card_arm
+            .expect("a ready card arm has a target")
+            .resolved_target();
+
+        // Install the complete card input contract before orderFront. Waiting
+        // for the first card UI pass leaves the root click-through whenever a
+        // child viewport is the only thing keeping eframe's UI loop alive.
+        self.overlay.invalidate_passthrough_cache();
+        reveal_card_surface(&self.native, ctx, resolved_target);
+        ctx.request_repaint();
+
+        self.card_arm = None;
+        self.shown_card_target = Some(resolved_target);
+        self.root_mode = RootSurfaceMode::Cards;
+        tracing::debug!(
+            position = ?resolved_target.geometry.position(),
+            size = ?resolved_target.geometry.size(),
+            scale = ?resolved_target.scale.map(ScaleFactor::get),
+            "revealed settled card surface"
+        );
+    }
+
     fn sync_root_visibility(&mut self, ctx: &egui::Context) {
         let selector_visible = self.selection.wants_visible_selector();
         let history_open = self
@@ -769,6 +891,13 @@ impl Driver {
             self.handle.needs_visible_surface(),
             auxiliary_open,
         );
+        if mode == RootSurfaceMode::Cards {
+            self.sync_card_visibility(ctx);
+            return;
+        }
+
+        self.card_arm = None;
+        self.shown_card_target = None;
         let startup_rehide = self.startup_rehide && mode == RootSurfaceMode::Hidden;
         if mode == self.root_mode && !startup_rehide {
             return;
@@ -778,19 +907,6 @@ impl Driver {
         match mode {
             RootSurfaceMode::Selector => {
                 self.startup_rehide = false;
-                self.native.set_visible(true);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.request_repaint();
-            }
-            RootSurfaceMode::Cards => {
-                self.startup_rehide = false;
-                let geometry = self.overlay.geometry();
-                self.native
-                    .apply(&scrozz_shell::OverlayBehavior::capture_card());
-                self.native.set_frame(logical_frame(geometry));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
                 self.native.set_visible(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
@@ -831,34 +947,11 @@ impl Driver {
                     }
                 }
             }
+            RootSurfaceMode::Cards | RootSurfaceMode::ArmingCards => {
+                unreachable!("card modes are handled by the hidden framebuffer arming barrier")
+            }
         }
         self.root_mode = mode;
-    }
-
-    fn sync_card_geometry(&mut self, ctx: &egui::Context) {
-        if !self.selection.allows_card_surface() || self.handle.geometry_locked() {
-            return;
-        }
-        let count = self
-            .app
-            .showing()
-            .max(self.handle.visible_card_count())
-            .max(1);
-        let geometry = card_surface_geometry(self.base_geometry, count);
-        if geometry == self.overlay.geometry() {
-            return;
-        }
-
-        self.overlay
-            .set_geometry(geometry, ctx, &scrozz_ui::motion::Motion::from_context(ctx));
-        self.pending_native_frame = Some(geometry);
-        if self.root_mode == RootSurfaceMode::Cards {
-            self.native.set_frame(logical_frame(geometry));
-        }
-        self.selection.set_cards_geometry(geometry);
-        if let Ok(mut current) = self.pointer_geometry.lock() {
-            *current = geometry;
-        }
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
@@ -880,10 +973,149 @@ impl Driver {
     }
 }
 
+const CARD_READY_OBSERVATIONS: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardSurfaceTarget {
+    geometry: OverlayGeometry,
+    scale: Option<ScaleFactor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ViewportMeasurement {
+    origin: egui::Pos2,
+    size: egui::Vec2,
+    native_scale: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardArm {
+    target: CardSurfaceTarget,
+    ready_observations: u8,
+    observed_scale: Option<f32>,
+}
+
+impl CardArm {
+    const fn new(target: CardSurfaceTarget) -> Self {
+        Self {
+            target,
+            ready_observations: 0,
+            observed_scale: None,
+        }
+    }
+
+    fn observe(&mut self, measurement: Option<ViewportMeasurement>) -> bool {
+        let Some(measurement) = measurement else {
+            self.observed_scale = None;
+            return self.observe_ready(false);
+        };
+        if !viewport_matches(self.target, measurement) {
+            self.observed_scale = None;
+            return self.observe_ready(false);
+        }
+
+        if self.target.scale.is_none() {
+            if self
+                .observed_scale
+                .is_some_and(|scale| (scale - measurement.native_scale).abs() > 0.01)
+            {
+                self.ready_observations = 0;
+            }
+            self.observed_scale = Some(measurement.native_scale);
+        }
+        self.observe_ready(true)
+    }
+
+    fn observe_ready(&mut self, ready: bool) -> bool {
+        if ready {
+            self.ready_observations = self.ready_observations.saturating_add(1);
+        } else {
+            self.ready_observations = 0;
+        }
+        self.ready_observations >= CARD_READY_OBSERVATIONS
+    }
+
+    fn resolved_target(self) -> CardSurfaceTarget {
+        CardSurfaceTarget {
+            scale: self.target.scale.or_else(|| {
+                self.observed_scale
+                    .filter(|scale| scale.is_finite() && *scale > 0.0)
+                    .map(|scale| ScaleFactor::new(f64::from(scale)))
+            }),
+            ..self.target
+        }
+    }
+}
+
+fn root_viewport_measurement(ctx: &egui::Context) -> Option<ViewportMeasurement> {
+    let zoom = ctx.zoom_factor();
+    ctx.input(|input| {
+        let viewport = input.viewport();
+        let outer = viewport.outer_rect?;
+        let inner = viewport.inner_rect?;
+        Some(ViewportMeasurement {
+            origin: egui::pos2(outer.min.x * zoom, outer.min.y * zoom),
+            size: inner.size() * zoom,
+            native_scale: viewport.native_pixels_per_point?,
+        })
+    })
+}
+
+fn viewport_matches(target: CardSurfaceTarget, measurement: ViewportMeasurement) -> bool {
+    let scale = target
+        .scale
+        .map_or(measurement.native_scale, |scale| scale.get() as f32);
+    let logical_tolerance = (1.0 / scale).max(0.25);
+    let close = |left: f32, right: f32| (left - right).abs() <= logical_tolerance;
+    let scale_matches = target
+        .scale
+        .is_none_or(|scale| (measurement.native_scale - scale.get() as f32).abs() <= 0.01);
+    let geometry = target.geometry;
+    scale_matches
+        && close(measurement.origin.x, geometry.position().x)
+        && close(measurement.origin.y, geometry.position().y)
+        && close(measurement.size.x, geometry.size().x)
+        && close(measurement.size.y, geometry.size().y)
+}
+
+fn shown_card_surface_matches(
+    desired: CardSurfaceTarget,
+    shown: CardSurfaceTarget,
+    measurement: Option<ViewportMeasurement>,
+) -> bool {
+    if desired.geometry != shown.geometry {
+        return false;
+    }
+    if let Some(scale) = desired.scale
+        && shown.scale != Some(scale)
+    {
+        return false;
+    }
+    measurement.map_or(
+        cfg!(target_os = "linux") && shown.scale.is_none(),
+        |measurement| viewport_matches(shown, measurement),
+    )
+}
+
+fn reveal_card_surface(
+    native: &BehaviorController,
+    ctx: &egui::Context,
+    target: CardSurfaceTarget,
+) {
+    native.apply(&scrozz_shell::OverlayBehavior::capture_card());
+    native.set_cursor(scrozz_shell::OverlayCursor::Arrow);
+    native.set_frame(logical_frame(target.geometry));
+    ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+    native.set_visible(true);
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootSurfaceMode {
     Hidden,
     Parked,
+    ArmingCards,
     Cards,
     Selector,
 }
@@ -1047,24 +1279,18 @@ impl eframe::App for Driver {
         if std::mem::take(&mut self.permission_resume_armed) {
             self.app.dispatch_permission_resume();
         }
-        if !self.selection.owns_surface()
-            && let Some(geometry) = self.pending_native_frame.take()
-        {
-            self.native.set_frame(logical_frame(geometry));
-        }
         let selector_owned_the_window = self.selection.owns_surface();
         self.selection.logic(ctx, &self.native);
         let selector_owns_the_window = self.selection.owns_surface();
         if selector_owned_the_window || selector_owns_the_window {
             self.overlay.invalidate_passthrough_cache();
-            if selector_owned_the_window && !selector_owns_the_window {
-                self.pending_native_frame = Some(self.overlay.geometry());
-            }
         } else if Instant::now() >= self.next_work_area_refresh {
             self.next_work_area_refresh = Instant::now() + WORK_AREA_REFRESH;
-            let geometry = refreshed_work_area(self.base_geometry, &mut self.display_id);
-            if geometry != self.base_geometry {
+            let (geometry, scale) =
+                refreshed_work_area(self.base_geometry, self.display_scale, &mut self.display_id);
+            if geometry != self.base_geometry || scale != self.display_scale {
                 self.base_geometry = geometry;
+                self.display_scale = scale;
             }
         }
 
@@ -1096,7 +1322,6 @@ impl eframe::App for Driver {
             });
             let _ = self.editor.open(title);
         }
-        self.sync_card_geometry(ctx);
         self.sync_root_visibility(ctx);
         if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
@@ -1249,12 +1474,16 @@ fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
 /// The card layout uses the work area, not the display bounds: anchoring a card
 /// to the bottom-left of the *bounds* puts it behind the Dock. The transparent
 /// viewport may extend below that safe area solely so shadows can fade naturally.
-fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>)> {
+fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>, Option<ScaleFactor>)> {
     #[cfg(target_os = "macos")]
     {
         let display = scrozz_shell::macos::display::active_display().map_err(CliError::from)?;
         let id = display.id.clone();
-        Ok((geometry_from_display(&display)?, Some(id)))
+        Ok((
+            geometry_from_display(&display)?,
+            Some(id),
+            Some(display.scale),
+        ))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1274,7 +1503,11 @@ fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>)> {
                 })
             })?;
         let id = display.id.clone();
-        Ok((geometry_from_display(display)?, Some(id)))
+        Ok((
+            geometry_from_display(display)?,
+            Some(id),
+            Some(display.scale),
+        ))
     }
 }
 
@@ -1421,8 +1654,9 @@ fn local_pointer(geometry: OverlayGeometry, point: scrozz_core::LogicalPoint) ->
 
 fn refreshed_work_area(
     current: OverlayGeometry,
+    current_scale: Option<ScaleFactor>,
     display_id: &mut Option<DisplayId>,
-) -> OverlayGeometry {
+) -> (OverlayGeometry, Option<ScaleFactor>) {
     #[cfg(target_os = "macos")]
     {
         if let Ok(displays) = scrozz_shell::macos::display::displays()
@@ -1430,16 +1664,17 @@ fn refreshed_work_area(
                 .as_ref()
                 .and_then(|id| display_by_id(&displays, id))
         {
-            return geometry_for_display(display);
+            return (geometry_for_display(display), Some(display.scale));
         }
         if let Ok(display) = scrozz_shell::macos::display::active_display() {
             let geometry = geometry_for_display(&display);
+            let scale = display.scale;
             *display_id = Some(display.id);
-            return geometry;
+            return (geometry, Some(scale));
         }
     }
 
-    current
+    (current, current_scale)
 }
 
 fn display_by_id<'a>(displays: &'a [Display], id: &DisplayId) -> Option<&'a Display> {
@@ -1478,7 +1713,27 @@ pub fn headless_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
+    use crate::gui::panel::RecordedNativeAction;
+    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Provenance, ScaleFactor};
+
+    fn card_target(scale: f64, origin: egui::Pos2) -> CardSurfaceTarget {
+        let base = OverlayGeometry::with_viewport(
+            egui::Rect::from_min_size(origin, egui::vec2(1440.0, 850.0)),
+            egui::Rect::from_min_size(origin, egui::vec2(1440.0, 1010.0)),
+        );
+        CardSurfaceTarget {
+            geometry: card_surface_geometry(base, 1),
+            scale: Some(ScaleFactor::new(scale)),
+        }
+    }
+
+    fn exact_measurement(target: CardSurfaceTarget) -> ViewportMeasurement {
+        ViewportMeasurement {
+            origin: target.geometry.position(),
+            size: target.geometry.size(),
+            native_scale: target.scale.expect("test target scale").get() as f32,
+        }
+    }
 
     /// Which frame pass a call sits in, read from this file's own source.
     ///
@@ -1798,35 +2053,12 @@ mod tests {
     }
 
     #[test]
-    fn first_card_restores_native_input_before_the_root_is_ordered_front() {
-        let source = include_str!("host.rs");
-        let cards = source
-            .split("RootSurfaceMode::Cards => {")
-            .nth(1)
-            .and_then(|body| body.split_once("RootSurfaceMode::Parked => {"))
-            .map(|(body, _)| body)
-            .expect("cards root transition");
-        let behavior = cards
-            .find("OverlayBehavior::capture_card()")
-            .expect("card behavior is restored");
-        let passthrough = cards
-            .find("MousePassthrough(false)")
-            .expect("eframe input is restored");
-        let visible = cards
-            .find("self.native.set_visible(true)")
-            .expect("native root is ordered front");
-
-        assert!(behavior < visible);
-        assert!(passthrough < visible);
-    }
-
-    #[test]
     fn auxiliary_children_park_the_root_without_controlling_card_input() {
         let source = include_str!("host.rs");
         let visibility = source
             .split("fn sync_root_visibility")
             .nth(1)
-            .and_then(|body| body.split_once("fn sync_card_geometry"))
+            .and_then(|body| body.split_once("fn show_settings"))
             .map(|(body, _)| body)
             .expect("root visibility synchronizer");
 
@@ -1834,7 +2066,7 @@ mod tests {
         assert!(visibility.contains("self.editor.is_open()"));
         assert!(visibility.contains("self.app.permission_prompt().is_some()"));
         assert!(visibility.contains(".is_visible()"));
-        assert!(visibility.contains("OverlayBehavior::capture_card()"));
+        assert!(visibility.contains("self.sync_card_visibility(ctx)"));
     }
 
     #[test]
@@ -1850,6 +2082,175 @@ mod tests {
 
         assert!(logic.contains("IDLE_FALLBACK_WAKE"));
         assert!(IDLE_FALLBACK_WAKE >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn first_card_waits_for_two_settled_native_measurements_at_every_scale() {
+        for scale in [1.0, 1.25, 2.0] {
+            let target = card_target(scale, egui::pos2(100.0, 40.0));
+            let mut arm = CardArm::new(target);
+            let parked = ViewportMeasurement {
+                origin: egui::pos2(PARKED_ROOT_ORIGIN, PARKED_ROOT_ORIGIN),
+                size: egui::vec2(1.0, 1.0),
+                native_scale: 1.0,
+            };
+
+            assert!(
+                !arm.observe(Some(parked)),
+                "{scale}x must not reveal the parked framebuffer"
+            );
+            assert!(
+                !arm.observe(Some(exact_measurement(target))),
+                "{scale}x needs a complete hidden window-server turn"
+            );
+            assert!(
+                arm.observe(Some(exact_measurement(target))),
+                "{scale}x should reveal after two stable observations"
+            );
+
+            let slot = scrozz_ui::stack::StackLayout::new(
+                target.geometry.local(),
+                scrozz_ui::stack::CardMetrics::default(),
+            )
+            .slot_rect(0);
+            let expected = egui::vec2(
+                scrozz_ui::stack::CardMetrics::PREFERRED_WIDTH,
+                scrozz_ui::stack::CardMetrics::PREFERRED_HEIGHT,
+            );
+            assert_eq!(slot.size(), expected);
+            assert_eq!(slot.size() * scale as f32, expected * scale as f32);
+        }
+    }
+
+    #[test]
+    fn platforms_without_a_premeasured_display_scale_accept_the_native_scale() {
+        let mut target = card_target(1.0, egui::pos2(40.0, 24.0));
+        target.scale = None;
+        let first_scale = exact_measurement(CardSurfaceTarget {
+            scale: Some(ScaleFactor::new(1.25)),
+            ..target
+        });
+        let second_scale = exact_measurement(CardSurfaceTarget {
+            scale: Some(ScaleFactor::new(1.5)),
+            ..target
+        });
+
+        let mut arm = CardArm::new(target);
+        assert!(!arm.observe(Some(first_scale)));
+        assert!(
+            !arm.observe(Some(second_scale)),
+            "a changing native scale must restart the stable observation count"
+        );
+        assert!(arm.observe(Some(second_scale)));
+        let resolved = arm.resolved_target();
+        assert_eq!(resolved.scale, Some(ScaleFactor::new(1.5)));
+        assert!(shown_card_surface_matches(
+            target,
+            resolved,
+            Some(second_scale)
+        ));
+        assert!(
+            !shown_card_surface_matches(target, resolved, Some(first_scale)),
+            "a visible non-mac card root must re-arm after a DPI transition"
+        );
+    }
+
+    #[test]
+    fn every_capture_kind_uses_the_same_full_size_first_card_barrier() {
+        let target = card_target(2.0, egui::pos2(0.0, 33.0));
+        for kind in crate::gui::action::CaptureKind::ALL {
+            let mut arm = CardArm::new(target);
+            assert!(
+                !arm.observe(Some(exact_measurement(target))),
+                "{} must not bypass first-card arming",
+                kind.label()
+            );
+            assert!(
+                arm.observe(Some(exact_measurement(target))),
+                "{} did not reach the ordinary card geometry",
+                kind.label()
+            );
+
+            let slot = scrozz_ui::stack::StackLayout::new(
+                target.geometry.local(),
+                scrozz_ui::stack::CardMetrics::default(),
+            )
+            .slot_rect(0);
+            let provenance = match kind {
+                crate::gui::action::CaptureKind::Window => Provenance::Window,
+                crate::gui::action::CaptureKind::Region
+                | crate::gui::action::CaptureKind::AllInOne => Provenance::Region,
+                crate::gui::action::CaptureKind::Fullscreen => Provenance::Display,
+                crate::gui::action::CaptureKind::AllDisplays => Provenance::AllDisplays,
+            };
+            let preview = scrozz_ui::card::CardChrome::for_provenance(provenance)
+                .geometry(slot, (3840, 2160));
+            assert_eq!(preview.container, slot);
+            assert_eq!(preview.capture, slot);
+        }
+    }
+
+    #[test]
+    fn every_empty_to_first_cycle_rearms_and_display_changes_invalidate_readiness() {
+        let first = card_target(2.0, egui::pos2(0.0, 33.0));
+        for _ in 0..3 {
+            let mut arm = CardArm::new(first);
+            assert!(!arm.observe(Some(exact_measurement(first))));
+            assert!(arm.observe(Some(exact_measurement(first))));
+        }
+
+        let moved = card_target(1.25, egui::pos2(1440.0, 24.0));
+        let mut arm = CardArm::new(moved);
+        assert!(
+            !arm.observe(Some(exact_measurement(first))),
+            "old display geometry/scale must never unlock a moved card root"
+        );
+        assert!(!arm.observe(Some(exact_measurement(moved))));
+        assert!(arm.observe(Some(exact_measurement(moved))));
+    }
+
+    #[test]
+    fn card_input_and_tracking_are_installed_before_native_visibility() {
+        let target = card_target(2.0, egui::pos2(0.0, 33.0));
+        let ctx = egui::Context::default();
+        let (native, _) = BehaviorController::recording();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            reveal_card_surface(&native, &ctx, target);
+        });
+        output.textures_delta.clear();
+
+        let actions = native.recorded_actions();
+        let behavior = actions
+            .iter()
+            .position(|action| {
+                *action
+                    == RecordedNativeAction::Behavior(scrozz_shell::OverlayBehavior::capture_card())
+            })
+            .expect("capture-card behavior");
+        let visible = actions
+            .iter()
+            .position(|action| *action == RecordedNativeAction::Visible(true))
+            .expect("native orderFront");
+        assert!(behavior < visible);
+        assert!(
+            !scrozz_shell::OverlayBehavior::capture_card().click_through,
+            "the sole card root must own pointer tracking before it is shown"
+        );
+
+        let commands = &output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .commands;
+        let input = commands
+            .iter()
+            .position(|command| matches!(command, egui::ViewportCommand::MousePassthrough(false)))
+            .expect("winit input enable");
+        let show = commands
+            .iter()
+            .position(|command| matches!(command, egui::ViewportCommand::Visible(true)))
+            .expect("winit visibility");
+        assert!(input < show);
     }
 
     #[test]

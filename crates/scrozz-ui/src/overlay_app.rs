@@ -1328,6 +1328,17 @@ pub struct OverlayApp {
     armed: Option<CardId>,
 }
 
+/// Keeps screen-anchored overlay geometry in native logical points.
+///
+/// Egui zoom scales viewport commands as well as widgets. A capture overlay's
+/// coordinates already come from the operating system, so applying an
+/// additional user zoom would move/resize the native window and make a
+/// 210-point card cease to match its window-server frame.
+pub fn install_native_point_scale(ctx: &egui::Context) {
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+    ctx.set_zoom_factor(1.0);
+}
+
 impl OverlayApp {
     /// Build the overlay.
     ///
@@ -1340,6 +1351,7 @@ impl OverlayApp {
         mut options: OverlayOptions,
     ) -> Self {
         let ctx = &cc.egui_ctx;
+        install_native_point_scale(ctx);
         let theme = Theme::for_appearance(options.appearance);
         crate::theme::install_fonts(ctx);
         crate::theme::install_style(ctx, &theme);
@@ -1356,6 +1368,7 @@ impl OverlayApp {
         if !report.non_activating {
             tracing::warn!(detail = %report.detail, "overlay window is not non-activating");
         }
+
         if let Ok(mut slot) = handle.shared.report.lock() {
             *slot = Some(report);
         }
@@ -2409,10 +2422,22 @@ impl eframe::App for OverlayApp {
             .shared
             .visible_content
             .store(!frames.is_empty() || dock_hit.is_some(), Ordering::Release);
-        self.handle
+        let previous_card_count = self
+            .handle
             .shared
             .visible_card_count
-            .store(frames.len(), Ordering::Release);
+            .swap(frames.len(), Ordering::AcqRel);
+        if previous_card_count == 0
+            && let Some(first) = frames.first()
+        {
+            tracing::debug!(
+                card = first.id.0,
+                card_rect = ?first.rect,
+                viewport = ?self.geometry.size(),
+                pixels_per_point = ctx.pixels_per_point(),
+                "painted first card in settled native viewport"
+            );
+        }
         self.handle
             .shared
             .geometry_locked
@@ -2448,6 +2473,22 @@ mod tests {
         assert_eq!(g.size(), Vec2::new(1440.0, 850.0));
         assert_eq!(g.local().min, Pos2::ZERO);
         assert_eq!(g.local().size(), g.size());
+    }
+
+    #[test]
+    fn screen_anchored_overlays_refuse_application_zoom() {
+        let ctx = egui::Context::default();
+        ctx.set_zoom_factor(1.75);
+        let mut zoomed = ctx.run_ui(egui::RawInput::default(), |_| {});
+        zoomed.textures_delta.clear();
+        assert_eq!(ctx.zoom_factor(), 1.75);
+
+        install_native_point_scale(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+
+        assert_eq!(ctx.zoom_factor(), 1.0);
+        assert!(!ctx.options(|options| options.zoom_with_keyboard));
     }
 
     #[test]

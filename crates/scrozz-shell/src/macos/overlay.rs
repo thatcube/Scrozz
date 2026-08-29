@@ -77,7 +77,8 @@ use scrozz_core::{Error, LogicalRect, Result};
 use crate::OverlayWindow;
 use crate::macos::{display, main_thread};
 use crate::overlay::{
-    OverlayBehavior, OverlayCursor, OverlayLevel, OverlayReport, logical_to_appkit,
+    AppKitRect, OverlayBehavior, OverlayCursor, OverlayLevel, OverlayReport, appkit_to_logical,
+    logical_to_appkit,
 };
 
 /// Name of the runtime-built `NSPanel` subclass windows are swizzled into.
@@ -681,6 +682,8 @@ impl MacOverlay {
     ///     CGWindowID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID,
     /// };
     /// use objc2_foundation::{NSDate, NSPoint, NSRect, NSRunLoop, NSSize};
+    /// use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+    /// use scrozz_shell::OverlayWindow;
     /// use scrozz_shell::macos::overlay::MacOverlay;
     /// use scrozz_shell::overlay::OverlayBehavior;
     ///
@@ -728,11 +731,27 @@ impl MacOverlay {
     /// overlay.set_visible(false).expect("order out");
     /// assert!(!is_on_screen(), "an idle overlay remained in CGWindowList");
     ///
+    /// let target = LogicalRect::new(
+    ///     LogicalPoint::new(40.0, 60.0),
+    ///     LogicalSize::new(320.0, 240.0),
+    /// );
+    /// overlay.set_frame(target).expect("prepare native frame");
+    /// let prepared = overlay.diagnostics().expect("prepared diagnostics");
+    /// assert_eq!(prepared.frame, target);
+    /// assert!(prepared.backing_scale > 0.0);
+    /// assert!(!prepared.is_visible, "preparation must stay ordered out");
+    /// assert!(!is_on_screen(), "prepared frame leaked before first paint");
+    ///
+    /// overlay
+    ///     .apply(&OverlayBehavior::capture_card())
+    ///     .expect("install card input before reveal");
     /// overlay.set_visible(true).expect("order front");
     /// flush_window_server();
     /// assert!(is_on_screen(), "the active fixture never reached the window server");
     /// let active = overlay.diagnostics().expect("active diagnostics");
     /// assert_eq!(active.sharing_type, NSWindowSharingType::None);
+    /// assert!(!active.ignores_mouse_events);
+    /// assert!(active.accepts_mouse_moved_events);
     ///
     /// overlay
     ///     .apply(&OverlayBehavior::hidden_surface())
@@ -935,9 +954,19 @@ impl MacOverlay {
     ///
     /// Returns [`Error::Platform`] if called off the main thread.
     pub fn diagnostics(&self) -> Result<OverlayDiagnostics> {
-        let _mtm = main_thread("inspecting an overlay window")?;
+        let mtm = main_thread("inspecting an overlay window")?;
         // SAFETY: reinterpreting an Objective-C object pointer as `AnyObject`.
         let object: &AnyObject = unsafe { &*std::ptr::from_ref(&*self.window).cast::<AnyObject>() };
+        let frame = self.window.frame();
+        let frame = appkit_to_logical(
+            AppKitRect::new(
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            ),
+            display::reference_height(mtm),
+        );
         Ok(OverlayDiagnostics {
             class_name: object.class().name().to_string_lossy().into_owned(),
             is_panel: self.window.isKindOfClass(NSPanel::class()),
@@ -953,6 +982,8 @@ impl MacOverlay {
             ignores_mouse_events: self.window.ignoresMouseEvents(),
             sharing_type: self.window.sharingType(),
             window_number: self.window.windowNumber(),
+            frame,
+            backing_scale: self.window.backingScaleFactor(),
             is_key: self.window.isKeyWindow(),
             is_visible: self.window.isVisible(),
         })
@@ -970,7 +1001,7 @@ impl Drop for MacOverlay {
 }
 
 /// A snapshot of an overlay window's native state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OverlayDiagnostics {
     /// The window's current Objective-C class name.
     pub class_name: String,
@@ -995,6 +1026,10 @@ pub struct OverlayDiagnostics {
     pub sharing_type: NSWindowSharingType,
     /// CoreGraphics/AppKit identity used by native enumeration probes.
     pub window_number: isize,
+    /// Current native frame in Scrozz's top-left logical coordinates.
+    pub frame: LogicalRect,
+    /// Native backing pixels per logical point.
+    pub backing_scale: f64,
     /// Whether the surface currently owns keyboard focus.
     pub is_key: bool,
     /// Whether the window is currently on screen.
