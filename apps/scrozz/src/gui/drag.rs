@@ -350,21 +350,24 @@ fn payload_for(card: CardId, bytes: &CaptureBytes, spot: DragSpot) -> DragPayloa
     payload
 }
 
-/// The payload a recording drag offers.
+/// The payload a finished recording or export drag offers.
 ///
 /// Kept separate from [`DragHost::begin_media`] so the one property that
-/// matters can be asserted without a window: the promised file is an MP4 and
-/// **no image flavour is advertised at all**.
+/// matters can be asserted without a window: the promised file names the
+/// container it actually is, and **no image flavour is advertised at all**.
 fn media_payload(media: &Path, spot: DragSpot, poster_png: Option<&[u8]>) -> DragPayload {
-    let stem = media
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("Scrozz recording")
-        .to_owned();
-    // The recording is already a durable owned artifact. Offer that path
-    // directly; reading it into a Vec and writing a second copy here would block
-    // the UI in proportion to the recording's duration.
-    let mut payload = DragPayload::existing_file(media, DragFormat::Mp4);
+    // Editor exports reach the card stack as GIF and WebM as well as MP4, so
+    // the promised type comes from the durable file rather than a guess. An
+    // unrecognised extension stays MP4, which is what the recorder writes.
+    let format = media
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(DragFormat::from_extension)
+        .unwrap_or(DragFormat::Mp4);
+    // The media is already a durable owned artifact. Offer that path directly;
+    // reading it into a Vec and writing a second copy here would block the UI
+    // in proportion to the recording's duration.
+    let mut payload = DragPayload::existing_file(media, format);
     if let Some(poster) = poster_png {
         match preview_for_card(poster, spot) {
             Ok(preview) => payload = payload.with_preview(preview),
@@ -542,6 +545,35 @@ mod tests {
             "a missing durable file must fail at drop time rather than silently \
              producing the poster instead"
         );
+    }
+
+    #[test]
+    fn an_exported_drag_promises_the_container_it_actually_is() {
+        for (name, format, extension) in [
+            ("Scrozz Export.gif", DragFormat::Gif, ".gif"),
+            ("Scrozz Export.webm", DragFormat::Webm, ".webm"),
+            ("Scrozz Export.mp4", DragFormat::Mp4, ".mp4"),
+            // An unrecognised container still drags as the recorder's own.
+            ("Scrozz Export.bin", DragFormat::Mp4, ".mp4"),
+        ] {
+            let payload = media_payload(&Path::new("/tmp").join(name), spot(), None);
+            assert_eq!(payload.file().format(), format, "{name}");
+            assert!(
+                payload.file().file_name().ends_with(extension),
+                "{}",
+                payload.file().file_name()
+            );
+            assert_eq!(
+                payload.existing_file_path(),
+                Some(Path::new("/tmp").join(name).as_path()),
+                "every durable export is offered in place rather than copied"
+            );
+            assert!(
+                payload.image().is_none(),
+                "an exported artifact is file-or-nothing, even a GIF: the card \
+                 stack drags the durable file, not a re-encoded still"
+            );
+        }
     }
 
     #[test]

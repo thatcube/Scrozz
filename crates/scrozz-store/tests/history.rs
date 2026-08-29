@@ -725,9 +725,78 @@ fn sample_video_metadata(path: &std::path::Path) -> VideoMetadata {
         audio_channels: Some(2),
         file_size_bytes: Some(123_456),
         codec: Some("h264".to_owned()),
+        content_type: Some("video/mp4".to_owned()),
         quality: Some("balanced".to_owned()),
         resolution: Some("native".to_owned()),
     }
+}
+
+#[test]
+fn exported_gif_and_webm_keep_truthful_history_types() {
+    let (dir, mut store) = store("exported-media-types");
+    for (name, content_type, codec, expected_kind) in [
+        ("animation.gif", "image/gif", "gif", MediaKind::Gif),
+        ("fallback.webm", "video/webm", "av1", MediaKind::Video),
+        ("hardware.mp4", "video/mp4", "h264", MediaKind::Video),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, [1, 2, 3, 4]).expect("write exported media");
+        let path = std::fs::canonicalize(&path).expect("canonicalize export");
+        let id = store
+            .insert_recording(NewRecording::new(VideoMetadata {
+                path,
+                duration_secs: 1.0,
+                engine: "editor export".into(),
+                completion: VideoCompletion::Complete,
+                size: Some(scrozz_core::PhysicalSize::new(64.0, 48.0)),
+                frames: Some(10),
+                audio_channels: Some(0),
+                file_size_bytes: Some(4),
+                codec: Some(codec.to_owned()),
+                content_type: Some(content_type.to_owned()),
+                quality: Some("low".to_owned()),
+                resolution: Some("custom".to_owned()),
+            }))
+            .expect("insert export");
+
+        let record = store.record(&id).expect("read").expect("present");
+        assert_eq!(record.media_kind, expected_kind, "{name}");
+        let video = record.video.expect("video metadata");
+        assert_eq!(video.content_type.as_deref(), Some(content_type), "{name}");
+        assert_eq!(video.codec.as_deref(), Some(codec), "{name}");
+    }
+
+    // The filter bar sees exactly what was stored, with no inference.
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().kind(MediaKind::Gif))
+            .expect("gif search")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .search(&SearchQuery::all().kind(MediaKind::Video))
+            .expect("video search")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_media_type_that_contradicts_the_file_is_refused() {
+    let (dir, mut store) = store("mismatched-media-type");
+    let path = dir.path().join("mismatched.gif");
+    std::fs::write(&path, [1, 2, 3, 4]).expect("write media");
+    let path = std::fs::canonicalize(&path).expect("canonicalize");
+    let mut meta = sample_video_metadata(&path);
+    meta.content_type = Some("video/mp4".to_owned());
+
+    assert!(meta.validate_content_type().is_err());
+    let err = store
+        .insert_recording(NewRecording::new(meta))
+        .expect_err("a GIF cannot enter history claiming to be an MP4");
+    assert!(format!("{err}").contains("video/mp4"), "{err}");
 }
 
 #[test]
@@ -781,6 +850,7 @@ fn recording_insert_rejects_empty_path() {
         audio_channels: None,
         file_size_bytes: None,
         codec: None,
+        content_type: None,
         quality: None,
         resolution: None,
     };
@@ -803,6 +873,7 @@ fn recording_insert_rejects_relative_path() {
         audio_channels: None,
         file_size_bytes: None,
         codec: None,
+        content_type: None,
         quality: None,
         resolution: None,
     };
@@ -825,6 +896,7 @@ fn recording_insert_rejects_nonexistent_path() {
         audio_channels: None,
         file_size_bytes: None,
         codec: None,
+        content_type: None,
         quality: None,
         resolution: None,
     };
@@ -923,6 +995,7 @@ fn partial_video_completion_round_trips() {
         audio_channels: None,
         file_size_bytes: None,
         codec: None,
+        content_type: None,
         quality: None,
         resolution: None,
     };

@@ -317,6 +317,8 @@ pub enum Scenario {
     VideoEditingNarrow,
     /// A GIF export in progress.
     VideoExporting,
+    /// The explicit software AV1 fallback selected for WebM output.
+    VideoWebmFallback,
     /// A failed transcode with salvageable partial output.
     VideoExportFailedPartial,
 }
@@ -358,6 +360,7 @@ impl Scenario {
         Self::VideoEditing,
         Self::VideoEditingNarrow,
         Self::VideoExporting,
+        Self::VideoWebmFallback,
         Self::VideoExportFailedPartial,
     ];
 
@@ -388,6 +391,7 @@ impl Scenario {
             Self::VideoEditing => "video-editing",
             Self::VideoEditingNarrow => "video-editing-narrow",
             Self::VideoExporting => "video-exporting",
+            Self::VideoWebmFallback => "video-webm-fallback",
             Self::VideoExportFailedPartial => "video-export-failed-partial",
             Self::SelectorIdle => "selector-idle",
             Self::SelectorDragging => "selector-dragging",
@@ -978,6 +982,17 @@ impl Fixture {
                     None,
                     Some(Self::editor_fixture(scenario)),
                 ),
+                Scenario::VideoWebmFallback => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Software AV1 fallback selected",
+                    "The editor names WebM and AV1 explicitly, explains destination compatibility, and keeps unavailable audio controls out of the way.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
+                ),
                 Scenario::VideoExportFailedPartial => (
                     Vec::new(),
                     Gesture::None,
@@ -1231,6 +1246,7 @@ impl Fixture {
             Scenario::SettingsAfterCapture => (780.0, 640.0),
             Scenario::VideoEditing
             | Scenario::VideoExporting
+            | Scenario::VideoWebmFallback
             | Scenario::VideoExportFailedPartial => (1180.0, 820.0),
             Scenario::VideoEditingNarrow => (760.0, 900.0),
             Scenario::SelectorIdle
@@ -1317,6 +1333,18 @@ impl Fixture {
                 plan.quality = Quality::Balanced;
                 plan.resolution = ResolutionCap::Hd720;
                 EditorExportFixture::Running { progress: 0.62 }
+            }
+            Scenario::VideoWebmFallback => {
+                plan = EditPlan::webm(&document).expect("the fixed WebM plan is valid");
+                plan.trim = TrimRange::new(
+                    Duration::from_secs(4),
+                    Duration::from_secs(18),
+                    document.duration(),
+                )
+                .expect("the fixed WebM trim is in range");
+                plan.quality = Quality::Balanced;
+                plan.resolution = ResolutionCap::Hd720;
+                EditorExportFixture::Idle
             }
             Scenario::VideoExportFailedPartial => {
                 let partial = TranscodeOutput::synthetic_partial(
@@ -2448,6 +2476,7 @@ impl SceneRegistry {
             Scenario::VideoEditing,
             Scenario::VideoEditingNarrow,
             Scenario::VideoExporting,
+            Scenario::VideoWebmFallback,
             Scenario::VideoExportFailedPartial,
         ] {
             me.register(scenario, Box::new(crate::video_editor::VideoEditorScene));

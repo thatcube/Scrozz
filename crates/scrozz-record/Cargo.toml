@@ -20,7 +20,7 @@ linux-native = [
 ]
 # The only software video encoder Scrozz permits. Hardware H.264 remains the
 # default, and this sizeable fallback stays independently optional.
-rav1e-fallback = ["dep:rav1e"]
+rav1e-fallback = ["dep:oxideav-core", "dep:oxideav-mkv", "dep:rav1e"]
 
 [dependencies]
 scrozz-core.workspace = true
@@ -29,6 +29,8 @@ thiserror.workspace = true
 tracing.workspace = true
 scrozz-capture.workspace = true
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
+oxideav-core = { workspace = true, optional = true }
+oxideav-mkv = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true

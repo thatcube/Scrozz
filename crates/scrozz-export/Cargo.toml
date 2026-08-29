@@ -14,6 +14,7 @@ thiserror.workspace = true
 tracing.workspace = true
 image.workspace = true
 gif.workspace = true
+color_quant.workspace = true
 arboard.workspace = true
 
 [lints]

@@ -32,8 +32,9 @@ use scrozz_core::{CaptureTarget, Error as CoreError};
 use scrozz_record::{
     MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
     RecordingSettings,
-    edit::{EditOutput, EditPlan, VideoDocument},
+    edit::{EditPlan, VideoDocument},
     handoff::FinalizedMediaHandoff,
+    media::DecodedVideoFrame,
     playback::NativePlayback,
     storyboard::NativeStoryboard,
     transcode::{
@@ -92,6 +93,22 @@ pub enum Completion {
     Finished(Box<Report>),
     /// The recording failed, or was cancelled.
     Failed(String),
+}
+
+/// Everything a finished editor export needs to reach history and a card.
+///
+/// Produced by [`RecordingState::advance_export`] on the tick the export
+/// settles, so the poster is taken from workers that are still alive and no
+/// media is decoded a second time on the UI thread.
+pub struct CompletedExport {
+    /// The source document the export was made from.
+    pub document: VideoDocument,
+    /// The plan that decided container, codec, cadence and dimensions.
+    pub plan: EditPlan,
+    /// The completed artifact.
+    pub output: TranscodeOutput,
+    /// An already-decoded source frame for the aggregate card's poster.
+    pub poster: Option<DecodedVideoFrame>,
 }
 
 /// A live video editor: a document, a preview worker, and any export in flight.
@@ -337,19 +354,25 @@ impl RecordingState {
             .unwrap_or_default()
     }
 
-    /// Advances the export job and reports whether anything changed.
-    pub fn advance_export(&mut self) {
-        let Some(editor) = self.editor.as_mut() else {
-            return;
-        };
-        let Some(job) = editor.transcode_job.as_mut() else {
-            return;
-        };
+    /// Advances the export job, returning the export if it settled completely.
+    ///
+    /// Only a `Finished` export is returned: a cancelled or failed one has
+    /// nothing to put in history, and its retained partial is already on the
+    /// editor for the user to reveal.
+    pub fn advance_export(&mut self) -> Option<CompletedExport> {
+        let editor = self.editor.as_mut()?;
+        editor.transcode_job.as_ref()?;
         let mut terminal = false;
+        let mut finished = None;
         // Bounded: a job that produces events faster than they are consumed
         // must not be able to hold the UI thread for a whole frame.
         for _ in 0..MAX_EXPORT_EVENTS_PER_TICK {
-            let Some(event) = job.poll() else {
+            let Some(event) = editor
+                .transcode_job
+                .as_mut()
+                .expect("the export job was checked above")
+                .poll()
+            else {
                 break;
             };
             match event {
@@ -358,6 +381,12 @@ impl RecordingState {
                     editor.transcode_status = Some(TranscodeStatus::Running { progress });
                 }
                 TranscodeEvent::Finished(output) => {
+                    finished = Some(CompletedExport {
+                        document: editor.document.clone(),
+                        plan: editor.plan,
+                        output: output.clone(),
+                        poster: export_poster(editor),
+                    });
                     editor.transcode_progress = 1.0;
                     editor.transcode_output = Some(output);
                     editor.transcode_failure = None;
@@ -384,8 +413,9 @@ impl RecordingState {
         if terminal {
             editor.transcode_job = None;
         } else {
-            editor.transcode_status = Some(job.status());
+            editor.transcode_status = editor.transcode_job.as_ref().map(|job| job.status());
         }
+        finished
     }
 
     /// Tears the editor down, returning any shutdown complaints to be noted.
@@ -431,6 +461,33 @@ impl RecordingState {
 
 /// The most export events one tick will drain before yielding the frame.
 const MAX_EXPORT_EVENTS_PER_TICK: u8 = 64;
+
+/// A source frame to use as the finished export's poster.
+///
+/// Preferred from the storyboard, which has already decoded the trimmed range
+/// off-thread; the live preview frame is the fallback. Returning `None` is a
+/// real answer: the export still succeeded, it simply has no card poster.
+fn export_poster(editor: &ActiveVideoEditor) -> Option<DecodedVideoFrame> {
+    let storyboard = editor.storyboard.snapshot();
+    storyboard
+        .frames
+        .iter()
+        .flatten()
+        .filter(|slot| {
+            slot.frame.timestamp >= editor.plan.trim.start
+                && slot.frame.timestamp < editor.plan.trim.end
+        })
+        .min_by_key(|slot| slot.frame.timestamp)
+        .map(|slot| slot.frame.as_ref().clone())
+        .or_else(|| {
+            editor
+                .playback
+                .snapshot()
+                .frame
+                .as_ref()
+                .map(|preview| preview.frame.as_ref().clone())
+        })
+}
 
 /// Runs the blocking native finalisation on its own thread.
 ///
@@ -484,10 +541,7 @@ pub fn edited_output_path(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("recording");
-    let extension = match plan.output {
-        EditOutput::Video => "mp4",
-        EditOutput::Animation(format) => format.extension(),
-    };
+    let extension = plan.output.extension();
     for suffix in 0..MAX_EDITED_NAME_ATTEMPTS {
         let name = if suffix == 0 {
             format!("{stem}-edited.{extension}")
@@ -551,6 +605,46 @@ pub fn reveal_file(path: &Path) -> scrozz_core::Result<()> {
     } else {
         Err(CoreError::Platform(format!(
             "the platform file browser exited with {status}"
+        )))
+    }
+}
+
+/// Opens `path` with the platform's registered viewer for its type.
+///
+/// The counterpart to [`reveal_file`]: a GIF export has no video editor to
+/// open, so its card opens the artifact itself rather than pretending the
+/// editor can decode it.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Platform`] when the viewer could not be launched or
+/// exited unsuccessfully.
+pub fn open_file(path: &Path) -> scrozz_core::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C").arg("start").arg("").arg(path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CoreError::Platform(format!(
+            "the platform viewer exited with {status}"
         )))
     }
 }
@@ -621,5 +715,62 @@ mod tests {
         ] {
             assert!(!action_allowed_during_export(&action), "{action:?}");
         }
+    }
+
+    #[test]
+    fn edited_output_paths_match_format_and_never_replace_a_collision() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("scrozz-output-path-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("scratch directory");
+        let document = VideoDocument::open_fixture(
+            Recording::synthetic(root.join("capture.mp4"), 2.0, "output path fixture")
+                .expect("synthetic source"),
+            scrozz_record::edit::SourceMetadata {
+                width: 64,
+                height: 48,
+                fps: 10.0,
+                audio_channels: 0,
+            },
+        )
+        .expect("open fixture");
+
+        // Each destination names itself: the extension comes from the plan's
+        // container, never from the source file it was edited from.
+        let gif = EditPlan::gif(&document).expect("gif plan");
+        let first = edited_output_path(&document, &gif).expect("first gif path");
+        assert_eq!(first.file_name().expect("name"), "capture-edited.gif");
+        std::fs::write(&first, b"existing").expect("occupy the first name");
+        assert_eq!(
+            edited_output_path(&document, &gif)
+                .expect("second gif path")
+                .file_name()
+                .expect("name"),
+            "capture-edited-1.gif",
+            "an existing export is never silently overwritten"
+        );
+
+        let webm = EditPlan::webm(&document).expect("webm plan");
+        assert_eq!(
+            edited_output_path(&document, &webm)
+                .expect("webm path")
+                .file_name()
+                .expect("name"),
+            "capture-edited.webm"
+        );
+
+        let video = EditPlan::video(&document).expect("video plan");
+        assert_eq!(
+            edited_output_path(&document, &video)
+                .expect("mp4 path")
+                .file_name()
+                .expect("name"),
+            "capture-edited.mp4"
+        );
+
+        std::fs::remove_dir_all(root).expect("clean up scratch directory");
     }
 }

@@ -61,12 +61,25 @@ report an explicit unsupported capability until their native decode and audio
 adapters are complete; they never substitute a synthetic clock or static source
 thumbnail for playback.
 
-Completed recordings cross into the aggregate UI through
+Completed recordings and editor exports cross into the aggregate UI through
 `scrozz_record::handoff::FinalizedMediaHandoff`. The handoff carries durable
-ownership, a canonical video path, a bounded poster with explicit color
-metadata, duration, dimensions, file size, audio presence, and
-video-appropriate actions. Card geometry remains owned by the modern adaptive
+ownership, a canonical media path, the exact content type and codec, a bounded
+poster with explicit color metadata, duration, dimensions, file size, audio
+presence, and media-appropriate actions. GIF is `image/gif`, hardware H.264 is
+`video/mp4`, and software AV1 is `video/webm`; no consumer has to infer a
+container from a generic "video" bit, and only a real video opens the editor
+while a GIF opens the file. Card geometry remains owned by the modern adaptive
 Recent Captures Overlay.
+
+Editor export capabilities are asymmetric for the same reason playback is.
+macOS probes its hardware-only H.264 writer once per session, with the result
+cached, so the editor knows whether MP4 can actually be produced before the
+user commits to it. Windows and Linux advertise that path as unavailable until
+their native writer adapters exist. The pure-Rust `rav1e`/WebM path is offered
+only when the `rav1e-fallback` feature is compiled, and GIF is always
+available because it is pure Rust with no platform dependency. A requested MP4
+is never silently turned into a WebM: an unavailable codec is reported as an
+unavailable codec.
 
 Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
 dependency, which matters far more than local cross-check coverage of a crate

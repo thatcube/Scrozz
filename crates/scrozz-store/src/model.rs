@@ -236,6 +236,14 @@ pub struct VideoMetadata {
     /// Resolved codec, never `Auto` for real output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
+    /// IANA media type of the durable artifact.
+    ///
+    /// Recorded explicitly rather than inferred, because "video" is not a
+    /// container: a GIF export, a hardware H.264 MP4 and a software AV1 WebM
+    /// all arrive here and every consumer downstream — history filters, drag
+    /// payloads, the share sheet — needs the exact type rather than a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// Quality rung used by the encoder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<String>,
@@ -245,6 +253,81 @@ pub struct VideoMetadata {
 }
 
 impl VideoMetadata {
+    /// The media type implied by the durable filename, when recognised.
+    ///
+    /// Only used to cross-check an explicit [`Self::content_type`] and to
+    /// classify legacy rows that predate it. An unknown extension is not an
+    /// error: history stores media it did not produce.
+    #[must_use]
+    pub fn inferred_content_type(&self) -> Option<&'static str> {
+        match self
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mp4" | "m4v" => Some("video/mp4"),
+            "webm" => Some("video/webm"),
+            "gif" => Some("image/gif"),
+            _ => None,
+        }
+    }
+
+    /// The history category this media belongs in.
+    ///
+    /// A GIF export is a GIF in the filter bar, not a "video that happens to
+    /// end in .gif". Everything else — H.264 in MP4, AV1 in WebM — is a video.
+    #[must_use]
+    pub fn media_kind(&self) -> MediaKind {
+        if self.content_type.as_deref() == Some("image/gif")
+            || (self.content_type.is_none() && self.inferred_content_type() == Some("image/gif"))
+        {
+            MediaKind::Gif
+        } else {
+            MediaKind::Video
+        }
+    }
+
+    /// Validates the recorded media type against the durable filename.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for an empty media type, or for one
+    /// that contradicts the extension the file actually has.
+    pub fn validate_content_type(&self) -> Result<()> {
+        let Some(explicit) = self.content_type.as_deref() else {
+            return Ok(());
+        };
+        if explicit.trim().is_empty() {
+            return Err(Error::InvalidRequest(
+                "video metadata media type must not be empty".into(),
+            ));
+        }
+        if let Some(inferred) = self.inferred_content_type()
+            && explicit != inferred
+        {
+            return Err(Error::InvalidRequest(format!(
+                "video metadata media type {explicit:?} does not match {} ({inferred:?})",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates everything history checks before accepting a recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if the media type contradicts the
+    /// filename, or if the path is empty, relative, non-canonical, missing or
+    /// not a regular file.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_content_type()?;
+        self.validate_path()
+    }
+
     /// Validates that the path is non-empty, absolute, canonical and points to
     /// an existing regular file.
     ///

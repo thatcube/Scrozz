@@ -442,6 +442,8 @@ pub enum Outcome {
         path: std::path::PathBuf,
         /// Active duration in seconds, as history recorded it.
         duration_secs: f64,
+        /// Original source target retained for derivative export provenance.
+        target: CaptureTarget,
     },
     /// A card's capture was decoded and the editor can open on it.
     Opened {
@@ -2038,14 +2040,15 @@ impl Worker {
                     path.display()
                 ))));
             }
-            Ok((path, video.duration_secs))
+            Ok((path, video.duration_secs, record.target))
         });
         match resolved {
-            Ok((path, duration_secs)) => {
+            Ok((path, duration_secs, target)) => {
                 self.emit(Outcome::HistoryRecording {
                     capture: capture.clone(),
                     path,
                     duration_secs,
+                    target,
                 });
                 self.history_done(
                     HistoryOperation::OpenEditor,
@@ -3644,6 +3647,7 @@ mod tests {
                     audio_channels: Some(2),
                     file_size_bytes: Some(4_096),
                     codec: Some("h264".to_owned()),
+                    content_type: Some("video/mp4".to_owned()),
                     quality: Some("balanced".to_owned()),
                     resolution: Some("native".to_owned()),
                 })

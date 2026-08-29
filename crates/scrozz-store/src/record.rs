@@ -412,6 +412,7 @@ mod tests {
                 audio_channels: Some(2),
                 file_size_bytes: Some(123_456),
                 codec: Some("h264".to_owned()),
+                content_type: Some("video/mp4".to_owned()),
                 quality: Some("balanced".to_owned()),
                 resolution: Some("native".to_owned()),
             })

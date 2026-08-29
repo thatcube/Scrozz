@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use scrozz_core::{Error, Result};
-use scrozz_export::AnimationFormat;
+pub use scrozz_export::{AnimationFormat, AnimationRepeat, GifDither};
 
 use crate::{
     Recording,
@@ -384,6 +384,8 @@ pub enum EditOutput {
     /// Platform-native video output.
     #[default]
     Video,
+    /// Software AV1 in a WebM container.
+    WebM,
     /// A reusable animation format from `scrozz-export`.
     Animation(AnimationFormat),
 }
@@ -394,6 +396,149 @@ impl EditOutput {
     pub const fn supports_audio(self) -> bool {
         matches!(self, Self::Video)
     }
+
+    /// Conventional filename extension without a leading dot.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Video => "mp4",
+            Self::WebM => "webm",
+            Self::Animation(format) => format.extension(),
+        }
+    }
+
+    /// IANA media type for the completed artifact.
+    #[must_use]
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Video => "video/mp4",
+            Self::WebM => "video/webm",
+            Self::Animation(format) => format.media_type(),
+        }
+    }
+
+    /// Stable codec spelling stored in capture metadata.
+    #[must_use]
+    pub const fn codec_slug(self) -> &'static str {
+        match self {
+            Self::Video => "h264",
+            Self::WebM => "av1",
+            Self::Animation(AnimationFormat::Gif) => "gif",
+        }
+    }
+
+    /// Human-readable name for actionable validation messages.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Video => "MP4 (hardware H.264)",
+            Self::WebM => "WebM (software AV1)",
+            Self::Animation(AnimationFormat::Gif) => "GIF",
+        }
+    }
+}
+
+/// GIF-specific controls and hard resource limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GifExportSettings {
+    /// Requested output frame rate. Source cadence remains the upper bound.
+    pub frame_rate: u16,
+    /// Playback repetition behavior.
+    pub repeat: AnimationRepeat,
+    /// Palette error diffusion.
+    pub dither: GifDither,
+}
+
+impl GifExportSettings {
+    /// Frame rates offered by the recording editor.
+    pub const FRAME_RATES: [u16; 5] = [5, 10, 15, 24, 30];
+    /// Default frame rate chosen for a new GIF plan.
+    pub const DEFAULT_FRAME_RATE: u16 = 15;
+    /// Largest accepted GIF frame rate.
+    pub const MAX_FRAME_RATE: u16 = 30;
+    /// Longest accepted GIF timeline.
+    pub const MAX_DURATION: Duration = Duration::from_secs(120);
+    /// Largest accepted GIF pixel count (1280x720).
+    pub const MAX_PIXELS: u64 = 1_280 * 720;
+    /// Largest accepted GIF edge.
+    pub const MAX_EDGE: u32 = 1_920;
+    /// Largest estimated or written GIF.
+    pub const MAX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
+    /// Largest estimated live working set.
+    pub const MAX_WORKING_SET_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Effective output rate after respecting the source cadence.
+    #[must_use]
+    pub fn effective_frame_rate(self, source_fps: f64) -> u16 {
+        let source = source_fps
+            .ceil()
+            .clamp(1.0, f64::from(Self::MAX_FRAME_RATE)) as u16;
+        self.frame_rate.min(source)
+    }
+}
+
+impl Default for GifExportSettings {
+    fn default() -> Self {
+        Self {
+            frame_rate: Self::DEFAULT_FRAME_RATE,
+            repeat: AnimationRepeat::Infinite,
+            dither: GifDither::FloydSteinberg,
+        }
+    }
+}
+
+/// Software AV1/WebM controls and hard resource limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebmExportSettings {
+    /// Requested output frame rate. Source cadence remains the upper bound.
+    pub frame_rate: u16,
+}
+
+impl WebmExportSettings {
+    /// Frame rates offered by the recording editor.
+    pub const FRAME_RATES: [u16; 5] = [15, 24, 30, 48, 60];
+    /// Default software-encoding frame rate.
+    pub const DEFAULT_FRAME_RATE: u16 = 30;
+    /// Largest accepted software-encoding frame rate.
+    pub const MAX_FRAME_RATE: u16 = 60;
+    /// Longest accepted software fallback timeline.
+    pub const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
+    /// Largest accepted software fallback frame (3840x2160).
+    pub const MAX_PIXELS: u64 = 3_840 * 2_160;
+    /// Largest accepted software fallback edge.
+    pub const MAX_EDGE: u32 = 3_840;
+    /// Largest estimated or written WebM artifact.
+    pub const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    /// Largest estimated live working set.
+    pub const MAX_WORKING_SET_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Effective output rate after respecting the source cadence.
+    #[must_use]
+    pub fn effective_frame_rate(self, source_fps: f64) -> u16 {
+        let source = source_fps
+            .ceil()
+            .clamp(1.0, f64::from(Self::MAX_FRAME_RATE)) as u16;
+        self.frame_rate.min(source)
+    }
+}
+
+impl Default for WebmExportSettings {
+    fn default() -> Self {
+        Self {
+            frame_rate: Self::DEFAULT_FRAME_RATE,
+        }
+    }
+}
+
+/// Deterministic resource estimate shown before export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportEstimate {
+    /// Expected encoded bytes, suitable for capacity planning rather than billing.
+    pub output_bytes: u64,
+    /// Maximum live memory attributable to frame conversion and palette work.
+    pub working_set_bytes: u64,
+    /// Frames the selected cadence will submit.
+    pub frame_count: u64,
 }
 
 /// Aspect-preserving custom output geometry.
@@ -528,6 +673,10 @@ pub struct EditPlan {
     pub audio: AudioEdit,
     /// Video or animation output.
     pub output: EditOutput,
+    /// GIF-only cadence, loop, and palette controls.
+    pub gif: GifExportSettings,
+    /// Software AV1/WebM cadence.
+    pub webm: WebmExportSettings,
 }
 
 impl EditPlan {
@@ -544,6 +693,8 @@ impl EditPlan {
             custom_dimensions: None,
             audio: AudioEdit::default(),
             output: EditOutput::Video,
+            gif: GifExportSettings::default(),
+            webm: WebmExportSettings::default(),
         })
     }
 
@@ -555,7 +706,32 @@ impl EditPlan {
     pub fn gif(document: &VideoDocument) -> Result<Self> {
         let mut plan = Self::video(document)?;
         plan.audio.mute = true;
+        plan.resolution = ResolutionCap::Hd720;
+        plan.custom_dimensions = bounded_dimensions(
+            document.metadata(),
+            plan.resolution,
+            GifExportSettings::MAX_EDGE,
+            GifExportSettings::MAX_PIXELS,
+        )?;
         plan.output = EditOutput::Animation(AnimationFormat::Gif);
+        Ok(plan)
+    }
+
+    /// Creates a software AV1/WebM plan with bounded defaults.
+    ///
+    /// WebM audio is intentionally disabled until a reviewed Opus encoder is
+    /// available; the container is never mislabeled with AAC.
+    pub fn webm(document: &VideoDocument) -> Result<Self> {
+        let mut plan = Self::video(document)?;
+        plan.audio.mute = true;
+        plan.resolution = ResolutionCap::Fhd1080;
+        plan.custom_dimensions = bounded_dimensions(
+            document.metadata(),
+            plan.resolution,
+            WebmExportSettings::MAX_EDGE,
+            WebmExportSettings::MAX_PIXELS,
+        )?;
+        plan.output = EditOutput::WebM;
         Ok(plan)
     }
 
@@ -573,9 +749,44 @@ impl EditPlan {
             OutputDimensions::new(dimensions.width, dimensions.height, metadata)?;
         }
         if !self.output.supports_audio() && metadata.audio_channels > 0 && !self.audio.mute {
-            return Err(Error::InvalidRequest(
-                "GIF output cannot carry audio; set the edit plan to mute".to_owned(),
-            ));
+            return Err(Error::InvalidRequest(format!(
+                "{} output cannot carry audio in this build; set the edit plan to mute",
+                self.output.label()
+            )));
+        }
+        let estimate = self.export_estimate(metadata);
+        match self.output {
+            EditOutput::Animation(AnimationFormat::Gif) => {
+                validate_bounded_output(
+                    "GIF",
+                    self.trim.duration(),
+                    self.gif.frame_rate,
+                    self.output_dimensions(metadata),
+                    estimate,
+                    GifExportSettings::MAX_DURATION,
+                    GifExportSettings::MAX_FRAME_RATE,
+                    GifExportSettings::MAX_EDGE,
+                    GifExportSettings::MAX_PIXELS,
+                    GifExportSettings::MAX_OUTPUT_BYTES,
+                    GifExportSettings::MAX_WORKING_SET_BYTES,
+                )?;
+            }
+            EditOutput::WebM => {
+                validate_bounded_output(
+                    "software AV1/WebM",
+                    self.trim.duration(),
+                    self.webm.frame_rate,
+                    self.output_dimensions(metadata),
+                    estimate,
+                    WebmExportSettings::MAX_DURATION,
+                    WebmExportSettings::MAX_FRAME_RATE,
+                    WebmExportSettings::MAX_EDGE,
+                    WebmExportSettings::MAX_PIXELS,
+                    WebmExportSettings::MAX_OUTPUT_BYTES,
+                    WebmExportSettings::MAX_WORKING_SET_BYTES,
+                )?;
+            }
+            EditOutput::Video => {}
         }
         Ok(())
     }
@@ -598,6 +809,171 @@ impl EditPlan {
             0
         }
     }
+
+    /// Effective GIF cadence after respecting source and product caps.
+    #[must_use]
+    pub fn gif_frame_rate(self, metadata: SourceMetadata) -> u16 {
+        self.gif.effective_frame_rate(metadata.fps)
+    }
+
+    /// Effective software AV1 cadence after respecting source and product caps.
+    #[must_use]
+    pub fn webm_frame_rate(self, metadata: SourceMetadata) -> u16 {
+        self.webm.effective_frame_rate(metadata.fps)
+    }
+
+    /// Estimates output size, working memory, and submitted frames.
+    #[must_use]
+    pub fn export_estimate(self, metadata: SourceMetadata) -> ExportEstimate {
+        let (width, height) = self.output_dimensions(metadata);
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        let duration = self
+            .trim
+            .end
+            .checked_sub(self.trim.start)
+            .unwrap_or_default();
+        let duration_millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let frame_rate = match self.output {
+            EditOutput::Video => metadata.fps.round().clamp(1.0, SourceMetadata::MAX_FPS) as u64,
+            EditOutput::WebM => u64::from(self.webm_frame_rate(metadata)),
+            EditOutput::Animation(AnimationFormat::Gif) => u64::from(self.gif_frame_rate(metadata)),
+        };
+        let frame_count = duration_millis
+            .saturating_mul(frame_rate)
+            .saturating_add(999)
+            / 1_000;
+        let output_bytes = match self.output {
+            EditOutput::Video | EditOutput::WebM => {
+                let video_bps = self
+                    .quality
+                    .target_bitrate(width, height, frame_rate as u32);
+                let audio_bps = if self.output_audio_channels(metadata) == 0 {
+                    0
+                } else {
+                    192_000
+                };
+                (video_bps.saturating_add(audio_bps)).saturating_mul(duration_millis) / 8_000
+            }
+            EditOutput::Animation(AnimationFormat::Gif) => {
+                let encoded_percent = match self.quality {
+                    Quality::Low => 18,
+                    Quality::Balanced => 28,
+                    Quality::High => 40,
+                };
+                pixels
+                    .saturating_mul(frame_count)
+                    .saturating_mul(encoded_percent)
+                    / 100
+            }
+        };
+        let frame_bytes = pixels.saturating_mul(4);
+        let working_set_bytes = match self.output {
+            EditOutput::Video => frame_bytes.saturating_mul(2),
+            EditOutput::WebM => frame_bytes
+                .saturating_mul(3)
+                .saturating_add(pixels.saturating_mul(3) / 2),
+            EditOutput::Animation(AnimationFormat::Gif) => {
+                frame_bytes.saturating_mul(3).saturating_add(pixels)
+            }
+        };
+        ExportEstimate {
+            output_bytes,
+            working_set_bytes,
+            frame_count,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_bounded_output(
+    label: &str,
+    duration: Duration,
+    frame_rate: u16,
+    dimensions: (u32, u32),
+    estimate: ExportEstimate,
+    max_duration: Duration,
+    max_frame_rate: u16,
+    max_edge: u32,
+    max_pixels: u64,
+    max_output_bytes: u64,
+    max_working_set_bytes: u64,
+) -> Result<()> {
+    if duration > max_duration {
+        return Err(Error::Unsupported {
+            what: format!(
+                "{label} export lasting {:.1} seconds",
+                duration.as_secs_f64()
+            ),
+            why: format!(
+                "the bounded exporter allows at most {} seconds; shorten the trim",
+                max_duration.as_secs()
+            ),
+        });
+    }
+    if frame_rate == 0 || frame_rate > max_frame_rate {
+        return Err(Error::InvalidRequest(format!(
+            "{label} frame rate must be between 1 and {max_frame_rate}, got {frame_rate}"
+        )));
+    }
+    let pixels = u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1));
+    if dimensions.0 > max_edge || dimensions.1 > max_edge || pixels > max_pixels {
+        return Err(Error::Unsupported {
+            what: format!("{label} output at {}x{}", dimensions.0, dimensions.1),
+            why: format!(
+                "the bounded exporter allows at most {max_edge} pixels per edge and {max_pixels} pixels per frame; choose a smaller resolution"
+            ),
+        });
+    }
+
+    if estimate.output_bytes > max_output_bytes {
+        return Err(Error::Unsupported {
+            what: format!(
+                "{label} export estimated at {} MiB",
+                estimate.output_bytes / (1024 * 1024)
+            ),
+            why: format!(
+                "the staged output cap is {} MiB; reduce duration, frame rate, resolution, or quality",
+                max_output_bytes / (1024 * 1024)
+            ),
+        });
+    }
+    if estimate.working_set_bytes > max_working_set_bytes {
+        return Err(Error::Unsupported {
+            what: format!(
+                "{label} working set estimated at {} MiB",
+                estimate.working_set_bytes / (1024 * 1024)
+            ),
+            why: format!(
+                "the exporter working-set cap is {} MiB; choose a smaller resolution",
+                max_working_set_bytes / (1024 * 1024)
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn bounded_dimensions(
+    metadata: SourceMetadata,
+    resolution: ResolutionCap,
+    max_edge: u32,
+    max_pixels: u64,
+) -> Result<Option<OutputDimensions>> {
+    let (width, height) = resolution.apply(metadata.width, metadata.height);
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width <= max_edge && height <= max_edge && pixels <= max_pixels {
+        return Ok(None);
+    }
+    let edge_scale = f64::from(max_edge) / f64::from(width.max(height));
+    let pixel_scale = (max_pixels as f64 / pixels as f64).sqrt();
+    let scale = edge_scale.min(pixel_scale).min(1.0);
+    let target_width = (f64::from(width) * scale).floor() as u32 & !1;
+    let target_height = (f64::from(height) * scale).floor() as u32 & !1;
+    OutputDimensions::new(target_width.max(2), target_height.max(2), metadata).map(Some)
 }
 
 #[cfg(test)]
@@ -744,10 +1120,87 @@ mod tests {
         let document = fixture();
         let mut plan = EditPlan::gif(&document).unwrap();
         assert_eq!(plan.output, EditOutput::Animation(AnimationFormat::Gif));
+        assert_eq!(plan.output.extension(), "gif");
+        assert_eq!(plan.output.media_type(), "image/gif");
+        assert_eq!(plan.output.codec_slug(), "gif");
+        assert_eq!(plan.output_dimensions(metadata()), (1280, 720));
+        assert_eq!(plan.gif_frame_rate(metadata()), 15);
+        assert_eq!(plan.export_estimate(metadata()).frame_count, 150);
         assert_eq!(plan.output_audio_channels(metadata()), 0);
         document.validate_plan(&plan).unwrap();
         plan.audio.mute = false;
         assert!(document.validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn gif_guards_reject_oversized_fast_and_long_exports() {
+        let document = fixture();
+        let mut plan = EditPlan::gif(&document).unwrap();
+        plan.resolution = ResolutionCap::Native;
+        assert!(
+            document
+                .validate_plan(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("smaller resolution")
+        );
+
+        plan.resolution = ResolutionCap::Hd720;
+        plan.gif.frame_rate = GifExportSettings::MAX_FRAME_RATE + 1;
+        assert!(
+            document
+                .validate_plan(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("frame rate")
+        );
+
+        let long = VideoDocument::open_fixture(
+            Recording::synthetic("long.mp4", 121.0, "long GIF guard").unwrap(),
+            SourceMetadata {
+                width: 640,
+                height: 360,
+                fps: 30.0,
+                audio_channels: 0,
+            },
+        )
+        .unwrap();
+        let long_plan = EditPlan::gif(&long).unwrap();
+        assert!(
+            long.validate_plan(&long_plan)
+                .unwrap_err()
+                .to_string()
+                .contains("shorten the trim")
+        );
+
+        let ultrawide = VideoDocument::open_fixture(
+            Recording::synthetic("ultrawide.mp4", 5.0, "safe GIF defaults").unwrap(),
+            SourceMetadata {
+                width: 5_120,
+                height: 1_440,
+                fps: 60.0,
+                audio_channels: 0,
+            },
+        )
+        .unwrap();
+        let safe = EditPlan::gif(&ultrawide).unwrap();
+        ultrawide.validate_plan(&safe).unwrap();
+        let dimensions = safe.output_dimensions(ultrawide.metadata());
+        assert!(dimensions.0 <= GifExportSettings::MAX_EDGE);
+        assert!(u64::from(dimensions.0) * u64::from(dimensions.1) <= GifExportSettings::MAX_PIXELS);
+    }
+
+    #[test]
+    fn webm_is_an_explicit_bounded_silent_av1_choice() {
+        let document = fixture();
+        let plan = EditPlan::webm(&document).unwrap();
+        assert_eq!(plan.output, EditOutput::WebM);
+        assert_eq!(plan.output.extension(), "webm");
+        assert_eq!(plan.output.media_type(), "video/webm");
+        assert_eq!(plan.output.codec_slug(), "av1");
+        assert_eq!(plan.output_audio_channels(metadata()), 0);
+        assert_eq!(plan.webm_frame_rate(metadata()), 30);
+        document.validate_plan(&plan).unwrap();
     }
 
     #[test]

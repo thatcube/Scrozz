@@ -24,12 +24,16 @@ use scrozz_annotate::{
     BeautificationPreset, Document, Renderer as _, SkiaRenderer, analyze_smart_frame,
 };
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
-    SelectionOptions, SelectionOutcome,
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, PhysicalSize,
+    Provenance, SelectionOptions, SelectionOutcome,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, to_straight_rgba8};
 use scrozz_ocr::Ocr as _;
-use scrozz_record::{RecordingMachine, RecordingPhase, RecordingRequest, RecordingSettings};
+use scrozz_record::{
+    RecordingMachine, RecordingPhase, RecordingRequest, RecordingSettings,
+    edit::{EditOutput, EditPlan, VideoDocument},
+    transcode::{TranscodeCompletion, TranscodeOutput},
+};
 use scrozz_store::{
     CaptureId, CaptureRecord, DocumentState, History as _, ImageState, Page, SearchQuery,
     SqliteStore, Store, Timestamp,
@@ -1064,6 +1068,7 @@ pub(crate) fn persist_recording(
         scrozz_record::RecordingProvenance::Native { engine, target } => {
             (engine.clone(), target.as_ref())
         }
+
         scrozz_record::RecordingProvenance::Synthetic { .. } => {
             return Err(CliError::Core(CoreError::InvalidRequest(
                 "synthetic recording output never enters history".to_owned(),
@@ -1100,6 +1105,7 @@ pub(crate) fn persist_recording(
             .metadata
             .video_codec
             .map(|codec| codec.slug().to_owned()),
+        content_type: Some("video/mp4".to_owned()),
         quality: recording
             .metadata
             .quality
@@ -1137,6 +1143,76 @@ fn video_completion(
             reason: reason.clone(),
         },
     }
+}
+
+/// Adds a finished editor export to history as a typed media row.
+///
+/// The exported file is durable and externally owned exactly as a recording is.
+/// Everything the container decides — extension, media type and codec — comes
+/// from the plan that produced it rather than from a guess, so a GIF enters
+/// history as a GIF and a WebM enters it as `video/webm`.
+pub(crate) fn persist_transcode_output(
+    document: &VideoDocument,
+    plan: &EditPlan,
+    output: &TranscodeOutput,
+) -> CliResult<CaptureId> {
+    output.require_native().map_err(CliError::Core)?;
+    let target = match &document.recording().provenance {
+        scrozz_record::RecordingProvenance::Native {
+            target: Some(target),
+            ..
+        } => target.clone(),
+        scrozz_record::RecordingProvenance::Native { target: None, .. } => {
+            return Err(CliError::Core(CoreError::Storage(
+                "edited recording source did not retain its capture target".to_owned(),
+            )));
+        }
+        scrozz_record::RecordingProvenance::Synthetic { .. } => {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "synthetic media cannot enter capture history".to_owned(),
+            )));
+        }
+    };
+    let completion = match &output.completion {
+        TranscodeCompletion::Complete => scrozz_store::VideoCompletion::Complete,
+        TranscodeCompletion::Partial { reason } => scrozz_store::VideoCompletion::Partial {
+            // A retained partial export always contains written frames; an
+            // export that never produced one fails instead of being retained.
+            salvageability: scrozz_store::VideoSalvageability::Playable,
+            reason: reason.clone(),
+        },
+    };
+    let path = std::fs::canonicalize(&output.path).map_err(|error| {
+        CliError::Core(CoreError::Storage(format!(
+            "could not resolve the completed export {}: {error}",
+            output.path.display()
+        )))
+    })?;
+    let (width, height) = plan.output_dimensions(document.metadata());
+    let video = scrozz_store::VideoMetadata {
+        path,
+        duration_secs: plan.trim.duration().as_secs_f64(),
+        engine: output.producer().to_owned(),
+        completion,
+        size: Some(PhysicalSize::new(f64::from(width), f64::from(height))),
+        // A frame count is only knowable ahead of time for the formats whose
+        // cadence the plan fixes; native video keeps the source cadence.
+        frames: (!matches!(plan.output, EditOutput::Video))
+            .then(|| plan.export_estimate(document.metadata()).frame_count),
+        audio_channels: Some(plan.output_audio_channels(document.metadata())),
+        file_size_bytes: Some(output.bytes_written),
+        codec: Some(plan.output.codec_slug().to_owned()),
+        content_type: Some(plan.output.media_type().to_owned()),
+        quality: Some(plan.quality.slug().to_owned()),
+        resolution: Some(plan.resolution.slug().to_owned()),
+    };
+    let provenance = provenance_for_target(&target);
+    let mut store = platform::store()?;
+    Ok(store.insert_recording(
+        scrozz_store::NewRecording::new(video)
+            .with_provenance(provenance)
+            .with_target(target),
+    )?)
 }
 
 const fn provenance_for_target(target: &CaptureTarget) -> Provenance {

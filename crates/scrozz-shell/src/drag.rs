@@ -106,6 +106,8 @@ pub enum DragFormat {
     Gif,
     /// Recorded video.
     Mp4,
+    /// Open AV1 video.
+    Webm,
 }
 
 impl DragFormat {
@@ -118,6 +120,7 @@ impl DragFormat {
             Self::Webp => "webp",
             Self::Gif => "gif",
             Self::Mp4 => "mp4",
+            Self::Webm => "webm",
         }
     }
 
@@ -131,6 +134,7 @@ impl DragFormat {
             Self::Webp => "org.webmproject.webp",
             Self::Gif => "com.compuserve.gif",
             Self::Mp4 => "public.mpeg-4",
+            Self::Webm => "org.webmproject.webm",
         }
     }
 
@@ -143,14 +147,15 @@ impl DragFormat {
             Self::Webp => "image/webp",
             Self::Gif => "image/gif",
             Self::Mp4 => "video/mp4",
+            Self::Webm => "video/webm",
         }
     }
 
     /// Whether this is a still image, and so can also be offered as raw image
     /// data on the clipboard.
     ///
-    /// [`Self::Mp4`] cannot: there is no "video on the pasteboard" flavour that
-    /// any real app accepts, so a recording is file-or-nothing.
+    /// [`Self::Mp4`] and [`Self::Webm`] cannot: there is no "video on the
+    /// pasteboard" flavour that any real app accepts, so video is file-or-nothing.
     #[must_use]
     pub const fn is_still_image(self) -> bool {
         matches!(self, Self::Png | Self::Jpeg | Self::Webp | Self::Gif)
@@ -173,6 +178,7 @@ impl DragFormat {
             "webp" => Some(Self::Webp),
             "gif" => Some(Self::Gif),
             "mp4" | "m4v" => Some(Self::Mp4),
+            "webm" => Some(Self::Webm),
             _ => None,
         }
     }

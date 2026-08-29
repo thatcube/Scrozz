@@ -5,9 +5,11 @@
 //! the ways it actually gets destroyed — truncation, garbage, a half-finished
 //! write — and insist the history comes back.
 
+use scrozz_core::{CaptureTarget, DisplayId, Provenance};
 use scrozz_store::{
-    CaptureId, DocumentState, History as _, ImageState, NewCapture, SearchQuery, SqliteStore,
-    Store as _, StoredRecord, Timestamp,
+    CaptureId, DocumentState, History as _, ImageState, MediaKind, NewCapture, NewRecording,
+    SearchQuery, SqliteStore, Store as _, StoredRecord, Timestamp, VideoCompletion, VideoMetadata,
+    VideoSalvageability,
     test_support::{ScratchDir, richly_annotated_document, sample_document, scratch_dir},
 };
 use std::fs;
@@ -82,6 +84,52 @@ fn assert_history_intact(store: &mut SqliteStore, ids: &[CaptureId]) {
         document.beautification().is_some(),
         "beautification is part of the document and must survive too"
     );
+}
+
+#[test]
+fn a_video_sidecar_rebuilds_the_recording_index() {
+    let dir = scratch_dir("video-recovery");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let video_path = dir.path().join("retained-partial.mp4");
+    fs::write(&video_path, vec![0xA5; 512]).expect("write retained media");
+    let video_path = fs::canonicalize(&video_path).expect("canonical retained media");
+    let id = store
+        .insert_recording(
+            NewRecording::new(VideoMetadata {
+                path: video_path,
+                duration_secs: 0.0,
+                engine: "native-test".into(),
+                completion: VideoCompletion::Partial {
+                    salvageability: VideoSalvageability::InitialisationOnly,
+                    reason: "device disappeared before the first fragment".into(),
+                },
+                size: None,
+                frames: Some(0),
+                audio_channels: None,
+                file_size_bytes: Some(512),
+                codec: Some("h264".into()),
+                content_type: Some("video/mp4".into()),
+                quality: None,
+                resolution: None,
+            })
+            .with_provenance(Provenance::Display)
+            .with_target(CaptureTarget::Display(DisplayId("main".into()))),
+        )
+        .expect("insert recording");
+    let index = store.layout().index_path();
+    drop(store);
+    fs::write(&index, b"not a sqlite database").expect("corrupt index");
+
+    let store = SqliteStore::open(dir.path()).expect("rebuild from sidecar");
+    let record = store
+        .record(&id)
+        .expect("read")
+        .expect("recording recovered");
+    assert_eq!(record.media_kind, MediaKind::Video);
+    let video = record.video.expect("video metadata");
+    assert!(matches!(video.completion, VideoCompletion::Partial { .. }));
+    assert_eq!(video.content_type.as_deref(), Some("video/mp4"));
+    assert_eq!(video.codec.as_deref(), Some("h264"));
 }
 
 #[test]

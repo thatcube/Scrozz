@@ -267,6 +267,11 @@ impl NativeMediaSource {
 
     /// Starts a bounded-memory decoder over one source interval.
     ///
+    /// Platform adapters must make the first returned video sample represent
+    /// the image visible at `range.start`, even when that point falls inside a
+    /// long variable-frame-rate sample. Export and preview therefore share the
+    /// same half-open trim semantics without decoding from the beginning.
+    ///
     /// # Errors
     ///
     /// Returns an error for an invalid range or native decoder startup failure.

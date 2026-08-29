@@ -583,6 +583,8 @@ pub struct App {
     recording: RecordingState,
     /// Durable recordings currently shown as cards, by card identity.
     recorded_media: HashMap<CardId, FinalizedMediaHandoff>,
+    /// Original capture targets retained for derivative editor exports.
+    recorded_media_targets: HashMap<CardId, CaptureTarget>,
     /// The history row the next recording card should be attributed to.
     recorded_history_id: Option<CaptureId>,
 }
@@ -952,6 +954,7 @@ impl App {
             pending_drags: VecDeque::new(),
             recording: RecordingState::new(recording_settings),
             recorded_media: HashMap::new(),
+            recorded_media_targets: HashMap::new(),
             recorded_history_id: None,
         };
         app.refresh_tray_shortcuts();
@@ -1385,7 +1388,8 @@ impl App {
                     capture,
                     path,
                     duration_secs,
-                } => self.open_history_recording(&capture, path, duration_secs),
+                    target,
+                } => self.open_history_recording(&capture, path, duration_secs, target),
                 Outcome::Ready(ready) => {
                     self.captures += 1;
                     if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
@@ -2135,6 +2139,7 @@ impl App {
                     self.surface.dismiss(card);
                     self.pipeline.post(Job::Release(card));
                     self.recorded_media.remove(&card);
+                    self.recorded_media_targets.remove(&card);
                     self.note(format!("{card} dropped"));
                 }
                 // The card stays. Said out loud rather than logged quietly:
@@ -3556,7 +3561,14 @@ impl App {
         self.recording.sequence = self.recording.sequence.wrapping_add(1);
         self.finish_pending_recording();
         self.advance_video_playback();
-        self.recording.advance_export();
+        if let Some(export) = self.recording.advance_export() {
+            self.finish_video_export(&export);
+            let target = match &export.document.recording().provenance {
+                scrozz_record::RecordingProvenance::Native { target, .. } => target.clone(),
+                scrozz_record::RecordingProvenance::Synthetic { .. } => None,
+            };
+            self.present_recorded_media(target);
+        }
         self.finish_recording_selection();
         self.start_pending_recording();
 
@@ -3583,6 +3595,57 @@ impl App {
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
+    }
+
+    /// Takes a settled editor export into history and the aggregate card stack.
+    ///
+    /// Both halves are best-effort and independently reported: an export that
+    /// cannot be indexed is still a file the user has, and one that cannot
+    /// produce a card is still in history. Neither failure is allowed to look
+    /// like a failed export.
+    fn finish_video_export(&mut self, export: &crate::gui::recording::CompletedExport) {
+        let crate::gui::recording::CompletedExport {
+            document,
+            plan,
+            output,
+            poster,
+        } = export;
+
+        self.recorded_history_id =
+            match crate::commands::persist_transcode_output(document, plan, output) {
+                Ok(id) => {
+                    self.note(format!(
+                        "{} export entered capture history as {}",
+                        plan.output.label(),
+                        id.0
+                    ));
+                    // A visible history viewport must show the new row now rather
+                    // than on the user's next interaction with it.
+                    self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+                    Some(id)
+                }
+                Err(error) => {
+                    self.note(format!(
+                        "the export was saved but could not enter capture history: {error}"
+                    ));
+                    None
+                }
+            };
+
+        let handoff = poster.as_ref().map_or_else(
+            || {
+                Err(CoreError::Codec(
+                    "the completed export has no decoded preview for a card".to_owned(),
+                ))
+            },
+            |frame| FinalizedMediaHandoff::from_export(document, plan, output, frame),
+        );
+        match handoff {
+            Ok(handoff) => self.recording.handoff = Some(handoff),
+            Err(error) => self.note(format!(
+                "the export was saved but its aggregate media handoff failed: {error}"
+            )),
+        }
     }
 
     fn advance_video_playback(&mut self) {
@@ -3887,9 +3950,18 @@ impl App {
     /// a saved recording look like a failed one.
     fn retain_recording_completion(
         &mut self,
-        output: Recording,
+        mut output: Recording,
         fallback_target: Option<&CaptureTarget>,
     ) {
+        if let scrozz_record::RecordingProvenance::Native { target, .. } = &mut output.provenance
+            && target.is_none()
+        {
+            *target = fallback_target.cloned();
+        }
+        let media_target = match &output.provenance {
+            scrozz_record::RecordingProvenance::Native { target, .. } => target.clone(),
+            scrozz_record::RecordingProvenance::Synthetic { .. } => None,
+        };
         let path = output.path.clone();
         let actions = self.recording.completion_actions();
         self.release_video_editor();
@@ -3915,7 +3987,7 @@ impl App {
         self.recorded_history_id = finished.history_id;
 
         if actions.recent_captures_overlay {
-            self.present_recorded_media();
+            self.present_recorded_media(media_target);
         } else {
             self.recording.handoff = None;
             self.recorded_history_id = None;
@@ -3940,7 +4012,7 @@ impl App {
     /// once. The durable path travels with the card as its written location:
     /// dismissing the card releases nothing, because the card never owned the
     /// bytes in the first place.
-    fn present_recorded_media(&mut self) {
+    fn present_recorded_media(&mut self, target: Option<CaptureTarget>) {
         let Some(handoff) = self.take_finalized_media_handoff() else {
             return;
         };
@@ -3949,6 +4021,9 @@ impl App {
         let card = Card::from_finalized_media(id, capture_id, &handoff);
         let path = handoff.path.clone();
         self.recorded_media.insert(id, handoff);
+        if let Some(target) = target {
+            self.recorded_media_targets.insert(id, target);
+        }
         match self.surface.present(card) {
             Ok(()) => {
                 self.captures += 1;
@@ -3956,6 +4031,7 @@ impl App {
             }
             Err(error) => {
                 self.recorded_media.remove(&id);
+                self.recorded_media_targets.remove(&id);
                 self.note(format!(
                     "recording was saved to {} but its card could not be shown: {error}",
                     path.display()
@@ -3994,6 +4070,7 @@ impl App {
                 // The card goes; the video stays exactly where it was written.
                 self.surface.dismiss(card);
                 self.recorded_media.remove(&card);
+                self.recorded_media_targets.remove(&card);
                 self.note(format!("{card} dismissed; its recording is untouched"));
                 true
             }
@@ -4041,12 +4118,16 @@ impl App {
         capture: &CaptureId,
         path: std::path::PathBuf,
         duration_secs: f64,
+        target: CaptureTarget,
     ) {
         if self.recording.editor_is_open() {
             self.note("the video editor is already open");
             return;
         }
         match Recording::native(path.clone(), duration_secs, "history")
+            .and_then(|recording| {
+                recording.with_native_details(target, scrozz_record::RecordingMetadata::default())
+            })
             .and_then(|recording| ActiveVideoEditor::open(&recording))
         {
             Ok(Some(editor)) => {
@@ -4072,11 +4153,27 @@ impl App {
             return;
         };
         let path = handoff.path.clone();
+        // The handoff already decided this: only real video opens the editor.
+        // A GIF has no editable media track, so its card opens the artifact
+        // itself rather than failing inside a decoder that cannot read it.
+        if handoff.open_action != scrozz_record::handoff::FinalizedVideoAction::OpenEditor {
+            match crate::gui::recording::open_file(&path) {
+                Ok(()) => self.note(format!("opened {}", path.display())),
+                Err(error) => self.note(format!("could not open {}: {error}", path.display())),
+            }
+            return;
+        }
         if self.recording.editor_is_open() {
             self.note("the video editor is already open");
             return;
         }
+        let target = self.recorded_media_targets.get(&card).cloned();
         match Recording::native(path.clone(), handoff.duration.as_secs_f64(), "handoff")
+            .and_then(|recording| match target {
+                Some(target) => recording
+                    .with_native_details(target, scrozz_record::RecordingMetadata::default()),
+                None => Ok(recording),
+            })
             .and_then(|recording| ActiveVideoEditor::open(&recording))
         {
             Ok(Some(editor)) => {
@@ -4340,7 +4437,9 @@ impl App {
             .is_some_and(ActiveVideoEditor::is_exporting)
             && Instant::now() < deadline
         {
-            self.recording.advance_export();
+            if let Some(export) = self.recording.advance_export() {
+                self.finish_video_export(&export);
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
 
@@ -5523,6 +5622,8 @@ mod tests {
             path: std::fs::canonicalize(&path).expect("canonical durable media"),
             ownership: scrozz_record::handoff::FinalizedMediaOwnership::ApplicationRetained,
             media_kind: scrozz_record::handoff::FinalizedMediaKind::Video,
+            content_type: "video/mp4".to_owned(),
+            codec: "h264".to_owned(),
             poster: scrozz_record::handoff::VideoPoster {
                 timestamp: Duration::ZERO,
                 width: 2,
@@ -5582,7 +5683,7 @@ mod tests {
         let media = handoff.path.clone();
 
         app.recording.handoff = Some(handoff);
-        app.present_recorded_media();
+        app.present_recorded_media(None);
 
         let cards = surface.presented();
         assert_eq!(cards.len(), 1, "one finished recording makes one card");
@@ -5625,11 +5726,45 @@ mod tests {
     }
 
     #[test]
+    fn a_gif_card_opens_the_file_rather_than_the_video_editor() {
+        let (mut app, _surface) = app();
+        let root = scratch("gif-card");
+        std::fs::create_dir_all(&root).expect("scratch directory");
+        let path = root.join("Scrozz Export.gif");
+        std::fs::write(&path, b"durable-gif").expect("durable gif");
+        let mut handoff = durable_handoff(&root);
+        handoff.path = std::fs::canonicalize(&path).expect("canonical gif");
+        handoff.media_kind = scrozz_record::handoff::FinalizedMediaKind::Gif;
+        handoff.content_type = "image/gif".to_owned();
+        handoff.codec = "gif".to_owned();
+        handoff.audio_present = false;
+        handoff.open_action = scrozz_record::handoff::FinalizedVideoAction::OpenFile;
+
+        app.recording.handoff = Some(handoff);
+        app.present_recorded_media(None);
+        let card = *app.recorded_media.keys().next().expect("gif card");
+        app.open_recorded_media(card);
+
+        // The editor is never opened over an animation: it has no decodable
+        // media track, and the handoff already said so.
+        assert!(
+            !app.video_editor_is_open(),
+            "a GIF must never be routed into the native video editor"
+        );
+        let notes = app.notes().join("\n");
+        assert!(
+            !notes.contains("video editor opened"),
+            "a GIF card must not claim the editor opened: {notes}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn same_frame_video_drag_uses_the_media_path_not_the_image_vault() {
         let (mut app, surface) = app();
         let root = scratch("drag-card");
         app.recording.handoff = Some(durable_handoff(&root));
-        app.present_recorded_media();
+        app.present_recorded_media(None);
         let card = *app.recorded_media.keys().next().expect("video card");
         surface.arm(CardEvent::Drag {
             card,
@@ -5654,7 +5789,7 @@ mod tests {
         let (mut app, _) = app();
         let root = scratch("actions");
         app.recording.handoff = Some(durable_handoff(&root));
-        app.present_recorded_media();
+        app.present_recorded_media(None);
         let card = *app
             .recorded_media
             .keys()

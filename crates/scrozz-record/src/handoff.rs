@@ -13,8 +13,9 @@ use scrozz_core::{ColorSpace, Error, PixelFormat, Result};
 
 use crate::{
     Recording,
-    edit::{SourceMetadata, TrimRange, VideoDocument},
+    edit::{EditOutput, EditPlan, SourceMetadata, TrimRange, VideoDocument},
     media::{DecodedMediaSample, DecodedVideoFrame, NativeMediaSource},
+    transcode::TranscodeOutput,
 };
 
 /// Largest poster edge supplied to a capture card.
@@ -25,6 +26,8 @@ pub const POSTER_MAX_EDGE: u32 = 512;
 pub enum FinalizedMediaKind {
     /// A native recorded video.
     Video,
+    /// An animated GIF exported from a recording.
+    Gif,
 }
 
 /// Who must keep the finalized file alive.
@@ -39,6 +42,8 @@ pub enum FinalizedMediaOwnership {
 pub enum FinalizedVideoAction {
     /// Open or foreground the recording editor.
     OpenEditor,
+    /// Open the durable artifact with the platform's registered viewer.
+    OpenFile,
     /// Copy the durable media file where the platform supports file clipboard data.
     CopyFile,
     /// Save/export to another destination.
@@ -75,8 +80,12 @@ pub struct FinalizedMediaHandoff {
     pub path: PathBuf,
     /// Ownership that prevents temporary-file cleanup from removing card media.
     pub ownership: FinalizedMediaOwnership,
-    /// Always video for this recording handoff.
+    /// Video or GIF category consumed by the aggregate capture surface.
     pub media_kind: FinalizedMediaKind,
+    /// IANA content type matching the durable filename and codec.
+    pub content_type: String,
+    /// Stable codec slug.
+    pub codec: String,
     /// Bounded first playable frame.
     pub poster: VideoPoster,
     /// Native container duration.
@@ -147,6 +156,72 @@ impl FinalizedMediaHandoff {
         )
     }
 
+    /// Builds an aggregate handoff for a completed editor export.
+    ///
+    /// The caller supplies an already-decoded source preview so GIF and WebM
+    /// output never need to be synchronously decoded on the UI thread.
+    pub fn from_export(
+        document: &VideoDocument,
+        plan: &EditPlan,
+        output: &TranscodeOutput,
+        frame: &DecodedVideoFrame,
+    ) -> Result<Self> {
+        output.require_native()?;
+        if output.is_partial() {
+            return Err(Error::InvalidRequest(
+                "only complete exports enter the aggregate media handoff".to_owned(),
+            ));
+        }
+        let path = std::fs::canonicalize(&output.path).map_err(|error| {
+            Error::Storage(format!(
+                "could not canonicalize completed export {}: {error}",
+                output.path.display()
+            ))
+        })?;
+        if is_internal_staging_path(&path) {
+            return Err(Error::InvalidRequest(format!(
+                "completed export handoff cannot retain cleanup-owned staging path {}",
+                path.display()
+            )));
+        }
+        let file_size_bytes = std::fs::metadata(&path)?.len();
+        if file_size_bytes == 0 || file_size_bytes != output.bytes_written {
+            return Err(Error::Codec(format!(
+                "completed export reports {} bytes but {} contains {file_size_bytes}",
+                output.bytes_written,
+                path.display()
+            )));
+        }
+        let dimensions = plan.output_dimensions(document.metadata());
+        let mut frame = frame.clone();
+        frame.timestamp = frame
+            .timestamp
+            .clamp(plan.trim.start, plan.trim.end)
+            .saturating_sub(plan.trim.start);
+        let media_kind = if matches!(plan.output, EditOutput::Animation(_)) {
+            FinalizedMediaKind::Gif
+        } else {
+            FinalizedMediaKind::Video
+        };
+        Ok(Self {
+            path,
+            ownership: FinalizedMediaOwnership::ApplicationRetained,
+            media_kind,
+            content_type: plan.output.media_type().to_owned(),
+            codec: plan.output.codec_slug().to_owned(),
+            poster: Self::poster_from_frame(frame)?,
+            duration: plan.trim.duration(),
+            dimensions,
+            file_size_bytes,
+            audio_present: plan.output_audio_channels(document.metadata()) > 0,
+            open_action: if matches!(plan.output, EditOutput::Video) {
+                FinalizedVideoAction::OpenEditor
+            } else {
+                FinalizedVideoAction::OpenFile
+            },
+        })
+    }
+
     fn build(
         recording: &Recording,
         metadata: SourceMetadata,
@@ -182,6 +257,11 @@ impl FinalizedMediaHandoff {
             path,
             ownership: FinalizedMediaOwnership::ApplicationRetained,
             media_kind: FinalizedMediaKind::Video,
+            content_type: "video/mp4".to_owned(),
+            codec: recording
+                .metadata
+                .video_codec
+                .map_or_else(|| "unknown".to_owned(), |codec| codec.slug().to_owned()),
             poster,
             duration,
             dimensions: (metadata.width, metadata.height),
@@ -252,16 +332,10 @@ impl FinalizedMediaHandoff {
         output
     }
 
-    /// Actions the modern aggregate card may expose.
+    /// Actions the modern aggregate card may expose for this media type.
     #[must_use]
-    pub const fn actions() -> &'static [FinalizedVideoAction] {
-        &[
-            FinalizedVideoAction::OpenEditor,
-            FinalizedVideoAction::CopyFile,
-            FinalizedVideoAction::SaveAs,
-            FinalizedVideoAction::UploadWhenConfigured,
-            FinalizedVideoAction::CloseCard,
-        ]
+    pub const fn actions(&self) -> &'static [FinalizedVideoAction] {
+        actions_for(self.open_action)
     }
 
     /// Durable file used for drag-out and file-oriented actions.
@@ -283,6 +357,31 @@ fn poster_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
+const fn actions_for(open_action: FinalizedVideoAction) -> &'static [FinalizedVideoAction] {
+    const EDITABLE: &[FinalizedVideoAction] = &[
+        FinalizedVideoAction::OpenEditor,
+        FinalizedVideoAction::CopyFile,
+        FinalizedVideoAction::SaveAs,
+        FinalizedVideoAction::UploadWhenConfigured,
+        FinalizedVideoAction::CloseCard,
+    ];
+    const EXTERNAL: &[FinalizedVideoAction] = &[
+        FinalizedVideoAction::OpenFile,
+        FinalizedVideoAction::CopyFile,
+        FinalizedVideoAction::SaveAs,
+        FinalizedVideoAction::UploadWhenConfigured,
+        FinalizedVideoAction::CloseCard,
+    ];
+    match open_action {
+        FinalizedVideoAction::OpenEditor => EDITABLE,
+        FinalizedVideoAction::OpenFile => EXTERNAL,
+        FinalizedVideoAction::CopyFile
+        | FinalizedVideoAction::SaveAs
+        | FinalizedVideoAction::UploadWhenConfigured
+        | FinalizedVideoAction::CloseCard => EXTERNAL,
+    }
+}
+
 fn is_internal_staging_path(path: &Path) -> bool {
     path.components().any(|component| {
         let Component::Normal(component) = component else {
@@ -297,6 +396,7 @@ fn is_internal_staging_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::EditPlan;
 
     #[test]
     fn poster_dimensions_preserve_aspect_and_bound_memory() {
@@ -307,9 +407,19 @@ mod tests {
     #[test]
     fn video_actions_exclude_screenshot_only_operations() {
         assert_eq!(
-            FinalizedMediaHandoff::actions(),
+            actions_for(FinalizedVideoAction::OpenEditor),
             &[
                 FinalizedVideoAction::OpenEditor,
+                FinalizedVideoAction::CopyFile,
+                FinalizedVideoAction::SaveAs,
+                FinalizedVideoAction::UploadWhenConfigured,
+                FinalizedVideoAction::CloseCard,
+            ]
+        );
+        assert_eq!(
+            actions_for(FinalizedVideoAction::OpenFile),
+            &[
+                FinalizedVideoAction::OpenFile,
                 FinalizedVideoAction::CopyFile,
                 FinalizedVideoAction::SaveAs,
                 FinalizedVideoAction::UploadWhenConfigured,
@@ -326,5 +436,74 @@ mod tests {
         assert!(!is_internal_staging_path(Path::new(
             "/Users/example/Movies/Scrozz/recording.mp4"
         )));
+    }
+
+    #[test]
+    fn editor_exports_keep_container_codec_and_open_action() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-export-handoff-{}-{nonce}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let document = VideoDocument::open_fixture(
+            Recording::synthetic(root.join("source.mp4"), 1.0, "handoff fixture").unwrap(),
+            SourceMetadata {
+                width: 64,
+                height: 48,
+                fps: 10.0,
+                audio_channels: 2,
+            },
+        )
+        .unwrap();
+        let frame = DecodedVideoFrame {
+            timestamp: Duration::ZERO,
+            duration: Duration::from_millis(100),
+            image: scrozz_export::RgbaImage {
+                width: 64,
+                height: 48,
+                data: [20, 40, 60, 255].repeat(64 * 48),
+            },
+        };
+
+        for (plan, name, kind, content_type, codec, action) in [
+            (
+                EditPlan::gif(&document).unwrap(),
+                "edited.gif",
+                FinalizedMediaKind::Gif,
+                "image/gif",
+                "gif",
+                FinalizedVideoAction::OpenFile,
+            ),
+            (
+                EditPlan::webm(&document).unwrap(),
+                "edited.webm",
+                FinalizedMediaKind::Video,
+                "video/webm",
+                "av1",
+                FinalizedVideoAction::OpenFile,
+            ),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"durable export").unwrap();
+            let output = TranscodeOutput::native(
+                &path,
+                std::fs::metadata(&path).unwrap().len(),
+                "test exporter",
+            )
+            .unwrap();
+            let handoff =
+                FinalizedMediaHandoff::from_export(&document, &plan, &output, &frame).unwrap();
+            assert_eq!(handoff.media_kind, kind);
+            assert_eq!(handoff.content_type, content_type);
+            assert_eq!(handoff.codec, codec);
+            assert_eq!(handoff.open_action, action);
+            assert_eq!(handoff.actions().first(), Some(&action));
+            assert!(!handoff.audio_present);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

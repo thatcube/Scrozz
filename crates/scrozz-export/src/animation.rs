@@ -4,11 +4,14 @@
 //! codec lives here so neither caller grows a second, subtly different encoder.
 
 use std::{
+    borrow::Cow,
+    collections::BTreeSet,
     io::{BufReader, Write},
     path::Path,
     time::Duration,
 };
 
+use color_quant::NeuQuant;
 use gif::{DecodeOptions, Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use scrozz_core::{Error, Result};
 
@@ -56,6 +59,16 @@ pub enum AnimationRepeat {
     Finite(u16),
 }
 
+/// Palette error diffusion applied before GIF indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GifDither {
+    /// Map each pixel directly to the nearest generated palette entry.
+    None,
+    /// Diffuse quantization error across neighboring pixels.
+    #[default]
+    FloydSteinberg,
+}
+
 /// Stream-derived properties of a GIF file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GifInspection {
@@ -67,6 +80,8 @@ pub struct GifInspection {
     pub frames: u64,
     /// Sum of encoded centisecond delays.
     pub duration: Duration,
+    /// Loop behavior encoded in the application extension.
+    pub repeat: AnimationRepeat,
 }
 
 /// One tightly packed RGBA frame and how long it remains visible.
@@ -91,6 +106,7 @@ impl TimedRgbaFrame {
 pub struct GifAnimationEncoder {
     repeat: AnimationRepeat,
     speed: i32,
+    dither: GifDither,
 }
 
 impl GifAnimationEncoder {
@@ -103,6 +119,7 @@ impl GifAnimationEncoder {
         Self {
             repeat: AnimationRepeat::Infinite,
             speed: Self::DEFAULT_SPEED,
+            dither: GifDither::FloydSteinberg,
         }
     }
 
@@ -112,6 +129,7 @@ impl GifAnimationEncoder {
         Self {
             repeat,
             speed: Self::DEFAULT_SPEED,
+            dither: GifDither::FloydSteinberg,
         }
     }
 
@@ -128,13 +146,34 @@ impl GifAnimationEncoder {
                 "GIF palette speed {speed} is outside 1..=30"
             )));
         }
-        Ok(Self { repeat, speed })
+        Ok(Self {
+            repeat,
+            speed,
+            dither: GifDither::FloydSteinberg,
+        })
+    }
+
+    /// Creates an encoder with explicit repeat, palette effort, and dithering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] unless `speed` is in `1..=30`.
+    pub fn with_options(repeat: AnimationRepeat, speed: i32, dither: GifDither) -> Result<Self> {
+        let mut encoder = Self::with_speed(repeat, speed)?;
+        encoder.dither = dither;
+        Ok(encoder)
     }
 
     /// The repeat behaviour in force.
     #[must_use]
     pub const fn repeat(self) -> AnimationRepeat {
         self.repeat
+    }
+
+    /// Palette error diffusion in force.
+    #[must_use]
+    pub const fn dither(self) -> GifDither {
+        self.dither
     }
 
     /// Starts a bounded-memory stream that writes each frame immediately.
@@ -144,6 +183,7 @@ impl GifAnimationEncoder {
             encoder: None,
             repeat: self.repeat,
             speed: self.speed,
+            dither: self.dither,
             dimensions: None,
             elapsed_nanos: 0,
             emitted_centiseconds: 0,
@@ -193,6 +233,11 @@ pub fn inspect_gif_file(path: &Path) -> Result<GifInspection> {
         .map_err(|error| Error::Codec(format!("could not read GIF header: {error}")))?;
     let width = decoder.width();
     let height = decoder.height();
+    let repeat = match decoder.repeat() {
+        Repeat::Infinite => AnimationRepeat::Infinite,
+        Repeat::Finite(0) => AnimationRepeat::Once,
+        Repeat::Finite(additional) => AnimationRepeat::Finite(additional),
+    };
     let mut frames = 0_u64;
     let mut centiseconds = 0_u64;
     while let Some(frame) = decoder
@@ -214,6 +259,7 @@ pub fn inspect_gif_file(path: &Path) -> Result<GifInspection> {
         height,
         frames,
         duration: Duration::from_millis(centiseconds.saturating_mul(10)),
+        repeat,
     })
 }
 
@@ -223,6 +269,7 @@ pub struct GifAnimationStream<W: Write> {
     encoder: Option<GifEncoder<W>>,
     repeat: AnimationRepeat,
     speed: i32,
+    dither: GifDither,
     dimensions: Option<(u32, u32)>,
     elapsed_nanos: u128,
     emitted_centiseconds: u128,
@@ -240,7 +287,7 @@ impl<W: Write> GifAnimationStream<W> {
     ///
     /// Returns [`Error::InvalidRequest`] for malformed frames or a delay that
     /// cannot be represented, and [`Error::Codec`] for encoder/write failures.
-    pub fn write_frame(&mut self, mut frame: TimedRgbaFrame) -> Result<()> {
+    pub fn write_frame(&mut self, frame: TimedRgbaFrame) -> Result<()> {
         let index = self.frame_count;
         validate_image(&frame.image, index)?;
         validate_delay(frame.delay, index)?;
@@ -270,7 +317,7 @@ impl<W: Write> GifAnimationStream<W> {
             ))
         })?;
         let mut encoded =
-            GifFrame::from_rgba_speed(width, height, &mut frame.image.data, self.speed);
+            Self::quantize_frame(width, height, frame.image.data, self.speed, self.dither);
         encoded.delay = delay;
         self.encoder
             .as_mut()
@@ -279,6 +326,73 @@ impl<W: Write> GifAnimationStream<W> {
             .map_err(|error| Error::Codec(format!("GIF frame {index} encoding failed: {error}")))?;
         self.frame_count += 1;
         Ok(())
+    }
+
+    fn quantize_frame(
+        width: u16,
+        height: u16,
+        mut rgba: Vec<u8>,
+        speed: i32,
+        dither: GifDither,
+    ) -> GifFrame<'static> {
+        if dither == GifDither::None {
+            return GifFrame::from_rgba_speed(width, height, &mut rgba, speed);
+        }
+
+        if rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255) {
+            return GifFrame::from_rgba_speed(width, height, &mut rgba, speed);
+        }
+        let mut exact_colors = BTreeSet::new();
+        for pixel in rgba.as_chunks::<4>().0 {
+            exact_colors.insert([pixel[0], pixel[1], pixel[2], pixel[3]]);
+            if exact_colors.len() > 256 {
+                break;
+            }
+        }
+        if exact_colors.len() <= 256 {
+            return GifFrame::from_rgba_speed(width, height, &mut rgba, speed);
+        }
+
+        let palette = NeuQuant::new(speed, 256, &rgba);
+        let width_usize = usize::from(width);
+        let row_channels = (width_usize + 2) * 3;
+        let mut current_error = vec![0_i32; row_channels];
+        let mut next_error = vec![0_i32; row_channels];
+        let mut indices = Vec::with_capacity(width_usize * usize::from(height));
+
+        for row in rgba.chunks_exact(width_usize * 4) {
+            for (x, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
+                let error_offset = (x + 1) * 3;
+                let adjusted = [
+                    (i32::from(pixel[0]) + current_error[error_offset] / 16).clamp(0, 255) as u8,
+                    (i32::from(pixel[1]) + current_error[error_offset + 1] / 16).clamp(0, 255)
+                        as u8,
+                    (i32::from(pixel[2]) + current_error[error_offset + 2] / 16).clamp(0, 255)
+                        as u8,
+                    255,
+                ];
+                let index = palette.index_of(&adjusted);
+                indices.push(index as u8);
+                let mapped = palette.lookup(index).unwrap_or([0, 0, 0, 255]);
+                for channel in 0..3 {
+                    let error = i32::from(adjusted[channel]) - i32::from(mapped[channel]);
+                    current_error[error_offset + 3 + channel] += error * 7;
+                    next_error[error_offset - 3 + channel] += error * 3;
+                    next_error[error_offset + channel] += error * 5;
+                    next_error[error_offset + 3 + channel] += error;
+                }
+            }
+            std::mem::swap(&mut current_error, &mut next_error);
+            next_error.fill(0);
+        }
+
+        GifFrame {
+            width,
+            height,
+            palette: Some(palette.color_map_rgb()),
+            buffer: Cow::Owned(indices),
+            ..GifFrame::default()
+        }
     }
 
     /// Centiseconds the cumulative GIF clock would allocate to `additional`.

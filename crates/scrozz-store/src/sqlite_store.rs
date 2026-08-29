@@ -1064,7 +1064,10 @@ impl History for SqliteStore {
     }
 
     fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId> {
-        recording.video.validate_path()?;
+        recording.video.validate()?;
+        // The container decides the history category: a GIF export is a GIF in
+        // the filter bar, not a video that happens to end in `.gif`.
+        let media_kind = recording.video.media_kind();
 
         let id = capture_id_at(recording.created_at.0);
         let now = Timestamp::now();
@@ -1073,7 +1076,7 @@ impl History for SqliteStore {
             &id,
             recording.created_at,
             now,
-            MediaKind::Video,
+            media_kind,
             recording.pinned,
             recording.app_name,
             recording.window_title,

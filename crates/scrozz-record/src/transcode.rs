@@ -13,13 +13,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "rav1e-fallback")]
+mod webm;
+
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
 use scrozz_core::{Error, Result};
+#[cfg(test)]
+use scrozz_export::AnimationRepeat;
 use scrozz_export::{
-    AnimationFormat, AnimationRepeat, GIF_MIN_FRAME_DELAY, GifAnimationEncoder, GifAnimationStream,
-    TimedRgbaFrame,
+    AnimationFormat, GIF_MIN_FRAME_DELAY, GifAnimationEncoder, GifAnimationStream, TimedRgbaFrame,
 };
 
 use crate::{
@@ -49,6 +53,10 @@ mod platform {
     } else {
         "native media framework"
     };
+
+    pub(super) const fn hardware_h264_available() -> bool {
+        false
+    }
 
     pub(super) struct VideoWriter;
 
@@ -320,6 +328,15 @@ impl TranscodeOutput {
         matches!(self.completion, TranscodeCompletion::Partial { .. })
     }
 
+    /// Native or synthetic producer responsible for this artifact.
+    #[must_use]
+    pub fn producer(&self) -> &str {
+        match &self.provenance {
+            TranscodeProvenance::Native { transcoder } => transcoder,
+            TranscodeProvenance::Synthetic { generator } => generator,
+        }
+    }
+
     /// Terminal reason, when this artifact is partial.
     #[must_use]
     pub fn partial_reason(&self) -> Option<&str> {
@@ -399,6 +416,118 @@ pub trait Transcoder: Send + Sync {
     ) -> Result<Box<dyn TranscodeJob>>;
 }
 
+/// Availability and actionable absence reason for one export choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportCapability {
+    /// Whether this exact container/codec path can start.
+    pub available: bool,
+    /// Why the path is unavailable in this build or on this machine.
+    pub unavailable_reason: Option<&'static str>,
+}
+
+impl ExportCapability {
+    /// An available path.
+    #[must_use]
+    pub const fn available() -> Self {
+        Self {
+            available: true,
+            unavailable_reason: None,
+        }
+    }
+
+    /// An unavailable path with an actionable reason.
+    #[must_use]
+    pub const fn unavailable(reason: &'static str) -> Self {
+        Self {
+            available: false,
+            unavailable_reason: Some(reason),
+        }
+    }
+}
+
+/// Explicit export choices supported by this build and machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportCapabilities {
+    /// Hardware H.264 in an MP4 container.
+    pub mp4_h264: ExportCapability,
+    /// Bounded animated GIF output.
+    pub gif: ExportCapability,
+    /// Software AV1 in a WebM container.
+    pub webm_av1: ExportCapability,
+}
+
+/// Stream-derived properties of a software AV1/WebM artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebmInspection {
+    /// Encoded pixel dimensions.
+    pub dimensions: (u32, u32),
+    /// Number of AV1 packets in presentation order.
+    pub frames: u64,
+    /// Duration derived from packet timestamps and declared frame cadence.
+    pub duration: Duration,
+    /// Seek points emitted for AV1 random-access frames.
+    pub keyframe_cues: u64,
+}
+
+/// Inspects a WebM artifact without decoding its AV1 frame payloads.
+///
+/// # Errors
+///
+/// Returns an explicit unsupported error when software AV1 was not compiled,
+/// or a codec/storage error for malformed or unreadable media.
+pub fn inspect_webm_file(path: &Path) -> Result<WebmInspection> {
+    #[cfg(feature = "rav1e-fallback")]
+    {
+        webm::inspect_file(path)
+    }
+    #[cfg(not(feature = "rav1e-fallback"))]
+    {
+        let _ = path;
+        Err(Error::Unsupported {
+            what: "WebM inspection".to_owned(),
+            why: "this binary was built without the `rav1e-fallback` feature".to_owned(),
+        })
+    }
+}
+
+impl ExportCapabilities {
+    /// Deterministic capability set for UI harnesses and contract tests.
+    #[must_use]
+    pub const fn all_available() -> Self {
+        Self {
+            mp4_h264: ExportCapability::available(),
+            gif: ExportCapability::available(),
+            webm_av1: ExportCapability::available(),
+        }
+    }
+
+    /// Capability for a concrete output choice.
+    #[must_use]
+    pub const fn for_output(self, output: EditOutput) -> ExportCapability {
+        match output {
+            EditOutput::Video => self.mp4_h264,
+            EditOutput::WebM => self.webm_av1,
+            EditOutput::Animation(AnimationFormat::Gif) => self.gif,
+        }
+    }
+
+    /// Validates that an exact output choice is available.
+    pub fn require(self, output: EditOutput) -> Result<()> {
+        let capability = self.for_output(output);
+        if capability.available {
+            Ok(())
+        } else {
+            Err(Error::Unsupported {
+                what: format!("{} export", output.label()),
+                why: capability
+                    .unavailable_reason
+                    .unwrap_or("this export path is unavailable")
+                    .to_owned(),
+            })
+        }
+    }
+}
+
 /// Native asynchronous transcoder for real recording files.
 ///
 /// The implementation never invokes an external executable. It uses the
@@ -422,8 +551,48 @@ impl NativeTranscoder {
 
     /// Whether this build includes a real native source and writer backend.
     #[must_use]
-    pub const fn is_available() -> bool {
-        crate::media::native_media_capabilities().video_transcode
+    pub fn is_available() -> bool {
+        let capabilities = Self::capabilities();
+        capabilities.mp4_h264.available
+            || capabilities.gif.available
+            || capabilities.webm_av1.available
+    }
+
+    /// Probes each exact container/codec path without silently substituting one.
+    #[must_use]
+    pub fn capabilities() -> ExportCapabilities {
+        let media = crate::media::native_media_capabilities();
+        let decoder_reason = media
+            .unavailable_reason
+            .unwrap_or("this platform has no native source decoder");
+        let mp4_h264 = if !media.source_decode {
+            ExportCapability::unavailable(decoder_reason)
+        } else if platform::hardware_h264_available() {
+            ExportCapability::available()
+        } else {
+            ExportCapability::unavailable(
+                "no compatible hardware H.264 encoder is available; choose WebM / AV1",
+            )
+        };
+        let gif = if media.gif_transcode {
+            ExportCapability::available()
+        } else {
+            ExportCapability::unavailable(decoder_reason)
+        };
+        let webm_av1 = if !media.source_decode {
+            ExportCapability::unavailable(decoder_reason)
+        } else if cfg!(feature = "rav1e-fallback") {
+            ExportCapability::available()
+        } else {
+            ExportCapability::unavailable(
+                "this build does not include the optional rav1e software encoder",
+            )
+        };
+        ExportCapabilities {
+            mp4_h264,
+            gif,
+            webm_av1,
+        }
     }
 }
 
@@ -435,6 +604,7 @@ impl Transcoder for NativeTranscoder {
         output_path: PathBuf,
     ) -> Result<Box<dyn TranscodeJob>> {
         document.validate_plan(plan)?;
+        Self::capabilities().require(plan.output)?;
         let source = NativeMediaSource::open(document.recording().clone())?;
         validate_document_source(document, &source)?;
         validate_output_path(&source, &output_path)?;
@@ -615,21 +785,24 @@ fn claim_terminal(terminal: WorkerTerminal, gate: &AtomicU8) -> WorkerTerminal {
         WorkerTerminal::Finished(output) => {
             match gate.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => WorkerTerminal::Finished(output),
-                Err(1) => match TranscodeOutput::native_partial(
-                    output.path,
-                    output.bytes_written,
-                    NativeTranscoder::name(),
-                    "cancelled by user after output finalization",
-                ) {
-                    Ok(partial) => {
-                        gate.store(2, Ordering::Release);
-                        WorkerTerminal::Cancelled(Some(partial))
+                Err(1) => {
+                    let producer = output.producer().to_owned();
+                    match TranscodeOutput::native_partial(
+                        output.path,
+                        output.bytes_written,
+                        producer,
+                        "cancelled by user after output finalization",
+                    ) {
+                        Ok(partial) => {
+                            gate.store(2, Ordering::Release);
+                            WorkerTerminal::Cancelled(Some(partial))
+                        }
+                        Err(error) => {
+                            gate.store(2, Ordering::Release);
+                            failed(error, None)
+                        }
                     }
-                    Err(error) => {
-                        gate.store(2, Ordering::Release);
-                        failed(error, None)
-                    }
-                },
+                }
                 Err(_) => failed(
                     Error::Platform(
                         "native transcode attempted a second terminal transition".to_owned(),
@@ -649,6 +822,26 @@ fn claim_terminal(terminal: WorkerTerminal, gate: &AtomicU8) -> WorkerTerminal {
 enum ArtifactKind {
     Video,
     Gif,
+    WebM,
+}
+
+impl ArtifactKind {
+    const fn producer(self) -> &'static str {
+        match self {
+            Self::Video => NativeTranscoder::name(),
+            Self::Gif => "Scrozz streaming GIF",
+            Self::WebM => {
+                #[cfg(feature = "rav1e-fallback")]
+                {
+                    webm::TRANSCODER_NAME
+                }
+                #[cfg(not(feature = "rav1e-fallback"))]
+                {
+                    "rav1e + libwebm"
+                }
+            }
+        }
+    }
 }
 
 fn run_native_transcode(
@@ -665,6 +858,7 @@ fn run_native_transcode(
     let mut progress = ProgressEmitter::new(events, status, plan.trim.duration());
     let terminal = match plan.output {
         EditOutput::Video => run_video(source, plan, output.path(), cancelled, &mut progress),
+        EditOutput::WebM => run_webm(source, plan, output.path(), cancelled, &mut progress),
         EditOutput::Animation(AnimationFormat::Gif) => {
             run_gif(source, plan, output.path(), cancelled, &mut progress)
         }
@@ -686,8 +880,57 @@ struct PublishFailure {
     retained_path: PathBuf,
 }
 
+struct BoundedWriter<W> {
+    inner: W,
+    limit: u64,
+    position: u64,
+}
+
+impl<W> BoundedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            position: 0,
+        }
+    }
+
+    const fn get_ref(&self) -> &W {
+        &self.inner
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let requested = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.position.saturating_add(requested) > self.limit {
+            return Err(std::io::Error::other(format!(
+                "export exceeded its {} MiB staged-output limit",
+                self.limit / (1024 * 1024)
+            )));
+        }
+        let written = self.inner.write(bytes)?;
+        self.position = self
+            .position
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for BoundedWriter<W> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.position = self.inner.seek(position)?;
+        Ok(self.position)
+    }
+}
+
 impl StagedOutput {
     fn new(final_path: &Path, output: EditOutput) -> Result<Self> {
+        validate_output_extension(final_path, output)?;
         let parent = final_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -709,10 +952,7 @@ impl StagedOutput {
         sync_parent_directory(&directory)?;
         preparation.0 = None;
         let lock_path = directory.join("owner.lock");
-        let extension = match output {
-            EditOutput::Video => "mp4",
-            EditOutput::Animation(format) => format.extension(),
-        };
+        let extension = output.extension();
         Ok(Self {
             final_path: final_path.to_owned(),
             staging_path: directory.join(format!("output.{extension}")),
@@ -735,6 +975,7 @@ impl StagedOutput {
                     WorkerTerminal::Finished(output)
                 }
                 Err(publish) => {
+                    let producer = output.producer().to_owned();
                     let reason = format!(
                         "encoded output could not be durably published at {}: {error}; retained output at {}",
                         self.final_path.display(),
@@ -745,7 +986,7 @@ impl StagedOutput {
                     match TranscodeOutput::native_partial(
                         &publish.retained_path,
                         output.bytes_written,
-                        NativeTranscoder::name(),
+                        producer,
                         &reason,
                     ) {
                         Ok(partial) => failed(Error::Storage(reason), Some(partial)),
@@ -861,6 +1102,22 @@ impl StagedOutput {
             ))),
         }
     }
+}
+
+fn validate_output_extension(path: &Path, output: EditOutput) -> Result<()> {
+    let actual = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if !actual.eq_ignore_ascii_case(output.extension()) {
+        return Err(Error::InvalidRequest(format!(
+            "{} export requires a .{} destination, got {}",
+            output.label(),
+            output.extension(),
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 struct PreparingDirectory(Option<PathBuf>);
@@ -1063,15 +1320,18 @@ fn run_gif(
         crate::Quality::Balanced => GifAnimationEncoder::DEFAULT_SPEED,
         crate::Quality::Low => 30,
     };
-    let encoder = match GifAnimationEncoder::with_speed(AnimationRepeat::Infinite, speed) {
+    let encoder = match GifAnimationEncoder::with_options(plan.gif.repeat, speed, plan.gif.dither) {
         Ok(encoder) => encoder,
         Err(error) => return failed_after_cleanup(error, output_path),
     };
-    let mut stream = encoder.stream(BufWriter::new(file));
+    let mut stream = encoder.stream(BufWriter::new(BoundedWriter::new(
+        file,
+        crate::edit::GifExportSettings::MAX_OUTPUT_BYTES,
+    )));
     let mut frame_count = 0_u64;
     let mut pending = None;
     let mut queued = GifFrameQueue::default();
-    let mut cursor = plan.trim.start;
+    let mut schedule = UniformFrameSchedule::new(plan.trim, plan.gif_frame_rate(source.metadata()));
 
     loop {
         if cancelled.load(Ordering::Acquire) {
@@ -1112,13 +1372,32 @@ fn run_gif(
                 .as_ref()
                 .expect("the current frame was just installed")
                 .timestamp
-                .clamp(cursor, plan.trim.end);
-            if boundary > cursor {
+                .clamp(plan.trim.start, plan.trim.end);
+            while let Some(delay) = schedule.take_before(boundary) {
+                if cancelled.load(Ordering::Acquire) {
+                    decoder.cancel();
+                    if let Err(error) = flush_gif_frames(&mut stream, &mut queued, &mut frame_count)
+                    {
+                        return finish_failed_gif(
+                            error,
+                            stream,
+                            frame_count,
+                            output_path,
+                            plan.trim.duration(),
+                        );
+                    }
+                    return finish_cancelled_gif(
+                        stream,
+                        frame_count,
+                        output_path,
+                        plan.trim.duration(),
+                    );
+                }
                 if let Err(error) = queue_gif_frame(
                     &mut stream,
                     &mut queued,
                     &mut frame_count,
-                    TimedRgbaFrame::new(previous.image, boundary - cursor),
+                    TimedRgbaFrame::new(previous.image.clone(), delay),
                 ) {
                     return finish_failed_gif(
                         error,
@@ -1128,10 +1407,10 @@ fn run_gif(
                         plan.trim.duration(),
                     );
                 }
-                cursor = boundary;
+                progress.emit(schedule.position());
             }
+            progress.emit(boundary.saturating_sub(plan.trim.start));
         }
-        progress.emit(cursor.saturating_sub(plan.trim.start));
     }
 
     let Some(last) = pending else {
@@ -1141,21 +1420,35 @@ fn run_gif(
             output_path,
         );
     };
-    if cursor < plan.trim.end
-        && let Err(error) = queue_gif_frame(
+    while let Some(delay) = schedule.take_before(plan.trim.end) {
+        if cancelled.load(Ordering::Acquire) {
+            decoder.cancel();
+            if let Err(error) = flush_gif_frames(&mut stream, &mut queued, &mut frame_count) {
+                return finish_failed_gif(
+                    error,
+                    stream,
+                    frame_count,
+                    output_path,
+                    plan.trim.duration(),
+                );
+            }
+            return finish_cancelled_gif(stream, frame_count, output_path, plan.trim.duration());
+        }
+        if let Err(error) = queue_gif_frame(
             &mut stream,
             &mut queued,
             &mut frame_count,
-            TimedRgbaFrame::new(last.image, plan.trim.end - cursor),
-        )
-    {
-        return finish_failed_gif(
-            error,
-            stream,
-            frame_count,
-            output_path,
-            plan.trim.duration(),
-        );
+            TimedRgbaFrame::new(last.image.clone(), delay),
+        ) {
+            return finish_failed_gif(
+                error,
+                stream,
+                frame_count,
+                output_path,
+                plan.trim.duration(),
+            );
+        }
+        progress.emit(schedule.position());
     }
     if let Err(error) = flush_gif_frames(&mut stream, &mut queued, &mut frame_count) {
         return finish_failed_gif(
@@ -1183,7 +1476,7 @@ fn run_gif(
         return terminal_failure(error, output_path, ArtifactKind::Gif, plan.trim.duration());
     }
     progress.finish();
-    match TranscodeOutput::native(output_path, bytes_written, NativeTranscoder::name()) {
+    match TranscodeOutput::native(output_path, bytes_written, ArtifactKind::Gif.producer()) {
         Ok(output) => WorkerTerminal::Finished(output),
         Err(error) => failed(error, None),
     }
@@ -1279,9 +1572,204 @@ fn run_video(
         );
     }
     progress.finish();
-    match TranscodeOutput::native(output_path, bytes_written, NativeTranscoder::name()) {
+    match TranscodeOutput::native(output_path, bytes_written, ArtifactKind::Video.producer()) {
         Ok(output) => WorkerTerminal::Finished(output),
         Err(error) => failed(error, None),
+    }
+}
+
+#[cfg(feature = "rav1e-fallback")]
+fn run_webm(
+    source: &NativeMediaSource,
+    plan: EditPlan,
+    output_path: &Path,
+    cancelled: &AtomicBool,
+    progress: &mut ProgressEmitter<'_>,
+) -> WorkerTerminal {
+    let dimensions = plan.output_dimensions(source.metadata());
+    let frame_rate = plan.webm_frame_rate(source.metadata());
+    let mut decoder = match source.decoder_with_dimensions(plan.trim, dimensions) {
+        Ok(decoder) => decoder,
+        Err(error) => return failed(error, None),
+    };
+    let mut writer = match webm::Av1WebmWriter::new(
+        output_path,
+        dimensions,
+        frame_rate,
+        plan.quality,
+        crate::edit::WebmExportSettings::MAX_OUTPUT_BYTES,
+    ) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return terminal_failure(error, output_path, ArtifactKind::WebM, Duration::ZERO);
+        }
+    };
+    let mut schedule = UniformFrameSchedule::new(plan.trim, frame_rate);
+    let expected_frames = schedule.total_frames();
+    let mut pending = None;
+
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            decoder.cancel();
+            return finish_cancelled_webm(writer, output_path, plan.trim.duration());
+        }
+        let sample = match decoder.next_sample() {
+            Ok(sample) => sample,
+            Err(error) => {
+                return finish_failed_webm(error, writer, output_path, plan.trim.duration());
+            }
+        };
+        let Some(sample) = sample else { break };
+        let DecodedMediaSample::Video(frame) = sample else {
+            continue;
+        };
+        if let Some(previous) = pending.replace(frame) {
+            let boundary = pending
+                .as_ref()
+                .expect("the current frame was just installed")
+                .timestamp
+                .clamp(plan.trim.start, plan.trim.end);
+            while schedule.take_before(boundary).is_some() {
+                if cancelled.load(Ordering::Acquire) {
+                    decoder.cancel();
+                    return finish_cancelled_webm(writer, output_path, plan.trim.duration());
+                }
+                if let Err(error) = writer.append_frame(&previous.image) {
+                    return finish_failed_webm(error, writer, output_path, plan.trim.duration());
+                }
+                progress.emit(schedule.position());
+            }
+            progress.emit(boundary.saturating_sub(plan.trim.start));
+        }
+    }
+
+    let Some(last) = pending else {
+        drop(writer);
+        return failed_after_cleanup(
+            Error::Codec("software AV1 export decoded no video frames".to_owned()),
+            output_path,
+        );
+    };
+    while schedule.take_before(plan.trim.end).is_some() {
+        if cancelled.load(Ordering::Acquire) {
+            decoder.cancel();
+            return finish_cancelled_webm(writer, output_path, plan.trim.duration());
+        }
+        if let Err(error) = writer.append_frame(&last.image) {
+            return finish_failed_webm(error, writer, output_path, plan.trim.duration());
+        }
+        progress.emit(schedule.position());
+    }
+    if cancelled.load(Ordering::Acquire) {
+        decoder.cancel();
+        return finish_cancelled_webm(writer, output_path, plan.trim.duration());
+    }
+    let frames = writer.frames();
+    let bytes_written = match writer.finish(plan.trim.duration()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return terminal_failure(error, output_path, ArtifactKind::WebM, plan.trim.duration());
+        }
+    };
+    if cancelled.load(Ordering::Acquire) {
+        return terminal_cancelled(output_path, ArtifactKind::WebM, plan.trim.duration(), None);
+    }
+    if let Err(error) = verify_webm(
+        output_path,
+        dimensions,
+        expected_frames,
+        plan.trim.duration(),
+        frame_rate,
+    ) {
+        return terminal_failure(error, output_path, ArtifactKind::WebM, plan.trim.duration());
+    }
+    if frames != expected_frames {
+        return terminal_failure(
+            Error::Codec(format!(
+                "software AV1 submitted {frames} frames, expected {expected_frames}"
+            )),
+            output_path,
+            ArtifactKind::WebM,
+            plan.trim.duration(),
+        );
+    }
+    progress.finish();
+    match TranscodeOutput::native(output_path, bytes_written, webm::TRANSCODER_NAME) {
+        Ok(output) => WorkerTerminal::Finished(output),
+        Err(error) => failed(error, None),
+    }
+}
+
+#[cfg(not(feature = "rav1e-fallback"))]
+fn run_webm(
+    _source: &NativeMediaSource,
+    _plan: EditPlan,
+    _output_path: &Path,
+    _cancelled: &AtomicBool,
+    _progress: &mut ProgressEmitter<'_>,
+) -> WorkerTerminal {
+    failed(
+        Error::Unsupported {
+            what: "software AV1/WebM export".to_owned(),
+            why: "this binary was built without the `rav1e-fallback` feature".to_owned(),
+        },
+        None,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UniformFrameSchedule {
+    range: crate::edit::TrimRange,
+    frame_rate: u16,
+    next_index: u64,
+    total_frames: u64,
+}
+
+impl UniformFrameSchedule {
+    fn new(range: crate::edit::TrimRange, frame_rate: u16) -> Self {
+        let frames = range
+            .duration()
+            .as_nanos()
+            .saturating_mul(u128::from(frame_rate))
+            .saturating_add(999_999_999)
+            / 1_000_000_000;
+        Self {
+            range,
+            frame_rate,
+            next_index: 0,
+            total_frames: u64::try_from(frames).unwrap_or(u64::MAX),
+        }
+    }
+
+    const fn total_frames(self) -> u64 {
+        self.total_frames
+    }
+
+    fn position(self) -> Duration {
+        self.timestamp(self.next_index)
+            .saturating_sub(self.range.start)
+    }
+
+    fn take_before(&mut self, boundary: Duration) -> Option<Duration> {
+        if self.next_index >= self.total_frames {
+            return None;
+        }
+        let start = self.timestamp(self.next_index);
+        if start >= boundary.min(self.range.end) {
+            return None;
+        }
+        let end = self
+            .timestamp(self.next_index.saturating_add(1))
+            .min(self.range.end);
+        self.next_index = self.next_index.saturating_add(1);
+        Some(end.saturating_sub(start))
+    }
+
+    fn timestamp(self, index: u64) -> Duration {
+        let offset_nanos =
+            u128::from(index).saturating_mul(1_000_000_000) / u128::from(self.frame_rate.max(1));
+        let offset = Duration::from_nanos(u64::try_from(offset_nanos).unwrap_or(u64::MAX));
+        self.range.start.saturating_add(offset).min(self.range.end)
     }
 }
 
@@ -1372,7 +1860,7 @@ fn write_queued_gif_frame<W: Write>(
 
 fn finish_failed_gif(
     error: Error,
-    stream: GifAnimationStream<BufWriter<File>>,
+    stream: GifAnimationStream<BufWriter<BoundedWriter<File>>>,
     frame_count: u64,
     output_path: &Path,
     duration: Duration,
@@ -1390,7 +1878,7 @@ fn finish_failed_gif(
 }
 
 fn finish_cancelled_gif(
-    stream: GifAnimationStream<BufWriter<File>>,
+    stream: GifAnimationStream<BufWriter<BoundedWriter<File>>>,
     frame_count: u64,
     output_path: &Path,
     duration: Duration,
@@ -1403,11 +1891,14 @@ fn finish_cancelled_gif(
     terminal_cancelled(output_path, ArtifactKind::Gif, duration, finalize_error)
 }
 
-fn finalize_gif(stream: GifAnimationStream<BufWriter<File>>, output_path: &Path) -> Result<u64> {
+fn finalize_gif(
+    stream: GifAnimationStream<BufWriter<BoundedWriter<File>>>,
+    output_path: &Path,
+) -> Result<u64> {
     let mut writer = stream.finish()?;
     writer.flush()?;
-    writer.get_ref().sync_all()?;
-    let bytes = writer.get_ref().metadata()?.len();
+    writer.get_ref().get_ref().sync_all()?;
+    let bytes = writer.get_ref().get_ref().metadata()?.len();
     sync_parent_directory(output_path)?;
     Ok(bytes)
 }
@@ -1442,6 +1933,40 @@ fn finish_cancelled_video(mut writer: platform::VideoWriter, output_path: &Path)
     }
     let finalize_error = writer.finish(duration).err();
     terminal_cancelled(output_path, ArtifactKind::Video, duration, finalize_error)
+}
+
+#[cfg(feature = "rav1e-fallback")]
+fn finish_failed_webm(
+    error: Error,
+    writer: webm::Av1WebmWriter,
+    output_path: &Path,
+    requested_duration: Duration,
+) -> WorkerTerminal {
+    if writer.frames() == 0 {
+        drop(writer);
+        return failed_after_cleanup(error, output_path);
+    }
+    let duration = writer.media_end().min(requested_duration);
+    let error = match writer.finish(duration) {
+        Ok(_) => error,
+        Err(finalize) => combine_errors(error, finalize),
+    };
+    terminal_failure(error, output_path, ArtifactKind::WebM, duration)
+}
+
+#[cfg(feature = "rav1e-fallback")]
+fn finish_cancelled_webm(
+    writer: webm::Av1WebmWriter,
+    output_path: &Path,
+    requested_duration: Duration,
+) -> WorkerTerminal {
+    if writer.frames() == 0 {
+        drop(writer);
+        return cancelled_after_cleanup(output_path);
+    }
+    let duration = writer.media_end().min(requested_duration);
+    let finalize_error = writer.finish(duration).err();
+    terminal_cancelled(output_path, ArtifactKind::WebM, duration, finalize_error)
 }
 
 fn discard_video_writer(writer: platform::VideoWriter) {
@@ -1499,6 +2024,16 @@ fn retain_partial(
     };
     let usable = match kind {
         ArtifactKind::Gif => scrozz_export::inspect_gif_file(output_path).is_ok(),
+        ArtifactKind::WebM => {
+            #[cfg(feature = "rav1e-fallback")]
+            {
+                webm::inspect_file(output_path).is_ok()
+            }
+            #[cfg(not(feature = "rav1e-fallback"))]
+            {
+                false
+            }
+        }
         ArtifactKind::Video => {
             let duration = duration.max(Duration::from_nanos(1));
             let recording = Recording::native_partial(
@@ -1514,8 +2049,7 @@ fn retain_partial(
         remove_output(output_path)?;
         return Ok(None);
     }
-    TranscodeOutput::native_partial(output_path, file_size, NativeTranscoder::name(), reason)
-        .map(Some)
+    TranscodeOutput::native_partial(output_path, file_size, kind.producer(), reason).map(Some)
 }
 
 fn verify_gif(
@@ -1587,6 +2121,43 @@ fn verify_video(
             "written video duration {:.3} s differs from expected {:.3} s",
             written.inspection().duration.as_secs_f64(),
             expected_duration.as_secs_f64()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rav1e-fallback")]
+fn verify_webm(
+    output_path: &Path,
+    dimensions: (u32, u32),
+    expected_frames: u64,
+    expected_duration: Duration,
+    frame_rate: u16,
+) -> Result<()> {
+    let inspection = webm::inspect_file(output_path)?;
+    if inspection.dimensions != dimensions {
+        return Err(Error::Codec(format!(
+            "written WebM is {}x{}, expected {}x{}",
+            inspection.dimensions.0, inspection.dimensions.1, dimensions.0, dimensions.1
+        )));
+    }
+    if inspection.frames != expected_frames {
+        return Err(Error::Codec(format!(
+            "written WebM contains {} AV1 frames, expected {expected_frames}",
+            inspection.frames
+        )));
+    }
+    if inspection.keyframe_cues == 0 {
+        return Err(Error::Codec(
+            "written WebM contains no keyframe seek point".to_owned(),
+        ));
+    }
+    let tolerance = Duration::from_secs_f64(1.0 / f64::from(frame_rate));
+    if inspection.duration.abs_diff(expected_duration) > tolerance {
+        return Err(Error::Codec(format!(
+            "written WebM duration {} ms differs from expected {} ms",
+            inspection.duration.as_millis(),
+            expected_duration.as_millis()
         )));
     }
     Ok(())
@@ -2240,12 +2811,72 @@ mod tests {
     }
 
     #[test]
+    fn bounded_frame_schedule_preserves_trim_duration_and_frame_cap() {
+        let range = crate::edit::TrimRange {
+            start: Duration::from_millis(125),
+            end: Duration::from_millis(625),
+        };
+        let mut schedule = UniformFrameSchedule::new(range, 15);
+        assert_eq!(schedule.total_frames(), 8);
+        let mut delays = Vec::new();
+        while let Some(delay) = schedule.take_before(range.end) {
+            delays.push(delay);
+        }
+        assert_eq!(delays.len(), 8);
+        assert_eq!(
+            delays.into_iter().sum::<Duration>(),
+            Duration::from_millis(500)
+        );
+        assert!(schedule.take_before(range.end).is_none());
+    }
+
+    #[test]
     fn source_plan_is_revalidated_at_start() {
         let (document, mut plan) = fixture();
         plan.trim.end = document.duration() + Duration::from_secs(1);
         let transcoder = MockTranscoder::success(vec![], 1).unwrap();
         let result = transcoder.start(&document, &plan, PathBuf::from("out.mp4"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn output_extension_must_match_the_explicit_container() {
+        assert!(validate_output_extension(Path::new("out.mp4"), EditOutput::Video).is_ok());
+        assert!(validate_output_extension(Path::new("out.webm"), EditOutput::WebM).is_ok());
+        assert!(
+            validate_output_extension(
+                Path::new("out.gif"),
+                EditOutput::Animation(AnimationFormat::Gif)
+            )
+            .is_ok()
+        );
+        assert!(validate_output_extension(Path::new("out.mp4"), EditOutput::WebM).is_err());
+        assert!(
+            validate_output_extension(
+                Path::new("out.webm"),
+                EditOutput::Animation(AnimationFormat::Gif)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_hardware_never_silently_changes_the_requested_container() {
+        let capabilities = ExportCapabilities {
+            mp4_h264: ExportCapability::unavailable("hardware probe failed"),
+            gif: ExportCapability::available(),
+            webm_av1: ExportCapability::available(),
+        };
+        let error = capabilities
+            .require(EditOutput::Video)
+            .expect_err("MP4 must remain unavailable");
+        assert!(error.to_string().contains("hardware probe failed"));
+        assert!(capabilities.require(EditOutput::WebM).is_ok());
+        assert!(
+            capabilities
+                .require(EditOutput::Animation(AnimationFormat::Gif))
+                .is_ok()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2432,6 +3063,59 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn trimmed_decoder_starts_with_the_frame_visible_at_the_in_point() {
+        let directory = TestDirectory::new("vfr-in-point");
+        let path = directory.path.join("source.mp4");
+        let cancelled = AtomicBool::new(false);
+        let mut writer =
+            platform::VideoWriter::new(&path, (64, 48), 1.0, crate::Quality::Low, 0).unwrap();
+        for (timestamp, color) in [
+            (Duration::ZERO, [240, 12, 12, 255]),
+            (Duration::from_secs(2), [12, 12, 240, 255]),
+        ] {
+            writer
+                .append_video(
+                    &DecodedVideoFrame {
+                        timestamp,
+                        duration: Duration::from_secs(1),
+                        image: RgbaImage {
+                            width: 64,
+                            height: 48,
+                            data: color.repeat(64 * 48),
+                        },
+                    },
+                    Duration::ZERO,
+                    &cancelled,
+                )
+                .unwrap();
+        }
+        writer.finish(Duration::from_secs(3)).unwrap();
+        let source =
+            NativeMediaSource::open(Recording::native(&path, 3.0, "VFR trim fixture").unwrap())
+                .unwrap();
+        let mut decoder = source
+            .decoder(TrimRange {
+                start: Duration::from_secs(1),
+                end: Duration::from_millis(2_500),
+            })
+            .unwrap();
+        let frame = loop {
+            match decoder.next_sample().unwrap() {
+                Some(DecodedMediaSample::Video(frame)) => break frame,
+                Some(DecodedMediaSample::Audio(_)) => {}
+                None => panic!("trimmed VFR range returned no visible frame"),
+            }
+        };
+        assert!(frame.timestamp <= Duration::from_secs(1));
+        let pixel = &frame.image.data[..4];
+        assert!(
+            pixel[0] > pixel[2],
+            "trim start should retain the red frame visible at 1s, got {pixel:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_storyboard_incrementally_decodes_bounded_video_and_audio() {
         let directory = TestDirectory::new("storyboard");
         let recording = write_native_fixture(&directory.path.join("source.mp4"));
@@ -2585,6 +3269,30 @@ mod tests {
         .expect("playable bytes mandate a partial artifact");
         assert!(retained.is_partial());
         assert!(retained.provenance.is_native());
+
+        #[cfg(feature = "rav1e-fallback")]
+        {
+            let mut webm_plan = EditPlan::webm(&document).unwrap();
+            webm_plan.trim = TrimRange::new(
+                Duration::from_millis(25),
+                Duration::from_millis(525),
+                document.duration(),
+            )
+            .unwrap();
+            webm_plan.resolution = crate::ResolutionCap::Half;
+            webm_plan.webm.frame_rate = 10;
+            let webm_path = directory.path.join("edited.webm");
+            let webm_output = finished_output(
+                transcoder
+                    .start(&document, &webm_plan, webm_path.clone())
+                    .unwrap(),
+            );
+            webm_output.require_native().unwrap();
+            let webm = webm::inspect_file(&webm_path).unwrap();
+            assert_eq!(webm.dimensions, (48, 32));
+            assert_eq!(webm.frames, 5);
+            assert_eq!(webm.duration, Duration::from_millis(500));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -2638,6 +3346,58 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(job.status(), TranscodeStatus::Cancelled);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "rav1e-fallback"))]
+    #[test]
+    fn native_webm_cancellation_retains_only_the_encoded_duration() {
+        let directory = TestDirectory::new("webm-cancel");
+        let recording =
+            write_native_silent_fixture(&directory.path.join("source.mp4"), (320, 180), 30, 300);
+        let document = VideoDocument::open_native(recording).unwrap();
+        let mut plan = EditPlan::webm(&document).unwrap();
+        plan.quality = crate::Quality::High;
+        let output_path = directory.path.join("cancelled.webm");
+        let mut job = NativeTranscoder::new()
+            .start(&document, &plan, output_path.clone())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut cancellation_requested = false;
+        loop {
+            if let Some(event) = job.poll() {
+                match event {
+                    TranscodeEvent::Progress(_) if !cancellation_requested => {
+                        job.cancel().expect("cancel active WebM export");
+                        cancellation_requested = true;
+                    }
+                    TranscodeEvent::Progress(_) => {}
+                    TranscodeEvent::Cancelled(Some(partial)) => {
+                        assert!(partial.is_partial());
+                        let inspection = webm::inspect_file(&partial.path).unwrap();
+                        assert!(inspection.duration > Duration::ZERO);
+                        assert!(inspection.duration < plan.trim.duration());
+                        break;
+                    }
+                    TranscodeEvent::Cancelled(None) => {
+                        panic!("encoded WebM frames should be retained after cancellation")
+                    }
+                    TranscodeEvent::Finished(_) => {
+                        panic!("WebM export finished before cancellation")
+                    }
+                    TranscodeEvent::Failed(failure) => {
+                        panic!("cancelled WebM export failed: {}", failure.error)
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "WebM cancellation timed out with status {:?}",
+                job.status()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cancellation_requested);
         assert_eq!(job.status(), TranscodeStatus::Cancelled);
     }
 

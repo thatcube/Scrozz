@@ -86,7 +86,13 @@ allow = [
     "GPL-3.0-or-later",
 ]
 
-exceptions = []
+exceptions = [
+  # Exact, Linux-only FFI binding release. WTFPL is FSF-recognized free software
+  # and GPL-compatible, but keeping it package-scoped avoids admitting the
+  # identifier for unrelated future dependencies. Re-review with any version
+  # change to ffmpeg-sys-next.
+  { allow = ["WTFPL"], name = "ffmpeg-sys-next", version = "=9.0.0" },
+]
 
 [advisories]
 version = 2
@@ -127,6 +133,12 @@ ignore = [
   # and emits code. Will disappear on its own as the crates that use it bump.
   # Revisit 2027-02-01.
   { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained, build-time only, not in the shipped binary" },
+
+  # `paste` is an unmaintained macro dependency of the latest upstream rav1e
+  # release. It has no vulnerability advisory and contributes generated code,
+  # not a runtime component. There is no patched rav1e release to select.
+  # Revisit by 2027-02-01 or immediately when rav1e replaces it.
+  { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained rav1e macro dependency; no patched upstream release, no known vulnerability, review by 2027-02-01" },
 ]
 
 [bans]
