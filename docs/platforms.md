@@ -123,6 +123,25 @@ stays live so the backend can preserve the window's native isolation, shape and
 shadow; all-display mode stays live so the backend owns mixed-scale composition.
 Frozen frames and thumbnails are presentation data only: they are never inserted
 into the window target list and cannot become a desktop-sized capture candidate.
+The long-running root window is constructed hidden and parked off-screen because
+eframe orders a root window in once after its first rendered frame even when its
+builder requested `visible: false`. After that bootstrap pass, idle means a real
+AppKit `orderOut:`, not alpha zero or click-through. Capture-card mode sizes the
+native root to the occupied stack column plus the complete gesture envelope,
+expanding only as card count grows and freezing its origin during an in-progress
+drag. An ordinary Settings/editor child keeps only a one-point off-screen parent
+bootstrap alive; the parent is not on any display. All card/selector roots and
+secondary selector viewports use public content-protection APIs
+(`NSWindowSharingNone` on macOS), while ordinary Settings/editor viewports keep
+the default externally capturable sharing mode.
+
+ScreenCaptureKit may still enumerate the identity and bounds of a protected
+window; AppKit's sharing type prevents its pixels from being read, not its
+metadata from being listed. That is why card mode is content-bounded rather than
+leaving a protected but desktop-sized blank candidate. External pickers are
+expected to honor the public protection flag; a picker that deliberately offers
+protected utility chrome may still show its compact bounds but cannot capture
+its contents.
 
 Window selection has a stricter invocation boundary than the other modes. The
 selector takes a fresh native target snapshot before it sends any event that can
@@ -175,6 +194,10 @@ retains terminal-key ownership only until Escape key-up, then restores the arrow
 hides, releases native focus, completes the cancellation handshake, and frees the
 single-selection gate. Menu and global-hotkey routes share this state machine and
 can begin another invocation immediately after restoration.
+AppKit panel order-in/order-out animation is disabled for this utility root.
+Without that, `isVisible` becomes false before the fade completes while
+CoreGraphics still reports the old fullscreen window; terminal outcomes now
+leave native enumeration on the next bounded window-server turn.
 
 Shortcut settings and runtime actions are separate names:
 `hotkey.capture-region` persists the accelerator, while `capture.region` is the

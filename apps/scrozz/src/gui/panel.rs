@@ -346,6 +346,8 @@ pub struct BehaviorController {
     behavior_log: Rc<RefCell<Vec<OverlayBehavior>>>,
     #[cfg(test)]
     cursor_log: Rc<RefCell<Vec<OverlayCursor>>>,
+    #[cfg(test)]
+    visibility_log: Rc<RefCell<Vec<bool>>>,
 }
 
 impl BehaviorController {
@@ -424,6 +426,26 @@ impl BehaviorController {
         let _ = cursor;
     }
 
+    /// Orders the retained utility surface in or out immediately.
+    ///
+    /// Viewport commands are still sent alongside this by the host for winit's
+    /// bookkeeping. The native call is what makes the terminal lifecycle
+    /// synchronous from the window server's point of view.
+    pub fn set_visible(&self, visible: bool) {
+        #[cfg(target_os = "macos")]
+        if let Some(overlay) = self.overlay.borrow_mut().as_mut()
+            && let Err(error) = overlay.set_visible(visible)
+        {
+            tracing::warn!(%error, visible, "could not change native overlay visibility");
+        }
+
+        #[cfg(test)]
+        self.visibility_log.borrow_mut().push(visible);
+
+        #[cfg(all(not(target_os = "macos"), not(test)))]
+        let _ = visible;
+    }
+
     /// Retries native behavior that had to wait for queued window commands.
     pub fn refresh(&self) {
         #[cfg(target_os = "linux")]
@@ -464,6 +486,11 @@ impl BehaviorController {
     #[cfg(test)]
     pub(crate) fn recorded_cursors(&self) -> Vec<OverlayCursor> {
         self.cursor_log.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_visibility(&self) -> Vec<bool> {
+        self.visibility_log.borrow().clone()
     }
 }
 
@@ -515,6 +542,9 @@ unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Opti
         Ok(report) => PanelReport::unsupported(report.detail),
         Err(err) => PanelReport::unsupported(err.to_string()),
     };
+    if let Err(error) = overlay.set_visible(false) {
+        tracing::warn!(%error, "could not order the initial overlay out");
+    }
     (report, Some(overlay))
 }
 

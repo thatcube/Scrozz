@@ -272,6 +272,12 @@ impl SettingsWindow {
         disposition
     }
 
+    /// Whether the ordinary Settings child viewport is open.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.open
+    }
+
     /// Whether a row is currently waiting for the user to press a combination.
     #[must_use]
     pub fn is_recording(&self) -> bool {

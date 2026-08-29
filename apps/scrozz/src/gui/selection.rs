@@ -377,6 +377,21 @@ impl ControllerPhase {
             Self::RestoringCards { .. } => "restoring-cards",
         }
     }
+
+    const fn wants_visible_selector(&self) -> bool {
+        matches!(
+            self,
+            Self::HideBeforePreparation { .. }
+                | Self::WaitingForPreparation { .. }
+                | Self::ReadyToSelect { .. }
+                | Self::Selecting { .. }
+                | Self::ReleaseBeforeHide { .. }
+        )
+    }
+
+    const fn allows_card_surface(&self) -> bool {
+        matches!(self, Self::Cards | Self::PreparingWithCards { .. })
+    }
 }
 
 impl ClientOverlaySelector {
@@ -720,6 +735,18 @@ impl CaptureSelector for ClientOverlaySelector {
 }
 
 impl ClientOverlayController {
+    /// Whether the native fullscreen selector must currently be ordered in.
+    #[must_use]
+    pub fn wants_visible_selector(&self) -> bool {
+        self.phase.wants_visible_selector()
+    }
+
+    /// Whether the shared root may currently present capture cards.
+    #[must_use]
+    pub fn allows_card_surface(&self) -> bool {
+        self.phase.allows_card_surface()
+    }
+
     /// Updates the work area capture cards return to after selection.
     pub fn set_cards_geometry(&mut self, geometry: OverlayGeometry) {
         self.cards = geometry;
@@ -874,6 +901,11 @@ impl ClientOverlayController {
                         let builder = child_viewport_builder(child);
                         decision =
                             ctx.show_viewport_immediate(child.id, builder, |child_ui, _class| {
+                                let child_ctx = child_ui.ctx();
+                                child_ctx.send_viewport_cmd(
+                                    egui::ViewportCommand::ContentProtected(true),
+                                );
+                                child_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                                 selector.update_display(child_ui, &child.display)
                             });
                         if decision != SelectionDecision::Pending {
@@ -997,6 +1029,7 @@ impl ClientOverlayController {
                         );
                     }
                     native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    native.set_visible(false);
                     viewports.hide_and_release_input(ctx);
                     ControllerPhase::HideAfterDecision {
                         id,
@@ -1014,7 +1047,6 @@ impl ClientOverlayController {
                 ControllerPhase::AwaitingCapture { id }
             }
             ControllerPhase::RestoringCards { restored } => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 let _ = restored.send(());
                 ControllerPhase::Cards
             }
@@ -1048,6 +1080,7 @@ impl ClientOverlayController {
                 surface_can_remain_visible: false,
             } if matches!(self.phase, ControllerPhase::Cards) => {
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                native.set_visible(false);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
@@ -1076,6 +1109,9 @@ impl ClientOverlayController {
                 claim_macos_desktop(native);
                 native.set_cursor(cursor);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
+                native.set_visible(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforePreparation { id, hidden, cursor };
             }
@@ -1136,6 +1172,7 @@ impl ClientOverlayController {
                 ) =>
             {
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                native.set_visible(false);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.phase = ControllerPhase::AwaitingCapture { id };
@@ -1162,6 +1199,7 @@ impl ClientOverlayController {
             {
                 if self.completion == Completion::CloseWindow {
                     native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    native.set_visible(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     let _ = restored.send(());
@@ -1169,6 +1207,7 @@ impl ClientOverlayController {
                 } else {
                     configure_viewport(ctx, native, self.cards, false);
                     native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    native.set_visible(false);
                     ctx.request_repaint();
                     self.phase = ControllerPhase::RestoringCards { restored };
                 }
@@ -1187,6 +1226,7 @@ impl ClientOverlayController {
             }
             BridgeEvent::Cancel => {
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                native.set_visible(false);
                 match &self.phase {
                     ControllerPhase::Selecting { viewports, .. }
                     | ControllerPhase::ReleaseBeforeHide { viewports, .. } => {
@@ -1579,6 +1619,7 @@ fn child_viewport_builder(child: &SelectorChildViewport) -> egui::ViewportBuilde
     scrozz_ui::overlay_app::viewport(child.geometry)
         .with_title("Scrozz Selector")
         .with_app_id(format!("com.scrozz.selector.{}", child.display.0))
+        .with_visible(false)
 }
 
 fn keep_child_viewports_alive(ctx: &egui::Context, viewports: &SelectorViewports) -> usize {
@@ -1586,7 +1627,11 @@ fn keep_child_viewports_alive(ctx: &egui::Context, viewports: &SelectorViewports
         ctx.show_viewport_immediate(
             child.id,
             child_viewport_builder(child),
-            |_child_ui, _class| {},
+            |child_ui, _class| {
+                let child_ctx = child_ui.ctx();
+                child_ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
+                child_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            },
         );
     }
     viewports.children.len()
@@ -1619,24 +1664,24 @@ fn configure_viewport(
     selection: bool,
 ) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
     #[cfg(target_os = "macos")]
     if selection {
         native.set_frame(logical_frame(geometry));
-    } else {
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        let _ = native;
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
-    }
+    let _ = native;
+    // Keep winit's geometry in sync even when AppKit is authoritative. The
+    // one-shot selector deliberately installs no retained native adapter, so
+    // these commands are its only route out of the parked bootstrap frame.
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
     ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!selection));
     // The viewport starts always-on-top. Re-queueing that level here would run
     // after the native macOS adapter raises selection to screen-saver level and
     // silently lower it back to an ordinary floating window.
     if selection {
+        native.set_visible(true);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
@@ -1974,6 +2019,11 @@ mod tests {
                 ControllerPhase::HideBeforePreparation { .. }
             )
         });
+        assert_eq!(
+            native.recorded_visibility(),
+            [true],
+            "{origin:?} must order the selector in only after its snapshot"
+        );
         assert_eq!(snapshots.load(Ordering::SeqCst), 1);
         controller.logic(&ctx, &native);
         wait_until(|| {
@@ -2038,6 +2088,11 @@ mod tests {
             Some(&OverlayCursor::Arrow),
             "{origin:?} cancellation must restore the ordinary cursor"
         );
+        assert_eq!(
+            native.recorded_visibility().last(),
+            Some(&false),
+            "{origin:?} cancellation must order the selector out"
+        );
 
         controller.logic(&ctx, &native);
         assert!(matches!(
@@ -2050,6 +2105,11 @@ mod tests {
         });
         controller.logic(&ctx, &native);
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
+        assert_eq!(
+            native.recorded_visibility().last(),
+            Some(&false),
+            "{origin:?} must remain ordered out after restoration without cards"
+        );
         assert!(matches!(first.join().unwrap(), Err(Error::Cancelled)));
 
         let second_selector = Arc::clone(&selector);
@@ -2068,9 +2128,11 @@ mod tests {
             2,
             "{origin:?} must permit an immediate second invocation"
         );
+        assert_eq!(native.recorded_visibility().last(), Some(&true));
 
         selector.cancel();
         controller.logic(&ctx, &native);
+        assert_eq!(native.recorded_visibility().last(), Some(&false));
         assert!(matches!(second.join().unwrap(), Err(Error::Cancelled)));
     }
 
@@ -2079,6 +2141,50 @@ mod tests {
         for origin in [CaptureOrigin::MenuBar, CaptureOrigin::GlobalHotkey] {
             run_escape_lifecycle(origin);
         }
+    }
+
+    #[test]
+    fn preparation_error_orders_out_the_fullscreen_surface_before_returning() {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let snapshot: Arc<SnapshotFn> = Arc::new(move |_| Ok(test_window_snapshot(bounds)));
+        let prepare: Arc<PrepareFn> =
+            Arc::new(|_, _, _| Err(Error::Platform("synthetic preparation failure".to_owned())));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            snapshot,
+            prepare,
+        );
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select_for_capture(
+                &SelectionOptions::for_mode(scrozz_core::SelectionMode::Window),
+                CursorMode::Hidden,
+                false,
+            );
+            worker_selector.capture_finished();
+            result
+        });
+        let ctx = egui::Context::default();
+        let (native, _) = crate::gui::panel::BehaviorController::recording();
+
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            native.recorded_visibility().last() == Some(&true)
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            native.recorded_visibility().last() == Some(&false)
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Cards)
+        });
+
+        let error = worker.join().expect("preparation worker").unwrap_err();
+        assert!(error.to_string().contains("synthetic preparation failure"));
+        assert_eq!(native.recorded_visibility().last(), Some(&false));
+        assert!(!controller.wants_visible_selector());
     }
 
     #[test]
@@ -2180,6 +2286,55 @@ mod tests {
         );
         assert!(
             (viewports.children[0].geometry.size() - egui::vec2(1706.67, 960.0)).length() < 0.01
+        );
+        let child = child_viewport_builder(&viewports.children[0]);
+        assert_eq!(
+            child.visible,
+            Some(false),
+            "secondary selectors must start hidden until capture protection is queued"
+        );
+    }
+
+    #[test]
+    fn selection_activation_moves_the_parked_root_before_showing_it() {
+        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
+            egui::pos2(120.0, 80.0),
+            egui::vec2(640.0, 480.0),
+        ));
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            configure_viewport(&ctx, &native, geometry, true);
+        });
+        output.textures_delta.clear();
+        let commands = &output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .commands;
+
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                egui::ViewportCommand::OuterPosition(position)
+                    if *position == geometry.position()
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                egui::ViewportCommand::InnerSize(size) if *size == geometry.size()
+            )
+        }));
+        assert!(
+            commands.iter().any(|command| {
+                matches!(command, egui::ViewportCommand::ContentProtected(true))
+            })
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| { matches!(command, egui::ViewportCommand::Visible(true)) })
         );
     }
 
@@ -2508,6 +2663,11 @@ mod tests {
             ["snapshot"],
             "native targets must be frozen before Scrozz changes its surface"
         );
+        assert_eq!(
+            native.recorded_visibility(),
+            [true],
+            "the selector may be ordered in only after the target snapshot"
+        );
 
         controller.logic(&ctx, &native);
         wait_until(|| {
@@ -2635,6 +2795,11 @@ mod tests {
             &controller.phase,
             ControllerPhase::HideAfterDecision { .. }
         ));
+        assert_eq!(
+            native.recorded_visibility().last(),
+            Some(&false),
+            "the terminal decision must order the fullscreen selector out"
+        );
         assert!(
             selected_rx.try_recv().is_err(),
             "capture must wait until the hidden selector frame has elapsed"
@@ -2695,6 +2860,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("capture finish should wait for restored cards");
         first_worker.join().expect("first selector worker");
+        assert_eq!(
+            native.recorded_visibility().last(),
+            Some(&false),
+            "restoring the card state must not reveal an empty fullscreen root"
+        );
 
         selector.cancel();
         second_worker.join().expect("second selector worker");
