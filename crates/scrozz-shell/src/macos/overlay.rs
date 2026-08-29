@@ -68,7 +68,8 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationPresentationOptions, NSCursor,
     NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
     NSRunningApplication, NSScreenSaverWindowLevel, NSStatusWindowLevel, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask, NSWorkspace,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowLevel, NSWindowSharingType,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::NSRect;
 use scrozz_core::{Error, LogicalRect, Result};
@@ -559,6 +560,11 @@ impl MacOverlay {
         window.setAcceptsMouseMovedEvents(!behavior.click_through);
         window.setOpaque(behavior.opaque);
         window.setHasShadow(behavior.has_shadow);
+        window.setSharingType(if behavior.capture_excluded {
+            NSWindowSharingType::None
+        } else {
+            NSWindowSharingType::ReadOnly
+        });
         window.setMovable(behavior.movable);
         window.setMovableByWindowBackground(false);
 
@@ -576,6 +582,123 @@ impl MacOverlay {
             non_activating: self.non_activating,
             detail,
         })
+    }
+
+    /// Orders the native surface in or out immediately.
+    ///
+    /// `orderOut:` is the correctness boundary for idle utility windows.
+    /// Transparency and click-through affect pixels and input, but both still
+    /// leave a real window in CoreGraphics/ScreenCaptureKit enumeration.
+    ///
+    /// Hiding is defensive: it also releases pointer/cursor ownership and any
+    /// selection presentation lease before returning.
+    ///
+    /// The native regression below checks the window server, not just AppKit's
+    /// local `isVisible` flag. The fixture is a one-point borderless utility
+    /// window and is ordered out again immediately.
+    ///
+    /// ```
+    /// use objc2::{MainThreadMarker, MainThreadOnly};
+    /// use objc2_app_kit::{
+    ///     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSWindow,
+    ///     NSWindowSharingType, NSWindowStyleMask,
+    /// };
+    /// use objc2_core_graphics::{
+    ///     CGWindowID, CGWindowListCreate, CGWindowListOption, kCGNullWindowID,
+    /// };
+    /// use objc2_foundation::{NSDate, NSPoint, NSRect, NSRunLoop, NSSize};
+    /// use scrozz_shell::macos::overlay::MacOverlay;
+    /// use scrozz_shell::overlay::OverlayBehavior;
+    ///
+    /// let mtm = MainThreadMarker::new().expect("doctests run on the main thread");
+    /// let app = NSApplication::sharedApplication(mtm);
+    /// let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    /// app.finishLaunching();
+    /// let window = unsafe {
+    ///     NSWindow::initWithContentRect_styleMask_backing_defer(
+    ///         NSWindow::alloc(mtm),
+    ///         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+    ///         NSWindowStyleMask::Borderless,
+    ///         NSBackingStoreType::Buffered,
+    ///         false,
+    ///     )
+    /// };
+    /// unsafe { window.setReleasedWhenClosed(false) };
+    /// let id = CGWindowID::try_from(window.windowNumber()).expect("positive window number");
+    /// let flush_window_server = || {
+    ///     NSRunLoop::mainRunLoop()
+    ///         .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.01));
+    /// };
+    /// let is_on_screen = || {
+    ///     CGWindowListCreate(
+    ///         CGWindowListOption::OptionOnScreenOnly,
+    ///         kCGNullWindowID,
+    ///     )
+    ///     .is_some_and(|list| {
+    ///         (0..list.count()).any(|index| {
+    ///             let slot = unsafe { list.value_at_index(index) };
+    ///             CGWindowID::try_from(slot.addr()).ok() == Some(id)
+    ///         })
+    ///     })
+    /// };
+    ///
+    /// let mut overlay = unsafe {
+    ///     MacOverlay::from_ns_window(
+    ///         objc2::rc::Retained::as_ptr(&window).cast_mut().cast(),
+    ///     )
+    /// }
+    /// .expect("adopt fixture");
+    /// overlay
+    ///     .apply(&OverlayBehavior::capture_card())
+    ///     .expect("configure fixture");
+    /// overlay.set_visible(false).expect("order out");
+    /// assert!(!is_on_screen(), "an idle overlay remained in CGWindowList");
+    ///
+    /// overlay.set_visible(true).expect("order front");
+    /// flush_window_server();
+    /// assert!(is_on_screen(), "the active fixture never reached the window server");
+    /// let active = overlay.diagnostics().expect("active diagnostics");
+    /// assert_eq!(active.sharing_type, NSWindowSharingType::None);
+    ///
+    /// overlay
+    ///     .apply(&OverlayBehavior::hidden_surface())
+    ///     .expect("release input");
+    /// overlay.set_visible(false).expect("terminal order out");
+    /// flush_window_server();
+    /// let idle = overlay.diagnostics().expect("idle diagnostics");
+    /// assert!(!idle.is_visible);
+    /// assert!(!idle.is_key);
+    /// assert!(idle.ignores_mouse_events);
+    /// assert!(!is_on_screen(), "a terminal overlay remained in CGWindowList");
+    /// window.close();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] if called off the main thread.
+    pub fn set_visible(&mut self, visible: bool) -> Result<()> {
+        let mtm = main_thread("changing overlay visibility")?;
+        // NSPanel otherwise infers a utility-window fade. During that animation
+        // `isVisible` is already false while CoreGraphics can still enumerate
+        // the old fullscreen surface, exactly the external-picker failure this
+        // method exists to prevent.
+        self.window
+            .setAnimationBehavior(NSWindowAnimationBehavior::None);
+        if visible {
+            self.window.orderFrontRegardless();
+        } else {
+            self.window.setIgnoresMouseEvents(true);
+            self.window.setAcceptsMouseMovedEvents(false);
+            if !self.window.areCursorRectsEnabled() {
+                self.window.enableCursorRects();
+            }
+            NSCursor::arrowCursor().set();
+            self.window.orderOut(None);
+            if let Some(lease) = self.presentation_lease.take() {
+                lease.release(mtm);
+            }
+        }
+        Ok(())
     }
 
     /// Sets just the stacking level.
@@ -753,6 +876,10 @@ impl MacOverlay {
             level: self.window.level(),
             collection_behavior: self.window.collectionBehavior().0,
             accepts_mouse_moved_events: self.window.acceptsMouseMovedEvents(),
+            ignores_mouse_events: self.window.ignoresMouseEvents(),
+            sharing_type: self.window.sharingType(),
+            window_number: self.window.windowNumber(),
+            is_key: self.window.isKeyWindow(),
             is_visible: self.window.isVisible(),
         })
     }
@@ -788,6 +915,14 @@ pub struct OverlayDiagnostics {
     pub collection_behavior: usize,
     /// Whether pointer motion is delivered while the panel is not active.
     pub accepts_mouse_moved_events: bool,
+    /// Whether pointer input passes through the whole native window.
+    pub ignores_mouse_events: bool,
+    /// Whether other processes may capture this utility surface.
+    pub sharing_type: NSWindowSharingType,
+    /// CoreGraphics/AppKit identity used by native enumeration probes.
+    pub window_number: isize,
+    /// Whether the surface currently owns keyboard focus.
+    pub is_key: bool,
     /// Whether the window is currently on screen.
     pub is_visible: bool,
 }

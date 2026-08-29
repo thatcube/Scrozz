@@ -58,7 +58,10 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
@@ -216,6 +219,20 @@ impl OverlayGeometry {
         Self {
             work_area,
             viewport: viewport.union(work_area),
+        }
+    }
+
+    /// A content-bounded viewport over a larger global work area.
+    ///
+    /// Capture cards still lay out against the complete work area, but their
+    /// native host needs to cover only the occupied stack column. The viewport
+    /// may therefore be smaller than `work_area`; [`Self::local`] preserves the
+    /// offset that keeps the same global card positions.
+    #[must_use]
+    pub fn with_content_viewport(work_area: Rect, viewport: Rect) -> Self {
+        Self {
+            work_area,
+            viewport,
         }
     }
 
@@ -440,7 +457,6 @@ enum Command {
     Collapse,
     Expand,
     ToggleDock,
-    Close,
 }
 
 #[derive(Default)]
@@ -450,6 +466,10 @@ struct Shared {
     commands: Mutex<Vec<Command>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
+    visible_content: AtomicBool,
+    visible_card_count: AtomicUsize,
+    geometry_locked: AtomicBool,
+    close_requested: AtomicBool,
 }
 
 /// The application's grip on a running overlay.
@@ -514,7 +534,8 @@ impl OverlayHandle {
 
     /// Ask the overlay window to close.
     pub fn close(&self) {
-        self.command(Command::Close);
+        self.shared.close_requested.store(true, Ordering::Release);
+        self.wake();
     }
 
     /// What the native layer reported, once the window exists.
@@ -527,6 +548,40 @@ impl OverlayHandle {
     #[must_use]
     pub fn is_attached(&self) -> bool {
         self.shared.ctx.lock().map(|c| c.is_some()).unwrap_or(false)
+    }
+
+    /// Whether a card, departure animation, or dock is currently drawable.
+    #[must_use]
+    pub fn has_visible_content(&self) -> bool {
+        self.shared.visible_content.load(Ordering::Acquire)
+    }
+
+    /// Number of card frames still drawable, including departure animations.
+    #[must_use]
+    pub fn visible_card_count(&self) -> usize {
+        self.shared.visible_card_count.load(Ordering::Acquire)
+    }
+
+    /// Whether pointer state is currently expressed in this viewport's local
+    /// coordinates and the viewport origin must not move.
+    #[must_use]
+    pub fn geometry_locked(&self) -> bool {
+        self.shared.geometry_locked.load(Ordering::Acquire)
+    }
+
+    /// Whether a newly submitted card still waits for the overlay's next pass.
+    #[must_use]
+    pub fn has_pending_content(&self) -> bool {
+        self.shared
+            .inbox
+            .lock()
+            .is_ok_and(|inbox| !inbox.is_empty())
+    }
+
+    /// Whether the native card surface needs to be ordered in.
+    #[must_use]
+    pub fn needs_visible_surface(&self) -> bool {
+        self.has_pending_content() || self.has_visible_content()
     }
 
     /// Ask the overlay to draw a frame, if it is running.
@@ -543,6 +598,10 @@ impl OverlayHandle {
             q.push(cmd);
         }
         self.wake();
+    }
+
+    fn take_close_request(&self) -> bool {
+        self.shared.close_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -821,6 +880,7 @@ impl OverlayApp {
         if let Ok(mut slot) = handle.shared.ctx.lock() {
             *slot = Some(ctx.clone());
         }
+        ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
 
         let report = options.panel.take().map_or_else(
             || PanelReport::unsupported("no native panel hook supplied"),
@@ -897,6 +957,16 @@ impl OverlayApp {
         self.passthrough_now = None;
     }
 
+    /// Processes commands that must work while the native root is ordered out.
+    ///
+    /// Eframe calls app logic for a hidden root but skips its UI pass. Close is
+    /// therefore kept out of the ordinary card-command queue.
+    pub fn logic(&self, ctx: &egui::Context) {
+        if self.handle.take_close_request() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn emit(&self, event: OverlayEvent) {
         if let Ok(mut q) = self.handle.shared.outbox.lock() {
             q.push(event);
@@ -941,7 +1011,7 @@ impl OverlayApp {
         }
     }
 
-    fn run_commands(&mut self, ctx: &egui::Context, m: &Motion) {
+    fn run_commands(&mut self, m: &Motion) {
         for cmd in self.take_commands() {
             match cmd {
                 Command::Dismiss(id) => {
@@ -965,7 +1035,6 @@ impl OverlayApp {
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
-                Command::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
     }
@@ -1137,11 +1206,15 @@ impl eframe::App for OverlayApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        Self::logic(self, ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let m = Motion::from_context(&ctx);
 
-        self.run_commands(&ctx, &m);
+        self.run_commands(&m);
         self.ingest(&m);
         self.reconcile(&ctx);
         self.stack.advance(&m);
@@ -1264,7 +1337,18 @@ impl eframe::App for OverlayApp {
         }
 
         self.apply_passthrough(&ctx, &hits, pointer);
-
+        self.handle
+            .shared
+            .visible_content
+            .store(!frames.is_empty() || dock_hit.is_some(), Ordering::Release);
+        self.handle
+            .shared
+            .visible_card_count
+            .store(frames.len(), Ordering::Release);
+        self.handle
+            .shared
+            .geometry_locked
+            .store(self.dragging.is_some(), Ordering::Release);
         // The single place repainting is requested: idle costs nothing, an
         // animation gets a continuous repaint, and a pending wake gets a timer.
         self.stack.activity(&m).apply(&ctx);
@@ -1308,6 +1392,20 @@ mod tests {
         assert_eq!(g.size(), viewport.size());
         assert_eq!(g.viewport(), viewport);
         assert_eq!(g.local(), rect(80.0, 0.0, 1360.0, 800.0));
+    }
+
+    #[test]
+    fn content_viewport_keeps_global_work_area_offsets() {
+        let work_area = rect(0.0, 25.0, 1440.0, 850.0);
+        let viewport = rect(24.0, 650.0, 282.0, 210.0);
+        let geometry = OverlayGeometry::with_content_viewport(work_area, viewport);
+
+        assert_eq!(geometry.viewport(), viewport);
+        assert_eq!(
+            geometry.local(),
+            rect(-24.0, -625.0, 1440.0, 850.0),
+            "card layout remains anchored to the original global work area"
+        );
     }
 
     #[test]
@@ -1425,14 +1523,31 @@ mod tests {
     fn handle_queues_before_a_window_exists() {
         let h = OverlayHandle::new();
         assert!(!h.is_attached());
+        assert!(!h.needs_visible_surface());
         h.push(CaptureRequest::new(
             "Shot.png",
             Provenance::Display,
             (100, 50),
         ));
         assert_eq!(h.shared.inbox.lock().unwrap().len(), 1);
+        assert!(
+            h.needs_visible_surface(),
+            "pending card content must wake and reveal the ordered-out root"
+        );
         assert!(h.drain_events().is_empty());
         assert!(h.panel_report().is_none());
+    }
+
+    #[test]
+    fn close_is_a_hidden_root_command_not_a_ui_command() {
+        let h = OverlayHandle::new();
+        h.close();
+        assert!(h.take_close_request());
+        assert!(!h.take_close_request(), "close is consumed exactly once");
+        assert!(
+            h.shared.commands.lock().unwrap().is_empty(),
+            "an idle root has no UI pass available to drain card commands"
+        );
     }
 
     #[test]
@@ -1479,6 +1594,7 @@ mod tests {
         assert_eq!(v.taskbar, Some(false));
         assert_eq!(v.resizable, Some(false));
         assert_eq!(v.active, Some(false));
+        assert_eq!(v.visible, None);
         assert_eq!(v.window_level, Some(egui::WindowLevel::AlwaysOnTop));
         assert_eq!(v.position, Some(Pos2::new(0.0, 25.0)));
         assert_eq!(v.inner_size, Some(Vec2::new(1440.0, 850.0)));

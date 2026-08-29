@@ -49,6 +49,7 @@ const IDLE: Duration = Duration::from_millis(16);
 const WORK_AREA_REFRESH: Duration = Duration::from_millis(250);
 
 type SharedGeometry = Arc<Mutex<OverlayGeometry>>;
+const PARKED_ROOT_ORIGIN: f32 = -100_000.0;
 
 /// Something that can drive an [`App`] to completion.
 /// Writes the final report the way `main` would have.
@@ -82,6 +83,43 @@ pub trait Host {
 
     /// The selector that shares this host's event loop.
     fn selector(&self) -> Arc<dyn CaptureSelector>;
+}
+
+fn card_surface_geometry(base: OverlayGeometry, card_count: usize) -> OverlayGeometry {
+    let layout =
+        scrozz_ui::stack::StackLayout::new(base.local(), scrozz_ui::stack::CardMetrics::default());
+    let last = card_count.saturating_sub(1).min(layout.slots() - 1);
+    let occupied = layout.slot_rect(0).union(layout.slot_rect(last));
+    let viewport = occupied
+        .translate(base.position().to_vec2())
+        .expand(card_gesture_envelope())
+        .intersect(base.viewport());
+    OverlayGeometry::with_content_viewport(base.work_area, viewport)
+}
+
+fn card_gesture_envelope() -> f32 {
+    let gestures = scrozz_ui::stack::GestureConfig::default();
+    gestures
+        .dismiss_dist
+        .max(gestures.dragout_dist)
+        .max(gestures.collapse_dist)
+        + scrozz_ui::card::SHADOW_BLEED
+}
+
+fn parked_native_options(geometry: OverlayGeometry) -> eframe::NativeOptions {
+    let mut options = scrozz_ui::overlay_app::native_options(geometry);
+    options.viewport = options.viewport.with_visible(false);
+    #[cfg(target_os = "macos")]
+    {
+        // Eframe orders the root in after its first rendered frame even when it
+        // was constructed hidden. Keep that bootstrap frame outside every
+        // display; Driver moves it to live geometry only for real content.
+        options.viewport = options
+            .viewport
+            .with_position(egui::pos2(PARKED_ROOT_ORIGIN, PARKED_ROOT_ORIGIN))
+            .with_inner_size(egui::vec2(1.0, 1.0));
+    }
+    options
 }
 
 /// Drives the app from a plain sleep loop, with no window.
@@ -182,6 +220,7 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
 pub struct Windowed {
     handle: OverlayHandle,
     emit: Emit,
+    base_geometry: OverlayGeometry,
     geometry: OverlayGeometry,
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
@@ -194,7 +233,8 @@ impl Windowed {
     /// A host with an overlay handle that works before the window exists.
     #[must_use]
     pub fn new(emit: Emit) -> Self {
-        let (geometry, display_id) = work_area();
+        let (base_geometry, display_id) = work_area();
+        let geometry = card_surface_geometry(base_geometry, 1);
         let pointer_geometry = Arc::new(Mutex::new(geometry));
         let native = BehaviorController::default();
         let (client, selection) = ClientOverlaySelector::managed(geometry);
@@ -209,6 +249,7 @@ impl Windowed {
         Self {
             handle: OverlayHandle::new(),
             emit,
+            base_geometry,
             geometry,
             display_id,
             pointer_geometry,
@@ -230,6 +271,7 @@ impl Host for Windowed {
         let Self {
             handle,
             emit,
+            base_geometry,
             geometry,
             display_id,
             pointer_geometry,
@@ -255,10 +297,9 @@ impl Host for Windowed {
 
         eframe::run_native(
             "Scrozz",
-            scrozz_ui::overlay_app::native_options(geometry),
+            parked_native_options(geometry),
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
-                native.set_frame(logical_frame(geometry));
                 Ok(Box::new(Driver {
                     app,
                     overlay,
@@ -269,9 +310,12 @@ impl Host for Windowed {
                     settings: scrozz_ui::settings::SettingsWindow::default(),
                     native,
                     display_id,
+                    base_geometry,
                     pointer_geometry,
                     next_work_area_refresh: Instant::now(),
                     pending_native_frame: None,
+                    root_mode: RootSurfaceMode::Hidden,
+                    startup_rehide: true,
                     announced: false,
                     stopped: false,
                 }))
@@ -362,7 +406,7 @@ pub fn select_once(
         })?;
 
     let geometry = OverlayGeometry::default();
-    let mut native_options = scrozz_ui::overlay_app::native_options(geometry);
+    let mut native_options = parked_native_options(geometry);
     native_options.viewport = native_options
         .viewport
         .with_visible(false)
@@ -444,11 +488,18 @@ struct Driver {
     settings: scrozz_ui::settings::SettingsWindow,
     native: BehaviorController,
     display_id: Option<DisplayId>,
+    /// Complete display work-area geometry card slots are anchored against.
+    base_geometry: OverlayGeometry,
     pointer_geometry: SharedGeometry,
     next_work_area_refresh: Instant,
     /// Work-area frame to apply natively on the pass after queued viewport
     /// commands have reached winit.
     pending_native_frame: Option<OverlayGeometry>,
+    /// Last presentation role applied to the shared native root window.
+    root_mode: RootSurfaceMode,
+    /// Eframe orders the root in after its first rendered frame regardless of
+    /// its initial visibility; reassert hidden once after that pass.
+    startup_rehide: bool,
     announced: bool,
     stopped: bool,
 }
@@ -483,6 +534,138 @@ impl Driver {
         self.handle
             .panel_report()
             .is_some_and(|report| report.non_activating)
+    }
+
+    fn sync_root_visibility(&mut self, ctx: &egui::Context) {
+        let selector_visible = self.selection.wants_visible_selector();
+        let mode = root_surface_mode(
+            selector_visible,
+            self.selection.allows_card_surface(),
+            self.handle.needs_visible_surface(),
+            self.settings.is_open(),
+        );
+        let startup_rehide = self.startup_rehide && mode == RootSurfaceMode::Hidden;
+        if mode == self.root_mode && !startup_rehide {
+            return;
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
+        match mode {
+            RootSurfaceMode::Selector => {
+                self.startup_rehide = false;
+                self.native.set_visible(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.request_repaint();
+            }
+            RootSurfaceMode::Cards => {
+                self.startup_rehide = false;
+                let geometry = self.overlay.geometry();
+                self.native.set_frame(logical_frame(geometry));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+                self.native.set_visible(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.request_repaint();
+            }
+            RootSurfaceMode::Parked => {
+                self.startup_rehide = false;
+                let frame = scrozz_core::LogicalRect::new(
+                    scrozz_core::LogicalPoint::new(
+                        f64::from(PARKED_ROOT_ORIGIN),
+                        f64::from(PARKED_ROOT_ORIGIN),
+                    ),
+                    scrozz_core::LogicalSize::new(1.0, 1.0),
+                );
+                self.native.set_frame(frame);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    PARKED_ROOT_ORIGIN,
+                    PARKED_ROOT_ORIGIN,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
+                self.native.set_visible(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.request_repaint();
+            }
+            RootSurfaceMode::Hidden => {
+                self.native
+                    .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                self.native.set_cursor(scrozz_shell::OverlayCursor::Arrow);
+                self.native.set_visible(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                if self.startup_rehide {
+                    if ctx.cumulative_frame_nr() == 0 {
+                        ctx.request_repaint();
+                    } else {
+                        self.startup_rehide = false;
+                    }
+                }
+            }
+        }
+        self.root_mode = mode;
+    }
+
+    fn sync_card_geometry(&mut self, ctx: &egui::Context) {
+        if !self.selection.allows_card_surface() || self.handle.geometry_locked() {
+            return;
+        }
+        let count = self
+            .app
+            .showing()
+            .max(self.handle.visible_card_count())
+            .max(1);
+        let geometry = card_surface_geometry(self.base_geometry, count);
+        if geometry == self.overlay.geometry() {
+            return;
+        }
+
+        self.overlay
+            .set_geometry(geometry, ctx, &scrozz_ui::motion::Motion::from_context(ctx));
+        self.pending_native_frame = Some(geometry);
+        if self.root_mode == RootSurfaceMode::Cards {
+            self.native.set_frame(logical_frame(geometry));
+        }
+        self.selection.set_cards_geometry(geometry);
+        if let Ok(mut current) = self.pointer_geometry.lock() {
+            *current = geometry;
+        }
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        let edits = self.settings.show(
+            ctx,
+            scrozz_ui::settings::BuildInfo {
+                version: crate::build_info::VERSION,
+                build: crate::build_info::BUILD,
+            },
+            &self.app.shortcut_rows(),
+        );
+        self.app.edit_shortcuts(&edits);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSurfaceMode {
+    Hidden,
+    Parked,
+    Cards,
+    Selector,
+}
+
+const fn root_surface_mode(
+    selector_visible: bool,
+    cards_allowed: bool,
+    card_content: bool,
+    auxiliary_open: bool,
+) -> RootSurfaceMode {
+    if selector_visible {
+        RootSurfaceMode::Selector
+    } else if cards_allowed && card_content {
+        RootSurfaceMode::Cards
+    } else if auxiliary_open {
+        RootSurfaceMode::Parked
+    } else {
+        RootSurfaceMode::Hidden
     }
 }
 
@@ -531,6 +714,7 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        self.overlay.logic(ctx);
         if !self.selection.owns_surface()
             && let Some(geometry) = self.pending_native_frame.take()
         {
@@ -546,18 +730,9 @@ impl eframe::App for Driver {
             }
         } else if Instant::now() >= self.next_work_area_refresh {
             self.next_work_area_refresh = Instant::now() + WORK_AREA_REFRESH;
-            let geometry = refreshed_work_area(self.overlay.geometry(), &mut self.display_id);
-            if geometry != self.overlay.geometry() {
-                self.overlay.set_geometry(
-                    geometry,
-                    ctx,
-                    &scrozz_ui::motion::Motion::from_context(ctx),
-                );
-                self.pending_native_frame = Some(geometry);
-                self.selection.set_cards_geometry(geometry);
-                if let Ok(mut current) = self.pointer_geometry.lock() {
-                    *current = geometry;
-                }
+            let geometry = refreshed_work_area(self.base_geometry, &mut self.display_id);
+            if geometry != self.base_geometry {
+                self.base_geometry = geometry;
             }
         }
 
@@ -565,6 +740,8 @@ impl eframe::App for Driver {
         if self.app.take_settings_request() {
             self.settings.open();
         }
+        self.sync_card_geometry(ctx);
+        self.sync_root_visibility(ctx);
         if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
             let report = self.app.report();
@@ -598,18 +775,7 @@ impl eframe::App for Driver {
         } else {
             self.overlay.ui(ui, frame);
         }
-        // Drawn from the app's own view of the shortcuts, and edits are handed
-        // straight back to it: the pane reports intent, the app decides whether
-        // the OS will accept it.
-        let edits = self.settings.show(
-            ui.ctx(),
-            scrozz_ui::settings::BuildInfo {
-                version: crate::build_info::VERSION,
-                build: crate::build_info::BUILD,
-            },
-            &self.app.shortcut_rows(),
-        );
-        self.app.edit_shortcuts(&edits);
+        self.show_settings(ui.ctx());
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -721,7 +887,7 @@ fn geometry_for_display(display: &Display) -> OverlayGeometry {
         egui::vec2(area.size.width as f32, area.size.height as f32),
     );
     let bounds_bottom = (display.bounds.origin.y + display.bounds.size.height) as f32;
-    let viewport_bottom = (work_area.bottom() + scrozz_ui::card::SHADOW_BLEED).min(bounds_bottom);
+    let viewport_bottom = (work_area.bottom() + card_gesture_envelope()).min(bounds_bottom);
     let viewport = egui::Rect::from_min_max(
         work_area.min,
         egui::pos2(work_area.right(), viewport_bottom),
@@ -816,6 +982,103 @@ mod tests {
     }
 
     #[test]
+    fn root_surface_mode_is_content_and_lifecycle_bounded() {
+        assert_eq!(
+            root_surface_mode(false, true, false, false),
+            RootSurfaceMode::Hidden
+        );
+        assert_eq!(
+            root_surface_mode(true, false, false, false),
+            RootSurfaceMode::Selector
+        );
+        assert_eq!(
+            root_surface_mode(false, true, true, false),
+            RootSurfaceMode::Cards
+        );
+        assert_eq!(
+            root_surface_mode(false, false, true, false),
+            RootSurfaceMode::Hidden,
+            "cards stay hidden during capture even if old cards still exist"
+        );
+        assert_eq!(
+            root_surface_mode(false, true, false, true),
+            RootSurfaceMode::Parked,
+            "an auxiliary child gets an off-screen parent without exposing it"
+        );
+    }
+
+    #[test]
+    fn app_host_parks_only_its_private_root_bootstrap() {
+        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
+            egui::pos2(40.0, 30.0),
+            egui::vec2(800.0, 600.0),
+        ));
+        let generic = scrozz_ui::overlay_app::native_options(geometry);
+        let parked = parked_native_options(geometry);
+
+        assert_eq!(generic.viewport.visible, None);
+        assert_eq!(parked.viewport.visible, Some(false));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                parked.viewport.position,
+                Some(egui::pos2(-100_000.0, -100_000.0))
+            );
+            assert_eq!(parked.viewport.inner_size, Some(egui::vec2(1.0, 1.0)));
+        }
+    }
+
+    #[test]
+    fn card_surface_is_bounded_to_the_occupied_stack_column() {
+        let base = OverlayGeometry::with_viewport(
+            egui::Rect::from_min_size(egui::pos2(0.0, 33.0), egui::vec2(1728.0, 950.0)),
+            egui::Rect::from_min_size(egui::pos2(0.0, 33.0), egui::vec2(1728.0, 1084.0)),
+        );
+        let one = card_surface_geometry(base, 1);
+        let three = card_surface_geometry(base, 3);
+
+        assert!(one.viewport().width() < 450.0);
+        assert!(one.viewport().height() < 500.0);
+        assert!(three.viewport().width() < 450.0);
+        assert!(three.viewport().height() > one.viewport().height());
+        assert!(three.viewport().height() < base.viewport().height());
+        assert_eq!(one.work_area, base.work_area);
+        assert_eq!(three.work_area, base.work_area);
+
+        let layout = scrozz_ui::stack::StackLayout::new(
+            base.local(),
+            scrozz_ui::stack::CardMetrics::default(),
+        );
+        let resting = layout.slot_rect(0).translate(base.position().to_vec2());
+        let gestures = scrozz_ui::stack::GestureConfig::default();
+        assert!(
+            one.viewport()
+                .contains_rect(resting.translate(egui::vec2(gestures.dragout_dist, 0.0)))
+        );
+        assert!(
+            one.viewport()
+                .contains_rect(resting.translate(egui::vec2(0.0, gestures.collapse_dist)))
+        );
+    }
+
+    #[test]
+    fn compact_card_geometry_preserves_global_slot_positions() {
+        let base = OverlayGeometry::with_viewport(
+            egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1200.0, 800.0)),
+            egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1200.0, 848.0)),
+        );
+        let compact = card_surface_geometry(base, 2);
+        let metrics = scrozz_ui::stack::CardMetrics::default();
+        let base_slot = scrozz_ui::stack::StackLayout::new(base.local(), metrics).slot_rect(1);
+        let compact_slot =
+            scrozz_ui::stack::StackLayout::new(compact.local(), metrics).slot_rect(1);
+
+        assert_eq!(
+            base_slot.translate(base.position().to_vec2()),
+            compact_slot.translate(compact.position().to_vec2())
+        );
+    }
+
+    #[test]
     fn pointer_probe_is_available_on_macos() {
         let probe = pointer_probe(Arc::new(Mutex::new(OverlayGeometry::default())));
         assert_eq!(probe.is_some(), cfg!(target_os = "macos"));
@@ -874,7 +1137,7 @@ mod tests {
         let bottom_card = layout.slot_rect(0);
 
         assert_eq!(geometry.position(), egui::pos2(0.0, 33.0));
-        assert_eq!(geometry.viewport().bottom(), 1031.0);
+        assert_eq!(geometry.viewport().bottom(), 1117.0);
         assert_eq!(geometry.work_area.bottom(), 983.0);
         assert_eq!(
             geometry.position().y + bottom_card.bottom(),
@@ -883,8 +1146,8 @@ mod tests {
         );
         assert_eq!(
             geometry.size().y - bottom_card.bottom(),
-            50.0,
-            "the viewport leaves the two-point gap plus the full shadow bleed"
+            136.0,
+            "the viewport preserves the downward gesture envelope within display bounds"
         );
     }
 

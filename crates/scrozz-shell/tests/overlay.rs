@@ -275,6 +275,10 @@ fn the_default_behaviour_is_a_normal_window() {
     assert_eq!(behavior.level, OverlayLevel::Normal);
     assert!(!behavior.click_through);
     assert!(!behavior.join_all_spaces);
+    assert!(
+        !behavior.capture_excluded,
+        "ordinary Settings/editor windows remain externally capturable"
+    );
 }
 
 #[test]
@@ -299,6 +303,10 @@ fn a_capture_card_floats_without_taking_focus() {
         !card.suppress_system_ui,
         "capture cards must not change normal Dock behavior"
     );
+    assert!(
+        card.capture_excluded,
+        "utility chrome must not become an external window-capture candidate"
+    );
 }
 
 #[test]
@@ -309,6 +317,7 @@ fn a_hidden_surface_cannot_intercept_pointer_input() {
         !hidden.accepts_key,
         "an invisible overlay must relinquish both pointer and keyboard input"
     );
+    assert!(hidden.capture_excluded);
 }
 
 #[test]
@@ -324,6 +333,7 @@ fn the_selection_overlay_sits_above_the_menu_bar() {
         overlay.suppress_system_ui,
         "the Dock must not respond to the pointer during selection"
     );
+    assert!(overlay.capture_excluded);
 }
 
 #[test]

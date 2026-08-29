@@ -236,6 +236,12 @@ pub struct OverlayBehavior {
     pub opaque: bool,
     /// Whether the OS draws a drop shadow behind the window.
     pub has_shadow: bool,
+    /// Whether other processes may capture or share this utility surface.
+    ///
+    /// This is true for Scrozz's card and selector chrome, never for ordinary
+    /// Settings/editor windows. It supplements real visibility management; an
+    /// excluded window must still be ordered out while idle.
+    pub capture_excluded: bool,
     /// Whether the user can drag the window.
     ///
     /// `false` per D27: capture cards live in fixed slots because the slot *is*
@@ -258,6 +264,7 @@ impl Default for OverlayBehavior {
             hides_on_deactivate: false,
             opaque: true,
             has_shadow: true,
+            capture_excluded: false,
             movable: true,
         }
     }
@@ -287,6 +294,7 @@ impl OverlayBehavior {
             hides_on_deactivate: false,
             opaque: false,
             has_shadow: false,
+            capture_excluded: true,
             movable: false,
         }
     }
@@ -324,6 +332,7 @@ impl OverlayBehavior {
             hides_on_deactivate: false,
             opaque: false,
             has_shadow: false,
+            capture_excluded: true,
             movable: false,
         }
     }

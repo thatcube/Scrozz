@@ -441,6 +441,9 @@ fn native_options_carry_the_viewport_and_never_persist_geometry() {
     let options = overlay_app::native_options(geometry);
 
     assert_eq!(options.viewport.decorations, Some(false));
+    assert_eq!(options.viewport.visible, None);
+    assert_eq!(options.viewport.position, Some(geometry.position()));
+    assert_eq!(options.viewport.inner_size, Some(geometry.size()));
     assert!(
         !options.persist_window,
         "a restored window position would drop the overlay somewhere other \
