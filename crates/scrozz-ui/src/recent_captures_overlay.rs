@@ -1,4 +1,4 @@
-//! The floating overlay window that hosts the capture stack.
+//! The floating Recent Captures Overlay window that hosts the capture stack.
 //!
 //! [`stack`](crate::stack) knows where every card goes; [`card`](crate::card)
 //! knows how one is painted. This module is the window they live in, and the
@@ -14,7 +14,7 @@
 //! that as egui can express. `scrozz-ui` does not depend on `scrozz-shell` and
 //! is `#![forbid(unsafe_code)]`, so additional native configuration is supplied
 //! through [`PanelHook`]. The hook reports whether non-activation is genuinely
-//! available through [`OverlayHandle::panel_report`].
+//! available through [`RecentCapturesOverlayHandle::panel_report`].
 //!
 //! # Anchoring
 //!
@@ -72,7 +72,8 @@ use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
 use crate::pinned;
-use crate::stack::{CaptureStack, CardFrame, CardId, CardState, Intent, dock};
+pub use crate::stack::RecentCapturesPlacement;
+use crate::stack::{CaptureStack, CardFrame, CardId, CardMetrics, CardState, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
@@ -86,6 +87,119 @@ pub const RESAMPLE_SECS: f32 = 0.35;
 pub const THUMBNAIL_PX: u32 = 512;
 /// Longest edge accepted for a pinned-capture GPU texture.
 pub const PIN_TEXTURE_PX: u32 = 2_048;
+
+/// What automatic cleanup does once a card's interval elapses.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RecentCapturesAutoCloseAction {
+    /// Hide the card only when its artifact is already retained elsewhere.
+    #[default]
+    Hide,
+    /// Save an unsaved card to the configured Export Location, then hide it.
+    SaveThenHide,
+}
+
+impl RecentCapturesAutoCloseAction {
+    /// Stable persisted setting value.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Hide => "hide",
+            Self::SaveThenHide => "save-then-hide",
+        }
+    }
+
+    /// Parses a persisted setting value.
+    #[must_use]
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "hide" => Some(Self::Hide),
+            "save-then-hide" => Some(Self::SaveThenHide),
+            _ => None,
+        }
+    }
+}
+
+/// Default behavior of the Save button in the Recent Captures Overlay.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RecentCapturesSaveBehavior {
+    /// Save directly to the configured Export Location.
+    #[default]
+    ExportLocation,
+    /// Open the native destination chooser.
+    ChooseDestination,
+}
+
+impl RecentCapturesSaveBehavior {
+    /// Stable persisted setting value.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::ExportLocation => "export-location",
+            Self::ChooseDestination => "choose-destination",
+        }
+    }
+
+    /// Parses a persisted setting value.
+    #[must_use]
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "export-location" => Some(Self::ExportLocation),
+            "choose-destination" => Some(Self::ChooseDestination),
+            _ => None,
+        }
+    }
+}
+
+/// Complete behavior contract for the Recent Captures Overlay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecentCapturesOverlaySettings {
+    /// Display edge where cards are anchored.
+    pub placement: RecentCapturesPlacement,
+    /// Follow the active display instead of staying on the current display.
+    pub follow_active_display: bool,
+    /// Preferred 16:10 card width in logical points.
+    pub card_width: f32,
+    /// Whether elapsed-time cleanup is enabled.
+    pub auto_close_enabled: bool,
+    /// What cleanup does when its interval elapses.
+    pub auto_close_action: RecentCapturesAutoCloseAction,
+    /// Elapsed interval before cleanup, in seconds.
+    pub auto_close_seconds: u32,
+    /// Hide after an accepted external drag unless Option/Alt is held.
+    pub close_after_drag: bool,
+    /// Hide only after a confirmed cloud upload succeeds.
+    pub close_after_upload: bool,
+    /// Default Save-button routing; Option/Alt temporarily inverts it.
+    pub save_behavior: RecentCapturesSaveBehavior,
+}
+
+impl Default for RecentCapturesOverlaySettings {
+    fn default() -> Self {
+        Self {
+            placement: RecentCapturesPlacement::Left,
+            follow_active_display: false,
+            card_width: CardMetrics::PREFERRED_WIDTH,
+            auto_close_enabled: false,
+            auto_close_action: RecentCapturesAutoCloseAction::Hide,
+            auto_close_seconds: 30,
+            close_after_drag: true,
+            close_after_upload: false,
+            save_behavior: RecentCapturesSaveBehavior::ExportLocation,
+        }
+    }
+}
+
+impl RecentCapturesOverlaySettings {
+    /// Returns a bounded settings value suitable for layout and timers.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.card_width = self
+            .card_width
+            .clamp(CardMetrics::MIN_WIDTH, CardMetrics::MAX_WIDTH);
+        self.auto_close_seconds = self.auto_close_seconds.clamp(5, 3_600);
+        self
+    }
+}
 
 /// Native window drags can report a new frame on every repaint. Persist only
 /// after movement settles so one gesture produces one durable update.
@@ -118,7 +232,7 @@ impl PanelReport {
         }
     }
 
-    /// A successful conversion.
+    /// A successful native configuration.
     #[must_use]
     pub fn converted(detail: impl Into<String>) -> Self {
         Self {
@@ -132,8 +246,8 @@ impl PanelReport {
 ///
 /// Called once, from inside the `eframe` app creator. This crate is
 /// `#![forbid(unsafe_code)]` and does not depend on `scrozz-shell`, so the
-/// conversion cannot live here; the application crate, which depends on both,
-/// supplies it.
+/// native configuration cannot live here; the application crate, which depends
+/// on both, supplies it.
 ///
 /// [`eframe::CreationContext`] implements `HasWindowHandle`, which is where the
 /// platform handle comes from. On macOS the whole hook is roughly:
@@ -141,7 +255,7 @@ impl PanelReport {
 /// ```ignore
 /// use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 /// use scrozz_shell::overlay::{OverlayBehavior, NativeOverlay};
-/// use scrozz_ui::overlay_app::PanelReport;
+/// use scrozz_ui::recent_captures_overlay::PanelReport;
 ///
 /// let hook = Box::new(|cc: &eframe::CreationContext<'_>| {
 ///     let Ok(handle) = cc.window_handle() else {
@@ -214,7 +328,7 @@ pub enum Passthrough {
 /// Where the overlay window sits, in the OS's logical, top-left-origin
 /// coordinate space.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OverlayGeometry {
+pub struct RecentCapturesOverlayGeometry {
     /// The display's work area: bounds minus the menu bar and the Dock.
     pub work_area: Rect,
     /// The transparent native viewport. It may extend beyond [`Self::work_area`]
@@ -222,7 +336,7 @@ pub struct OverlayGeometry {
     viewport: Rect,
 }
 
-impl OverlayGeometry {
+impl RecentCapturesOverlayGeometry {
     /// A geometry covering `work_area`.
     #[must_use]
     pub const fn new(work_area: Rect) -> Self {
@@ -284,23 +398,23 @@ impl OverlayGeometry {
     }
 }
 
-impl Default for OverlayGeometry {
+impl Default for RecentCapturesOverlayGeometry {
     fn default() -> Self {
         Self::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 875.0)))
     }
 }
 
 /// Everything the overlay needs that is not the stack itself.
-pub struct OverlayOptions {
+pub struct RecentCapturesOverlayOptions {
     /// Where the window goes.
-    pub geometry: OverlayGeometry,
+    pub geometry: RecentCapturesOverlayGeometry,
     /// Light or dark.
     pub appearance: Appearance,
     /// Click-through policy.
     pub passthrough: Passthrough,
     /// Optional exact pointer source; see [`PointerProbe`].
     pub probe: Option<PointerProbe>,
-    /// Optional native conversion; see [`PanelHook`].
+    /// Optional safe native configuration; see [`PanelHook`].
     pub panel: Option<PanelHook>,
     /// Longest thumbnail edge in pixels.
     pub thumbnail_px: u32,
@@ -314,11 +428,13 @@ pub struct OverlayOptions {
     pub pin_lock_escapes: Vec<LockEscape>,
     /// Optional live display query for pin creation and hot-plug reconciliation.
     pub pin_topology_probe: Option<PinTopologyProbe>,
+    /// User-configurable Recent Captures behavior.
+    pub settings: RecentCapturesOverlaySettings,
 }
 
-impl Default for OverlayOptions {
+impl Default for RecentCapturesOverlayOptions {
     fn default() -> Self {
-        let geometry = OverlayGeometry::default();
+        let geometry = RecentCapturesOverlayGeometry::default();
         Self {
             geometry,
             appearance: Appearance::Dark,
@@ -333,13 +449,14 @@ impl Default for OverlayOptions {
             ),
             pin_lock_escapes: Vec::new(),
             pin_topology_probe: None,
+            settings: RecentCapturesOverlaySettings::default(),
         }
     }
 }
 
-impl std::fmt::Debug for OverlayOptions {
+impl std::fmt::Debug for RecentCapturesOverlayOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OverlayOptions")
+        f.debug_struct("RecentCapturesOverlayOptions")
             .field("geometry", &self.geometry)
             .field("appearance", &self.appearance)
             .field("passthrough", &self.passthrough)
@@ -351,6 +468,7 @@ impl std::fmt::Debug for OverlayOptions {
             .field("pin_support", &self.pin_support)
             .field("pin_lock_escapes", &self.pin_lock_escapes)
             .field("pin_topology_probe", &self.pin_topology_probe.is_some())
+            .field("settings", &self.settings)
             .finish()
     }
 }
@@ -584,7 +702,7 @@ pub enum DismissReason {
 /// Something the user did to the overlay.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum OverlayEvent {
+pub enum RecentCapturesOverlayEvent {
     /// A capture entered the pile.
     Pushed {
         /// The new card.
@@ -606,6 +724,8 @@ pub enum OverlayEvent {
     SaveRequested {
         /// The card.
         id: CardId,
+        /// Whether the native destination chooser should be used.
+        choose_destination: bool,
     },
     /// Open this capture in the annotation editor.
     AnnotateRequested {
@@ -614,7 +734,7 @@ pub enum OverlayEvent {
     },
     /// Open this recording in the video editor.
     ///
-    /// Distinct from [`OverlayEvent::AnnotateRequested`] because the two open
+    /// Distinct from [`RecentCapturesOverlayEvent::AnnotateRequested`] because the two open
     /// different editors over different documents; collapsing them would make a
     /// video silently open an annotation surface it has no raster for.
     EditRequested {
@@ -683,10 +803,19 @@ pub enum OverlayEvent {
         card: Rect,
         /// Where the pointer is right now, in window coordinates.
         pointer: Pos2,
+        /// Option/Alt was held when the native hand-off committed.
+        keep_after_accept: bool,
+    },
+    /// A card's elapsed cleanup interval expired.
+    AutoCloseRequested {
+        /// The card.
+        id: CardId,
+        /// Safe cleanup action selected in Settings.
+        action: RecentCapturesAutoCloseAction,
     },
     /// A drag committed to leaving the pile, observed at release.
     ///
-    /// Emitted only when no host took over via [`OverlayEvent::DragOutArmed`],
+    /// Emitted only when no host took over via [`RecentCapturesOverlayEvent::DragOutArmed`],
     /// so a platform without a native drag source still sees the gesture.
     DragOut {
         /// The card.
@@ -714,6 +843,7 @@ enum Command {
     Collapse,
     Expand,
     ToggleDock,
+    Configure(RecentCapturesOverlaySettings),
     // Boxed: a restore carries a complete capture request, which is an order
     // of magnitude larger than every other command, and the queue holds one
     // enum-sized slot per entry.
@@ -760,7 +890,7 @@ pub struct NativePinRequest {
 #[derive(Default)]
 struct Shared {
     inbox: Mutex<Vec<CaptureRequest>>,
-    outbox: Mutex<Vec<OverlayEvent>>,
+    outbox: Mutex<Vec<RecentCapturesOverlayEvent>>,
     commands: Mutex<Vec<Command>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
@@ -769,6 +899,7 @@ struct Shared {
     visible_card_count: AtomicUsize,
     geometry_locked: AtomicBool,
     close_requested: AtomicBool,
+    applied_settings: Mutex<RecentCapturesOverlaySettings>,
 }
 
 /// The application's grip on a running overlay.
@@ -777,11 +908,11 @@ struct Shared {
 /// window exists: a hotkey handler can be wired to a handle at start-up and the
 /// first capture pushed through it will be waiting when the window opens.
 #[derive(Clone, Default)]
-pub struct OverlayHandle {
+pub struct RecentCapturesOverlayHandle {
     shared: Arc<Shared>,
 }
 
-impl OverlayHandle {
+impl RecentCapturesOverlayHandle {
     /// A handle not yet bound to a window.
     #[must_use]
     pub fn new() -> Self {
@@ -801,7 +932,7 @@ impl OverlayHandle {
     /// The renderer does not use this — it emits directly. This is for a host
     /// that notices something natively which the renderer cannot see, and for
     /// tests that need to drive a host's event translation without a window.
-    pub fn report(&self, event: OverlayEvent) {
+    pub fn report(&self, event: RecentCapturesOverlayEvent) {
         if let Ok(mut q) = self.shared.outbox.lock() {
             q.push(event);
         }
@@ -809,7 +940,7 @@ impl OverlayHandle {
 
     /// Take everything that has happened since the last call.
     #[must_use]
-    pub fn drain_events(&self) -> Vec<OverlayEvent> {
+    pub fn drain_events(&self) -> Vec<RecentCapturesOverlayEvent> {
         self.shared
             .outbox
             .lock()
@@ -849,6 +980,11 @@ impl OverlayHandle {
     /// Retire every card.
     pub fn dismiss_all(&self) {
         self.command(Command::DismissAll);
+    }
+
+    /// Applies Recent Captures settings to current and future cards.
+    pub fn configure(&self, settings: RecentCapturesOverlaySettings) {
+        self.command(Command::Configure(settings.normalized()));
     }
 
     /// Collapse the pile into the dock (D20).
@@ -958,6 +1094,15 @@ impl OverlayHandle {
         self.shared.visible_card_count.load(Ordering::Acquire)
     }
 
+    /// Settings the renderer has safely applied to current card geometry.
+    #[must_use]
+    pub fn applied_settings(&self) -> RecentCapturesOverlaySettings {
+        self.shared.applied_settings.lock().map_or_else(
+            |_| RecentCapturesOverlaySettings::default(),
+            |settings| *settings,
+        )
+    }
+
     /// Whether pointer state is currently expressed in this viewport's local
     /// coordinates and the viewport origin must not move.
     #[must_use]
@@ -1001,9 +1146,9 @@ impl OverlayHandle {
     }
 }
 
-impl std::fmt::Debug for OverlayHandle {
+impl std::fmt::Debug for RecentCapturesOverlayHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OverlayHandle")
+        f.debug_struct("RecentCapturesOverlayHandle")
             .field("attached", &self.is_attached())
             .finish()
     }
@@ -1017,13 +1162,13 @@ impl std::fmt::Debug for OverlayHandle {
 ///
 /// Every property here is one the overlay depends on, and every one of them is
 /// a hint the window manager is free to ignore — which is why the macOS path
-/// also converts the window natively, and why [`PanelReport`] exists to say
-/// whether that worked.
+/// also applies any safe native properties the platform exposes, and why
+/// [`PanelReport`] exists to report whether non-activation is genuinely available.
 #[must_use]
-pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
+pub fn viewport(geometry: RecentCapturesOverlayGeometry) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
-        .with_title("Scrozz Overlay")
-        .with_app_id("com.scrozz.overlay")
+        .with_title("Scrozz Recent Captures Overlay")
+        .with_app_id("com.scrozz.recent-captures-overlay")
         .with_position(geometry.position())
         .with_inner_size(geometry.size())
         .with_decorations(false)
@@ -1036,8 +1181,8 @@ pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
         // own outgoing CF_HDROP before the application underneath ever sees it.
         .with_drag_and_drop(false)
         .with_always_on_top()
-        // Do not take focus when the window opens. On macOS the real guarantee
-        // is the `NSPanel` conversion; this is the portable half of it.
+        // Do not request focus when the window opens. Native adapters may add
+        // stronger guarantees where the platform exposes them safely.
         .with_active(false);
 
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
@@ -1053,7 +1198,7 @@ pub fn viewport(geometry: OverlayGeometry) -> egui::ViewportBuilder {
 
 /// [`eframe::NativeOptions`] for a capture overlay.
 #[must_use]
-pub fn native_options(geometry: OverlayGeometry) -> eframe::NativeOptions {
+pub fn native_options(geometry: RecentCapturesOverlayGeometry) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: viewport(geometry),
         // The overlay is transient: nothing about it is worth restoring, and a
@@ -1105,7 +1250,7 @@ pub fn passes_through(pointer: Option<Pos2>, hits: &[Rect]) -> bool {
 /// window can expand underneath a pointer that has not moved — the ordinary
 /// shape of "reveal a card that just grew into place" — and winit has nothing
 /// to deliver in that case, so `hovered()` stays false for every card until
-/// the next click manufactures an event. [`OverlayApp::pointer`] already
+/// the next click manufactures an event. [`RecentCapturesOverlayApp::pointer`] already
 /// tracks the pointer independently of that, through the macOS
 /// [`PointerProbe`] when one is installed, for exactly the reason that
 /// click-through cannot trust egui's pointer state either (see
@@ -1326,6 +1471,7 @@ struct Entry {
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
     pin_notice: Option<String>,
+    auto_close_started_at: f64,
 }
 
 struct PinnedEntry {
@@ -1357,16 +1503,16 @@ impl PinnedEntry {
 }
 
 /// The `eframe` application that hosts the capture stack.
-pub struct OverlayApp {
+pub struct RecentCapturesOverlayApp {
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
     pins: HashMap<PinId, PinnedEntry>,
     pending_pin_cards: HashMap<PinId, CardId>,
     pinned_cards: HashSet<CardId>,
-    handle: OverlayHandle,
+    handle: RecentCapturesOverlayHandle,
     theme: Theme,
     icons: IconStore,
-    geometry: OverlayGeometry,
+    geometry: RecentCapturesOverlayGeometry,
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
     thumbnail_px: u32,
@@ -1391,6 +1537,8 @@ pub struct OverlayApp {
     /// Set the instant the live gesture commits, so the release path knows the
     /// platform now owns this drag and must not be told about it a second time.
     armed: Option<CardId>,
+    settings: RecentCapturesOverlaySettings,
+    pending_settings: Option<RecentCapturesOverlaySettings>,
 }
 
 /// Keeps screen-anchored overlay geometry in native logical points.
@@ -1404,7 +1552,7 @@ pub fn install_native_point_scale(ctx: &egui::Context) {
     ctx.set_zoom_factor(1.0);
 }
 
-impl OverlayApp {
+impl RecentCapturesOverlayApp {
     /// Build the overlay.
     ///
     /// Installs fonts and the style, uploads the icon set, binds `handle` to
@@ -1412,8 +1560,8 @@ impl OverlayApp {
     #[must_use]
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        handle: OverlayHandle,
-        mut options: OverlayOptions,
+        handle: RecentCapturesOverlayHandle,
+        mut options: RecentCapturesOverlayOptions,
     ) -> Self {
         let ctx = &cc.egui_ctx;
         install_native_point_scale(ctx);
@@ -1431,11 +1579,17 @@ impl OverlayApp {
             |hook| hook(cc),
         );
         if !report.non_activating {
-            tracing::warn!(detail = %report.detail, "overlay window is not non-activating");
+            tracing::warn!(
+                detail = %report.detail,
+                "Recent Captures Overlay window is not non-activating"
+            );
         }
 
         if let Ok(mut slot) = handle.shared.report.lock() {
             *slot = Some(report);
+        }
+        if let Ok(mut slot) = handle.shared.applied_settings.lock() {
+            *slot = options.settings;
         }
 
         if options.passthrough == Passthrough::Auto && options.probe.is_none() {
@@ -1447,7 +1601,11 @@ impl OverlayApp {
         }
 
         Self {
-            stack: CaptureStack::for_work_area(options.geometry.local()),
+            stack: CaptureStack::configured(
+                options.geometry.local(),
+                options.settings.placement,
+                options.settings.card_width,
+            ),
             content: HashMap::new(),
             pins: HashMap::new(),
             pending_pin_cards: HashMap::new(),
@@ -1472,6 +1630,8 @@ impl OverlayApp {
             dock_collapsed: false,
             dragging: None,
             armed: None,
+            settings: options.settings.normalized(),
+            pending_settings: None,
         }
     }
 
@@ -1489,12 +1649,17 @@ impl OverlayApp {
 
     /// Where the window is.
     #[must_use]
-    pub fn geometry(&self) -> OverlayGeometry {
+    pub fn geometry(&self) -> RecentCapturesOverlayGeometry {
         self.geometry
     }
 
     /// Move the overlay to a new work area, e.g. after a display change.
-    pub fn set_geometry(&mut self, geometry: OverlayGeometry, ctx: &egui::Context, m: &Motion) {
+    pub fn set_geometry(
+        &mut self,
+        geometry: RecentCapturesOverlayGeometry,
+        ctx: &egui::Context,
+        m: &Motion,
+    ) {
         if geometry == self.geometry {
             return;
         }
@@ -1549,7 +1714,7 @@ impl OverlayApp {
             changed.push((id, entry.surface.state().clone()));
         }
         for (pin, state) in changed {
-            self.emit(OverlayEvent::PinUpdated { pin, state });
+            self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
         }
         for pin in closed {
             self.close_pin(ctx, &pin);
@@ -1581,9 +1746,8 @@ impl OverlayApp {
                 changed.push((id.clone(), entry.surface.state().clone()));
             }
         }
-
         for (pin, state) in changed {
-            self.emit(OverlayEvent::PinUpdated { pin, state });
+            self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
         }
     }
 
@@ -1607,7 +1771,7 @@ impl OverlayApp {
         }
     }
 
-    fn emit(&self, event: OverlayEvent) {
+    fn emit(&self, event: RecentCapturesOverlayEvent) {
         if let Ok(mut q) = self.handle.shared.outbox.lock() {
             q.push(event);
         }
@@ -1650,9 +1814,10 @@ impl OverlayApp {
                     texture: None,
                     pending: thumb,
                     pin_notice: request.content_error,
+                    auto_close_started_at: m.now(),
                 },
             );
-            self.emit(OverlayEvent::Pushed { id });
+            self.emit(RecentCapturesOverlayEvent::Pushed { id });
         }
     }
 
@@ -1661,7 +1826,7 @@ impl OverlayApp {
             match cmd {
                 Command::Dismiss(id) => {
                     if self.stack.dismiss(id, m) {
-                        self.emit(OverlayEvent::Dismissed {
+                        self.emit(RecentCapturesOverlayEvent::Dismissed {
                             id,
                             reason: DismissReason::Programmatic,
                         });
@@ -1679,13 +1844,18 @@ impl OverlayApp {
                     if self.dragging == Some(id) {
                         self.dragging = None;
                     }
-                    tracing::debug!(card = id.0, accepted, stuck, "overlay: native drag settled");
+                    tracing::debug!(
+                        card = id.0,
+                        accepted,
+                        stuck,
+                        "Recent Captures Overlay native drag settled"
+                    );
                 }
                 Command::DismissAll => {
                     let ids: Vec<CardId> = self.stack.cards().iter().map(|c| c.id()).collect();
                     self.stack.dismiss_all(m);
                     for id in ids {
-                        self.emit(OverlayEvent::Dismissed {
+                        self.emit(RecentCapturesOverlayEvent::Dismissed {
                             id,
                             reason: DismissReason::Programmatic,
                         });
@@ -1694,6 +1864,9 @@ impl OverlayApp {
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
+                Command::Configure(settings) => {
+                    self.pending_settings = Some(settings.normalized());
+                }
                 Command::RestorePin { request, state } => self.restore_pin(*request, state),
                 Command::RefreshPinTexture { pin, image } => {
                     if let Some(entry) = self.pins.get_mut(&pin) {
@@ -1715,6 +1888,29 @@ impl OverlayApp {
                 Command::ClosePin(id) => self.close_pin(ctx, &id),
                 Command::UnlockPins => self.unlock_pins(ctx),
                 Command::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
+        if self.dragging.is_none()
+            && self.armed.is_none()
+            && let Some(requested) = self.pending_settings
+        {
+            let width_is_safe = self
+                .stack
+                .configuration_preserves_residents(requested.placement, requested.card_width);
+            let mut applied = requested;
+            if !width_is_safe {
+                applied.card_width = self.settings.card_width;
+            }
+            if applied != self.settings {
+                self.settings = applied;
+                self.stack
+                    .configure(self.settings.placement, self.settings.card_width, m);
+                if let Ok(mut acknowledged) = self.handle.shared.applied_settings.lock() {
+                    *acknowledged = applied;
+                }
+            }
+            if width_is_safe {
+                self.pending_settings = None;
             }
         }
     }
@@ -1740,7 +1936,7 @@ impl OverlayApp {
         for id in gone {
             self.content.remove(&id);
             if !self.pinned_cards.remove(&id) {
-                self.emit(OverlayEvent::Dismissed {
+                self.emit(RecentCapturesOverlayEvent::Dismissed {
                     id,
                     reason: DismissReason::Overflow,
                 });
@@ -1855,7 +2051,7 @@ impl OverlayApp {
         };
         self.pins.insert(pin.clone(), entry);
         self.pending_pin_cards.insert(pin.clone(), card);
-        self.emit(OverlayEvent::PinRequested {
+        self.emit(RecentCapturesOverlayEvent::PinRequested {
             id: card,
             pin,
             state,
@@ -1867,7 +2063,7 @@ impl OverlayApp {
         if let Some(source) = self.content.get_mut(&card) {
             source.pin_notice = Some(reason.clone());
         }
-        self.emit(OverlayEvent::PinUnavailable { card, reason });
+        self.emit(RecentCapturesOverlayEvent::PinUnavailable { card, reason });
     }
 
     fn restore_pin(&mut self, request: CaptureRequest, state: PinState) {
@@ -1917,7 +2113,7 @@ impl OverlayApp {
             PinnedEntry::from_request(request, surface, self.pin_support.limitation_notice()),
         );
         if requested_locked && !normalized.locked {
-            self.emit(OverlayEvent::PinUpdated {
+            self.emit(RecentCapturesOverlayEvent::PinUpdated {
                 pin: id,
                 state: normalized,
             });
@@ -1930,7 +2126,7 @@ impl OverlayApp {
         }
         ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
         self.pending_pin_cards.remove(id);
-        self.emit(OverlayEvent::PinClosed { pin: id.clone() });
+        self.emit(RecentCapturesOverlayEvent::PinClosed { pin: id.clone() });
     }
 
     fn commit_pin(&mut self, id: &PinId, m: &Motion) {
@@ -1971,7 +2167,7 @@ impl OverlayApp {
             }
         }
         for (pin, state) in changed {
-            self.emit(OverlayEvent::PinUpdated { pin, state });
+            self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
         }
     }
 
@@ -2077,10 +2273,10 @@ impl OverlayApp {
         }
 
         for (pin, state) in changed {
-            self.emit(OverlayEvent::PinUpdated { pin, state });
+            self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
         }
         for (pin, reason) in unavailable {
-            self.emit(OverlayEvent::PinPositioningUnavailable { pin, reason });
+            self.emit(RecentCapturesOverlayEvent::PinPositioningUnavailable { pin, reason });
         }
         for pin in closed {
             self.close_pin(ctx, &pin);
@@ -2136,7 +2332,7 @@ impl OverlayApp {
         }
     }
 
-    fn handle_action(&mut self, id: CardId, action: CardAction, m: &Motion) {
+    fn handle_action(&mut self, id: CardId, action: CardAction, alt_held: bool, m: &Motion) {
         if action == CardAction::Pin {
             // The card never draws Pin for a recording, and a caller that
             // reaches here anyway is told why rather than opening a native
@@ -2146,7 +2342,7 @@ impl OverlayApp {
                 .get(&id)
                 .is_some_and(|entry| entry.media.is_video())
             {
-                self.emit(OverlayEvent::PinUnavailable {
+                self.emit(RecentCapturesOverlayEvent::PinUnavailable {
                     card: id,
                     reason: "Pin to Screen holds a still image and does not apply to a recording."
                         .to_owned(),
@@ -2157,11 +2353,32 @@ impl OverlayApp {
             return;
         }
         let (event, dismiss) = match action {
-            CardAction::Copy => (Some(OverlayEvent::CopyRequested { id }), true),
-            CardAction::Save => (Some(OverlayEvent::SaveRequested { id }), true),
-            CardAction::Annotate => (Some(OverlayEvent::AnnotateRequested { id }), false),
-            CardAction::Edit => (Some(OverlayEvent::EditRequested { id }), false),
-            CardAction::Upload => (Some(OverlayEvent::UploadRequested { id }), false),
+            CardAction::Copy => (
+                Some(RecentCapturesOverlayEvent::CopyRequested { id }),
+                false,
+            ),
+            CardAction::Save => (
+                Some(RecentCapturesOverlayEvent::SaveRequested {
+                    id,
+                    choose_destination: save_chooses_destination(
+                        self.settings.save_behavior,
+                        alt_held,
+                    ),
+                }),
+                false,
+            ),
+            CardAction::Annotate => (
+                Some(RecentCapturesOverlayEvent::AnnotateRequested { id }),
+                false,
+            ),
+            CardAction::Edit => (
+                Some(RecentCapturesOverlayEvent::EditRequested { id }),
+                false,
+            ),
+            CardAction::Upload => (
+                Some(RecentCapturesOverlayEvent::UploadRequested { id }),
+                false,
+            ),
             CardAction::Pin => unreachable!("pin actions return above"),
             CardAction::Close => (None, true),
         };
@@ -2169,7 +2386,7 @@ impl OverlayApp {
             self.emit(event);
         }
         if dismiss && self.stack.dismiss(id, m) {
-            self.emit(OverlayEvent::Dismissed {
+            self.emit(RecentCapturesOverlayEvent::Dismissed {
                 id,
                 reason: if action == CardAction::Close {
                     DismissReason::Closed
@@ -2177,6 +2394,36 @@ impl OverlayApp {
                     DismissReason::Acted
                 },
             });
+        }
+    }
+
+    fn emit_due_auto_close(&mut self, ctx: &egui::Context, now: f64) {
+        if !self.settings.auto_close_enabled || self.dragging.is_some() || self.armed.is_some() {
+            return;
+        }
+
+        let seconds = f64::from(self.settings.auto_close_seconds);
+        let mut due = Vec::new();
+        let mut next = seconds;
+        for (&id, entry) in &self.content {
+            let elapsed = now - entry.auto_close_started_at;
+            if elapsed >= seconds {
+                due.push(id);
+            } else {
+                next = next.min(seconds - elapsed);
+            }
+        }
+        for id in due {
+            if let Some(entry) = self.content.get_mut(&id) {
+                entry.auto_close_started_at = f64::INFINITY;
+            }
+            self.emit(RecentCapturesOverlayEvent::AutoCloseRequested {
+                id,
+                action: self.settings.auto_close_action,
+            });
+        }
+        if next.is_finite() {
+            ctx.request_repaint_after(Duration::from_secs_f64(next.max(0.01)));
         }
     }
 
@@ -2339,7 +2586,7 @@ fn draw_card_notice(ui: &mut egui::Ui, card: Rect, text: &str, theme: &Theme) {
     });
 }
 
-impl eframe::App for OverlayApp {
+impl eframe::App for RecentCapturesOverlayApp {
     /// Fully transparent. eframe's default is a dark translucent wash, which on
     /// an overlay is a grey sheet over the entire work area.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -2361,6 +2608,7 @@ impl eframe::App for OverlayApp {
         self.reconcile(&ctx);
         self.draw_pins(&ctx);
         self.stack.advance(&m);
+        self.emit_due_auto_close(&ctx, ctx.input(|input| input.time));
 
         let was_empty = self.stack.is_empty();
         let dock_was = self.stack.dock().is_collapsed();
@@ -2442,7 +2690,7 @@ impl eframe::App for OverlayApp {
         {
             self.dragging = Some(id);
             self.armed = None;
-            self.emit(OverlayEvent::DragStarted { id, at: pointer });
+            self.emit(RecentCapturesOverlayEvent::DragStarted { id, at: pointer });
         }
         if let Some(p) = drag_to {
             self.stack.drag_to(p, &m);
@@ -2457,10 +2705,14 @@ impl eframe::App for OverlayApp {
             && live.intent == Intent::DragOut
         {
             self.armed = Some(live.id);
-            self.emit(OverlayEvent::DragOutArmed {
+            self.emit(RecentCapturesOverlayEvent::DragOutArmed {
                 id: live.id,
                 card: live.rect,
                 pointer: live.pointer,
+                keep_after_accept: keep_after_accepted_drag(
+                    self.settings.close_after_drag,
+                    ctx.input(|input| input.modifiers.alt),
+                ),
             });
         }
         if drag_end {
@@ -2474,12 +2726,12 @@ impl eframe::App for OverlayApp {
             } else if let Some(release) = self.stack.release_drag(&m) {
                 let at = release.rect.center();
                 match release.intent {
-                    Intent::Dismiss => self.emit(OverlayEvent::Dismissed {
+                    Intent::Dismiss => self.emit(RecentCapturesOverlayEvent::Dismissed {
                         id: release.id,
                         reason: DismissReason::Swipe,
                     }),
                     Intent::DragOut => {
-                        self.emit(OverlayEvent::DragOut { id: release.id, at });
+                        self.emit(RecentCapturesOverlayEvent::DragOut { id: release.id, at });
                     }
                     Intent::Collapse | Intent::SpringBack => {}
                 }
@@ -2488,20 +2740,20 @@ impl eframe::App for OverlayApp {
             self.armed = None;
         }
         if let Some((id, a)) = action {
-            self.handle_action(id, a, &m);
+            self.handle_action(id, a, ctx.input(|input| input.modifiers.alt), &m);
         }
 
         let dock_now = self.stack.dock().is_collapsed();
         if dock_now != dock_was {
             self.emit(if dock_now {
-                OverlayEvent::DockCollapsed
+                RecentCapturesOverlayEvent::DockCollapsed
             } else {
-                OverlayEvent::DockExpanded
+                RecentCapturesOverlayEvent::DockExpanded
             });
         }
         self.dock_collapsed = dock_now;
         if !was_empty && self.stack.is_empty() && self.stack.departing().is_empty() {
-            self.emit(OverlayEvent::Emptied);
+            self.emit(RecentCapturesOverlayEvent::Emptied);
         }
 
         self.apply_passthrough(&ctx, &hits, pointer);
@@ -2535,11 +2787,19 @@ impl eframe::App for OverlayApp {
     }
 }
 
+fn save_chooses_destination(behavior: RecentCapturesSaveBehavior, alt_held: bool) -> bool {
+    (behavior == RecentCapturesSaveBehavior::ChooseDestination) ^ alt_held
+}
+
+fn keep_after_accepted_drag(close_after_drag: bool, alt_held: bool) -> bool {
+    !close_after_drag || alt_held
+}
+
 /// The rectangle the dock occupies for a given work area, without building a
 /// stack — for a host that needs to know where to put a click target before the
 /// overlay exists.
 #[must_use]
-pub fn dock_rect(geometry: OverlayGeometry) -> Rect {
+pub fn dock_rect(geometry: RecentCapturesOverlayGeometry) -> Rect {
     let layout =
         crate::stack::StackLayout::new(geometry.local(), crate::stack::CardMetrics::default());
     dock::rect_for_slot0(layout.slot_rect(0))
@@ -2555,7 +2815,7 @@ mod tests {
 
     #[test]
     fn geometry_is_work_area_relative() {
-        let g = OverlayGeometry::new(rect(0.0, 25.0, 1440.0, 850.0));
+        let g = RecentCapturesOverlayGeometry::new(rect(0.0, 25.0, 1440.0, 850.0));
         assert_eq!(g.position(), Pos2::new(0.0, 25.0));
         assert_eq!(g.size(), Vec2::new(1440.0, 850.0));
         assert_eq!(g.local().min, Pos2::ZERO);
@@ -2579,10 +2839,59 @@ mod tests {
     }
 
     #[test]
+    fn option_or_alt_inverts_save_routing_for_one_action() {
+        assert!(!save_chooses_destination(
+            RecentCapturesSaveBehavior::ExportLocation,
+            false
+        ));
+        assert!(save_chooses_destination(
+            RecentCapturesSaveBehavior::ExportLocation,
+            true
+        ));
+        assert!(save_chooses_destination(
+            RecentCapturesSaveBehavior::ChooseDestination,
+            false
+        ));
+        assert!(!save_chooses_destination(
+            RecentCapturesSaveBehavior::ChooseDestination,
+            true
+        ));
+    }
+
+    #[test]
+    fn option_or_alt_keeps_an_accepted_external_drag() {
+        assert!(!keep_after_accepted_drag(true, false));
+        assert!(keep_after_accepted_drag(true, true));
+        assert!(keep_after_accepted_drag(false, false));
+        assert!(keep_after_accepted_drag(false, true));
+    }
+
+    #[test]
+    fn settings_normalize_accessibility_and_timer_bounds() {
+        let compact = RecentCapturesOverlaySettings {
+            card_width: 1.0,
+            auto_close_seconds: 1,
+            ..RecentCapturesOverlaySettings::default()
+        }
+        .normalized();
+        assert_eq!(compact.card_width, CardMetrics::MIN_WIDTH);
+        assert_eq!(compact.auto_close_seconds, 5);
+
+        let large = RecentCapturesOverlaySettings {
+            card_width: 10_000.0,
+            auto_close_seconds: u32::MAX,
+            ..RecentCapturesOverlaySettings::default()
+        }
+        .normalized();
+        assert_eq!(large.card_width, CardMetrics::MAX_WIDTH);
+        assert_eq!(large.auto_close_seconds, 3_600);
+    }
+
+    #[test]
     fn geometry_keeps_shadow_bleed_outside_the_card_safe_area() {
         let work_area = rect(80.0, 25.0, 1360.0, 800.0);
         let viewport = rect(0.0, 25.0, 1440.0, 848.0);
-        let g = OverlayGeometry::with_viewport(work_area, viewport);
+        let g = RecentCapturesOverlayGeometry::with_viewport(work_area, viewport);
 
         assert_eq!(g.position(), viewport.min);
         assert_eq!(g.size(), viewport.size());
@@ -2594,7 +2903,7 @@ mod tests {
     fn content_viewport_keeps_global_work_area_offsets() {
         let work_area = rect(0.0, 25.0, 1440.0, 850.0);
         let viewport = rect(24.0, 650.0, 282.0, 210.0);
-        let geometry = OverlayGeometry::with_content_viewport(work_area, viewport);
+        let geometry = RecentCapturesOverlayGeometry::with_content_viewport(work_area, viewport);
 
         assert_eq!(geometry.viewport(), viewport);
         assert_eq!(
@@ -2717,7 +3026,7 @@ mod tests {
 
     #[test]
     fn handle_queues_before_a_window_exists() {
-        let h = OverlayHandle::new();
+        let h = RecentCapturesOverlayHandle::new();
         assert!(!h.is_attached());
         assert!(!h.needs_visible_surface());
         h.push(CaptureRequest::new(
@@ -2736,7 +3045,7 @@ mod tests {
 
     #[test]
     fn close_is_a_hidden_root_command_not_a_ui_command() {
-        let h = OverlayHandle::new();
+        let h = RecentCapturesOverlayHandle::new();
         h.close();
         assert!(h.take_close_request());
         assert!(!h.take_close_request(), "close is consumed exactly once");
@@ -2802,7 +3111,9 @@ mod tests {
 
     #[test]
     fn viewport_declares_the_overlay_properties() {
-        let v = viewport(OverlayGeometry::new(rect(0.0, 25.0, 1440.0, 850.0)));
+        let v = viewport(RecentCapturesOverlayGeometry::new(rect(
+            0.0, 25.0, 1440.0, 850.0,
+        )));
         assert_eq!(v.decorations, Some(false));
         assert_eq!(v.transparent, Some(true));
         assert_eq!(v.has_shadow, Some(false));
@@ -2819,7 +3130,7 @@ mod tests {
     fn panel_report_defaults_to_not_converted() {
         assert!(!PanelReport::default().non_activating);
         assert!(!PanelReport::unsupported("none").non_activating);
-        assert!(PanelReport::converted("NSPanel").non_activating);
+        assert!(PanelReport::converted("safe native adapter").non_activating);
     }
 
     #[test]

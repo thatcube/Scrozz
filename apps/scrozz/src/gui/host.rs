@@ -10,7 +10,7 @@
 
 use std::{
     sync::{Arc, Mutex, mpsc::channel},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scrozz_core::{
@@ -22,9 +22,12 @@ use scrozz_shell::{
     native_surface_for_window,
 };
 use scrozz_ui::{
-    OverlayHandle,
+    RecentCapturesOverlayHandle,
     history::{WINDOW_TITLE as HISTORY_WINDOW_TITLE, viewport_builder, viewport_id},
-    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions, PinSupport, PinTopology},
+    recent_captures_overlay::{
+        PinSupport, PinTopology, RecentCapturesOverlayApp, RecentCapturesOverlayGeometry,
+        RecentCapturesOverlayOptions,
+    },
 };
 
 use crate::{
@@ -32,9 +35,9 @@ use crate::{
     gui::{
         app::{App, Config, EditorSnapshot, KeyboardOwner, PendingDrag, Tick},
         card::{CardSurface, Recording},
-        overlay::OverlayCards,
         panel::BehaviorController,
         pipeline::{DragGeometry, DragSubject},
+        recent_captures_overlay::RecentCapturesOverlayCards,
         selection::{
             CaptureSelector, ClientOverlayController, ClientOverlaySelector, UnsupportedSelector,
             current_plan, for_current_session,
@@ -57,8 +60,9 @@ const VIDEO_EDITOR_TICK: Duration = Duration::from_millis(16);
 /// Fast enough that a stop feels immediate and a finished recording's card
 /// appears at once; slow enough that an idle menu-bar app is still idle.
 const RECORDING_TICK: Duration = Duration::from_millis(50);
+const DISPLAY_REFRESH: Duration = Duration::from_millis(250);
 
-type SharedGeometry = Arc<Mutex<OverlayGeometry>>;
+type SharedGeometry = Arc<Mutex<RecentCapturesOverlayGeometry>>;
 const PARKED_ROOT_ORIGIN: f32 = -100_000.0;
 
 /// Something that can drive an [`App`] to completion.
@@ -98,16 +102,36 @@ pub trait Host {
     fn supports_permission_ui(&self) -> bool;
 }
 
-fn card_surface_geometry(base: OverlayGeometry, card_count: usize) -> OverlayGeometry {
+fn card_surface_geometry(
+    base: RecentCapturesOverlayGeometry,
+    card_count: usize,
+) -> RecentCapturesOverlayGeometry {
+    card_surface_geometry_with_settings(
+        base,
+        card_count,
+        scrozz_ui::RecentCapturesOverlaySettings::default(),
+    )
+}
+
+fn card_surface_geometry_with_settings(
+    base: RecentCapturesOverlayGeometry,
+    card_count: usize,
+    settings: scrozz_ui::RecentCapturesOverlaySettings,
+) -> RecentCapturesOverlayGeometry {
+    let metrics = scrozz_ui::stack::CardMetrics {
+        width: settings.card_width,
+        height: settings.card_width / 1.6,
+        ..scrozz_ui::stack::CardMetrics::default()
+    };
     let layout =
-        scrozz_ui::stack::StackLayout::new(base.local(), scrozz_ui::stack::CardMetrics::default());
+        scrozz_ui::stack::StackLayout::with_placement(base.local(), metrics, settings.placement);
     let last = card_count.saturating_sub(1).min(layout.slots() - 1);
     let occupied = layout.slot_rect(0).union(layout.slot_rect(last));
     let viewport = occupied
         .translate(base.position().to_vec2())
         .expand(card_gesture_envelope())
         .intersect(base.viewport());
-    OverlayGeometry::with_content_viewport(base.work_area, viewport)
+    RecentCapturesOverlayGeometry::with_content_viewport(base.work_area, viewport)
 }
 
 fn card_gesture_envelope() -> f32 {
@@ -119,8 +143,8 @@ fn card_gesture_envelope() -> f32 {
         + scrozz_ui::card::SHADOW_BLEED
 }
 
-fn parked_native_options(geometry: OverlayGeometry) -> eframe::NativeOptions {
-    let mut options = scrozz_ui::overlay_app::native_options(geometry);
+fn parked_native_options(geometry: RecentCapturesOverlayGeometry) -> eframe::NativeOptions {
+    let mut options = scrozz_ui::recent_captures_overlay::native_options(geometry);
     options.viewport = options.viewport.with_visible(false);
     #[cfg(target_os = "macos")]
     {
@@ -219,7 +243,7 @@ pub const HAS_WINDOW: bool = true;
 /// Retained because [`for_platform`] must still say something useful if
 /// [`HAS_WINDOW`] is ever turned off for a target that cannot open one.
 pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
-     scrozz-ui supplies the whole overlay (OverlayApp, OverlayHandle, \
+     scrozz-ui supplies the whole Recent Captures Overlay \
      native_options) but the call that opens a window is eframe::run_native. \
      Add `eframe.workspace = true` to apps/scrozz/Cargo.toml, then set \
      HAS_WINDOW to true. Until then, SCROZZ_GUI_HEADLESS=1 runs everything \
@@ -235,10 +259,10 @@ pub const WINDOW_GAP: &str = "this binary has no windowing dependency. \
 /// thread, in the same callback, in a fixed order, and nothing blocking
 /// happens there — capture and encoding are already on a worker.
 pub struct Windowed {
-    handle: OverlayHandle,
+    handle: RecentCapturesOverlayHandle,
     emit: Emit,
-    base_geometry: OverlayGeometry,
-    geometry: OverlayGeometry,
+    base_geometry: RecentCapturesOverlayGeometry,
+    geometry: RecentCapturesOverlayGeometry,
     display_id: Option<DisplayId>,
     display_scale: Option<ScaleFactor>,
     pointer_geometry: SharedGeometry,
@@ -253,7 +277,7 @@ impl Windowed {
     pub fn new(emit: Emit) -> Self {
         let (base_geometry, display_id, display_scale) = work_area().unwrap_or_else(|error| {
             tracing::warn!(%error, "native work area is not ready; deferring the required check until launch");
-            (OverlayGeometry::default(), None, None)
+            (RecentCapturesOverlayGeometry::default(), None, None)
         });
         let geometry = card_surface_geometry(base_geometry, 1);
         let pointer_geometry = Arc::new(Mutex::new(geometry));
@@ -268,7 +292,7 @@ impl Windowed {
             "resolved interactive selector"
         );
         Self {
-            handle: OverlayHandle::new(),
+            handle: RecentCapturesOverlayHandle::new(),
             emit,
             base_geometry,
             geometry,
@@ -303,7 +327,8 @@ impl Host for Windowed {
             native,
         } = *self;
         let (base_geometry, display_id, display_scale) = work_area()?;
-        let geometry = card_surface_geometry(base_geometry, 1);
+        let overlay_settings = app.recent_captures_overlay_settings();
+        let geometry = card_surface_geometry_with_settings(base_geometry, 1, overlay_settings);
         if let Ok(mut current) = pointer_geometry.lock() {
             *current = geometry;
         }
@@ -323,8 +348,9 @@ impl Host for Windowed {
         #[cfg(target_os = "macos")]
         let native_activity_start = scrozz_shell::macos::activity::snapshot();
 
-        let options = OverlayOptions {
+        let options = RecentCapturesOverlayOptions {
             geometry,
+            settings: app.recent_captures_overlay_settings(),
             panel: Some(crate::gui::panel::hook_with_controller(native.clone())),
             probe: pointer_probe(Arc::clone(&pointer_geometry)),
             displays,
@@ -353,7 +379,7 @@ impl Host for Windowed {
                         None
                     }
                 };
-                let overlay = OverlayApp::new(cc, handle, options);
+                let overlay = RecentCapturesOverlayApp::new(cc, handle, options);
                 native.set_frame(logical_frame(geometry));
                 let (color_swatch_store, custom_swatches) =
                     match crate::color_swatches::CustomSwatchStore::default_location() {
@@ -391,6 +417,7 @@ impl Host for Windowed {
                     base_geometry,
                     display_scale,
                     pointer_geometry,
+                    next_active_display_refresh: Instant::now(),
                     #[cfg(target_os = "macos")]
                     display_changes,
                     #[cfg(target_os = "macos")]
@@ -438,7 +465,9 @@ impl Host for Windowed {
     fn surface(&self) -> Box<dyn CardSurface> {
         // Cloned, not moved: the same handle goes to the window, so a capture
         // taken before the window opens is already in the pile when it does.
-        Box::new(OverlayCards::new(self.handle.clone()).with_native(self.native.clone()))
+        Box::new(
+            RecentCapturesOverlayCards::new(self.handle.clone()).with_native(self.native.clone()),
+        )
     }
 
     fn selector(&self) -> Arc<dyn CaptureSelector> {
@@ -451,7 +480,7 @@ impl Host for Windowed {
 }
 
 fn initialize_one_shot_context(ctx: &egui::Context) {
-    scrozz_ui::overlay_app::install_native_point_scale(ctx);
+    scrozz_ui::recent_captures_overlay::install_native_point_scale(ctx);
     scrozz_ui::theme::install_fonts(ctx);
 }
 
@@ -496,7 +525,7 @@ pub fn select_once(
             CoreError::Platform(format!("could not start the selector worker: {error}"))
         })?;
 
-    let geometry = OverlayGeometry::default();
+    let geometry = RecentCapturesOverlayGeometry::default();
     let mut native_options = parked_native_options(geometry);
     native_options.viewport = native_options
         .viewport
@@ -577,9 +606,9 @@ struct Editing {
 
 struct Driver {
     app: App,
-    overlay: OverlayApp,
+    overlay: RecentCapturesOverlayApp,
     sink: Arc<Mutex<Option<Report>>>,
-    handle: OverlayHandle,
+    handle: RecentCapturesOverlayHandle,
     selection: ClientOverlayController,
     settings: scrozz_ui::settings::SettingsWindow,
     permission: scrozz_ui::permission::PermissionWindow,
@@ -600,10 +629,11 @@ struct Driver {
     native: BehaviorController,
     display_id: Option<DisplayId>,
     /// Complete display work-area geometry card slots are anchored against.
-    base_geometry: OverlayGeometry,
+    base_geometry: RecentCapturesOverlayGeometry,
     /// Native pixels per logical point on the display owning the card root.
     display_scale: Option<ScaleFactor>,
     pointer_geometry: SharedGeometry,
+    next_active_display_refresh: Instant,
     #[cfg(target_os = "macos")]
     display_changes: Option<scrozz_shell::macos::display::DisplayChangeMonitor>,
     #[cfg(target_os = "macos")]
@@ -787,7 +817,8 @@ impl Driver {
                 self.app
                     .persist_editor(EditorSnapshot::new(card, generation, editor));
             }
-            self.app.editor_closed(card);
+            self.app
+                .editor_closed(EditorSnapshot::new(card, generation, editor));
             self.editing = None;
         }
     }
@@ -805,18 +836,27 @@ impl Driver {
         };
         self.announced = true;
         if report.non_activating {
-            tracing::info!(detail = %report.detail, "the overlay is a non-activating panel");
+            tracing::info!(
+                detail = %report.detail,
+                "the Recent Captures Overlay is non-activating"
+            );
         } else {
             tracing::warn!(
                 detail = %report.detail,
-                "the overlay is an ordinary window: clicking a card will steal focus"
+                "the Recent Captures Overlay is an ordinary window: clicking a card will steal focus"
             );
         }
     }
 
     fn refresh_display_state(&mut self) {
-        let (geometry, scale) =
-            refreshed_work_area(self.base_geometry, self.display_scale, &mut self.display_id);
+        let (geometry, scale) = refreshed_work_area(
+            self.base_geometry,
+            self.display_scale,
+            &mut self.display_id,
+            self.app
+                .recent_captures_overlay_settings()
+                .follow_active_display,
+        );
         if geometry != self.base_geometry || scale != self.display_scale {
             self.base_geometry = geometry;
             self.display_scale = scale;
@@ -882,7 +922,11 @@ impl Driver {
             .max(self.handle.visible_card_count())
             .max(1);
         CardSurfaceTarget {
-            geometry: card_surface_geometry(self.base_geometry, count),
+            geometry: card_surface_geometry_with_settings(
+                self.base_geometry,
+                count,
+                self.handle.applied_settings(),
+            ),
             scale: self.display_scale,
         }
     }
@@ -1084,6 +1128,7 @@ impl Driver {
             &self.app.shortcut_rows(),
             &self.app.after_capture_rows(),
             self.app.recording_settings_pane(),
+            self.app.recent_captures_overlay_settings(),
         );
         self.app.set_keyboard_owner(
             KeyboardOwner::ShortcutRecorder,
@@ -1092,6 +1137,9 @@ impl Driver {
         self.app.edit_shortcuts(&edits.shortcuts);
         self.app.edit_after_capture(&edits.after_capture);
         self.app.edit_recording_settings(&edits.recording);
+        if let Some(settings) = edits.recent_captures_overlay {
+            self.app.edit_recent_captures_overlay(settings);
+        }
     }
 }
 
@@ -1099,7 +1147,7 @@ const CARD_READY_OBSERVATIONS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CardSurfaceTarget {
-    geometry: OverlayGeometry,
+    geometry: RecentCapturesOverlayGeometry,
     scale: Option<ScaleFactor>,
 }
 
@@ -1516,8 +1564,30 @@ impl eframe::App for Driver {
         if selector_owned_the_window || selector_owns_the_window {
             self.overlay.invalidate_passthrough_cache();
         }
-        if self.native_display_parameters_changed() {
+        let follow_active_display = self
+            .app
+            .recent_captures_overlay_settings()
+            .follow_active_display;
+        let now = Instant::now();
+        let active_display_refresh_due =
+            follow_active_display && now >= self.next_active_display_refresh;
+        #[cfg(not(target_os = "macos"))]
+        let disconnected_display_check_due =
+            follow_active_display && now >= self.next_active_display_refresh;
+        #[cfg(target_os = "macos")]
+        let disconnected_display_check_due = false;
+        if active_display_refresh_due || disconnected_display_check_due {
+            self.next_active_display_refresh = now + DISPLAY_REFRESH;
+        }
+        if self.native_display_parameters_changed()
+            || active_display_refresh_due
+            || disconnected_display_check_due
+        {
             self.refresh_display_state();
+        }
+        #[cfg(not(target_os = "macos"))]
+        if follow_active_display {
+            ctx.request_repaint_after(DISPLAY_REFRESH);
         }
 
         let editor = self
@@ -1525,6 +1595,9 @@ impl eframe::App for Driver {
             .as_ref()
             .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor));
         let tick = self.app.tick_with_editor(editor);
+        if self.app.has_pending_save_dialog() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         if self.app.take_modal_drag_input_release() {
             crate::gui::selection::release_modal_drag_input(ctx);
         }
@@ -1690,7 +1763,11 @@ fn geometry_in_viewport(mut geometry: DragGeometry, origin: egui::Pos2) -> DragG
 /// The card layout uses the work area, not the display bounds: anchoring a card
 /// to the bottom-left of the *bounds* puts it behind the Dock. The transparent
 /// viewport may extend below that safe area solely so shadows can fade naturally.
-fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>, Option<ScaleFactor>)> {
+fn work_area() -> CliResult<(
+    RecentCapturesOverlayGeometry,
+    Option<DisplayId>,
+    Option<ScaleFactor>,
+)> {
     #[cfg(target_os = "macos")]
     {
         let display = scrozz_shell::macos::display::active_display().map_err(CliError::from)?;
@@ -1727,7 +1804,7 @@ fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>, Option<ScaleFac
     }
 }
 
-fn geometry_from_display(display: &Display) -> CliResult<OverlayGeometry> {
+fn geometry_from_display(display: &Display) -> CliResult<RecentCapturesOverlayGeometry> {
     let area = display.work_area;
     if !area.origin.x.is_finite()
         || !area.origin.y.is_finite()
@@ -1743,7 +1820,7 @@ fn geometry_from_display(display: &Display) -> CliResult<OverlayGeometry> {
     Ok(geometry_for_display(display))
 }
 
-fn pin_displays(_geometry: OverlayGeometry) -> (DisplaySet, Option<DisplayId>) {
+fn pin_displays(_geometry: RecentCapturesOverlayGeometry) -> (DisplaySet, Option<DisplayId>) {
     if let Some(topology) = query_pin_topology() {
         return (topology.displays, topology.active_display);
     }
@@ -1863,30 +1940,57 @@ fn pointer_probe(geometry: SharedGeometry) -> Option<scrozz_ui::PointerProbe> {
     }
 }
 
-fn local_pointer(geometry: OverlayGeometry, point: scrozz_core::LogicalPoint) -> egui::Pos2 {
+fn local_pointer(
+    geometry: RecentCapturesOverlayGeometry,
+    point: scrozz_core::LogicalPoint,
+) -> egui::Pos2 {
     let origin = geometry.position();
     egui::pos2(point.x as f32 - origin.x, point.y as f32 - origin.y)
 }
 
 fn refreshed_work_area(
-    current: OverlayGeometry,
+    current: RecentCapturesOverlayGeometry,
     current_scale: Option<ScaleFactor>,
     display_id: &mut Option<DisplayId>,
-) -> (OverlayGeometry, Option<ScaleFactor>) {
+    follow_active_display: bool,
+) -> (RecentCapturesOverlayGeometry, Option<ScaleFactor>) {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(displays) = scrozz_shell::macos::display::displays()
-            && let Some(display) = display_id
-                .as_ref()
-                .and_then(|id| display_by_id(&displays, id))
-        {
-            return (geometry_for_display(display), Some(display.scale));
+        if let Ok(displays) = scrozz_shell::macos::display::displays() {
+            let active = follow_active_display
+                .then(scrozz_shell::macos::display::active_display)
+                .and_then(Result::ok);
+            let display = select_recent_captures_display(
+                &displays,
+                display_id.as_ref(),
+                active.as_ref(),
+                follow_active_display,
+            );
+            if let Some(display) = display {
+                *display_id = Some(display.id.clone());
+                return (geometry_for_display(display), Some(display.scale));
+            }
         }
-        if let Ok(display) = scrozz_shell::macos::display::active_display() {
-            let geometry = geometry_for_display(&display);
-            let scale = display.scale;
-            *display_id = Some(display.id);
-            return (geometry, Some(scale));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(backend) = crate::platform::display_topology()
+        && let Ok(displays) = backend.displays()
+    {
+        let active = follow_active_display
+            .then(|| backend.active_display().ok())
+            .flatten();
+        let display = select_recent_captures_display(
+            &displays,
+            display_id.as_ref(),
+            active.as_ref(),
+            follow_active_display,
+        );
+        if let Some(display) = display
+            && let Ok(geometry) = geometry_from_display(display)
+        {
+            *display_id = Some(display.id.clone());
+            return (geometry, Some(display.scale));
         }
     }
 
@@ -1897,7 +2001,24 @@ fn display_by_id<'a>(displays: &'a [Display], id: &DisplayId) -> Option<&'a Disp
     displays.iter().find(|display| display.id == *id)
 }
 
-fn geometry_for_display(display: &Display) -> OverlayGeometry {
+fn select_recent_captures_display<'a>(
+    displays: &'a [Display],
+    remembered: Option<&DisplayId>,
+    active: Option<&'a Display>,
+    follow_active_display: bool,
+) -> Option<&'a Display> {
+    let active = if follow_active_display {
+        active.and_then(|display| display_by_id(displays, &display.id))
+    } else {
+        None
+    };
+    active
+        .or_else(|| remembered.and_then(|id| display_by_id(displays, id)))
+        .or_else(|| displays.iter().find(|display| display.is_primary))
+        .or_else(|| displays.first())
+}
+
+fn geometry_for_display(display: &Display) -> RecentCapturesOverlayGeometry {
     let area = display.work_area;
     let work_area = egui::Rect::from_min_size(
         egui::pos2(area.origin.x as f32, area.origin.y as f32),
@@ -1909,10 +2030,10 @@ fn geometry_for_display(display: &Display) -> OverlayGeometry {
         work_area.min,
         egui::pos2(work_area.right(), viewport_bottom),
     );
-    OverlayGeometry::with_viewport(work_area, viewport)
+    RecentCapturesOverlayGeometry::with_viewport(work_area, viewport)
 }
 
-fn logical_frame(geometry: OverlayGeometry) -> scrozz_core::LogicalRect {
+fn logical_frame(geometry: RecentCapturesOverlayGeometry) -> scrozz_core::LogicalRect {
     let area = geometry.viewport();
     scrozz_core::LogicalRect::new(
         scrozz_core::LogicalPoint::new(f64::from(area.min.x), f64::from(area.min.y)),
@@ -1933,7 +2054,7 @@ mod tests {
     use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Provenance, ScaleFactor};
 
     fn card_target(scale: f64, origin: egui::Pos2) -> CardSurfaceTarget {
-        let base = OverlayGeometry::with_viewport(
+        let base = RecentCapturesOverlayGeometry::with_viewport(
             egui::Rect::from_min_size(origin, egui::vec2(1440.0, 850.0)),
             egui::Rect::from_min_size(origin, egui::vec2(1440.0, 1010.0)),
         );
@@ -2603,11 +2724,11 @@ mod tests {
 
     #[test]
     fn app_host_parks_only_its_private_root_bootstrap() {
-        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
+        let geometry = RecentCapturesOverlayGeometry::new(egui::Rect::from_min_size(
             egui::pos2(40.0, 30.0),
             egui::vec2(800.0, 600.0),
         ));
-        let generic = scrozz_ui::overlay_app::native_options(geometry);
+        let generic = scrozz_ui::recent_captures_overlay::native_options(geometry);
         let parked = parked_native_options(geometry);
 
         assert_eq!(generic.viewport.visible, None);
@@ -2623,7 +2744,7 @@ mod tests {
 
     #[test]
     fn card_surface_is_bounded_to_the_occupied_stack_column() {
-        let base = OverlayGeometry::with_viewport(
+        let base = RecentCapturesOverlayGeometry::with_viewport(
             egui::Rect::from_min_size(egui::pos2(0.0, 33.0), egui::vec2(1728.0, 950.0)),
             egui::Rect::from_min_size(egui::pos2(0.0, 33.0), egui::vec2(1728.0, 1084.0)),
         );
@@ -2656,7 +2777,7 @@ mod tests {
 
     #[test]
     fn compact_card_geometry_preserves_global_slot_positions() {
-        let base = OverlayGeometry::with_viewport(
+        let base = RecentCapturesOverlayGeometry::with_viewport(
             egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1200.0, 800.0)),
             egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1200.0, 848.0)),
         );
@@ -2674,13 +2795,15 @@ mod tests {
 
     #[test]
     fn pointer_probe_is_available_on_macos() {
-        let probe = pointer_probe(Arc::new(Mutex::new(OverlayGeometry::default())));
+        let probe = pointer_probe(Arc::new(Mutex::new(
+            RecentCapturesOverlayGeometry::default(),
+        )));
         assert_eq!(probe.is_some(), cfg!(target_os = "macos"));
     }
 
     #[test]
     fn pointer_coordinates_are_relative_to_the_live_work_area() {
-        let geometry = OverlayGeometry::new(egui::Rect::from_min_size(
+        let geometry = RecentCapturesOverlayGeometry::new(egui::Rect::from_min_size(
             egui::pos2(100.0, 40.0),
             egui::vec2(800.0, 600.0),
         ));
@@ -2696,7 +2819,7 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1728.0, 951.0));
         let viewport =
             egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1728.0, 999.0));
-        let geometry = OverlayGeometry::with_viewport(work_area, viewport);
+        let geometry = RecentCapturesOverlayGeometry::with_viewport(work_area, viewport);
         assert_eq!(
             logical_frame(geometry),
             LogicalRect::new(
@@ -2763,6 +2886,78 @@ mod tests {
                 .origin
                 .x,
             -800.0
+        );
+    }
+
+    #[test]
+    fn recent_captures_display_policy_is_sticky_or_active_as_configured() {
+        let display = |id: &str, primary: bool| Display {
+            id: DisplayId(id.to_owned()),
+            name: id.to_owned(),
+            bounds: LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(800.0, 600.0)),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 24.0),
+                LogicalSize::new(800.0, 540.0),
+            ),
+            scale: ScaleFactor::new(1.0),
+            is_primary: primary,
+        };
+        let displays = [display("primary", true), display("active", false)];
+        let remembered = DisplayId("primary".to_owned());
+
+        assert_eq!(
+            select_recent_captures_display(
+                &displays,
+                Some(&remembered),
+                Some(&displays[1]),
+                false,
+            )
+            .map(|display| &display.id),
+            Some(&displays[0].id)
+        );
+        assert_eq!(
+            select_recent_captures_display(&displays, Some(&remembered), Some(&displays[1]), true,)
+                .map(|display| &display.id),
+            Some(&displays[1].id)
+        );
+    }
+
+    #[test]
+    fn recent_captures_display_removal_falls_back_to_primary_then_first() {
+        let display = |id: &str, primary: bool| Display {
+            id: DisplayId(id.to_owned()),
+            name: id.to_owned(),
+            bounds: LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(800.0, 600.0)),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 24.0),
+                LogicalSize::new(800.0, 540.0),
+            ),
+            scale: ScaleFactor::new(1.0),
+            is_primary: primary,
+        };
+        let missing = DisplayId("disconnected".to_owned());
+        let with_primary = [display("first", false), display("primary", true)];
+        let disconnected_active = display("disconnected", false);
+        assert_eq!(
+            select_recent_captures_display(
+                &with_primary,
+                Some(&missing),
+                Some(&disconnected_active),
+                true,
+            )
+            .map(|display| &display.id),
+            Some(&with_primary[1].id)
+        );
+
+        let without_primary = [display("first", false), display("second", false)];
+        assert_eq!(
+            select_recent_captures_display(&without_primary, Some(&missing), None, false)
+                .map(|display| &display.id),
+            Some(&without_primary[0].id)
+        );
+        assert!(
+            select_recent_captures_display(&[], Some(&missing), None, false).is_none(),
+            "no display must preserve the last known geometry"
         );
     }
 

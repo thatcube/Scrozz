@@ -18,8 +18,8 @@ use scrozz_shell::{
     OverlayCursor, SelectionIntegration, SelectionPlan, Session, resolve_selection,
 };
 use scrozz_ui::{
-    FrozenDisplayFrame, SelectionDecision, SelectionUi, overlay_app::OverlayGeometry,
-    select::DisplayLayout,
+    FrozenDisplayFrame, RecentCapturesOverlayGeometry as OverlayGeometry, SelectionDecision,
+    SelectionUi, select::DisplayLayout,
 };
 
 const BRIDGE_POLL: Duration = Duration::from_millis(25);
@@ -1621,7 +1621,7 @@ fn selector_viewports_for(
 }
 
 fn child_viewport_builder(child: &SelectorChildViewport) -> egui::ViewportBuilder {
-    scrozz_ui::overlay_app::viewport(child.geometry)
+    scrozz_ui::recent_captures_overlay::viewport(child.geometry)
         .with_title("Scrozz Selector")
         .with_app_id(format!("com.scrozz.selector.{}", child.display.0))
         .with_visible(false)
@@ -2103,12 +2103,19 @@ mod tests {
         assert!(matches!(
             &controller.phase,
             ControllerPhase::AwaitingCapture { .. }
+                | ControllerPhase::RestoringCards { .. }
+                | ControllerPhase::Cards
         ));
         wait_until(|| {
             controller.logic(&ctx, &native);
-            matches!(&controller.phase, ControllerPhase::RestoringCards { .. })
+            matches!(
+                &controller.phase,
+                ControllerPhase::RestoringCards { .. } | ControllerPhase::Cards
+            )
         });
-        controller.logic(&ctx, &native);
+        if matches!(&controller.phase, ControllerPhase::RestoringCards { .. }) {
+            controller.logic(&ctx, &native);
+        }
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
         assert_eq!(
             native.recorded_visibility().last(),
@@ -3162,7 +3169,9 @@ mod tests {
         controller.logic(&ctx, &native);
         assert!(matches!(
             &controller.phase,
-            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
+            ControllerPhase::AwaitingCapture { .. }
+                | ControllerPhase::RestoringCards { .. }
+                | ControllerPhase::Cards
         ));
         wait_until(|| {
             controller.logic(&ctx, &native);

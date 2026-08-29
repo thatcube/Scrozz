@@ -26,7 +26,7 @@ These run on every push and need no display server.
 | A stale outcome cannot cancel whatever the user is holding now | same |
 | The native drag begins in the UI pass, not the logic pass | `apps/scrozz` — `host.rs`, `native_drags_are_started_in_the_ui_pass` |
 | An armed drag is acted on with no `tick` in between | `apps/scrozz` — `app.rs`, `an_armed_drag_is_acted_on_without_waiting_for_a_tick` |
-| A drag jumps the event queue; nothing else does | `apps/scrozz` — `overlay.rs` drag-splitting tests |
+| A drag jumps the event queue; nothing else does | `apps/scrozz` — `recent_captures_overlay.rs` drag-splitting tests |
 | An edited card drags only from bytes prepared for its editor generation and current document revision; stale bytes refuse instead of exposing the original under a redaction | `apps/scrozz` — `app.rs`, `drag_waits_for_the_live_redacted_revision_instead_of_using_the_card_cache` |
 | The pasteboard advertises `public.file-url` first, then `public.png`, then `public.tiff`, on one item | `scrozz-shell` — `tests/drag.rs`, `#[ignore]`d AppKit tests |
 | A payload with no image producer advertises **neither** `public.png` nor `public.tiff` | same |

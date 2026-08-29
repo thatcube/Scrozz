@@ -215,15 +215,15 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 
 | ID | Feature | Tier | Notes |
 |---|---|---|---|
-| QA-01 | Post-capture floating overlay | T0 | |
-| QA-02 | Copy / save / annotate from overlay | T0 | |
-| QA-03 | **Drag & drop to any app** | **T0** | Hero interaction. See QA-14 — this is harder than it looks |
+| QA-01 | Post-capture floating overlay | T0 | **Implemented:** dedicated Recent Captures Overlay Settings category, immediate runtime updates, and persisted platform-adaptive controls |
+| QA-02 | Copy / save / annotate from overlay | T0 | **Implemented:** Copy and Save close only after successful output; Save supports Export Location or a native destination chooser |
+| QA-03 | **Drag & drop to any app** | **T0** | **Implemented:** accepted external drops may close the card; cancel, rejection, and failure restore it. Option/Alt keeps it for one accepted drop |
 | QA-04 | Display file information | T2 | |
 | QA-05 | Restore recently closed overlay | T2 | |
-| QA-06 | Adjust position on screen | T2 | |
-| QA-07 | Adjust overlay size | T2 | |
-| QA-08 | Configurable auto-close behavior | T1 | |
-| QA-09 | Multi-display support | T1 | |
+| QA-06 | Adjust position on screen | T2 | **Implemented:** bottom-left and bottom-right, with edge-mirrored entry, dismissal, and drag intent |
+| QA-07 | Adjust overlay size | T2 | **Implemented:** 224–320 logical-point width, 16:10 cards, presets, constrained-work-area scaling, and uncapped as-many-as-fit capacity |
+| QA-08 | Configurable auto-close behavior | T1 | **Implemented:** disabled by default; Hide refuses to destroy the only retained artifact, while Save then hide closes only after confirmed export. Cleanup and capacity overflow defer while the card's editor is open and resume against the revision it ends on, and never pre-empt an in-flight Save As or output |
+| QA-09 | Multi-display support | T1 | **Implemented:** sticky display by default or follow the active capture/cursor display; removal falls back deterministically to primary, then first available |
 | QA-10 | **Swipe-to-dismiss gesture** | **T1** | Previously mis-tiered T3. Primary dismissal on macOS; needs a non-trackpad equivalent on Windows/Linux |
 | QA-11 | Quick actions | T2 | |
 | QA-12 | Temporarily hide overlays | T2 | |
@@ -236,6 +236,23 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 > `CFSTR_FILEDESCRIPTOR` / delayed rendering on Windows, and XDND with
 > `text/uri-list` plus a temp file on Linux (portal-mediated under Wayland).
 > Budget this as real per-platform work, not a toolkit checkbox.
+
+**Settings contract (2026-08-29).** The category is named **Recent Captures** and
+the pane is named **Recent Captures Overlay**. Defaults preserve the established
+behavior: left side, sticky display, 288-point cards, automatic cleanup off,
+30-second interval, Hide action, close after accepted external drag on, close
+after upload off, and Save to the configured Export Location. The native
+Option key on macOS or Alt key on Windows/Linux temporarily keeps an accepted
+drag and inverts Save routing for one action. Upload-driven close remains
+visible but unavailable until Scrozz has a confirmed upload-success result; it
+never treats dispatch, cancellation, or failure as success.
+
+Settings use the `recent-captures-overlay.*` persistence namespace and the
+`RecentCapturesOverlay*` / `recent_captures_overlay` code boundary. The generic
+`scrozz-shell::overlay` and `OverlayBehavior` names remain because they model
+shared native infrastructure used by selection, cards, and pins. Unknown
+settings and values from newer document versions survive atomic
+read-modify-write round trips.
 
 ---
 

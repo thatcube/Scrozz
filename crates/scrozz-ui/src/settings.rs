@@ -9,6 +9,10 @@ use scrozz_record::{EngineCapabilities, RecordingSettings};
 
 use crate::{
     icons::{Icon, IconStore},
+    recent_captures_overlay::{
+        RecentCapturesAutoCloseAction, RecentCapturesOverlaySettings, RecentCapturesPlacement,
+        RecentCapturesSaveBehavior,
+    },
     recording_settings::RecordingSettingsPanel,
     theme::{Appearance, Space, Text, Theme},
 };
@@ -88,13 +92,18 @@ pub struct SettingsEdits {
     pub after_capture: Vec<AfterCaptureEdit>,
     /// Recording interaction changes.
     pub recording: Vec<RecordingSettingsAction>,
+    /// Complete Recent Captures Overlay configuration after an accepted edit.
+    pub recent_captures_overlay: Option<RecentCapturesOverlaySettings>,
 }
 
 impl SettingsEdits {
     /// Whether the frame requested no changes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.shortcuts.is_empty() && self.after_capture.is_empty() && self.recording.is_empty()
+        self.shortcuts.is_empty()
+            && self.after_capture.is_empty()
+            && self.recording.is_empty()
+            && self.recent_captures_overlay.is_none()
     }
 }
 
@@ -237,6 +246,7 @@ enum Pane {
     #[default]
     AfterCapture,
     Recording,
+    RecentCapturesOverlay,
     Shortcuts,
     About,
 }
@@ -329,6 +339,7 @@ impl SettingsWindow {
         shortcuts: &[ShortcutRow],
         after_capture: &[AfterCaptureRow],
         recording_pane: RecordingPane,
+        recent_captures_overlay: RecentCapturesOverlaySettings,
     ) -> SettingsEdits {
         let mut edits = SettingsEdits::default();
         if !self.open {
@@ -372,6 +383,7 @@ impl SettingsWindow {
                 shortcuts,
                 after_capture,
                 recording_pane,
+                recent_captures_overlay,
                 platform,
                 &mut self.pane,
                 &mut self.recording,
@@ -436,6 +448,36 @@ pub fn render_preview(
         shortcuts,
         &[],
         RecordingPane::default(),
+        RecentCapturesOverlaySettings::default(),
+        platform,
+        &mut pane,
+        &mut recording,
+    );
+}
+
+/// Draws the Recent Captures Overlay pane for deterministic visual review.
+pub fn render_recent_captures_preview(
+    ui: &mut egui::Ui,
+    platform: SettingsPlatform,
+    icons: &IconStore,
+    settings: RecentCapturesOverlaySettings,
+) {
+    let theme = theme_for(ui);
+    let mut pane = Pane::RecentCapturesOverlay;
+    let mut recording = None;
+    let _ = draw_settings(
+        ui,
+        &theme,
+        icons,
+        None,
+        BuildInfo {
+            version: "0.1.0",
+            build: "100",
+        },
+        &[],
+        &[],
+        RecordingPane::default(),
+        settings,
         platform,
         &mut pane,
         &mut recording,
@@ -529,6 +571,7 @@ fn draw_settings(
     shortcuts: &[ShortcutRow],
     after_capture: &[AfterCaptureRow],
     recording_pane: RecordingPane,
+    recent_captures_overlay: RecentCapturesOverlaySettings,
     platform: SettingsPlatform,
     pane: &mut Pane,
     recording: &mut Option<String>,
@@ -557,6 +600,8 @@ fn draw_settings(
                 shortcuts,
                 after_capture,
                 recording_pane,
+                recent_captures_overlay,
+                platform,
                 pane,
                 recording,
             )
@@ -597,6 +642,8 @@ fn draw_settings(
                 shortcuts,
                 after_capture,
                 recording_pane,
+                recent_captures_overlay,
+                platform,
                 pane,
                 recording,
             )
@@ -675,10 +722,15 @@ fn draw_sidebar_navigation(
     }
 }
 
-fn navigation_items() -> [(Pane, &'static str, Icon); 4] {
+fn navigation_items() -> [(Pane, &'static str, Icon); 5] {
     [
         (Pane::AfterCapture, "After Capture", Icon::Copy),
         (Pane::Recording, "Recording", Icon::Video),
+        (
+            Pane::RecentCapturesOverlay,
+            "Recent Captures",
+            Icon::LayoutGrid,
+        ),
         (Pane::Shortcuts, "Shortcuts", Icon::Settings),
         (Pane::About, "About", Icon::AppWindow),
     ]
@@ -761,6 +813,8 @@ fn draw_body(
     shortcuts: &[ShortcutRow],
     after_capture: &[AfterCaptureRow],
     recording_pane: RecordingPane,
+    recent_captures_overlay: RecentCapturesOverlaySettings,
+    platform: SettingsPlatform,
     pane: &Pane,
     recording: &mut Option<String>,
 ) -> SettingsEdits {
@@ -775,6 +829,10 @@ fn draw_body(
                 }
                 Pane::Recording => {
                     edits.recording = draw_recording(ui, theme, recording_pane);
+                }
+                Pane::RecentCapturesOverlay => {
+                    edits.recent_captures_overlay =
+                        draw_recent_captures_overlay(ui, theme, recent_captures_overlay, platform);
                 }
                 Pane::Shortcuts => {
                     edits.shortcuts = draw_shortcuts(ui, theme, icons, shortcuts, recording);
@@ -805,6 +863,265 @@ fn draw_recording(
                 .actions
         })
         .inner
+}
+
+fn draw_recent_captures_overlay(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    current: RecentCapturesOverlaySettings,
+    platform: SettingsPlatform,
+) -> Option<RecentCapturesOverlaySettings> {
+    let mut settings = current;
+    ui.spacing_mut().interact_size.y = 44.0;
+    ui.label(
+        RichText::new("Recent Captures Overlay")
+            .font(theme.font(Text::Title))
+            .color(theme.palette.text),
+    );
+    ui.add_space(Space::XS);
+    ui.label(
+        RichText::new("Control where recent captures appear and what happens after you use them.")
+            .font(theme.font(Text::Body))
+            .color(theme.palette.text_muted),
+    );
+    ui.add_space(Space::LG);
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            recent_captures_section(ui, theme, "Placement", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    placement_preview(ui, theme, settings.placement);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Screen side")
+                                .font(theme.font(Text::Label))
+                                .color(theme.palette.text),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut settings.placement,
+                                RecentCapturesPlacement::Left,
+                                "Left",
+                            );
+                            ui.selectable_value(
+                                &mut settings.placement,
+                                RecentCapturesPlacement::Right,
+                                "Right",
+                            );
+                        });
+                        ui.checkbox(
+                            &mut settings.follow_active_display,
+                            "Move to the active display",
+                        )
+                        .on_hover_text(
+                            "Follow the display used by the pointer or current capture action. \
+                             If it disconnects, Scrozz falls back to the primary display.",
+                        );
+                    });
+                });
+            });
+
+            recent_captures_section(ui, theme, "Appearance", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Card size");
+                    ui.add(
+                        egui::Slider::new(
+                            &mut settings.card_width,
+                            crate::stack::CardMetrics::MIN_WIDTH
+                                ..=crate::stack::CardMetrics::MAX_WIDTH,
+                        )
+                        .step_by(8.0)
+                        .suffix(" pt"),
+                    )
+                    .on_hover_text(
+                        "Cards keep a 16:10 shape. Scrozz shows as many as fit on the display.",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for (label, width) in [
+                        ("Compact", crate::stack::CardMetrics::MIN_WIDTH),
+                        ("Preferred", crate::stack::CardMetrics::PREFERRED_WIDTH),
+                        ("Large", crate::stack::CardMetrics::MAX_WIDTH),
+                    ] {
+                        if ui
+                            .selectable_label((settings.card_width - width).abs() < 1.0, label)
+                            .clicked()
+                        {
+                            settings.card_width = width;
+                        }
+                    }
+                });
+            });
+
+            recent_captures_section(ui, theme, "Automatic cleanup", |ui| {
+                ui.checkbox(
+                    &mut settings.auto_close_enabled,
+                    "Close cards after a delay",
+                );
+                if settings.auto_close_enabled {
+                    ui.indent("recent-captures-auto-close", |ui| {
+                        egui::ComboBox::from_id_salt("recent-captures-auto-close-action")
+                            .selected_text(match settings.auto_close_action {
+                                RecentCapturesAutoCloseAction::Hide => "Hide when safely retained",
+                                RecentCapturesAutoCloseAction::SaveThenHide => {
+                                    "Save to Export Location, then hide"
+                                }
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut settings.auto_close_action,
+                                    RecentCapturesAutoCloseAction::Hide,
+                                    "Hide when safely retained",
+                                );
+                                ui.selectable_value(
+                                    &mut settings.auto_close_action,
+                                    RecentCapturesAutoCloseAction::SaveThenHide,
+                                    "Save to Export Location, then hide",
+                                );
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("After");
+                            ui.add(
+                                egui::Slider::new(&mut settings.auto_close_seconds, 5..=3_600)
+                                    .logarithmic(true)
+                                    .suffix(" sec"),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "A card never closes if that would remove the only retained copy.",
+                            )
+                            .font(theme.font(Text::Caption))
+                            .color(theme.palette.text_muted),
+                        );
+                    });
+                }
+            });
+
+            recent_captures_section(ui, theme, "Action behavior", |ui| {
+                ui.checkbox(
+                    &mut settings.close_after_drag,
+                    "Close after an accepted external drag",
+                );
+                let modifier = match platform {
+                    SettingsPlatform::MacOs => "Option",
+                    SettingsPlatform::Windows | SettingsPlatform::Linux => "Alt",
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "Hold {modifier} while dragging to keep the card visible."
+                    ))
+                    .font(theme.font(Text::Caption))
+                    .color(theme.palette.text_muted),
+                );
+
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(
+                        &mut settings.close_after_upload,
+                        "Close after a successful cloud upload",
+                    ),
+                );
+                ui.label(
+                    RichText::new(
+                        "Unavailable until a cloud provider is configured. Failed or cancelled \
+                         uploads always keep the card visible.",
+                    )
+                    .font(theme.font(Text::Caption))
+                    .color(theme.palette.text_faint),
+                );
+
+                ui.horizontal(|ui| {
+                    ui.label("Save button");
+                    egui::ComboBox::from_id_salt("recent-captures-save-behavior")
+                        .selected_text(match settings.save_behavior {
+                            RecentCapturesSaveBehavior::ExportLocation => "Save to Export Location",
+                            RecentCapturesSaveBehavior::ChooseDestination => "Choose destination",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut settings.save_behavior,
+                                RecentCapturesSaveBehavior::ExportLocation,
+                                "Save to Export Location",
+                            );
+                            ui.selectable_value(
+                                &mut settings.save_behavior,
+                                RecentCapturesSaveBehavior::ChooseDestination,
+                                "Choose destination",
+                            );
+                        });
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "Hold {modifier} when choosing Save to use the other behavior once."
+                    ))
+                    .font(theme.font(Text::Caption))
+                    .color(theme.palette.text_muted),
+                );
+            });
+        });
+
+    (settings != current).then_some(settings.normalized())
+}
+
+fn recent_captures_section(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    title: &str,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
+    ui.label(
+        RichText::new(title)
+            .font(theme.font(Text::Subtitle))
+            .color(theme.palette.text),
+    );
+    ui.add_space(Space::XS);
+    egui::Frame::new()
+        .fill(theme.palette.card_fill)
+        .stroke(egui::Stroke::new(1.0, theme.palette.hairline))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(Space::MD as i8))
+        .show(ui, contents);
+    ui.add_space(Space::LG);
+}
+
+fn placement_preview(ui: &mut egui::Ui, theme: &Theme, placement: RecentCapturesPlacement) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(150.0, 96.0), Sense::hover());
+    ui.painter().rect(
+        rect.shrink(2.0),
+        10.0,
+        theme.palette.canvas(),
+        egui::Stroke::new(1.0, theme.palette.divider),
+        egui::StrokeKind::Inside,
+    );
+    let left = matches!(placement, RecentCapturesPlacement::Left);
+    for index in 0..3 {
+        let width = 48.0;
+        let height = 30.0;
+        let x = if left {
+            rect.left() + 10.0
+        } else {
+            rect.right() - width - 10.0
+        };
+        let y = rect.bottom() - 10.0 - height - index as f32 * 8.0;
+        let card = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height));
+        ui.painter().rect_filled(
+            card,
+            5.0,
+            if index == 0 {
+                theme.palette.accent
+            } else {
+                theme.palette.card_fill
+            },
+        );
+        ui.painter().rect_stroke(
+            card,
+            5.0,
+            egui::Stroke::new(1.0, theme.palette.hairline),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 fn draw_shortcuts(
@@ -2009,6 +2326,7 @@ mod tests {
             &[],
             &[],
             RecordingPane::default(),
+            RecentCapturesOverlaySettings::default(),
         );
         assert!(edits.is_empty());
         assert!(!window.is_recording());

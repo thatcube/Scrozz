@@ -9,7 +9,7 @@ use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
 use scrozz_ui::motion::Motion;
 use scrozz_ui::stack::{
     CaptureStack, CardFrame, CardId, CardMetrics, CardState, DRAG_LOCK_SLOP, DRAG_SOURCE_ALPHA,
-    Dir, GestureConfig, Intent, MIN_SLOTS, StackLayout, Timing, classify,
+    Dir, GestureConfig, Intent, MIN_SLOTS, RecentCapturesPlacement, StackLayout, Timing, classify,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ fn sixteen_inch_macbook_pro_uses_preferred_sixteen_by_ten_cards() {
     assert_eq!(metrics.height, 180.0);
     assert_eq!(metrics.gap, 8.0);
     assert_eq!(metrics.margin, 2.0);
-    assert_eq!(metrics.left_margin, 40.0);
+    assert_eq!(metrics.side_margin, 40.0);
     assert_eq!(StackLayout::new(mbp16(), metrics).slots(), 5);
 }
 
@@ -203,6 +203,58 @@ fn density_and_monitor_scale_are_applied_once_in_separate_spaces() {
 }
 
 #[test]
+fn right_placement_mirrors_the_anchor_without_changing_capacity() {
+    let left = StackLayout::with_placement(
+        mbp16(),
+        CardMetrics::default(),
+        RecentCapturesPlacement::Left,
+    );
+    let right = StackLayout::with_placement(
+        mbp16(),
+        CardMetrics::default(),
+        RecentCapturesPlacement::Right,
+    );
+    assert_eq!(left.slots(), right.slots());
+    assert_eq!(left.slot_rect(0).size(), right.slot_rect(0).size());
+    assert_eq!(
+        left.slot_rect(0).left() - mbp16().left(),
+        mbp16().right() - right.slot_rect(0).right()
+    );
+    assert!(right.entry_rect(0).left() > mbp16().right());
+}
+
+#[test]
+fn runtime_size_change_reflows_current_cards_and_reapplies_capacity() {
+    let mut stack = CaptureStack::configured(
+        work_area(580.0),
+        RecentCapturesPlacement::Left,
+        CardMetrics::MIN_WIDTH,
+    );
+    for _ in 0..stack.capacity() {
+        stack.push(&at(0));
+    }
+    let compact_capacity = stack.capacity();
+
+    assert!(
+        !stack.configuration_preserves_residents(
+            RecentCapturesPlacement::Right,
+            CardMetrics::MAX_WIDTH,
+        ),
+        "the runtime settings host must defer a width that would discard residents"
+    );
+    stack.configure(
+        RecentCapturesPlacement::Right,
+        CardMetrics::MAX_WIDTH,
+        &at(100),
+    );
+
+    assert!(stack.capacity() < compact_capacity);
+    assert_eq!(stack.len(), stack.capacity());
+    assert_eq!(stack.layout().placement(), RecentCapturesPlacement::Right);
+    assert_eq!(stack.layout().metrics().width, CardMetrics::MAX_WIDTH);
+}
+
+#[test]
 fn slot_count_follows_card_metrics_not_a_constant() {
     let small = CardMetrics {
         height: 60.0,
@@ -227,7 +279,7 @@ fn slots_stack_upward_from_the_bottom_of_the_work_area() {
         slot0,
         Rect::from_min_size(
             pos2(
-                mbp16().left() + m.left_margin,
+                mbp16().left() + m.side_margin,
                 mbp16().bottom() - m.margin - m.height,
             ),
             vec2(m.width, m.height),

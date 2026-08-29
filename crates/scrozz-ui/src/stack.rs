@@ -1,7 +1,7 @@
 //! The **capture stack** — the app's primary surface (D12, D21, D28).
 //!
-//! A pile of thumbnail cards anchored to the **bottom-left of the work area**,
-//! growing **upward**. Cards enter and leave **only from the left**, and — the
+//! A pile of thumbnail cards anchored to a chosen side of the work area,
+//! growing **upward**. Cards enter and leave through that outer edge, and — the
 //! invariant the whole design turns on — **a card never moves upward**.
 //!
 //! ```text
@@ -11,13 +11,14 @@
 //!    slot 2
 //!    slot 1  <- 2nd capture
 //!    slot 0  <- 1st capture, and the first to leave
-//!    ------- bottom-left of the WORK AREA
+//!    ------- bottom edge of the WORK AREA
 //! ```
 //!
-//! 1. The first capture appears at slot 0, sliding in from the left.
+//! 1. The first capture appears at slot 0, sliding in from the selected side.
 //! 2. Each next capture slides into the next slot up. **Existing cards do not
 //!    move at all** while the pile is growing.
-//! 3. When full, one coordinated motion: the oldest slides out left, every
+//! 3. When full, one coordinated motion: the oldest slides out through the
+//!    selected side, every
 //!    remaining card falls down one slot, the new card arrives at the top.
 //! 4. Dismissing any card drops the cards above it by one slot. Cards below it
 //!    never move.
@@ -70,6 +71,52 @@ pub type Millis = u64;
 // Slot geometry
 // ---------------------------------------------------------------------------
 
+/// Side of the display that owns the Recent Captures Overlay.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecentCapturesPlacement {
+    /// Anchor cards to the lower-left and dismiss them toward the left edge.
+    #[default]
+    Left,
+    /// Anchor cards to the lower-right and dismiss them toward the right edge.
+    Right,
+}
+
+impl RecentCapturesPlacement {
+    /// Stable persisted setting value.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    /// Parses a persisted setting value.
+    #[must_use]
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    const fn outward(self) -> Dir {
+        match self {
+            Self::Left => Dir::Left,
+            Self::Right => Dir::Right,
+        }
+    }
+
+    const fn intent_for(self, direction: Dir) -> Intent {
+        match (self, direction) {
+            (_, Dir::Down) => Intent::Collapse,
+            (Self::Left, Dir::Left) | (Self::Right, Dir::Right) => Intent::Dismiss,
+            _ => Intent::DragOut,
+        }
+    }
+}
+
 /// The fewest slots a usable stack can have.
 pub const MIN_SLOTS: usize = 1;
 
@@ -88,8 +135,8 @@ pub struct CardMetrics {
     pub gap: f32,
     /// Inset from the top and bottom work-area edges.
     pub margin: f32,
-    /// Inset from the work area's left edge.
-    pub left_margin: f32,
+    /// Inset from the selected work-area edge.
+    pub side_margin: f32,
     /// Extra travel past the screen edge before a departing card is considered
     /// gone. Without it a card with a shadow leaves a smudge at the edge.
     pub clearance: f32,
@@ -102,7 +149,7 @@ impl Default for CardMetrics {
             height: Self::PREFERRED_HEIGHT,
             gap: 8.0,
             margin: 2.0,
-            left_margin: 40.0,
+            side_margin: 40.0,
             clearance: 24.0,
         }
     }
@@ -135,7 +182,7 @@ impl CardMetrics {
     }
 
     fn constrained_to(mut self, work_area: Rect) -> Self {
-        let width_room = (work_area.width() - self.left_margin - self.margin).max(1.0);
+        let width_room = (work_area.width() - self.side_margin - self.margin).max(1.0);
         let height_room = (work_area.height() - self.margin * 2.0).max(1.0);
         let scale = (width_room / self.width)
             .min(height_room / self.height)
@@ -177,12 +224,23 @@ pub struct StackLayout {
     requested_metrics: CardMetrics,
     metrics: CardMetrics,
     slots: usize,
+    placement: RecentCapturesPlacement,
 }
 
 impl StackLayout {
     /// Derives a layout — and a slot count — from a work area.
     #[must_use]
     pub fn new(work_area: Rect, metrics: CardMetrics) -> Self {
+        Self::with_placement(work_area, metrics, RecentCapturesPlacement::Left)
+    }
+
+    /// Derives a layout for a specific Recent Captures Overlay side.
+    #[must_use]
+    pub fn with_placement(
+        work_area: Rect,
+        metrics: CardMetrics,
+        placement: RecentCapturesPlacement,
+    ) -> Self {
         let requested_metrics = metrics;
         let metrics = metrics.constrained_to(work_area);
         let usable = work_area.height() - 2.0 * metrics.margin;
@@ -192,6 +250,7 @@ impl StackLayout {
             requested_metrics,
             metrics,
             slots,
+            placement,
         }
     }
 
@@ -205,6 +264,12 @@ impl StackLayout {
     #[must_use]
     pub fn metrics(&self) -> CardMetrics {
         self.metrics
+    }
+
+    /// The edge this layout is anchored to.
+    #[must_use]
+    pub const fn placement(&self) -> RecentCapturesPlacement {
+        self.placement
     }
 
     /// How many cards the pile holds before it starts retiring the oldest.
@@ -227,13 +292,14 @@ impl StackLayout {
     pub fn slot_rect_f(&self, slot: f32) -> Rect {
         let m = self.metrics;
         let top = self.work_area.bottom() - m.margin - m.height - slot * m.pitch();
-        Rect::from_min_size(
-            pos2(self.work_area.left() + m.left_margin, top),
-            vec2(m.width, m.height),
-        )
+        let left = match self.placement {
+            RecentCapturesPlacement::Left => self.work_area.left() + m.side_margin,
+            RecentCapturesPlacement::Right => self.work_area.right() - m.side_margin - m.width,
+        };
+        Rect::from_min_size(pos2(left, top), vec2(m.width, m.height))
     }
 
-    /// Where a card sits before it has slid in — fully off the left edge.
+    /// Where a card sits before it has slid in — fully beyond the selected edge.
     #[must_use]
     pub fn entry_rect(&self, slot: usize) -> Rect {
         self.entry_rect_for(self.slot_rect(slot))
@@ -242,8 +308,23 @@ impl StackLayout {
     /// Where an arbitrary card rectangle sits before horizontal entry.
     #[must_use]
     pub fn entry_rect_for(&self, rest: Rect) -> Rect {
-        let dx = self.work_area.left() - self.metrics.clearance - rest.right();
+        let dx = match self.placement {
+            RecentCapturesPlacement::Left => {
+                self.work_area.left() - self.metrics.clearance - rest.right()
+            }
+            RecentCapturesPlacement::Right => {
+                self.work_area.right() + self.metrics.clearance - rest.left()
+            }
+        };
         rest.translate(vec2(dx, 0.0))
+    }
+
+    const fn outward(&self) -> Dir {
+        self.placement.outward()
+    }
+
+    const fn intent_for(&self, direction: Dir) -> Intent {
+        self.placement.intent_for(direction)
     }
 
     /// The dock's rectangle for this layout.
@@ -943,6 +1024,25 @@ impl CaptureStack {
         )
     }
 
+    /// An empty stack configured for the current Recent Captures preferences.
+    #[must_use]
+    pub fn configured(
+        work_area: Rect,
+        placement: RecentCapturesPlacement,
+        card_width: f32,
+    ) -> Self {
+        let width = card_width.clamp(CardMetrics::MIN_WIDTH, CardMetrics::MAX_WIDTH);
+        let metrics = CardMetrics {
+            width,
+            height: width / 1.6,
+            ..CardMetrics::default()
+        };
+        Self::new(
+            StackLayout::with_placement(work_area, metrics, placement),
+            Timing::default(),
+        )
+    }
+
     /// The slot geometry.
     #[must_use]
     pub fn layout(&self) -> &StackLayout {
@@ -991,6 +1091,23 @@ impl CaptureStack {
         self.layout.slots()
     }
 
+    /// Whether changing placement and width can keep every current card resident.
+    #[must_use]
+    pub fn configuration_preserves_residents(
+        &self,
+        placement: RecentCapturesPlacement,
+        card_width: f32,
+    ) -> bool {
+        let width = card_width.clamp(CardMetrics::MIN_WIDTH, CardMetrics::MAX_WIDTH);
+        let metrics = CardMetrics {
+            width,
+            height: width / 1.6,
+            ..CardMetrics::default()
+        };
+        StackLayout::with_placement(self.layout.work_area, metrics, placement).slots()
+            >= self.cards.len()
+    }
+
     /// The residents, bottom slot first.
     #[must_use]
     pub fn cards(&self) -> &[Card] {
@@ -1037,7 +1154,7 @@ impl CaptureStack {
             self.dock.expand(m);
         }
         if self.cards.len() >= self.capacity() {
-            self.retire_slot(0, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+            self.retire_slot(0, Intent::Dismiss, self.layout.outward(), Vec2::ZERO, m);
         }
         let slot = self.cards.len();
         let id = CardId(self.next_id);
@@ -1069,7 +1186,7 @@ impl CaptureStack {
         let Some(slot) = self.slot_of(id) else {
             return false;
         };
-        self.retire_slot(slot, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+        self.retire_slot(slot, Intent::Dismiss, self.layout.outward(), Vec2::ZERO, m);
         true
     }
 
@@ -1078,7 +1195,7 @@ impl CaptureStack {
         if self.cards.is_empty() {
             return false;
         }
-        self.retire_slot(0, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+        self.retire_slot(0, Intent::Dismiss, self.layout.outward(), Vec2::ZERO, m);
         true
     }
 
@@ -1089,7 +1206,7 @@ impl CaptureStack {
     pub fn dismiss_all(&mut self, m: &Motion) {
         self.drag = None;
         while let Some(top) = self.cards.len().checked_sub(1) {
-            self.retire_slot(top, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+            self.retire_slot(top, Intent::Dismiss, self.layout.outward(), Vec2::ZERO, m);
         }
     }
 
@@ -1164,10 +1281,33 @@ impl CaptureStack {
     /// Shrinking retires from the bottom, oldest first, exactly as overflow
     /// does, so the invariant survives a display change.
     pub fn resize(&mut self, work_area: Rect, m: &Motion) {
-        self.layout = StackLayout::new(work_area, self.layout.requested_metrics);
+        self.layout = StackLayout::with_placement(
+            work_area,
+            self.layout.requested_metrics,
+            self.layout.placement,
+        );
         self.dock.set_rect(self.layout.dock_rect());
         while self.cards.len() > self.capacity() {
-            self.retire_slot(0, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
+            self.retire_slot(0, Intent::Dismiss, self.layout.outward(), Vec2::ZERO, m);
+        }
+    }
+
+    /// Applies placement and card size to current and future cards.
+    ///
+    /// A size reduction keeps the normal capacity contract: oldest cards retire
+    /// first until every remaining card has a slot.
+    pub fn configure(&mut self, placement: RecentCapturesPlacement, card_width: f32, m: &Motion) {
+        let width = card_width.clamp(CardMetrics::MIN_WIDTH, CardMetrics::MAX_WIDTH);
+        let metrics = CardMetrics {
+            width,
+            height: width / 1.6,
+            ..CardMetrics::default()
+        };
+        self.layout = StackLayout::with_placement(self.layout.work_area, metrics, placement);
+        self.dock.set_rect(self.layout.dock_rect());
+        self.drag = None;
+        while self.cards.len() > self.capacity() {
+            self.retire_slot(0, Intent::Dismiss, self.layout.outward(), Vec2::ZERO, m);
         }
     }
 
@@ -1272,7 +1412,8 @@ impl CaptureStack {
             }
         }
 
-        if newly_locked.is_some_and(|direction| direction.intent() == Intent::DragOut)
+        if newly_locked
+            .is_some_and(|direction| self.layout.intent_for(direction) == Intent::DragOut)
             && let Some(slot) = self.slot_of(id)
         {
             let pinned = self.rect_of_resident(slot, m);
@@ -1281,7 +1422,9 @@ impl CaptureStack {
             }
         }
         if let Some(card) = self.cards.iter_mut().find(|c| c.id == id) {
-            if direction.is_some_and(|direction| direction.intent() == Intent::DragOut) {
+            if direction
+                .is_some_and(|direction| self.layout.intent_for(direction) == Intent::DragOut)
+            {
                 card.drag = Some(Vec2::ZERO);
                 card.lifted = false;
                 if newly_locked.is_some() {
@@ -1318,7 +1461,7 @@ impl CaptureStack {
     pub fn live_gesture(&self, m: &Motion) -> Option<LiveGesture> {
         let drag = self.drag.as_ref()?;
         let direction = drag.direction?;
-        let intent = direction.intent();
+        let intent = self.layout.intent_for(direction);
         let travel = drag.latest - drag.origin;
         if intent != Intent::DragOut && self.gestures.score(direction, travel, Vec2::ZERO) < 1.0 {
             return None;
@@ -1347,7 +1490,7 @@ impl CaptureStack {
         let direction = drag.direction;
         let intent = direction.map_or(Intent::SpringBack, |direction| {
             if self.gestures.score(direction, travel, velocity) >= 1.0 {
-                direction.intent()
+                self.layout.intent_for(direction)
             } else {
                 Intent::SpringBack
             }
@@ -1359,7 +1502,7 @@ impl CaptureStack {
 
         match intent {
             Intent::Dismiss => {
-                let dir = direction.unwrap_or(Dir::Left);
+                let dir = direction.unwrap_or_else(|| self.layout.outward());
                 self.retire_slot(slot, intent, dir, velocity, m);
             }
             // Too late to begin a native session. A distance-committed drag-out

@@ -25,22 +25,25 @@
 //! | Platform | [`vibrancy`] | OS window materials, where they exist |
 //! | Drawing | [`paint`] | Primitives and controls built from all of the above |
 //! | Surfaces | [`card`], [`stack`] | The product's actual screens |
-//! | Window | [`overlay_app`] | The floating window the stack lives in |
+//! | Window | [`recent_captures_overlay`] | The floating window the stack lives in |
 //! | Verification | [`harness`] | Headless rendering of any surface |
 //!
 //! # Driving the overlay
 //!
-//! [`overlay_app`] is the seam the rest of the application uses. Build an
-//! [`OverlayHandle`], keep a clone, hand the other to [`OverlayApp::new`] inside
-//! `eframe`'s app creator, then [`OverlayHandle::push`] captures in and
-//! [`OverlayHandle::drain_events`] results out. The handle is `Send + Sync` and
+//! [`recent_captures_overlay`] is the seam the rest of the application uses.
+//! Build a [`RecentCapturesOverlayHandle`], keep a clone, hand the other to
+//! [`RecentCapturesOverlayApp::new`] inside `eframe`'s app creator, then
+//! [`RecentCapturesOverlayHandle::push`] captures in and
+//! [`RecentCapturesOverlayHandle::drain_events`] results out. The handle is
+//! `Send + Sync` and
 //! works before the window exists, so a hotkey thread can be wired to it at
 //! start-up.
 //!
 //! Two things the window cannot do for itself are supplied as hooks, because
 //! this crate is `#![forbid(unsafe_code)]` and does not depend on
-//! `scrozz-shell`: [`overlay_app::PanelHook`] converts the native window into a
-//! non-activating panel, and [`overlay_app::PointerProbe`] reports the cursor
+//! `scrozz-shell`: [`recent_captures_overlay::PanelHook`] converts the native
+//! window into a non-activating panel, and
+//! [`recent_captures_overlay::PointerProbe`] reports the cursor
 //! position while the window is passing clicks through.
 //!
 //! # Window captures are never composited onto
@@ -86,10 +89,10 @@ pub mod harness;
 pub mod history;
 pub mod icons;
 pub mod motion;
-pub mod overlay_app;
 pub mod paint;
 pub mod permission;
 pub mod pinned;
+pub mod recent_captures_overlay;
 mod recording_controls;
 pub mod recording_settings;
 pub mod select;
@@ -105,13 +108,16 @@ pub use history::{
     HistoryViewModel,
 };
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
-pub use overlay_app::{
-    CaptureMedia, CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry,
-    OverlayHandle, OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+pub use recent_captures_overlay::{
+    CaptureMedia, CaptureRequest, DismissReason, PanelHook, PanelReport, Passthrough, PointerProbe,
+    RecentCapturesOverlayApp, RecentCapturesOverlayEvent, RecentCapturesOverlayGeometry,
+    RecentCapturesOverlayHandle, RecentCapturesOverlayOptions, RecentCapturesOverlaySettings,
+    RecentCapturesPlacement,
 };
 pub use recording_settings::{
     RecordingSettingsAction, RecordingSettingsPanel, RecordingSettingsResponse,
 };
+
 pub use select::{
     AxisDirection, DisplayLayout, DragModifiers, FrozenDesktop, FrozenDisplayFrame, FrozenPixel,
     HudEntry, HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,

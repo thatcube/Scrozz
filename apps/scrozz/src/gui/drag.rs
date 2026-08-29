@@ -11,13 +11,14 @@
 //! and the visible symptom is a card that flies off the screen while the chat
 //! window it was aimed at receives nothing at all.
 //!
-//! `scrozz-ui` therefore raises [`OverlayEvent::DragOutArmed`][armed] the
+//! `scrozz-ui` therefore raises
+//! [`RecentCapturesOverlayEvent::DragOutArmed`][armed] the
 //! moment the pointer has travelled far enough to mean it, *mid*-gesture, and
 //! this module turns that into a real [`DragSource::begin`]. From that instant
 //! the operating system owns the gesture: it draws the image, it tracks the
 //! destination, and it tells us what happened.
 //!
-//! [armed]: scrozz_ui::OverlayEvent::DragOutArmed
+//! [armed]: scrozz_ui::RecentCapturesOverlayEvent::DragOutArmed
 //!
 //! # Why the card does not leave on its own
 //!
@@ -63,6 +64,8 @@ pub struct DragSpot {
     pub card: [f32; 4],
     /// The pointer position: x, y.
     pub pointer: [f32; 2],
+    /// Option/Alt was held when the platform hand-off committed.
+    pub keep_after_accept: bool,
 }
 
 impl DragSpot {
@@ -604,6 +607,7 @@ mod tests {
         DragSpot {
             card: [10.0, 20.0, 210.0, 150.0],
             pointer: [80.0, 90.0],
+            keep_after_accept: false,
         }
     }
 
@@ -728,6 +732,7 @@ mod tests {
         let spot = DragSpot {
             card: [0.0, 0.0, 100.0, 60.0],
             pointer: [10.0, 10.0],
+            keep_after_accept: false,
         };
 
         let refusal = host
@@ -745,6 +750,7 @@ mod tests {
         let spot = DragSpot {
             card: [12.0, 34.0, 56.0, 78.0],
             pointer: [20.0, 40.0],
+            keep_after_accept: false,
         };
         // Safety: never dereferenced — `DragOrigin` only carries the handle.
         let surface = unsafe { NativeSurface::from_raw(std::ptr::null_mut()) };

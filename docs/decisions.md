@@ -274,9 +274,10 @@ single card. Its primary interaction is **dragging a capture directly into
 another application** — above copy, above save. Swipe-to-dismiss is a primary
 gesture. Clipboard remains essential but is no longer described as "first".
 
-**Layout.** Fixed slots anchored at the bottom-left; a new capture slides in from
-off-screen left into the next empty slot upward, building a tower with the oldest
-at the bottom. **Existing cards do not move on arrival.** Nothing ever covers
+**Layout.** Fixed slots anchored at the configured bottom-left or bottom-right
+edge; a new capture slides in from that edge into the next empty slot upward,
+building a tower with the oldest at the bottom. **Existing cards do not move on
+arrival.** Nothing ever covers
 anything — zero overlap, full size and opacity, consistent gaps. Each card is
 independently hoverable, draggable and dismissable; hovering one reveals only its
 own chrome. Full layout, overflow and gesture rules are in D21.
@@ -598,13 +599,13 @@ overlays" as a settings toggle, not a spatial, reversible, one-gesture affordanc
 
 ---
 
-## D21 — The overlay interaction and animation set
+## D21 — The Recent Captures Overlay interaction and animation set
 
 ### Layout: fixed slots, nothing reflows on arrival
 
-The overlay is a column of **fixed slots** anchored at the bottom-left. A new
-capture slides in from off-screen left into the **next empty slot upward** —
-building a tower, oldest at the bottom. **Existing cards do not move.** No
+The overlay is a column of **fixed slots** anchored at the configured bottom
+edge. A new capture slides in from that screen edge into the **next empty slot
+upward** — building a tower, oldest at the bottom. **Existing cards do not move.** No
 shifting, no reflow, no settle when a capture arrives.
 
 The slot count is **computed from display height** (≈6 on a 16" MacBook Pro),
@@ -622,13 +623,13 @@ moves nothing; departure obeys gravity.
 
 | Gesture on a card | Meaning | Behaviour |
 |---|---|---|
-| **Left** | Dismiss | Velocity-driven fling off-screen; springs back below threshold |
-| **Right or Up** | **Drag onto something** | Enters drag mode; on release the card drops and animates away; cancel springs it back |
+| **Toward the anchored screen edge** | Dismiss | Velocity-driven fling off-screen; springs back below threshold |
+| **Away from the anchored edge, or Up** | **Drag onto something** | Enters drag mode; an accepted drop may close according to Settings; cancel, rejection, and failure spring it back |
 | **Down** | Collapse | The whole list collapses into the dock (D20); non-destructive |
 
 **Consequence: there is no drag handle and no drag button.** Direction alone
-expresses intent — throw it left to discard, push it right or up to hand it to
-another app, push it down to hide everything. This is what resolves D12's
+expresses intent — throw it toward its screen edge to discard, push it inward or
+up to hand it to another app, push it down to hide everything. This is what resolves D12's
 drag-first requirement against D12's "no chrome at rest" requirement.
 
 Drag mode is where the OS promised-file drag lives (D12), so a capture never
@@ -636,7 +637,7 @@ written to disk can still be dropped into another application.
 
 ### The animation set
 
-1. **Card enters** — glides in from off-screen left over 440 ms with a smooth
+1. **Card enters** — glides in from its configured screen edge over 440 ms with a smooth
    in-out curve and no bounce or overshoot.
 2. **Card leaves** — via close, copy, save, or swipe-left. **One shared exit
    animation**, also used for overflow retirement.
@@ -652,8 +653,9 @@ easing.
 **The mental model is phone notifications:** discrete cards that accumulate, get
 swiped away individually, and can be collapsed out of the way.
 
-**Why copy and save also dismiss.** That is the real workflow — capture, copy,
-gone. A card left on screen after its action has been taken is clutter.
+**Why copy and save also dismiss after confirmed success.** That is the real
+workflow — capture, copy, gone. A card left on screen after its action has been
+taken is clutter; a card removed before a failed action reports is data loss.
 
 **Why so few animations.** Maintainer: *"im realizing theres not that much
 animation… it might be nice to animate button presses for example, but that's not
@@ -926,9 +928,9 @@ escape must be.**
 
 ## D28 — The Recent Captures Overlay is bottom-anchored and grows upward
 
-**Decision.** The pile of capture cards is anchored to the **bottom-left of the
-screen** and grows **upward**. Cards enter and leave **only from the left**, and
-they only ever move **downward**.
+**Decision.** The pile of capture cards is anchored to the configured
+**bottom-left or bottom-right of the screen** and grows **upward**. Cards enter
+and leave only through that screen edge, and they only ever move **downward**.
 
 ```
    slot 5  ← 6th capture
@@ -937,18 +939,18 @@ they only ever move **downward**.
    slot 2
    slot 1  ← 2nd capture
    slot 0  ← 1st capture, and the first to leave
-   ─────── bottom-left of the work area
+   ─────── configured bottom corner of the work area
 ```
 
 The complete behaviour, which is the whole specification:
 
-1. **First capture** appears at slot 0, the bottom, sliding in from the left.
-2. **Each subsequent capture** slides in from the left into the next slot up.
+1. **First capture** appears at slot 0, the bottom, sliding in from its screen edge.
+2. **Each subsequent capture** slides in from that edge into the next slot up.
    **Existing cards do not move at all** while the pile is still growing.
 3. **When the pile is full**, three things happen as one coordinated motion: the
-   oldest card at slot 0 slides out to the **left** — the same way it came in —
+   oldest card at slot 0 slides out through its configured edge — the same way it came in —
    every remaining card **falls down** one slot, and the new card slides in from
-   the left into the top slot.
+   the    configured edge into the top slot.
 4. **Dismissing any card** applies the same gravity: cards above it fall down one
    slot to close the gap; cards below it never move.
 
@@ -988,8 +990,9 @@ user did not ask for, applied to cards they may be reaching toward. The bottom
 anchor keeps existing cards perfectly still until something actually leaves,
 which is the property that makes the pile safe to aim at.
 
-**Possible future setting.** Top-anchored may be offered as a preference later.
-It is not the default and is not built for v1.
+**Placement setting.** Left remains the default; right mirrors the horizontal
+anchor, entry, exit, and drag-intent directions without changing the
+bottom-up/never-upward invariant. Top-anchored placement is not implemented.
 
 ## D29 — Annotation semantics that users can observe
 
@@ -1300,6 +1303,81 @@ destinations cannot predict, while an unbounded frame loop can exhaust disk or
 memory far faster than the source recording. Explicit choices and hard limits
 make retries deterministic, keep source media untouched, and preserve the App
 Store exception without introducing a software H.264 patent or license surprise.
+
+---
+
+## D35 — Recent Captures Overlay settings are immediate, outcome-driven, and non-destructive
+
+**Decision.** Recent Captures has its own Settings category, adapted to the
+macOS top-category and Windows/Linux sidebar hosts. Placement supports the two
+behaviors the overlay genuinely implements: bottom-left and bottom-right.
+Cards retain a 16:10 shape and accept a 224–320 logical-point width, with
+288 × 180 as the preferred default. Capacity always follows D28's
+as-many-as-fit formula; changing size never introduces a six-item cap. If a
+larger width would immediately evict a currently visible card, the live surface
+defers that width until the resident count fits. Placement and non-destructive
+size changes still apply immediately.
+
+Display ownership is sticky by default. When **Move to the active display** is
+enabled, the overlay follows the display associated with the current capture
+or pointer action. A disconnected or reconfigured display resolves
+deterministically to the primary display, then the first available display.
+Geometry changes use the existing hidden-root/CardArm handoff and defer while
+an external drag owns pointer state.
+
+Automatic cleanup is disabled by default. When enabled it measures each card's
+elapsed lifetime using a monotonic deadline for the current process and starts a
+fresh interval after restart; stale wall-clock timestamps are not persisted. **Hide** refuses
+to remove a card that owns the only retained artifact. The worker verifies
+history retention and releases live bytes as one ordered operation, so retention
+cannot change between the safety decision and release. Capacity overflow uses
+the same gate; when no durable artifact remains, it writes the current card
+revision to Export Location before releasing live pixels. If that recovery
+cannot be queued or fails, the unreachable overflow cache is released rather
+than leaking full-resolution bytes for the process lifetime.
+**Save then hide** reuses an existing export when one exists and otherwise waits
+for confirmed atomic export success. Failure or cancellation leaves the card
+visible.
+
+**Cleanup defers to an open editor and to work already in flight.** An expired
+interval or a capacity eviction that lands while the card's editor owns the live
+revision is recorded, not performed: the editor would otherwise be stranded on
+pixels it can no longer re-read. The deferred action resumes when that window
+closes, carrying the editor's final snapshot, so a recovery or **Save then
+hide** export writes the revision the user actually finished with. For the same
+reason an export that predates the editor session cannot stand in for it — a
+stale file is only reused when nothing is editing the card. Cleanup likewise
+never pre-empts an in-flight Save As or output: automatic close and dismissal
+leave the card visible until that action reports, and overflow only records that
+the card became unreachable so the outcome — success, failure, or cancellation —
+decides whether its bytes are released.
+
+Action-driven closing is also outcome-based. Copy and Save close only after the
+worker reports success. An accepted external drag closes only when
+**Close after drag** is enabled; holding Option on macOS or Alt on
+Windows/Linux keeps the card for that drag. A cancelled, rejected, or failed
+drop always restores it. Save either writes directly to Export Location or
+opens the native destination chooser; the same modifier temporarily inverts
+that choice. These actions do not rerun the After Capture policy, so they cannot
+duplicate its automatic save or upload work.
+
+**Cloud limit.** Close-after-upload is shown with an unavailable explanation
+until upload produces a confirmed success result. Dispatching a request is not
+success, and failure, cancellation, or unavailable service never closes a card.
+
+**Persistence and naming.** These settings live under
+`recent-captures-overlay.*` in the existing atomic, forward-preserving settings
+document. No earlier keys existed for these controls, so defaults are the
+migration. Recent-capture-specific modules and public types use
+`recent_captures_overlay` and `RecentCapturesOverlay*`. Generic
+`scrozz-shell::overlay`, `OverlayBehavior`, and selection's local geometry name
+remain because they cover shared native or selector infrastructure.
+
+**Why.** A close preference is safe only when it composes with artifact
+retention and asynchronous outcomes. Treating a queued job or drag handoff as
+success loses work on rejection and failure. Explicit ownership, deferred
+geometry, and conservative defaults let settings apply immediately without
+surprising existing users or corrupting active interactions.
 
 ---
 

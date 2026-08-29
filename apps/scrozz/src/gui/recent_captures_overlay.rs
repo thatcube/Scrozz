@@ -1,4 +1,4 @@
-//! The adapter between this app's cards and `scrozz-ui`'s capture stack.
+//! The adapter between this app's cards and `scrozz-ui`'s Recent Captures Overlay.
 //!
 //! `scrozz-ui` owns everything about how a card looks and moves: the pile at the
 //! bottom-left, the swipe-to-dismiss, the dock it collapses into, the hover
@@ -16,7 +16,7 @@
 //! numbering and the pipeline only understands *ours*.
 //!
 //! The overlay assigns its identifier on push and announces it with
-//! [`OverlayEvent::Pushed`], in push order. So the translation is a queue: what
+//! [`RecentCapturesOverlayEvent::Pushed`], in push order. So the translation is a queue: what
 //! we pushed and have not yet been told the identifier for, matched up as the
 //! announcements arrive.
 
@@ -25,7 +25,8 @@ use std::collections::{HashMap, VecDeque};
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
 use scrozz_store::CaptureId;
 use scrozz_ui::{
-    CaptureMedia, CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
+    CaptureMedia, CaptureRequest, RecentCapturesOverlayEvent, RecentCapturesOverlayHandle,
+    recent_captures_overlay::THUMBNAIL_PX,
 };
 
 use crate::gui::{
@@ -34,13 +35,13 @@ use crate::gui::{
     panel::BehaviorController,
 };
 
-/// A [`CardSurface`] backed by a running `scrozz-ui` overlay.
+/// A [`CardSurface`] backed by the running Recent Captures Overlay.
 ///
-/// Holds only an [`OverlayHandle`], which is cheap to clone and safe to hold
+/// Holds only a [`RecentCapturesOverlayHandle`], which is cheap to clone and safe to hold
 /// before the window exists — a capture taken during start-up is waiting in the
 /// pile when the overlay opens rather than being lost.
-pub struct OverlayCards {
-    handle: OverlayHandle,
+pub struct RecentCapturesOverlayCards {
+    handle: RecentCapturesOverlayHandle,
     /// The native window, once the creation hook has seen it. Only a drag needs
     /// it, and a drag asked for before the window exists is refused rather than
     /// guessing at a handle.
@@ -60,10 +61,10 @@ pub struct OverlayCards {
     queued: VecDeque<CardEvent>,
 }
 
-impl OverlayCards {
-    /// Wraps a handle to an overlay.
+impl RecentCapturesOverlayCards {
+    /// Wraps a handle to the Recent Captures Overlay.
     #[must_use]
-    pub fn new(handle: OverlayHandle) -> Self {
+    pub fn new(handle: RecentCapturesOverlayHandle) -> Self {
         Self {
             handle,
             native: None,
@@ -84,7 +85,7 @@ impl OverlayCards {
 
     /// A clone of the handle, for the window that draws it.
     #[must_use]
-    pub fn handle(&self) -> OverlayHandle {
+    pub fn handle(&self) -> RecentCapturesOverlayHandle {
         self.handle.clone()
     }
 
@@ -95,7 +96,14 @@ impl OverlayCards {
     }
 }
 
-impl CardSurface for OverlayCards {
+impl CardSurface for RecentCapturesOverlayCards {
+    fn configure_recent_captures_overlay(
+        &mut self,
+        settings: scrozz_ui::RecentCapturesOverlaySettings,
+    ) {
+        self.handle.configure(settings);
+    }
+
     fn present(&mut self, card: Card) -> scrozz_core::Result<()> {
         let request = request_for_card(&card);
 
@@ -246,7 +254,7 @@ impl CardSurface for OverlayCards {
     }
 }
 
-impl OverlayCards {
+impl RecentCapturesOverlayCards {
     /// Drains the overlay's outbox and appends the translation to `queued`.
     ///
     /// `drain_events` empties the outbox, so the whole batch must be translated
@@ -258,7 +266,7 @@ impl OverlayCards {
 
         for event in batch {
             match event {
-                OverlayEvent::Pushed { id } => {
+                RecentCapturesOverlayEvent::Pushed { id } => {
                     // In push order, which is the contract that makes this
                     // matching sound.
                     if let Some(ours) = self.pending.pop_front() {
@@ -271,29 +279,34 @@ impl OverlayCards {
                         );
                     }
                 }
-                OverlayEvent::Dismissed { id, reason } => {
+                RecentCapturesOverlayEvent::Dismissed { id, reason } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        // Every reason ends the same way here: the card is gone
-                        // from the pile and its bytes can be released. A drag
-                        // that was handed to the platform never reaches this
-                        // arm — the overlay springs that card back and the host
-                        // dismisses it only once a drop is accepted.
                         tracing::debug!(?reason, card = %ours, "card left the pile");
-                        out.push(CardEvent::Dismiss(ours));
+                        if reason == scrozz_ui::DismissReason::Overflow {
+                            out.push(CardEvent::Overflow(ours));
+                        } else {
+                            out.push(CardEvent::Dismiss(ours));
+                        }
                         self.forget(ours);
                     }
                 }
-                OverlayEvent::CopyRequested { id } => {
+                RecentCapturesOverlayEvent::CopyRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         out.push(CardEvent::Copy(ours));
                     }
                 }
-                OverlayEvent::SaveRequested { id } => {
+                RecentCapturesOverlayEvent::SaveRequested {
+                    id,
+                    choose_destination,
+                } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        out.push(CardEvent::Save(ours));
+                        out.push(CardEvent::Save {
+                            card: ours,
+                            choose_destination,
+                        });
                     }
                 }
-                OverlayEvent::EditRequested { id } => {
+                RecentCapturesOverlayEvent::EditRequested { id } => {
                     // Both editors are reached through `Open`; the coordinator
                     // already knows which media the card holds and therefore
                     // which editor the request means.
@@ -301,12 +314,17 @@ impl OverlayCards {
                         out.push(CardEvent::Open(ours));
                     }
                 }
-                OverlayEvent::AnnotateRequested { id } => {
+                RecentCapturesOverlayEvent::AnnotateRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         out.push(CardEvent::Open(ours));
                     }
                 }
-                OverlayEvent::DragOutArmed { id, card, pointer } => {
+                RecentCapturesOverlayEvent::DragOutArmed {
+                    id,
+                    card,
+                    pointer,
+                    keep_after_accept,
+                } => {
                     // The only event that starts a native drag, and the only
                     // one that arrives while the mouse button is still down.
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
@@ -315,6 +333,7 @@ impl OverlayCards {
                             at: DragSpot {
                                 card: [card.min.x, card.min.y, card.width(), card.height()],
                                 pointer: [pointer.x, pointer.y],
+                                keep_after_accept,
                             },
                         });
                     }
@@ -324,8 +343,9 @@ impl OverlayCards {
                 // release-time report, which the overlay raises only when no
                 // host armed the gesture; this host always does, on every
                 // platform, and refuses visibly if it cannot.
-                OverlayEvent::DragStarted { .. } | OverlayEvent::DragOut { .. } => {}
-                OverlayEvent::DockCollapsed => {
+                RecentCapturesOverlayEvent::DragStarted { .. }
+                | RecentCapturesOverlayEvent::DragOut { .. } => {}
+                RecentCapturesOverlayEvent::DockCollapsed => {
                     // Collapsing is about the pile, not a card. The oldest one
                     // stands in for it so the event is not lost entirely.
                     if let Some(ours) = self.mapped.values().copied().min() {
@@ -335,33 +355,42 @@ impl OverlayCards {
                 // Nothing downstream acts on these yet, and inventing a
                 // translation for them would be worse than leaving the gap
                 // visible.
-                OverlayEvent::UploadRequested { .. }
-                | OverlayEvent::DockExpanded
-                | OverlayEvent::Emptied => {}
-                OverlayEvent::PinRequested { id, pin, state } => {
+                RecentCapturesOverlayEvent::UploadRequested { id } => {
+                    if let Some(ours) = self.mapped.get(&id.0).copied() {
+                        out.push(CardEvent::Upload(ours));
+                    }
+                }
+                RecentCapturesOverlayEvent::AutoCloseRequested { id, action } => {
+                    if let Some(ours) = self.mapped.get(&id.0).copied() {
+                        out.push(CardEvent::AutoClose(ours, action));
+                    }
+                }
+                RecentCapturesOverlayEvent::DockExpanded | RecentCapturesOverlayEvent::Emptied => {}
+                RecentCapturesOverlayEvent::PinRequested { id, pin, state } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         self.pinned.insert(pin.0.clone(), ours);
                         out.push(CardEvent::Pin(ours, CaptureId(pin.0), state));
                     }
                 }
-                OverlayEvent::PinUpdated { pin, state } => {
+                RecentCapturesOverlayEvent::PinUpdated { pin, state } => {
                     out.push(CardEvent::PinChanged(CaptureId(pin.0), state));
                 }
-                OverlayEvent::PinClosed { pin } => {
+                RecentCapturesOverlayEvent::PinClosed { pin } => {
                     self.pinned.remove(&pin.0);
                     out.push(CardEvent::Unpin(CaptureId(pin.0)));
                 }
-                OverlayEvent::PinUnavailable { card, reason } => {
+                RecentCapturesOverlayEvent::PinUnavailable { card, reason } => {
                     if let Some(ours) = self.mapped.get(&card.0).copied() {
                         out.push(CardEvent::PinUnavailable { card: ours, reason });
                     }
                 }
-                OverlayEvent::PinPositioningUnavailable { pin, reason } => {
+                RecentCapturesOverlayEvent::PinPositioningUnavailable { pin, reason } => {
                     out.push(CardEvent::PinPositioningUnavailable {
                         capture: CaptureId(pin.0),
                         reason,
                     });
                 }
+
                 _ => {}
             }
         }
@@ -463,15 +492,15 @@ mod tests {
     fn a_pushed_card_is_counted_before_the_overlay_answers() {
         // The window may not exist yet. A capture taken now must still be
         // accounted for, or the app will think nothing is showing.
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         surface.present(card(1)).expect("push never refuses");
         assert_eq!(surface.len(), 1);
     }
 
     #[test]
     fn identifiers_are_matched_in_push_order() {
-        let handle = OverlayHandle::new();
-        let mut surface = OverlayCards::new(handle);
+        let handle = RecentCapturesOverlayHandle::new();
+        let mut surface = RecentCapturesOverlayCards::new(handle);
         surface.present(card(7)).expect("push");
         surface.present(card(8)).expect("push");
 
@@ -521,13 +550,13 @@ mod tests {
 
     #[test]
     fn a_surface_with_no_window_says_so() {
-        let surface = OverlayCards::new(OverlayHandle::new());
+        let surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         assert!(surface.describe().contains("no window"));
     }
 
     #[test]
     fn dismissing_an_unknown_card_is_harmless() {
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         surface.dismiss(CardId(99));
         assert_eq!(surface.len(), 0);
     }
@@ -544,26 +573,27 @@ mod tests {
 
     /// Announces `card` to the surface the way a real frame does, and returns
     /// the overlay-side id the surface will be told about.
-    fn announce(surface: &mut OverlayCards, card: Card) -> u64 {
+    fn announce(surface: &mut RecentCapturesOverlayCards, card: Card) -> u64 {
         let id = card.id.0;
         surface.present(card).expect("push never refuses");
         surface
             .handle
-            .report(OverlayEvent::Pushed { id: UiCardId(id) });
+            .report(RecentCapturesOverlayEvent::Pushed { id: UiCardId(id) });
         id
     }
 
-    fn drag_event(id: u64) -> OverlayEvent {
-        OverlayEvent::DragOutArmed {
+    fn drag_event(id: u64) -> RecentCapturesOverlayEvent {
+        RecentCapturesOverlayEvent::DragOutArmed {
             id: UiCardId(id),
             card: egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(210.0, 150.0)),
             pointer: egui::pos2(60.0, 70.0),
+            keep_after_accept: false,
         }
     }
 
     #[test]
     fn a_drag_is_lifted_out_of_the_batch_it_arrived_in() {
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         let a = announce(&mut surface, card(1));
         surface.poll();
 
@@ -578,24 +608,33 @@ mod tests {
         // Hoisting the drag ahead of a queued dismiss is deliberate; leaving
         // the rest *reordered* would not be. The pile's event order is the
         // user's gesture order.
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         let a = announce(&mut surface, card(1));
         let b = announce(&mut surface, card(2));
         surface.poll();
 
         surface
             .handle
-            .report(OverlayEvent::CopyRequested { id: UiCardId(b) });
+            .report(RecentCapturesOverlayEvent::CopyRequested { id: UiCardId(b) });
         surface.handle.report(drag_event(a));
         surface
             .handle
-            .report(OverlayEvent::SaveRequested { id: UiCardId(b) });
+            .report(RecentCapturesOverlayEvent::SaveRequested {
+                id: UiCardId(b),
+                choose_destination: false,
+            });
 
         let drags = surface.poll_drag_starts();
         assert_eq!(drags.len(), 1, "only the drag may be lifted out");
 
         assert_eq!(surface.poll(), Some(CardEvent::Copy(CardId(2))));
-        assert_eq!(surface.poll(), Some(CardEvent::Save(CardId(2))));
+        assert_eq!(
+            surface.poll(),
+            Some(CardEvent::Save {
+                card: CardId(2),
+                choose_destination: false,
+            })
+        );
         assert_eq!(surface.poll(), None, "the drag was drained twice");
     }
 
@@ -605,13 +644,13 @@ mod tests {
         // the queue empties, which is right for ordering and fatal for a drag:
         // a copy queued ahead of it would hold the drag until a later frame,
         // by which time the mouse is up.
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         let a = announce(&mut surface, card(1));
         surface.poll();
 
         surface
             .handle
-            .report(OverlayEvent::CopyRequested { id: UiCardId(a) });
+            .report(RecentCapturesOverlayEvent::CopyRequested { id: UiCardId(a) });
         surface.poll_drag_starts();
         assert_eq!(surface.queued.len(), 1, "the copy should be waiting");
 
@@ -629,7 +668,7 @@ mod tests {
     fn the_drag_carries_where_the_card_and_pointer_are() {
         // Wrong geometry here and the drag image jumps somewhere else the
         // instant the platform takes over.
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         let a = announce(&mut surface, card(1));
         surface.poll();
         surface.handle.report(drag_event(a));
@@ -647,7 +686,7 @@ mod tests {
         // The two id spaces are different, and a settle sent under the wrong
         // one silently does nothing — which looks exactly like the bug it is
         // meant to fix.
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         let a = announce(&mut surface, card(1));
         surface.poll();
         assert_eq!(surface.reverse.get(&CardId(1)).copied(), Some(a));
@@ -662,7 +701,7 @@ mod tests {
 
     #[test]
     fn settling_a_card_the_overlay_never_saw_is_harmless() {
-        let mut surface = OverlayCards::new(OverlayHandle::new());
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         surface.settle_drag(CardId(404), true);
         assert_eq!(surface.len(), 0);
     }

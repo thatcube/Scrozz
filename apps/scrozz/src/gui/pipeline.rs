@@ -64,7 +64,7 @@ use scrozz_core::{
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_shell::{DragPayload, DragPreview, byte_source};
 use scrozz_store::{
-    CaptureId, CaptureRecord, DocumentState, FrameHeader, History, NewCapture, Page,
+    CaptureId, CaptureRecord, DocumentState, FrameHeader, History, ImageState, NewCapture, Page,
     RetentionPolicy, SearchQuery, SqliteStore, Store,
 };
 use scrozz_ui::editor::RevisionedFrame;
@@ -281,8 +281,24 @@ pub enum Job {
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
     },
+    /// Write an already-rendered image to an explicitly chosen path.
+    SaveImageTo {
+        /// Which card the image came from, for the log line.
+        card: CardId,
+        /// The flattened image and the exact document revision it represents.
+        rendered: Box<RevisionedFrame>,
+        /// Native-dialog destination.
+        path: std::path::PathBuf,
+    },
     /// Write a card's capture to the configured folder.
     Save(CardId),
+    /// Write a card's capture to an explicitly chosen path.
+    SaveTo {
+        /// Card whose immutable bytes are being exported.
+        card: CardId,
+        /// Native-dialog destination.
+        path: std::path::PathBuf,
+    },
     /// Restore a stored capture into a new live card.
     Restore {
         /// Durable capture.
@@ -328,6 +344,13 @@ pub enum Job {
     EnforceRetention(RetentionPolicy),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Release live bytes only if durable history still owns the source pixels.
+    ReleaseIfRetained {
+        /// Live card awaiting a safe cleanup decision.
+        card: CardId,
+        /// Durable history identity to inspect.
+        capture: CaptureId,
+    },
     /// Persist a new pin using the capture associated with a live card.
     PinCard {
         /// Live card identity.
@@ -510,6 +533,20 @@ pub enum Outcome {
         /// Why.
         error: CliError,
     },
+    /// A requested card output failed.
+    OutputRefused {
+        /// Which card.
+        card: CardId,
+        /// Why.
+        error: CliError,
+    },
+    /// Result of an atomic durable-source check and live-byte release.
+    RetentionRelease {
+        /// Live card awaiting the decision.
+        card: CardId,
+        /// Whether live bytes were released because history owned the source.
+        released: bool,
+    },
     /// A persisted pin is ready to restore or refresh on screen.
     PinReady(Box<PinnedCapture>),
     /// Higher-resolution pixels for a newly created pin.
@@ -588,6 +625,10 @@ pub struct ReadyCapture {
     pub card: Card,
     /// Enabled actions in deterministic execution order.
     pub actions: ExecutionReport,
+    /// Whether a durable history source or confirmed external destination owns the artifact.
+    pub retained_elsewhere: bool,
+    /// Whether After Capture already wrote the artifact to a local export path.
+    pub exported: bool,
 }
 
 /// A handle to the capture and history threads.
@@ -1269,10 +1310,28 @@ impl Worker {
                 Job::Copy(card) => self.copy(card),
                 Job::CopyImage { card, rendered } => self.copy_image(card, &rendered),
                 Job::SaveImage { card, rendered } => self.save_image(card, &rendered),
+                Job::SaveImageTo {
+                    card,
+                    rendered,
+                    path,
+                } => self.save_image_to(card, &rendered, &path),
                 Job::Save(card) => self.save(card),
+                Job::SaveTo { card, path } => self.save_to(card, &path),
                 Job::Release(card) => {
                     self.vault.forget(card);
                     self.derived_documents.remove(&card);
+                }
+                Job::ReleaseIfRetained { card, capture } => {
+                    let released = self
+                        .store
+                        .as_ref()
+                        .and_then(|store| store.record(&capture).ok().flatten())
+                        .is_some_and(|record| matches!(record.image, ImageState::Present { .. }));
+                    if released {
+                        self.vault.forget(card);
+                        self.derived_documents.remove(&card);
+                    }
+                    self.emit(Outcome::RetentionRelease { card, released });
                 }
                 Job::PinCard {
                     card,
@@ -1546,6 +1605,12 @@ impl Worker {
         // drag has no time to spare once it has started.
         let preview = thumbnail.as_ref().and_then(preview_png).map(Arc::new);
         let capture_id = self.remember_document(&document);
+        let retained_in_history = capture_id.as_ref().is_some_and(|id| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.record(id).ok().flatten())
+                .is_some_and(|record| matches!(record.image, ImageState::Present { .. }))
+        });
         if apply_smart_frame {
             self.derived_documents.insert(card, document.data());
         }
@@ -1581,6 +1646,21 @@ impl Worker {
                 _ => None,
             })
             .collect();
+        let exported = actions.steps.iter().any(|step| {
+            matches!(
+                step.outcome,
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Saved(_))
+            )
+        });
+        let retained_elsewhere = retained_in_history
+            || actions.steps.iter().any(|step| {
+                matches!(
+                    step.outcome,
+                    crate::after_capture::ActionOutcome::Succeeded(
+                        ActionEffect::Saved(_) | ActionEffect::Uploaded(_)
+                    )
+                )
+            });
 
         Ok(ReadyCapture {
             card: Card {
@@ -1600,6 +1680,8 @@ impl Worker {
                 taken_at: SystemTime::now(),
             },
             actions,
+            retained_elsewhere,
+            exported,
         })
     }
 
@@ -1932,6 +2014,23 @@ impl Worker {
         self.answer(card, result);
     }
 
+    fn save_image_to(&mut self, card: CardId, rendered: &RevisionedFrame, path: &std::path::Path) {
+        tracing::debug!(
+            %card,
+            revision = rendered.revision(),
+            destination = %path.display(),
+            "saving a rendered document revision to a chosen destination"
+        );
+        let result = FrameEncoder::new()
+            .encode(rendered.frame(), ImageFormat::Png)
+            .map_err(CliError::from)
+            .and_then(|bytes| {
+                let path = crate::output::export_to_path(&bytes, path)?;
+                Ok(format!("saved the annotated image to {}", path.display()))
+            });
+        self.answer(card, result);
+    }
+
     fn copy(&mut self, card: CardId) {
         // The round trip through PNG is deliberate — see the module docs — and
         // is also what will make "copy" work for a card whose capture arrived
@@ -1949,6 +2048,14 @@ impl Worker {
     fn save(&mut self, card: CardId) {
         let result = self.cached(card, "save").and_then(|cached| {
             let path = crate::output::export_default(&cached.full)?;
+            Ok(format!("saved to {}", path.display()))
+        });
+        self.answer(card, result);
+    }
+
+    fn save_to(&mut self, card: CardId, path: &std::path::Path) {
+        let result = self.cached(card, "save").and_then(|cached| {
+            let path = crate::output::export_to_path(&cached.full, path)?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer(card, result);
@@ -2508,7 +2615,7 @@ impl Worker {
     fn answer(&self, card: CardId, result: CliResult<String>) {
         let message = match result {
             Ok(detail) => Outcome::Done { card, detail },
-            Err(error) => Outcome::Refused { card, error },
+            Err(error) => Outcome::OutputRefused { card, error },
         };
         self.emit(message);
     }
@@ -4069,7 +4176,7 @@ mod tests {
         assert!(pipeline.post(Job::Copy(CardId(404))));
 
         match wait_for(&pipeline) {
-            Some(Outcome::Refused { card, error }) => {
+            Some(Outcome::OutputRefused { card, error }) => {
                 assert_eq!(card, CardId(404));
                 assert!(error.to_string().contains("404"), "{error}");
             }
@@ -4083,7 +4190,7 @@ mod tests {
         assert!(pipeline.post(Job::Save(CardId(7))));
 
         match wait_for(&pipeline) {
-            Some(Outcome::Refused { card, .. }) => assert_eq!(card, CardId(7)),
+            Some(Outcome::OutputRefused { card, .. }) => assert_eq!(card, CardId(7)),
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -4144,6 +4251,42 @@ mod tests {
         let (width, height, scale, error) = safe_pin_source_geometry(&header);
         assert_eq!((width, height, scale), (420, 180, 1.0));
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn ready_capture_reports_when_retention_immediately_evicts_its_source() {
+        let root = scratch("ready-capture-retention-truth");
+        let store = SqliteStore::open_ephemeral(&root).expect("ephemeral history");
+        let (outcomes, _outcome_rx) = channel();
+        let mut worker = Worker {
+            outcomes,
+            waker: None,
+            selector: Arc::new(RefusingSelector),
+            store: Some(store),
+            vault: CaptureVault::new(),
+            pin_generations: HashMap::new(),
+            retention_policy: RetentionPolicy {
+                max_image_bytes: 0,
+                max_image_age: scrozz_store::RetentionWindow::Forever,
+            },
+            derived_documents: HashMap::new(),
+            analysis_cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let ready = worker
+            .finish_capture(
+                CaptureKind::Window,
+                CardId(46),
+                sample_capture(Provenance::Window),
+                &no_after_capture_actions(),
+            )
+            .expect("capture remains available in the live vault");
+
+        assert!(ready.card.capture_id.is_some());
+        assert!(!ready.retained_elsewhere);
+        assert!(!ready.exported);
+        drop(worker);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -36,6 +36,21 @@ use std::path::PathBuf;
 
 /// Persisted opt-in transform resolved before screenshot consumers run.
 pub const APPLY_SMART_FRAME_AFTER_CAPTURE_KEY: &str = "after-capture.apply-smart-frame";
+pub const RECENT_CAPTURES_OVERLAY_PLACEMENT_KEY: &str = "recent-captures-overlay.placement";
+pub const RECENT_CAPTURES_OVERLAY_FOLLOW_ACTIVE_DISPLAY_KEY: &str =
+    "recent-captures-overlay.follow-active-display";
+pub const RECENT_CAPTURES_OVERLAY_CARD_WIDTH_KEY: &str = "recent-captures-overlay.card-width";
+pub const RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ENABLED_KEY: &str =
+    "recent-captures-overlay.auto-close-enabled";
+pub const RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ACTION_KEY: &str =
+    "recent-captures-overlay.auto-close-action";
+pub const RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_SECONDS_KEY: &str =
+    "recent-captures-overlay.auto-close-seconds";
+pub const RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_DRAG_KEY: &str =
+    "recent-captures-overlay.close-after-drag";
+pub const RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_UPLOAD_KEY: &str =
+    "recent-captures-overlay.close-after-upload";
+pub const RECENT_CAPTURES_OVERLAY_SAVE_BUTTON_KEY: &str = "recent-captures-overlay.save-button";
 
 const RECORDING_CURSOR_KEY: &str = "record.cursor";
 const RECORDING_CURSOR_SMOOTHING_KEY: &str = "record.cursor-smoothing";
@@ -630,6 +645,60 @@ pub const SETTINGS: &[Setting] = &[
         description: "Maximum age of unpinned source images. Capture documents and edits are kept.",
     },
     Setting {
+        key: RECENT_CAPTURES_OVERLAY_PLACEMENT_KEY,
+        kind: Kind::Choice(&["left", "right"]),
+        default: "left",
+        description: "Screen edge used by the Recent Captures Overlay.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_FOLLOW_ACTIVE_DISPLAY_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Move Recent Captures to the display containing the active pointer or capture.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_CARD_WIDTH_KEY,
+        kind: Kind::Int { min: 224, max: 320 },
+        default: "288",
+        description: "Preferred Recent Captures card width in logical points.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ENABLED_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Clean up Recent Captures cards after an elapsed interval.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ACTION_KEY,
+        kind: Kind::Choice(&["hide", "save-then-hide"]),
+        default: "hide",
+        description: "Safe action performed when Recent Captures cleanup runs.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_SECONDS_KEY,
+        kind: Kind::Int { min: 5, max: 3_600 },
+        default: "30",
+        description: "Elapsed seconds before Recent Captures cleanup.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_DRAG_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Hide a card after an accepted external drag unless Option or Alt is held.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_UPLOAD_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Hide a card only after a cloud upload is confirmed successful.",
+    },
+    Setting {
+        key: RECENT_CAPTURES_OVERLAY_SAVE_BUTTON_KEY,
+        kind: Kind::Choice(&["export-location", "choose-destination"]),
+        default: "export-location",
+        description: "Default destination behavior of the Recent Captures Save button.",
+    },
+    Setting {
         key: "hotkey.capture-all-in-one",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureAllInOne.default_accelerator_setting(),
@@ -874,6 +943,55 @@ pub fn smart_frame_after_capture(persisted: &AfterCaptureSettings) -> CliResult<
             "{APPLY_SMART_FRAME_AFTER_CAPTURE_KEY} must be `true` or `false`"
         ))
     })
+}
+
+/// Resolves the complete Recent Captures Overlay behavior contract.
+pub fn recent_captures_overlay_settings(
+    persisted: &AfterCaptureSettings,
+) -> CliResult<scrozz_ui::RecentCapturesOverlaySettings> {
+    use scrozz_ui::recent_captures_overlay::{
+        RecentCapturesAutoCloseAction, RecentCapturesSaveBehavior,
+    };
+
+    let shortcuts = Shortcuts::default();
+    let value = |key| -> CliResult<String> { Ok(resolve(lookup(key)?, &shortcuts, persisted).0) };
+    let parse_bool = |key| -> CliResult<bool> {
+        value(key)?
+            .parse::<bool>()
+            .map_err(|_| CliError::usage(format!("stored setting {key:?} must be true or false")))
+    };
+    let placement = scrozz_ui::RecentCapturesPlacement::from_slug(&value(
+        RECENT_CAPTURES_OVERLAY_PLACEMENT_KEY,
+    )?)
+    .ok_or_else(|| CliError::usage("stored Recent Captures placement is invalid"))?;
+    let auto_close_action = RecentCapturesAutoCloseAction::from_slug(&value(
+        RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ACTION_KEY,
+    )?)
+    .ok_or_else(|| CliError::usage("stored Recent Captures auto-close action is invalid"))?;
+    let save_behavior =
+        RecentCapturesSaveBehavior::from_slug(&value(RECENT_CAPTURES_OVERLAY_SAVE_BUTTON_KEY)?)
+            .ok_or_else(|| {
+                CliError::usage("stored Recent Captures Save button behavior is invalid")
+            })?;
+
+    Ok(scrozz_ui::RecentCapturesOverlaySettings {
+        placement,
+        follow_active_display: parse_bool(RECENT_CAPTURES_OVERLAY_FOLLOW_ACTIVE_DISPLAY_KEY)?,
+        card_width: value(RECENT_CAPTURES_OVERLAY_CARD_WIDTH_KEY)?
+            .parse::<f32>()
+            .map_err(|_| CliError::usage("stored Recent Captures card width must be a number"))?,
+        auto_close_enabled: parse_bool(RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ENABLED_KEY)?,
+        auto_close_action,
+        auto_close_seconds: value(RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_SECONDS_KEY)?
+            .parse::<u32>()
+            .map_err(|_| {
+                CliError::usage("stored Recent Captures auto-close interval must be an integer")
+            })?,
+        close_after_drag: parse_bool(RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_DRAG_KEY)?,
+        close_after_upload: parse_bool(RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_UPLOAD_KEY)?,
+        save_behavior,
+    }
+    .normalized())
 }
 
 fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSound> {
@@ -1154,6 +1272,57 @@ mod tests {
             "false"
         );
         assert!(!smart_frame_after_capture(&persisted).unwrap());
+    }
+
+    #[test]
+    fn recent_captures_overlay_defaults_preserve_existing_behavior() {
+        let settings =
+            recent_captures_overlay_settings(&AfterCaptureSettings::fresh()).expect("defaults");
+        assert_eq!(
+            settings,
+            scrozz_ui::RecentCapturesOverlaySettings::default()
+        );
+        assert_eq!(settings.placement, scrozz_ui::RecentCapturesPlacement::Left);
+        assert_eq!(settings.card_width, 288.0);
+        assert!(!settings.follow_active_display);
+        assert!(!settings.auto_close_enabled);
+        assert!(settings.close_after_drag);
+    }
+
+    #[test]
+    fn recent_captures_overlay_values_resolve_and_normalize() {
+        let mut persisted = AfterCaptureSettings::fresh();
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_PLACEMENT_KEY, "right");
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_FOLLOW_ACTIVE_DISPLAY_KEY, "true");
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_CARD_WIDTH_KEY, "999");
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ENABLED_KEY, "true");
+        persisted.set_value(
+            RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_ACTION_KEY,
+            "save-then-hide",
+        );
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_AUTO_CLOSE_SECONDS_KEY, "2");
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_DRAG_KEY, "false");
+        persisted.set_value(RECENT_CAPTURES_OVERLAY_CLOSE_AFTER_UPLOAD_KEY, "true");
+        persisted.set_value(
+            RECENT_CAPTURES_OVERLAY_SAVE_BUTTON_KEY,
+            "choose-destination",
+        );
+
+        let settings = recent_captures_overlay_settings(&persisted).expect("resolve");
+        assert_eq!(
+            settings.placement,
+            scrozz_ui::RecentCapturesPlacement::Right
+        );
+        assert!(settings.follow_active_display);
+        assert_eq!(settings.card_width, 320.0);
+        assert!(settings.auto_close_enabled);
+        assert_eq!(settings.auto_close_seconds, 5);
+        assert!(!settings.close_after_drag);
+        assert!(settings.close_after_upload);
+        assert_eq!(
+            settings.save_behavior,
+            scrozz_ui::recent_captures_overlay::RecentCapturesSaveBehavior::ChooseDestination
+        );
     }
 
     #[test]

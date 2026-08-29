@@ -34,7 +34,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use scrozz_core::LogicalRect;
 use scrozz_shell::OverlayWindow;
 use scrozz_shell::{NativeOverlay, NativeSurface, OverlayBehavior, OverlayCursor};
-use scrozz_ui::{PanelReport, overlay_app::NativePinRequest};
+use scrozz_ui::{PanelReport, recent_captures_overlay::NativePinRequest};
 
 #[derive(Clone, Debug, PartialEq)]
 struct AppliedPin {
@@ -702,7 +702,7 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
         };
 
         // SAFETY: `handle` borrows the window for this scope, so the view is
-        // alive; `OverlayApp::new` runs on the main thread.
+        // alive; `RecentCapturesOverlayApp::new` runs on the main thread.
         #[cfg(target_os = "macos")]
         {
             let (report, overlay) =

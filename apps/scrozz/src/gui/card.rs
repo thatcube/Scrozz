@@ -31,6 +31,7 @@ use std::{
 use scrozz_core::{ColorSpace, Frame, PinState, Provenance, Transform as ColorTransform};
 use scrozz_store::CaptureId;
 use scrozz_ui::card::CardMedia;
+use scrozz_ui::recent_captures_overlay::RecentCapturesAutoCloseAction;
 
 use crate::gui::action::CaptureKind;
 
@@ -67,7 +68,7 @@ pub struct PinGeneration(pub u64);
 pub const THUMBNAIL_MAX_EDGE: u32 = 640;
 
 /// Longest texture edge retained for a native pinned window.
-pub const PIN_TEXTURE_MAX_EDGE: u32 = scrozz_ui::overlay_app::PIN_TEXTURE_PX;
+pub const PIN_TEXTURE_MAX_EDGE: u32 = scrozz_ui::recent_captures_overlay::PIN_TEXTURE_PX;
 const MAX_TEXTURE_PIXELS: u64 = (PIN_TEXTURE_MAX_EDGE as u64) * (PIN_TEXTURE_MAX_EDGE as u64);
 
 /// Straight-alpha RGBA8 pixels, ready to upload as a texture.
@@ -410,10 +411,21 @@ impl Card {
 pub enum CardEvent {
     /// Put this capture on the clipboard.
     Copy(CardId),
-    /// Write it to the configured folder.
-    Save(CardId),
+    /// Save it, optionally asking for a destination first.
+    Save {
+        /// Card to save.
+        card: CardId,
+        /// Whether the platform-native destination chooser should open.
+        choose_destination: bool,
+    },
+    /// Upload it through the configured cloud provider.
+    Upload(CardId),
+    /// A card's configured elapsed cleanup interval expired.
+    AutoClose(CardId, RecentCapturesAutoCloseAction),
     /// Swiped left: throw it away.
     Dismiss(CardId),
+    /// The display could no longer fit this card.
+    Overflow(CardId),
     /// Dragged right or up far enough to mean it, **while the button is still
     /// down**.
     ///
@@ -459,13 +471,15 @@ impl CardEvent {
     pub const fn card(&self) -> Option<CardId> {
         match self {
             Self::Copy(id)
-            | Self::Save(id)
+            | Self::Upload(id)
+            | Self::AutoClose(id, _)
             | Self::Dismiss(id)
+            | Self::Overflow(id)
             | Self::Collapse(id)
             | Self::Open(id)
             | Self::Pin(id, _, _)
             | Self::PinUnavailable { card: id, .. } => Some(*id),
-            Self::Drag { card, .. } => Some(*card),
+            Self::Save { card, .. } | Self::Drag { card, .. } => Some(*card),
             Self::PinChanged(..) | Self::Unpin(..) | Self::PinPositioningUnavailable { .. } => None,
         }
     }
@@ -479,6 +493,14 @@ impl CardEvent {
 /// Implementations may therefore be `!Send`, which they have to be: an eframe
 /// context is.
 pub trait CardSurface {
+    /// Applies Recent Captures preferences to current and future cards.
+    fn configure_recent_captures_overlay(
+        &mut self,
+        settings: scrozz_ui::RecentCapturesOverlaySettings,
+    ) {
+        let _ = settings;
+    }
+
     /// Shows a new card at the top of the stack.
     ///
     /// # Errors
@@ -937,13 +959,17 @@ mod tests {
         let id = CardId(3);
         for event in [
             CardEvent::Copy(id),
-            CardEvent::Save(id),
+            CardEvent::Save {
+                card: id,
+                choose_destination: false,
+            },
             CardEvent::Dismiss(id),
             CardEvent::Drag {
                 card: id,
                 at: crate::gui::drag::DragSpot {
                     card: [0.0, 0.0, 10.0, 10.0],
                     pointer: [5.0, 5.0],
+                    keep_after_accept: false,
                 },
             },
             CardEvent::Collapse(id),

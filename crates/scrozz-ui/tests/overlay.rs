@@ -22,8 +22,11 @@ use scrozz_ui::harness::{
 };
 use scrozz_ui::icons::IconStore;
 use scrozz_ui::motion::Motion;
-use scrozz_ui::overlay_app::{self, OverlayGeometry, OverlayHandle, OverlayOptions, Passthrough};
 use scrozz_ui::paint::Surface;
+use scrozz_ui::recent_captures_overlay::{
+    self, Passthrough, RecentCapturesOverlayGeometry, RecentCapturesOverlayHandle,
+    RecentCapturesOverlayOptions,
+};
 use scrozz_ui::stack::{CardFrame, CardId, CardState};
 use scrozz_ui::theme::{self, Appearance, Theme};
 
@@ -373,19 +376,31 @@ fn clicks_pass_through_the_gaps_between_cards() {
     let b = Rect::from_min_size(pos2(10.0, 110.0), vec2(100.0, 60.0));
     let hits = [a, b];
 
-    assert!(!overlay_app::passes_through(Some(a.center()), &hits));
-    assert!(!overlay_app::passes_through(Some(b.center()), &hits));
+    assert!(!recent_captures_overlay::passes_through(
+        Some(a.center()),
+        &hits
+    ));
+    assert!(!recent_captures_overlay::passes_through(
+        Some(b.center()),
+        &hits
+    ));
     // The gap between them is desktop, and must stay clickable.
-    assert!(overlay_app::passes_through(Some(pos2(60.0, 90.0)), &hits));
+    assert!(recent_captures_overlay::passes_through(
+        Some(pos2(60.0, 90.0)),
+        &hits
+    ));
     // So is everything outside.
-    assert!(overlay_app::passes_through(Some(pos2(400.0, 400.0)), &hits));
+    assert!(recent_captures_overlay::passes_through(
+        Some(pos2(400.0, 400.0)),
+        &hits
+    ));
 }
 
 #[test]
 fn an_unknown_pointer_never_passes_through() {
     let hits = [Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 60.0))];
     assert!(
-        !overlay_app::passes_through(None, &hits),
+        !recent_captures_overlay::passes_through(None, &hits),
         "with no pointer position the overlay must keep its clicks; the \
          opposite is unrecoverable, because a window that ignores mouse events \
          can never learn the pointer came back"
@@ -394,8 +409,11 @@ fn an_unknown_pointer_never_passes_through() {
 
 #[test]
 fn an_empty_overlay_is_entirely_click_through() {
-    assert!(overlay_app::passes_through(Some(pos2(5.0, 5.0)), &[]));
-    assert!(overlay_app::passes_through(None, &[]));
+    assert!(recent_captures_overlay::passes_through(
+        Some(pos2(5.0, 5.0)),
+        &[]
+    ));
+    assert!(recent_captures_overlay::passes_through(None, &[]));
 }
 
 // ---------------------------------------------------------------------------
@@ -405,8 +423,8 @@ fn an_empty_overlay_is_entirely_click_through() {
 #[test]
 fn the_viewport_is_a_borderless_transparent_always_on_top_panel() {
     let work_area = Rect::from_min_size(pos2(0.0, 25.0), vec2(1440.0, 875.0));
-    let geometry = OverlayGeometry::new(work_area);
-    let builder = overlay_app::viewport(geometry);
+    let geometry = RecentCapturesOverlayGeometry::new(work_area);
+    let builder = recent_captures_overlay::viewport(geometry);
 
     assert_eq!(builder.decorations, Some(false), "borderless");
     assert_eq!(builder.transparent, Some(true), "transparent");
@@ -438,7 +456,7 @@ fn the_viewport_is_a_borderless_transparent_always_on_top_panel() {
 #[test]
 fn the_overlay_covers_the_work_area_in_local_coordinates() {
     let work_area = Rect::from_min_size(pos2(120.0, 25.0), vec2(1200.0, 800.0));
-    let geometry = OverlayGeometry::new(work_area);
+    let geometry = RecentCapturesOverlayGeometry::new(work_area);
 
     assert_eq!(geometry.position(), pos2(120.0, 25.0));
     assert_eq!(geometry.size(), vec2(1200.0, 800.0));
@@ -451,8 +469,9 @@ fn the_overlay_covers_the_work_area_in_local_coordinates() {
 
 #[test]
 fn native_options_carry_the_viewport_and_never_persist_geometry() {
-    let geometry = OverlayGeometry::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
-    let options = overlay_app::native_options(geometry);
+    let geometry =
+        RecentCapturesOverlayGeometry::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)));
+    let options = recent_captures_overlay::native_options(geometry);
 
     assert_eq!(options.viewport.decorations, Some(false));
     assert_eq!(options.viewport.visible, None);
@@ -471,8 +490,8 @@ fn native_options_carry_the_viewport_and_never_persist_geometry() {
 
 #[test]
 fn the_handle_accepts_captures_before_the_window_exists() {
-    let handle = OverlayHandle::new();
-    handle.push(scrozz_ui::overlay_app::CaptureRequest::new(
+    let handle = RecentCapturesOverlayHandle::new();
+    handle.push(scrozz_ui::recent_captures_overlay::CaptureRequest::new(
         "early.png",
         Provenance::Display,
         (1920, 1080),
@@ -488,7 +507,7 @@ fn the_handle_accepts_captures_before_the_window_exists() {
 
 #[test]
 fn overlay_options_default_to_recoverable_click_through() {
-    let options = OverlayOptions::default();
+    let options = RecentCapturesOverlayOptions::default();
     assert_eq!(
         options.passthrough,
         Passthrough::Auto,
