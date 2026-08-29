@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use scrozz_ui::harness::{
     Background, DEFAULT_SEED, GoldenOutcome, GoldenStore, Image, Profile, RenderSpec, Rng,
     Scenario, SceneRegistry, SequenceSpec, SoftwareRenderer, StoreManifest, Tolerance,
-    VirtualClock, default_snapshot_dir, diff, docs_plan, golden_plan, store_plan,
+    VirtualClock, default_snapshot_dir, diff, docs_plan, golden_plan, render_settings_golden,
+    settings_golden_plan, store_plan,
 };
 
 // ---------------------------------------------------------------------------
@@ -745,4 +746,24 @@ fn golden_corpus_matches_baselines() {
         message.push('\n');
     }
     panic!("{message}");
+}
+
+#[test]
+fn settings_goldens_match_platform_layouts_and_appearances() {
+    let store = GoldenStore::new(default_snapshot_dir().join("golden"))
+        .with_failures_dir(default_snapshot_dir().join("failures"));
+    let mut failures = Vec::new();
+    for case in settings_golden_plan() {
+        assert!(!case.expectation.trim().is_empty());
+        let image = render_settings_golden(&case).expect("render Settings golden");
+        if let Err(error) = store.assert(case.name, &image) {
+            failures.push(error.to_string());
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} Settings golden(s) changed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

@@ -1,14 +1,21 @@
 //! The ordinary settings window and its About surface.
 
 use egui::{
-    Align, Color32, Key, Layout, Modifiers, RichText, Sense, TextureHandle, TextureOptions, Vec2,
+    Align, Align2, Color32, Key, Layout, Modifiers, RichText, Sense, TextureHandle, TextureOptions,
+    Vec2,
 };
 
-use crate::theme::{Appearance, Space, Text, Theme};
+use crate::{
+    icons::{Icon, IconStore},
+    theme::{Appearance, Space, Text, Theme},
+};
 
 const SETTINGS_VIEWPORT: &str = "scrozz-settings";
-const WINDOW_SIZE: Vec2 = Vec2::new(680.0, 470.0);
-const ICON_SIZE: f32 = 132.0;
+const WINDOW_SIZE: Vec2 = Vec2::new(800.0, 600.0);
+const MIN_WINDOW_SIZE: Vec2 = Vec2::new(680.0, 520.0);
+const APP_ICON_SIZE: f32 = 128.0;
+const SIDEBAR_WIDTH: f32 = 188.0;
+const TOOLBAR_HEIGHT: f32 = 94.0;
 
 /// One editable shortcut, as the settings window needs to see it.
 ///
@@ -32,6 +39,8 @@ pub struct ShortcutRow {
     pub usable: bool,
     /// Why this row is not in force, if it is not.
     pub problem: Option<String>,
+    /// Nonblocking guidance for a binding that may overlap an OS default.
+    pub advisory: Option<String>,
 }
 
 /// A change the user asked for, for the host to validate and apply.
@@ -63,6 +72,58 @@ pub enum ShortcutEdit {
     ResetAll,
 }
 
+/// Desktop whose native Settings convention should be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPlatform {
+    /// Icon categories in a top toolbar.
+    MacOs,
+    /// Left navigation, matching Windows Settings.
+    Windows,
+    /// Desktop-neutral left navigation.
+    Linux,
+}
+
+impl SettingsPlatform {
+    /// The platform this binary was built for.
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+
+    /// Where category navigation belongs on this desktop.
+    #[must_use]
+    pub const fn navigation(self) -> Navigation {
+        match self {
+            Self::MacOs => Navigation::TopToolbar,
+            Self::Windows | Self::Linux => Navigation::Sidebar,
+        }
+    }
+}
+
+/// Placement selected by [`SettingsPlatform`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Navigation {
+    /// macOS preference-window toolbar.
+    TopToolbar,
+    /// Windows and Linux left navigation.
+    Sidebar,
+}
+
+/// Whether opening Settings creates or reuses its viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenDisposition {
+    /// No Settings viewport was open.
+    FirstOpen,
+    /// The existing Settings viewport should be focused.
+    Reused,
+}
+
 /// Which pane of the settings window is showing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -89,20 +150,51 @@ impl BuildInfo {
 }
 
 /// Persistent state for the settings viewport.
-#[derive(Default)]
 pub struct SettingsWindow {
     open: bool,
     focus_requested: bool,
-    icon: Option<TextureHandle>,
+    app_icon: Option<TextureHandle>,
+    icons: Option<IconStore>,
     pane: Pane,
     recording: Option<String>,
+    platform: SettingsPlatform,
+    appearance: Appearance,
+    #[cfg(target_os = "linux")]
+    appearance_initialized: bool,
+    #[cfg(target_os = "linux")]
+    appearance_watcher: Option<dark_light::Watcher>,
+}
+
+impl Default for SettingsWindow {
+    fn default() -> Self {
+        Self {
+            open: false,
+            focus_requested: false,
+            app_icon: None,
+            icons: None,
+            pane: Pane::default(),
+            recording: None,
+            platform: SettingsPlatform::current(),
+            appearance: Appearance::Light,
+            #[cfg(target_os = "linux")]
+            appearance_initialized: false,
+            #[cfg(target_os = "linux")]
+            appearance_watcher: None,
+        }
+    }
 }
 
 impl SettingsWindow {
     /// Opens or focuses the settings window.
-    pub fn open(&mut self) {
+    pub fn open(&mut self) -> OpenDisposition {
+        let disposition = if self.open {
+            OpenDisposition::Reused
+        } else {
+            OpenDisposition::FirstOpen
+        };
         self.open = true;
         self.focus_requested = true;
+        disposition
     }
 
     /// Whether a row is currently waiting for the user to press a combination.
@@ -127,8 +219,9 @@ impl SettingsWindow {
             return edits;
         }
 
-        let icon = self
-            .icon
+        let appearance = self.resolve_appearance(ctx);
+        let app_icon = self
+            .app_icon
             .get_or_insert_with(|| {
                 ctx.load_texture(
                     "scrozz-settings-icon",
@@ -137,51 +230,34 @@ impl SettingsWindow {
                 )
             })
             .clone();
+        self.icons.get_or_insert_with(|| IconStore::new(ctx));
         let mut open = true;
+        let focus_requested = std::mem::take(&mut self.focus_requested);
+        let builder = viewport_builder(focus_requested);
+        let platform = self.platform;
 
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("Scrozz Settings")
-            .with_app_id("com.thatcube.Scrozz.settings")
-            .with_inner_size(WINDOW_SIZE)
-            .with_min_inner_size(WINDOW_SIZE)
-            .with_max_inner_size(WINDOW_SIZE)
-            .with_resizable(false);
-        if std::mem::take(&mut self.focus_requested) {
-            builder = builder.with_active(true);
-        }
-
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of(SETTINGS_VIEWPORT),
-            builder,
-            |settings_ui, _class| {
-                if settings_ui
-                    .ctx()
-                    .input(|input| input.viewport().close_requested())
-                {
-                    open = false;
-                }
-                let theme = theme_for(settings_ui);
-                settings_ui.painter().rect_filled(
-                    settings_ui.max_rect(),
-                    0.0,
-                    theme.palette.canvas(),
-                );
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::same(Space::XXL as i8))
-                    .show(settings_ui, |ui| {
-                        self.draw_header(ui, &theme);
-                        ui.add_space(Space::LG);
-                        ui.separator();
-                        ui.add_space(Space::LG);
-                        match self.pane {
-                            Pane::Shortcuts => {
-                                edits = self.draw_shortcuts(ui, &theme, shortcuts);
-                            }
-                            Pane::About => draw_about(ui, &theme, &icon, build),
-                        }
-                    });
-            },
-        );
+        ctx.show_viewport_immediate(settings_viewport_id(), builder, |settings_ui, _class| {
+            if settings_ui
+                .ctx()
+                .input(|input| input.viewport().close_requested())
+            {
+                open = false;
+            }
+            let theme = Theme::for_appearance(appearance);
+            let icons = self.icons.as_ref().expect("settings icons were loaded");
+            request_foreground(settings_ui.ctx(), focus_requested);
+            edits = draw_settings(
+                settings_ui,
+                &theme,
+                icons,
+                Some(&app_icon),
+                build,
+                shortcuts,
+                platform,
+                &mut self.pane,
+                &mut self.recording,
+            );
+        });
 
         self.open = open;
         if !self.open {
@@ -190,222 +266,632 @@ impl SettingsWindow {
         edits
     }
 
-    fn draw_header(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let palette = theme.palette;
-        ui.horizontal(|ui| {
-            ui.heading(
-                RichText::new("Settings")
-                    .font(theme.font(Text::Title))
-                    .color(palette.text),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                for (pane, name) in [(Pane::About, "About"), (Pane::Shortcuts, "Shortcuts")] {
-                    let selected = self.pane == pane;
-                    let fill = if selected {
-                        palette.active
-                    } else {
-                        palette.card_fill_raised
-                    };
-                    let ink = if selected {
-                        palette.accent_hi
-                    } else {
-                        palette.text_muted
-                    };
-                    let response = egui::Frame::new()
-                        .fill(fill)
-                        .corner_radius(9)
-                        .inner_margin(egui::Margin::symmetric(14, 7))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(name).font(theme.font(Text::Label)).color(ink));
-                        })
-                        .response
-                        .interact(Sense::click());
-                    if response.clicked() {
-                        self.pane = pane;
-                        self.recording = None;
-                    }
-                    if response.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                }
-            });
-        });
-    }
+    fn resolve_appearance(&mut self, ctx: &egui::Context) -> Appearance {
+        if let Some(theme) = ctx.system_theme() {
+            self.appearance = appearance_for_theme(Some(theme), false);
+            return self.appearance;
+        }
 
-    fn draw_shortcuts(
-        &mut self,
-        ui: &mut egui::Ui,
-        theme: &Theme,
-        rows: &[ShortcutRow],
-    ) -> Vec<ShortcutEdit> {
-        let palette = theme.palette;
-        let mut edits = Vec::new();
-
-        // Read the keyboard once, before any row draws, so an armed row cannot
-        // swallow a chord that a later row also sees.
-        let captured = self
-            .recording
-            .as_ref()
-            .and_then(|_| ui.ctx().input(capture_chord));
-
-        if let Some(id) = self.recording.clone() {
-            match captured {
-                Some(Chord::Cancelled) => self.recording = None,
-                Some(Chord::Cleared) => {
-                    edits.push(ShortcutEdit::Clear { id });
-                    self.recording = None;
+        #[cfg(target_os = "linux")]
+        {
+            if !self.appearance_initialized {
+                self.appearance_initialized = true;
+                if let Ok(mode) = dark_light::detect() {
+                    self.appearance = appearance_for_mode(mode, self.appearance);
                 }
-                Some(Chord::Pressed(accelerator)) => {
-                    edits.push(ShortcutEdit::Set { id, accelerator });
-                    self.recording = None;
+                self.appearance_watcher = dark_light::subscribe().ok();
+            }
+            if let Some(watcher) = &self.appearance_watcher {
+                for mode in watcher.try_iter() {
+                    self.appearance = appearance_for_mode(mode, self.appearance);
                 }
-                None => {}
             }
         }
 
-        egui::ScrollArea::vertical()
-            .max_height(250.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for row in rows {
-                    self.draw_shortcut_row(ui, theme, row, &mut edits);
-                    ui.add_space(Space::SM);
-                }
-            });
+        self.appearance
+    }
+}
 
-        ui.add_space(Space::MD);
-        ui.separator();
-        ui.add_space(Space::MD);
-        ui.horizontal(|ui| {
-            let hint = if self.recording.is_some() {
-                "Press a combination. Esc cancels, Delete unassigns."
-            } else {
-                "Click a shortcut to change it."
-            };
-            ui.label(
-                RichText::new(hint)
-                    .font(theme.font(Text::Caption))
-                    .color(palette.text_faint),
+/// Draws the real Settings content without creating a native viewport.
+///
+/// The golden harness uses this exact path to render platform layouts rather
+/// than maintaining mock screenshots.
+pub fn render_preview(
+    ui: &mut egui::Ui,
+    platform: SettingsPlatform,
+    icons: &IconStore,
+    shortcuts: &[ShortcutRow],
+) {
+    let theme = theme_for(ui);
+    let mut pane = Pane::Shortcuts;
+    let mut recording = None;
+    let _ = draw_settings(
+        ui,
+        &theme,
+        icons,
+        None,
+        BuildInfo {
+            version: "0.1.0",
+            build: "100",
+        },
+        shortcuts,
+        platform,
+        &mut pane,
+        &mut recording,
+    );
+}
+
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(SETTINGS_VIEWPORT)
+}
+
+fn viewport_builder(active: bool) -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Scrozz Settings")
+        .with_app_id("com.thatcube.Scrozz.settings")
+        .with_inner_size(WINDOW_SIZE)
+        .with_min_inner_size(MIN_WINDOW_SIZE)
+        .with_resizable(true)
+        .with_decorations(true)
+        .with_window_level(egui::WindowLevel::Normal);
+    if active {
+        builder.with_active(true)
+    } else {
+        builder
+    }
+}
+
+fn request_foreground(ctx: &egui::Context, requested: bool) {
+    if requested {
+        // `Focus` activates the app and orders this window front on macOS,
+        // calls the foreground-window path on Windows, and sends
+        // `_NET_ACTIVE_WINDOW` on X11. It is emitted only after the user invokes
+        // Settings; ordinary repainting never steals focus.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+}
+
+/// Stable shortcut data used by platform golden renders.
+#[must_use]
+pub fn preview_shortcuts(platform: SettingsPlatform) -> Vec<ShortcutRow> {
+    let symbols = match platform {
+        SettingsPlatform::MacOs => ["⇧⌘0", "⇧⌘8", "⇧⌘9", "⇧⌘7", "⌃⇧⌘7"],
+        SettingsPlatform::Windows => [
+            "Win + Shift + 2",
+            "Win + Shift + 4",
+            "Win + Shift + 5",
+            "Win + Shift + 3",
+            "Win + Ctrl + Shift + 3",
+        ],
+        SettingsPlatform::Linux => [
+            "Super + Shift + 2",
+            "Super + Shift + 4",
+            "Super + Shift + 5",
+            "Super + Shift + 3",
+            "Super + Ctrl + Shift + 3",
+        ],
+    };
+    [
+        ("capture.all-in-one", "All-in-One", symbols[0], true),
+        ("capture.region", "Capture Region", symbols[1], true),
+        ("capture.window", "Capture Window", symbols[2], true),
+        ("capture.fullscreen", "Capture Display", symbols[3], true),
+        (
+            "capture.all-displays",
+            "Capture All Displays",
+            symbols[4],
+            true,
+        ),
+        ("record.toggle", "Start / Stop Recording", "", false),
+    ]
+    .into_iter()
+    .map(|(id, label, symbols, usable)| ShortcutRow {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        accelerator: symbols.to_owned(),
+        symbols: symbols.to_owned(),
+        is_default: true,
+        usable,
+        problem: None,
+        advisory: None,
+    })
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_settings(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    app_icon: Option<&TextureHandle>,
+    build: BuildInfo,
+    shortcuts: &[ShortcutRow],
+    platform: SettingsPlatform,
+    pane: &mut Pane,
+    recording: &mut Option<String>,
+) -> Vec<ShortcutEdit> {
+    crate::theme::apply_style(ui.style_mut(), theme);
+    ui.painter()
+        .rect_filled(ui.max_rect(), 0.0, theme.palette.canvas());
+    match platform.navigation() {
+        Navigation::TopToolbar => {
+            draw_top_navigation(ui, theme, icons, pane, recording);
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), ui.max_rect().top() + TOOLBAR_HEIGHT),
+                ui.max_rect().max,
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let all_default = rows.iter().all(|row| row.is_default);
-                if ui
-                    .add_enabled(!all_default, egui::Button::new("Reset all"))
-                    .clicked()
-                {
-                    self.recording = None;
-                    edits.push(ShortcutEdit::ResetAll);
+            let mut body = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(Layout::top_down(Align::LEFT)),
+            );
+            draw_body(
+                &mut body, theme, icons, app_icon, build, shortcuts, pane, recording,
+            )
+        }
+        Navigation::Sidebar => {
+            let sidebar = egui::Rect::from_min_max(
+                ui.max_rect().min,
+                egui::pos2(ui.max_rect().left() + SIDEBAR_WIDTH, ui.max_rect().bottom()),
+            );
+            ui.painter()
+                .rect_filled(sidebar, 0.0, theme.palette.card_fill);
+            ui.painter().line_segment(
+                [sidebar.right_top(), sidebar.right_bottom()],
+                egui::Stroke::new(1.0, theme.palette.divider),
+            );
+            let mut nav = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(sidebar.shrink2(Vec2::new(Space::MD, Space::XL)))
+                    .layout(Layout::top_down(Align::LEFT)),
+            );
+            draw_sidebar_navigation(&mut nav, theme, icons, pane, recording);
+
+            let body_rect = egui::Rect::from_min_max(
+                egui::pos2(sidebar.right(), ui.max_rect().top()),
+                ui.max_rect().max,
+            );
+            let mut body = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body_rect)
+                    .layout(Layout::top_down(Align::LEFT)),
+            );
+            draw_body(
+                &mut body, theme, icons, app_icon, build, shortcuts, pane, recording,
+            )
+        }
+    }
+}
+
+fn draw_top_navigation(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    pane: &mut Pane,
+    recording: &mut Option<String>,
+) {
+    let rect = egui::Rect::from_min_max(
+        ui.max_rect().min,
+        egui::pos2(ui.max_rect().right(), ui.max_rect().top() + TOOLBAR_HEIGHT),
+    );
+    ui.painter().rect_filled(rect, 0.0, theme.palette.card_fill);
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        egui::Stroke::new(1.0, theme.palette.divider),
+    );
+    let mut nav = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(Space::XXL, Space::SM)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    nav.add_space(Space::LG);
+    for (candidate, label, icon) in navigation_items() {
+        if navigation_button(
+            &mut nav,
+            theme,
+            icons,
+            candidate,
+            label,
+            icon,
+            *pane == candidate,
+            true,
+        ) {
+            *pane = candidate;
+            *recording = None;
+        }
+        nav.add_space(Space::SM);
+    }
+}
+
+fn draw_sidebar_navigation(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    pane: &mut Pane,
+    recording: &mut Option<String>,
+) {
+    ui.label(
+        RichText::new("Scrozz")
+            .font(theme.font(Text::Title))
+            .color(theme.palette.text),
+    );
+    ui.add_space(Space::XL);
+    for (candidate, label, icon) in navigation_items() {
+        if navigation_button(
+            ui,
+            theme,
+            icons,
+            candidate,
+            label,
+            icon,
+            *pane == candidate,
+            false,
+        ) {
+            *pane = candidate;
+            *recording = None;
+        }
+        ui.add_space(Space::XS);
+    }
+}
+
+fn navigation_items() -> [(Pane, &'static str, Icon); 2] {
+    [
+        (Pane::Shortcuts, "Shortcuts", Icon::Settings),
+        (Pane::About, "About", Icon::AppWindow),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn navigation_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    _pane: Pane,
+    label: &str,
+    icon: Icon,
+    selected: bool,
+    vertical: bool,
+) -> bool {
+    let size = if vertical {
+        Vec2::new(86.0, 72.0)
+    } else {
+        Vec2::new(ui.available_width(), 42.0)
+    };
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if selected {
+        theme.palette.active
+    } else if response.hovered() {
+        theme.palette.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 10.0, fill);
+    let ink = if selected {
+        theme.palette.accent_hi
+    } else {
+        theme.palette.text_muted
+    };
+    if vertical {
+        icons.draw(
+            ui.painter(),
+            icon,
+            egui::pos2(rect.center().x, rect.top() + 24.0),
+            26.0,
+            ink,
+        );
+        ui.painter().text(
+            egui::pos2(rect.center().x, rect.bottom() - 16.0),
+            Align2::CENTER_CENTER,
+            label,
+            theme.font(Text::Caption),
+            ink,
+        );
+    } else {
+        icons.draw(
+            ui.painter(),
+            icon,
+            egui::pos2(rect.left() + 22.0, rect.center().y),
+            20.0,
+            ink,
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + 42.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            theme.font(Text::Label),
+            ink,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_body(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    app_icon: Option<&TextureHandle>,
+    build: BuildInfo,
+    shortcuts: &[ShortcutRow],
+    pane: &Pane,
+    recording: &mut Option<String>,
+) -> Vec<ShortcutEdit> {
+    let mut edits = Vec::new();
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(Space::XXL as i8, Space::XL as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match pane {
+                Pane::Shortcuts => {
+                    edits = draw_shortcuts(ui, theme, icons, shortcuts, recording);
                 }
-            });
+                Pane::About => draw_about(ui, theme, app_icon, build),
+            }
+        });
+    edits
+}
+
+fn draw_shortcuts(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    rows: &[ShortcutRow],
+    recording: &mut Option<String>,
+) -> Vec<ShortcutEdit> {
+    let palette = theme.palette;
+    let mut edits = Vec::new();
+
+    // Read the keyboard once, before any row draws, so an armed row cannot
+    // swallow a chord that a later row also sees.
+    let captured = recording
+        .as_ref()
+        .and_then(|_| ui.ctx().input(capture_chord));
+
+    if let Some(id) = recording.clone() {
+        match captured {
+            Some(Chord::Cancelled) => *recording = None,
+            Some(Chord::Cleared) => {
+                edits.push(ShortcutEdit::Clear { id });
+                *recording = None;
+            }
+            Some(Chord::Pressed(accelerator)) => {
+                edits.push(ShortcutEdit::Set { id, accelerator });
+                *recording = None;
+            }
+            None => {}
+        }
+    }
+
+    ui.label(
+        RichText::new("Shortcuts")
+            .font(theme.font(Text::Title))
+            .color(palette.text),
+    );
+    ui.add_space(Space::XS);
+    ui.label(
+        RichText::new("Click a shortcut to record a new key combination.")
+            .font(theme.font(Text::Body))
+            .color(palette.text_muted),
+    );
+    ui.add_space(Space::XL);
+
+    let split = rows
+        .iter()
+        .position(|row| row.id.starts_with("record."))
+        .unwrap_or(rows.len());
+    egui::ScrollArea::vertical()
+        .max_height((ui.available_height() - 54.0).max(180.0))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if split > 0 {
+                draw_shortcut_group(
+                    ui,
+                    theme,
+                    icons,
+                    "Screenshots",
+                    Icon::Viewfinder,
+                    &rows[..split],
+                    recording,
+                    &mut edits,
+                );
+            }
+            if split < rows.len() {
+                ui.add_space(Space::XL);
+                draw_shortcut_group(
+                    ui,
+                    theme,
+                    icons,
+                    "Recording",
+                    Icon::Video,
+                    &rows[split..],
+                    recording,
+                    &mut edits,
+                );
+            }
         });
 
-        edits
-    }
+    ui.add_space(Space::MD);
+    ui.horizontal(|ui| {
+        let hint = if recording.is_some() {
+            "Press a combination. Esc cancels, Delete unassigns."
+        } else {
+            "Changes are saved as soon as the system accepts them."
+        };
+        ui.label(
+            RichText::new(hint)
+                .font(theme.font(Text::Caption))
+                .color(palette.text_faint),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let all_default = rows.iter().all(|row| row.is_default);
+            if ui
+                .add_enabled(!all_default, egui::Button::new("Reset all"))
+                .clicked()
+            {
+                *recording = None;
+                edits.push(ShortcutEdit::ResetAll);
+            }
+        });
+    });
 
-    fn draw_shortcut_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        theme: &Theme,
-        row: &ShortcutRow,
-        edits: &mut Vec<ShortcutEdit>,
-    ) {
-        let palette = theme.palette;
-        let armed = self.recording.as_deref() == Some(row.id.as_str());
-        egui::Frame::new()
-            .fill(palette.card_fill_raised)
-            .stroke(egui::Stroke::new(
-                1.0,
-                if row.problem.is_some() {
-                    problem_ink(palette.appearance)
-                } else if armed {
-                    palette.accent
-                } else {
-                    palette.hairline
-                },
-            ))
-            .corner_radius(10)
-            .inner_margin(egui::Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(&row.label)
-                                .font(theme.font(Text::Label))
-                                .color(if row.usable {
-                                    palette.text
-                                } else {
-                                    palette.text_faint
-                                }),
-                        );
-                        if !row.usable {
-                            ui.label(
-                                RichText::new("unavailable in this session")
-                                    .font(theme.font(Text::Caption))
-                                    .color(palette.text_faint),
-                            );
-                        }
-                    });
+    edits
+}
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!row.is_default, egui::Button::new("Reset"))
-                            .on_hover_text("Back to the shipped default")
-                            .clicked()
-                        {
-                            self.recording = None;
-                            edits.push(ShortcutEdit::Reset { id: row.id.clone() });
-                        }
-                        if ui
-                            .add_enabled(!row.accelerator.is_empty(), egui::Button::new("Clear"))
-                            .on_hover_text("Leave this action unassigned")
-                            .clicked()
-                        {
-                            self.recording = None;
-                            edits.push(ShortcutEdit::Clear { id: row.id.clone() });
-                        }
-
-                        let caption = if armed {
-                            "Press keys…".to_owned()
-                        } else if row.symbols.is_empty() {
-                            "Unassigned".to_owned()
-                        } else {
-                            row.symbols.clone()
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(caption).font(theme.font(Text::Label)).color(
-                                        if armed {
-                                            palette.accent_hi
-                                        } else {
-                                            palette.text
-                                        },
-                                    ),
-                                )
-                                .min_size(Vec2::new(120.0, 26.0))
-                                .fill(if armed {
-                                    palette.accent
-                                } else {
-                                    palette.chip_fill
-                                }),
-                            )
-                            .clicked()
-                        {
-                            self.recording = if armed { None } else { Some(row.id.clone()) };
-                        }
-                    });
-                });
-
-                if let Some(problem) = &row.problem {
-                    ui.add_space(Space::XS);
-                    ui.label(
-                        RichText::new(problem)
-                            .font(theme.font(Text::Caption))
-                            .color(problem_ink(palette.appearance)),
+#[allow(clippy::too_many_arguments)]
+fn draw_shortcut_group(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icons: &IconStore,
+    title: &str,
+    icon: Icon,
+    rows: &[ShortcutRow],
+    recording: &mut Option<String>,
+    edits: &mut Vec<ShortcutEdit>,
+) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+        icons.draw(
+            ui.painter(),
+            icon,
+            rect.center(),
+            20.0,
+            theme.palette.text_muted,
+        );
+        ui.label(
+            RichText::new(title)
+                .font(theme.font(Text::Subtitle))
+                .color(theme.palette.text),
+        );
+    });
+    ui.add_space(Space::SM);
+    egui::Frame::new()
+        .fill(theme.palette.card_fill)
+        .stroke(egui::Stroke::new(1.0, theme.palette.hairline))
+        .corner_radius(12)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (index, row) in rows.iter().enumerate() {
+                draw_shortcut_row(ui, theme, row, index, recording, edits);
+                if index + 1 < rows.len() {
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(ui.min_rect().left() + 16.0, ui.min_rect().bottom()),
+                            egui::pos2(ui.min_rect().right() - 16.0, ui.min_rect().bottom()),
+                        ],
+                        egui::Stroke::new(1.0, theme.palette.divider),
                     );
                 }
+            }
+        });
+}
+
+fn draw_shortcut_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    row: &ShortcutRow,
+    index: usize,
+    recording: &mut Option<String>,
+    edits: &mut Vec<ShortcutEdit>,
+) {
+    let palette = theme.palette;
+    let armed = recording.as_deref() == Some(row.id.as_str());
+    egui::Frame::new()
+        .fill(if index.is_multiple_of(2) {
+            palette.card_fill
+        } else {
+            palette.card_fill_raised
+        })
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(&row.label)
+                            .font(theme.font(Text::Label))
+                            .color(if row.usable {
+                                palette.text
+                            } else {
+                                palette.text_faint
+                            }),
+                    );
+                    if !row.usable {
+                        ui.label(
+                            RichText::new("unavailable in this session")
+                                .font(theme.font(Text::Caption))
+                                .color(palette.text_faint),
+                        );
+                    }
+                });
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!row.is_default, egui::Button::new("Reset"))
+                        .on_hover_text("Back to the shipped default")
+                        .clicked()
+                    {
+                        *recording = None;
+                        edits.push(ShortcutEdit::Reset { id: row.id.clone() });
+                    }
+                    if ui
+                        .add_enabled(!row.accelerator.is_empty(), egui::Button::new("Clear"))
+                        .on_hover_text("Leave this action unassigned")
+                        .clicked()
+                    {
+                        *recording = None;
+                        edits.push(ShortcutEdit::Clear { id: row.id.clone() });
+                    }
+
+                    let caption = if armed {
+                        "Press keys…".to_owned()
+                    } else if row.symbols.is_empty() {
+                        "Unassigned".to_owned()
+                    } else {
+                        row.symbols.clone()
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(caption).font(theme.font(Text::Label)).color(
+                                    if armed {
+                                        palette.accent_hi
+                                    } else {
+                                        palette.text
+                                    },
+                                ),
+                            )
+                            .min_size(Vec2::new(170.0, 32.0))
+                            .fill(if armed {
+                                palette.accent
+                            } else {
+                                palette.chip_fill
+                            }),
+                        )
+                        .clicked()
+                    {
+                        *recording = if armed { None } else { Some(row.id.clone()) };
+                    }
+                });
             });
-    }
+
+            if let Some(problem) = &row.problem {
+                ui.add_space(Space::XS);
+                ui.label(
+                    RichText::new(problem)
+                        .font(theme.font(Text::Caption))
+                        .color(problem_ink(palette.appearance)),
+                );
+            } else if let Some(advisory) = &row.advisory {
+                ui.add_space(Space::XS);
+                ui.label(
+                    RichText::new(advisory)
+                        .font(theme.font(Text::Caption))
+                        .color(palette.text_muted),
+                );
+            }
+        });
 }
 
 /// What a frame of keyboard input meant to an armed shortcut row.
@@ -426,16 +912,25 @@ enum Chord {
 /// Escape and Delete are intercepted before they can be bound, because a shortcut
 /// recorder that lets you bind the key that cancels it has no way out.
 fn capture_chord(input: &egui::InputState) -> Option<Chord> {
-    for event in &input.events {
+    capture_events(&input.events)
+}
+
+fn capture_events(events: &[egui::Event]) -> Option<Chord> {
+    for event in events {
         let egui::Event::Key {
             key,
+            physical_key,
             pressed: true,
+            repeat: false,
             modifiers,
             ..
         } = event
         else {
             continue;
         };
+        if is_modifier_key(*key) || physical_key.is_some_and(is_modifier_key) {
+            continue;
+        }
         return Some(match key {
             Key::Escape => Chord::Cancelled,
             Key::Delete | Key::Backspace => Chord::Cleared,
@@ -449,6 +944,20 @@ fn capture_chord(input: &egui::InputState) -> Option<Chord> {
         });
     }
     None
+}
+
+const fn is_modifier_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::SuperLeft
+            | Key::SuperRight
+    )
 }
 
 /// Spells an egui key press the way the hotkey parser expects to read it.
@@ -480,7 +989,7 @@ fn spell(key: Key, modifiers: Modifiers) -> Option<String> {
     };
 
     let mut spelled = String::new();
-    if modifiers.ctrl && !modifiers.mac_cmd {
+    if modifiers.ctrl {
         spelled.push_str("Ctrl+");
     }
     if modifiers.alt {
@@ -512,26 +1021,47 @@ const fn problem_ink(appearance: Appearance) -> Color32 {
 }
 
 fn theme_for(ui: &egui::Ui) -> Theme {
-    let appearance = if ui.visuals().dark_mode {
-        Appearance::Dark
-    } else {
-        Appearance::Light
-    };
-    Theme::for_appearance(appearance)
+    Theme::for_appearance(appearance_for_theme(
+        ui.ctx().system_theme(),
+        ui.visuals().dark_mode,
+    ))
 }
 
-fn draw_about(ui: &mut egui::Ui, theme: &Theme, icon: &TextureHandle, build: BuildInfo) {
+const fn appearance_for_theme(
+    system_theme: Option<egui::Theme>,
+    fallback_dark: bool,
+) -> Appearance {
+    match system_theme {
+        Some(egui::Theme::Dark) => Appearance::Dark,
+        Some(egui::Theme::Light) => Appearance::Light,
+        None if fallback_dark => Appearance::Dark,
+        None => Appearance::Light,
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn appearance_for_mode(mode: dark_light::Mode, fallback: Appearance) -> Appearance {
+    match mode {
+        dark_light::Mode::Dark => Appearance::Dark,
+        dark_light::Mode::Light => Appearance::Light,
+        dark_light::Mode::Unspecified => fallback,
+    }
+}
+
+fn draw_about(ui: &mut egui::Ui, theme: &Theme, icon: Option<&TextureHandle>, build: BuildInfo) {
     let palette = theme.palette;
 
     ui.horizontal(|ui| {
         ui.add_space(Space::XL);
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), Sense::hover());
-        ui.painter().image(
-            icon.id(),
-            rect,
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(APP_ICON_SIZE), Sense::hover());
+        if let Some(icon) = icon {
+            ui.painter().image(
+                icon.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
 
         ui.add_space(Space::HUGE);
         ui.vertical(|ui| {
@@ -613,6 +1143,80 @@ mod tests {
     }
 
     #[test]
+    fn first_open_and_reopen_both_request_foregrounding() {
+        let mut window = SettingsWindow::default();
+        assert_eq!(window.open(), OpenDisposition::FirstOpen);
+        assert!(window.open);
+        assert!(std::mem::take(&mut window.focus_requested));
+
+        assert_eq!(window.open(), OpenDisposition::Reused);
+        assert!(std::mem::take(&mut window.focus_requested));
+    }
+
+    #[test]
+    fn shortcut_state_changes_never_request_window_focus() {
+        let mut window = SettingsWindow::default();
+        window.open();
+        assert!(std::mem::take(&mut window.focus_requested));
+
+        window.recording = Some("capture.region".to_owned());
+        window.recording = None;
+        assert!(
+            !window.focus_requested,
+            "only an explicit Settings action may foreground the viewport"
+        );
+    }
+
+    #[test]
+    fn settings_is_an_explicitly_normal_level_window() {
+        let builder = viewport_builder(true);
+        assert_eq!(builder.window_level, Some(egui::WindowLevel::Normal));
+        assert_eq!(builder.active, Some(true));
+        assert_eq!(builder.resizable, Some(true));
+        assert_eq!(viewport_builder(false).active, None);
+    }
+
+    #[test]
+    fn focus_is_emitted_only_for_a_settings_request() {
+        let commands = |requested| {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                request_foreground(ui.ctx(), requested);
+            });
+            output.textures_delta.clear();
+            output
+                .viewport_output
+                .into_values()
+                .flat_map(|viewport| viewport.commands)
+                .filter(|command| matches!(command, egui::ViewportCommand::Focus))
+                .count()
+        };
+        assert_eq!(commands(false), 0);
+        assert_eq!(commands(true), 1);
+    }
+
+    #[test]
+    fn platform_navigation_follows_native_conventions() {
+        assert_eq!(SettingsPlatform::MacOs.navigation(), Navigation::TopToolbar);
+        assert_eq!(SettingsPlatform::Windows.navigation(), Navigation::Sidebar);
+        assert_eq!(SettingsPlatform::Linux.navigation(), Navigation::Sidebar);
+    }
+
+    #[test]
+    fn settings_appearance_tracks_the_viewport_visuals() {
+        assert_eq!(appearance_for_theme(None, false), Appearance::Light);
+        assert_eq!(appearance_for_theme(None, true), Appearance::Dark);
+        assert_eq!(
+            appearance_for_theme(Some(egui::Theme::Light), true),
+            Appearance::Light
+        );
+        assert_eq!(
+            appearance_for_theme(Some(egui::Theme::Dark), false),
+            Appearance::Dark
+        );
+    }
+
+    #[test]
     fn a_bare_key_is_not_a_shortcut() {
         // A global hotkey on an unmodified letter would swallow that letter
         // everywhere on the system, which is not a preference worth offering.
@@ -631,7 +1235,111 @@ mod tests {
             mac_cmd: true,
             command: true,
         };
-        assert_eq!(press(Key::A, all), Some("Alt+Shift+Cmd+A".to_owned()));
+        assert_eq!(press(Key::A, all), Some("Ctrl+Alt+Shift+Cmd+A".to_owned()));
+    }
+
+    fn key_event(
+        key: Key,
+        physical_key: Option<Key>,
+        pressed: bool,
+        modifiers: Modifiers,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn captured(events: Vec<egui::Event>) -> Option<Chord> {
+        capture_events(&events)
+    }
+
+    #[test]
+    fn left_and_right_modifier_keys_never_commit_as_the_primary_key() {
+        for modifier in [
+            Key::ShiftLeft,
+            Key::ShiftRight,
+            Key::ControlLeft,
+            Key::ControlRight,
+            Key::AltLeft,
+            Key::AltRight,
+            Key::SuperLeft,
+            Key::SuperRight,
+        ] {
+            assert_eq!(
+                captured(vec![
+                    key_event(
+                        modifier,
+                        Some(modifier),
+                        true,
+                        Modifiers {
+                            alt: matches!(modifier, Key::AltLeft | Key::AltRight),
+                            ctrl: matches!(modifier, Key::ControlLeft | Key::ControlRight),
+                            shift: matches!(modifier, Key::ShiftLeft | Key::ShiftRight),
+                            mac_cmd: matches!(modifier, Key::SuperLeft | Key::SuperRight),
+                            command: matches!(modifier, Key::SuperLeft | Key::SuperRight),
+                        },
+                    ),
+                    key_event(modifier, Some(modifier), false, Modifiers::NONE,),
+                ]),
+                None,
+                "{modifier:?} must remain a modifier"
+            );
+        }
+    }
+
+    #[test]
+    fn either_side_of_every_modifier_produces_the_same_ordered_chord() {
+        let all = Modifiers {
+            alt: true,
+            ctrl: true,
+            shift: true,
+            mac_cmd: true,
+            command: true,
+        };
+        for modifiers in [
+            [
+                Key::ControlLeft,
+                Key::AltLeft,
+                Key::ShiftLeft,
+                Key::SuperLeft,
+            ],
+            [
+                Key::SuperRight,
+                Key::ShiftRight,
+                Key::AltRight,
+                Key::ControlRight,
+            ],
+        ] {
+            let mut events: Vec<_> = modifiers
+                .into_iter()
+                .map(|key| key_event(key, Some(key), true, all))
+                .collect();
+            events.push(key_event(Key::Num0, Some(Key::Num0), true, all));
+            assert_eq!(
+                captured(events),
+                Some(Chord::Pressed("Ctrl+Alt+Shift+Cmd+0".to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn key_up_events_cannot_replace_the_captured_non_modifier_key() {
+        let mut shifted_command = CMD;
+        shifted_command.shift = true;
+        assert_eq!(
+            captured(vec![
+                key_event(Key::ShiftLeft, Some(Key::ShiftLeft), true, shifted_command,),
+                key_event(Key::Num0, Some(Key::Num0), true, shifted_command),
+                key_event(Key::Num0, Some(Key::Num0), false, shifted_command),
+                key_event(Key::ShiftLeft, Some(Key::ShiftLeft), false, CMD),
+                key_event(Key::SuperLeft, Some(Key::SuperLeft), false, Modifiers::NONE,),
+            ]),
+            Some(Chord::Pressed("Shift+Cmd+0".to_owned()))
+        );
     }
 
     #[test]

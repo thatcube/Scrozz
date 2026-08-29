@@ -30,8 +30,8 @@ use std::{
 
 use scrozz_core::{Capture, SelectionCapabilities};
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, KeyState, Permissions, ScreenshotSound, Session,
-    SystemPermissions, Tray, TrayAction,
+    Accelerator, Capability, GlobalHotkeys, HotkeyEvent, KeyState, Permissions, ScreenshotSound,
+    Session, SystemPermissions, Tray, TrayAction,
     hotkey::{DesiredBinding, Rejection},
     play_screenshot_sound,
 };
@@ -288,6 +288,13 @@ pub enum Tick {
     Stop,
 }
 
+const ASSIGNMENT_EVENT_GUARD: Duration = Duration::from_millis(150);
+
+struct AssignmentEventGuard {
+    accelerator: Accelerator,
+    expires: Instant,
+}
+
 /// The running application.
 pub struct App {
     config: Config,
@@ -319,6 +326,7 @@ pub struct App {
     shortcuts: Shortcuts,
     shortcut_store: Option<ShortcutStore>,
     rejected: Vec<(ShortcutAction, String)>,
+    assignment_guard: Option<AssignmentEventGuard>,
     session: Session,
     selection_capabilities: SelectionCapabilities,
     capture_backend_ready: bool,
@@ -511,6 +519,7 @@ impl App {
             shortcuts,
             shortcut_store,
             rejected: Vec::new(),
+            assignment_guard: None,
             session,
             selection_capabilities,
             capture_backend_ready,
@@ -685,20 +694,39 @@ impl App {
     fn drain_hotkeys(&mut self) {
         let mut pending = Vec::new();
         while let Some(event) = self.hotkeys.poll() {
-            // Both edges arrive. Acting on the release as well would take two
-            // captures per press.
-            if event.state == KeyState::Pressed {
-                pending.push(event.action);
-            }
+            pending.push(event);
         }
 
-        for id in pending {
-            if let Some(action) = Action::from_id(&id) {
+        for event in pending {
+            if let Some(action) = self.action_for_hotkey_event(event) {
                 self.perform_from(CaptureOrigin::GlobalHotkey, action);
-            } else {
-                tracing::warn!(action = %id, "a hotkey fired for an action this build does not know");
             }
         }
+    }
+
+    fn action_for_hotkey_event(&mut self, event: HotkeyEvent) -> Option<Action> {
+        if self.assignment_guard.as_ref().is_some_and(|guard| {
+            guard.accelerator == event.accelerator && Instant::now() <= guard.expires
+        }) {
+            if event.state == KeyState::Released {
+                self.assignment_guard = None;
+            }
+            return None;
+        }
+        self.assignment_guard
+            .take_if(|guard| Instant::now() > guard.expires);
+
+        // Both edges arrive. Acting on the release as well would take two
+        // captures per press.
+        if event.state != KeyState::Pressed {
+            return None;
+        }
+
+        let action = Action::from_id(&event.action);
+        if action.is_none() {
+            tracing::warn!(action = %event.action, "a hotkey fired for an action this build does not know");
+        }
+        action
     }
 
     fn drain_server(&mut self) -> Tick {
@@ -1168,6 +1196,14 @@ impl App {
                     is_default: self.shortcuts.is_default(action),
                     usable: self.shortcut_is_usable(action),
                     problem,
+                    advisory: (cfg!(target_os = "macos")
+                        && Accelerator::parse(accelerator)
+                            .is_ok_and(|parsed| parsed.system_owner().is_some()))
+                    .then_some(
+                        "May conflict with a macOS shortcut. If it does not fire, review System \
+                         Settings › Keyboard › Keyboard Shortcuts."
+                            .to_owned(),
+                    ),
                 }
             })
             .collect()
@@ -1185,6 +1221,7 @@ impl App {
         }
         let mut candidate = self.shortcuts.clone();
         let mut touched = Vec::new();
+        let mut recorded = None;
         for edit in edits {
             match edit {
                 ShortcutEdit::ResetAll => {
@@ -1197,6 +1234,9 @@ impl App {
                     };
                     candidate.set(action, Some(accelerator));
                     touched.push(action);
+                    recorded = candidate
+                        .get(action)
+                        .and_then(|raw| Accelerator::parse(raw).ok());
                 }
                 ShortcutEdit::Clear { id } => {
                     let Some(action) = ShortcutAction::from_id(id) else {
@@ -1245,8 +1285,15 @@ impl App {
             return;
         }
 
-        match self.apply_shortcuts(&candidate) {
-            Ok(()) => self.rejected.clear(),
+        match self.register_shortcuts(&candidate) {
+            Ok(()) => {
+                self.assignment_guard = recorded.map(|accelerator| AssignmentEventGuard {
+                    accelerator,
+                    expires: Instant::now() + ASSIGNMENT_EVENT_GUARD,
+                });
+                self.commit_shortcuts(candidate);
+                self.rejected.clear();
+            }
             Err(rejections) => {
                 self.rejected = rejections
                     .iter()
@@ -1281,20 +1328,7 @@ impl App {
         )
     }
 
-    /// Puts an edited set of shortcuts in force, saving it if it takes.
-    ///
-    /// Atomic by construction: [`GlobalHotkeys::apply`] validates the whole set
-    /// before touching the OS and restores the previous registrations if the OS
-    /// refuses one, so a rejected edit leaves the shortcuts that were working
-    /// still working — and, because nothing is written until registration
-    /// succeeds, the file on disk keeps matching what the keyboard does.
-    ///
-    /// # Errors
-    ///
-    /// Returns one [`Rejection`] per offending row so the pane can mark each of
-    /// them, rather than reporting only the first and sending the user round the
-    /// loop again.
-    pub fn apply_shortcuts(&mut self, next: &Shortcuts) -> std::result::Result<(), Vec<Rejection>> {
+    fn register_shortcuts(&mut self, next: &Shortcuts) -> std::result::Result<(), Vec<Rejection>> {
         let session = self.session.clone();
         let capabilities = self.selection_capabilities;
         let ready = self.capture_backend_ready;
@@ -1304,10 +1338,6 @@ impl App {
         let desired = wanted(&bindings_from(next), &available, &mut skipped);
 
         self.hotkeys.apply(&desired)?;
-
-        self.shortcuts = next.clone();
-        self.config.shortcuts = next.clone();
-        self.config.bindings = bindings_from(next);
         for note in skipped {
             self.note(note);
         }
@@ -1315,15 +1345,22 @@ impl App {
             self.note(format!("{} → {}", want.accelerator, want.action));
         }
 
+        Ok(())
+    }
+
+    fn commit_shortcuts(&mut self, next: Shortcuts) {
+        self.shortcuts = next.clone();
+        self.config.shortcuts = next.clone();
+        self.config.bindings = bindings_from(&next);
+
         // Saving last, and only on success, so the stored set is always one the
         // app was able to put in force.
         if let Some(store) = self.shortcut_store.clone()
-            && let Err(err) = store.save(next)
+            && let Err(err) = store.save(&next)
         {
             self.note(format!("shortcuts not saved: {err}"));
         }
         self.refresh_tray_shortcuts();
-        Ok(())
     }
 
     /// Relabels the menu with the shortcuts that are actually registered.
@@ -1487,11 +1524,13 @@ impl Drop for App {
     }
 }
 
-/// Reports what a hotkey would do to the system, without registering it.
+/// Reports whether a hotkey is a known system default, without claiming its
+/// current availability.
 ///
 /// Used by diagnostics, and worth having separately: the answer for
-/// `Cmd+Shift+4` is *not* "it failed", it is "macOS owns this one", and the two
-/// send a user to very different places.
+/// The result is diagnostic metadata only. Users can disable or reassign these
+/// defaults, so native registration and live delivery still decide whether the
+/// combination is usable.
 ///
 /// # Errors
 ///
@@ -1500,7 +1539,7 @@ pub fn describe_conflict(accelerator: &str) -> CliResult<Option<String>> {
     let parsed = Accelerator::parse(accelerator).map_err(CliError::Core)?;
     Ok(parsed
         .system_owner()
-        .map(|reserved| format!("{parsed} is reserved: {reserved:?}")))
+        .map(|reserved| format!("{parsed} is a known system default: {reserved:?}")))
 }
 
 /// The tray entries this build offers, for diagnostics.
@@ -1522,6 +1561,7 @@ mod tests {
         CaptureTarget, ColorSpace, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
         PixelFormat, Provenance, ScaleFactor,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
@@ -1543,6 +1583,9 @@ mod tests {
         let (mut app, _) = app();
         app.shortcuts = shortcuts.clone();
         app.config.shortcuts = shortcuts;
+        app.shortcut_store = None;
+        app.selection_capabilities = SelectionCapabilities::CLIENT_OVERLAY;
+        app.capture_backend_ready = true;
         app
     }
 
@@ -1585,17 +1628,209 @@ mod tests {
         editor
     }
 
+    fn shortcut_store(name: &str) -> (std::path::PathBuf, ShortcutStore) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-gui-shortcuts-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).expect("create shortcut test directory");
+        (
+            directory.clone(),
+            ShortcutStore::new(directory.join("shortcuts.json")),
+        )
+    }
+
     #[test]
     fn a_recorded_combination_replaces_the_old_one() {
         let mut app = app_with_shortcuts(Shortcuts::default());
+        let recorded = "Ctrl+Alt+Shift+Cmd+0";
         app.edit_shortcuts(&[ShortcutEdit::Set {
             id: ShortcutAction::CaptureRegion.id().to_owned(),
-            accelerator: "Ctrl+Shift+F9".to_owned(),
+            accelerator: recorded.to_owned(),
         }]);
+        let registered = Accelerator::parse(recorded)
+            .expect("recorded chord parses")
+            .to_string();
         assert_eq!(
             app.shortcuts.get(ShortcutAction::CaptureRegion),
-            Some("Ctrl+Shift+F9")
+            Some(registered.as_str())
         );
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is always listed");
+        assert_eq!(row.accelerator, registered);
+        assert_eq!(
+            row.symbols,
+            Accelerator::parse(&row.accelerator)
+                .expect("recorded chord parses")
+                .symbols()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assign_known_default(app: &mut App) -> Accelerator {
+        let accelerator = Accelerator::parse("Cmd+Shift+4").expect("known default parses");
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: accelerator.to_string(),
+        }]);
+        accelerator
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disabled_system_default_saves_immediately_with_advisory() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let (directory, store) = shortcut_store("known-default");
+        app.shortcut_store = Some(store.clone());
+        let accelerator = assign_known_default(&mut app);
+
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            Some(accelerator.to_string().as_str())
+        );
+        assert_eq!(
+            store.load().get(ShortcutAction::CaptureRegion),
+            Some(accelerator.to_string().as_str()),
+            "successful native registration saves immediately"
+        );
+        assert_eq!(
+            app.hotkeys.action_for(&accelerator),
+            Some(ShortcutAction::CaptureRegion.id()),
+            "the live registration and tray source update immediately"
+        );
+        assert_eq!(
+            app.config.bindings,
+            bindings_from(&app.shortcuts),
+            "the configured and displayed shortcut table updates immediately"
+        );
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is listed");
+        assert_eq!(row.accelerator, accelerator.to_string());
+        assert_eq!(row.symbols, accelerator.symbols());
+        assert!(row.problem.is_none());
+        assert!(
+            row.advisory
+                .is_some_and(|message| message.contains("May conflict"))
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn free_chord_has_no_system_advisory() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: "Cmd+Shift+F13".to_owned(),
+        }]);
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is listed");
+        assert!(row.advisory.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn known_default_dispatch_never_reopens_or_refocuses_settings() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
+        assert!(
+            app.take_settings_request(),
+            "the host has opened the visible Settings window"
+        );
+        let accelerator = assign_known_default(&mut app);
+        let event = |state| HotkeyEvent {
+            action: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator,
+            state,
+        };
+
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Released)),
+            None,
+            "the recorder's assignment release clears its guard"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                app.action_for_hotkey_event(event(KeyState::Pressed)),
+                Some(Action::Capture(CaptureKind::Region)),
+                "each press routes exactly one capture action"
+            );
+            assert_eq!(app.action_for_hotkey_event(event(KeyState::Released)), None);
+            assert!(
+                !app.take_settings_request(),
+                "capture hotkeys must not reopen or foreground Settings"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_event_is_suppressed_but_later_presses_route_only_the_assigned_action() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let accelerator = Accelerator::parse("Cmd+Shift+F13").expect("free chord parses");
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: accelerator.to_string(),
+        }]);
+
+        let event = |state| HotkeyEvent {
+            action: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator,
+            state,
+        };
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Pressed)),
+            None,
+            "the assignment key-down cannot invoke its new action"
+        );
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Released)),
+            None,
+            "the assignment release clears the narrow guard"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                app.action_for_hotkey_event(event(KeyState::Pressed)),
+                Some(Action::Capture(CaptureKind::Region))
+            );
+            assert_eq!(app.action_for_hotkey_event(event(KeyState::Released)), None);
+            assert!(!app.take_settings_request());
+        }
+        assert!(!app.settings_requested);
+    }
+
+    #[test]
+    fn assignment_guard_expires_without_swallowing_a_later_press() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let accelerator = Accelerator::parse("Cmd+Shift+F13").expect("free chord parses");
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: accelerator.to_string(),
+        }]);
+        app.assignment_guard
+            .as_mut()
+            .expect("a recorded assignment gets a narrow guard")
+            .expires = Instant::now();
+
+        assert_eq!(
+            app.action_for_hotkey_event(HotkeyEvent {
+                action: ShortcutAction::CaptureRegion.id().to_owned(),
+                accelerator,
+                state: KeyState::Pressed,
+            }),
+            Some(Action::Capture(CaptureKind::Region))
+        );
+        assert!(!app.take_settings_request());
     }
 
     #[test]
@@ -2150,7 +2385,7 @@ mod tests {
     }
 
     #[test]
-    fn the_screenshot_shortcuts_are_recognised_as_taken() {
+    fn system_defaults_are_recognised_as_advisory_metadata() {
         // The negative of the test above: if this stops holding, the one above
         // has stopped proving anything.
         //
@@ -2162,7 +2397,7 @@ mod tests {
         let reserved = scrozz_shell::hotkey::reserved_shortcuts();
         assert!(
             !reserved.is_empty(),
-            "every platform must declare the combinations it has already taken"
+            "every platform must declare its common system defaults"
         );
 
         for shortcut in reserved {

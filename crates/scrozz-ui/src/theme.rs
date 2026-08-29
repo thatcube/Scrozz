@@ -766,26 +766,34 @@ pub fn font_definitions() -> FontDefinitions {
 /// depend on which frame it caught.
 pub fn install_style(ctx: &egui::Context, theme: &Theme) {
     let theme = *theme;
-    let palette = theme.palette;
     ctx.all_styles_mut(move |style| {
-        let visuals = &mut style.visuals;
-        visuals.dark_mode = palette.is_dark();
-        visuals.override_text_color = Some(palette.text);
-        visuals.panel_fill = Color32::TRANSPARENT;
-        visuals.window_fill = Color32::TRANSPARENT;
-        visuals.window_stroke = egui::Stroke::NONE;
-        visuals.window_shadow = Shadow::NONE;
-        visuals.popup_shadow = Shadow::NONE;
-        visuals.selection.bg_fill = palette.accent.linear_multiply(0.55);
-        visuals.selection.stroke = egui::Stroke::new(1.0, palette.on_accent);
-        visuals.text_cursor.blink = false;
-
-        // Controls are instant (D19); stills are deterministic (D25).
-        style.animation_time = 0.0;
-        style.spacing.item_spacing = egui::vec2(Space::SM, Space::SM);
-        style.spacing.button_padding = egui::vec2(Space::MD, Space::SM);
-        style.text_styles = text_styles(&theme);
+        apply_style(style, &theme);
     });
+}
+
+/// Applies the token style to one UI subtree.
+///
+/// Secondary viewports use this to follow their OS appearance without changing
+/// the transparent overlay's deliberately dark style.
+pub fn apply_style(style: &mut egui::Style, theme: &Theme) {
+    let palette = theme.palette;
+    let visuals = &mut style.visuals;
+    visuals.dark_mode = palette.is_dark();
+    visuals.override_text_color = Some(palette.text);
+    visuals.panel_fill = Color32::TRANSPARENT;
+    visuals.window_fill = Color32::TRANSPARENT;
+    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.window_shadow = Shadow::NONE;
+    visuals.popup_shadow = Shadow::NONE;
+    visuals.selection.bg_fill = palette.accent.linear_multiply(0.55);
+    visuals.selection.stroke = egui::Stroke::new(1.0, palette.on_accent);
+    visuals.text_cursor.blink = false;
+
+    // Controls are instant (D19); stills are deterministic (D25).
+    style.animation_time = 0.0;
+    style.spacing.item_spacing = egui::vec2(Space::SM, Space::SM);
+    style.spacing.button_padding = egui::vec2(Space::MD, Space::SM);
+    style.text_styles = text_styles(theme);
 }
 
 /// The type ramp mapped onto egui's built-in text styles.
