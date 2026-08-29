@@ -2,8 +2,9 @@
 
 mod common;
 
-use common::{document, every_annotation, rect};
+use common::{document, every_annotation, rect, region_capture};
 use scrozz_annotate::{Annotation, AnnotationKind, Color, Document, RedactStyle, Style};
+use scrozz_core::ContentRevision;
 use scrozz_core::LogicalPoint;
 
 #[test]
@@ -433,6 +434,124 @@ fn only_redactions_report_as_destructive() {
         }
         .is_destructive()
     );
+}
+
+#[test]
+fn every_manual_edit_invalidates_the_document_revision() {
+    let mut doc = document(200, 200);
+    let initial = doc.revision();
+    let id = doc.add_default(Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)));
+    let added = doc.revision();
+    assert!(added > initial);
+
+    assert!(doc.translate(id, 1.0, 0.0));
+    let translated = doc.revision();
+    assert!(translated > added);
+
+    {
+        let mut annotation = doc.get_mut(id).expect("annotation");
+        *annotation.annotation() = Annotation::Highlight(rect(2.0, 2.0, 3.0, 4.0));
+    }
+    assert!(doc.revision() > translated);
+}
+
+#[test]
+fn current_sensitive_findings_become_ordinary_secure_redactions() {
+    let mut doc = document(200, 200);
+    let revision = doc.revision();
+    let ids = doc
+        .add_redactions_at_revision(
+            revision,
+            [rect(10.0, 12.0, 40.0, 18.0), rect(80.0, 60.0, 55.0, 20.0)],
+        )
+        .expect("current scan");
+
+    assert_eq!(ids.len(), 2);
+    assert!(doc.revision() > revision);
+    for id in ids {
+        assert!(matches!(
+            doc.get(id).map(|object| &object.annotation),
+            Some(Annotation::Redact {
+                style: RedactStyle::Solid,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn duplicate_findings_create_one_redaction_for_one_source_region() {
+    let mut doc = document(200, 200);
+    let area = rect(10.0, 12.0, 40.0, 18.0);
+    let ids = doc
+        .add_redactions_at_revision(doc.revision(), [area, area])
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(doc.len(), 1);
+}
+
+#[test]
+fn stale_sensitive_findings_cannot_modify_the_document() {
+    let mut doc = document(200, 200);
+    let scanned = doc.revision();
+    doc.add_default(Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)));
+    let before = doc.data();
+
+    let error = doc
+        .add_redactions_at_revision(scanned, [rect(10.0, 10.0, 20.0, 20.0)])
+        .unwrap_err();
+
+    assert!(error.to_string().contains("stale"), "{error}");
+    assert_eq!(doc.data(), before);
+}
+
+#[test]
+fn invalid_sensitive_bounds_fail_atomically() {
+    let mut doc = document(200, 200);
+    let revision = doc.revision();
+    let before = doc.data();
+    let error = doc
+        .add_redactions_at_revision(
+            revision,
+            [rect(10.0, 10.0, 20.0, 20.0), rect(-1.0, 0.0, 10.0, 10.0)],
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("outside"), "{error}");
+    assert_eq!(doc.data(), before);
+}
+
+#[test]
+fn a_caller_cannot_forge_a_stale_initial_revision_after_an_edit() {
+    let mut doc = document(200, 200);
+    assert_ne!(doc.revision(), ContentRevision::INITIAL);
+    doc.add_default(Annotation::Rectangle(rect(1.0, 2.0, 3.0, 4.0)));
+    assert_ne!(doc.revision(), ContentRevision::INITIAL);
+}
+
+#[test]
+fn separate_documents_never_share_an_initial_revision() {
+    assert_ne!(document(200, 200).revision(), document(200, 200).revision());
+}
+
+#[test]
+fn divergent_document_clones_never_reuse_a_revision() {
+    let original = document(200, 200);
+    let mut left = original.clone();
+    let mut right = original;
+    left.add_default(Annotation::Rectangle(rect(1.0, 1.0, 10.0, 10.0)));
+    right.add_default(Annotation::Rectangle(rect(20.0, 20.0, 10.0, 10.0)));
+    assert_ne!(left.revision(), right.revision());
+}
+
+#[test]
+fn replacing_source_pixels_invalidates_existing_analysis() {
+    let mut doc = document(200, 200);
+    let scanned = doc.revision();
+    doc.replace_source(region_capture(320, 180))
+        .expect("compatible replacement");
+    assert_ne!(doc.revision(), scanned);
+    assert_eq!(doc.source().frame.width(), 320);
 }
 
 fn counter_indices(doc: &Document) -> Vec<u32> {

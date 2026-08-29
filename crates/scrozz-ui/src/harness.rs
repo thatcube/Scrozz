@@ -259,6 +259,8 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// Possible sensitive information shown for explicit review before redaction.
+    SensitiveReview,
 }
 
 impl Scenario {
@@ -275,6 +277,7 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::SensitiveReview,
         ]
     }
 
@@ -294,6 +297,7 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::SensitiveReview => "sensitive-review",
         }
     }
 
@@ -747,9 +751,23 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::SensitiveReview => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Review before redacting",
+                    "Possible sensitive information is outlined on the source and listed by category. Nothing is selected or changed automatically.",
+                    instants::REST,
+                    None,
+                ),
             };
 
-        let size_pt = if annotating { (900.0, 620.0) } else { size_pt };
+        let size_pt = match scenario {
+            Scenario::SensitiveReview => (1080.0, 680.0),
+            _ if annotating => (900.0, 620.0),
+            _ => size_pt,
+        };
 
         Self {
             scenario,
@@ -1870,7 +1888,7 @@ impl SceneRegistry {
     /// then add one `register` call below. Nothing else in this file changes.
     #[must_use]
     pub fn production() -> Self {
-        let me = Self::placeholders();
+        let mut me = Self::placeholders();
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
@@ -1878,6 +1896,10 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        me.register(
+            Scenario::SensitiveReview,
+            Box::new(crate::sensitive::SensitiveReviewScene),
+        );
         me
     }
 
@@ -3657,6 +3679,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::SensitiveReview,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

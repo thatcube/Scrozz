@@ -61,7 +61,7 @@ impl SkiaRenderer {
             ));
         }
 
-        let source = raster::to_pixmap(&document.source.frame)?;
+        let source = raster::to_pixmap(&document.source().frame)?;
         let logical = document.logical_size();
         let width = (logical.width * scale.get()).round().max(1.0) as u32;
         let height = (logical.height * scale.get()).round().max(1.0) as u32;
@@ -83,7 +83,7 @@ impl SkiaRenderer {
 
         Ok(raster::from_pixmap(
             canvas,
-            document.source.frame.color_space,
+            document.source().frame.color_space,
             scale,
         ))
     }
@@ -113,7 +113,7 @@ impl SkiaRenderer {
 impl Renderer for SkiaRenderer {
     /// Composites at the source's own scale, which is the lossless default.
     fn render(&self, document: &Document) -> Result<Frame> {
-        self.render_at(document, document.source.frame.scale)
+        self.render_at(document, document.source().frame.scale)
     }
 }
 

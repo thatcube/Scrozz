@@ -345,7 +345,7 @@ fn redaction_survives_a_downscaled_export() {
 fn the_source_frame_is_untouched_by_every_redaction_style() {
     for style in [RedactStyle::Blur, RedactStyle::Pixelate, RedactStyle::Solid] {
         let mut doc = checkered(80, 80);
-        let before = doc.source.frame.data.clone();
+        let before = doc.source().frame.data.clone();
         doc.add(
             Annotation::Redact {
                 area: rect(0.0, 0.0, 80.0, 80.0),
@@ -355,7 +355,8 @@ fn the_source_frame_is_untouched_by_every_redaction_style() {
         );
         let _ = SkiaRenderer::new().render(&doc).unwrap();
         assert_eq!(
-            before, doc.source.frame.data,
+            before,
+            doc.source().frame.data,
             "{style:?} mutated the document's source; D14 requires it stay editable"
         );
     }

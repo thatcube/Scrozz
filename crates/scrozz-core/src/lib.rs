@@ -29,6 +29,7 @@ pub mod capture;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod revision;
 pub mod target;
 
 pub use capture::{Capture, CaptureBackend, CaptureRequest, CursorMode, Provenance};
@@ -38,4 +39,5 @@ pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
+pub use revision::ContentRevision;
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};

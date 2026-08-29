@@ -87,6 +87,7 @@ pub mod motion;
 pub mod onboarding;
 pub mod overlay_app;
 pub mod paint;
+pub mod sensitive;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
@@ -97,5 +98,8 @@ pub use onboarding::{OcrOnboarding, OcrSettings, OcrSettingsResponse, Onboarding
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+};
+pub use sensitive::{
+    FindingDecision, SensitiveReview, SensitiveReviewResponse, SensitiveReviewScene,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

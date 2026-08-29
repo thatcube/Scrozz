@@ -3503,6 +3503,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "objc2-vision",
+ "regex",
  "rxing",
  "scrozz-core",
  "thiserror 2.0.20",
@@ -3580,6 +3581,8 @@ dependencies = [
  "resvg",
  "scrozz-annotate",
  "scrozz-core",
+ "scrozz-ocr",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
 ]

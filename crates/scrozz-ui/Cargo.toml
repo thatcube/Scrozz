@@ -13,10 +13,14 @@ scrozz-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-annotate.workspace = true
+scrozz-ocr.workspace = true
 egui.workspace = true
 eframe.workspace = true
 image.workspace = true
 resvg.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

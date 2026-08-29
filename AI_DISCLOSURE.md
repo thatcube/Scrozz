@@ -74,6 +74,12 @@ These are properties of the shipped application, not promises about intent.
   uses the executable and language data installed by the user. Scrozz always
   passes an explicit language model and returns an actionable error when a
   requested model is absent. Nothing is sent off the machine.
+- **Sensitive-information suggestions are local and deterministic.** Scrozz can
+  classify OCR geometry as possible email addresses, payment cards, network
+  addresses, phone numbers, token-bearing URLs, or likely keys using ordinary
+  parsing, checksums, entropy and nearby context. Findings retain no recognized
+  value, are never selected automatically, and become redactions only after the
+  user reviews and accepts them.
 
 ### How you can verify that
 

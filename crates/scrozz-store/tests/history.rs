@@ -18,7 +18,7 @@ fn store(label: &str) -> (ScratchDir, SqliteStore) {
 fn a_capture_survives_a_round_trip_through_history() {
     let (_dir, mut store) = store("round-trip");
     let document = richly_annotated_document(7);
-    let original_pixels = document.source.frame.data.clone();
+    let original_pixels = document.source().frame.data.clone();
 
     let id = store
         .insert(
@@ -41,7 +41,8 @@ fn a_capture_survives_a_round_trip_through_history() {
         panic!("a freshly inserted capture must still have its pixels");
     };
     assert_eq!(
-        back.source.frame.data, original_pixels,
+        back.source().frame.data,
+        original_pixels,
         "D14: the source image is never mutated"
     );
     assert_eq!(back.annotations().len(), 3);
@@ -52,7 +53,9 @@ fn a_capture_survives_a_round_trip_through_history() {
 fn a_malformed_frame_is_refused_rather_than_stored() {
     let (_dir, mut store) = store("malformed");
     let mut document = sample_document(8, 8, 1, 0);
-    document.source.frame.stride = 3; // 8px of RGBA cannot fit in 3 bytes.
+    let mut malformed = document.source().clone();
+    malformed.frame.stride = 3; // 8px of RGBA cannot fit in 3 bytes.
+    document.replace_source(malformed).unwrap();
 
     let err = store
         .insert(NewCapture::new(&document))
@@ -70,7 +73,7 @@ fn identical_captures_share_one_blob_on_disk() {
     let second = store.insert(NewCapture::new(&document)).expect("insert");
     assert_ne!(first, second, "the same pixels are still two captures");
 
-    let one_image = document.source.frame.data.len() as u64;
+    let one_image = document.source().frame.data.len() as u64;
     assert_eq!(
         store.stored_image_bytes().expect("size"),
         one_image,
@@ -238,7 +241,7 @@ fn search_treats_sql_wildcards_as_ordinary_characters() {
 fn editing_a_capture_persists_and_never_touches_its_pixels() {
     let (_dir, mut store) = store("editing");
     let document = sample_document(16, 16, 5, 0);
-    let pixels = document.source.frame.data.clone();
+    let pixels = document.source().frame.data.clone();
     let id = store.insert(NewCapture::new(&document)).expect("insert");
 
     let DocumentState::Complete(mut live) = store.document(&id).expect("read").expect("present")
@@ -260,7 +263,8 @@ fn editing_a_capture_persists_and_never_touches_its_pixels() {
     };
     assert_eq!(reloaded.annotations().len(), 1);
     assert_eq!(
-        reloaded.source.frame.data, pixels,
+        reloaded.source().frame.data,
+        pixels,
         "D14: annotations are an overlay; the capture underneath is untouched"
     );
     assert_eq!(
@@ -323,7 +327,7 @@ fn deleting_a_capture_removes_its_record_and_its_pixels() {
     assert!(store.record(&kept).expect("read").is_some());
     assert_eq!(
         store.stored_image_bytes().expect("size"),
-        b.source.frame.data.len() as u64
+        b.source().frame.data.len() as u64
     );
 
     let documents = std::fs::read_dir(store.layout().documents_dir())
@@ -343,7 +347,8 @@ fn deleting_one_of_two_identical_captures_keeps_the_shared_blob() {
 
     let bytes = store.image(&second).expect("read").expect("still there");
     assert_eq!(
-        bytes, document.source.frame.data,
+        bytes,
+        document.source().frame.data,
         "deduplication must not let one delete take another capture's pixels"
     );
 }
@@ -408,7 +413,7 @@ fn an_image_state_reports_what_actually_happened_to_the_pixels() {
 
     match store.record(&id).expect("read").expect("present").image {
         ImageState::Present { byte_len, ref hash } => {
-            assert_eq!(byte_len, document.source.frame.data.len() as u64);
+            assert_eq!(byte_len, document.source().frame.data.len() as u64);
             assert_eq!(hash.len(), 64);
         }
         other => panic!("expected present pixels, got {other:?}"),

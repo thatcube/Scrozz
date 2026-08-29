@@ -53,6 +53,7 @@ thiserror = "2"
 tracing = "0.1"
 isolang = { version = "2.4", default-features = false }
 language-tags = "0.3"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = [
     "png",

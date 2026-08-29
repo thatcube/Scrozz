@@ -15,6 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 isolang = { workspace = true, optional = true }
 language-tags.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 # Fixtures are generated, never committed: a test encodes a QR or a Code 128 and

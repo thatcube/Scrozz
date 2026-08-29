@@ -68,6 +68,7 @@ pub mod onboarding;
 pub mod overlay;
 pub mod panel;
 pub mod pipeline;
+pub mod sensitive;
 pub mod server;
 
 // Re-exported so the rest of the binary — and anything that later lifts this

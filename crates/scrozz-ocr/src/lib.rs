@@ -48,6 +48,7 @@ pub mod layout;
 pub mod links;
 mod live;
 pub mod prepare;
+pub mod sensitive;
 
 pub use barcode::{
     Barcode, BarcodeDetector, BarcodeOptions, PortableBarcodes, Symbology, SystemBarcodes,
@@ -60,6 +61,11 @@ pub use layout::{LineBreaks, plain_text, text};
 pub use links::{Link, LinkKind, links};
 pub use live::{LiveOcr, block_at_point, frame_local_point};
 pub use prepare::UpscalePolicy;
+pub use sensitive::{
+    CancellationToken, FindingConfidence, FindingId, FindingReason, LocalSensitiveDetector,
+    SensitiveCategory, SensitiveFinding, SensitiveScan, SensitiveScanCache, SensitiveScanOptions,
+    SensitiveSource,
+};
 
 /// Optional absolute directory containing a local Tesseract installation.
 ///

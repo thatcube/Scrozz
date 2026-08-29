@@ -1,10 +1,12 @@
 //! The document: a capture plus every edit ever made to it.
 
-use scrozz_core::{Capture, Error, LogicalPoint, LogicalRect, LogicalSize, Result};
+use scrozz_core::{
+    Capture, ContentRevision, Error, LogicalPoint, LogicalRect, LogicalSize, Result,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    annotation::{Annotation, AnnotationId, AnnotationObject},
+    annotation::{Annotation, AnnotationId, AnnotationObject, RedactStyle},
     style::{Color, Style},
 };
 
@@ -130,10 +132,11 @@ pub struct Document {
     /// Rendering copies before it composites, and redaction destroys pixels only
     /// in that copy. A redacted export is unrecoverable; the document it came
     /// from is still fully editable.
-    pub source: Capture,
+    source: Capture,
     objects: Vec<AnnotationObject>,
     beautification: Option<Beautification>,
     next_id: u64,
+    revision: ContentRevision,
 }
 
 impl Document {
@@ -145,6 +148,7 @@ impl Document {
             objects: Vec::new(),
             beautification: None,
             next_id: 1,
+            revision: ContentRevision::fresh(),
         }
     }
 
@@ -180,6 +184,7 @@ impl Document {
             objects: data.annotations,
             beautification: data.beautification,
             next_id: data.next_id.max(highest).max(1),
+            revision: ContentRevision::fresh(),
         };
         document.renumber_counters();
         Ok(document)
@@ -232,6 +237,34 @@ impl Document {
         LogicalRect::new(LogicalPoint::new(0.0, 0.0), self.logical_size())
     }
 
+    /// The immutable identity of the document's current editable content.
+    #[must_use]
+    pub const fn revision(&self) -> ContentRevision {
+        self.revision
+    }
+
+    /// Untouched source capture.
+    #[must_use]
+    pub const fn source(&self) -> &Capture {
+        &self.source
+    }
+
+    /// Replaces the source capture and invalidates every prior analysis result.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a source whose provenance conflicts with current beautification.
+    pub fn replace_source(&mut self, source: Capture) -> Result<()> {
+        if self.beautification.is_some() && source.provenance.forbids_compositing() {
+            return Err(Error::InvalidRequest(
+                "beautification is not permitted for window captures (decision D9)".to_owned(),
+            ));
+        }
+        self.source = source;
+        self.touch();
+        Ok(())
+    }
+
     /// Adds an annotation on top of everything else.
     ///
     /// Counter markers are numbered by the document, so the `index` on a
@@ -242,6 +275,7 @@ impl Document {
         self.objects
             .push(AnnotationObject::new(id, annotation, style));
         self.renumber_counters();
+        self.touch();
         id
     }
 
@@ -260,12 +294,16 @@ impl Document {
         let index = self.index_of(id)?;
         let removed = self.objects.remove(index);
         self.renumber_counters();
+        self.touch();
         Some(removed)
     }
 
     /// Removes every annotation, leaving the source untouched.
     pub fn clear(&mut self) {
-        self.objects.clear();
+        if !self.objects.is_empty() {
+            self.objects.clear();
+            self.touch();
+        }
     }
 
     /// Looks up an annotation.
@@ -290,7 +328,10 @@ impl Document {
     pub fn set_style(&mut self, id: AnnotationId, style: Style) -> bool {
         match self.index_of(id) {
             Some(index) => {
-                self.objects[index].style = style;
+                if self.objects[index].style != style {
+                    self.objects[index].style = style;
+                    self.touch();
+                }
                 true
             }
             None => false,
@@ -302,6 +343,7 @@ impl Document {
         match self.index_of(id) {
             Some(index) => {
                 self.objects[index].annotation.translate(dx, dy);
+                self.touch();
                 true
             }
             None => false,
@@ -313,6 +355,7 @@ impl Document {
         match self.index_of(id) {
             Some(index) => {
                 self.objects[index].annotation.set_bounds(bounds);
+                self.touch();
                 true
             }
             None => false,
@@ -349,6 +392,7 @@ impl Document {
             Some(index) => {
                 let object = self.objects.remove(index);
                 self.objects.push(object);
+                self.touch();
                 true
             }
             None => false,
@@ -361,6 +405,7 @@ impl Document {
             Some(index) => {
                 let object = self.objects.remove(index);
                 self.objects.insert(0, object);
+                self.touch();
                 true
             }
             None => false,
@@ -372,6 +417,7 @@ impl Document {
         match self.index_of(id) {
             Some(index) if index + 1 < self.objects.len() => {
                 self.objects.swap(index, index + 1);
+                self.touch();
                 true
             }
             _ => false,
@@ -383,6 +429,7 @@ impl Document {
         match self.index_of(id) {
             Some(index) if index > 0 => {
                 self.objects.swap(index, index - 1);
+                self.touch();
                 true
             }
             _ => false,
@@ -425,8 +472,61 @@ impl Document {
                 "beautification is not permitted for window captures (decision D9)".to_owned(),
             ));
         }
-        self.beautification = beautification;
+        if self.beautification != beautification {
+            self.beautification = beautification;
+            self.touch();
+        }
         Ok(())
+    }
+
+    /// Adds secure redaction annotations only when an analysis result still
+    /// matches this exact document revision.
+    ///
+    /// The operation is all-or-nothing: every area is validated before the first
+    /// annotation is created, so malformed or stale analysis cannot partially
+    /// edit the document.
+    pub fn add_redactions_at_revision<I>(
+        &mut self,
+        expected: ContentRevision,
+        areas: I,
+    ) -> Result<Vec<AnnotationId>>
+    where
+        I: IntoIterator<Item = LogicalRect>,
+    {
+        if self.revision != expected {
+            return Err(Error::InvalidRequest(
+                "the sensitive-information scan is stale; scan the current revision again"
+                    .to_owned(),
+            ));
+        }
+        let mut unique_areas = Vec::new();
+        for area in areas {
+            if !unique_areas.contains(&area) {
+                unique_areas.push(area);
+            }
+        }
+        let bounds = self.logical_bounds();
+        if unique_areas
+            .iter()
+            .any(|area| !valid_redaction_area(*area, bounds))
+        {
+            return Err(Error::InvalidRequest(
+                "a proposed sensitive-information redaction lies outside the source image"
+                    .to_owned(),
+            ));
+        }
+        Ok(unique_areas
+            .into_iter()
+            .map(|area| {
+                self.add_default(Annotation::Redact {
+                    area,
+                    // Sensitive-information suggestions must destroy content
+                    // independently of the original pixels. Blur and mosaic
+                    // remain available as manual effects, not privacy claims.
+                    style: RedactStyle::Solid,
+                })
+            })
+            .collect())
     }
 
     /// The highest number currently assigned to a counter marker.
@@ -440,6 +540,10 @@ impl Document {
 
     fn index_of(&self, id: AnnotationId) -> Option<usize> {
         self.objects.iter().position(|o| o.id == id)
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.next();
     }
 
     /// Renumbers counter markers 1..n in creation order.
@@ -497,5 +601,21 @@ impl AnnotationMut<'_> {
 impl Drop for AnnotationMut<'_> {
     fn drop(&mut self) {
         self.document.renumber_counters();
+        self.document.touch();
     }
+}
+
+fn valid_redaction_area(area: LogicalRect, bounds: LogicalRect) -> bool {
+    let values = [
+        area.origin.x,
+        area.origin.y,
+        area.size.width,
+        area.size.height,
+    ];
+    values.into_iter().all(f64::is_finite)
+        && !area.is_empty()
+        && area.origin.x >= bounds.origin.x
+        && area.origin.y >= bounds.origin.y
+        && area.origin.x + area.size.width <= bounds.origin.x + bounds.size.width
+        && area.origin.y + area.size.height <= bounds.origin.y + bounds.size.height
 }
