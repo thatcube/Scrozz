@@ -112,6 +112,38 @@ fn an_old_database_climbs_forward_with_every_row_intact() {
 }
 
 #[test]
+fn a_recording_schema_six_database_gains_the_pin_cache_without_losing_rows() {
+    let dir = scratch_dir("recording-schema-six");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 7, 2)))
+        .expect("insert");
+    let index = store.layout().index_path();
+    drop(store);
+
+    let conn = Connection::open(&index).expect("raw open");
+    conn.execute("DROP TABLE capture_pins", [])
+        .expect("match recording schema without screen-pin cache");
+    conn.pragma_update(None, "user_version", 6)
+        .expect("record schema six");
+    drop(conn);
+
+    let store = SqliteStore::open(dir.path()).expect("schema six migrates");
+    assert_eq!(store.schema_version().expect("version"), 7);
+    assert!(store.record(&id).expect("read").is_some());
+    let conn = Connection::open(&index).expect("inspect migrated index");
+    let pins: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'capture_pins'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query pin table");
+    assert_eq!(pins, 1);
+}
+
+#[test]
 fn a_database_from_a_newer_build_is_refused_rather_than_mangled() {
     let dir = scratch_dir("future-database");
     let store = SqliteStore::open(dir.path()).expect("open");

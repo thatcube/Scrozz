@@ -2156,7 +2156,17 @@ impl Worker {
         };
         let state = record.screen_pin.clone()?;
         let (source_width, source_height, scale, geometry_error) =
-            safe_pin_source_geometry(&record.frame);
+            record.frame.as_ref().map_or_else(
+                || {
+                    (
+                        420,
+                        180,
+                        1.0,
+                        Some("pinned capture has no still-frame geometry".to_owned()),
+                    )
+                },
+                safe_pin_source_geometry,
+            );
         let (mut texture, pixel_error) = match self.load_pin_texture(id) {
             Ok(texture) => (Some(texture), None),
             Err(error) => {
@@ -2411,7 +2421,7 @@ fn history_entry(
         Ok(Some(DocumentState::ImageEvicted(_))) => (false, None, None),
         Ok(Some(DocumentState::Complete(document))) => {
             let rendered = (|| {
-                let preview = history_thumbnail(&document, record.frame.scale)?;
+                let preview = history_thumbnail(&document, document.source.frame.scale)?;
                 let rgba = scrozz_export::to_straight_rgba8(&preview)?;
                 HistoryThumbnail::from_rgba(rgba.width, rgba.height, rgba.data).ok_or_else(|| {
                     CliError::Core(CoreError::Codec(format!(
@@ -2453,8 +2463,7 @@ fn history_entry(
             )
         }
     };
-    let width = dimension(record.frame.size.width);
-    let height = dimension(record.frame.size.height);
+    let (width, height, scale) = record_geometry(&record);
     Ok(Some(HistoryEntry {
         id: record.id,
         created_at: record.created_at,
@@ -2464,13 +2473,33 @@ fn history_entry(
         window_title: record.window_title,
         width,
         height,
-        scale: record.frame.scale.get(),
+        scale,
         image_present,
         content_error,
         annotation_count: record.annotation_count,
         ocr_text: record.ocr_text,
         thumbnail,
     }))
+}
+
+fn record_geometry(record: &CaptureRecord) -> (u32, u32, f64) {
+    if let Some(frame) = &record.frame {
+        return (
+            dimension(frame.size.width),
+            dimension(frame.size.height),
+            frame.scale.get(),
+        );
+    }
+    let size = record.video.as_ref().and_then(|video| video.get("size"));
+    let width = size
+        .and_then(|size| size.get("width"))
+        .and_then(serde_json::Value::as_f64)
+        .map_or(0, dimension);
+    let height = size
+        .and_then(|size| size.get("height"))
+        .and_then(serde_json::Value::as_f64)
+        .map_or(0, dimension);
+    (width, height, 1.0)
 }
 
 fn history_thumbnail(

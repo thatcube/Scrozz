@@ -122,6 +122,26 @@ pub const MIGRATIONS: &[Migration] = &[
             ON captures (media_kind, created_at DESC, id DESC);
     ",
     },
+    Migration {
+        version: 4,
+        name: "retain optional video metadata",
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 5,
+        name: "retain optional application identity",
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 6,
+        name: "retain optional window shadow metadata",
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 7,
+        name: "unify recording metadata and pinned window cache",
+        sql: "SELECT 1;",
+    },
 ];
 
 /// The version a freshly-migrated file ends up at.
@@ -188,7 +208,7 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32> {
             continue;
         }
 
-        tx.execute_batch(migration.sql).map_err(|e| {
+        apply_migration(&tx, migration).map_err(|e| {
             Error::Storage(format!(
                 "migration {} ({}) failed: {e}",
                 migration.version, migration.name
@@ -207,6 +227,81 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32> {
     }
 
     schema_version(conn)
+}
+
+fn apply_migration(tx: &rusqlite::Transaction<'_>, migration: &Migration) -> rusqlite::Result<()> {
+    match migration.version {
+        4 => ensure_capture_column(
+            tx,
+            "video_json",
+            "ALTER TABLE captures ADD COLUMN video_json TEXT;",
+        ),
+        5 => ensure_capture_column(
+            tx,
+            "app_identifier",
+            "ALTER TABLE captures ADD COLUMN app_identifier TEXT;",
+        ),
+        6 => ensure_capture_column(
+            tx,
+            "window_shadow",
+            "ALTER TABLE captures ADD COLUMN window_shadow INTEGER \
+             CHECK (window_shadow IS NULL OR window_shadow IN (0, 1));",
+        ),
+        7 => {
+            ensure_capture_column(
+                tx,
+                "media_kind",
+                "ALTER TABLE captures ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'screenshot' \
+                 CHECK (media_kind IN ('screenshot', 'video', 'gif'));",
+            )?;
+            ensure_capture_column(
+                tx,
+                "video_json",
+                "ALTER TABLE captures ADD COLUMN video_json TEXT;",
+            )?;
+            ensure_capture_column(
+                tx,
+                "app_identifier",
+                "ALTER TABLE captures ADD COLUMN app_identifier TEXT;",
+            )?;
+            ensure_capture_column(
+                tx,
+                "window_shadow",
+                "ALTER TABLE captures ADD COLUMN window_shadow INTEGER \
+                 CHECK (window_shadow IS NULL OR window_shadow IN (0, 1));",
+            )?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS capture_pins (
+                    capture_id TEXT NOT NULL PRIMARY KEY
+                        REFERENCES captures(id) ON DELETE CASCADE,
+                    pin_json TEXT NOT NULL
+                ) STRICT;
+                CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+                    ON captures (media_kind, created_at DESC, id DESC);
+                UPDATE captures SET media_kind = 'screenshot' WHERE media_kind = 'image';",
+            )
+        }
+        _ => tx.execute_batch(migration.sql),
+    }
+}
+
+fn ensure_capture_column(
+    tx: &rusqlite::Transaction<'_>,
+    column: &str,
+    add_column: &str,
+) -> rusqlite::Result<()> {
+    let exists = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('captures') WHERE name = ?1
+        )",
+        [column],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        tx.execute_batch(add_column)
+    }
 }
 
 fn ensure_ascending(migrations: &[Migration]) -> Result<()> {
@@ -383,7 +478,10 @@ mod tests {
         )
         .expect("old row");
 
-        assert_eq!(migrate(&mut conn, MIGRATIONS).expect("version three"), 3);
+        assert_eq!(
+            migrate(&mut conn, &MIGRATIONS[..3]).expect("version three"),
+            3
+        );
         let kind: String = conn
             .query_row(
                 "SELECT media_kind FROM captures WHERE id = 'old'",

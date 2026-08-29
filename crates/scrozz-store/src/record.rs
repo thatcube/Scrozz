@@ -61,15 +61,24 @@ pub struct StoredRecord {
     /// Owning application.
     #[serde(default)]
     pub app_name: Option<String>,
+    /// Stable application identifier retained for recording-compatible sidecars.
+    #[serde(default)]
+    pub app_identifier: Option<String>,
     /// Window title.
     #[serde(default)]
     pub window_title: Option<String>,
+    /// Whether a captured window included its native shadow.
+    #[serde(default)]
+    pub window_shadow: Option<bool>,
     /// How the capture was produced.
     pub provenance: ProvenanceRepr,
     /// What it was aimed at.
     pub target: TargetRepr,
     /// Frame geometry.
-    pub frame: FrameHeader,
+    pub frame: Option<FrameHeader>,
+    /// Recording metadata retained opaquely by non-recording builds.
+    #[serde(default)]
+    pub video: Option<serde_json::Value>,
     /// Content address of the source pixels, if they were ever stored.
     #[serde(default)]
     pub image_hash: Option<String>,
@@ -130,10 +139,13 @@ impl StoredRecord {
             pinned,
             screen_pin: None,
             app_name,
+            app_identifier: None,
             window_title,
+            window_shadow: None,
             provenance: provenance.into(),
             target: TargetRepr::from(target),
-            frame,
+            frame: Some(frame),
+            video: None,
             image_hash,
             image_bytes,
             image_evicted_at: None,
@@ -214,10 +226,13 @@ impl StoredRecord {
             pinned: self.pinned,
             screen_pin: self.screen_pin.clone(),
             app_name: self.app_name.clone(),
+            app_identifier: self.app_identifier.clone(),
             window_title: self.window_title.clone(),
+            window_shadow: self.window_shadow,
             provenance: self.provenance.into(),
             target: self.target.clone().into(),
             frame: self.frame.clone(),
+            video: self.video.clone(),
             image: self.image_state(),
             ocr_text: self.ocr_text.clone(),
             annotation_count: self.annotation_count(),
@@ -360,6 +375,35 @@ mod tests {
         assert_eq!(
             data.beautification,
             Some(Beautification::padded(8.0, Background::default()))
+        );
+    }
+
+    #[test]
+    fn non_recording_builds_round_trip_video_metadata_without_interpreting_it() {
+        let mut original = record();
+        original.media_kind = MediaKind::Video;
+        original.frame = None;
+        original.app_identifier = Some("com.example.recorder".into());
+        original.window_shadow = Some(false);
+        original.video = Some(serde_json::json!({
+            "path": "/retained/media.mov",
+            "duration_secs": 6.75,
+            "engine": "AVFoundation",
+            "completion": "Complete",
+            "size": {"width": 1728.0, "height": 1116.0}
+        }));
+
+        let bytes = original.to_json().expect("encode video sidecar");
+        let back = StoredRecord::from_json(&bytes).expect("decode video sidecar");
+
+        assert_eq!(back, original);
+        assert!(back.frame.is_none());
+        assert_eq!(
+            back.video
+                .as_ref()
+                .and_then(|video| video.get("duration_secs"))
+                .and_then(serde_json::Value::as_f64),
+            Some(6.75)
         );
     }
 

@@ -238,7 +238,7 @@ fn concurrent_pin_and_read_never_produce_a_torn_view() {
             // be coherent — a half-written update would show up here.
             assert!(record.image.is_present());
             assert_eq!(record.annotation_count, 1);
-            assert_eq!(record.frame.size.width, 8.0);
+            assert_eq!(record.frame.as_ref().expect("still frame").size.width, 8.0);
         }
     });
 

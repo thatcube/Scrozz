@@ -387,14 +387,20 @@ pub struct CaptureRecord {
     pub screen_pin: Option<PinState>,
     /// Owning application, where the platform reported one.
     pub app_name: Option<String>,
+    /// Stable application identifier retained for recording-compatible history.
+    pub app_identifier: Option<String>,
     /// Window title, where the platform reported one.
     pub window_title: Option<String>,
+    /// Whether a captured window included its native shadow.
+    pub window_shadow: Option<bool>,
     /// How the capture was produced.
     pub provenance: Provenance,
     /// What it was aimed at.
     pub target: CaptureTarget,
-    /// Frame geometry, which outlives the frame.
-    pub frame: FrameHeader,
+    /// Frame geometry, absent for native video rows.
+    pub frame: Option<FrameHeader>,
+    /// Opaque native video metadata retained by non-recording builds.
+    pub video: Option<serde_json::Value>,
     /// Whether the pixels are still here.
     pub image: ImageState,
     /// Recognised text, if OCR has run.

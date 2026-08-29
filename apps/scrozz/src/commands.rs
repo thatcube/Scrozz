@@ -780,9 +780,22 @@ fn capture_record_json(record: &CaptureRecord) -> Json {
             Json::opt(record.window_title.as_deref(), Json::str),
         ),
         ("provenance", Json::str(provenance_slug(record.provenance))),
-        ("width", Json::Float(record.frame.size.width)),
-        ("height", Json::Float(record.frame.size.height)),
-        ("scale", Json::Float(record.frame.scale.get())),
+        (
+            "width",
+            Json::opt(record.frame.as_ref(), |frame| Json::Float(frame.size.width)),
+        ),
+        (
+            "height",
+            Json::opt(record.frame.as_ref(), |frame| {
+                Json::Float(frame.size.height)
+            }),
+        ),
+        (
+            "scale",
+            Json::opt(record.frame.as_ref(), |frame| {
+                Json::Float(frame.scale.get())
+            }),
+        ),
         ("image_state", Json::str(image_state_slug(&record.image))),
         (
             "image_bytes",

@@ -21,9 +21,9 @@ use crate::{
 };
 
 /// Columns every record query selects, in the order [`row_to_record`] reads.
-const RECORD_COLUMNS: &str = "id, created_at, media_kind, pinned, app_name, window_title, provenance, \
-     target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text, \
-     annotation_count, \
+const RECORD_COLUMNS: &str = "id, created_at, media_kind, pinned, app_name, app_identifier, \
+     window_title, window_shadow, provenance, target_json, frame_json, video_json, image_hash, \
+     image_bytes, image_evicted_at, ocr_text, annotation_count, \
      (SELECT pin_json FROM capture_pins WHERE capture_id = captures.id)";
 
 /// Records that the one-time legacy sidecar/cache comparison has completed.
@@ -990,7 +990,12 @@ impl History for SqliteStore {
             ))));
         };
 
-        let header = &record.frame;
+        let header = record.frame.as_ref().ok_or_else(|| {
+            Error::Storage(format!(
+                "capture {} has media bytes but no still-frame geometry",
+                record.id
+            ))
+        })?;
         let capture = Capture {
             frame: Frame {
                 data: pixels,
@@ -1419,6 +1424,12 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
         .map_err(|e| Error::Storage(format!("cannot serialise target: {e}")))?;
     let frame_json = serde_json::to_string(&record.frame)
         .map_err(|e| Error::Storage(format!("cannot serialise frame: {e}")))?;
+    let video_json = record
+        .video
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| Error::Storage(format!("cannot serialise video metadata: {e}")))?;
     let pin_json = record
         .screen_pin
         .as_ref()
@@ -1428,11 +1439,13 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
 
     conn.execute(
         "INSERT INTO captures (
-             id, created_at, stored_at, media_kind, pinned, app_name, window_title, provenance,
-             target_json, frame_json, image_hash, image_bytes, image_evicted_at,
-            ocr_text, annotation_count, search_fold, app_fold, title_fold, ocr_fold
+            id, created_at, stored_at, media_kind, pinned, app_name, app_identifier,
+            window_title, window_shadow, provenance, target_json, frame_json, video_json,
+            image_hash, image_bytes, image_evicted_at, ocr_text, annotation_count,
+            search_fold, app_fold, title_fold, ocr_fold
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+            ?17, ?18, ?19, ?20, ?21, ?22
          )
          ON CONFLICT (id) DO UPDATE SET
              created_at = excluded.created_at,
@@ -1440,10 +1453,13 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
              media_kind = excluded.media_kind,
              pinned = excluded.pinned,
              app_name = excluded.app_name,
+             app_identifier = excluded.app_identifier,
              window_title = excluded.window_title,
+             window_shadow = excluded.window_shadow,
              provenance = excluded.provenance,
              target_json = excluded.target_json,
              frame_json = excluded.frame_json,
+             video_json = excluded.video_json,
              image_hash = excluded.image_hash,
              image_bytes = excluded.image_bytes,
              image_evicted_at = excluded.image_evicted_at,
@@ -1460,10 +1476,13 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
             record.media_kind.as_token(),
             i64::from(record.pinned),
             record.app_name,
+            record.app_identifier,
             record.window_title,
+            record.window_shadow.map(i64::from),
             record.provenance.as_token(),
             target_json,
             frame_json,
+            video_json,
             record.image_hash,
             i64::try_from(record.image_bytes).unwrap_or(i64::MAX),
             record.image_evicted_at,
@@ -1781,21 +1800,30 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let media_kind: String = get(row, 2)?;
     let pinned: i64 = get(row, 3)?;
     let app_name: Option<String> = get(row, 4)?;
-    let window_title: Option<String> = get(row, 5)?;
-    let provenance: String = get(row, 6)?;
-    let target_json: String = get(row, 7)?;
-    let frame_json: String = get(row, 8)?;
-    let image_hash: Option<String> = get(row, 9)?;
-    let image_bytes: i64 = get(row, 10)?;
-    let image_evicted_at: Option<i64> = get(row, 11)?;
-    let ocr_text: Option<String> = get(row, 12)?;
-    let annotation_count: i64 = get(row, 13)?;
-    let pin_json: Option<String> = get(row, 14)?;
+    let app_identifier: Option<String> = get(row, 5)?;
+    let window_title: Option<String> = get(row, 6)?;
+    let window_shadow: Option<i64> = get(row, 7)?;
+    let provenance: String = get(row, 8)?;
+    let target_json: String = get(row, 9)?;
+    let frame_json: String = get(row, 10)?;
+    let video_json: Option<String> = get(row, 11)?;
+    let image_hash: Option<String> = get(row, 12)?;
+    let image_bytes: i64 = get(row, 13)?;
+    let image_evicted_at: Option<i64> = get(row, 14)?;
+    let ocr_text: Option<String> = get(row, 15)?;
+    let annotation_count: i64 = get(row, 16)?;
+    let pin_json: Option<String> = get(row, 17)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
-    let frame: FrameHeader = serde_json::from_str(&frame_json)
+    let frame: Option<FrameHeader> = serde_json::from_str(&frame_json)
         .map_err(|e| Error::Storage(format!("cannot read frame for {id}: {e}")))?;
+    let video = video_json
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|e| Error::Storage(format!("cannot read video metadata for {id}: {e}")))
+        })
+        .transpose()?;
     let screen_pin = pin_json
         .map(|json| {
             serde_json::from_str(&json)
@@ -1830,10 +1858,13 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         pinned: pinned != 0,
         screen_pin,
         app_name,
+        app_identifier,
         window_title,
+        window_shadow: window_shadow.map(|shadow| shadow != 0),
         provenance: ProvenanceRepr::from_token(&provenance)?.into(),
         target: target.into(),
         frame,
+        video,
         image,
         ocr_text,
         annotation_count: usize::try_from(annotation_count).unwrap_or(0),
