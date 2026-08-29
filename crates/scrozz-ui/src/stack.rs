@@ -831,6 +831,8 @@ pub struct DragRelease {
     pub direction: Option<Dir>,
     /// Where the card was when it was let go.
     pub rect: Rect,
+    /// Where the pointer was when the card was let go.
+    pub pointer: Pos2,
     /// Release speed, in points per second.
     pub velocity: Vec2,
 }
@@ -1382,6 +1384,7 @@ impl CaptureStack {
             intent,
             direction,
             rect,
+            pointer: drag.latest,
             velocity,
         })
     }

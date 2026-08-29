@@ -287,6 +287,12 @@ pub enum Scenario {
     PinnedCaptureHover,
     /// A click-through pin showing its external unlock guidance.
     PinnedCaptureLocked,
+    /// Capture history showing a page of recent media.
+    HistoryGrid,
+    /// Capture history with one capture's actions and metadata open.
+    HistoryDetail,
+    /// Capture history before the first capture exists.
+    HistoryEmpty,
 }
 
 impl Scenario {
@@ -317,6 +323,9 @@ impl Scenario {
             Self::SettingsAfterCapture,
             Self::PinnedCaptureHover,
             Self::PinnedCaptureLocked,
+            Self::HistoryGrid,
+            Self::HistoryDetail,
+            Self::HistoryEmpty,
         ]
     }
 
@@ -350,6 +359,9 @@ impl Scenario {
             Self::PinnedCaptureHover => "pinned-capture-hover",
             Self::PinnedCaptureLocked => "pinned-capture-locked",
             Self::DockScrubbing => "dock-scrubbing",
+            Self::HistoryGrid => "history-grid",
+            Self::HistoryDetail => "history-detail",
+            Self::HistoryEmpty => "history-empty",
         }
     }
 
@@ -700,7 +712,16 @@ impl Fixture {
         // The harness pins six slots solely as a stable visual stress case.
         let slot_count = 6;
         let size_pt = (420.0, 620.0);
-        let seed = DEFAULT_SEED ^ (scenario as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        // History first shipped against the pre-selector corpus, where its
+        // three scenarios occupied discriminants 9-11. Preserve those fixtures
+        // without shifting any of the newer reviewed selector/editor goldens.
+        let seed_index = match scenario {
+            Scenario::HistoryGrid => 9,
+            Scenario::HistoryDetail => 10,
+            Scenario::HistoryEmpty => 11,
+            _ => scenario as u64,
+        };
+        let seed = DEFAULT_SEED ^ seed_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
         let (cards, gesture, docked, annotating, title, intent, key_instants, sequence) =
             match scenario {
@@ -961,6 +982,36 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::HistoryGrid => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Find any capture again",
+                    "The ordinary history window, showing a filterable page of screenshots, recordings, and GIFs.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::HistoryDetail => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "A capture stays useful",
+                    "History detail exposes restore, edit, copy, save, drag, pin, and delete without hiding the surrounding timeline.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::HistoryEmpty => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "History starts with the first capture",
+                    "The empty history window explains what will appear here instead of presenting a dead grid.",
+                    instants::REST,
+                    None,
+                ),
             };
         let size_pt = match scenario {
             Scenario::EditorAnnotating
@@ -976,6 +1027,8 @@ impl Fixture {
             | Scenario::SelectorAllInOne => (720.0, 420.0),
             Scenario::SelectorMixedDpi => (800.0, 320.0),
             Scenario::PinnedCaptureHover | Scenario::PinnedCaptureLocked => (420.0, 270.0),
+            Scenario::HistoryGrid | Scenario::HistoryDetail => (1180.0, 760.0),
+            Scenario::HistoryEmpty => (980.0, 680.0),
             _ => size_pt,
         };
 
@@ -2137,6 +2190,20 @@ impl SceneRegistry {
             Scenario::PinnedCaptureLocked,
             Box::new(crate::pinned::PinnedScene::locked()),
         );
+        // History is an ordinary secondary window, but its deterministic scene
+        // shares the same production theme and controls.
+        me.register(
+            Scenario::HistoryGrid,
+            Box::new(crate::history::HistoryScene),
+        );
+        me.register(
+            Scenario::HistoryDetail,
+            Box::new(crate::history::HistoryScene),
+        );
+        me.register(
+            Scenario::HistoryEmpty,
+            Box::new(crate::history::HistoryScene),
+        );
         me
     }
 
@@ -2754,7 +2821,7 @@ impl TextureStore {
     /// on drop that a `TexturesDelta` was consumed, and — more to the point —
     /// the font atlas usually arrives on a warm-up pass, so skipping one renders
     /// every glyph as a blank rectangle.
-    fn apply(&mut self, mut delta: egui::TexturesDelta) {
+    fn prepare(&mut self, mut delta: egui::TexturesDelta) -> Vec<egui::TextureId> {
         // Taken rather than destructured: `TexturesDelta` has a `Drop` impl that
         // asserts it was emptied, which is exactly the guard that stops a
         // forgotten warm-up pass from silently costing us the font atlas.
@@ -2770,6 +2837,10 @@ impl TextureStore {
                 self.set(id, patch);
             }
         }
+        free.into_iter().collect()
+    }
+
+    fn free(&mut self, free: Vec<egui::TextureId>) {
         for id in free {
             self.map.remove(&id);
         }
@@ -2830,6 +2901,7 @@ struct RasterJob {
     /// The frozen instant, in seconds. Every pass sees this same value.
     time: f64,
     warmup_passes: u32,
+    defer_texture_frees: bool,
 }
 
 impl RasterJob {
@@ -2923,11 +2995,18 @@ impl RasterJob {
         // and `epaint` asserts on drop if a delta is never consumed.
         for _ in 0..self.warmup_passes {
             let out = pass(input.clone(), &mut draw);
-            textures.apply(out.textures_delta);
+            let free = textures.prepare(out.textures_delta);
+            textures.free(free);
         }
 
         let out = pass(input.clone(), &mut draw);
-        textures.apply(out.textures_delta);
+        // Texture frees belong after painting. A short-lived image handle can
+        // be set and freed in the same egui output, but its mesh still needs the
+        // texture for this frame.
+        let mut free = textures.prepare(out.textures_delta);
+        if !self.defer_texture_frees {
+            textures.free(std::mem::take(&mut free));
+        }
         let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
 
         // Framebuffer in premultiplied sRGB, held at f32 so hundreds of blends
@@ -2968,6 +3047,7 @@ impl RasterJob {
                 raster_triangle(&mut fb, w_px, clip, ppp, a, b, c, tex);
             }
         }
+        textures.free(free);
 
         Image::from_premultiplied_f32(self.width_px, self.height_px, &fb)
     }
@@ -2995,6 +3075,7 @@ pub fn render_settings_golden(case: &SettingsGoldenCase) -> Result<Image> {
         seed: DEFAULT_SEED,
         time: 0.0,
         warmup_passes: 3,
+        defer_texture_frees: false,
     }
     .run_with_setup(
         |ctx| {
@@ -3103,6 +3184,10 @@ impl SoftwareRenderer {
             seed: scene_ctx_seed,
             time: spec.clock.as_secs_f64(),
             warmup_passes: spec.warmup_passes,
+            defer_texture_frees: matches!(
+                spec.scenario,
+                Scenario::HistoryGrid | Scenario::HistoryDetail | Scenario::HistoryEmpty
+            ),
         };
         let _ = (w_pt, h_pt);
 
@@ -3681,6 +3766,7 @@ fn render_label_strip(
         seed: 0,
         time: 0.0,
         warmup_passes: 1,
+        defer_texture_frees: false,
     };
     let owned: Vec<String> = labels.to_vec();
     let title = name.to_owned();

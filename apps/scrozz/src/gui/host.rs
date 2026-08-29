@@ -17,18 +17,24 @@ use scrozz_core::{
     Capture, CaptureRequest, CursorMode, Display, DisplayId, DisplaySet, Error as CoreError,
     RegionSelector, SelectionHost, SelectionOptions, SelectionOutcome,
 };
+use scrozz_shell::{
+    DragOrigin, DragSession, DragSource, NativeDragSource, native_drag_source,
+    native_surface_for_window,
+};
 use scrozz_ui::{
     OverlayHandle,
+    history::{WINDOW_TITLE as HISTORY_WINDOW_TITLE, viewport_builder, viewport_id},
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions, PinSupport, PinTopology},
 };
 
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, EditorSnapshot, KeyboardOwner, Tick},
+        app::{App, Config, EditorSnapshot, KeyboardOwner, PendingDrag, Tick},
         card::{CardSurface, Recording},
         overlay::OverlayCards,
         panel::BehaviorController,
+        pipeline::{DragGeometry, DragSubject},
         selection::{
             CaptureSelector, ClientOverlayController, ClientOverlaySelector, UnsupportedSelector,
             current_plan, for_current_session,
@@ -320,6 +326,13 @@ impl Host for Windowed {
             "Scrozz",
             parked_native_options(geometry),
             Box::new(move |cc| {
+                let drag_source = match native_drag_source() {
+                    Ok(source) => Some(source),
+                    Err(err) => {
+                        tracing::warn!("native drag-out is unavailable: {err}");
+                        None
+                    }
+                };
                 let overlay = OverlayApp::new(cc, handle, options);
                 native.set_frame(logical_frame(geometry));
                 let (color_swatch_store, custom_swatches) =
@@ -363,6 +376,9 @@ impl Host for Windowed {
                     startup_rehide: true,
                     announced: false,
                     stopped: false,
+                    drag_source,
+                    active_drag: None,
+                    retired_drags: Vec::new(),
                 }))
             }),
         )
@@ -568,6 +584,14 @@ struct Driver {
     startup_rehide: bool,
     announced: bool,
     stopped: bool,
+    drag_source: Option<NativeDragSource>,
+    active_drag: Option<ActiveDrag>,
+    retired_drags: Vec<DragSession>,
+}
+
+struct ActiveDrag {
+    subject: DragSubject,
+    session: DragSession,
 }
 
 impl Driver {
@@ -583,14 +607,10 @@ impl Driver {
     /// card: per D14 a capture's own pixels are never replaced by an annotated
     /// version unless the user explicitly saves one.
     ///
-    /// **Known gap.** D14 also promises that history persists the editable
-    /// document, so a past capture reopens with its annotations intact. That
-    /// half is not built: closing this window discards the scene graph, and
-    /// reopening the card starts from the original pixels. There is no
-    /// dirty-state guard on the way out either, because a warning that offers
-    /// no way to keep the work is just an obstacle. Both wait on the storage
-    /// format decision D14 deliberately left open, which is a product call, not
-    /// something to invent here.
+    /// Closing a dirty editor queues its scene graph before the card cache is
+    /// released. The worker channel preserves that order, so a history-backed
+    /// capture reopens with its editable annotations rather than a flattened
+    /// approximation.
     fn show_editor(&mut self, ctx: &egui::Context) {
         use scrozz_ui::editor::Intent;
 
@@ -691,6 +711,10 @@ impl Driver {
                 tracing::warn!(%error, "the system colour picker could not close");
             }
             self.color_picker_generation = None;
+            if editor.state().is_dirty() {
+                self.app
+                    .persist_editor(EditorSnapshot::new(card, generation, editor));
+            }
             self.app.editor_closed(card);
             self.editing = None;
         }
@@ -729,9 +753,16 @@ impl Driver {
 
     fn sync_root_visibility(&mut self, ctx: &egui::Context) {
         let selector_visible = self.selection.wants_visible_selector();
+        let history_open = self
+            .app
+            .history()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_visible();
         let auxiliary_open = self.settings.is_open()
             || self.editor.is_open()
-            || self.app.permission_prompt().is_some();
+            || self.app.permission_prompt().is_some()
+            || history_open;
         let mode = root_surface_mode(
             selector_visible,
             self.selection.allows_card_surface(),
@@ -874,6 +905,99 @@ const fn root_surface_mode(
     }
 }
 
+impl Driver {
+    fn show_history(&self, ctx: &egui::Context) {
+        let history = self.app.history();
+        let (visible, focus) = {
+            let mut history = history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (history.is_visible(), history.take_focus_request())
+        };
+        if !visible {
+            return;
+        }
+
+        let viewport = viewport_id();
+        let waker = self.handle.clone();
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(viewport, viewport_builder(focus), move |ui, _class| {
+            let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+            let mut history = history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if close_requested {
+                history.close();
+                return;
+            }
+            history.ui(ui);
+            let needs_dispatch = history.has_pending_actions();
+            drop(history);
+            if needs_dispatch {
+                waker.wake();
+            }
+        });
+    }
+
+    fn service_history_drag(&mut self, ctx: &egui::Context) {
+        for session in &self.retired_drags {
+            session.sweep();
+        }
+        self.retired_drags.retain(|session| !session.is_settled());
+
+        let outcome = self
+            .active_drag
+            .as_ref()
+            .and_then(|active| active.session.outcome());
+        if let (Some(outcome), Some(active)) = (outcome, self.active_drag.take()) {
+            self.app.history_drag_finished(&active.subject, &outcome);
+            crate::gui::selection::release_modal_drag_input_for(ctx, viewport_id());
+            active.session.sweep();
+            if !active.session.is_settled() {
+                self.retired_drags.push(active.session);
+            }
+        }
+        if self.active_drag.is_some() {
+            return;
+        }
+
+        let Some(pending) = self.app.take_history_drag() else {
+            return;
+        };
+        let subject = pending.subject.clone();
+        let Some(source) = self.drag_source.as_ref() else {
+            self.app.history_drag_finished(
+                &subject,
+                &scrozz_shell::DragOutcome::Failed(
+                    "the native drag backend is unavailable".to_owned(),
+                ),
+            );
+            return;
+        };
+        let origin = match drag_origin(ctx, &pending) {
+            Ok(origin) => origin,
+            Err(error) => {
+                self.app.history_drag_finished(
+                    &subject,
+                    &scrozz_shell::DragOutcome::Failed(error.to_string()),
+                );
+                return;
+            }
+        };
+        match source.begin(pending.payload, origin) {
+            Ok(session) => {
+                self.active_drag = Some(ActiveDrag { subject, session });
+            }
+            Err(error) => {
+                self.app.history_drag_finished(
+                    &subject,
+                    &scrozz_shell::DragOutcome::Failed(error.to_string()),
+                );
+            }
+        }
+    }
+}
+
 impl eframe::App for Driver {
     /// The app's own work, before anything is drawn.
     ///
@@ -963,8 +1087,7 @@ impl eframe::App for Driver {
             }
             self.color_picker_generation = None;
             let title = format!("{}", request.card);
-            let mut editor =
-                scrozz_ui::editor::EditorUi::new(scrozz_annotate::Document::new(request.capture));
+            let mut editor = scrozz_ui::editor::EditorUi::new(request.document);
             editor.set_custom_swatches(self.custom_swatches.clone());
             self.editing = Some(Editing {
                 card: request.card,
@@ -982,6 +1105,7 @@ impl eframe::App for Driver {
             if let Ok(mut slot) = self.sink.lock() {
                 *slot = Some(report.clone());
             }
+
             // Before the window closes, so the menu-bar item never outlives
             // what the user can see.
             self.app.shut_down();
@@ -1027,6 +1151,8 @@ impl eframe::App for Driver {
 
         self.show_settings(ui.ctx());
         self.show_editor(ui.ctx());
+        self.show_history(ui.ctx());
+        self.service_history_drag(ui.ctx());
 
         if self.selection.owns_surface() {
             self.selection.ui(ui);
@@ -1064,6 +1190,37 @@ impl eframe::App for Driver {
     }
 }
 
+fn drag_origin(ctx: &egui::Context, pending: &PendingDrag) -> scrozz_core::Result<DragOrigin> {
+    let mut geometry = pending.geometry;
+    if !matches!(pending.subject, DragSubject::History(_)) {
+        return Err(CoreError::InvalidRequest(
+            "live card drags must use the overlay's same-frame drag path".into(),
+        ));
+    }
+    let history_origin = ctx.input(|input| {
+        input
+            .raw
+            .viewports
+            .get(&viewport_id())
+            .and_then(|viewport| viewport.inner_rect)
+            .map(|rect| rect.min)
+    });
+    let history_origin = history_origin.ok_or_else(|| {
+        CoreError::TargetGone("the capture history window closed before drag-out began".into())
+    })?;
+    geometry = geometry_in_viewport(geometry, history_origin);
+    let surface = native_surface_for_window(HISTORY_WINDOW_TITLE)?;
+    Ok(DragOrigin::new(surface, geometry.rect, geometry.pointer))
+}
+
+fn geometry_in_viewport(mut geometry: DragGeometry, origin: egui::Pos2) -> DragGeometry {
+    geometry.rect.origin.x -= f64::from(origin.x);
+    geometry.rect.origin.y -= f64::from(origin.y);
+    geometry.pointer.x -= f64::from(origin.x);
+    geometry.pointer.y -= f64::from(origin.y);
+    geometry
+}
+
 /// Set to `0` to leave the overlay window as `eframe` made it.
 ///
 /// The conversion is what stops a capture card stealing focus (D27), so this
@@ -1097,7 +1254,7 @@ fn work_area() -> CliResult<(OverlayGeometry, Option<DisplayId>)> {
     {
         let display = scrozz_shell::macos::display::active_display().map_err(CliError::from)?;
         let id = display.id.clone();
-        return Ok((geometry_from_display(&display)?, Some(id)));
+        Ok((geometry_from_display(&display)?, Some(id)))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1372,6 +1529,43 @@ mod tests {
     }
 
     #[test]
+    fn history_window_rendering_and_drag_start_stay_in_the_ui_pass() {
+        assert_eq!(
+            driver_pass("self.show_history"),
+            "ui",
+            "history must use an ordinary child viewport, not paint from hidden-root logic"
+        );
+        assert_eq!(
+            driver_pass("self.service_history_drag"),
+            "ui",
+            "native history drag setup is main-thread UI work"
+        );
+    }
+
+    #[test]
+    fn history_actions_wake_root_logic_and_drag_artifacts_stay_sweepable() {
+        let source = include_str!("host.rs");
+        let history = source
+            .split("fn show_history")
+            .nth(1)
+            .and_then(|body| body.split_once("fn service_history_drag"))
+            .map(|(body, _)| body)
+            .expect("history viewport host");
+        assert!(history.contains("history.has_pending_actions()"));
+        assert!(history.contains("waker.wake()"));
+
+        let drag = source
+            .split("fn service_history_drag")
+            .nth(1)
+            .and_then(|body| body.split_once("impl eframe::App for Driver"))
+            .map(|(body, _)| body)
+            .expect("history drag host");
+        assert!(drag.contains("session.sweep()"));
+        assert!(drag.contains("retired_drags"));
+        assert!(drag.contains("release_modal_drag_input_for"));
+    }
+
+    #[test]
     fn permission_resume_closes_in_ui_and_dispatches_in_the_next_logic_pass() {
         assert_eq!(
             driver_pass("has_permission_resume"),
@@ -1413,6 +1607,22 @@ mod tests {
             "shortcut ownership must settle before editor input, and that input must advance the \
              revision before an adjacent overlay draw and native drag start"
         );
+    }
+
+    #[test]
+    fn dirty_editor_persistence_is_queued_before_its_cache_is_released() {
+        let source = include_str!("host.rs");
+        let editor = source
+            .split("fn show_editor")
+            .nth(1)
+            .and_then(|body| body.split_once("fn announce_panel"))
+            .map(|(body, _)| body)
+            .expect("editor host");
+        let persist = editor
+            .find("persist_editor")
+            .expect("dirty editor persistence");
+        let release = editor.find("editor_closed").expect("editor cache release");
+        assert!(persist < release);
     }
 
     #[test]
@@ -1623,6 +1833,7 @@ mod tests {
         assert!(visibility.contains("self.settings.is_open()"));
         assert!(visibility.contains("self.editor.is_open()"));
         assert!(visibility.contains("self.app.permission_prompt().is_some()"));
+        assert!(visibility.contains(".is_visible()"));
         assert!(visibility.contains("OverlayBehavior::capture_card()"));
     }
 
@@ -1876,5 +2087,27 @@ mod tests {
             decision,
             scrozz_ui::SelectionDecision::Selected(_)
         ));
+    }
+
+    #[test]
+    fn absolute_drag_geometry_is_translated_into_its_source_viewport() {
+        let geometry = DragGeometry {
+            rect: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(410.0, 260.0),
+                scrozz_core::LogicalSize::new(240.0, 160.0),
+            ),
+            pointer: scrozz_core::LogicalPoint::new(520.0, 330.0),
+        };
+
+        let translated = geometry_in_viewport(geometry, egui::pos2(100.0, 40.0));
+
+        assert_eq!(
+            translated.rect.origin,
+            scrozz_core::LogicalPoint::new(310.0, 220.0)
+        );
+        assert_eq!(
+            translated.pointer,
+            scrozz_core::LogicalPoint::new(420.0, 290.0)
+        );
     }
 }

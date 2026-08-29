@@ -1055,11 +1055,18 @@ fn a_swipe_right_or_up_begins_a_drag_out() {
 
         assert_eq!(release.intent, Intent::DragOut, "{dir:?}");
         assert_eq!(release.direction, Some(dir));
+        assert_eq!(release.pointer, origin + delta);
         assert_eq!(
             s.len(),
             1,
             "a release-time drag-out is too late to deliver and must spring back"
         );
+        assert_eq!(
+            s.slot_of(id),
+            Some(0),
+            "the source remains in its exact slot until the native drop is accepted"
+        );
+        assert!(s.departing().is_empty());
     }
 }
 

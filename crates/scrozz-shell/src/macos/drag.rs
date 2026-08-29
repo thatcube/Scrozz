@@ -91,6 +91,23 @@ use crate::drag::{
 };
 use crate::overlay::AppKitRect;
 
+/// Resolves the content view for an ordinary application window.
+pub(crate) fn surface_for_window_title(title: &str) -> Result<crate::drag::NativeSurface> {
+    let mtm = crate::macos::main_thread("locating a drag source window")?;
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app
+        .windows()
+        .iter()
+        .find(|window| window.title().to_string() == title)
+        .ok_or_else(|| Error::TargetGone(format!("window {title:?} is no longer open")))?;
+    let view = window.contentView().ok_or_else(|| {
+        Error::TargetGone(format!("window {title:?} has no content view for dragging"))
+    })?;
+    // SAFETY: the application window retains its content view for as long as it
+    // remains open. The drag backend immediately takes its own strong reference.
+    Ok(unsafe { crate::drag::NativeSurface::from_raw(Retained::as_ptr(&view).cast_mut().cast()) })
+}
+
 /// How many finished image providers are kept alive as a backstop.
 ///
 /// A receiver that reads a lazy flavour after the drop needs the provider to

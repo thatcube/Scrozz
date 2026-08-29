@@ -26,7 +26,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
@@ -34,14 +34,16 @@ use std::{
 };
 
 use clap::Parser as _;
-use scrozz_core::{Capture, Error as CoreError, LockEscape, SelectionCapabilities};
+use scrozz_annotate::Document;
+use scrozz_core::{Error as CoreError, LockEscape, SelectionCapabilities};
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, HotkeyEvent, KeyState, Permissions, ScreenshotSound,
-    Session, SystemPermissions, Tray, TrayAction,
+    Accelerator, Capability, DragPayload, GlobalHotkeys, HotkeyEvent, KeyState, Permissions,
+    ScreenshotSound, Session, SystemPermissions, Tray, TrayAction,
     hotkey::{DesiredBinding, Rejection},
     play_screenshot_sound,
 };
-use scrozz_store::CaptureId;
+use scrozz_store::{CaptureId, Timestamp};
+use scrozz_ui::history::{HistoryAction, HistoryViewModel};
 
 use crate::{
     after_capture::{
@@ -52,13 +54,19 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind, CaptureOrigin},
-        card::{CardEvent, CardId, CardSurface, PinGeneration, SurfaceWaker},
+        card::{
+            CardEvent, CardId, CardSurface, PIN_TEXTURE_MAX_EDGE, PinGeneration, SurfaceWaker,
+            Thumbnail,
+        },
         drag::{DragHost, DragSpot},
         permission::{
             self, Access, Effect as PermissionEffect, PendingCapture, PermissionStore,
             PickerAvailability, PickerMode, Response as PermissionResponse,
         },
-        pipeline::{CaptureBytes, Job, Outcome, Pipeline},
+        pipeline::{
+            CaptureBytes, DragGeometry, DragSubject, HistoryOperation, Job, Outcome,
+            PinEditorSnapshot, Pipeline, PreparedHistoryDrag,
+        },
         selection::CaptureSelector,
         server::{Forwarder, Server},
     },
@@ -535,6 +543,9 @@ pub struct App {
     apple_picker: Option<scrozz_capture::AppleContentPicker>,
     #[cfg(target_os = "macos")]
     picker_surface: Option<PickerSurfaceReservation>,
+    history: Arc<Mutex<HistoryViewModel>>,
+    prepared_history_drags: HashMap<CaptureId, PreparedHistoryDrag>,
+    pending_drags: VecDeque<PendingDrag>,
 }
 
 /// A capture the annotation editor has been asked to open.
@@ -545,8 +556,8 @@ pub struct EditorRequest {
     pub card: CardId,
     /// Uniquely identifies this opening of the editor.
     pub generation: u64,
-    /// The decoded capture.
-    pub capture: Capture,
+    /// The complete editable document.
+    pub document: Document,
 }
 
 /// The live editor state available during one host pass.
@@ -685,6 +696,16 @@ impl KeyboardOwner {
             Self::ShortcutRecorder => 1 << 1,
         }
     }
+}
+
+/// A worker-built drag waiting for the window host to enter the native loop.
+pub struct PendingDrag {
+    /// Card or history capture.
+    pub subject: DragSubject,
+    /// Promised file and image data.
+    pub payload: DragPayload,
+    /// Source geometry.
+    pub geometry: DragGeometry,
 }
 
 impl App {
@@ -858,6 +879,9 @@ impl App {
             apple_picker: None,
             #[cfg(target_os = "macos")]
             picker_surface: None,
+            history: Arc::new(Mutex::new(HistoryViewModel::new(Timestamp::now()))),
+            prepared_history_drags: HashMap::new(),
+            pending_drags: VecDeque::new(),
         };
         app.refresh_tray_shortcuts();
 
@@ -911,9 +935,11 @@ impl App {
         if self.drain_server() == Tick::Stop {
             return Tick::Stop;
         }
+        self.with_history(|history| history.advance_clock(Timestamp::now()));
         self.drain_pipeline();
         self.drain_cards(editor);
         self.drain_drags();
+        self.drain_history();
 
         Tick::Continue
     }
@@ -1158,6 +1184,8 @@ impl App {
         }
         if matches!(command, crate::cli::Command::Gui) {
             self.note("a second launch was answered by this instance");
+        } else {
+            self.with_history(|history| history.refresh_from_start(Timestamp::now()));
         }
     }
 
@@ -1215,6 +1243,7 @@ impl App {
                     }
                     let ready = *ready;
                     let card = ready.card;
+                    let history_changed = card.capture_id.is_some();
                     let card_id = card.id;
                     let summary = card.summary();
                     for (action, error) in ready.actions.failures() {
@@ -1273,6 +1302,19 @@ impl App {
                     if !retained {
                         self.pipeline.post(Job::Release(card_id));
                     }
+                    if history_changed {
+                        self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+                    }
+                }
+                Outcome::Restored(card) => {
+                    let summary = card.summary();
+                    let card_id = card.id;
+                    if let Err(err) = self.surface.present(*card) {
+                        self.pipeline.post(Job::Release(card_id));
+                        self.note(format!("a restored card could not be shown: {err}"));
+                    } else {
+                        self.note(format!("restored {summary}"));
+                    }
                 }
                 Outcome::Failed {
                     card,
@@ -1290,13 +1332,20 @@ impl App {
                 Outcome::Done { card, detail } => {
                     self.note(format!("{card} {detail}"));
                 }
-                Outcome::Opened { card, capture } => {
+                Outcome::Opened {
+                    card,
+                    document,
+                    editor_only,
+                } => {
                     let generation = self.next_editor_generation;
                     self.next_editor_generation = self.next_editor_generation.wrapping_add(1);
+                    if editor_only {
+                        self.editor_only_cards.insert(card);
+                    }
                     self.editor_requests.push_back(EditorRequest {
                         card,
                         generation,
-                        capture: *capture,
+                        document: *document,
                     });
                 }
                 Outcome::Prepared {
@@ -1419,6 +1468,72 @@ impl App {
                         capture.0
                     ));
                 }
+                Outcome::HistoryLoaded { request, page } => {
+                    self.with_history(|history| history.apply_page(request, page));
+                }
+                Outcome::HistoryFailed {
+                    request,
+                    operation,
+                    capture,
+                    error,
+                } => {
+                    let message = format!("could not {}: {error}", operation.label());
+                    self.with_history(|history| {
+                        if let Some(request) = request {
+                            history.apply_query_error(request, &message);
+                        } else if operation == HistoryOperation::Drag {
+                            if let Some(capture) = capture.as_ref() {
+                                history.drag_preparation_failed(capture, &message);
+                            } else {
+                                history.operation_failed(&message);
+                            }
+                        } else {
+                            history.operation_failed(&message);
+                            if capture.is_some() {
+                                history.refresh_current(Timestamp::now());
+                            }
+                        }
+                    });
+                    if let Some(capture) = capture {
+                        self.note(format!("{}: {message}", capture.0));
+                    } else {
+                        self.note(message);
+                    }
+                }
+                Outcome::HistoryDone {
+                    operation,
+                    capture,
+                    pinned,
+                    detail,
+                } => {
+                    if matches!(operation, HistoryOperation::Delete | HistoryOperation::Edit)
+                        && let Some(capture) = capture.as_ref()
+                    {
+                        self.prepared_history_drags.remove(capture);
+                    }
+                    self.with_history(|history| match (operation, capture.as_ref(), pinned) {
+                        (HistoryOperation::Pin, Some(id), Some(pinned)) => {
+                            history.pinned(id, pinned);
+                        }
+                        (HistoryOperation::Delete, Some(id), _) => history.deleted(id),
+                        (HistoryOperation::Edit, Some(id), _) => {
+                            history.completed(&detail);
+                            history.invalidate_drag(id);
+                            history.refresh_current(Timestamp::now());
+                        }
+                        (HistoryOperation::Retention, _, _) => {
+                            history.completed(&detail);
+                            history.refresh_current(Timestamp::now());
+                        }
+                        _ => history.completed(&detail),
+                    });
+                    self.note(detail);
+                }
+                Outcome::HistoryDragPrepared { capture, prepared } => {
+                    self.prepared_history_drags
+                        .insert(capture.clone(), prepared);
+                    self.with_history(|history| history.drag_prepared(&capture));
+                }
             }
         }
     }
@@ -1457,14 +1572,65 @@ impl App {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
                 CardEvent::Pin(id, capture, state) => {
+                    let editor = if let Some(editor) = editor.and_then(|editor| editor.for_card(id))
+                    {
+                        let rendered = match editor.render() {
+                            Ok(rendered) => rendered,
+                            Err(error) => {
+                                self.surface.fail_pin(&capture, error.to_string());
+                                self.note(format!(
+                                    "{id} could not be pinned from editor revision {}: {error}",
+                                    editor.editor.state().revision()
+                                ));
+                                continue;
+                            }
+                        };
+                        let texture =
+                            match Thumbnail::from_frame(rendered.frame(), PIN_TEXTURE_MAX_EDGE) {
+                                Ok(texture) => texture,
+                                Err(error) => {
+                                    self.surface.fail_pin(&capture, error.to_string());
+                                    self.note(format!(
+                                        "{id} could not prepare safe edited pin pixels: {error}"
+                                    ));
+                                    continue;
+                                }
+                            };
+                        if let Err(error) = self.surface.refresh_pin_texture(&capture, texture) {
+                            self.surface.fail_pin(&capture, error.to_string());
+                            self.note(format!(
+                                "{id} could not replace provisional pin pixels: {error}"
+                            ));
+                            continue;
+                        }
+                        Some(Box::new(PinEditorSnapshot {
+                            generation: editor.generation,
+                            revision: rendered.revision(),
+                            rendered,
+                            document: editor.editor.document().data(),
+                        }))
+                    } else {
+                        None
+                    };
                     let generation = self.set_pin_intent(capture.clone(), true);
-                    self.pipeline.post(Job::PinCard {
+                    if self.pipeline.post(Job::PinCard {
                         card: id,
-                        capture,
+                        capture: capture.clone(),
                         generation,
                         state,
-                    });
-                    self.note(format!("{id} pinned"));
+                        editor,
+                    }) {
+                        self.note(format!("{id} pinned"));
+                    } else {
+                        self.set_pin_intent(capture.clone(), false);
+                        self.surface.fail_pin(
+                            &capture,
+                            "the capture worker stopped before the pin could be persisted".into(),
+                        );
+                        self.note(format!(
+                            "{id} could not be pinned because the capture worker has gone"
+                        ));
+                    }
                 }
                 CardEvent::PinChanged(capture, state) => {
                     let Some(generation) = self.active_pin_generation(&capture) else {
@@ -1494,6 +1660,99 @@ impl App {
                         capture.0
                     ));
                 }
+            }
+        }
+    }
+
+    fn drain_history(&mut self) {
+        let actions = self.with_history(HistoryViewModel::drain_actions);
+        for action in actions {
+            let posted = self.perform_history_action(action);
+            if !posted {
+                self.note("the capture worker has gone");
+            }
+        }
+    }
+
+    fn perform_history_action(&mut self, action: HistoryAction) -> bool {
+        match action {
+            HistoryAction::Query { request, query } => self.pipeline.query_history(request, query),
+            HistoryAction::Restore(capture) => {
+                let card = self.pipeline.allocate();
+                self.pipeline.post(Job::Restore { capture, card })
+            }
+            HistoryAction::OpenEditor(capture) => {
+                let card = self.pipeline.allocate();
+                self.pipeline.post(Job::OpenHistoryEditor { capture, card })
+            }
+            HistoryAction::Copy(capture) => self.pipeline.post(Job::CopyHistory(capture)),
+            HistoryAction::Save(capture) => self.pipeline.post(Job::SaveHistory(capture)),
+            HistoryAction::PrepareDrag(capture) => {
+                if self.prepared_history_drags.contains_key(&capture) {
+                    self.with_history(|history| history.drag_prepared(&capture));
+                    true
+                } else {
+                    self.pipeline.post(Job::PrepareHistoryDrag(capture))
+                }
+            }
+            HistoryAction::Drag { id, rect, pointer } => {
+                let geometry = DragGeometry { rect, pointer };
+                let prepared = self.prepared_history_drags.get(&id).cloned();
+                let payload = prepared
+                    .ok_or_else(|| "the capture has not finished preparing".to_owned())
+                    .and_then(|prepared| {
+                        prepared
+                            .payload(geometry)
+                            .map_err(|error| error.to_string())
+                    });
+                match payload {
+                    Ok(payload) => {
+                        self.pending_drags.push_back(PendingDrag {
+                            subject: DragSubject::History(id),
+                            payload,
+                            geometry,
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "Drag was not ready; select the capture and try again: {error}"
+                        );
+                        self.with_history(|history| {
+                            history.drag_preparation_failed(&id, &message);
+                        });
+                        self.note(message);
+                    }
+                }
+                true
+            }
+            HistoryAction::SetPinned { id, pinned } => {
+                let screen_unpinned = if pinned {
+                    true
+                } else {
+                    let generation = self.set_pin_intent(id.clone(), false);
+                    self.surface.discard_pin(&id);
+                    self.pipeline.post(Job::SetPin {
+                        capture: id.clone(),
+                        generation,
+                        state: None,
+                    })
+                };
+                let retention_updated = self.pipeline.post(Job::SetPinned {
+                    capture: id,
+                    pinned,
+                });
+                screen_unpinned && retention_updated
+            }
+            HistoryAction::Delete(capture) => {
+                let generation = self.set_pin_intent(capture.clone(), false);
+                self.surface.discard_pin(&capture);
+                let screen_unpinned = self.pipeline.post(Job::SetPin {
+                    capture: capture.clone(),
+                    generation,
+                    state: None,
+                });
+                let deleted = self.pipeline.post(Job::Delete(capture));
+                screen_unpinned && deleted
             }
         }
     }
@@ -1716,7 +1975,8 @@ impl App {
                 Tick::Continue
             }
             Action::OpenHistory => {
-                self.note("the history window is not built yet");
+                self.with_history(|history| history.open(Timestamp::now()));
+                self.note("capture history opened");
                 Tick::Continue
             }
             Action::OpenSettings => {
@@ -2593,6 +2853,24 @@ impl App {
         }
     }
 
+    /// Persists the exact edited scene before its editor-only cache is released.
+    pub fn persist_editor(&mut self, editor: EditorSnapshot<'_>) {
+        let revision = editor.editor.state().revision();
+        let job = Job::PersistDocument {
+            card: editor.card,
+            generation: editor.generation,
+            revision,
+            data: Box::new(editor.editor.document().data()),
+        };
+        if !self.pipeline.post(job) {
+            self.note(format!(
+                "{} editor {} revision {revision} could not be queued for history persistence: \
+                 the capture worker has gone",
+                editor.card, editor.generation
+            ));
+        }
+    }
+
     /// Copies an image the editor has flattened.
     ///
     /// Routed through the worker so the PNG encode and the clipboard write stay
@@ -2610,6 +2888,40 @@ impl App {
             card,
             rendered: Box::new(rendered),
         });
+    }
+
+    fn with_history<R>(&self, f: impl FnOnce(&mut HistoryViewModel) -> R) -> R {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut history)
+    }
+
+    /// Shared state rendered by the secondary history viewport.
+    #[must_use]
+    pub fn history(&self) -> Arc<Mutex<HistoryViewModel>> {
+        Arc::clone(&self.history)
+    }
+
+    /// Takes a history-window drag prepared by the worker.
+    pub fn take_history_drag(&mut self) -> Option<PendingDrag> {
+        self.pending_drags.pop_front()
+    }
+
+    /// Records completion of a native drag from the history window.
+    pub fn history_drag_finished(&mut self, subject: &DragSubject, outcome: &DragOutcome) {
+        let detail = match outcome {
+            DragOutcome::Accepted(_) => "Capture dragged to another app".to_owned(),
+            DragOutcome::Rejected => "The destination did not accept the capture".to_owned(),
+            DragOutcome::Cancelled => "Drag cancelled".to_owned(),
+            DragOutcome::Failed(reason) => format!("Drag failed: {reason}"),
+            _ => "Drag finished".to_owned(),
+        };
+        if let DragSubject::History(_) = subject {
+            self.with_history(|history| history.completed(&detail));
+        }
+        self.note(detail);
     }
 
     /// How many cards are on screen.
@@ -2978,12 +3290,12 @@ mod tests {
         app.editor_requests.push_back(EditorRequest {
             card: CardId(1),
             generation: 1,
-            capture: capture.clone(),
+            document: scrozz_annotate::Document::new(capture.clone()),
         });
         app.editor_requests.push_back(EditorRequest {
             card: CardId(2),
             generation: 2,
-            capture,
+            document: scrozz_annotate::Document::new(capture),
         });
 
         assert_eq!(app.take_editor_request().unwrap().card, CardId(1));
@@ -3098,7 +3410,7 @@ mod tests {
             LogicalPoint::new(0.0, 0.0),
             LogicalSize::new(f64::from(width), f64::from(height)),
         );
-        let capture = Capture {
+        let capture = scrozz_core::Capture {
             frame: scrozz_core::Frame {
                 data,
                 size: PhysicalSize::new(f64::from(width), f64::from(height)),
@@ -3674,12 +3986,9 @@ mod tests {
     #[test]
     fn an_unwired_action_says_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
-        for action in [Action::ToggleRecording, Action::OpenHistory] {
-            assert_eq!(app.perform(action), Tick::Continue);
-        }
+        assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
         assert!(notes.contains("recording is not wired up yet"), "{notes}");
-        assert!(notes.contains("history window"), "{notes}");
     }
 
     #[test]
@@ -3689,6 +3998,54 @@ mod tests {
         assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
         assert!(app.take_settings_request());
         assert!(!app.take_settings_request());
+    }
+
+    #[test]
+    fn opening_history_makes_the_window_visible_and_queues_a_query() {
+        let (mut app, _) = app();
+        assert_eq!(app.perform(Action::OpenHistory), Tick::Continue);
+        let history = app.history();
+        let mut history = history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(history.is_visible());
+        assert!(matches!(
+            history.drain_actions().as_slice(),
+            [HistoryAction::Query { request: 1, .. }]
+        ));
+    }
+
+    #[test]
+    fn history_unpin_and_delete_retire_any_live_screen_pin_generation() {
+        let (mut app, _) = app();
+        let capture = CaptureId("history-visible-pin".into());
+        assert_eq!(app.set_pin_intent(capture.clone(), true), PinGeneration(1));
+
+        assert!(app.perform_history_action(HistoryAction::SetPinned {
+            id: capture.clone(),
+            pinned: false,
+        }));
+        assert!(app.pin_is_current(&capture, PinGeneration(2), false));
+
+        assert!(app.perform_history_action(HistoryAction::Delete(capture.clone())));
+        assert!(app.pin_is_current(&capture, PinGeneration(3), false));
+    }
+
+    #[test]
+    fn edited_pin_pixels_replace_the_provisional_texture_before_worker_commit() {
+        let source = include_str!("app.rs");
+        let pin = source
+            .split("CardEvent::Pin(id, capture, state) =>")
+            .nth(1)
+            .and_then(|body| body.split_once("CardEvent::PinChanged"))
+            .map(|(body, _)| body)
+            .expect("pin event route");
+        let refresh = pin
+            .find("refresh_pin_texture")
+            .expect("provisional texture replacement");
+        let commit = pin.find("Job::PinCard").expect("durable pin job");
+        assert!(refresh < commit);
+        assert!(pin.contains("PinEditorSnapshot"));
     }
 
     #[test]

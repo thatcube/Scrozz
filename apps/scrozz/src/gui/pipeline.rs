@@ -8,16 +8,21 @@
 //! capture taken on it stalls all three, and the visible symptom is that the
 //! card animating in stutters at exactly the moment the user is watching it.
 //!
-//! So the main thread does one thing on a hotkey: post a [`Job`]. Everything
-//! after that happens here, and comes back as an [`Outcome`] the main thread
-//! picks up on its next tick.
+//! So the main thread does one thing on a hotkey: post a [`Job`]. Capture and
+//! mutation work runs on the capture worker; thumbnail-heavy history reads run
+//! on an independent, coalescing reader so opening a large library cannot delay
+//! the shutter. Both report [`Outcome`] values the main thread picks up on its
+//! next tick.
 //!
 //! # What the worker owns
 //!
-//! The store handle, and the encoded bytes of the cards still on screen. Both
-//! deliberately. `SqliteStore` holds a `rusqlite::Connection`, so keeping it on
-//! one thread means there is exactly one writer and no lock discipline to get
-//! wrong. And keeping the *encoded* bytes rather than the `Frame` is what makes
+//! The capture worker owns the writing store handle and encoded bytes of cards
+//! still on screen. Both deliberately. `SqliteStore` holds a
+//! `rusqlite::Connection`, so keeping mutations on one thread means there is
+//! exactly one GUI writer and no lock discipline to get wrong. The history
+//! reader has its own read connection, relying on SQLite WAL snapshots just as a
+//! forwarded CLI invocation does. And keeping the *encoded* bytes rather than
+//! the `Frame` is what makes
 //! "copy this card" cheap without holding 30 MB of RGBA per card — the PNG of
 //! the same capture is a few hundred kilobytes, and `scrozz-export` decodes it
 //! back when the clipboard asks.
@@ -48,16 +53,19 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_annotate::{Document, DocumentData};
+use scrozz_annotate::{Document, DocumentData, Renderer, SkiaRenderer};
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError, PinState,
-    Provenance, ScaleFactor, SelectionMode, SelectionOptions,
+    Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
+    LogicalPoint, LogicalRect, PinState, Provenance, ScaleFactor, SelectionMode, SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
+use scrozz_shell::{DragPayload, DragPreview, byte_source};
 use scrozz_store::{
-    CaptureId, DocumentState, FrameHeader, History, NewCapture, Page, SearchQuery, SqliteStore,
+    CaptureId, CaptureRecord, DocumentState, FrameHeader, History, NewCapture, Page,
+    RetentionPolicy, SearchQuery, SqliteStore, Store,
 };
 use scrozz_ui::editor::RevisionedFrame;
+use scrozz_ui::history::{HistoryEntry, HistoryPage, HistoryThumbnail};
 
 use crate::{
     after_capture::{
@@ -75,6 +83,95 @@ use crate::{
     },
     platform,
 };
+
+/// Geometry the native drag backend needs from the source window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DragGeometry {
+    /// Card rectangle in source-window points or history preview in screen points.
+    pub rect: LogicalRect,
+    /// Pointer position in the same coordinate space as `rect`.
+    pub pointer: LogicalPoint,
+}
+
+/// Exact editor state captured when Pin to Screen was requested.
+#[derive(Debug)]
+pub struct PinEditorSnapshot {
+    /// Editor lifetime that produced the snapshot.
+    pub generation: u64,
+    /// Exact content revision rendered into `rendered`.
+    pub revision: u64,
+    /// Flattened pixels safe to display immediately.
+    pub rendered: RevisionedFrame,
+    /// Editable scene persisted before the screen pin is committed.
+    pub document: DocumentData,
+}
+
+/// Pre-rendered history media ready to become a native drag payload.
+#[derive(Clone, Debug)]
+pub struct PreparedHistoryDrag {
+    stem: String,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl PreparedHistoryDrag {
+    /// Adds gesture geometry without reloading or re-rendering the document.
+    pub fn payload(&self, geometry: DragGeometry) -> CliResult<DragPayload> {
+        drag_payload(&self.stem, Arc::clone(&self.bytes), geometry)
+    }
+}
+
+/// What one prepared drag belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DragSubject {
+    /// A live card in the overlay.
+    Card(CardId),
+    /// A durable capture in the history window.
+    History(CaptureId),
+}
+
+/// History operation names shared by logs and view-model feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryOperation {
+    /// Read one filtered page.
+    Query,
+    /// Return a stored capture to the live pile.
+    Restore,
+    /// Load the editable annotation document.
+    OpenEditor,
+    /// Put the rendered capture on the clipboard.
+    Copy,
+    /// Export the rendered capture.
+    Save,
+    /// Prepare a promised-file drag.
+    Drag,
+    /// Change retention protection.
+    Pin,
+    /// Permanently remove the capture.
+    Delete,
+    /// Apply the image retention policy.
+    Retention,
+    /// Persist an edited scene graph.
+    Edit,
+}
+
+impl HistoryOperation {
+    /// Stable present-tense label for diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Query => "load history",
+            Self::Restore => "restore capture",
+            Self::OpenEditor => "open editor",
+            Self::Copy => "copy capture",
+            Self::Save => "save capture",
+            Self::Drag => "drag capture",
+            Self::Pin => "change pinned state",
+            Self::Delete => "delete capture",
+            Self::Retention => "enforce retention",
+            Self::Edit => "save edited document",
+        }
+    }
+}
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
@@ -123,6 +220,17 @@ pub enum Job {
         /// from its own cache.
         data: Box<DocumentData>,
     },
+    /// Persist the editor scene graph before its cached source is released.
+    PersistDocument {
+        /// Card whose durable history identity owns the document.
+        card: CardId,
+        /// Editor lifetime that produced the snapshot.
+        generation: u64,
+        /// Exact content revision being persisted.
+        revision: u64,
+        /// Editable scene graph; source pixels remain in the existing record.
+        data: Box<DocumentData>,
+    },
     /// Accept pixels already captured by an interactive region/window selector.
     Captured {
         /// User-facing capture kind that produced the output.
@@ -157,6 +265,37 @@ pub enum Job {
     },
     /// Write a card's capture to the configured folder.
     Save(CardId),
+    /// Restore a stored capture into a new live card.
+    Restore {
+        /// Durable capture.
+        capture: CaptureId,
+        /// Session-local card allocated before posting.
+        card: CardId,
+    },
+    /// Load a stored document for annotation.
+    OpenHistoryEditor {
+        /// Durable capture to edit.
+        capture: CaptureId,
+        /// Session-local identity used by the editor output pipeline.
+        card: CardId,
+    },
+    /// Copy a stored document.
+    CopyHistory(CaptureId),
+    /// Save a stored document.
+    SaveHistory(CaptureId),
+    /// Pre-render a stored document before a drag gesture starts.
+    PrepareHistoryDrag(CaptureId),
+    /// Change a stored capture's pinned state.
+    SetPinned {
+        /// Durable capture.
+        capture: CaptureId,
+        /// New state.
+        pinned: bool,
+    },
+    /// Permanently delete a stored capture.
+    Delete(CaptureId),
+    /// Enforce the current source-image retention policy.
+    EnforceRetention(RetentionPolicy),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Persist a new pin using the capture associated with a live card.
@@ -169,6 +308,8 @@ pub enum Job {
         generation: PinGeneration,
         /// Initial durable pin state.
         state: PinState,
+        /// Current edited pixels and scene graph, when this card owns an editor.
+        editor: Option<Box<PinEditorSnapshot>>,
     },
     /// Persist a changed pin or clear a closed one.
     SetPin {
@@ -261,12 +402,16 @@ impl PendingPinUpdates {
 pub enum Outcome {
     /// A capture succeeded and is ready to show.
     Ready(Box<ReadyCapture>),
+    /// A stored capture was rebuilt as a live card.
+    Restored(Box<Card>),
     /// A card's capture was decoded and the editor can open on it.
     Opened {
         /// Which card.
         card: CardId,
-        /// The decoded capture.
-        capture: Box<Capture>,
+        /// The complete editable document.
+        document: Box<Document>,
+        /// Whether no overlay card owns this editor artifact.
+        editor_only: bool,
     },
     /// An editor revision is encoded and ready for synchronous drag use.
     Prepared {
@@ -346,6 +491,42 @@ pub enum Outcome {
         /// Explicit storage error.
         error: CliError,
     },
+    /// A filtered history page is ready.
+    HistoryLoaded {
+        /// Query generation this answers.
+        request: u64,
+        /// Rows, count, and application choices.
+        page: HistoryPage,
+    },
+    /// A history operation failed.
+    HistoryFailed {
+        /// Query generation for query failures; absent for mutations.
+        request: Option<u64>,
+        /// Operation that failed.
+        operation: HistoryOperation,
+        /// Capture involved, when there was one.
+        capture: Option<CaptureId>,
+        /// The explicit failure.
+        error: CliError,
+    },
+    /// A history mutation or export completed.
+    HistoryDone {
+        /// Operation that completed.
+        operation: HistoryOperation,
+        /// Capture involved, when there was one.
+        capture: Option<CaptureId>,
+        /// New pinned state for a pin operation.
+        pinned: Option<bool>,
+        /// User-facing result.
+        detail: String,
+    },
+    /// A selected history item is pre-rendered for immediate drag startup.
+    HistoryDragPrepared {
+        /// Durable capture.
+        capture: CaptureId,
+        /// Rendered bytes and stable file label.
+        prepared: PreparedHistoryDrag,
+    },
 }
 
 /// A finalized card plus every isolated ambient action result.
@@ -357,14 +538,22 @@ pub struct ReadyCapture {
     pub actions: ExecutionReport,
 }
 
-/// A handle to the capture thread.
+/// A handle to the capture and history threads.
 pub struct Pipeline {
     jobs: Sender<Job>,
     pending_pin_updates: Arc<PendingPinUpdates>,
+    history_queries: Sender<HistoryQuery>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
+    history_worker: Option<JoinHandle<()>>,
     next_card: u64,
     vault: CaptureVault,
+}
+
+#[derive(Debug)]
+enum HistoryQuery {
+    Load { request: u64, query: SearchQuery },
+    Stop,
 }
 
 impl Pipeline {
@@ -398,11 +587,14 @@ impl Pipeline {
         waker: Option<SurfaceWaker>,
     ) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
+        let (history_queries, history_rx) = channel();
         let (outcome_tx, outcomes) = channel();
         let vault = CaptureVault::new();
         let worker_vault = vault.clone();
         let pending_pin_updates = Arc::new(PendingPinUpdates::default());
         let worker_pin_updates = Arc::clone(&pending_pin_updates);
+        let history_outcomes = outcome_tx.clone();
+        let history_waker = waker.clone();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
@@ -415,12 +607,29 @@ impl Pipeline {
                     "could not start the capture worker: {err}"
                 )))
             })?;
+        let history_worker = match std::thread::Builder::new()
+            .name("scrozz-history".to_owned())
+            .spawn(move || {
+                HistoryReader::new(history_outcomes, history_waker, history_enabled)
+                    .run(&history_rx);
+            }) {
+            Ok(worker) => worker,
+            Err(err) => {
+                let _ = jobs.send(Job::Stop);
+                let _ = worker.join();
+                return Err(CliError::Core(CoreError::Platform(format!(
+                    "could not start the history worker: {err}"
+                ))));
+            }
+        };
 
         Ok(Self {
             jobs,
             pending_pin_updates,
+            history_queries,
             outcomes,
             worker: Some(worker),
+            history_worker: Some(history_worker),
             next_card: 1,
             vault,
         })
@@ -544,6 +753,13 @@ impl Pipeline {
         })?
     }
 
+    /// Posts a coalescible history read on a worker independent of capture.
+    pub fn query_history(&self, request: u64, query: SearchQuery) -> bool {
+        self.history_queries
+            .send(HistoryQuery::Load { request, query })
+            .is_ok()
+    }
+
     /// Takes one finished piece of work, if there is one. Never blocks.
     pub fn poll(&self) -> Option<Outcome> {
         self.outcomes.try_recv().ok()
@@ -555,7 +771,11 @@ impl Pipeline {
     /// rather than at an unspecified point during teardown.
     pub fn stop(&mut self) {
         let _ = self.jobs.send(Job::Stop);
+        let _ = self.history_queries.send(HistoryQuery::Stop);
         if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.history_worker.take() {
             let _ = worker.join();
         }
     }
@@ -573,6 +793,12 @@ struct Cached {
     /// The untouched card capture. This remains the default after the editor
     /// closes, per D14.
     bytes: CaptureBytes,
+    /// Original source pixels for rebuilding an editable history document.
+    ///
+    /// Restored cards display a flattened render in `bytes`, but editor
+    /// revisions must start from this source or existing edits would be baked
+    /// in and applied a second time.
+    editor_source: Option<Arc<Vec<u8>>>,
     /// A revision prepared only for an active editor's output and drag paths.
     rendered: Option<CaptureBytes>,
     /// Where the pixels came from, kept alongside them.
@@ -724,6 +950,7 @@ impl CaptureVault {
                     full,
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: capture.provenance,
                 target: capture.target.clone(),
@@ -915,6 +1142,12 @@ impl Worker {
                     revision,
                     data,
                 } => self.prepare_image(card, generation, revision, *data),
+                Job::PersistDocument {
+                    card,
+                    generation,
+                    revision,
+                    data,
+                } => self.persist_document(card, generation, revision, &data),
                 Job::Captured {
                     kind,
                     origin,
@@ -932,9 +1165,10 @@ impl Worker {
                     capture,
                     generation,
                     state,
+                    editor,
                 } => {
                     if self.claim_pin_generation(&capture, generation) {
-                        self.pin_card(card, &capture, generation, &state);
+                        self.pin_card(card, &capture, generation, &state, editor.as_deref());
                     }
                 }
                 Job::SetPin {
@@ -978,6 +1212,16 @@ impl Worker {
                         }
                     }
                 }
+                Job::Restore { capture, card } => self.restore(capture, card),
+                Job::OpenHistoryEditor { capture, card } => {
+                    self.open_history_editor(capture, card);
+                }
+                Job::CopyHistory(capture) => self.copy_history(capture),
+                Job::SaveHistory(capture) => self.save_history(capture),
+                Job::PrepareHistoryDrag(capture) => self.prepare_history_drag(capture),
+                Job::SetPinned { capture, pinned } => self.set_pinned(capture, pinned),
+                Job::Delete(capture) => self.delete(capture),
+                Job::EnforceRetention(policy) => self.enforce_retention(&policy),
                 Job::Stop => break,
             }
         }
@@ -1186,6 +1430,7 @@ impl Worker {
                     full: Arc::clone(&bytes),
                     preview,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: capture.provenance,
                 target: capture.target.clone(),
@@ -1283,12 +1528,51 @@ impl Worker {
         self.emit(outcome);
     }
 
+    fn persist_document(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        revision: u64,
+        data: &DocumentData,
+    ) {
+        let result = self
+            .cached_entry(card, "save its edits")
+            .and_then(|cached| {
+                cached.capture_id.ok_or_else(|| {
+                    CliError::Core(CoreError::Storage(format!(
+                        "{card} was captured while history was unavailable"
+                    )))
+                })
+            })
+            .and_then(|capture| {
+                self.history_store()?.save_edits(&capture, data)?;
+                Ok(capture)
+            });
+        match result {
+            Ok(capture) => self.history_done(
+                HistoryOperation::Edit,
+                Some(capture),
+                None,
+                format!("{card} editor {generation} revision {revision} saved to capture history"),
+            ),
+            Err(error) => self.emit(Outcome::Refused { card, error }),
+        }
+    }
+
     /// Persists a capture, or explains in the log why it was not.
     fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
         let store = self.store.as_mut()?;
         let document = Document::new(capture.clone());
-        match store.insert(NewCapture::new(&document)) {
-            Ok(id) => Some(id),
+        match store.insert(NewCapture::of_kind(
+            &document,
+            scrozz_store::MediaKind::Screenshot,
+        )) {
+            Ok(id) => {
+                if let Err(err) = store.enforce_retention(&RetentionPolicy::default()) {
+                    tracing::warn!("capture was stored but retention could not run: {err}");
+                }
+                Some(id)
+            }
             Err(err) => {
                 tracing::warn!("could not add the capture to history: {err}");
                 None
@@ -1302,12 +1586,28 @@ impl Worker {
     /// illegal for window captures and the editor must be told which kind it
     /// holds rather than guess.
     fn open(&mut self, card: CardId) {
-        let decoded = self.capture_from_cache(card, "open");
-        match decoded {
-            Ok(capture) => {
+        let durable = self.vault.cached(card).and_then(|cached| cached.capture_id);
+        let document = match durable {
+            Some(capture) => match self.load_document(&capture) {
+                Ok(document) => Ok(document),
+                Err(error) => {
+                    tracing::warn!(
+                        %card,
+                        %error,
+                        "stored document could not be loaded; opening its flattened visible pixels"
+                    );
+                    self.capture_from_visible_cache(card, "open")
+                        .map(Document::new)
+                }
+            },
+            None => self.capture_from_cache(card, "open").map(Document::new),
+        };
+        match document {
+            Ok(document) => {
                 self.emit(Outcome::Opened {
                     card,
-                    capture: Box::new(capture),
+                    document: Box::new(document),
+                    editor_only: false,
                 });
             }
             Err(error) => {
@@ -1376,6 +1676,257 @@ impl Worker {
             .ok_or_else(|| CliError::usage(format!("{card} has no capture to {verb}")))
     }
 
+    fn restore(&mut self, capture: CaptureId, card: CardId) {
+        let result = self.render_stored(&capture).map(|rendered| {
+            let kind = capture_kind(rendered.record.provenance);
+            let thumbnail = Thumbnail::from_frame(&rendered.frame, THUMBNAIL_MAX_EDGE).ok();
+            let preview = thumbnail.as_ref().and_then(preview_png).map(Arc::new);
+            let built = Card {
+                id: card,
+                capture_id: Some(capture.clone()),
+                kind,
+                provenance: rendered.record.provenance,
+                source_width: rendered.frame.width(),
+                source_height: rendered.frame.height(),
+                scale: rendered.frame.scale.get(),
+                thumbnail,
+                written: Vec::new(),
+                taken_at: rendered.record.created_at.to_system_time(),
+            };
+            self.vault.store(
+                card,
+                Cached {
+                    bytes: CaptureBytes {
+                        generation: None,
+                        revision: 0,
+                        full: Arc::clone(&rendered.bytes),
+                        preview,
+                    },
+                    editor_source: Some(Arc::clone(&rendered.source_bytes)),
+                    rendered: None,
+                    provenance: rendered.record.provenance,
+                    target: rendered.record.target.clone(),
+                    scale: rendered.frame.scale,
+                    color_space: rendered.frame.color_space,
+                    capture_id: Some(capture.clone()),
+                },
+            );
+            built
+        });
+
+        match result {
+            Ok(card) => {
+                self.emit(Outcome::Restored(Box::new(card)));
+                self.history_done(
+                    HistoryOperation::Restore,
+                    Some(capture),
+                    None,
+                    "restored to the capture stack".to_owned(),
+                );
+            }
+            Err(error) => {
+                self.history_failed(HistoryOperation::Restore, Some(capture), error);
+            }
+        }
+    }
+
+    fn open_history_editor(&mut self, capture: CaptureId, card: CardId) {
+        let result = self.render_stored(&capture).map(|rendered| {
+            let thumbnail = Thumbnail::from_frame(&rendered.frame, THUMBNAIL_MAX_EDGE).ok();
+            let preview = thumbnail.as_ref().and_then(preview_png).map(Arc::new);
+            self.vault.store(
+                card,
+                Cached {
+                    bytes: CaptureBytes {
+                        generation: None,
+                        revision: 0,
+                        full: Arc::clone(&rendered.bytes),
+                        preview,
+                    },
+                    editor_source: Some(Arc::clone(&rendered.source_bytes)),
+                    rendered: None,
+                    provenance: rendered.record.provenance,
+                    target: rendered.record.target.clone(),
+                    scale: rendered.frame.scale,
+                    color_space: rendered.frame.color_space,
+                    capture_id: Some(capture.clone()),
+                },
+            );
+            rendered.document
+        });
+        match result {
+            Ok(document) => {
+                self.emit(Outcome::Opened {
+                    card,
+                    document: Box::new(document),
+                    editor_only: true,
+                });
+                self.history_done(
+                    HistoryOperation::OpenEditor,
+                    Some(capture),
+                    None,
+                    "opened in the annotation editor".to_owned(),
+                );
+            }
+            Err(error) => {
+                self.history_failed(HistoryOperation::OpenEditor, Some(capture), error);
+            }
+        }
+    }
+
+    fn copy_history(&mut self, capture: CaptureId) {
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            scrozz_shell::write_capture_to_clipboard(&rendered.frame, &rendered.bytes)?;
+            Ok("copied to the clipboard".to_owned())
+        });
+        self.answer_history(HistoryOperation::Copy, capture, result);
+    }
+
+    fn save_history(&mut self, capture: CaptureId) {
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let path = crate::output::export_default(rendered.bytes.as_slice())?;
+            Ok(format!("saved to {}", path.display()))
+        });
+        self.answer_history(HistoryOperation::Save, capture, result);
+    }
+
+    fn prepare_history_drag(&mut self, capture: CaptureId) {
+        let result = self
+            .render_stored(&capture)
+            .map(|rendered| PreparedHistoryDrag {
+                stem: stem_for(&rendered.record),
+                bytes: rendered.bytes,
+            });
+        match result {
+            Ok(prepared) => {
+                self.emit(Outcome::HistoryDragPrepared { capture, prepared });
+            }
+            Err(error) => {
+                self.history_failed(HistoryOperation::Drag, Some(capture), error);
+            }
+        }
+    }
+
+    fn set_pinned(&mut self, capture: CaptureId, pinned: bool) {
+        let result = self
+            .history_store()
+            .and_then(|store| Ok(store.set_pinned(&capture, pinned)?))
+            .map(|()| {
+                if pinned {
+                    "capture pinned".to_owned()
+                } else {
+                    "capture unpinned".to_owned()
+                }
+            });
+        match result {
+            Ok(detail) => {
+                self.history_done(HistoryOperation::Pin, Some(capture), Some(pinned), detail)
+            }
+            Err(error) => self.history_failed(HistoryOperation::Pin, Some(capture), error),
+        }
+    }
+
+    fn delete(&mut self, capture: CaptureId) {
+        let result = self
+            .history_store()
+            .and_then(|store| Ok(store.delete(&capture)?))
+            .and_then(|deleted| {
+                if deleted {
+                    Ok("capture deleted".to_owned())
+                } else {
+                    Err(history_not_found(&capture))
+                }
+            });
+        self.answer_history(HistoryOperation::Delete, capture, result);
+    }
+
+    fn enforce_retention(&mut self, policy: &RetentionPolicy) {
+        let result = self
+            .history_store()
+            .and_then(|store| Ok(store.enforce_retention(policy)?))
+            .map(|()| "source-image retention enforced".to_owned());
+        match result {
+            Ok(detail) => self.history_done(HistoryOperation::Retention, None, None, detail),
+            Err(error) => self.history_failed(HistoryOperation::Retention, None, error),
+        }
+    }
+
+    fn history_store(&mut self) -> CliResult<&mut SqliteStore> {
+        self.store.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "capture history is unavailable in this session".to_owned(),
+            ))
+        })
+    }
+
+    fn load_document(&mut self, capture: &CaptureId) -> CliResult<Document> {
+        match self.history_store()?.document(capture)? {
+            Some(DocumentState::Complete(document)) => Ok(*document),
+            Some(DocumentState::ImageEvicted(_)) => Err(history_image_evicted(capture)),
+            None => Err(history_not_found(capture)),
+        }
+    }
+
+    fn render_stored(&mut self, capture: &CaptureId) -> CliResult<RenderedStored> {
+        let record = self
+            .history_store()?
+            .record(capture)?
+            .ok_or_else(|| history_not_found(capture))?;
+        let document = self.load_document(capture)?;
+        let frame = SkiaRenderer::new().render(&document)?;
+        let source_bytes =
+            Arc::new(FrameEncoder::new().encode(&document.source.frame, ImageFormat::Png)?);
+        let bytes = Arc::new(FrameEncoder::new().encode(&frame, ImageFormat::Png)?);
+        Ok(RenderedStored {
+            record,
+            document,
+            frame,
+            bytes,
+            source_bytes,
+        })
+    }
+
+    fn answer_history(
+        &self,
+        operation: HistoryOperation,
+        capture: CaptureId,
+        result: CliResult<String>,
+    ) {
+        match result {
+            Ok(detail) => self.history_done(operation, Some(capture), None, detail),
+            Err(error) => self.history_failed(operation, Some(capture), error),
+        }
+    }
+
+    fn history_done(
+        &self,
+        operation: HistoryOperation,
+        capture: Option<CaptureId>,
+        pinned: Option<bool>,
+        detail: String,
+    ) {
+        self.emit(Outcome::HistoryDone {
+            operation,
+            capture,
+            pinned,
+            detail,
+        });
+    }
+
+    fn history_failed(
+        &self,
+        operation: HistoryOperation,
+        capture: Option<CaptureId>,
+        error: CliError,
+    ) {
+        self.emit(Outcome::HistoryFailed {
+            request: None,
+            operation,
+            capture,
+            error,
+        });
+    }
+
     fn cached_entry(&self, card: CardId, verb: &str) -> CliResult<Cached> {
         self.vault
             .cached(card)
@@ -1383,8 +1934,26 @@ impl Worker {
     }
 
     fn capture_from_cache(&self, card: CardId, verb: &str) -> CliResult<Capture> {
+        self.capture_from_cached_bytes(card, verb, true)
+    }
+
+    fn capture_from_visible_cache(&self, card: CardId, verb: &str) -> CliResult<Capture> {
+        self.capture_from_cached_bytes(card, verb, false)
+    }
+
+    fn capture_from_cached_bytes(
+        &self,
+        card: CardId,
+        verb: &str,
+        prefer_editor_source: bool,
+    ) -> CliResult<Capture> {
         let cached = self.cached_entry(card, verb)?;
-        let mut frame = scrozz_export::decode(&cached.bytes.full)?;
+        let source = if prefer_editor_source {
+            cached.editor_source.as_ref().unwrap_or(&cached.bytes.full)
+        } else {
+            &cached.bytes.full
+        };
+        let mut frame = scrozz_export::decode(source)?;
         // PNG carries neither backing scale nor colour space. Restore both from
         // capture metadata before editor geometry or rendering sees it.
         frame.scale = cached.scale;
@@ -1402,6 +1971,7 @@ impl Worker {
         capture: &CaptureId,
         generation: PinGeneration,
         state: &PinState,
+        editor: Option<&PinEditorSnapshot>,
     ) {
         let cached_capture = self.vault.cached(card).and_then(|cached| cached.capture_id);
         if cached_capture.as_ref() != Some(capture) {
@@ -1416,10 +1986,28 @@ impl Worker {
             });
             return;
         }
-        let result = self.persist_pin(capture, Some(state));
+        let result = (|| {
+            if let Some(editor) = editor {
+                self.history_store()?
+                    .save_edits(capture, &editor.document)?;
+                tracing::debug!(
+                    capture = %capture.0,
+                    editor_generation = editor.generation,
+                    revision = editor.revision,
+                    "persisted edited document before committing its screen pin"
+                );
+            }
+            self.persist_pin(capture, Some(state))
+        })();
         match result {
             Ok(()) => {
-                let (texture, warning) = match self.load_pin_texture(capture) {
+                let texture = editor
+                    .map(|editor| {
+                        Thumbnail::from_frame(editor.rendered.frame(), PIN_TEXTURE_MAX_EDGE)
+                            .map_err(CliError::from)
+                    })
+                    .unwrap_or_else(|| self.load_pin_texture(capture));
+                let (texture, warning) = match texture {
                     Ok(texture) => (Some(texture), None),
                     Err(error) => (None, Some(error)),
                 };
@@ -1558,8 +2146,8 @@ impl Worker {
         })?;
         match store.document(id) {
             Ok(Some(DocumentState::Complete(document))) => {
-                Thumbnail::from_frame(&document.source.frame, PIN_TEXTURE_MAX_EDGE)
-                    .map_err(CliError::from)
+                let frame = SkiaRenderer::new().render(&document)?;
+                Thumbnail::from_frame(&frame, PIN_TEXTURE_MAX_EDGE).map_err(CliError::from)
             }
             Ok(Some(DocumentState::ImageEvicted(_))) | Ok(None) => {
                 Err(CliError::Core(CoreError::Storage(format!(
@@ -1648,8 +2236,271 @@ fn preview_png(thumbnail: &Thumbnail) -> Option<Vec<u8>> {
     }
 }
 
+struct HistoryReader {
+    outcomes: Sender<Outcome>,
+    waker: Option<SurfaceWaker>,
+    store: Option<SqliteStore>,
+    open_default: bool,
+}
+
+impl HistoryReader {
+    fn new(outcomes: Sender<Outcome>, waker: Option<SurfaceWaker>, history_enabled: bool) -> Self {
+        Self {
+            outcomes,
+            waker,
+            store: None,
+            open_default: history_enabled,
+        }
+    }
+
+    fn run(mut self, queries: &Receiver<HistoryQuery>) {
+        'worker: while let Ok(message) = queries.recv() {
+            let (mut request, mut query) = match message {
+                HistoryQuery::Load { request, query } => (request, query),
+                HistoryQuery::Stop => break,
+            };
+            while let Ok(message) = queries.try_recv() {
+                match message {
+                    HistoryQuery::Load {
+                        request: newer_request,
+                        query: newer_query,
+                    } => {
+                        request = newer_request;
+                        query = newer_query;
+                    }
+                    HistoryQuery::Stop => break 'worker,
+                }
+            }
+            self.query(request, &query);
+        }
+        tracing::debug!("history worker stopped");
+    }
+
+    fn query(&mut self, request: u64, query: &SearchQuery) {
+        let result = self
+            .history_store()
+            .and_then(|store| load_history_page(store, query));
+        let outcome = match result {
+            Ok(page) => Outcome::HistoryLoaded { request, page },
+            Err(error) => Outcome::HistoryFailed {
+                request: Some(request),
+                operation: HistoryOperation::Query,
+                capture: None,
+                error,
+            },
+        };
+        if self.outcomes.send(outcome).is_ok()
+            && let Some(waker) = &self.waker
+        {
+            waker();
+        }
+    }
+
+    fn history_store(&mut self) -> CliResult<&mut SqliteStore> {
+        if self.store.is_none() && self.open_default {
+            self.store = Some(SqliteStore::open_default()?);
+        }
+        self.store.as_mut().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "capture history is unavailable in this session".to_owned(),
+            ))
+        })
+    }
+}
+
+fn load_history_page(store: &mut SqliteStore, query: &SearchQuery) -> CliResult<HistoryPage> {
+    let mut fallback = None;
+    for _ in 0..3 {
+        let total_before = store.count_matching(query)?;
+        let records = store.search(query)?;
+        let apps = store.apps()?;
+        let mut entries = Vec::with_capacity(records.len());
+        let mut missing_document = false;
+        for record in records {
+            if let Some(entry) = history_entry(store, record)? {
+                entries.push(entry);
+            } else {
+                missing_document = true;
+            }
+        }
+        let total_after = store.count_matching(query)?;
+        let page = HistoryPage {
+            entries,
+            total: total_after,
+            apps,
+            offset: query.page.offset,
+            limit: query.page.limit,
+        };
+        if !missing_document && total_before == total_after {
+            return Ok(page);
+        }
+        fallback = Some(page);
+    }
+    fallback.ok_or_else(|| {
+        CliError::Core(CoreError::Storage(
+            "capture history changed too quickly to read".to_owned(),
+        ))
+    })
+}
+
+struct RenderedStored {
+    record: CaptureRecord,
+    document: Document,
+    frame: scrozz_core::Frame,
+    bytes: Arc<Vec<u8>>,
+    source_bytes: Arc<Vec<u8>>,
+}
+
+fn history_entry(
+    store: &mut SqliteStore,
+    record: CaptureRecord,
+) -> CliResult<Option<HistoryEntry>> {
+    let loaded = store.document(&record.id);
+    let (image_present, thumbnail, content_error) = match loaded {
+        Ok(None) => return Ok(None),
+        Ok(Some(DocumentState::ImageEvicted(_))) => (false, None, None),
+        Ok(Some(DocumentState::Complete(document))) => {
+            let rendered = (|| {
+                let preview = history_thumbnail(&document, record.frame.scale)?;
+                let rgba = scrozz_export::to_straight_rgba8(&preview)?;
+                HistoryThumbnail::from_rgba(rgba.width, rgba.height, rgba.data).ok_or_else(|| {
+                    CliError::Core(CoreError::Codec(format!(
+                        "capture {} produced malformed thumbnail pixels",
+                        record.id.0
+                    )))
+                })
+            })();
+            match rendered {
+                Ok(thumbnail) => (true, Some(thumbnail), None),
+                Err(error) => {
+                    tracing::warn!(
+                        capture = %record.id.0,
+                        %error,
+                        "history entry is visible but its content cannot be rendered"
+                    );
+                    (
+                        true,
+                        None,
+                        Some(format!(
+                            "This capture cannot be opened by this build: {error}"
+                        )),
+                    )
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                capture = %record.id.0,
+                %error,
+                "history entry is visible but its document cannot be decoded"
+            );
+            (
+                matches!(&record.image, scrozz_store::ImageState::Present { .. }),
+                None,
+                Some(format!(
+                    "This capture cannot be opened by this build: {error}"
+                )),
+            )
+        }
+    };
+    let width = dimension(record.frame.size.width);
+    let height = dimension(record.frame.size.height);
+    Ok(Some(HistoryEntry {
+        id: record.id,
+        created_at: record.created_at,
+        media_kind: record.media_kind,
+        pinned: record.pinned,
+        app_name: record.app_name,
+        window_title: record.window_title,
+        width,
+        height,
+        scale: record.frame.scale.get(),
+        image_present,
+        content_error,
+        annotation_count: record.annotation_count,
+        ocr_text: record.ocr_text,
+        thumbnail,
+    }))
+}
+
+fn history_thumbnail(
+    document: &Document,
+    source_scale: ScaleFactor,
+) -> CliResult<scrozz_core::Frame> {
+    let logical = document.logical_size();
+    let padding = document
+        .beautification()
+        .map_or(0.0, |beautification| beautification.padding.max(0.0) * 2.0);
+    let longest = (logical.width + padding).max(logical.height + padding);
+    if !longest.is_finite() || longest <= 0.0 {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "capture history thumbnail has invalid geometry".to_owned(),
+        )));
+    }
+
+    let renderer = SkiaRenderer::new();
+    let mut scale = source_scale
+        .get()
+        .min(f64::from(THUMBNAIL_MAX_EDGE) / longest);
+    let mut preview = renderer.render_at(document, ScaleFactor::new(scale))?;
+    let rendered_longest = preview.width().max(preview.height());
+    if rendered_longest > THUMBNAIL_MAX_EDGE {
+        scale *= f64::from(THUMBNAIL_MAX_EDGE) / f64::from(rendered_longest);
+        preview = renderer.render_at(document, ScaleFactor::new(scale))?;
+    }
+    Ok(preview)
+}
+
+fn dimension(value: f64) -> u32 {
+    value.round().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+fn capture_kind(provenance: Provenance) -> CaptureKind {
+    match provenance {
+        Provenance::Window => CaptureKind::Window,
+        Provenance::Region | Provenance::Stitched => CaptureKind::Region,
+        Provenance::Display | Provenance::AllDisplays => CaptureKind::Fullscreen,
+    }
+}
+
+fn stem_for(record: &CaptureRecord) -> String {
+    record
+        .window_title
+        .as_deref()
+        .or(record.app_name.as_deref())
+        .unwrap_or("Scrozz capture")
+        .to_owned()
+}
+
+fn drag_payload(stem: &str, bytes: Arc<Vec<u8>>, geometry: DragGeometry) -> CliResult<DragPayload> {
+    let promised = Arc::clone(&bytes);
+    let source = byte_source(move || Ok(promised.as_ref().clone()));
+    let preview = DragPreview::from_png(bytes.as_ref().clone(), geometry.rect.size)?;
+    Ok(DragPayload::png_capture(stem, source).with_preview(preview))
+}
+
+fn history_not_found(capture: &CaptureId) -> CliError {
+    CliError::Core(CoreError::Storage(format!(
+        "capture {:?} was not found in history",
+        capture.0
+    )))
+}
+
+fn history_image_evicted(capture: &CaptureId) -> CliError {
+    CliError::Core(CoreError::Storage(format!(
+        "capture {:?} is still in history, but its source image was evicted by the retention policy",
+        capture.0
+    )))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use scrozz_store::test_support::{
+        ScratchDir, richly_annotated_document, sample_document, scratch_dir,
+    };
+
     use super::*;
     use scrozz_core::{
         ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Provenance, RegionSelector,
@@ -1747,6 +2598,7 @@ mod tests {
                     full: Arc::new(one_pixel_png()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Region,
                 target: CaptureTarget::AllDisplays,
@@ -1757,15 +2609,15 @@ mod tests {
         );
         worker.open(card);
 
-        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+        let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
         assert!(
-            (capture.frame.scale.get() - 2.0).abs() < f64::EPSILON,
+            (document.source.frame.scale.get() - 2.0).abs() < f64::EPSILON,
             "the capture's own scale should survive the cache, not decode's identity"
         );
         assert_eq!(
-            capture.frame.color_space,
+            document.source.frame.color_space,
             ColorSpace::DisplayP3,
             "a wide-gamut capture must not become unlabelled on the way to the editor"
         );
@@ -1786,6 +2638,7 @@ mod tests {
                     full: Arc::new(two_by_two_png()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Region,
                 target: CaptureTarget::AllDisplays,
@@ -1796,10 +2649,10 @@ mod tests {
         );
         worker.open(card);
 
-        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+        let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        let logical = f64::from(capture.frame.width()) / capture.frame.scale.get();
+        let logical = f64::from(document.source.frame.width()) / document.source.frame.scale.get();
         assert!(
             (logical - 1.0).abs() < f64::EPSILON,
             "a 2x2 physical capture at 2.0 scale is 1x1 logical, not 2x2"
@@ -1820,6 +2673,7 @@ mod tests {
                     full: Arc::new(one_pixel_png()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Region,
                 target: CaptureTarget::AllDisplays,
@@ -1830,10 +2684,10 @@ mod tests {
         );
         worker.open(card);
 
-        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+        let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        assert_eq!(capture.frame.color_space, ColorSpace::Unknown);
+        assert_eq!(document.source.frame.color_space, ColorSpace::Unknown);
     }
 
     #[test]
@@ -1852,6 +2706,7 @@ mod tests {
                     full: Arc::new(one_pixel_png()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Window,
                 target: CaptureTarget::Window(scrozz_core::WindowId("test-window".to_owned())),
@@ -1862,12 +2717,12 @@ mod tests {
         );
         worker.open(card);
 
-        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+        let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        assert_eq!(capture.provenance, Provenance::Window);
+        assert_eq!(document.source.provenance, Provenance::Window);
         assert!(
-            !scrozz_annotate::Document::new(*capture).may_beautify(),
+            !document.may_beautify(),
             "a window capture must still refuse beautification after a round trip"
         );
     }
@@ -1888,6 +2743,7 @@ mod tests {
                     full: Arc::new(one_pixel_png()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Region,
                 target: CaptureTarget::Region(bounds),
@@ -1898,11 +2754,11 @@ mod tests {
         );
         worker.open(card);
 
-        let Some(Outcome::Opened { capture, .. }) = inbox.try_iter().next() else {
+        let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        assert_eq!(capture.provenance, Provenance::Region);
-        assert!(scrozz_annotate::Document::new(*capture).may_beautify());
+        assert_eq!(document.source.provenance, Provenance::Region);
+        assert!(document.may_beautify());
     }
 
     #[test]
@@ -1916,6 +2772,7 @@ mod tests {
                     full: Arc::new(one_pixel_png()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Region,
                 target: CaptureTarget::AllDisplays,
@@ -1929,6 +2786,37 @@ mod tests {
             inbox.try_iter().next(),
             Some(Outcome::Refused { card, .. }) if card == CardId(9)
         ));
+    }
+
+    #[test]
+    fn unavailable_stored_edits_fall_back_to_flattened_pixels_not_raw_source() {
+        let card = CardId(10);
+        let (mut worker, inbox) = worker_holding(
+            card,
+            Cached {
+                bytes: CaptureBytes {
+                    generation: None,
+                    revision: 0,
+                    full: Arc::new(two_by_two_png()),
+                    preview: None,
+                },
+                editor_source: Some(Arc::new(one_pixel_png())),
+                rendered: None,
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::IDENTITY,
+                color_space: ColorSpace::Srgb,
+                capture_id: Some(CaptureId("stored-redaction".into())),
+            },
+        );
+
+        worker.open(card);
+
+        let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
+            panic!("flattened fallback should remain editable");
+        };
+        assert_eq!(document.source.frame.width(), 2);
+        assert_eq!(document.source.frame.height(), 2);
     }
 
     fn sample_capture(provenance: Provenance) -> Capture {
@@ -1962,6 +2850,30 @@ mod tests {
         settings
     }
 
+    fn worker_with_store(label: &str) -> (ScratchDir, Worker, Receiver<Outcome>) {
+        let dir = scratch_dir(label);
+        let store = SqliteStore::open_ephemeral(dir.path()).expect("open isolated history");
+        let (outcomes, receiver) = channel();
+        (
+            dir,
+            Worker {
+                outcomes,
+                waker: None,
+                selector: Arc::new(RefusingSelector),
+                store: Some(store),
+                vault: CaptureVault::new(),
+                pin_generations: HashMap::new(),
+            },
+            receiver,
+        )
+    }
+
+    fn received(receiver: &Receiver<Outcome>) -> Outcome {
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker outcome")
+    }
+
     #[test]
     fn a_pipeline_hands_out_distinct_card_identities() {
         let mut pipeline = start_pipeline();
@@ -1990,6 +2902,413 @@ mod tests {
         assert!(pipeline.post(Job::Copy(CardId(404))));
         let _ = wait_for(&pipeline);
         assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn queued_history_reads_coalesce_to_the_newest_generation() {
+        let dir = scratch_dir("history-coalescing");
+        let store = SqliteStore::open_ephemeral(dir.path()).expect("history store");
+        let (outcomes, receiver) = channel();
+        let (queries, query_receiver) = channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        queries
+            .send(HistoryQuery::Load {
+                request: 1,
+                query: SearchQuery::all().text("obsolete"),
+            })
+            .expect("first query");
+        queries
+            .send(HistoryQuery::Load {
+                request: 2,
+                query: SearchQuery::all(),
+            })
+            .expect("newest query");
+        let worker = std::thread::spawn(move || {
+            HistoryReader {
+                outcomes,
+                waker: Some(waker),
+                store: Some(store),
+                open_default: false,
+            }
+            .run(&query_receiver);
+        });
+
+        let Outcome::HistoryLoaded { request, .. } = received(&receiver) else {
+            panic!("expected a history page");
+        };
+        assert_eq!(request, 2);
+        assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        queries.send(HistoryQuery::Stop).expect("stop history");
+        worker.join().expect("history worker");
+        drop(dir);
+    }
+
+    #[test]
+    fn disabled_history_refuses_queries_without_opening_the_default_profile() {
+        let pipeline =
+            Pipeline::start_with_history(Arc::new(RefusingSelector), false).expect("worker");
+        assert!(pipeline.query_history(7, SearchQuery::all()));
+
+        let Some(Outcome::HistoryFailed {
+            request,
+            operation,
+            error,
+            ..
+        }) = wait_for(&pipeline)
+        else {
+            panic!("disabled history did not answer explicitly");
+        };
+        assert_eq!(request, Some(7));
+        assert_eq!(operation, HistoryOperation::Query);
+        assert!(error.to_string().contains("unavailable"), "{error}");
+    }
+
+    #[test]
+    fn history_reads_return_filtered_entries_counts_apps_and_previews() {
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-query");
+        let video = sample_document(64, 32, 1, 2);
+        let screenshot = sample_document(40, 20, 2, 0);
+        let video_id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(
+                NewCapture::of_kind(&video, scrozz_store::MediaKind::Video)
+                    .from_app("Figma")
+                    .titled("Needle review")
+                    .with_ocr("needle in recognised text")
+                    .taken_at(scrozz_store::Timestamp(2_000)),
+            )
+            .expect("insert video");
+        worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(
+                NewCapture::new(&screenshot)
+                    .from_app("Preview")
+                    .titled("Other capture")
+                    .taken_at(scrozz_store::Timestamp(1_000)),
+            )
+            .expect("insert screenshot");
+
+        let query = SearchQuery::all()
+            .text("needle")
+            .kind(scrozz_store::MediaKind::Video)
+            .paged(scrozz_store::Page::new(1, 0));
+        let page =
+            load_history_page(worker.store.as_mut().expect("store"), &query).expect("history page");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.apps, ["Figma", "Preview"]);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, video_id);
+        assert_eq!(page.entries[0].annotation_count, 2);
+        assert!(page.entries[0].thumbnail.is_some());
+    }
+
+    #[test]
+    fn one_unreadable_document_does_not_hide_the_rest_of_its_history_page() {
+        let (dir, mut worker, _receiver) = worker_with_store("worker-future-document");
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&sample_document(16, 8, 3, 1)))
+            .expect("insert");
+        let record = worker
+            .store
+            .as_ref()
+            .expect("store")
+            .record(&id)
+            .expect("read")
+            .expect("record");
+        let path = worker
+            .store
+            .as_ref()
+            .expect("store")
+            .layout()
+            .record_path(&id)
+            .expect("record path");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read sidecar"))
+                .expect("decode sidecar");
+        value["document"] = serde_json::json!({"future_annotation_schema": 99});
+        std::fs::write(&path, serde_json::to_vec(&value).expect("encode sidecar"))
+            .expect("write sidecar");
+
+        let entry = history_entry(worker.store.as_mut().expect("store"), record)
+            .expect("page remains readable")
+            .expect("entry remains visible");
+        assert_eq!(entry.id, id);
+        assert!(entry.thumbnail.is_none());
+        assert!(entry.content_error.is_some());
+        drop(dir);
+    }
+
+    #[test]
+    fn history_restore_and_editor_keep_the_complete_document() {
+        let (_dir, mut worker, receiver) = worker_with_store("worker-restore");
+        let document = richly_annotated_document(42);
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&document).titled("Editable"))
+            .expect("insert");
+
+        worker.open_history_editor(id.clone(), CardId(8));
+        let Outcome::Opened {
+            card,
+            document: loaded,
+            editor_only,
+        } = received(&receiver)
+        else {
+            panic!("expected an editable document");
+        };
+        assert_eq!(card, CardId(8));
+        assert!(editor_only);
+        assert_eq!(loaded.data(), document.data());
+        assert!(worker.vault.get(CardId(8)).is_some());
+        assert!(matches!(
+            received(&receiver),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::OpenEditor,
+                ..
+            }
+        ));
+
+        let expected = SkiaRenderer::new()
+            .render(&document)
+            .expect("reference render");
+        worker.prepare_image(CardId(8), 1, 7, document.data());
+        assert!(matches!(
+            received(&receiver),
+            Outcome::Prepared {
+                card: CardId(8),
+                generation: 1,
+                revision: 7,
+            }
+        ));
+        let prepared = worker
+            .vault
+            .get_revision(CardId(8), 1, 7)
+            .expect("prepared history revision");
+        let actual = scrozz_export::decode(&prepared.full).expect("decode prepared revision");
+        assert_eq!(
+            actual.data, expected.data,
+            "stored annotations were baked into the source and applied twice"
+        );
+
+        worker.restore(id.clone(), CardId(9));
+        let Outcome::Restored(card) = received(&receiver) else {
+            panic!("expected a restored card");
+        };
+        assert_eq!(card.id, CardId(9));
+        assert_eq!(card.capture_id.as_ref(), Some(&id));
+        assert_eq!(card.source_px(), (128, 112));
+        assert!(worker.vault.get(CardId(9)).is_some());
+    }
+
+    #[test]
+    fn selected_history_drag_is_fully_rendered_before_the_gesture() {
+        let (dir, mut worker, receiver) = worker_with_store("worker-drag-preload");
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&richly_annotated_document(5)))
+            .expect("insert");
+
+        worker.prepare_history_drag(id.clone());
+        let Outcome::HistoryDragPrepared { capture, prepared } = received(&receiver) else {
+            panic!("expected a prepared history drag");
+        };
+        assert_eq!(capture, id);
+        let geometry = DragGeometry {
+            rect: LogicalRect::new(
+                LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(240.0, 160.0),
+            ),
+            pointer: LogicalPoint::new(80.0, 60.0),
+        };
+        let payload = prepared.payload(geometry).expect("payload");
+        let (artifact, bytes) = payload.materialise(dir.path()).expect("materialise");
+        assert!(!bytes.is_empty());
+        drop(artifact);
+    }
+
+    #[test]
+    fn history_pin_and_delete_mutate_the_worker_store() {
+        let (_dir, mut worker, receiver) = worker_with_store("worker-mutations");
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&sample_document(16, 8, 3, 1)))
+            .expect("insert");
+
+        worker.set_pinned(id.clone(), true);
+        assert!(matches!(
+            received(&receiver),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::Pin,
+                pinned: Some(true),
+                ..
+            }
+        ));
+        assert!(
+            worker
+                .store
+                .as_ref()
+                .expect("store")
+                .record(&id)
+                .expect("read")
+                .expect("record")
+                .pinned
+        );
+
+        worker.delete(id.clone());
+        assert!(matches!(
+            received(&receiver),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::Delete,
+                ..
+            }
+        ));
+        assert!(
+            worker
+                .store
+                .as_ref()
+                .expect("store")
+                .record(&id)
+                .expect("read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_pin_texture_renders_saved_edits_instead_of_raw_source_pixels() {
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-pin-render");
+        let document = richly_annotated_document(17);
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&document))
+            .expect("insert");
+
+        let actual = worker.load_pin_texture(&id).expect("pin texture");
+        let rendered = SkiaRenderer::new()
+            .render(&document)
+            .expect("render saved edits");
+        let expected =
+            Thumbnail::from_frame(&rendered, PIN_TEXTURE_MAX_EDGE).expect("expected texture");
+        let raw = Thumbnail::from_frame(&document.source.frame, PIN_TEXTURE_MAX_EDGE)
+            .expect("raw source texture");
+
+        assert_eq!(actual.pixels(), expected.pixels());
+        assert_ne!(
+            actual.pixels(),
+            raw.pixels(),
+            "pinning exposed the pixels underneath the saved edits"
+        );
+    }
+
+    #[test]
+    fn pinning_an_active_editor_persists_and_displays_the_exact_revision() {
+        let (_dir, mut worker, receiver) = worker_with_store("worker-edited-pin");
+        let original = richly_annotated_document(4);
+        let edited = richly_annotated_document(44);
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&original))
+            .expect("insert");
+        let card = CardId(13);
+        worker.open_history_editor(id.clone(), card);
+        let _ = received(&receiver);
+        let _ = received(&receiver);
+        let rendered = RevisionedFrame::from_document(&edited, 8).expect("render edited pin");
+        let expected =
+            Thumbnail::from_frame(rendered.frame(), PIN_TEXTURE_MAX_EDGE).expect("pin texture");
+        let editor = PinEditorSnapshot {
+            generation: 5,
+            revision: 8,
+            rendered,
+            document: edited.data(),
+        };
+        let state = PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(320.0, 180.0),
+            ),
+            scrozz_core::PinScale::ORIGINAL,
+            None,
+        );
+
+        worker.pin_card(card, &id, PinGeneration(1), &state, Some(&editor));
+
+        let Outcome::PinCreated { texture, .. } = received(&receiver) else {
+            panic!("edited pin was not committed");
+        };
+        assert_eq!(
+            texture.expect("edited pin texture").pixels(),
+            expected.pixels()
+        );
+        let DocumentState::Complete(reloaded) = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .document(&id)
+            .expect("read")
+            .expect("document")
+        else {
+            panic!("edited pin document was evicted");
+        };
+        assert_eq!(reloaded.data(), edited.data());
+    }
+
+    #[test]
+    fn closing_a_history_editor_persists_its_exact_scene_graph() {
+        let (_dir, mut worker, receiver) = worker_with_store("worker-editor-persist");
+        let original = richly_annotated_document(1);
+        let changed = richly_annotated_document(99);
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&original))
+            .expect("insert");
+        worker.open_history_editor(id.clone(), CardId(12));
+        let _ = received(&receiver);
+        let _ = received(&receiver);
+
+        worker.persist_document(CardId(12), 3, 9, &changed.data());
+
+        assert!(matches!(
+            received(&receiver),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::Edit,
+                capture: Some(ref saved),
+                ..
+            } if saved == &id
+        ));
+        let DocumentState::Complete(reloaded) = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .document(&id)
+            .expect("read")
+            .expect("document")
+        else {
+            panic!("saved editor source was unexpectedly evicted");
+        };
+        assert_eq!(reloaded.data(), changed.data());
     }
 
     #[test]
@@ -2162,6 +3481,7 @@ mod tests {
                     full: Arc::new(Vec::new()),
                     preview: None,
                 },
+                editor_source: None,
                 rendered: None,
                 provenance: Provenance::Region,
                 target: CaptureTarget::AllDisplays,
@@ -2187,7 +3507,7 @@ mod tests {
             None,
         );
 
-        worker.pin_card(card, &capture, PinGeneration(1), &state);
+        worker.pin_card(card, &capture, PinGeneration(1), &state, None);
 
         match outcome_rx.recv().expect("rollback outcome") {
             Outcome::PinCreationFailed {

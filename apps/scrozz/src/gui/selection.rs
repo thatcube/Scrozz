@@ -1255,7 +1255,12 @@ impl ClientOverlayController {
 /// events that terminate a drag. egui otherwise keeps those inputs down forever,
 /// and the next selection's launch-click barrier can never become quiescent.
 pub fn release_modal_drag_input(ctx: &egui::Context) {
-    ctx.input_mut_for(egui::ViewportId::ROOT, |input| {
+    release_modal_drag_input_for(ctx, egui::ViewportId::ROOT);
+}
+
+/// Clears input consumed by a native drag loop from one viewport.
+pub fn release_modal_drag_input_for(ctx: &egui::Context, viewport: egui::ViewportId) {
+    ctx.input_mut_for(viewport, |input| {
         let had_stale_input = input.pointer.any_down()
             || !input.keys_down.is_empty()
             || input.modifiers != egui::Modifiers::NONE;
@@ -2967,6 +2972,20 @@ mod tests {
         selector.cancel();
         controller.logic(&ctx, &native);
         assert!(worker.join().expect("selection worker").is_err());
+    }
+
+    #[test]
+    fn modal_drag_input_release_can_target_an_ordinary_child_viewport() {
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::from_hash_of("history-drag-input-test");
+        ctx.input_mut_for(viewport, |input| {
+            input.modifiers = egui::Modifiers::COMMAND;
+            input.keys_down.insert(egui::Key::A);
+        });
+
+        release_modal_drag_input_for(&ctx, viewport);
+
+        assert!(input_is_quiescent(&ctx, viewport));
     }
 
     #[test]

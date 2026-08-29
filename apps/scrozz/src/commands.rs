@@ -728,7 +728,7 @@ fn history_get(
 ) -> CliResult<Report> {
     let capture_id = CaptureId(id.to_owned());
     let document = match store.document(&capture_id)? {
-        Some(DocumentState::Complete(document)) => document,
+        Some(DocumentState::Complete(document)) => *document,
         Some(DocumentState::ImageEvicted(_)) => return Err(history_image_evicted(id)),
         None => return Err(history_not_found(id)),
     };
@@ -949,7 +949,7 @@ fn ocr_stored_capture(
 ) -> CliResult<Report> {
     let capture_id = CaptureId(id.to_owned());
     let document = match store.document(&capture_id)? {
-        Some(DocumentState::Complete(document)) => document,
+        Some(DocumentState::Complete(document)) => *document,
         Some(DocumentState::ImageEvicted(_)) => return Err(history_image_evicted(id)),
         None => return Err(history_not_found(id)),
     };

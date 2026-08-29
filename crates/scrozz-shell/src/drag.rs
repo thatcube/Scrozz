@@ -638,6 +638,34 @@ impl NativeSurface {
     }
 }
 
+/// Finds the native content surface of one of this process's application
+/// windows by title.
+///
+/// Secondary egui viewports do not expose a raw window handle to their parent
+/// callback. The native drag must still begin from the window where the gesture
+/// occurred, so the platform backend resolves that ordinary application window
+/// immediately before starting the drag.
+///
+/// # Errors
+///
+/// Returns [`Error::TargetGone`] if the window closed or has no content surface,
+/// or [`Error::Unsupported`] on platforms whose native drag backend is not
+/// implemented yet.
+pub fn native_surface_for_window(title: &str) -> Result<NativeSurface> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::drag::surface_for_window_title(title)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(Error::Unsupported {
+            what: "secondary-window drag source lookup".to_owned(),
+            why: format!("native window lookup is not implemented for {title:?} on this platform"),
+        })
+    }
+}
+
 /// The geometry of the moment the user committed to a drag.
 ///
 /// All coordinates are **window-local logical points with a top-left origin** —

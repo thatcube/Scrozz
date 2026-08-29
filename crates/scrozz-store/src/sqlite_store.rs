@@ -120,7 +120,7 @@ impl<'a> NewCapture<'a> {
 #[derive(Debug, Clone)]
 pub enum DocumentState {
     /// The pixels are here; this is the full editable document.
-    Complete(Document),
+    Complete(Box<Document>),
     /// The pixels were evicted under the size cap. Every edit is intact.
     ImageEvicted(Box<EvictedDocument>),
 }
@@ -130,7 +130,7 @@ impl DocumentState {
     #[must_use]
     pub fn complete(self) -> Option<Document> {
         match self {
-            Self::Complete(document) => Some(document),
+            Self::Complete(document) => Some(*document),
             Self::ImageEvicted(_) => None,
         }
     }
@@ -1003,9 +1003,9 @@ impl History for SqliteStore {
             provenance: record.provenance.into(),
             target: record.target.clone().into(),
         };
-        Ok(Some(DocumentState::Complete(Document::from_data(
-            capture, data,
-        )?)))
+        Ok(Some(DocumentState::Complete(Box::new(
+            Document::from_data(capture, data)?,
+        ))))
     }
 
     fn image(&mut self, id: &CaptureId) -> Result<Option<Vec<u8>>> {

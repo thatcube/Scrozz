@@ -35,7 +35,7 @@ pub use color_picker::{ColorPickerEvent, SystemColorPicker};
 pub use drag::{
     ArtifactState, ByteSource, DragArtifact, DragCapability, DragFormat, DragOperation, DragOrigin,
     DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
-    NativeSurface, PromisedFile, byte_source, native_drag_source,
+    NativeSurface, PromisedFile, byte_source, native_drag_source, native_surface_for_window,
 };
 pub use filesystem::replace_file;
 pub use hotkey::{
