@@ -88,6 +88,7 @@ objc2-screen-capture-kit = "0.3"
 objc2-vision = "0.3"
 objc2-av-foundation = "0.3"
 objc2-core-media = "0.3"
+objc2-media-toolbox = "0.3"
 dispatch2 = "0.3"
 
 # --- Windows ---

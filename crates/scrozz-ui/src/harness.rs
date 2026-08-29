@@ -1130,8 +1130,9 @@ impl Fixture {
             | Scenario::RecordingFailedPartial => (460.0, 420.0),
             Scenario::RecordingSelecting => (680.0, 760.0),
             Scenario::RecordingCountdown => (720.0, 480.0),
-            Scenario::VideoEditing | Scenario::VideoExporting => (940.0, 820.0),
-            Scenario::VideoExportFailedPartial => (940.0, 940.0),
+            Scenario::VideoEditing
+            | Scenario::VideoExporting
+            | Scenario::VideoExportFailedPartial => (940.0, 940.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
             | Scenario::SelectorRemembered

@@ -129,6 +129,7 @@ never run either probe:
 SCROZZ_RECORD_WINDOW_SMOKE=1 tools/run-macos-recording-smoke.sh window-disappearance
 tools/run-macos-recording-smoke.sh microphone-package # build/sign only; no prompt
 SCROZZ_RECORD_MIC_SMOKE=1 tools/run-macos-recording-smoke.sh microphone
+SCROZZ_PLAYBACK_SMOKE=1 tools/run-macos-playback-smoke.sh # plays a quiet A/V fixture
 ```
 
 ### From the command line

@@ -3,10 +3,12 @@
 use std::time::Duration;
 
 use egui::{
-    ComboBox, ProgressBar, Response, RichText, Sense, Slider, Stroke, StrokeKind, Ui, vec2,
+    Align2, ComboBox, Image, ProgressBar, Response, RichText, Sense, Slider, Stroke, StrokeKind,
+    Ui, load::SizedTexture, vec2,
 };
 use scrozz_record::{
     edit::{ChannelBehavior, EditOutput, EditPlan, PlaybackState, VideoDocument},
+    playback::{PlaybackAudio, PlaybackPhase, PlaybackSnapshot},
     settings::{Quality, ResolutionCap},
     transcode::{TranscodeFailure, TranscodeOutput, TranscodeStatus},
 };
@@ -78,8 +80,59 @@ pub struct VideoEditorModel<'a> {
     pub document: &'a VideoDocument,
     /// Edit plan to expose this pass.
     pub plan: EditPlan,
+    /// Decoded preview and native media-clock state.
+    pub preview: VideoPreview<'a>,
     /// Current export state.
     pub transcode: TranscodeView<'a>,
+}
+
+/// Decoded preview values supplied by the overlay texture owner.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoPreview<'a> {
+    /// Uploaded decoded frame.
+    pub texture: Option<SizedTexture>,
+    /// Native playback lifecycle.
+    pub phase: PlaybackPhase,
+    /// Requested playback rate.
+    pub rate: f32,
+    /// Source timestamp through which frames are decoded.
+    pub buffered_until: Duration,
+    /// Captured-audio behavior.
+    pub audio: PlaybackAudio,
+    /// Distance from the native clock to the displayed frame interval.
+    pub av_drift: Option<Duration>,
+    /// Explicit playback failure.
+    pub error: Option<&'a str>,
+}
+
+impl<'a> VideoPreview<'a> {
+    /// Borrows native playback state and pairs it with an uploaded frame.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &'a PlaybackSnapshot, texture: Option<SizedTexture>) -> Self {
+        Self {
+            texture,
+            phase: snapshot.phase,
+            rate: snapshot.rate,
+            buffered_until: snapshot.buffered_until,
+            audio: snapshot.audio,
+            av_drift: snapshot.av_drift,
+            error: snapshot.error.as_deref(),
+        }
+    }
+}
+
+impl Default for VideoPreview<'_> {
+    fn default() -> Self {
+        Self {
+            texture: None,
+            phase: PlaybackPhase::Paused,
+            rate: 1.0,
+            buffered_until: Duration::ZERO,
+            audio: PlaybackAudio::NoTrack,
+            av_drift: None,
+            error: None,
+        }
+    }
 }
 
 /// Semantic action requested by the video editor.
@@ -93,6 +146,8 @@ pub enum VideoEditorAction {
     Pause,
     /// Move the document playback cursor.
     Seek(Duration),
+    /// Change native playback rate.
+    SetRate(f32),
     /// Adopt the updated non-destructive edit plan.
     PlanChanged(EditPlan),
     /// Start transcoding this validated plan.
@@ -110,7 +165,7 @@ pub enum VideoEditorAction {
 pub struct VideoEditorControls {
     /// Whether playback can change.
     pub transport_enabled: bool,
-    /// Whether seek and trim values can change.
+    /// Whether non-destructive trim values can change.
     pub timeline_enabled: bool,
     /// Whether source audio controls are applicable and editable.
     pub audio_enabled: bool,
@@ -171,6 +226,7 @@ impl<'a> VideoEditor<'a> {
         let mut actions = Vec::new();
         let mut plan_changed = false;
         let running = self.model.transcode.is_running();
+        let playback_available = self.model.preview.phase != PlaybackPhase::Failed;
         let gif = !plan.output.supports_audio();
         if gif && !plan.audio.mute {
             plan.audio.mute = true;
@@ -219,7 +275,15 @@ impl<'a> VideoEditor<'a> {
                 });
             });
 
-            ui.add_space(Space::LG);
+            ui.add_space(Space::SM);
+            draw_video_preview(
+                ui,
+                self.theme,
+                self.model.preview,
+                metadata.width,
+                metadata.height,
+            );
+            ui.add_space(Space::SM);
             draw_trim_track(ui, self.theme, duration, document.position(), plan);
             ui.add_space(Space::SM);
 
@@ -229,7 +293,8 @@ impl<'a> VideoEditor<'a> {
                 } else {
                     "Play"
                 };
-                let transport = button(ui, self.theme, label, false, !running);
+                let transport =
+                    button(ui, self.theme, label, false, !running && playback_available);
                 if transport.clicked() {
                     actions.push(if document.playback() == PlaybackState::Playing {
                         VideoEditorAction::Pause
@@ -242,9 +307,12 @@ impl<'a> VideoEditor<'a> {
                 let mut position = document.position().as_secs_f64();
                 let seek = ui.add_enabled(
                     !running,
-                    Slider::new(&mut position, 0.0..=duration.as_secs_f64())
-                        .show_value(false)
-                        .text("Playback position"),
+                    Slider::new(
+                        &mut position,
+                        plan.trim.start.as_secs_f64()..=plan.trim.end.as_secs_f64(),
+                    )
+                    .show_value(false)
+                    .text("Playback position"),
                 );
                 if seek.changed()
                     && let Ok(position) = Duration::try_from_secs_f64(position)
@@ -252,15 +320,34 @@ impl<'a> VideoEditor<'a> {
                     actions.push(VideoEditorAction::Seek(position));
                 }
                 seek_response = Some(seek);
+
+                ui.add_enabled_ui(!running && playback_available, |ui| {
+                    ComboBox::from_id_salt("video-editor-rate")
+                        .selected_text(format!("{}×", format_rate(self.model.preview.rate)))
+                        .show_ui(ui, |ui| {
+                            for rate in [0.5_f32, 1.0, 1.5, 2.0] {
+                                if ui
+                                    .selectable_label(
+                                        (self.model.preview.rate - rate).abs() < f32::EPSILON,
+                                        format!("{}×", format_rate(rate)),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(VideoEditorAction::SetRate(rate));
+                                }
+                            }
+                        });
+                });
             });
 
-            ui.add_space(Space::LG);
+            ui.add_space(Space::SM);
             rule(ui, self.theme);
-            ui.add_space(Space::MD);
+            ui.add_space(Space::SM);
             section_label(ui, self.theme, "Trim");
 
             let mut trim_start = plan.trim.start.as_secs_f64();
             let mut trim_end = plan.trim.end.as_secs_f64();
+            let minimum_trim = (1.0 / metadata.fps).max(0.001);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("In {}", format_duration(plan.trim.start)))
@@ -269,7 +356,7 @@ impl<'a> VideoEditor<'a> {
                 );
                 let start = ui.add_enabled(
                     !running,
-                    Slider::new(&mut trim_start, 0.0..=duration.as_secs_f64())
+                    Slider::new(&mut trim_start, 0.0..=(trim_end - minimum_trim).max(0.0))
                         .show_value(false)
                         .text("Trim in"),
                 );
@@ -288,9 +375,13 @@ impl<'a> VideoEditor<'a> {
                 );
                 let end = ui.add_enabled(
                     !running,
-                    Slider::new(&mut trim_end, 0.0..=duration.as_secs_f64())
-                        .show_value(false)
-                        .text("Trim out"),
+                    Slider::new(
+                        &mut trim_end,
+                        (trim_start + minimum_trim).min(duration.as_secs_f64())
+                            ..=duration.as_secs_f64(),
+                    )
+                    .show_value(false)
+                    .text("Trim out"),
                 );
                 if end.changed()
                     && let Ok(value) = Duration::try_from_secs_f64(trim_end)
@@ -300,9 +391,9 @@ impl<'a> VideoEditor<'a> {
                 }
             });
 
-            ui.add_space(Space::LG);
+            ui.add_space(Space::SM);
             rule(ui, self.theme);
-            ui.add_space(Space::MD);
+            ui.add_space(Space::SM);
             section_label(ui, self.theme, "Export");
 
             ui.columns(2, |columns| {
@@ -389,54 +480,60 @@ impl<'a> VideoEditor<'a> {
                 ui.add_space(Space::SM);
                 section_label(ui, self.theme, "Audio");
                 let mut volume = plan.audio.volume;
-                let volume_response = ui.add_enabled(
-                    !running && !plan.audio.mute,
-                    Slider::new(
-                        &mut volume,
-                        0.0..=scrozz_record::edit::AudioEdit::MAX_VOLUME,
-                    )
-                    .text("Volume")
-                    .suffix("×"),
-                );
-                if volume_response.changed() {
-                    plan.audio.volume = volume;
-                    plan_changed = true;
-                }
+                ui.horizontal_wrapped(|ui| {
+                    let volume_response = ui
+                        .add_enabled_ui(!running && !plan.audio.mute, |ui| {
+                            ui.add_sized(
+                                [220.0, ui.spacing().interact_size.y],
+                                Slider::new(
+                                    &mut volume,
+                                    0.0..=scrozz_record::edit::AudioEdit::MAX_VOLUME,
+                                )
+                                .text("Volume")
+                                .suffix("×"),
+                            )
+                        })
+                        .inner;
+                    if volume_response.changed() {
+                        plan.audio.volume = volume;
+                        plan_changed = true;
+                    }
 
-                let mute_response = ui.add_enabled(
-                    !running,
-                    egui::Checkbox::new(
-                        &mut plan.audio.mute,
-                        RichText::new("Mute")
-                            .font(self.theme.font(Text::Label))
-                            .color(self.theme.palette.text),
-                    ),
-                );
-                plan_changed |= mute_response.changed();
-
-                if metadata.audio_channels > 1 {
-                    let mut mono = plan.audio.channels == ChannelBehavior::StereoToMono;
-                    let mono_response = ui.add_enabled(
-                        !running && !plan.audio.mute,
+                    let mute_response = ui.add_enabled(
+                        !running,
                         egui::Checkbox::new(
-                            &mut mono,
-                            RichText::new("Stereo to mono")
+                            &mut plan.audio.mute,
+                            RichText::new("Mute")
                                 .font(self.theme.font(Text::Label))
                                 .color(self.theme.palette.text),
                         ),
                     );
-                    if mono_response.changed() {
-                        plan.audio.channels = if mono {
-                            ChannelBehavior::StereoToMono
-                        } else {
-                            ChannelBehavior::Preserve
-                        };
-                        plan_changed = true;
+                    plan_changed |= mute_response.changed();
+
+                    if metadata.audio_channels > 1 {
+                        let mut mono = plan.audio.channels == ChannelBehavior::StereoToMono;
+                        let mono_response = ui.add_enabled(
+                            !running && !plan.audio.mute,
+                            egui::Checkbox::new(
+                                &mut mono,
+                                RichText::new("Stereo to mono")
+                                    .font(self.theme.font(Text::Label))
+                                    .color(self.theme.palette.text),
+                            ),
+                        );
+                        if mono_response.changed() {
+                            plan.audio.channels = if mono {
+                                ChannelBehavior::StereoToMono
+                            } else {
+                                ChannelBehavior::Preserve
+                            };
+                            plan_changed = true;
+                        }
                     }
-                }
+                });
             }
 
-            ui.add_space(Space::MD);
+            ui.add_space(Space::SM);
             draw_transcode_status(
                 ui,
                 self.theme,
@@ -454,9 +551,9 @@ impl<'a> VideoEditor<'a> {
                 ui.colored_label(self.theme.palette.recording, error);
             }
 
-            ui.add_space(Space::LG);
+            ui.add_space(Space::SM);
             rule(ui, self.theme);
-            ui.add_space(Space::MD);
+            ui.add_space(Space::SM);
             ui.horizontal(|ui| {
                 if running {
                     let cancel = button(ui, self.theme, "Cancel export", false, true);
@@ -494,7 +591,7 @@ impl<'a> VideoEditor<'a> {
             .map(|error| error.to_string());
         let audio_enabled = metadata.audio_channels > 0 && plan.output.supports_audio() && !running;
         let controls = VideoEditorControls {
-            transport_enabled: !running,
+            transport_enabled: !running && playback_available,
             timeline_enabled: !running,
             audio_enabled,
             mono_enabled: audio_enabled && metadata.audio_channels > 1 && !plan.audio.mute,
@@ -514,6 +611,104 @@ impl<'a> VideoEditor<'a> {
             cancel_export_response,
             reveal_response,
         }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn draw_video_preview(
+    ui: &mut Ui,
+    theme: &Theme,
+    preview: VideoPreview<'_>,
+    width: u32,
+    height: u32,
+) {
+    let aspect = (width as f32 / height.max(1) as f32).max(0.1);
+    let available_width = ui.available_width().max(1.0);
+    let preview_height = (available_width / aspect).clamp(120.0, 170.0);
+    let size = vec2(
+        (preview_height * aspect).min(available_width),
+        preview_height,
+    );
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        ui.painter()
+            .rect_filled(rect, corner(Radius::THUMB), egui::Color32::BLACK);
+        if let Some(texture) = preview.texture {
+            let texture_aspect = texture.size.x / texture.size.y.max(1.0);
+            let fitted = if texture_aspect >= rect.width() / rect.height() {
+                vec2(rect.width(), rect.width() / texture_aspect)
+            } else {
+                vec2(rect.height() * texture_aspect, rect.height())
+            };
+            let image_rect = egui::Rect::from_center_size(rect.center(), fitted);
+            ui.put(
+                image_rect,
+                Image::from_texture(texture)
+                    .fit_to_exact_size(fitted)
+                    .maintain_aspect_ratio(true),
+            );
+        } else {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                match preview.phase {
+                    PlaybackPhase::Loading => "Decoding preview…",
+                    PlaybackPhase::Buffering => "Buffering preview…",
+                    PlaybackPhase::Failed => "Preview unavailable",
+                    PlaybackPhase::Paused | PlaybackPhase::Playing | PlaybackPhase::Ended => {
+                        "Waiting for a decoded frame…"
+                    }
+                },
+                theme.font(Text::Label),
+                theme.palette.text_muted,
+            );
+        }
+        ui.painter().rect_stroke(
+            rect,
+            corner(Radius::THUMB),
+            Stroke::new(1.0, theme.palette.thumb_border),
+            StrokeKind::Inside,
+        );
+    });
+
+    let audio = match preview.audio {
+        PlaybackAudio::NoTrack => "no audio track",
+        PlaybackAudio::Muted => "audio muted by edit",
+        PlaybackAudio::Active => "captured audio synced",
+    };
+    let drift = preview.av_drift.map_or_else(String::new, |drift| {
+        format!("  •  A/V offset {} ms", drift.as_millis())
+    });
+    caption(
+        ui,
+        theme,
+        format!(
+            "{}  •  {audio}  •  decoded through {}{drift}",
+            playback_phase_label(preview.phase),
+            format_duration(preview.buffered_until),
+        ),
+    );
+    if let Some(error) = preview.error {
+        ui.colored_label(theme.palette.recording, error);
+    }
+}
+
+fn playback_phase_label(phase: PlaybackPhase) -> &'static str {
+    match phase {
+        PlaybackPhase::Loading => "Loading",
+        PlaybackPhase::Paused => "Paused",
+        PlaybackPhase::Playing => "Playing",
+        PlaybackPhase::Buffering => "Buffering",
+        PlaybackPhase::Ended => "Ended",
+        PlaybackPhase::Failed => "Playback failed",
+    }
+}
+
+fn format_rate(rate: f32) -> String {
+    if rate.fract().abs() < f32::EPSILON {
+        format!("{rate:.0}")
+    } else {
+        format!("{rate:.1}")
     }
 }
 
@@ -632,29 +827,36 @@ fn draw_transcode_status(
             }
         }
         TranscodeView::Failed { failure } => {
-            ui.colored_label(theme.palette.recording, "Export failed");
             if let Some(failure) = failure {
-                body(ui, theme, failure.error.to_string());
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(theme.palette.recording, "Export failed");
+                    ui.label(
+                        RichText::new(failure.error.to_string())
+                            .font(theme.font(Text::Body))
+                            .color(theme.palette.text),
+                    );
+                    if failure.partial.is_some() {
+                        let reveal = button(ui, theme, "Show partial", false, true);
+                        if reveal.clicked() {
+                            actions.push(VideoEditorAction::RevealPartialOutput);
+                        }
+                        *reveal_response = Some(reveal);
+                    }
+                });
                 if let Some(partial) = &failure.partial {
-                    body(
+                    let reason = partial
+                        .partial_reason()
+                        .map_or_else(String::new, |reason| format!(" • {reason}"));
+                    caption(
                         ui,
                         theme,
-                        format!(
-                            "A partial export is available at {}.",
-                            partial.path.display()
-                        ),
+                        format!("Partial export: {}{reason}", partial.path.display(),),
                     );
-                    if let Some(reason) = partial.partial_reason() {
-                        caption(ui, theme, format!("Could not finalise: {reason}"));
-                    }
-                    let reveal = button(ui, theme, "Show partial", false, true);
-                    if reveal.clicked() {
-                        actions.push(VideoEditorAction::RevealPartialOutput);
-                    }
-                    *reveal_response = Some(reveal);
                 } else {
                     caption(ui, theme, "No usable export was written.");
                 }
+            } else {
+                ui.colored_label(theme.palette.recording, "Export failed");
             }
         }
         TranscodeView::Cancelled { output } => {
@@ -711,10 +913,38 @@ impl Scene for VideoEditorScene {
         };
         ui.vertical_centered(|ui| {
             ui.add_space(Space::XXL);
+            let preview_image = fixture_preview_image();
+            let preview_texture = ui.ctx().load_texture(
+                "recording-video-editor-fixture",
+                preview_image,
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("recording-video-editor-fixture-handle"),
+                    preview_texture.clone(),
+                );
+            });
+            let preview = VideoPreview {
+                texture: Some(SizedTexture::from_handle(&preview_texture)),
+                phase: PlaybackPhase::Paused,
+                rate: 1.0,
+                buffered_until: fixture.document.position() + Duration::from_millis(250),
+                audio: if fixture.document.metadata().audio_channels == 0 {
+                    PlaybackAudio::NoTrack
+                } else if fixture.plan.audio.mute || !fixture.plan.output.supports_audio() {
+                    PlaybackAudio::Muted
+                } else {
+                    PlaybackAudio::Active
+                },
+                av_drift: Some(Duration::ZERO),
+                error: None,
+            };
             VideoEditor::new(
                 VideoEditorModel {
                     document: &fixture.document,
                     plan: fixture.plan,
+                    preview,
                     transcode,
                 },
                 &theme,
@@ -722,4 +952,29 @@ impl Scene for VideoEditorScene {
             .show(ui);
         });
     }
+}
+
+fn fixture_preview_image() -> egui::ColorImage {
+    const WIDTH: usize = 96;
+    const HEIGHT: usize = 54;
+
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let sky = egui::Color32::from_rgb(
+                42 + u8::try_from(x / 3).unwrap_or(0),
+                72 + u8::try_from(y / 2).unwrap_or(0),
+                118 + u8::try_from((x + y) / 8).unwrap_or(0),
+            );
+            let colour = if y > 34 {
+                egui::Color32::from_rgb(28, 34 + u8::try_from(x / 4).unwrap_or(0), 42)
+            } else if (22..74).contains(&x) && (12..34).contains(&y) {
+                egui::Color32::from_rgb(244, 157, 72)
+            } else {
+                sky
+            };
+            pixels.push(colour);
+        }
+    }
+    egui::ColorImage::new([WIDTH, HEIGHT], pixels)
 }

@@ -25,6 +25,13 @@ pub struct SourceMetadata {
 }
 
 impl SourceMetadata {
+    /// Largest encoded edge accepted by the native media pipeline.
+    pub const MAX_EDGE: u32 = 16_384;
+    /// Largest declared/average frame rate accepted by the native media pipeline.
+    pub const MAX_FPS: f64 = 240.0;
+    /// Largest source channel count accepted for inspection.
+    pub const MAX_AUDIO_CHANNELS: u16 = 32;
+
     /// Validates media stream metadata.
     ///
     /// # Errors
@@ -38,11 +45,30 @@ impl SourceMetadata {
                 self.width, self.height
             )));
         }
-        if !self.fps.is_finite() || self.fps <= 0.0 {
+        if self.width > Self::MAX_EDGE || self.height > Self::MAX_EDGE {
+            return Err(Error::Unsupported {
+                what: format!("{}x{} video source", self.width, self.height),
+                why: format!(
+                    "native media dimensions are bounded to {} pixels per edge",
+                    Self::MAX_EDGE
+                ),
+            });
+        }
+        if !self.fps.is_finite() || self.fps <= 0.0 || self.fps > Self::MAX_FPS {
             return Err(Error::InvalidRequest(format!(
-                "video source frame rate {} must be positive and finite",
-                self.fps
+                "video source frame rate {} must be positive, finite, and at most {}",
+                self.fps,
+                Self::MAX_FPS
             )));
+        }
+        if self.audio_channels > Self::MAX_AUDIO_CHANNELS {
+            return Err(Error::Unsupported {
+                what: format!("{}-channel video source", self.audio_channels),
+                why: format!(
+                    "native media inspection is bounded to {} audio channels",
+                    Self::MAX_AUDIO_CHANNELS
+                ),
+            });
         }
         Ok(self)
     }

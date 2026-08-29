@@ -48,6 +48,14 @@ format conversion, state and fragmented-MP4 code is still cross-checked
 everywhere, while the native feature is compiled, tested and run on Linux in its
 own CI lane.
 
+Recorded-media preview is intentionally asymmetric today. macOS uses
+`AVAssetReader` for bounded RGBA decode, `AVPlayer` as the authoritative media
+clock/audio renderer, and a MediaToolbox audio tap for the same gain, mute, and
+mono edits used by export. Windows and Linux compile the same playback contract,
+but report an explicit unsupported capability until Media Foundation
+source-reader/audio-renderer and linked-libav/desktop-audio adapters exist. They
+never advance a synthetic clock or show source thumbnails as fake playback.
+
 `scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
 almost nothing, and CI compiles it natively on all three runners anyway (layer
 2), which is a strictly stronger check.

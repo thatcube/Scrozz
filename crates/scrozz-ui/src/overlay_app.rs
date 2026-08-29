@@ -60,10 +60,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use egui::{Pos2, Rect, Vec2};
+use egui::{Pos2, Rect, TextureHandle, Vec2, load::SizedTexture};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
 use scrozz_record::{
     edit::{EditPlan, VideoDocument},
+    playback::PlaybackSnapshot,
     settings::CountdownSettings,
     transcode::TranscodeFailure,
 };
@@ -76,7 +77,9 @@ use crate::paint::{self, Surface};
 use crate::recording_hud::{RecordingHud, RecordingHudAction, RecordingHudSnapshot};
 use crate::stack::{CaptureStack, CardId, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
-use crate::video_editor::{TranscodeView, VideoEditor, VideoEditorAction, VideoEditorModel};
+use crate::video_editor::{
+    TranscodeView, VideoEditor, VideoEditorAction, VideoEditorModel, VideoPreview,
+};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
 /// single frame to re-sample the pointer, when no [`PointerProbe`] is supplied.
@@ -434,6 +437,8 @@ pub struct VideoEditorSnapshot {
     pub document: VideoDocument,
     /// Current non-destructive edit plan.
     pub plan: EditPlan,
+    /// Decoded preview frame and native media-clock state.
+    pub playback: PlaybackSnapshot,
     /// Current native export state, or `None` before the first export.
     pub transcode_status: Option<scrozz_record::transcode::TranscodeStatus>,
     /// Last normalized export progress.
@@ -811,6 +816,7 @@ pub struct OverlayApp {
     hovered: Option<CardId>,
     dock_collapsed: bool,
     dragging: Option<CardId>,
+    recording_preview: Option<(u64, u64, TextureHandle)>,
 }
 
 impl OverlayApp {
@@ -867,6 +873,7 @@ impl OverlayApp {
             hovered: None,
             dock_collapsed: false,
             dragging: None,
+            recording_preview: None,
         }
     }
 
@@ -918,6 +925,44 @@ impl OverlayApp {
             .lock()
             .ok()
             .and_then(|state| state.clone())
+    }
+
+    fn recording_preview_texture(
+        &mut self,
+        ctx: &egui::Context,
+        playback: &PlaybackSnapshot,
+    ) -> Option<SizedTexture> {
+        let preview = playback.frame.as_ref()?;
+        let replace = self
+            .recording_preview
+            .as_ref()
+            .is_none_or(|(stream, sequence, _)| {
+                *stream != playback.stream_id || *sequence != preview.sequence
+            });
+        if replace {
+            let frame = &preview.frame.image;
+            let width = usize::try_from(frame.width).ok()?;
+            let height = usize::try_from(frame.height).ok()?;
+            let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.data);
+            if let Some((stream, sequence, texture)) = &mut self.recording_preview {
+                texture.set(image, egui::TextureOptions::LINEAR);
+                *stream = playback.stream_id;
+                *sequence = preview.sequence;
+            } else {
+                self.recording_preview = Some((
+                    playback.stream_id,
+                    preview.sequence,
+                    ctx.load_texture(
+                        "scrozz.recording.preview",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ),
+                ));
+            }
+        }
+        self.recording_preview
+            .as_ref()
+            .map(|(_, _, texture)| SizedTexture::from_handle(texture))
     }
 
     fn take_inbox(&self) -> Vec<CaptureRequest> {
@@ -1095,7 +1140,7 @@ impl OverlayApp {
     }
 
     fn draw_recording(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         presentation: &RecordingPresentation,
         hits: &mut Vec<Rect>,
@@ -1111,8 +1156,9 @@ impl OverlayApp {
 
         let work = ui.max_rect();
         if let Some(editor) = &presentation.editor {
+            let preview_texture = self.recording_preview_texture(ui.ctx(), &editor.playback);
             let width = (work.width() - 48.0).clamp(420.0, 900.0);
-            let height = (work.height() - 48.0).clamp(420.0, 740.0);
+            let height = (work.height() - 48.0).clamp(560.0, 900.0);
             let rect = Rect::from_center_size(work.center(), Vec2::new(width, height));
             let shown = ui.scope_builder(
                 egui::UiBuilder::new()
@@ -1133,6 +1179,7 @@ impl OverlayApp {
                         VideoEditorModel {
                             document: &editor.document,
                             plan: editor.plan,
+                            preview: VideoPreview::from_snapshot(&editor.playback, preview_texture),
                             transcode,
                         },
                         &self.theme,
@@ -1146,6 +1193,7 @@ impl OverlayApp {
             }
             return;
         }
+        self.recording_preview = None;
 
         if matches!(
             presentation.hud.phase,
@@ -1236,6 +1284,13 @@ impl eframe::App for OverlayApp {
         let suppress_all_overlays = recording
             .as_ref()
             .is_some_and(|presentation| presentation.suppress_all_overlays);
+        if recording
+            .as_ref()
+            .and_then(|presentation| presentation.editor.as_ref())
+            .is_none()
+        {
+            self.recording_preview = None;
+        }
 
         let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 2);
         let mut hovered = None;

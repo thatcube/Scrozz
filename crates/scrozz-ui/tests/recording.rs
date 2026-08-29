@@ -16,7 +16,7 @@ use scrozz_record::{
 use scrozz_ui::{
     Countdown, RecordingHud, RecordingHudAction, RecordingHudControls, RecordingHudModel,
     RecordingOverlay, RecordingOverlayAction, RecordingOverlayModel, RecordingSelectionState,
-    Theme, TranscodeView, VideoEditor, VideoEditorAction, VideoEditorModel,
+    Theme, TranscodeView, VideoEditor, VideoEditorAction, VideoEditorModel, VideoPreview,
     harness::{RecordingFixture, Scenario, SceneRegistry, SoftwareRenderer, VirtualClock},
 };
 
@@ -315,6 +315,7 @@ fn video_editor_actions_and_enabled_state_are_headless() {
             VideoEditorModel {
                 document: &document,
                 plan,
+                preview: VideoPreview::default(),
                 transcode: TranscodeView::Idle,
             },
             &theme,
@@ -331,13 +332,20 @@ fn video_editor_actions_and_enabled_state_are_headless() {
     assert!(playing.actions.contains(&VideoEditorAction::Play));
 
     let exporting = click(&context, initial.export_response.rect.center(), draw);
-    assert!(exporting.actions.contains(&VideoEditorAction::Export(plan)));
+    assert!(
+        exporting.actions.contains(&VideoEditorAction::Export(plan)),
+        "export click at {:?} emitted {:?} from {:?}",
+        initial.export_response.rect.center(),
+        exporting.actions,
+        initial.export_response.rect
+    );
 
     let running = run_ui(&context, Vec::new(), |ui| {
         VideoEditor::new(
             VideoEditorModel {
                 document: &document,
                 plan,
+                preview: VideoPreview::default(),
                 transcode: TranscodeView::Running { progress: 0.5 },
             },
             &theme,
@@ -361,13 +369,19 @@ fn video_editor_actions_and_enabled_state_are_headless() {
             VideoEditorModel {
                 document: &document,
                 plan,
+                preview: VideoPreview::default(),
                 transcode: TranscodeView::Running { progress: 0.5 },
             },
             &theme,
         )
         .show(ui)
     });
-    assert!(cancelled.actions.contains(&VideoEditorAction::CancelExport));
+    assert!(
+        cancelled.actions.contains(&VideoEditorAction::CancelExport),
+        "cancel click at {cancel_point:?} emitted {:?} from {:?}",
+        cancelled.actions,
+        cancel.rect
+    );
 }
 
 #[test]
@@ -381,6 +395,7 @@ fn video_editor_disables_inapplicable_audio_and_invalid_trim() {
             VideoEditorModel {
                 document: &silent,
                 plan: silent_plan,
+                preview: VideoPreview::default(),
                 transcode: TranscodeView::Idle,
             },
             &theme,
@@ -397,6 +412,7 @@ fn video_editor_disables_inapplicable_audio_and_invalid_trim() {
             VideoEditorModel {
                 document: &with_audio,
                 plan: gif,
+                preview: VideoPreview::default(),
                 transcode: TranscodeView::Idle,
             },
             &theme,
@@ -416,6 +432,7 @@ fn video_editor_disables_inapplicable_audio_and_invalid_trim() {
             VideoEditorModel {
                 document: &with_audio,
                 plan: invalid,
+                preview: VideoPreview::default(),
                 transcode: TranscodeView::Idle,
             },
             &theme,

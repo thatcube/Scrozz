@@ -15,6 +15,9 @@ use crate::{
     edit::{SourceMetadata, TrimRange},
 };
 
+const MAX_DECODED_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const PROBE_MAX_EDGE: u32 = 64;
+
 #[cfg(target_os = "macos")]
 #[path = "media/macos.rs"]
 mod platform;
@@ -291,6 +294,29 @@ impl NativeMediaSource {
                 "decoded output dimensions must have area".to_owned(),
             ));
         }
+        let bytes = usize::try_from(dimensions.0)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(dimensions.1)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                Error::InvalidRequest("decoded video dimensions overflow memory".to_owned())
+            })?;
+        if dimensions.0 > SourceMetadata::MAX_EDGE
+            || dimensions.1 > SourceMetadata::MAX_EDGE
+            || bytes > MAX_DECODED_FRAME_BYTES
+        {
+            return Err(Error::Unsupported {
+                what: format!("{}x{} decoded video", dimensions.0, dimensions.1),
+                why: format!(
+                    "decoded frames are bounded to {MAX_DECODED_FRAME_BYTES} bytes and {} pixels per edge",
+                    SourceMetadata::MAX_EDGE
+                ),
+            });
+        }
         Ok(NativeMediaDecoder {
             inner: platform::Decoder::open(
                 self.path(),
@@ -310,12 +336,12 @@ impl NativeMediaSource {
 
     fn prove_decodable_video(&self) -> Result<()> {
         let range = TrimRange::full(self.inspection.duration)?;
-        let mut decoder = self.decoder(range)?;
+        let dimensions = probe_dimensions(self.inspection.metadata);
+        let mut decoder = self.decoder_with_dimensions(range, dimensions)?;
         loop {
             match decoder.next_sample()? {
                 Some(DecodedMediaSample::Video(frame))
-                    if frame.image.width == self.inspection.metadata.width
-                        && frame.image.height == self.inspection.metadata.height
+                    if (frame.image.width, frame.image.height) == dimensions
                         && !frame.image.data.is_empty() =>
                 {
                     return Ok(());
@@ -330,6 +356,18 @@ impl NativeMediaSource {
             }
         }
     }
+}
+
+fn probe_dimensions(metadata: SourceMetadata) -> (u32, u32) {
+    let edge = metadata.width.max(metadata.height);
+    if edge <= PROBE_MAX_EDGE {
+        return (metadata.width, metadata.height);
+    }
+    let scale = f64::from(PROBE_MAX_EDGE) / f64::from(edge);
+    (
+        (f64::from(metadata.width) * scale).round().max(1.0) as u32,
+        (f64::from(metadata.height) * scale).round().max(1.0) as u32,
+    )
 }
 
 /// Pull decoder for one validated native source.

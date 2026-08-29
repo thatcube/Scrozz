@@ -37,6 +37,7 @@ pub mod media;
 mod muxer;
 pub mod overlay;
 mod pacing;
+pub mod playback;
 pub mod selection;
 pub mod settings;
 mod state;

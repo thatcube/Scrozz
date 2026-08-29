@@ -125,5 +125,5 @@ pub use select::{
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
 pub use video_editor::{
     TranscodeView, VideoEditor, VideoEditorAction, VideoEditorControls, VideoEditorModel,
-    VideoEditorResponse,
+    VideoEditorResponse, VideoPreview,
 };

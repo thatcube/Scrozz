@@ -37,6 +37,7 @@ use scrozz_record::{
     MachineEvent, MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
     RecordingSettings,
     edit::{EditOutput, EditPlan, VideoDocument},
+    playback::{NativePlayback, sync_document},
     transcode::{
         NativeTranscoder, TranscodeEvent, TranscodeFailure, TranscodeJob, TranscodeOutput,
         TranscodeStatus, Transcoder as _,
@@ -81,6 +82,7 @@ enum GuiRecordingCompletion {
 struct ActiveVideoEditor {
     document: VideoDocument,
     plan: EditPlan,
+    playback: NativePlayback,
     transcode_job: Option<Box<dyn TranscodeJob>>,
     transcode_status: Option<TranscodeStatus>,
     transcode_progress: f32,
@@ -868,16 +870,13 @@ impl App {
 
     fn advance_recording(&mut self) {
         self.finish_pending_recording();
+        self.advance_video_playback();
         self.advance_video_export();
         self.finish_recording_selection();
         self.start_pending_recording();
         let now = Instant::now();
         let delta = now.saturating_duration_since(self.recording_tick);
         self.recording_tick = now;
-
-        if let Some(editor) = &mut self.recording_editor {
-            editor.document.tick(delta);
-        }
 
         let result = self.recording.as_mut().map(|machine| machine.tick(delta));
         if let Some(Err(error)) = result {
@@ -893,6 +892,16 @@ impl App {
         }
         self.drain_recording_events();
         self.refresh_recording_tray();
+    }
+
+    fn advance_video_playback(&mut self) {
+        let result = self.recording_editor.as_mut().map(|editor| {
+            let snapshot = editor.playback.poll()?.clone();
+            sync_document(&mut editor.document, &snapshot)
+        });
+        if let Some(Err(error)) = result {
+            self.note(format!("recording preview failed: {error}"));
+        }
     }
 
     fn finish_recording_selection(&mut self) {
@@ -1593,6 +1602,7 @@ impl App {
                 .map(|editor| VideoEditorSnapshot {
                     document: editor.document.clone(),
                     plan: editor.plan,
+                    playback: editor.playback.snapshot().clone(),
                     transcode_status: editor.transcode_status,
                     transcode_progress: editor.transcode_progress,
                     transcode_output: editor.transcode_output.clone(),
@@ -1684,7 +1694,13 @@ impl App {
                 self.note("cancel the active export before closing the video editor");
                 return;
             }
-            self.recording_editor = None;
+            if let Some(mut editor) = self.recording_editor.take()
+                && let Err(error) = editor.playback.shutdown()
+            {
+                self.note(format!(
+                    "could not close recording preview cleanly: {error}"
+                ));
+            }
             if let Some(machine) = self.recording.as_mut()
                 && matches!(
                     machine.phase(),
@@ -1704,21 +1720,46 @@ impl App {
             VideoEditorAction::Close => {
                 unreachable!("close is handled before borrowing the editor")
             }
-            VideoEditorAction::Play => editor.document.play(),
-            VideoEditorAction::Pause => editor.document.pause(),
+            VideoEditorAction::Play => match editor.playback.play() {
+                Ok(()) => editor.document.play(),
+                Err(error) => self.note(format!("could not play the recording: {error}")),
+            },
+            VideoEditorAction::Pause => {
+                editor.playback.pause();
+                editor.document.pause();
+            }
             VideoEditorAction::Seek(position) => {
-                if let Err(error) = editor.document.seek(position) {
+                if let Err(error) = editor
+                    .playback
+                    .seek(position)
+                    .and_then(|()| editor.document.seek(position))
+                {
                     self.note(format!("could not seek the recording: {error}"));
+                }
+            }
+            VideoEditorAction::SetRate(rate) => {
+                if let Err(error) = editor.playback.set_rate(rate) {
+                    self.note(format!("could not change recording playback rate: {error}"));
                 }
             }
             VideoEditorAction::PlanChanged(plan) => {
                 editor.plan = plan;
+                let preview_error = editor
+                    .playback
+                    .set_plan(&editor.document, plan)
+                    .err()
+                    .map(|error| format!("could not update recording preview: {error}"));
                 editor.transcode_status = None;
                 editor.transcode_progress = 0.0;
                 editor.transcode_output = None;
                 editor.transcode_failure = None;
+                if let Some(error) = preview_error {
+                    self.note(error);
+                }
             }
             VideoEditorAction::Export(plan) => {
+                editor.playback.pause();
+                editor.document.pause();
                 editor.plan = plan;
                 editor.transcode_progress = 0.0;
                 editor.transcode_output = None;
@@ -1829,6 +1870,11 @@ impl App {
     /// someone's screen.
     pub fn shut_down(&mut self) {
         self.finalise_recording_before_shutdown();
+        if let Some(editor) = &mut self.recording_editor
+            && let Err(error) = editor.playback.shutdown()
+        {
+            self.note(format!("recording preview shutdown failed: {error}"));
+        }
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
@@ -1944,9 +1990,11 @@ fn active_video_editor(
     }
     let document = VideoDocument::open_native(output.clone())?;
     let plan = EditPlan::video(&document)?;
+    let playback = NativePlayback::open(&document, plan)?;
     Ok(Some(ActiveVideoEditor {
         document,
         plan,
+        playback,
         transcode_job: None,
         transcode_status: None,
         transcode_progress: 0.0,
