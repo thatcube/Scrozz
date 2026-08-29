@@ -16,14 +16,14 @@
 //! | Microphone | `AVCaptureDevice.authorizationStatus(for:)` | Screen recordings have no voiceover track |
 //! | Accessibility | `AXIsProcessTrustedWithOptions` | No window titles, no synthesised input |
 //!
-//! # Why `request` opens Settings
+//! # Why Screen Recording does not open Settings by itself
 //!
 //! macOS shows each of these prompts **once per app, ever**. After the first
 //! denial the request API returns immediately with no UI at all, so a naive
-//! implementation appears to do nothing. [`Permissions::request`] therefore
-//! falls back to opening the exact Settings pane through the
-//! `x-apple.systempreferences:` URL scheme — landing the user on the right list
-//! rather than on the front page of System Settings.
+//! implementation appears to do nothing. Screen Recording is therefore split:
+//! [`Permissions::request`] invokes only the system request, while
+//! [`open_settings`] is an explicit action owned by the permission surface.
+//! Microphone and Accessibility retain their capability-specific legacy flow.
 
 use scrozz_core::{Error, Result};
 
@@ -167,5 +167,38 @@ pub fn open_settings(capability: Capability) -> Result<()> {
             what: format!("opening settings for {}", capability_name(capability)),
             why: "no settings-pane URL scheme is wired up for this platform yet".to_owned(),
         })
+    }
+}
+
+/// Whether Scrozz is currently the active application.
+///
+/// The permission coordinator uses this only to detect a real round trip through
+/// System Settings. Non-macOS platforms return `true`; their permission behavior
+/// is otherwise unchanged.
+#[must_use]
+pub fn application_is_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::permissions::application_is_active()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Brings Scrozz forward for an explicitly requested permission or picker UI.
+///
+/// # Errors
+///
+/// Returns [`Error::Platform`] if called away from macOS's main thread.
+pub fn activate_application() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::permissions::activate_application()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
     }
 }

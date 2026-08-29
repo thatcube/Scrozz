@@ -82,6 +82,9 @@ pub trait Host {
 
     /// The selector that shares this host's event loop.
     fn selector(&self) -> Arc<dyn CaptureSelector>;
+
+    /// Whether this host can present and service the permission viewport.
+    fn supports_permission_ui(&self) -> bool;
 }
 
 /// Drives the app from a plain sleep loop, with no window.
@@ -126,6 +129,10 @@ impl Host for Headless {
 
     fn selector(&self) -> Arc<dyn CaptureSelector> {
         Arc::new(UnsupportedSelector::headless())
+    }
+
+    fn supports_permission_ui(&self) -> bool {
+        false
     }
 }
 
@@ -267,6 +274,8 @@ impl Host for Windowed {
                     emit: Some(emit),
                     selection,
                     settings: scrozz_ui::settings::SettingsWindow::default(),
+                    permission: scrozz_ui::permission::PermissionWindow::default(),
+                    permission_resume_armed: false,
                     editor: scrozz_ui::editor::EditorWindow::new(),
                     editing: None,
                     color_picker: scrozz_shell::SystemColorPicker::default(),
@@ -315,6 +324,10 @@ impl Host for Windowed {
 
     fn selector(&self) -> Arc<dyn CaptureSelector> {
         Arc::clone(&self.selector)
+    }
+
+    fn supports_permission_ui(&self) -> bool {
+        true
     }
 }
 
@@ -452,6 +465,8 @@ struct Driver {
     emit: Option<Emit>,
     selection: ClientOverlayController,
     settings: scrozz_ui::settings::SettingsWindow,
+    permission: scrozz_ui::permission::PermissionWindow,
+    permission_resume_armed: bool,
     editor: scrozz_ui::editor::EditorWindow,
     /// The editor's document, and the card it came from.
     editing: Option<Editing>,
@@ -662,6 +677,9 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        if std::mem::take(&mut self.permission_resume_armed) {
+            self.app.dispatch_permission_resume();
+        }
         if !self.selection.owns_surface()
             && let Some(geometry) = self.pending_native_frame.take()
         {
@@ -746,6 +764,18 @@ impl eframe::App for Driver {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let permission = self.app.permission_prompt();
+        if let Some(response) = self.permission.show(ui.ctx(), permission.as_ref()) {
+            if response == scrozz_ui::permission::PermissionResponse::UseApplePicker {
+                self.permission.close(ui.ctx());
+            }
+            self.app.respond_to_permission(response);
+        }
+        if self.app.has_permission_resume() {
+            self.permission.close(ui.ctx());
+            self.permission_resume_armed = true;
+        }
+
         // Drawn from the app's own view of the shortcuts, and edits are handed
         // straight back to it: the pane reports intent, the app decides whether
         // the OS will accept it.
@@ -979,6 +1009,20 @@ mod tests {
     }
 
     #[test]
+    fn permission_resume_closes_in_ui_and_dispatches_in_the_next_logic_pass() {
+        assert_eq!(
+            driver_pass("has_permission_resume"),
+            "ui",
+            "the permission viewport must close from the UI pass"
+        );
+        assert_eq!(
+            driver_pass("dispatch_permission_resume"),
+            "logic",
+            "the granted action must wait until the following logic pass"
+        );
+    }
+
+    #[test]
     fn editor_input_and_shortcuts_settle_before_the_drag_revision_is_chosen() {
         let src = include_str!("host.rs");
         let ui = src
@@ -1028,6 +1072,7 @@ mod tests {
             Config::sealed(),
             Box::new(Recording::new()),
             Arc::new(UnsupportedSelector::headless()),
+            false,
         )
         .expect("sealed app");
         let started = std::time::Instant::now();

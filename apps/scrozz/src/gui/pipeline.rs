@@ -74,9 +74,23 @@ pub enum Job {
     Capture {
         /// What to capture.
         kind: CaptureKind,
+        /// The user-action source retained for an exact permission retry.
+        origin: &'static str,
         /// The identity the resulting card will carry, allocated up front so the
         /// main thread can correlate the answer with the request.
         card: CardId,
+    },
+    /// Process pixels from the exact one-shot filter returned by Apple's limited picker.
+    #[cfg(target_os = "macos")]
+    ApplePickerCapture {
+        /// The action whose fallback produced the filter.
+        kind: CaptureKind,
+        /// The original user-action source.
+        origin: &'static str,
+        /// The card identity allocated only after Apple returned a selection.
+        card: CardId,
+        /// Pixels captured from the least-privilege filter.
+        capture: scrozz_capture::PickerCapture,
     },
     /// Decode a card's capture so the annotation editor can open on it.
     ///
@@ -159,6 +173,10 @@ pub enum Outcome {
     Failed {
         /// Which card was expected.
         card: CardId,
+        /// Which action may be retried after a permission change.
+        kind: CaptureKind,
+        /// The original user-action source.
+        origin: &'static str,
         /// Why it will not arrive.
         error: CliError,
     },
@@ -541,7 +559,14 @@ impl Worker {
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
             match job {
-                Job::Capture { kind, card } => self.capture(kind, card),
+                Job::Capture { kind, origin, card } => self.capture(kind, origin, card),
+                #[cfg(target_os = "macos")]
+                Job::ApplePickerCapture {
+                    kind,
+                    origin,
+                    card,
+                    capture,
+                } => self.capture_apple_picker(kind, origin, card, capture),
                 Job::Open(card) => self.open(card),
                 Job::PrepareImage {
                     card,
@@ -560,7 +585,7 @@ impl Worker {
         tracing::debug!("capture worker stopped");
     }
 
-    fn capture(&mut self, kind: CaptureKind, card: CardId) {
+    fn capture(&mut self, kind: CaptureKind, origin: &'static str, card: CardId) {
         let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
         let result = self.take(kind, card, &mut lifecycle);
         match result {
@@ -572,7 +597,44 @@ impl Worker {
             }
             Err(error) => {
                 tracing::warn!(%card, "capture failed: {error}");
-                let _ = self.outcomes.send(Outcome::Failed { card, error });
+                let _ = self.outcomes.send(Outcome::Failed {
+                    card,
+                    kind,
+                    origin,
+                    error,
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_apple_picker(
+        &mut self,
+        kind: CaptureKind,
+        origin: &'static str,
+        card: CardId,
+        picker_capture: scrozz_capture::PickerCapture,
+    ) {
+        let result = picker_capture
+            .into_capture()
+            .map_err(CliError::Core)
+            .and_then(|capture| self.finish_capture(kind, card, capture));
+
+        match result {
+            Ok(card) => {
+                let _ = self.outcomes.send(Outcome::Ready(Box::new(card)));
+            }
+            Err(error) if error.is_cancellation() => {
+                tracing::debug!(%card, "Apple picker capture cancelled");
+            }
+            Err(error) => {
+                tracing::warn!(%card, "Apple picker capture failed: {error}");
+                let _ = self.outcomes.send(Outcome::Failed {
+                    card,
+                    kind,
+                    origin,
+                    error,
+                });
             }
         }
     }
@@ -648,6 +710,15 @@ impl Worker {
         {
             tracing::warn!("the capture succeeded but its region could not be remembered: {error}");
         }
+        self.finish_capture(kind, card, capture)
+    }
+
+    fn finish_capture(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        capture: Capture,
+    ) -> CliResult<Card> {
         let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
         let capture_id = self.remember(&capture);

@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use scrozz_core::{Capture, SelectionCapabilities};
+use scrozz_core::{Capture, Error as CoreError, SelectionCapabilities};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, KeyState, Permissions, ScreenshotSound, Session,
     SystemPermissions, Tray, TrayAction,
@@ -43,6 +43,10 @@ use crate::{
         action::{Action, CaptureKind},
         card::{CardEvent, CardId, CardSurface},
         drag::{DragHost, DragSpot},
+        permission::{
+            self, Access, Effect as PermissionEffect, PendingCapture, PermissionStore,
+            PickerAvailability, PickerMode, Response as PermissionResponse,
+        },
         pipeline::{CaptureBytes, Job, Outcome, Pipeline},
         selection::CaptureSelector,
         server::{Forwarder, Server},
@@ -54,6 +58,10 @@ use crate::{
 use scrozz_shell::DragOutcome;
 use scrozz_ui::{
     editor::{EditorUi, RevisionedFrame},
+    permission::{
+        PermissionPrompt as PermissionUiPrompt, PermissionStage as PermissionUiStage,
+        PickerFallback,
+    },
     settings::{ShortcutEdit, ShortcutRow},
 };
 
@@ -279,6 +287,75 @@ fn install_forgivingly(
     }
 }
 
+fn capture_action_label(kind: CaptureKind) -> &'static str {
+    match kind {
+        CaptureKind::AllInOne => scrozz_core::product_copy::ALL_IN_ONE,
+        CaptureKind::Region => scrozz_core::product_copy::CAPTURE_AREA,
+        CaptureKind::Window => scrozz_core::product_copy::CAPTURE_WINDOW,
+        CaptureKind::Fullscreen => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
+        CaptureKind::AllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+    }
+}
+
+fn picker_fallback(prompt: permission::Prompt) -> PickerFallback {
+    if let Some(mode) = prompt.picker_mode {
+        let limitations = match mode {
+            PickerMode::Window => {
+                "Apple's picker replaces Scrozz's custom Capture Window UI and captures only the \
+                 exact window you select. Capture Area, unattended global capture, and \
+                 system-audio recording remain unavailable."
+            }
+            PickerMode::Display => {
+                "Apple's picker replaces Scrozz's automatic screen targeting and captures only \
+                 the exact screen you select. Capture Area, All Displays, unattended global \
+                 capture, and system-audio recording remain unavailable."
+            }
+            PickerMode::WindowOrDisplay => {
+                "Apple's picker replaces Scrozz's custom selector and captures only the exact \
+                 window or screen you select. Capture Area, All Displays, unattended global \
+                 capture, and system-audio recording remain unavailable."
+            }
+        };
+        return PickerFallback::Available {
+            limitations: limitations.to_owned(),
+        };
+    }
+
+    let reason = match prompt.picker_availability {
+        PickerAvailability::OlderMacOs => {
+            "Apple's limited content picker requires macOS 14 or later. Direct access through \
+             System Settings is the only supported capture path on this version."
+        }
+        PickerAvailability::Unavailable => {
+            "Apple's limited content picker is unavailable in this session. Scrozz will not \
+             broaden access or substitute another target."
+        }
+        PickerAvailability::Available => match prompt.pending.kind {
+            CaptureKind::Region => {
+                "Apple's picker cannot reproduce Scrozz's custom Capture Area behavior. Choose a \
+                 Window or Screen capture, or grant direct access in System Settings."
+            }
+            CaptureKind::AllDisplays => {
+                "Apple's picker authorizes one screen at a time, so it cannot truthfully produce \
+                 an All Displays capture."
+            }
+            CaptureKind::AllInOne | CaptureKind::Window | CaptureKind::Fullscreen => {
+                "Apple's picker cannot complete this capture without broadening the requested \
+                 access."
+            }
+        },
+    };
+    PickerFallback::Unavailable {
+        reason: reason.to_owned(),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 /// Whether the host should keep going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -322,6 +399,14 @@ pub struct App {
     session: Session,
     selection_capabilities: SelectionCapabilities,
     capture_backend_ready: bool,
+    permission_ui_available: bool,
+    permission: permission::Flow,
+    permission_resume: Option<PendingCapture>,
+    permission_store: Option<PermissionStore>,
+    #[cfg(target_os = "macos")]
+    apple_picker: Option<scrozz_capture::AppleContentPicker>,
+    #[cfg(target_os = "macos")]
+    picker_surface: Option<PickerSurfaceReservation>,
 }
 
 /// A capture the annotation editor has been asked to open.
@@ -379,6 +464,81 @@ impl CardOutput {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct PickerSurfaceReservation {
+    mode: PickerMode,
+    ready: std::sync::mpsc::Receiver<scrozz_core::Result<()>>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    presented: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl PickerSurfaceReservation {
+    fn start(mode: PickerMode, selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("scrozz-picker-surface".to_owned())
+            .spawn(move || {
+                let result = selector.begin_capture(false);
+                let reserved = result.is_ok();
+                let _ = ready_tx.send(result);
+                if reserved {
+                    let _ = release_rx.recv();
+                    selector.capture_finished();
+                }
+            })
+            .map_err(|error| {
+                CliError::Core(CoreError::Platform(format!(
+                    "could not start the picker surface reservation: {error}"
+                )))
+            })?;
+        Ok(Self {
+            mode,
+            ready,
+            release: Some(release),
+            worker: Some(worker),
+            presented: false,
+        })
+    }
+
+    fn poll_ready(&mut self) -> Option<scrozz_core::Result<PickerMode>> {
+        if self.presented {
+            return None;
+        }
+        match self.ready.try_recv() {
+            Ok(result) => {
+                self.presented = result.is_ok();
+                Some(result.map(|()| self.mode))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(CoreError::Platform(
+                "the picker surface reservation stopped without answering".to_owned(),
+            ))),
+        }
+    }
+
+    fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        // `capture_finished` waits for the main loop to paint the restored
+        // surface. Joining here would block that very loop. Dropping a Rust
+        // JoinHandle detaches while the worker finishes the handshake.
+        let _ = self.worker.take();
+    }
+
+    fn release_and_join(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// A surface that can take the keyboard away from the global hotkeys.
 ///
 /// See [`App::set_keyboard_owner`].
@@ -413,6 +573,7 @@ impl App {
         config: Config,
         surface: Box<dyn CardSurface>,
         selector: Arc<dyn CaptureSelector>,
+        permission_ui_available: bool,
     ) -> CliResult<Self> {
         let pipeline = Pipeline::start(Arc::clone(&selector))?;
         let mut notes = Vec::new();
@@ -486,6 +647,24 @@ impl App {
             }
         };
 
+        let (permission_store, dismissed_at_unix) = match PermissionStore::default_location() {
+            Ok(store) => match store.load() {
+                Ok(dismissed) => (Some(store), dismissed),
+                Err(error) => {
+                    notes.push(format!(
+                        "permission dismissal history could not be read: {error}"
+                    ));
+                    (Some(store), None)
+                }
+            },
+            Err(error) => {
+                notes.push(format!(
+                    "permission dismissals cannot be remembered: {error}"
+                ));
+                (None, None)
+            }
+        };
+
         let shortcuts = config.shortcuts.clone();
         let mut app = Self {
             config,
@@ -514,6 +693,14 @@ impl App {
             session,
             selection_capabilities,
             capture_backend_ready,
+            permission_ui_available,
+            permission: permission::Flow::new(dismissed_at_unix),
+            permission_resume: None,
+            permission_store,
+            #[cfg(target_os = "macos")]
+            apple_picker: None,
+            #[cfg(target_os = "macos")]
+            picker_surface: None,
         };
         app.refresh_tray_shortcuts();
 
@@ -552,6 +739,8 @@ impl App {
             self.note("the run deadline passed");
             return Tick::Stop;
         }
+
+        self.drain_permission();
 
         if self.drain_tray() == Tick::Stop {
             return Tick::Stop;
@@ -778,8 +967,18 @@ impl App {
                         self.note(summary);
                     }
                 }
-                Outcome::Failed { card, error } => {
+                Outcome::Failed {
+                    card,
+                    kind,
+                    origin,
+                    error,
+                } => {
+                    let permission_denied =
+                        matches!(&error, CliError::Core(CoreError::PermissionDenied { .. }));
                     self.note(format!("{card} failed: {error}"));
+                    if permission_denied {
+                        self.handle_capture_permission_failure(kind, origin, Self::screen_access());
+                    }
                 }
                 Outcome::Done { card, detail } => {
                     self.note(format!("{card} {detail}"));
@@ -1100,23 +1299,398 @@ impl App {
     }
 
     fn begin_capture(&mut self, kind: CaptureKind, origin: &'static str) {
-        // D15: ask at first use, not at launch. This must happen on the main
-        // thread before the capture job is posted: the missing piece that made
-        // Scrozz report PermissionDenied in an invisible log without ever
-        // invoking CGRequestScreenCaptureAccess, so it never appeared in System
-        // Settings at all.
-        let permissions = SystemPermissions::new();
-        if !permissions.is_granted(Capability::ScreenRecording)
-            && let Err(error) = permissions.request(Capability::ScreenRecording)
+        let pending = PendingCapture::new(kind, origin);
+        let access = Self::screen_access();
+        if access != Access::Granted && !self.permission_ui_available {
+            self.note_permission_unavailable(kind, access);
+            return;
+        }
+        if self.permission_resume.is_some() {
+            self.note("the granted capture is waiting for the permission window to close");
+            return;
+        }
+        if self.permission.has_pending_action() {
+            self.note("a capture permission choice is already in progress");
+            return;
+        }
+        let prompt_before = self.permission.prompt();
+        let effect =
+            self.permission
+                .begin(pending, access, Self::picker_availability(), unix_now());
+        self.apply_permission_effect(effect);
+        if prompt_before.is_none() && self.permission.prompt().is_some() {
+            if let Err(error) = scrozz_shell::permissions::activate_application() {
+                self.note(format!(
+                    "capture permission UI could not be foregrounded: {error}"
+                ));
+            }
+        } else if origin == "startup" && !matches!(access, Access::Granted) {
+            self.note("startup capture skipped: Screen Recording access is not granted");
+        } else if origin == "hotkey"
+            && !matches!(access, Access::Granted)
+            && matches!(effect, PermissionEffect::None)
         {
-            self.note(format!("capture permission is required: {error}"));
+            self.note(
+                "capture permission reminder is snoozed; choose a Capture command from the \
+                 Scrozz menu to retry now",
+            );
+        }
+    }
+
+    fn note_permission_unavailable(&mut self, kind: CaptureKind, access: Access) {
+        let detail = match access {
+            Access::NotGranted => format!(
+                "requires Screen Recording access; grant it in {}",
+                scrozz_shell::permissions::remedy(Capability::ScreenRecording)
+            ),
+            Access::Restricted => {
+                "is restricted by device management or parental controls".to_owned()
+            }
+            Access::Unavailable => {
+                "requires the macOS 14 ScreenCaptureKit still-capture API".to_owned()
+            }
+            Access::Granted => {
+                "lost access while macOS still reports the grant; retry the action".to_owned()
+            }
+        };
+        self.note(format!("{} {detail}", capture_action_label(kind)));
+    }
+
+    fn handle_capture_permission_failure(
+        &mut self,
+        kind: CaptureKind,
+        origin: &'static str,
+        access: Access,
+    ) {
+        if !self.permission_ui_available {
+            self.note_permission_unavailable(kind, access);
+            return;
+        }
+        let prompt_before = self.permission.prompt();
+        let effect = self.permission.capture_access_revoked(
+            PendingCapture::new(kind, origin),
+            access,
+            Self::picker_availability(),
+            unix_now(),
+        );
+        self.apply_permission_effect(effect);
+        if prompt_before.is_none()
+            && self.permission.prompt().is_some()
+            && let Err(error) = scrozz_shell::permissions::activate_application()
+        {
+            self.note(format!(
+                "capture permission UI could not be foregrounded: {error}"
+            ));
+        }
+    }
+
+    fn queue_direct_capture(&mut self, pending: PendingCapture) {
+        let card = self.pipeline.allocate();
+        tracing::debug!(
+            %card,
+            capture = pending.kind.label(),
+            origin = pending.origin,
+            "capture job queued"
+        );
+        if !self.pipeline.post(Job::Capture {
+            kind: pending.kind,
+            origin: pending.origin,
+            card,
+        }) {
+            self.note("the capture worker has gone");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn queue_apple_picker_capture(
+        &mut self,
+        pending: PendingCapture,
+        capture: scrozz_capture::PickerCapture,
+    ) {
+        let card = self.pipeline.allocate();
+        tracing::debug!(
+            %card,
+            capture = pending.kind.label(),
+            origin = pending.origin,
+            "Apple picker capture job queued"
+        );
+        if !self.pipeline.post(Job::ApplePickerCapture {
+            kind: pending.kind,
+            origin: pending.origin,
+            card,
+            capture,
+        }) {
+            self.note("the capture worker has gone");
+        }
+    }
+
+    fn drain_permission(&mut self) {
+        let effect = self.permission.application_active_changed(
+            scrozz_shell::permissions::application_is_active(),
+            Self::screen_access(),
+        );
+        self.apply_permission_effect(effect);
+
+        #[cfg(target_os = "macos")]
+        {
+            let reservation = self
+                .picker_surface
+                .as_mut()
+                .and_then(PickerSurfaceReservation::poll_ready);
+            match reservation {
+                Some(Ok(mode)) => self.present_apple_picker_now(mode),
+                Some(Err(error)) => {
+                    self.permission.apple_picker_failed();
+                    self.finish_picker_surface();
+                    self.note(format!(
+                        "Scrozz could not hide its surfaces for Apple's picker: {error}"
+                    ));
+                }
+                None => {}
+            }
+
+            let event = self
+                .apple_picker
+                .as_ref()
+                .and_then(scrozz_capture::AppleContentPicker::poll);
+            match event {
+                Some(scrozz_capture::ApplePickerEvent::Captured(capture)) => {
+                    self.finish_picker_surface();
+                    if let Some(pending) = self.permission.apple_picker_captured() {
+                        self.queue_apple_picker_capture(pending, capture);
+                    } else {
+                        tracing::warn!(
+                            "discarding an Apple picker selection with no pending action"
+                        );
+                    }
+                }
+                Some(scrozz_capture::ApplePickerEvent::Cancelled) => {
+                    self.finish_picker_surface();
+                    let effect = self.permission.apple_picker_cancelled(unix_now());
+                    self.apply_permission_effect(effect);
+                    self.note("Apple's content picker was cancelled");
+                }
+                Some(scrozz_capture::ApplePickerEvent::Failed(error)) => {
+                    self.finish_picker_surface();
+                    self.apple_picker = None;
+                    self.permission.apple_picker_failed();
+                    self.note(format!("Apple's content picker failed: {error}"));
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn apply_permission_effect(&mut self, initial: PermissionEffect) {
+        let mut effect = initial;
+        loop {
+            effect = match effect {
+                PermissionEffect::None => break,
+                PermissionEffect::RunDirect(pending) => {
+                    self.queue_direct_capture(pending);
+                    PermissionEffect::None
+                }
+                PermissionEffect::RunDirectAfterPermission(pending) => {
+                    if self.permission_resume.replace(pending).is_some() {
+                        self.note("a pending permission resume was replaced before it ran");
+                    }
+                    PermissionEffect::None
+                }
+                PermissionEffect::RequestSystemAccess => {
+                    let permissions = SystemPermissions::new();
+                    if let Err(error) = permissions.request(Capability::ScreenRecording)
+                        && !matches!(error, CoreError::PermissionDenied { .. })
+                    {
+                        self.note(format!(
+                            "macOS could not present Screen Recording access: {error}"
+                        ));
+                    }
+                    self.permission
+                        .system_request_finished(Self::screen_access())
+                }
+                PermissionEffect::OpenSystemSettings => {
+                    if let Err(error) =
+                        scrozz_shell::permissions::open_settings(Capability::ScreenRecording)
+                    {
+                        self.permission.settings_open_failed();
+                        self.note(format!("System Settings could not be opened: {error}"));
+                    }
+                    PermissionEffect::None
+                }
+                PermissionEffect::PresentApplePicker(mode) => {
+                    self.prepare_apple_picker(mode);
+                    PermissionEffect::None
+                }
+                PermissionEffect::RememberDismissal(at) => {
+                    if let Some(store) = &self.permission_store
+                        && let Err(error) = store.save(at)
+                    {
+                        self.note(format!(
+                            "permission dismissal could not be remembered: {error}"
+                        ));
+                    }
+                    PermissionEffect::None
+                }
+            };
+        }
+    }
+
+    fn prepare_apple_picker(&mut self, mode: PickerMode) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.picker_surface.is_some() {
+                self.permission.apple_picker_failed();
+                self.note("Apple's content picker is already being prepared");
+                return;
+            }
+            match PickerSurfaceReservation::start(mode, Arc::clone(&self.selector)) {
+                Ok(reservation) => {
+                    self.picker_surface = Some(reservation);
+                }
+                Err(error) => {
+                    self.permission.apple_picker_failed();
+                    self.note(format!(
+                        "Scrozz could not prepare its surfaces for Apple's picker: {error}"
+                    ));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = mode;
+            self.permission.apple_picker_failed();
+            self.note("Apple's content picker exists only on macOS");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn present_apple_picker_now(&mut self, mode: PickerMode) {
+        if let Err(error) = scrozz_shell::permissions::activate_application() {
+            self.permission.apple_picker_failed();
+            self.finish_picker_surface();
+            self.note(format!("Apple's picker could not be foregrounded: {error}"));
             return;
         }
 
-        let card = self.pipeline.allocate();
-        tracing::debug!(%card, capture = kind.label(), origin, "capture job queued");
-        if !self.pipeline.post(Job::Capture { kind, card }) {
-            self.note("the capture worker has gone");
+        let picker = match self.apple_picker.take() {
+            Some(picker) => picker,
+            None => match scrozz_capture::AppleContentPicker::new() {
+                Ok(picker) => picker,
+                Err(error) => {
+                    self.permission.apple_picker_failed();
+                    self.finish_picker_surface();
+                    self.note(format!("Apple's content picker is unavailable: {error}"));
+                    return;
+                }
+            },
+        };
+        let native_mode = match mode {
+            PickerMode::Window => scrozz_capture::ApplePickerMode::Window,
+            PickerMode::Display => scrozz_capture::ApplePickerMode::Display,
+            PickerMode::WindowOrDisplay => scrozz_capture::ApplePickerMode::WindowOrDisplay,
+        };
+        match picker.present(native_mode) {
+            Ok(()) => {
+                self.apple_picker = Some(picker);
+            }
+            Err(error) => {
+                self.permission.apple_picker_failed();
+                self.finish_picker_surface();
+                self.note(format!("Apple's content picker could not open: {error}"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_picker_surface(&mut self) {
+        if let Some(reservation) = self.picker_surface.take() {
+            reservation.release();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_picker_surface_and_join(&mut self) {
+        if let Some(reservation) = self.picker_surface.take() {
+            reservation.release_and_join();
+        }
+    }
+
+    fn screen_access() -> Access {
+        #[cfg(target_os = "macos")]
+        if !scrozz_capture::still_capture_available() {
+            return Access::Unavailable;
+        }
+        if SystemPermissions::new().is_granted(Capability::ScreenRecording) {
+            Access::Granted
+        } else {
+            Access::NotGranted
+        }
+    }
+
+    fn picker_availability() -> PickerAvailability {
+        #[cfg(target_os = "macos")]
+        {
+            match scrozz_capture::AppleContentPicker::availability() {
+                scrozz_capture::ApplePickerAvailability::Available => PickerAvailability::Available,
+                scrozz_capture::ApplePickerAvailability::OlderMacOs => {
+                    PickerAvailability::OlderMacOs
+                }
+                scrozz_capture::ApplePickerAvailability::Unavailable => {
+                    PickerAvailability::Unavailable
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PickerAvailability::Unavailable
+        }
+    }
+
+    /// The permission surface model for the window host.
+    #[must_use]
+    pub fn permission_prompt(&self) -> Option<PermissionUiPrompt> {
+        self.permission.prompt().map(|prompt| PermissionUiPrompt {
+            stage: match prompt.stage {
+                permission::PromptStage::Preflight => PermissionUiStage::Preflight,
+                permission::PromptStage::Denied => PermissionUiStage::Denied,
+                permission::PromptStage::WaitingForSettings => {
+                    PermissionUiStage::WaitingForSettings
+                }
+                permission::PromptStage::Restricted => PermissionUiStage::Restricted,
+                permission::PromptStage::Unavailable => PermissionUiStage::Unavailable,
+            },
+            action: capture_action_label(prompt.pending.kind).to_owned(),
+            picker: picker_fallback(prompt),
+        })
+    }
+
+    /// Applies one response from the permission window.
+    pub fn respond_to_permission(&mut self, response: scrozz_ui::permission::PermissionResponse) {
+        let response = match response {
+            scrozz_ui::permission::PermissionResponse::Continue => PermissionResponse::Continue,
+            scrozz_ui::permission::PermissionResponse::UseApplePicker => {
+                PermissionResponse::UseApplePicker
+            }
+            scrozz_ui::permission::PermissionResponse::OpenSystemSettings => {
+                PermissionResponse::OpenSystemSettings
+            }
+            scrozz_ui::permission::PermissionResponse::NotNow => PermissionResponse::NotNow,
+        };
+        let effect = self.permission.respond(response, unix_now());
+        self.apply_permission_effect(effect);
+    }
+
+    /// Whether a granted action is waiting for the permission viewport to close.
+    #[must_use]
+    pub const fn has_permission_resume(&self) -> bool {
+        self.permission_resume.is_some()
+    }
+
+    /// Queues the exact action after the host has completed one close frame.
+    pub fn dispatch_permission_resume(&mut self) {
+        if let Some(pending) = self.permission_resume.take() {
+            self.queue_direct_capture(pending);
         }
     }
 
@@ -1463,6 +2037,12 @@ impl App {
         }
         self.server = None;
         self.selector.cancel();
+        #[cfg(target_os = "macos")]
+        self.finish_picker_surface_and_join();
+        #[cfg(target_os = "macos")]
+        {
+            self.apple_picker = None;
+        }
         if let Some(mut forwarder) = self.forwarder.take() {
             forwarder.stop();
         }
@@ -1525,6 +2105,7 @@ mod tests {
             Config::sealed(),
             Box::new(surface),
             Arc::new(UnsupportedSelector::headless()),
+            false,
         )
         .expect("a sealed app must start");
         (app, handle)
@@ -1539,6 +2120,101 @@ mod tests {
         app.shortcuts = shortcuts.clone();
         app.config.shortcuts = shortcuts;
         app
+    }
+
+    #[cfg(target_os = "macos")]
+    struct BlockingFinishSelector {
+        started: std::sync::mpsc::Sender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        done: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl scrozz_core::RegionSelector for BlockingFinishSelector {
+        fn name(&self) -> &'static str {
+            "blocking-finish-test"
+        }
+
+        fn capabilities(&self) -> SelectionCapabilities {
+            SelectionCapabilities::NONE
+        }
+
+        fn select(
+            &self,
+            _options: &scrozz_core::SelectionOptions,
+        ) -> scrozz_core::Result<scrozz_core::SelectionOutcome> {
+            Err(CoreError::Cancelled)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CaptureSelector for BlockingFinishSelector {
+        fn capture_finished(&self) {
+            let _ = self.started.send(());
+            let _ = self
+                .resume
+                .lock()
+                .expect("test resume mutex")
+                .recv_timeout(Duration::from_secs(2));
+            let _ = self.done.send(());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normal_picker_surface_release_never_joins_the_main_thread() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let selector: Arc<dyn CaptureSelector> = Arc::new(BlockingFinishSelector {
+            started: started_tx,
+            resume: std::sync::Mutex::new(resume_rx),
+            done: done_tx,
+        });
+        let mut reservation =
+            PickerSurfaceReservation::start(PickerMode::Window, selector).expect("start");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = reservation.poll_ready() {
+                assert_eq!(result.unwrap(), PickerMode::Window);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "surface reservation did not answer"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let released_at = Instant::now();
+        reservation.release();
+        assert!(
+            released_at.elapsed() < Duration::from_millis(100),
+            "normal release joined a worker waiting on the next main-loop frame"
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered capture_finished");
+        resume_tx.send(()).expect("allow worker to finish");
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached worker finished cleanly");
+    }
+
+    #[test]
+    fn headless_revocation_reports_and_never_parks_an_invisible_prompt() {
+        let (mut app, _) = app();
+        app.handle_capture_permission_failure(
+            CaptureKind::Fullscreen,
+            "direct",
+            Access::NotGranted,
+        );
+        assert!(!app.permission.has_pending_action());
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("System Settings")),
+            "the headless refusal must remain actionable"
+        );
     }
 
     fn redacted_editor() -> EditorUi {

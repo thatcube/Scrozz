@@ -195,6 +195,13 @@ the acceptance criteria above and to golden-image tests — never an invitation 
 apply an adjustable radius. Radius, shadow and inset controls apply only to
 non-window captures.
 
+**ScreenCaptureKit shadow limit.** Apple does not expose supported
+shadow-inclusive window bounds. Scrozz therefore requests the native shadow,
+disables global clipping, and preserves the exact pixels and colour profile the
+OS returns; it does not pad or guess at missing shadow extents. On macOS versions
+that omit exterior shadow pixels from a one-shot capture, omission is the honest
+residual limitation—manufacturing a lookalike shadow would violate this decision.
+
 This governs capture and export pixels, not transient UI around a preview. The
 floating stack normalizes every provenance into the same fixed 210 × 150 point
 container. Each image cover-fills that frame and is centre-cropped and clipped
@@ -373,6 +380,32 @@ effort; it is **trust cost**. Requesting Input Monitoring — a keylogger-class
 grant — during first-run onboarding taxes every user for a feature most never
 use. Deferring the prompt to first use removes that tax entirely and makes
 "attempt everything" safe. Nothing needs to be cut, only sequenced.
+
+**macOS Screen & System Audio Recording flow.** Launching Scrozz never queries
+with side effects and never requests this grant. The first capture that needs
+direct access gets one Scrozz preflight before macOS is allowed to prompt: it
+names the custom Area/Window selector, global shortcuts and recording, says that
+sensitive pixels or audio may be visible, and says that nothing is uploaded
+unless the user explicitly enables an upload action.
+
+If direct access remains unavailable, Scrozz offers Apple's public
+`SCContentSharingPicker` where that picker can complete the exact action. The
+returned `SCContentFilter` is a single-purpose capability: Scrozz consumes that
+filter for one job, never enumerates a replacement target, and never expands it.
+The system picker replaces Scrozz's selector; custom Area capture, All Displays,
+unattended global capture, and recording/system-audio combinations not
+implemented on that path stay unavailable and are labelled that way.
+
+`Open System Settings` and `Not Now` are explicit choices. A dismissal cools
+down shortcut-triggered reminders for 24 hours, while a visible capture command
+can reopen the choice immediately. Returning from Settings rechecks the public
+preflight API and consumes the pending action once if the grant is active.
+macOS does not publicly distinguish every user denial from MDM or parental
+control restriction, so Scrozz names that ambiguity instead of claiming a
+policy state it cannot observe. macOS also provides no permission-change
+callback and some releases require **Quit & Reopen** before a broad grant becomes
+active; in that case the preflight remains false and Scrozz does not fake an
+in-process retry. The picker path needs no broad grant or restart.
 
 ---
 

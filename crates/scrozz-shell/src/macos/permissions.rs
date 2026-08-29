@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, Bool};
-use objc2_app_kit::NSWorkspace;
+use objc2_app_kit::{NSApplication, NSWorkspace};
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 use scrozz_core::{Error, Result};
@@ -154,7 +154,11 @@ fn audio_media_type() -> Option<&'static NSString> {
     }
 }
 
-/// Prompts for a capability, falling back to the relevant Settings pane.
+/// Prompts for a capability.
+///
+/// Screen Recording never opens Settings implicitly; that is a distinct button
+/// on Scrozz's explained preflight. The older microphone and Accessibility paths
+/// retain their capability-specific Settings fallback.
 ///
 /// # Errors
 ///
@@ -179,8 +183,25 @@ fn request_screen_recording(capability: Capability) -> Result<()> {
     if CGRequestScreenCaptureAccess() {
         return Ok(());
     }
-    open_settings_pane(capability)?;
     Err(crate::permissions::denied(capability))
+}
+
+/// Whether the accessory application is currently active.
+#[must_use]
+pub fn application_is_active() -> bool {
+    crate::macos::main_thread("checking application activation")
+        .is_ok_and(|mtm| NSApplication::sharedApplication(mtm).isActive())
+}
+
+/// Activates Scrozz for a user-requested permission surface or Apple picker.
+///
+/// # Errors
+///
+/// Returns [`Error::Platform`] away from AppKit's main thread.
+pub fn activate_application() -> Result<()> {
+    let mtm = crate::macos::main_thread("showing capture permission UI")?;
+    NSApplication::sharedApplication(mtm).activate();
+    Ok(())
 }
 
 fn request_microphone(capability: Capability) -> Result<()> {
