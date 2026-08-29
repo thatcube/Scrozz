@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CaptureId,
-    model::{CaptureRecord, FrameHeader, ImageState, ProvenanceRepr, TargetRepr, Timestamp},
+    model::{
+        CaptureRecord, FrameHeader, ImageState, MediaKind, ProvenanceRepr, TargetRepr, Timestamp,
+    },
 };
 
 /// Current sidecar format. Bumped only when old files stop being readable,
@@ -47,6 +49,9 @@ pub struct StoredRecord {
     /// When it entered history, which may differ for an import.
     #[serde(default)]
     pub stored_at: i64,
+    /// Still, video or GIF. Old sidecars were all screenshots.
+    #[serde(default)]
+    pub media_kind: MediaKind,
     /// Exempt from eviction.
     #[serde(default)]
     pub pinned: bool,
@@ -104,6 +109,7 @@ impl StoredRecord {
         id: &CaptureId,
         created_at: Timestamp,
         stored_at: Timestamp,
+        media_kind: MediaKind,
         pinned: bool,
         app_name: Option<String>,
         window_title: Option<String>,
@@ -120,6 +126,7 @@ impl StoredRecord {
             id: id.0.clone(),
             created_at: created_at.0,
             stored_at: stored_at.0,
+            media_kind,
             pinned,
             screen_pin: None,
             app_name,
@@ -203,6 +210,7 @@ impl StoredRecord {
         CaptureRecord {
             id: CaptureId(self.id.clone()),
             created_at: Timestamp(self.created_at),
+            media_kind: self.media_kind,
             pinned: self.pinned,
             screen_pin: self.screen_pin.clone(),
             app_name: self.app_name.clone(),
@@ -316,6 +324,7 @@ mod tests {
             &CaptureId("01ABC".into()),
             Timestamp(1_700_000_000_000),
             Timestamp(1_700_000_000_001),
+            MediaKind::Screenshot,
             false,
             Some("Safari".into()),
             Some("Invoice".into()),
@@ -449,6 +458,7 @@ mod tests {
             .expect("decode");
         assert_eq!(record.annotation_count(), 0);
         assert_eq!(record.image_state(), ImageState::Absent);
+        assert_eq!(record.media_kind, MediaKind::Screenshot);
         assert!(!record.pinned);
         assert!(
             record.document_data().is_ok(),

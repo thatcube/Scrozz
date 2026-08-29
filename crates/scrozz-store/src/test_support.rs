@@ -26,7 +26,7 @@ use scrozz_core::{
 
 use crate::{
     CaptureId,
-    model::{FrameHeader, Timestamp},
+    model::{FrameHeader, MediaKind, Timestamp},
     record::StoredRecord,
 };
 
@@ -189,6 +189,7 @@ pub fn sample_record(app: &str, created_at: i64) -> StoredRecord {
         &crate::id::capture_id_at(created_at),
         Timestamp(created_at),
         Timestamp(created_at),
+        MediaKind::Screenshot,
         false,
         Some(app.to_owned()),
         Some(format!("{app} — window")),

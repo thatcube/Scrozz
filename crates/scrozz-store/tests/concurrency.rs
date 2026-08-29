@@ -14,6 +14,13 @@ use scrozz_store::{
     test_support::{sample_document, scratch_dir},
 };
 
+fn policy(max_image_bytes: u64) -> RetentionPolicy {
+    RetentionPolicy {
+        max_image_bytes,
+        ..RetentionPolicy::default()
+    }
+}
+
 #[test]
 fn two_processes_can_write_to_one_history_at_the_same_time() {
     let dir = scratch_dir("parallel-writers");
@@ -151,9 +158,7 @@ fn retention_running_in_one_process_does_not_break_inserts_in_another() {
         evictor_gate.wait();
         for _ in 0..10 {
             store
-                .evict(&RetentionPolicy {
-                    max_image_bytes: 4 * 8 * 8 * 4,
-                })
+                .evict(&policy(4 * 8 * 8 * 4))
                 .expect("retention must tolerate a concurrent writer");
         }
     });

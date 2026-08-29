@@ -76,11 +76,15 @@ fn an_old_database_climbs_forward_with_every_row_intact() {
     let index = store.layout().index_path();
     drop(store);
 
-    // Wind the recorded version backwards. The tables are already current, so a
-    // correct migration ladder must be safe to re-apply; an incorrect one that
-    // does `CREATE TABLE` without `IF NOT EXISTS` fails loudly right here.
+    // Recreate the exact v1 shape: the history rows and durable records already
+    // exist, but the media-kind column and index do not.
     let conn = Connection::open(&index).expect("raw open");
-    conn.pragma_update(None, "user_version", 0).expect("rewind");
+    conn.execute("DROP INDEX captures_by_kind_recency", [])
+        .expect("drop v2 index");
+    conn.execute("ALTER TABLE captures DROP COLUMN media_kind", [])
+        .expect("drop v2 column");
+    conn.pragma_update(None, "user_version", 1)
+        .expect("record v1");
     drop(conn);
 
     let store = SqliteStore::open(dir.path()).expect("reopen migrates");

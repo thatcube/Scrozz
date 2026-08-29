@@ -32,11 +32,10 @@ pub struct Migration {
 
 /// The schema, in order.
 ///
-/// Every statement is `IF NOT EXISTS`, so re-running a rung against a file that
-/// already has it is harmless. That matters more than it looks: the one way a
-/// `user_version` and a schema drift apart is an interrupted upgrade on a
-/// filesystem that lied about `fsync`, and idempotent rungs make that
-/// recoverable instead of fatal.
+/// Creation statements are `IF NOT EXISTS`, while each rung runs atomically with
+/// its `user_version` update. SQLite does not support `IF NOT EXISTS` for
+/// `ALTER TABLE ADD COLUMN`, so the transaction is what prevents a column and
+/// its recorded version from drifting apart.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -110,6 +109,18 @@ pub const MIGRATIONS: &[Migration] = &[
                 pin_json TEXT NOT NULL
             ) STRICT;
         ",
+    },
+    Migration {
+        version: 3,
+        name: "index capture media kind",
+        sql: r"
+        ALTER TABLE captures
+            ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'screenshot'
+            CHECK (media_kind IN ('screenshot', 'video', 'gif'));
+
+        CREATE INDEX IF NOT EXISTS captures_by_kind_recency
+            ON captures (media_kind, created_at DESC, id DESC);
+    ",
     },
 ];
 
@@ -358,6 +369,39 @@ mod tests {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
         assert_eq!(migrate(&mut conn, MIGRATIONS).expect("again"), version);
+    }
+
+    #[test]
+    fn version_three_backfills_old_rows_as_screenshots_and_adds_the_kind_index() {
+        let mut conn = memory();
+        migrate(&mut conn, &MIGRATIONS[..1]).expect("version one");
+        conn.execute(
+            "INSERT INTO captures (
+                 id, created_at, stored_at, provenance, target_json, frame_json
+             ) VALUES ('old', 1, 1, 'window', '{}', '{}')",
+            [],
+        )
+        .expect("old row");
+
+        assert_eq!(migrate(&mut conn, MIGRATIONS).expect("version three"), 3);
+        let kind: String = conn
+            .query_row(
+                "SELECT media_kind FROM captures WHERE id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backfilled kind");
+        assert_eq!(kind, "screenshot");
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'captures_by_kind_recency'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index lookup");
+        assert_eq!(indexed, 1);
     }
 
     #[test]
