@@ -76,6 +76,7 @@ rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 global-hotkey = "0.8"
 tray-icon = "0.24"
 dark-light = { version = "3", default-features = false }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 
 # --- macOS ---
 objc2 = "0.6"

@@ -65,10 +65,10 @@ pub mod app;
 pub mod card;
 pub mod drag;
 pub mod host;
-pub mod overlay;
 pub mod panel;
 pub mod permission;
 pub mod pipeline;
+pub mod recent_captures_overlay;
 pub mod recording;
 pub mod selection;
 pub mod server;
@@ -83,7 +83,7 @@ pub use crate::gui::{
     app::{App, Config},
     card::{Card, CardEvent, CardId, CardSurface, Thumbnail},
     host::Host,
-    overlay::OverlayCards,
+    recent_captures_overlay::RecentCapturesOverlayCards,
 };
 
 use crate::{cli::Cli, fault::CliResult, report::Report};

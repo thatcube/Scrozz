@@ -25,6 +25,15 @@ pub fn export_default(bytes: &[u8]) -> CliResult<PathBuf> {
     export_with_settings(bytes, &persisted)
 }
 
+/// Saves encoded image bytes to the path explicitly chosen by the user.
+///
+/// The replacement is atomic, so a failed write cannot leave a truncated
+/// destination after the native save dialog has confirmed an overwrite.
+pub fn export_to_path(bytes: &[u8], path: &Path) -> CliResult<PathBuf> {
+    scrozz_store::layout::atomic_write(path, bytes)?;
+    Ok(path.to_owned())
+}
+
 /// Saves encoded bytes using the exact settings snapshot that started an action
 /// pass.
 ///

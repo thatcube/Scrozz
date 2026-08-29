@@ -3394,7 +3394,7 @@ pub fn render_settings_golden(case: &SettingsGoldenCase) -> Result<Image> {
     };
     let icons = std::sync::Mutex::new(None);
     RasterJob {
-        width_px: 1600,
+        width_px: if case.compact { 1200 } else { 1600 },
         height_px: 1200,
         pixels_per_point,
         theme: case.theme,
@@ -3417,12 +3417,24 @@ pub fn render_settings_golden(case: &SettingsGoldenCase) -> Result<Image> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let empty = crate::icons::IconStore::empty();
-            crate::settings::render_preview(
-                ui,
-                case.platform,
-                guard.as_ref().unwrap_or(&empty),
-                &crate::settings::preview_shortcuts(case.platform),
-            );
+            if case.recent_captures_overlay {
+                crate::settings::render_recent_captures_preview(
+                    ui,
+                    case.platform,
+                    guard.as_ref().unwrap_or(&empty),
+                    crate::RecentCapturesOverlaySettings {
+                        auto_close_enabled: true,
+                        ..crate::RecentCapturesOverlaySettings::default()
+                    },
+                );
+            } else {
+                crate::settings::render_preview(
+                    ui,
+                    case.platform,
+                    guard.as_ref().unwrap_or(&empty),
+                    &crate::settings::preview_shortcuts(case.platform),
+                );
+            }
         },
     )
 }
@@ -4370,6 +4382,10 @@ pub struct SettingsGoldenCase {
     pub platform: crate::settings::SettingsPlatform,
     /// OS appearance to render.
     pub theme: egui::Theme,
+    /// Whether this case renders the Recent Captures Overlay pane.
+    pub recent_captures_overlay: bool,
+    /// Whether to render below the ordinary minimum width.
+    pub compact: bool,
     /// What a reviewer should verify.
     pub expectation: &'static str,
 }
@@ -4383,31 +4399,65 @@ pub fn settings_golden_plan() -> Vec<SettingsGoldenCase> {
             name: "settings-macos--light",
             platform: SettingsPlatform::MacOs,
             theme: egui::Theme::Light,
+            recent_captures_overlay: false,
+            compact: false,
             expectation: "macOS top category toolbar in system light appearance",
         },
         SettingsGoldenCase {
             name: "settings-macos--dark",
             platform: SettingsPlatform::MacOs,
             theme: egui::Theme::Dark,
+            recent_captures_overlay: false,
+            compact: false,
             expectation: "macOS top category toolbar in system dark appearance",
         },
         SettingsGoldenCase {
             name: "settings-windows--light",
             platform: SettingsPlatform::Windows,
             theme: egui::Theme::Light,
+            recent_captures_overlay: false,
+            compact: false,
             expectation: "Windows left navigation with the spacious Settings form",
         },
         SettingsGoldenCase {
             name: "settings-linux--dark",
             platform: SettingsPlatform::Linux,
             theme: egui::Theme::Dark,
+            recent_captures_overlay: false,
+            compact: false,
             expectation: "desktop-neutral Linux sidebar in system dark appearance",
         },
         SettingsGoldenCase {
             name: "settings-linux--light",
             platform: SettingsPlatform::Linux,
             theme: egui::Theme::Light,
+            recent_captures_overlay: false,
+            compact: false,
             expectation: "desktop-neutral Linux sidebar in system light appearance",
+        },
+        SettingsGoldenCase {
+            name: "settings-recent-captures-macos--light",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Light,
+            recent_captures_overlay: true,
+            compact: false,
+            expectation: "Recent Captures Overlay pane with a restrained left-placement schematic",
+        },
+        SettingsGoldenCase {
+            name: "settings-recent-captures-macos--dark",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Dark,
+            recent_captures_overlay: true,
+            compact: false,
+            expectation: "Recent Captures Overlay controls remain legible in system dark appearance",
+        },
+        SettingsGoldenCase {
+            name: "settings-recent-captures-linux--compact",
+            platform: SettingsPlatform::Linux,
+            theme: egui::Theme::Light,
+            recent_captures_overlay: true,
+            compact: true,
+            expectation: "compact sidebar layout wraps without clipping controls or unavailable reasons",
         },
     ]
 }

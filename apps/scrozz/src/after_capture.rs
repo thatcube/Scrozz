@@ -1857,6 +1857,36 @@ mod tests {
     }
 
     #[test]
+    fn recent_captures_overlay_values_survive_future_document_round_trip() {
+        let text = r#"{
+  "version": 99,
+  "future-root": {"kept": true},
+  "values": {
+    "recent-captures-overlay.placement": "right",
+    "recent-captures-overlay.card-width": 320,
+    "recent-captures-overlay.auto-close-enabled": true,
+    "recent-captures-overlay.future-behavior": {"kept": true}
+  },
+  "after_capture": {"screenshot": {}, "recording": {}}
+}"#;
+        let (settings, _) = AfterCaptureSettings::from_json(text).expect("read future");
+        let rendered = settings.to_json().expect("rewrite");
+        assert!(rendered.contains("\"version\": 99"), "{rendered}");
+        assert!(
+            rendered.contains("\"recent-captures-overlay.placement\": \"right\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"recent-captures-overlay.card-width\": \"320\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"recent-captures-overlay.future-behavior\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn malformed_action_values_are_reported_not_silently_defaulted() {
         let error = AfterCaptureSettings::from_json(
             r#"{"version":2,"after_capture":{"screenshot":{"copy-to-clipboard":"yes"}}}"#,
