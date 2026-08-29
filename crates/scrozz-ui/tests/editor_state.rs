@@ -14,8 +14,8 @@ use scrozz_core::{
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
 use scrozz_ui::editor::{
-    Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, TextEdit,
-    Tool,
+    Caret, Command, CropAspect, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE,
+    MIN_ZOOM, TextEdit, Tool,
 };
 
 /// A flat capture, 400x300 logical at 2x, big enough that the minimum-size
@@ -51,6 +51,18 @@ fn drag(state: &mut EditorState, from: LogicalPoint, to: LogicalPoint) {
     state.pointer_pressed(from);
     state.pointer_dragged(to, false);
     state.pointer_released();
+}
+
+fn draft_crop(state: &mut EditorState, left: f64, top: f64, right: f64, bottom: f64) {
+    state.set_tool(Tool::Crop);
+    let full = state.pending_crop().expect("crop mode");
+    drag(state, Handle::TopLeft.position(&full), at(left, top));
+    let after_top_left = state.pending_crop().expect("crop after first edge");
+    drag(
+        state,
+        Handle::BottomRight.position(&after_top_left),
+        at(right, bottom),
+    );
 }
 
 fn rect_tools() -> Vec<Tool> {
@@ -694,8 +706,7 @@ fn delete_removes_the_selection() {
 #[test]
 fn delete_with_nothing_selected_clears_the_crop() {
     let mut state = state();
-    state.set_tool(Tool::Crop);
-    drag(&mut state, at(40.0, 40.0), at(200.0, 180.0));
+    draft_crop(&mut state, 40.0, 40.0, 200.0, 180.0);
     state.command(Command::ApplyCrop).expect("crop");
     assert!(state.document().crop().is_some());
 
@@ -881,8 +892,7 @@ fn undo_restores_a_deleted_shape() {
 #[test]
 fn undo_reverses_a_crop() {
     let mut state = state();
-    state.set_tool(Tool::Crop);
-    drag(&mut state, at(40.0, 40.0), at(200.0, 180.0));
+    draft_crop(&mut state, 40.0, 40.0, 200.0, 180.0);
     state.command(Command::ApplyCrop).expect("crop");
     assert!(state.document().crop().is_some());
 
@@ -898,8 +908,7 @@ fn undo_reverses_a_crop() {
 fn a_crop_shrinks_the_content_without_touching_the_source() {
     let mut state = state();
     let full = state.document().content_size();
-    state.set_tool(Tool::Crop);
-    drag(&mut state, at(40.0, 40.0), at(200.0, 180.0));
+    draft_crop(&mut state, 40.0, 40.0, 200.0, 180.0);
     state.command(Command::ApplyCrop).expect("crop");
 
     let cropped = state.document().content_size();
@@ -915,8 +924,7 @@ fn a_crop_shrinks_the_content_without_touching_the_source() {
 #[test]
 fn applying_a_crop_returns_to_the_pointer() {
     let mut state = state();
-    state.set_tool(Tool::Crop);
-    drag(&mut state, at(40.0, 40.0), at(200.0, 180.0));
+    draft_crop(&mut state, 40.0, 40.0, 200.0, 180.0);
     state.command(Command::ApplyCrop).expect("crop");
     assert_eq!(state.tool(), Tool::Select);
 }
@@ -933,14 +941,205 @@ fn apply_crop_without_a_pending_rect_does_nothing() {
 fn a_pending_crop_is_visible_before_it_is_committed() {
     let mut state = state();
     state.set_tool(Tool::Crop);
-    state.pointer_pressed(at(40.0, 40.0));
-    state.pointer_dragged(at(200.0, 180.0), false);
-    assert!(state.pending_crop().is_some());
+    assert_eq!(
+        state.pending_crop(),
+        Some(state.document().logical_bounds()),
+        "crop mode must begin at the whole current image"
+    );
+    state.set_crop_width(200.0);
+    assert!(state.pending_crop().unwrap().size.width < 400.0);
     assert_eq!(
         state.document().crop(),
         None,
         "the crop was applied before it was committed"
     );
+}
+
+#[test]
+fn crop_mode_starts_at_the_entire_current_image_without_editing_it() {
+    let mut state = state();
+    let revision = state.revision();
+    state.set_tool(Tool::Crop);
+
+    assert_eq!(
+        state.pending_crop(),
+        Some(state.document().logical_bounds())
+    );
+    assert_eq!(state.document().crop(), None);
+    assert_eq!(state.revision(), revision);
+    assert!(!state.can_undo());
+}
+
+#[test]
+fn crop_edges_corners_and_inside_move_the_draft_directly() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    let narrowed = state.pending_crop().unwrap();
+    assert_eq!(narrowed.origin, at(40.0, 30.0));
+    assert_eq!(narrowed.size, LogicalSize::new(220.0, 180.0));
+
+    let centre = LogicalPoint::new(
+        narrowed.origin.x + narrowed.size.width / 2.0,
+        narrowed.origin.y + narrowed.size.height / 2.0,
+    );
+    drag(&mut state, centre, at(centre.x + 20.0, centre.y + 15.0));
+    let moved = state.pending_crop().unwrap();
+    assert_eq!(moved.origin, at(60.0, 45.0));
+    assert_eq!(moved.size, narrowed.size);
+    assert_eq!(state.document().crop(), None);
+}
+
+#[test]
+fn crop_aspect_dimensions_and_swap_stay_bounded_in_source_space() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_aspect(CropAspect::Square);
+    let square = state.pending_crop().unwrap();
+    assert!((square.size.width - square.size.height).abs() < 0.001);
+
+    state.set_crop_width(120.0);
+    let resized = state.pending_crop().unwrap();
+    assert_eq!(resized.size, LogicalSize::new(120.0, 120.0));
+
+    state.set_crop_aspect(CropAspect::Landscape16x9);
+    let landscape = state.pending_crop().unwrap();
+    assert!((landscape.size.width / landscape.size.height - 16.0 / 9.0).abs() < 0.001);
+
+    state.swap_crop_dimensions();
+    let portrait = state.pending_crop().unwrap();
+    assert_eq!(state.crop_aspect(), Some(CropAspect::Portrait9x16));
+    assert!((portrait.size.width / portrait.size.height - 9.0 / 16.0).abs() < 0.001);
+
+    let Some(((width_px, height_px), (800, 600))) = state.crop_pixel_sizes() else {
+        panic!("crop pixel readout");
+    };
+    assert_eq!(width_px, (portrait.size.width * 2.0).round() as u32);
+    assert_eq!(height_px, (portrait.size.height * 2.0).round() as u32);
+}
+
+#[test]
+fn crop_handle_drag_preserves_the_selected_aspect_ratio() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_aspect(CropAspect::Landscape16x9);
+    let before = state.pending_crop().unwrap();
+    let right = Handle::Right.position(&before);
+    drag(&mut state, right, at(right.x - 80.0, right.y));
+    let after = state.pending_crop().unwrap();
+    assert!((after.size.width / after.size.height - 16.0 / 9.0).abs() < 0.001);
+    assert_eq!(after.origin.x, before.origin.x);
+}
+
+#[test]
+fn malformed_crop_dimensions_are_sanitised_and_bounded() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(f64::NAN);
+    state.set_crop_height(f64::INFINITY);
+    let crop = state.pending_crop().unwrap();
+    let bounds = state.document().logical_bounds();
+    assert!(crop.size.width.is_finite() && crop.size.height.is_finite());
+    assert!(crop.size.width >= MIN_SIZE && crop.size.height >= MIN_SIZE);
+    assert!(crop.size.width <= bounds.size.width);
+    assert!(crop.size.height <= bounds.size.height);
+}
+
+#[test]
+fn crop_snap_can_be_temporarily_disabled_without_leaving_source_bounds() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(100.0);
+    state.set_crop_height(80.0);
+    let start = state.pending_crop().unwrap();
+    let centre = LogicalPoint::new(
+        start.origin.x + start.size.width / 2.0,
+        start.origin.y + start.size.height / 2.0,
+    );
+
+    state.pointer_pressed(centre);
+    state.pointer_dragged_with_snap(at(53.0, centre.y), false, false);
+    state.pointer_released();
+    assert_eq!(state.pending_crop().unwrap().origin.x, 0.0);
+
+    let snapped = state.pending_crop().unwrap();
+    let centre = LogicalPoint::new(
+        snapped.origin.x + snapped.size.width / 2.0,
+        snapped.origin.y + snapped.size.height / 2.0,
+    );
+    state.pointer_pressed(centre);
+    state.pointer_dragged_with_snap(at(centre.x + 3.0, centre.y), false, true);
+    state.pointer_released();
+    assert_eq!(state.pending_crop().unwrap().origin.x, 3.0);
+}
+
+#[test]
+fn crop_cancel_is_a_no_op_apply_is_one_step_and_revert_is_undoable() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::CancelCrop).expect("cancel crop");
+    assert_eq!(state.document().crop(), None);
+    assert!(!state.can_undo());
+    assert_eq!(state.tool(), Tool::Select);
+
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    let depth = state.undo_depth();
+    state.command(Command::ApplyCrop).expect("apply crop");
+    let applied = state.document().crop().expect("committed crop");
+    assert_eq!(state.undo_depth(), depth + 1);
+
+    state.set_tool(Tool::Crop);
+    state.command(Command::RevertCrop).expect("revert crop");
+    assert_eq!(state.document().crop(), None);
+    state.command(Command::Undo).expect("undo revert");
+    assert_eq!(state.document().crop(), Some(applied));
+}
+
+#[test]
+fn applying_the_initial_full_crop_is_a_no_op() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.command(Command::ApplyCrop).expect("apply full crop");
+    assert_eq!(state.document().crop(), None);
+    assert!(!state.can_undo());
+    assert_eq!(state.tool(), Tool::Select);
+}
+
+#[test]
+fn reopening_crop_starts_from_the_committed_crop_but_can_revert_to_full_source() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::ApplyCrop).expect("apply crop");
+    let committed = state.document().crop().unwrap();
+
+    state.set_tool(Tool::Crop);
+    assert_eq!(state.pending_crop(), Some(committed));
+    assert_eq!(
+        state.document().logical_bounds().size,
+        LogicalSize::new(400.0, 300.0),
+        "the complete source must remain available behind the crop draft"
+    );
+    state.command(Command::RevertCrop).expect("revert");
+    assert_eq!(state.document().crop(), None);
+}
+
+#[test]
+fn arrow_keys_nudge_the_crop_without_committing_it() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(100.0);
+    state.set_crop_height(80.0);
+    let before = state.pending_crop().unwrap();
+    let revision = state.revision();
+
+    state
+        .command(Command::Nudge { dx: 7.0, dy: -4.0 })
+        .expect("nudge crop");
+
+    let after = state.pending_crop().unwrap();
+    assert_eq!(after.origin.x, before.origin.x + 7.0);
+    assert_eq!(after.origin.y, before.origin.y - 4.0);
+    assert_eq!(state.revision(), revision);
+    assert!(!state.can_undo());
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +1193,27 @@ fn escape_cancels_a_drag_before_anything_else() {
         Tool::Rectangle,
         "escape also dropped the tool"
     );
+}
+
+#[test]
+fn escape_unwinds_crop_adjustment_then_crop_mode_without_committing() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(200.0);
+    let before = state.pending_crop().unwrap();
+    let right = Handle::Right.position(&before);
+    state.pointer_pressed(right);
+    state.pointer_dragged(at(right.x - 50.0, right.y), false);
+    assert_ne!(state.pending_crop(), Some(before));
+
+    state.command(Command::Escape).expect("cancel adjustment");
+    assert_eq!(state.pending_crop(), Some(before));
+    assert!(state.crop_mode());
+
+    state.command(Command::Escape).expect("leave crop mode");
+    assert!(!state.crop_mode());
+    assert_eq!(state.document().crop(), None);
+    assert!(!state.can_undo());
 }
 
 #[test]
@@ -1188,6 +1408,26 @@ fn zoom_reset_restores_both_zoom_and_pan() {
 }
 
 #[test]
+fn gesture_zoom_keeps_the_pointer_anchor_and_key_zoom_keeps_viewport_center() {
+    let mut state = state();
+    state.set_pan((30.0, -20.0));
+    state.zoom_about(2.0, (100.0, 50.0));
+    assert_eq!(state.zoom(), 2.0);
+    assert_eq!(state.pan(), (-40.0, -90.0));
+
+    state.command(Command::ZoomIn).expect("key zoom");
+    assert_eq!(state.pan(), (-50.0, -112.5));
+}
+
+#[test]
+fn invalid_zoom_input_cannot_poison_the_view_transform() {
+    let mut state = state();
+    state.zoom_about(f32::NAN, (10.0, 20.0));
+    assert_eq!(state.zoom(), 1.0);
+    assert_eq!(state.pan(), (0.0, 0.0));
+}
+
+#[test]
 fn panning_tracks_the_pointer_from_where_it_grabbed() {
     let mut state = state();
     state.set_pan((10.0, 10.0));
@@ -1274,8 +1514,7 @@ fn editor_chrome_changes_do_not_invalidate_rendered_content() {
     state.select(Some(id));
     state.set_tool(Tool::Crop);
     state.set_stroke_color(Color::rgb(1, 2, 3));
-    state.pointer_pressed(at(10.0, 10.0));
-    state.pointer_dragged(at(30.0, 30.0), false);
+    state.set_crop_width(200.0);
 
     assert_eq!(
         state.revision(),
@@ -1288,14 +1527,17 @@ fn editor_chrome_changes_do_not_invalidate_rendered_content() {
 fn crop_minimum_is_enforced_after_clamping_to_the_source() {
     let mut state = state();
     state.set_tool(Tool::Crop);
-    state.pointer_pressed(at(-100.0, 40.0));
-    state.pointer_dragged(at(MIN_SIZE / 2.0, 100.0), false);
+    let full = state.pending_crop().unwrap();
+    drag(
+        &mut state,
+        Handle::Left.position(&full),
+        at(full.size.width - 1.0, full.size.height / 2.0),
+    );
 
     assert!(
-        state.pending_crop().is_none(),
-        "a wide off-canvas drag became a sub-minimum crop after clamping"
+        state.pending_crop().unwrap().size.width >= MIN_SIZE,
+        "a crop edge collapsed below the minimum"
     );
-    state.pointer_released();
     assert_eq!(state.document().crop(), None);
 }
 
@@ -1342,7 +1584,7 @@ fn a_size_the_editor_reports_matches_what_it_would_render() {
     assert!((state.document().content_size().width - logical.width).abs() < 0.001);
 
     state.set_tool(Tool::Crop);
-    drag(&mut state, at(40.0, 40.0), at(200.0, 180.0));
+    draft_crop(&mut state, 40.0, 40.0, 200.0, 180.0);
     state.command(Command::ApplyCrop).expect("crop");
     let cropped = state.document().content_size();
     assert!((cropped.width - 160.0).abs() < 1.0, "{cropped:?}");

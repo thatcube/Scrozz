@@ -356,6 +356,15 @@ internal and unadvertised means the format can change freely while tools are
 still being designed. A user-facing export/import format can be added later,
 once the tool set has stabilised, without breaking anyone.
 
+Crop follows the same retained-document rule. Entering Crop shows the complete
+source with the current crop as an editable draft; changing handles, aspect,
+dimensions, or snapping changes only editor chrome. Apply records one history
+step, Cancel records none, and Revert to Original clears the crop through the
+same undoable path. The editor viewport is separate state too: Fit tracks window
+size, while manual zoom is an absolute percentage with pointer-centred pinch or
+wheel zoom and panning. Neither viewport motion nor a draft crop changes an
+export revision.
+
 ---
 
 ## D15 — Attempt everything; gate permissions behind first use

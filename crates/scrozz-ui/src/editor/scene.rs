@@ -74,6 +74,12 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
         return;
     }
     let state = editor.state_mut();
+    if fixture.scenario == crate::harness::Scenario::EditorCrop {
+        state.set_tool(super::Tool::Crop);
+        state.set_crop_aspect(super::CropAspect::Landscape16x9);
+        state.set_crop_width(state.document().logical_size().width * 0.68);
+        return;
+    }
     state.set_tool(super::Tool::Arrow);
     // Keep Arrow in hand while selecting the sample arrow, so the golden proves
     // the tool can edit an existing arrow and paints endpoint chrome only.

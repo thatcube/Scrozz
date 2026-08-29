@@ -12,7 +12,7 @@ use scrozz_core::{
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
 use scrozz_ui::editor::{
-    Command, EditorUi, Tool, fit, rect_to_screen, to_document, to_screen, toolbar,
+    Command, EditorUi, Tool, fit, fit_absolute, rect_to_screen, to_document, to_screen, toolbar,
 };
 
 const W: u32 = 800;
@@ -117,6 +117,19 @@ fn zoom_scales_the_canvas_about_its_centre() {
 }
 
 #[test]
+fn fit_tracks_window_size_while_manual_zoom_stays_absolute() {
+    let small = area(200.0, 160.0);
+    let large = area(500.0, 400.0);
+    let fitted_small = fit(content(), small, 1.0, (0.0, 0.0));
+    let fitted_large = fit(content(), large, 1.0, (0.0, 0.0));
+    assert!(fitted_large.width() > fitted_small.width());
+
+    let manual_small = fit_absolute(content(), small, 1.25, (0.0, 0.0));
+    let manual_large = fit_absolute(content(), large, 1.25, (0.0, 0.0));
+    assert_eq!(manual_small.size(), manual_large.size());
+}
+
+#[test]
 fn panning_translates_the_canvas_without_resizing_it() {
     let area = area(2000.0, 1600.0);
     let still = fit(content(), area, 1.0, (0.0, 0.0));
@@ -174,6 +187,29 @@ fn the_round_trip_survives_zoom_and_pan() {
     let back = to_document(to_screen(point, canvas, content()), canvas, content());
     assert!((back.x - point.x).abs() < 0.01, "{back:?}");
     assert!((back.y - point.y).abs() < 0.01, "{back:?}");
+}
+
+#[test]
+fn crop_edges_map_to_the_same_source_coordinates_at_any_zoom() {
+    let content = content();
+    let crop = LogicalRect::new(
+        LogicalPoint::new(40.0, 35.0),
+        LogicalSize::new(210.0, 120.0),
+    );
+    for (zoom, pan) in [
+        (0.25, (0.0, 0.0)),
+        (1.0, (30.0, -20.0)),
+        (8.0, (-90.0, 55.0)),
+    ] {
+        let canvas = fit(content, area(900.0, 700.0), zoom, pan);
+        let screen = rect_to_screen(crop, canvas, content);
+        let min = to_document(screen.min, canvas, content);
+        let max = to_document(screen.max, canvas, content);
+        assert!((min.x - crop.origin.x).abs() < 0.001);
+        assert!((min.y - crop.origin.y).abs() < 0.001);
+        assert!((max.x - 250.0).abs() < 0.001);
+        assert!((max.y - 155.0).abs() < 0.001);
+    }
 }
 
 #[test]
@@ -342,13 +378,8 @@ fn rendering_does_not_disturb_the_document() {
 fn a_crop_shrinks_the_exported_image() {
     let mut editor = editor();
     editor.state_mut().set_tool(Tool::Crop);
-    editor
-        .state_mut()
-        .pointer_pressed(LogicalPoint::new(50.0, 40.0));
-    editor
-        .state_mut()
-        .pointer_dragged(LogicalPoint::new(250.0, 190.0), false);
-    editor.state_mut().pointer_released();
+    editor.state_mut().set_crop_width(200.0);
+    editor.state_mut().set_crop_height(150.0);
     editor
         .state_mut()
         .command(Command::ApplyCrop)
@@ -361,16 +392,34 @@ fn a_crop_shrinks_the_exported_image() {
 }
 
 #[test]
+fn a_draft_crop_never_changes_copy_save_or_export_until_apply() {
+    let mut editor = editor();
+    let before = editor.render().expect("full render");
+    let revision = editor.state().revision();
+    editor.state_mut().set_tool(Tool::Crop);
+    editor.state_mut().set_crop_width(200.0);
+    editor.state_mut().set_crop_height(150.0);
+
+    let draft = editor.render().expect("draft render");
+    assert_eq!(draft.width(), before.width());
+    assert_eq!(draft.height(), before.height());
+    assert_eq!(editor.state().revision(), revision);
+
+    editor
+        .state_mut()
+        .command(Command::ApplyCrop)
+        .expect("apply");
+    let applied = editor.render().expect("applied render");
+    assert_eq!(applied.width(), 400);
+    assert_eq!(applied.height(), 300);
+}
+
+#[test]
 fn an_undone_crop_exports_the_whole_image_again() {
     let mut editor = editor();
     editor.state_mut().set_tool(Tool::Crop);
-    editor
-        .state_mut()
-        .pointer_pressed(LogicalPoint::new(50.0, 40.0));
-    editor
-        .state_mut()
-        .pointer_dragged(LogicalPoint::new(250.0, 190.0), false);
-    editor.state_mut().pointer_released();
+    editor.state_mut().set_crop_width(200.0);
+    editor.state_mut().set_crop_height(150.0);
     editor
         .state_mut()
         .command(Command::ApplyCrop)

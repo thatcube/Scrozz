@@ -41,8 +41,8 @@ use scrozz_core::{Frame, LogicalPoint, LogicalRect};
 pub use paint::{CanvasView, Preview, to_color_image};
 pub use scene::EditorScene;
 pub use state::{
-    Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE,
-    NUDGE_COARSE, TextEdit, Tool, ZOOM_STEP,
+    CROP_SNAP_TOLERANCE, Caret, Command, CropAspect, EditorState, Handle, Intent, MAX_ZOOM,
+    MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, TextEdit, Tool, ZOOM_STEP,
 };
 pub use toolbar::{PALETTE, STROKE_MAX, STROKE_MIN};
 
@@ -245,14 +245,8 @@ impl EditorUi {
         let icons = shared_icons(ui.ctx());
         let surface = crate::paint::Surface::new(&theme, &icons, crate::motion::Motion::at(0.0));
 
-        let inspector_open = self.color_popover.is_open() || self.arrow_popover.is_open();
+        let inspector_was_open = self.color_popover.is_open() || self.arrow_popover.is_open();
         let inspector_activation = toolbar::inspector_control_activation(ui);
-        if !inspector_open
-            && !inspector_activation
-            && let Some(intent) = self.keyboard(ui)
-        {
-            self.pending = Some(intent);
-        }
 
         let full = ui.available_rect_before_wrap();
         let (bar, canvas) = editor_layout(full);
@@ -263,7 +257,7 @@ impl EditorUi {
             &mut self.state,
             &mut self.preview,
             canvas,
-            !inspector_open,
+            !inspector_was_open,
         );
         if let Some(action) = toolbar::draw(
             ui,
@@ -272,9 +266,18 @@ impl EditorUi {
             &mut self.color_popover,
             &mut self.arrow_popover,
             bar,
-            inspector_open,
+            inspector_was_open,
         ) {
             self.pending = Some(action);
+        }
+        toolbar::draw_view_controls(ui, &surface, &mut self.state, canvas, &view);
+        let inspector_open = self.color_popover.is_open() || self.arrow_popover.is_open();
+        if !inspector_was_open
+            && !inspector_open
+            && !inspector_activation
+            && let Some(intent) = self.keyboard(ui)
+        {
+            self.pending = Some(intent);
         }
 
         self.pending.take().unwrap_or(Intent::None)
@@ -667,6 +670,28 @@ pub fn fit(content: LogicalRect, area: egui::Rect, zoom: f32, pan: (f32, f32)) -
     egui::Rect::from_center_size(center, size)
 }
 
+/// Places a document at an absolute screen-points-per-document-point zoom.
+#[must_use]
+pub fn fit_absolute(
+    content: LogicalRect,
+    area: egui::Rect,
+    zoom: f32,
+    pan: (f32, f32),
+) -> egui::Rect {
+    let (w, h) = (content.size.width as f32, content.size.height as f32);
+    if w <= 0.0 || h <= 0.0 || area.width() <= 0.0 || area.height() <= 0.0 {
+        return egui::Rect::from_min_size(area.center(), egui::Vec2::ZERO);
+    }
+    let zoom = if zoom.is_finite() {
+        zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+    } else {
+        1.0
+    };
+    let size = egui::vec2(w * zoom, h * zoom);
+    let center = area.center() + egui::vec2(pan.0, pan.1);
+    egui::Rect::from_center_size(center, size)
+}
+
 /// Converts a screen position into document logical points.
 #[must_use]
 pub fn to_document(screen: egui::Pos2, canvas: egui::Rect, content: LogicalRect) -> LogicalPoint {
@@ -717,6 +742,8 @@ pub struct EditorModifiers {
     pub constrain: bool,
     /// Space: pan instead of draw.
     pub pan: bool,
+    /// Command/Ctrl: temporarily disable crop-edge snapping.
+    pub disable_crop_snap: bool,
 }
 
 impl EditorModifiers {
@@ -726,6 +753,7 @@ impl EditorModifiers {
         ui.ctx().input(|input| Self {
             constrain: input.modifiers.shift,
             pan: input.key_down(Key::Space),
+            disable_crop_snap: input.modifiers.command,
         })
     }
 }

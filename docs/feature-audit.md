@@ -149,7 +149,7 @@ non-destructive. This is the single largest surface area in the product.
 
 | ID | Tool | Tier | Notes |
 |---|---|---|---|
-| ANN-01 | Crop — with aspect ratio + snap to edges | T0 | |
+| ANN-01 | Crop — with aspect ratio + snap to edges | T0 | **Implemented:** dedicated full-image mode, direct edge/corner/interior manipulation, Freeform/Original/1:1/16:9/9:16/4:3/3:4 presets, source-pixel dimensions, swap, snap with Command/Ctrl override, Cancel/Crop/Revert |
 | ANN-02 | Arrow — **4 styles including curved** | T0 | **Implemented:** Bold, Curved, Sketch, and Double; four named thickness presets backed by numeric source-unit width; deterministic Sketch seed; hybrid bend affordance |
 | ANN-03 | Rectangle | T0 | |
 | ANN-04 | Filled rectangle | T0 | |
@@ -404,8 +404,8 @@ Screenshots: `~/.copilot/scrozz-ui-reference/cleanshot/settings/`
 | ID | Feature | Tier | Notes |
 |---|---|---|---|
 | NEW-01 | **Redact tool** (`P`) with strength slider | T1 | Separate tool from blur/pixelate — see ANN-14 |
-| NEW-02 | **Non-destructive crop** with "Revert to Original" | T1 | Crop is a document operation, not a pixel operation. Falls out of D14's retained model **only if designed in from the start** |
-| NEW-03 | Crop: snap to edges (⌘ to disable), rotate, flip, numeric W×H, live image size | T2 | |
+| NEW-02 | **Non-destructive crop** with "Revert to Original" | T1 | **Implemented:** draft changes are view-only until one-step Apply; Cancel is a no-op; Revert is undoable |
+| NEW-03 | Crop: snap to edges (⌘ to disable), rotate, flip, numeric W×H, live image size | T2 | Snap override, numeric source-pixel W×H, dimension swap, and live image size are implemented; rotate/flip remain separate work |
 | NEW-04 | **Canvas auto-expand** — canvas grows so annotations placed outside the image still fit | T2 | Genuinely clever; changes how the document model handles bounds |
 | NEW-05 | **Show colour names** (accessibility option in Annotate) | T2 | Direct support for D13 — colour must never be the sole carrier of meaning |
 | NEW-06 | Draw shadow on annotation objects | T2 | |

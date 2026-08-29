@@ -47,9 +47,11 @@ pub struct Preview {
     revision: Option<u64>,
     /// The pixel width the cached texture was rendered at.
     width: u32,
+    /// Whether the cached texture shows the uncropped source for crop mode.
+    full_document: bool,
     /// The exact render key that failed, to stop retrying only that one every
     /// frame.
-    failed: Option<(u64, u32)>,
+    failed: Option<(u64, u32, bool)>,
 }
 
 impl std::fmt::Debug for Preview {
@@ -57,6 +59,7 @@ impl std::fmt::Debug for Preview {
         f.debug_struct("Preview")
             .field("revision", &self.revision)
             .field("width", &self.width)
+            .field("full_document", &self.full_document)
             .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
@@ -76,10 +79,13 @@ impl Preview {
         state: &EditorState,
         target_px: u32,
     ) -> Option<&egui::TextureHandle> {
-        let key = (state.revision(), target_px);
-        let fresh = self.revision == Some(key.0) && self.width == key.1;
+        let full_document = state.crop_mode();
+        let key = (state.revision(), target_px, full_document);
+        let fresh = self.revision == Some(key.0)
+            && self.width == key.1
+            && self.full_document == full_document;
         if !fresh && self.failed != Some(key) {
-            match render(state, target_px) {
+            match render(state, target_px, full_document) {
                 Ok(image) => {
                     let handle = ctx.load_texture(
                         "scrozz-editor-preview",
@@ -89,6 +95,7 @@ impl Preview {
                     self.texture = Some(handle);
                     self.revision = Some(key.0);
                     self.width = target_px;
+                    self.full_document = full_document;
                     self.failed = None;
                 }
                 Err(error) => {
@@ -125,8 +132,20 @@ impl Preview {
 /// the exported file, which carries a P3 profile and is therefore correct. They
 /// are converted here instead. Only here: the document keeps its own space, so
 /// nothing about the export changes.
-fn render(state: &EditorState, target_px: u32) -> scrozz_core::Result<egui::ColorImage> {
-    let frame = SkiaRenderer.render_to_width(state.document(), target_px.max(1))?;
+fn render(
+    state: &EditorState,
+    target_px: u32,
+    full_document: bool,
+) -> scrozz_core::Result<egui::ColorImage> {
+    let mut uncropped;
+    let document = if full_document && state.document().crop().is_some() {
+        uncropped = state.document().clone();
+        uncropped.set_crop(None)?;
+        &uncropped
+    } else {
+        state.document()
+    };
+    let frame = SkiaRenderer.render_to_width(document, target_px.max(1))?;
     Ok(to_color_image(&frame))
 }
 
@@ -247,8 +266,17 @@ pub fn draw_canvas(
     let painter = ui.painter_at(area);
     checkerboard(&painter, area, palette);
 
-    let content = state.document().content_bounds();
-    let image = super::fit(content, area.shrink(Space::LG), state.zoom(), state.pan());
+    let content = if state.crop_mode() {
+        state.document().logical_bounds()
+    } else {
+        state.document().content_bounds()
+    };
+    let fit_area = area.shrink(Space::LG);
+    let image = if state.is_fit_zoom() {
+        super::fit(content, fit_area, 1.0, state.pan())
+    } else {
+        super::fit_absolute(content, fit_area, state.zoom(), state.pan())
+    };
     let view = CanvasView {
         image,
         area,
@@ -265,7 +293,7 @@ pub fn draw_canvas(
     let target_px = preview_width(
         image,
         ui.ctx().pixels_per_point(),
-        state.document().content_size(),
+        content.size,
         state.document().logical_size(),
         max_texture_side,
     );
@@ -423,35 +451,69 @@ fn preview_width(
 /// Translates pointer events into state-machine calls.
 fn gestures(ui: &Ui, state: &mut EditorState, response: &egui::Response, view: &CanvasView) {
     let modifiers = EditorModifiers::read(ui);
-    let Some(screen) = response.interact_pointer_pos().or(response.hover_pos()) else {
-        if response.drag_stopped() {
+    let Some(screen) = response
+        .interact_pointer_pos()
+        .or(response.hover_pos())
+        .or_else(|| ui.ctx().input(|input| input.pointer.latest_pos()))
+    else {
+        if response.drag_stopped() || response.drag_stopped_by(egui::PointerButton::Middle) {
             state.pointer_released();
         }
         return;
     };
     let point = to_document(screen, view.image, view.content);
+    let (middle_pressed, middle_down, middle_released) = ui.ctx().input(|input| {
+        (
+            input.pointer.button_pressed(egui::PointerButton::Middle),
+            input.pointer.button_down(egui::PointerButton::Middle),
+            input.pointer.button_released(egui::PointerButton::Middle),
+        )
+    });
+    if middle_pressed && view.area.contains(screen) {
+        state.begin_pan((screen.x, screen.y));
+    }
+    if state.is_panning() && (middle_down || middle_released) {
+        state.pan_to((screen.x, screen.y));
+        if middle_released {
+            state.pointer_released();
+        }
+        return;
+    }
+    let pan_gesture = modifiers.pan;
 
     if response.drag_started() {
         let press_screen = screen - response.drag_delta();
         let press = to_document(press_screen, view.image, view.content);
-        if modifiers.pan {
+        if pan_gesture {
             state.begin_pan((press_screen.x, press_screen.y));
             state.pan_to((screen.x, screen.y));
         } else {
             state.pointer_pressed(press);
-            state.pointer_dragged(point, modifiers.constrain);
+            state.pointer_dragged_with_snap(
+                point,
+                modifiers.constrain,
+                modifiers.disable_crop_snap,
+            );
         }
     } else if response.dragged() {
-        if modifiers.pan {
+        if pan_gesture {
             state.pan_to((screen.x, screen.y));
         } else {
-            state.pointer_dragged(point, modifiers.constrain);
+            state.pointer_dragged_with_snap(
+                point,
+                modifiers.constrain,
+                modifiers.disable_crop_snap,
+            );
         }
     } else if response.drag_stopped() {
-        if modifiers.pan {
+        if pan_gesture {
             state.pan_to((screen.x, screen.y));
         } else {
-            state.pointer_dragged(point, modifiers.constrain);
+            state.pointer_dragged_with_snap(
+                point,
+                modifiers.constrain,
+                modifiers.disable_crop_snap,
+            );
         }
         state.pointer_released();
     } else if response.clicked() && !modifiers.pan {
@@ -462,9 +524,23 @@ fn gestures(ui: &Ui, state: &mut EditorState, response: &egui::Response, view: &
     }
 
     if response.hovered() {
-        let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
-        if ui.ctx().input(|input| input.modifiers.command) && scroll.abs() > 0.0 {
-            state.set_zoom(state.zoom() * (1.0 + scroll * 0.002));
+        let (zoom_delta, scroll, multi_touch) = ui.ctx().input(|input| {
+            (
+                input.zoom_delta(),
+                input.smooth_scroll_delta(),
+                input.multi_touch().is_some(),
+            )
+        });
+        if (zoom_delta - 1.0).abs() > f32::EPSILON {
+            let anchor = screen - view.area.center();
+            state.zoom_about(state.effective_zoom() * zoom_delta, (anchor.x, anchor.y));
+        }
+        if scroll != egui::Vec2::ZERO
+            && !state.is_fit_zoom()
+            && ((zoom_delta - 1.0).abs() <= f32::EPSILON || multi_touch)
+        {
+            let pan = state.pan();
+            state.set_pan((pan.0 + scroll.x, pan.1 + scroll.y));
         }
     }
 }
@@ -477,38 +553,52 @@ fn draw_crop_scrim(
     palette: &Palette,
 ) {
     let Some(rect) = state.pending_crop() else {
-        if state.tool() == Tool::Crop
-            && let Some(existing) = state.document().crop()
-        {
-            let screen = rect_to_screen(existing, view.image, view.content);
-            painter.rect_stroke(
-                screen,
-                corner(0.0),
-                Stroke::new(1.0, palette.accent),
-                StrokeKind::Outside,
-            );
-        }
         return;
     };
     let keep = rect_to_screen(rect, view.image, view.content);
-    let scrim = Color32::from_black_alpha(120);
-    for band in [
-        Rect::from_min_max(view.image.min, pos2(view.image.right(), keep.top())),
-        Rect::from_min_max(pos2(view.image.left(), keep.bottom()), view.image.max),
-        Rect::from_min_max(pos2(view.image.left(), keep.top()), keep.left_bottom()),
-        Rect::from_min_max(keep.right_top(), pos2(view.image.right(), keep.bottom())),
-    ] {
-        if band.is_positive() {
-            painter.rect_filled(band, corner(0.0), scrim);
+    if rect != state.document().logical_bounds() {
+        let scrim = Color32::from_black_alpha(120);
+        for band in [
+            Rect::from_min_max(view.image.min, pos2(view.image.right(), keep.top())),
+            Rect::from_min_max(pos2(view.image.left(), keep.bottom()), view.image.max),
+            Rect::from_min_max(pos2(view.image.left(), keep.top()), keep.left_bottom()),
+            Rect::from_min_max(keep.right_top(), pos2(view.image.right(), keep.bottom())),
+        ] {
+            if band.is_positive() {
+                painter.rect_filled(band, corner(0.0), scrim);
+            }
         }
     }
     painter.rect_stroke(
+        keep.expand(1.0),
+        corner(0.0),
+        Stroke::new(3.0, Color32::from_black_alpha(130)),
+        StrokeKind::Outside,
+    );
+    painter.rect_stroke(
         keep,
         corner(0.0),
-        Stroke::new(1.0, Color32::WHITE),
+        Stroke::new(1.5, Color32::WHITE),
         StrokeKind::Outside,
     );
     thirds(painter, keep);
+    for handle in Handle::ALL {
+        let at = super::to_screen(handle.position(&rect), view.image, view.content);
+        let radius = HANDLE_RADIUS as f32;
+        let handle_rect = Rect::from_center_size(at, vec2(radius * 2.0, radius * 2.0));
+        painter.rect_filled(
+            handle_rect.expand(1.5),
+            corner(2.0),
+            Color32::from_black_alpha(150),
+        );
+        painter.rect_filled(handle_rect, corner(1.5), Color32::WHITE);
+        painter.rect_stroke(
+            handle_rect,
+            corner(1.5),
+            Stroke::new(1.0, palette.accent),
+            StrokeKind::Inside,
+        );
+    }
 }
 
 /// The rule-of-thirds guides inside a crop.
@@ -687,6 +777,8 @@ pub fn scale_for_width(content: LogicalRect, width: u32) -> ScaleFactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrozz_annotate::{Annotation, Document, RedactStyle, Style};
+    use scrozz_core::{Capture, CaptureTarget, Frame, PhysicalSize, Provenance};
 
     #[test]
     fn a_tall_crop_fits_both_texture_edges() {
@@ -731,5 +823,46 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn full_source_crop_preview_still_destroys_redacted_pixels() {
+        let size = LogicalSize::new(8.0, 8.0);
+        let capture = Capture {
+            frame: Frame {
+                data: vec![255; 8 * 8 * 4],
+                size: PhysicalSize::new(8.0, 8.0),
+                stride: 8 * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(LogicalRect::new(LogicalPoint::new(0.0, 0.0), size)),
+        };
+        let mut document = Document::new(capture);
+        document.add(
+            Annotation::Redact {
+                area: LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(4.0, 4.0)),
+                style: RedactStyle::Solid,
+            },
+            Style::redaction(),
+        );
+        document
+            .set_crop(Some(LogicalRect::new(
+                LogicalPoint::new(4.0, 0.0),
+                LogicalSize::new(4.0, 8.0),
+            )))
+            .unwrap();
+        let mut state = EditorState::new(document);
+        state.set_tool(Tool::Crop);
+
+        let preview = render(&state, 8, true).unwrap();
+        assert_eq!(
+            preview.pixels[1 + preview.size[0]],
+            Color32::BLACK,
+            "showing the full source in crop mode exposed pixels beneath a redaction"
+        );
+        assert_eq!(state.document().crop().unwrap().origin.x, 4.0);
     }
 }

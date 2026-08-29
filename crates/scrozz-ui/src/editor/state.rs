@@ -63,6 +63,9 @@ pub const MAX_ZOOM: f32 = 8.0;
 /// The multiplier applied by one zoom-in or zoom-out step.
 pub const ZOOM_STEP: f32 = 1.25;
 
+/// Screen-point reach for snapping a crop edge to the source boundary.
+pub const CROP_SNAP_TOLERANCE: f64 = 8.0;
+
 /// The thinnest stroke the editor offers.
 ///
 /// Lives here rather than on the toolbar because the state enforces it:
@@ -319,6 +322,88 @@ impl Handle {
     }
 }
 
+/// Aspect constraint for the dedicated crop mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CropAspect {
+    /// Each edge moves independently.
+    #[default]
+    Freeform,
+    /// Match the source image.
+    Original,
+    /// Equal width and height.
+    Square,
+    /// Landscape 16:9.
+    Landscape16x9,
+    /// Portrait 9:16.
+    Portrait9x16,
+    /// Landscape 4:3.
+    Landscape4x3,
+    /// Portrait 3:4.
+    Portrait3x4,
+}
+
+impl CropAspect {
+    /// Presets in menu order.
+    pub const ALL: [Self; 7] = [
+        Self::Freeform,
+        Self::Original,
+        Self::Square,
+        Self::Landscape16x9,
+        Self::Portrait9x16,
+        Self::Landscape4x3,
+        Self::Portrait3x4,
+    ];
+
+    /// User-facing preset name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Freeform => "Freeform",
+            Self::Original => "Original",
+            Self::Square => "Square",
+            Self::Landscape16x9 => "16:9",
+            Self::Portrait9x16 => "9:16",
+            Self::Landscape4x3 => "4:3",
+            Self::Portrait3x4 => "3:4",
+        }
+    }
+
+    fn ratio(self, source: LogicalSize) -> Option<f64> {
+        match self {
+            Self::Freeform => None,
+            Self::Original => (source.height > 0.0).then_some(source.width / source.height),
+            Self::Square => Some(1.0),
+            Self::Landscape16x9 => Some(16.0 / 9.0),
+            Self::Portrait9x16 => Some(9.0 / 16.0),
+            Self::Landscape4x3 => Some(4.0 / 3.0),
+            Self::Portrait3x4 => Some(3.0 / 4.0),
+        }
+    }
+
+    fn swapped(self) -> Self {
+        match self {
+            Self::Landscape16x9 => Self::Portrait9x16,
+            Self::Portrait9x16 => Self::Landscape16x9,
+            Self::Landscape4x3 => Self::Portrait3x4,
+            Self::Portrait3x4 => Self::Landscape4x3,
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CropSession {
+    rect: LogicalRect,
+    aspect: CropAspect,
+    snap_edges: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropDrag {
+    Move,
+    Resize(Handle),
+}
+
 /// What the pointer is doing between press and release.
 #[derive(Debug, Clone, PartialEq)]
 enum Drag {
@@ -350,9 +435,10 @@ enum Drag {
         to: LogicalPoint,
         bend: f64,
     },
-    Cropping {
-        origin: LogicalPoint,
-        current: LogicalPoint,
+    CropAdjust {
+        action: CropDrag,
+        grab: LogicalPoint,
+        start: LogicalRect,
     },
     Panning {
         grab: (f32, f32),
@@ -438,6 +524,10 @@ pub enum Command {
     ZoomReset,
     /// Commit the crop currently being dragged.
     ApplyCrop,
+    /// Leave crop mode without changing the document.
+    CancelCrop,
+    /// Clear the committed crop and return to the original image bounds.
+    RevertCrop,
     /// Send the selection behind everything else.
     SendToBack,
     /// Bring the selection in front of everything else.
@@ -471,6 +561,7 @@ impl Command {
             | Self::SelectAll
             | Self::Nudge { .. }
             | Self::ApplyCrop
+            | Self::RevertCrop
             | Self::SendToBack
             | Self::BringToFront => true,
             Self::Escape
@@ -481,7 +572,8 @@ impl Command {
             | Self::Pick(_)
             | Self::ZoomIn
             | Self::ZoomOut
-            | Self::ZoomReset => false,
+            | Self::ZoomReset
+            | Self::CancelCrop => false,
         }
     }
 }
@@ -538,7 +630,9 @@ pub struct EditorState {
     interrupt_ime: bool,
     caret: usize,
     preedit: Option<Range<usize>>,
+    crop: Option<CropSession>,
     zoom: f32,
+    fit_zoom: bool,
     pan: (f32, f32),
     view_scale: f64,
     revision: u64,
@@ -564,7 +658,9 @@ impl EditorState {
             interrupt_ime: false,
             caret: 0,
             preedit: None,
+            crop: None,
             zoom: 1.0,
+            fit_zoom: true,
             pan: (0.0, 0.0),
             view_scale: 1.0,
             revision: 0,
@@ -632,6 +728,18 @@ impl EditorState {
         // will not take back can stay pending without anything landing on top
         // of it — and refusing the tool change would strand the user instead.
         let _ = self.settle_text();
+        if tool == Tool::Crop {
+            self.crop = Some(CropSession {
+                rect: self
+                    .document
+                    .crop()
+                    .unwrap_or_else(|| self.document.logical_bounds()),
+                aspect: CropAspect::Freeform,
+                snap_edges: true,
+            });
+        } else {
+            self.crop = None;
+        }
         self.tool = tool;
         // Arrow is the one drawing tool that also edits its own existing
         // objects. Every other drawing tool clears selection because its handles
@@ -1140,19 +1248,62 @@ impl EditorState {
         self.finish_text()
     }
 
-    /// The current zoom factor.
+    /// The current manual zoom factor.
+    ///
+    /// While Fit is active, [`Self::view_scale`] is the live fitted percentage
+    /// and this stored value remains the last neutral default.
     #[must_use]
     pub const fn zoom(&self) -> f32 {
         self.zoom
     }
 
-    /// Sets the zoom, clamped to the supported range.
+    /// Whether the image is fitted to the current viewport.
+    #[must_use]
+    pub const fn is_fit_zoom(&self) -> bool {
+        self.fit_zoom
+    }
+
+    /// Effective zoom for the next gesture or key step.
+    #[must_use]
+    pub fn effective_zoom(&self) -> f32 {
+        if self.fit_zoom {
+            self.view_scale as f32
+        } else {
+            self.zoom
+        }
+    }
+
+    /// Sets an absolute manual zoom, clamped to the supported range.
     pub fn set_zoom(&mut self, zoom: f32) {
         let clamped = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        if (clamped - self.zoom).abs() > f32::EPSILON {
+        if clamped.is_finite() && (self.fit_zoom || (clamped - self.zoom).abs() > f32::EPSILON) {
             self.zoom = clamped;
+            self.fit_zoom = false;
             self.touch_view();
         }
+    }
+
+    /// Sets zoom around an anchor measured from the viewport centre.
+    ///
+    /// Keeping the anchor's document point stationary is a pure pan adjustment:
+    /// the vector from the image centre to the anchor scales with the zoom.
+    pub fn zoom_about(&mut self, zoom: f32, anchor: (f32, f32)) {
+        let next = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let current = self.effective_zoom();
+        if !next.is_finite()
+            || (!self.fit_zoom && (next - current).abs() <= f32::EPSILON)
+            || current <= 0.0
+        {
+            return;
+        }
+        let ratio = next / current;
+        self.pan = (
+            anchor.0 - (anchor.0 - self.pan.0) * ratio,
+            anchor.1 - (anchor.1 - self.pan.1) * ratio,
+        );
+        self.zoom = next;
+        self.fit_zoom = false;
+        self.touch_view();
     }
 
     /// The pan offset, in screen points.
@@ -1221,22 +1372,152 @@ impl EditorState {
         self.history.can_redo()
     }
 
-    /// The crop being dragged out, if the crop tool is mid-gesture.
+    /// Whether the dedicated crop mode is active.
+    #[must_use]
+    pub const fn crop_mode(&self) -> bool {
+        self.crop.is_some()
+    }
+
+    /// The crop rectangle being previewed without mutating the document.
     #[must_use]
     pub fn pending_crop(&self) -> Option<LogicalRect> {
-        match &self.drag {
-            Drag::Cropping { origin, current } => {
-                let rect = LogicalRect::from_corners(*origin, *current);
-                usable_crop(self.document.logical_bounds(), rect)
-            }
-            _ => None,
+        self.crop.map(|crop| crop.rect)
+    }
+
+    /// Current crop aspect preset.
+    #[must_use]
+    pub fn crop_aspect(&self) -> Option<CropAspect> {
+        self.crop.map(|crop| crop.aspect)
+    }
+
+    /// Changes the crop aspect around its current centre.
+    pub fn set_crop_aspect(&mut self, aspect: CropAspect) {
+        let Some(mut crop) = self.crop else {
+            return;
+        };
+        crop.aspect = aspect;
+        if let Some(ratio) = aspect.ratio(self.document.logical_size()) {
+            crop.rect = crop_rect_with_size(
+                crop.rect,
+                crop.rect.size.width,
+                crop.rect.size.width / ratio,
+                self.document.logical_bounds(),
+                Some(ratio),
+            );
         }
+        if self.crop != Some(crop) {
+            self.crop = Some(crop);
+            self.touch_view();
+        }
+    }
+
+    /// Whether crop edges snap to the source boundary.
+    #[must_use]
+    pub fn crop_snap_edges(&self) -> bool {
+        self.crop.is_some_and(|crop| crop.snap_edges)
+    }
+
+    /// Enables or disables crop-edge snapping.
+    pub fn set_crop_snap_edges(&mut self, enabled: bool) {
+        if let Some(crop) = self.crop.as_mut()
+            && crop.snap_edges != enabled
+        {
+            crop.snap_edges = enabled;
+            self.touch_view();
+        }
+    }
+
+    /// Sets the draft crop width in source logical points.
+    pub fn set_crop_width(&mut self, width: f64) {
+        let Some(mut crop) = self.crop else {
+            return;
+        };
+        let ratio = crop.aspect.ratio(self.document.logical_size());
+        let height = ratio.map_or(crop.rect.size.height, |ratio| width / ratio);
+        crop.rect = crop_rect_with_size(
+            crop.rect,
+            width,
+            height,
+            self.document.logical_bounds(),
+            ratio,
+        );
+        if self.crop != Some(crop) {
+            self.crop = Some(crop);
+            self.touch_view();
+        }
+    }
+
+    /// Sets the draft crop height in source logical points.
+    pub fn set_crop_height(&mut self, height: f64) {
+        let Some(mut crop) = self.crop else {
+            return;
+        };
+        let ratio = crop.aspect.ratio(self.document.logical_size());
+        let width = ratio.map_or(crop.rect.size.width, |ratio| height * ratio);
+        crop.rect = crop_rect_with_size(
+            crop.rect,
+            width,
+            height,
+            self.document.logical_bounds(),
+            ratio,
+        );
+        if self.crop != Some(crop) {
+            self.crop = Some(crop);
+            self.touch_view();
+        }
+    }
+
+    /// Swaps draft width and height, including oriented aspect presets.
+    pub fn swap_crop_dimensions(&mut self) {
+        let Some(mut crop) = self.crop else {
+            return;
+        };
+        crop.aspect = crop.aspect.swapped();
+        let ratio = crop.aspect.ratio(self.document.logical_size());
+        crop.rect = crop_rect_with_size(
+            crop.rect,
+            crop.rect.size.height,
+            crop.rect.size.width,
+            self.document.logical_bounds(),
+            ratio,
+        );
+        self.crop = Some(crop);
+        self.touch_view();
+    }
+
+    /// Draft and source image dimensions in physical pixels.
+    #[must_use]
+    pub fn crop_pixel_sizes(&self) -> Option<((u32, u32), (u32, u32))> {
+        let crop = self.crop?;
+        let scale = self.document.source.frame.scale.get();
+        let quantise = |value: f64| {
+            value
+                .mul_add(scale, 0.0)
+                .round()
+                .clamp(1.0, f64::from(u32::MAX)) as u32
+        };
+        Some((
+            (
+                quantise(crop.rect.size.width),
+                quantise(crop.rect.size.height),
+            ),
+            (
+                self.document.source.frame.width(),
+                self.document.source.frame.height(),
+            ),
+        ))
     }
 
     /// Whether a pointer gesture is in progress.
     #[must_use]
     pub fn is_dragging(&self) -> bool {
         self.drag != Drag::Idle
+    }
+
+    /// Whether the active gesture is viewport panning.
+    #[must_use]
+    pub fn is_panning(&self) -> bool {
+        matches!(self.drag, Drag::Panning { .. })
     }
 
     /// Whether the distinct arrow bend affordance is being dragged.
@@ -1294,10 +1575,19 @@ impl EditorState {
                 false
             }
             Tool::Crop => {
-                self.drag = Drag::Cropping {
-                    origin: point,
-                    current: point,
-                };
+                if let Some(crop) = self.crop {
+                    let action = self
+                        .crop_handle_at(point)
+                        .map(CropDrag::Resize)
+                        .or_else(|| geom::contains(&crop.rect, point).then_some(CropDrag::Move));
+                    if let Some(action) = action {
+                        self.drag = Drag::CropAdjust {
+                            action,
+                            grab: point,
+                            start: crop.rect,
+                        };
+                    }
+                }
                 false
             }
             Tool::Pen => {
@@ -1333,6 +1623,16 @@ impl EditorState {
     /// `constrain` is the shift key: it snaps free endpoints to an axis or the
     /// diagonal, and locks a move to one axis.
     pub fn pointer_dragged(&mut self, point: LogicalPoint, constrain: bool) {
+        self.pointer_dragged_with_snap(point, constrain, false);
+    }
+
+    /// Handles a pointer drag with Command/Ctrl temporarily disabling crop snap.
+    pub fn pointer_dragged_with_snap(
+        &mut self,
+        point: LogicalPoint,
+        constrain: bool,
+        disable_crop_snap: bool,
+    ) {
         let mut changed = false;
         match std::mem::replace(&mut self.drag, Drag::Idle) {
             Drag::Idle => {}
@@ -1457,14 +1757,16 @@ impl EditorState {
                 }
                 self.drag = Drag::ArrowBend { from, to, bend };
             }
-            Drag::Cropping { origin, .. } => {
-                self.drag = Drag::Cropping {
-                    origin,
-                    current: if constrain {
-                        square_from(origin, point)
-                    } else {
-                        point
-                    },
+            Drag::CropAdjust {
+                action,
+                grab,
+                start,
+            } => {
+                self.update_crop_drag(action, grab, start, point, constrain, disable_crop_snap);
+                self.drag = Drag::CropAdjust {
+                    action,
+                    grab,
+                    start,
                 };
             }
             Drag::Panning { grab, start } => {
@@ -1505,15 +1807,7 @@ impl EditorState {
                     changed = self.document.remove(id).is_some();
                 }
             }
-            Drag::Cropping { origin, current } => {
-                let rect = LogicalRect::from_corners(origin, current);
-                if let Some(rect) = usable_crop(self.document.logical_bounds(), rect) {
-                    let before = self.document.crop();
-                    let _ = self.document.set_crop(Some(rect));
-                    changed = self.document.crop() != before;
-                    self.tool = Tool::Select;
-                }
-            }
+            Drag::CropAdjust { .. } => {}
             _ => {}
         }
         self.commit();
@@ -1551,7 +1845,18 @@ impl EditorState {
 
     /// Abandons any gesture in progress, undoing what it created.
     pub fn cancel_drag(&mut self) {
-        let changed = match std::mem::replace(&mut self.drag, Drag::Idle) {
+        let drag = std::mem::replace(&mut self.drag, Drag::Idle);
+        if let Drag::CropAdjust { start, .. } = &drag {
+            if let Some(crop) = self.crop.as_mut()
+                && crop.rect != *start
+            {
+                crop.rect = *start;
+                self.touch_view();
+            }
+            self.history.seal();
+            return;
+        }
+        let changed = match drag {
             Drag::Creating { id: Some(id), .. } | Drag::Drawing { id, .. } => {
                 let changed = self.document.remove(id).is_some();
                 if self.selection == Some(id) {
@@ -1635,6 +1940,63 @@ impl EditorState {
             .map(|(handle, _)| handle)
     }
 
+    /// The crop edge or corner under `point`, using a screen-sized target.
+    #[must_use]
+    pub fn crop_handle_at(&self, point: LogicalPoint) -> Option<Handle> {
+        let crop = self.crop?;
+        let tolerance = self.handle_tolerance();
+        Handle::ALL
+            .into_iter()
+            .map(|handle| (handle, geom::distance(handle.position(&crop.rect), point)))
+            .filter(|(_, distance)| *distance <= tolerance)
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(handle, _)| handle)
+    }
+
+    fn update_crop_drag(
+        &mut self,
+        action: CropDrag,
+        grab: LogicalPoint,
+        start: LogicalRect,
+        point: LogicalPoint,
+        constrain: bool,
+        disable_snap: bool,
+    ) {
+        let Some(crop) = self.crop else {
+            return;
+        };
+        let bounds = self.document.logical_bounds();
+        let snap = crop.snap_edges && !disable_snap;
+        let tolerance = CROP_SNAP_TOLERANCE / self.view_scale;
+        let ratio = if constrain && crop.aspect == CropAspect::Freeform {
+            Some(1.0)
+        } else {
+            crop.aspect.ratio(self.document.logical_size())
+        };
+        let next = match action {
+            CropDrag::Move => move_crop(
+                start,
+                point.x - grab.x,
+                point.y - grab.y,
+                bounds,
+                snap,
+                tolerance,
+            ),
+            CropDrag::Resize(handle) => {
+                let point = if snap {
+                    snap_resize_point(point, handle, bounds, tolerance)
+                } else {
+                    point
+                };
+                resize_crop(start, handle, grab, point, bounds, ratio)
+            }
+        };
+        if next != crop.rect {
+            self.crop = Some(CropSession { rect: next, ..crop });
+            self.touch_view();
+        }
+    }
+
     /// [`HANDLE_TOLERANCE`] expressed in document points at the current zoom.
     #[must_use]
     pub fn handle_tolerance(&self) -> f64 {
@@ -1716,7 +2078,20 @@ impl EditorState {
                 Intent::None
             }
             Command::Nudge { dx, dy } => {
-                if let Some(id) = self.selection
+                if let Some(crop) = self.crop {
+                    let next = move_crop(
+                        crop.rect,
+                        dx,
+                        dy,
+                        self.document.logical_bounds(),
+                        crop.snap_edges,
+                        CROP_SNAP_TOLERANCE / self.view_scale,
+                    );
+                    if next != crop.rect {
+                        self.crop = Some(CropSession { rect: next, ..crop });
+                        self.touch_view();
+                    }
+                } else if let Some(id) = self.selection
                     && (dx != 0.0 || dy != 0.0)
                     && self.document.translate(id, dx, dy)
                 {
@@ -1726,28 +2101,53 @@ impl EditorState {
                 Intent::None
             }
             Command::ZoomIn => {
-                self.set_zoom(self.zoom * ZOOM_STEP);
+                self.zoom_about(self.effective_zoom() * ZOOM_STEP, (0.0, 0.0));
                 Intent::None
             }
             Command::ZoomOut => {
-                self.set_zoom(self.zoom / ZOOM_STEP);
+                self.zoom_about(self.effective_zoom() / ZOOM_STEP, (0.0, 0.0));
                 Intent::None
             }
             Command::ZoomReset => {
-                self.set_zoom(1.0);
-                self.set_pan((0.0, 0.0));
+                if !self.fit_zoom || self.pan != (0.0, 0.0) {
+                    self.fit_zoom = true;
+                    self.zoom = 1.0;
+                    self.pan = (0.0, 0.0);
+                    self.touch_view();
+                }
                 Intent::None
             }
             Command::ApplyCrop => {
-                if let Some(rect) = self.pending_crop() {
+                if let Some(crop) = self.crop.take() {
                     self.drag = Drag::Idle;
                     let before = self.document.crop();
-                    let _ = self.document.set_crop(Some(rect));
+                    let _ = self.document.set_crop(Some(crop.rect));
                     self.tool = Tool::Select;
-                    self.commit();
                     if self.document.crop() != before {
+                        self.commit();
                         self.touch();
                     }
+                }
+                Intent::None
+            }
+            Command::CancelCrop => {
+                if self.crop.take().is_some() {
+                    self.drag = Drag::Idle;
+                    self.tool = Tool::Select;
+                    self.touch_view();
+                }
+                Intent::None
+            }
+            Command::RevertCrop => {
+                self.crop = None;
+                self.drag = Drag::Idle;
+                self.tool = Tool::Select;
+                if self.document.crop().is_some() {
+                    let _ = self.document.set_crop(None);
+                    self.commit();
+                    self.touch();
+                } else {
+                    self.touch_view();
                 }
                 Intent::None
             }
@@ -1788,6 +2188,9 @@ impl EditorState {
         }
         if self.is_dragging() {
             self.cancel_drag();
+        } else if self.crop.take().is_some() {
+            self.tool = Tool::Select;
+            self.touch_view();
         } else if self.selection.is_some() {
             self.select(None);
         } else if self.tool == Tool::Select {
@@ -2231,13 +2634,169 @@ fn enforce_min(rect: LogicalRect) -> LogicalRect {
     )
 }
 
-fn usable_crop(bounds: LogicalRect, rect: LogicalRect) -> Option<LogicalRect> {
-    let left = rect.origin.x.max(bounds.origin.x);
-    let top = rect.origin.y.max(bounds.origin.y);
-    let right = geom::max_x(&rect).min(geom::max_x(&bounds));
-    let bottom = geom::max_y(&rect).min(geom::max_y(&bounds));
-    let clamped = geom::from_edges(left, top, right, bottom);
-    (clamped.size.width >= MIN_SIZE && clamped.size.height >= MIN_SIZE).then_some(clamped)
+fn crop_rect_with_size(
+    current: LogicalRect,
+    width: f64,
+    height: f64,
+    bounds: LogicalRect,
+    ratio: Option<f64>,
+) -> LogicalRect {
+    let fallback = current.size;
+    let (width, height) = fit_crop_size(width, height, fallback, bounds.size, ratio);
+    let center = geom::center(&current);
+    clamp_crop_origin(
+        LogicalRect::new(
+            LogicalPoint::new(center.x - width / 2.0, center.y - height / 2.0),
+            LogicalSize::new(width, height),
+        ),
+        bounds,
+    )
+}
+
+fn move_crop(
+    start: LogicalRect,
+    dx: f64,
+    dy: f64,
+    bounds: LogicalRect,
+    snap: bool,
+    tolerance: f64,
+) -> LogicalRect {
+    let mut rect = LogicalRect::new(
+        LogicalPoint::new(start.origin.x + dx, start.origin.y + dy),
+        start.size,
+    );
+    if snap {
+        if (rect.origin.x - bounds.origin.x).abs() <= tolerance {
+            rect.origin.x = bounds.origin.x;
+        } else if (geom::max_x(&bounds) - geom::max_x(&rect)).abs() <= tolerance {
+            rect.origin.x = geom::max_x(&bounds) - rect.size.width;
+        }
+        if (rect.origin.y - bounds.origin.y).abs() <= tolerance {
+            rect.origin.y = bounds.origin.y;
+        } else if (geom::max_y(&bounds) - geom::max_y(&rect)).abs() <= tolerance {
+            rect.origin.y = geom::max_y(&bounds) - rect.size.height;
+        }
+    }
+    clamp_crop_origin(rect, bounds)
+}
+
+fn resize_crop(
+    start: LogicalRect,
+    handle: Handle,
+    grab: LogicalPoint,
+    point: LogicalPoint,
+    bounds: LogicalRect,
+    ratio: Option<f64>,
+) -> LogicalRect {
+    let raw = handle.resize(&start, point.x - grab.x, point.y - grab.y);
+    let (proposed_width, proposed_height) = match ratio {
+        Some(ratio) if matches!(handle, Handle::Left | Handle::Right) => {
+            (raw.size.width, raw.size.width / ratio)
+        }
+        Some(ratio) if matches!(handle, Handle::Top | Handle::Bottom) => {
+            (raw.size.height * ratio, raw.size.height)
+        }
+        Some(ratio) if raw.size.width / raw.size.height > ratio => {
+            (raw.size.width, raw.size.width / ratio)
+        }
+        Some(ratio) => (raw.size.height * ratio, raw.size.height),
+        None => (raw.size.width, raw.size.height),
+    };
+    let (width, height) = fit_crop_size(
+        proposed_width,
+        proposed_height,
+        start.size,
+        bounds.size,
+        ratio,
+    );
+    let center = geom::center(&start);
+    let x = if handle.moves_left() {
+        geom::max_x(&start) - width
+    } else if handle.moves_right() {
+        start.origin.x
+    } else {
+        center.x - width / 2.0
+    };
+    let y = if handle.moves_top() {
+        geom::max_y(&start) - height
+    } else if handle.moves_bottom() {
+        start.origin.y
+    } else {
+        center.y - height / 2.0
+    };
+    clamp_crop_origin(
+        LogicalRect::new(LogicalPoint::new(x, y), LogicalSize::new(width, height)),
+        bounds,
+    )
+}
+
+fn snap_resize_point(
+    mut point: LogicalPoint,
+    handle: Handle,
+    bounds: LogicalRect,
+    tolerance: f64,
+) -> LogicalPoint {
+    if handle.moves_left() || handle.moves_right() {
+        if (point.x - bounds.origin.x).abs() <= tolerance {
+            point.x = bounds.origin.x;
+        } else if (point.x - geom::max_x(&bounds)).abs() <= tolerance {
+            point.x = geom::max_x(&bounds);
+        }
+    }
+    if handle.moves_top() || handle.moves_bottom() {
+        if (point.y - bounds.origin.y).abs() <= tolerance {
+            point.y = bounds.origin.y;
+        } else if (point.y - geom::max_y(&bounds)).abs() <= tolerance {
+            point.y = geom::max_y(&bounds);
+        }
+    }
+    point
+}
+
+fn fit_crop_size(
+    width: f64,
+    height: f64,
+    fallback: LogicalSize,
+    bounds: LogicalSize,
+    ratio: Option<f64>,
+) -> (f64, f64) {
+    let mut width = if width.is_finite() {
+        width.abs()
+    } else {
+        fallback.width
+    };
+    let mut height = if height.is_finite() {
+        height.abs()
+    } else {
+        fallback.height
+    };
+    if let Some(ratio) = ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0) {
+        height = width / ratio;
+        let minimum_scale = (MIN_SIZE / width.max(f64::EPSILON))
+            .max(MIN_SIZE / height.max(f64::EPSILON))
+            .max(1.0);
+        width *= minimum_scale;
+        height *= minimum_scale;
+        let maximum_scale = (bounds.width / width).min(bounds.height / height).min(1.0);
+        width *= maximum_scale;
+        height *= maximum_scale;
+    } else {
+        width = width.clamp(MIN_SIZE.min(bounds.width), bounds.width);
+        height = height.clamp(MIN_SIZE.min(bounds.height), bounds.height);
+    }
+    (width, height)
+}
+
+fn clamp_crop_origin(mut rect: LogicalRect, bounds: LogicalRect) -> LogicalRect {
+    rect.origin.x = rect.origin.x.clamp(
+        bounds.origin.x,
+        (geom::max_x(&bounds) - rect.size.width).max(bounds.origin.x),
+    );
+    rect.origin.y = rect.origin.y.clamp(
+        bounds.origin.y,
+        (geom::max_y(&bounds) - rect.size.height).max(bounds.origin.y),
+    );
+    rect
 }
 
 /// Snaps a free corner so the rectangle it spans is square.

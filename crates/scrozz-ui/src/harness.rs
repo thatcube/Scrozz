@@ -281,6 +281,8 @@ pub enum Scenario {
     SelectorMixedDpi,
     /// A live vertical pull scrubbing every card toward the collapsed dock.
     DockScrubbing,
+    /// The editor's dedicated crop mode with full chrome and controls.
+    EditorCrop,
 }
 
 impl Scenario {
@@ -308,6 +310,7 @@ impl Scenario {
             Self::SelectorAllInOne,
             Self::SelectorMixedDpi,
             Self::DockScrubbing,
+            Self::EditorCrop,
         ]
     }
 
@@ -338,6 +341,7 @@ impl Scenario {
             Self::SelectorAllInOne => "selector-all-in-one",
             Self::SelectorMixedDpi => "selector-mixed-dpi",
             Self::DockScrubbing => "dock-scrubbing",
+            Self::EditorCrop => "editor-crop",
         }
     }
 
@@ -836,6 +840,16 @@ impl Fixture {
                     true,
                     "Shape the arrow",
                     "Arrow style, bend, and named source-unit thickness controls over the live editor.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorCrop => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Crop with precision",
+                    "The complete source stays visible behind a rule-of-thirds crop with direct edge handles, dimensions, aspect presets, snap, Cancel, and Crop actions.",
                     instants::REST,
                     None,
                 ),
@@ -2079,6 +2093,7 @@ impl SceneRegistry {
             Scenario::EditorAnnotating,
             Scenario::EditorColorPopover,
             Scenario::EditorArrowStyles,
+            Scenario::EditorCrop,
         ] {
             me.register(scenario, Box::new(crate::editor::EditorScene));
         }
@@ -3893,6 +3908,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorAnnotating,
         Scenario::EditorColorPopover,
         Scenario::EditorArrowStyles,
+        Scenario::EditorCrop,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),
