@@ -192,6 +192,12 @@ non-destructive. This is the single largest surface area in the product.
 | BG-05 | Alignment options | T2 | |
 | BG-06 | **Auto Balance** (auto-centers on visual content) | T3 | Content-aware trim/centering; genuinely clever |
 | BG-07 | Aspect ratio presets (social sizes) | T2 | |
+| BG-08 | **Smart Frame** — one action applies balanced padding, radius, shadow and a suitable background | T1 | Xnapper proves the value is the instant workflow, not the individual sliders |
+| BG-09 | Automatic background derived from capture colours and contrast | T2 | Must keep the capture legible and produce deterministic output |
+| BG-10 | Save, name and reuse custom beautification presets | T2 | Existing built-ins are only starting points |
+| BG-11 | Exact social output sizes in addition to aspect ratios | T2 | Preserve source pixels; expand/crop only the presentation canvas |
+| BG-12 | Optional text watermark | T3 | Off by default; never vendor-branded |
+| BG-13 | Browser/device mockup frames | T3 | Original Scrozz assets only; defer until core framing is excellent |
 
 ---
 
@@ -257,6 +263,7 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 | OCR-03 | Works on images, video frames, scanned docs | T1 | Falls out of OCR-01 |
 | OCR-04 | **QR codes and barcodes** | T1 | **Newly identified.** The competitor's own onboarding sells the tool as copying text "from images, videos, PDFs, webpages, photos **and even QR codes**". A QR in a screenshot is a URL the user cannot click, and retyping it is not an option — so this is closer to essential than to a bonus. macOS `VNDetectBarcodesRequest` gives it almost free alongside Vision text; Windows has no system barcode API, so `rxing` (pure-Rust ZXing port) or `rqrr` covers Windows and Linux together. Should return the payload *and* its bounds, so the UI can indicate what it found |
 | OCR-05 | Recognise text the pointer is over, without selecting | T2 | Live text under cursor, rather than drag-a-region first |
+| OCR-06 | **Find sensitive information** and suggest secure Redact regions | T1 | Local OCR plus deterministic detectors for emails, payment-card candidates, IP addresses and likely secrets. Always show findings for review; never silently redact or upload content |
 
 ### Onboarding pattern worth stealing
 
