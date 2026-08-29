@@ -2356,7 +2356,7 @@ impl App {
     fn drain_permission(&mut self) {
         let effect = self.permission.application_active_changed(
             scrozz_shell::permissions::application_is_active(),
-            Self::screen_access(),
+            Self::screen_access,
         );
         self.apply_permission_effect(effect);
 
@@ -2427,15 +2427,17 @@ impl App {
                 }
                 PermissionEffect::RequestSystemAccess => {
                     let permissions = SystemPermissions::new();
-                    if let Err(error) = permissions.request(Capability::ScreenRecording)
-                        && !matches!(error, CoreError::PermissionDenied { .. })
-                    {
-                        self.note(format!(
-                            "macOS could not present Screen Recording access: {error}"
-                        ));
-                    }
-                    self.permission
-                        .system_request_finished(Self::screen_access())
+                    let access = match permissions.request(Capability::ScreenRecording) {
+                        Ok(()) => Access::Granted,
+                        Err(CoreError::PermissionDenied { .. }) => Access::NotGranted,
+                        Err(error) => {
+                            self.note(format!(
+                                "macOS could not present Screen Recording access: {error}"
+                            ));
+                            Access::Unavailable
+                        }
+                    };
+                    self.permission.system_request_finished(access)
                 }
                 PermissionEffect::OpenSystemSettings => {
                     if let Err(error) =

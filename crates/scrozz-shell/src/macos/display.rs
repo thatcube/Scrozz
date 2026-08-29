@@ -30,11 +30,22 @@
 //! through the height of `NSScreen.screens[0].frame` — the screen that owns the
 //! menu bar and therefore AppKit's global origin.
 
-use objc2_app_kit::{NSEvent, NSScreen};
+use std::{
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2_app_kit::{NSApplicationDidChangeScreenParametersNotification, NSEvent, NSScreen};
 use objc2_core_foundation::{
     CFNumber, CFPreferencesCopyAppValue, CFPreferencesGetAppBooleanValue, CFString,
 };
-use objc2_foundation::{MainThreadMarker, NSRect};
+use objc2_foundation::{MainThreadMarker, NSNotification, NSNotificationCenter, NSRect};
 use scrozz_core::{Display, DisplayId, Error, LogicalPoint, LogicalRect, Result, ScaleFactor};
 
 use crate::macos::main_thread;
@@ -48,6 +59,7 @@ use crate::overlay::{AppKitRect, appkit_to_logical};
 /// plus this chrome keeps capture cards clear in both states.
 const AUTO_HIDE_DOCK_CHROME: f64 = 20.0;
 const DEFAULT_DOCK_TILE_SIZE: f64 = 64.0;
+static REFERENCE_HEIGHT_BITS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DockEdge {
@@ -87,9 +99,12 @@ const fn ns_rect(rect: NSRect) -> AppKitRect {
 /// asleep — which makes downstream rectangles degenerate rather than panicking.
 #[must_use]
 pub fn reference_height(mtm: MainThreadMarker) -> f64 {
-    NSScreen::screens(mtm)
+    crate::macos::activity::record_display_enumeration();
+    let height = NSScreen::screens(mtm)
         .firstObject()
-        .map_or(0.0, |screen| screen.frame().size.height)
+        .map_or(0.0, |screen| screen.frame().size.height);
+    REFERENCE_HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
+    height
 }
 
 /// Converts one `NSScreen` into a Scrozz [`Display`].
@@ -247,6 +262,7 @@ fn reserve_auto_hidden_dock(
 pub fn displays() -> Result<Vec<Display>> {
     let mtm = main_thread("enumerating displays")?;
     let reference = reference_height(mtm);
+    crate::macos::activity::record_display_enumeration();
     Ok(NSScreen::screens(mtm)
         .iter()
         .enumerate()
@@ -263,6 +279,7 @@ pub fn displays() -> Result<Vec<Display>> {
 pub fn primary_display() -> Result<Display> {
     let mtm = main_thread("reading the primary display")?;
     let reference = reference_height(mtm);
+    crate::macos::activity::record_display_enumeration();
     NSScreen::screens(mtm)
         .firstObject()
         .map(|screen| to_display(&screen, reference, true))
@@ -299,10 +316,15 @@ pub fn display_at(point: LogicalPoint) -> Result<Display> {
 /// Returns [`Error::Platform`] off the main thread.
 pub fn pointer_location() -> Result<LogicalPoint> {
     let mtm = main_thread("reading the pointer location")?;
-    let reference = reference_height(mtm);
-    // `NSEvent::mouseLocation` is a class method with no receiver state and is
-    // safe in these bindings; it reports AppKit global coordinates, so it needs
-    // the same flip as every screen rectangle.
+    let cached = f64::from_bits(REFERENCE_HEIGHT_BITS.load(Ordering::Acquire));
+    let reference = if cached.is_finite() && cached > 0.0 {
+        cached
+    } else {
+        reference_height(mtm)
+    };
+    // The display refresh paths update the cached reference height. Sampling
+    // the pointer therefore stays a pure NSEvent read instead of enumerating
+    // NSScreen on every idle hover probe.
     let location = NSEvent::mouseLocation();
     Ok(LogicalPoint::new(location.x, reference - location.y))
 }
@@ -315,6 +337,68 @@ pub fn pointer_location() -> Result<LogicalPoint> {
 /// if there are no displays.
 pub fn active_display() -> Result<Display> {
     display_at(pointer_location()?)
+}
+
+/// Event-driven invalidation for cached display geometry.
+///
+/// AppKit owns the notification source. The returned monitor owns exactly one
+/// observer token and unregisters it before release; reading [`Self::changed`]
+/// is an atomic load and never enumerates displays.
+pub struct DisplayChangeMonitor {
+    center: Retained<NSNotificationCenter>,
+    observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    generation: Arc<AtomicU64>,
+    observed_generation: u64,
+}
+
+impl DisplayChangeMonitor {
+    /// Installs one process-local AppKit screen-parameter observer.
+    pub fn new() -> Result<Self> {
+        let _mtm = main_thread("observing display changes")?;
+        let center = NSNotificationCenter::defaultCenter();
+        let generation = Arc::new(AtomicU64::new(0));
+        let callback_generation = Arc::clone(&generation);
+        let block = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+            callback_generation.fetch_add(1, Ordering::Release);
+        });
+        // SAFETY: the notification name is an AppKit process-lifetime constant,
+        // the copied block owns its Arc, and a nil queue delivers synchronously
+        // on the posting thread (AppKit posts this notification on the main
+        // thread).
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSApplicationDidChangeScreenParametersNotification),
+                None,
+                None,
+                &block,
+            )
+        };
+        Ok(Self {
+            center,
+            observer,
+            generation,
+            observed_generation: 0,
+        })
+    }
+
+    /// Returns true once for one or more notifications since the last read.
+    pub fn changed(&mut self) -> bool {
+        let generation = self.generation.load(Ordering::Acquire);
+        if generation == self.observed_generation {
+            return false;
+        }
+        self.observed_generation = generation;
+        true
+    }
+}
+
+impl Drop for DisplayChangeMonitor {
+    fn drop(&mut self) {
+        // SAFETY: this is the exact opaque token returned by this center.
+        unsafe {
+            self.center.removeObserver(self.observer.as_ref());
+        }
+    }
 }
 
 /// Whether a rectangle contains a point, half-open on the far edges.

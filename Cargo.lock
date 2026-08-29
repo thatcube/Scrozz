@@ -4044,6 +4044,7 @@ name = "scrozz-shell"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "block2 0.6.2",
  "global-hotkey",
  "image",
  "objc2 0.6.4",

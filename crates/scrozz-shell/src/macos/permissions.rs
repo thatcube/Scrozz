@@ -120,7 +120,7 @@ impl AuthorizationStatus {
 #[must_use]
 pub fn is_granted(capability: Capability) -> bool {
     match capability {
-        Capability::ScreenRecording => CGPreflightScreenCaptureAccess(),
+        Capability::ScreenRecording => screen_recording_is_granted(),
         Capability::Microphone => microphone_status() == AuthorizationStatus::Authorized,
         // SAFETY: a nullary C query with no arguments, no allocation and no
         // thread requirement.
@@ -203,16 +203,22 @@ fn request_input_monitoring(capability: Capability) -> Result<()> {
 }
 
 fn request_screen_recording(capability: Capability) -> Result<()> {
-    if CGPreflightScreenCaptureAccess() {
+    if screen_recording_is_granted() {
         return Ok(());
     }
     // Shows the system prompt the first time and nothing at all afterwards, so
     // its `false` return covers both "the user said no just now" and "the user
     // said no months ago". Either way the remedy is the same pane.
+    crate::macos::activity::record_screen_request();
     if CGRequestScreenCaptureAccess() {
         return Ok(());
     }
     Err(crate::permissions::denied(capability))
+}
+
+fn screen_recording_is_granted() -> bool {
+    crate::macos::activity::record_screen_preflight();
+    CGPreflightScreenCaptureAccess()
 }
 
 /// Whether the accessory application is currently active.

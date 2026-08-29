@@ -46,8 +46,8 @@ eframe = { version = "=0.36.1", default-features = false, features = [
 ] }
 egui = "=0.36.1"
 futures-util = "0.3"
-# Needed to reach the underlying NSView from eframe's CreationContext, which is
-# how the overlay window is converted to a non-activating NSPanel (D27).
+# Needed to reach the underlying NSView from eframe's CreationContext so the
+# native adapter can retain it without changing winit's class or delegate.
 raw-window-handle = "0.6"
 
 thiserror = "2"
