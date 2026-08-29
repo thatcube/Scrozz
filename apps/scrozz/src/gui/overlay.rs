@@ -102,7 +102,11 @@ impl CardSurface for OverlayCards {
             // capture that happened should be visible even if thumbnailing
             // failed, because the file on disk is fine.
             None => CaptureRequest::new(name, provenance, card.source_px()),
-        };
+        }
+        .with_upload_availability(
+            card.upload_available,
+            card.upload_unavailable_reason.clone(),
+        );
 
         self.pending.push_back(card.id);
         self.handle.push(request);
@@ -114,6 +118,20 @@ impl CardSurface for OverlayCards {
             self.handle.dismiss(scrozz_ui::stack::CardId(theirs));
         }
         self.forget(id);
+    }
+
+    fn set_status(&mut self, id: CardId, status: Option<String>) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .set_status(scrozz_ui::stack::CardId(theirs), status);
+        }
+    }
+
+    fn set_upload_availability(&mut self, id: CardId, enabled: bool, reason: Option<String>) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .set_upload_availability(scrozz_ui::stack::CardId(theirs), enabled, reason);
+        }
     }
 
     fn poll(&mut self) -> Option<CardEvent> {

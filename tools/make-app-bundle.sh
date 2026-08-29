@@ -9,6 +9,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true
 
 # Install where Finder's Applications sidebar actually points. Using
@@ -20,7 +21,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/scrozz-rel}"
 BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-$(date +%s)}"
 
 echo "==> building release binary"
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
+CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release --features cloud
 
 echo "==> assembling $APP"
 rm -rf "$APP"

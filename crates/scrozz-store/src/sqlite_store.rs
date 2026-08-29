@@ -18,12 +18,16 @@ use crate::{
     },
     record::StoredRecord,
     schema,
+    sharing::{CaptureSharing, RemoteDeletionState, RemoteObjectStatus},
 };
 
 /// Columns every record query selects, in the order [`row_to_record`] reads.
-const RECORD_COLUMNS: &str = "id, created_at, pinned, app_name, window_title, provenance, \
-     target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text, \
-     annotation_count";
+const RECORD_COLUMNS: &str = "captures.id, captures.created_at, captures.pinned, captures.app_name, \
+     captures.window_title, captures.provenance, captures.target_json, captures.frame_json, \
+     captures.image_hash, captures.image_bytes, captures.image_evicted_at, captures.ocr_text, \
+     captures.annotation_count, capture_shares.sharing_json";
+const RECORD_SOURCE: &str =
+    "captures LEFT JOIN capture_shares ON capture_shares.capture_id = captures.id";
 
 /// A capture on its way into history.
 ///
@@ -109,7 +113,7 @@ pub enum DocumentState {
     /// The pixels are here; this is the full editable document.
     Complete(Document),
     /// The pixels were evicted under the size cap. Every edit is intact.
-    ImageEvicted(EvictedDocument),
+    ImageEvicted(Box<EvictedDocument>),
 }
 
 impl DocumentState {
@@ -264,6 +268,43 @@ pub trait History: Store {
     /// Returns [`Error::Storage`] if the capture is unknown or the write fails.
     fn set_ocr_text(&mut self, id: &CaptureId, text: Option<&str>) -> Result<()>;
 
+    /// Reads the capture's sharing metadata, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture or metadata cannot be read.
+    fn share_metadata(&self, id: &CaptureId) -> Result<Option<CaptureSharing>>;
+
+    /// Replaces the capture's sharing metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture is unknown or the write fails,
+    /// or [`Error::InvalidRequest`] if the metadata is unsafe to persist.
+    fn set_share_metadata(&mut self, id: &CaptureId, sharing: Option<CaptureSharing>)
+    -> Result<()>;
+
+    /// Updates only the remote-object status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture has no sharing metadata or the
+    /// write fails.
+    fn set_share_remote_status(&mut self, id: &CaptureId, status: RemoteObjectStatus)
+    -> Result<()>;
+
+    /// Updates only the remote deletion state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture has no sharing metadata or the
+    /// write fails.
+    fn set_share_deletion_state(
+        &mut self,
+        id: &CaptureId,
+        deletion: RemoteDeletionState,
+    ) -> Result<()>;
+
     /// Bytes of source imagery currently on disk.
     ///
     /// # Errors
@@ -321,6 +362,7 @@ impl SqliteStore {
         };
 
         store.adopt_unindexed_records()?;
+        store.reconcile_share_index()?;
         Ok(store)
     }
 
@@ -518,6 +560,35 @@ impl SqliteStore {
         self.reconcile().map(|_| ())
     }
 
+    /// Replays the durable sharing field independently of capture counts.
+    ///
+    /// A share update writes its sidecar first. A crash before the SQLite write
+    /// leaves the capture count unchanged, so count-based adoption cannot detect
+    /// it; replaying only this small JSON field closes that recovery gap without
+    /// scanning image blobs.
+    fn reconcile_share_index(&mut self) -> Result<()> {
+        let layout = self.layout.clone();
+        // Lock SQLite before reading sidecars. A concurrent writer publishes its
+        // sidecar first and then waits here, so either this scan observes the new
+        // sidecar or that writer updates the index after this transaction.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin sharing metadata reconcile"))?;
+        let (records, failures) = layout.scan_records()?;
+        if !failures.is_empty() {
+            tracing::warn!(
+                failures = failures.len(),
+                "some durable records were unreadable while reconciling share metadata"
+            );
+        }
+        for record in records {
+            sync_share_row(&tx, &CaptureId(record.id.clone()), record.sharing.as_ref())?;
+        }
+        tx.commit()
+            .map_err(store_err("cannot commit sharing metadata reconcile"))
+    }
+
     /// Removes blobs no capture refers to any more.
     ///
     /// Orphans are produced by a crash between committing an eviction and
@@ -599,6 +670,24 @@ impl SqliteStore {
     fn require_record(&self, id: &CaptureId) -> Result<StoredRecord> {
         self.stored_record(id)?
             .ok_or_else(|| Error::Storage(format!("no capture {} in history", id.0)))
+    }
+
+    fn write_share_index(&self, id: &CaptureId, sharing: Option<&CaptureSharing>) -> Result<()> {
+        let changed = sync_share_row(&self.conn, id, sharing)?;
+        if changed == 0
+            && self
+                .conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM captures WHERE id = ?1)",
+                    params![id.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(store_err("cannot verify sharing metadata target"))?
+                == 0
+        {
+            return Err(Error::Storage(format!("no capture {} in history", id.0)));
+        }
+        Ok(())
     }
 }
 
@@ -707,7 +796,7 @@ impl History for SqliteStore {
     fn record(&self, id: &CaptureId) -> Result<Option<CaptureRecord>> {
         self.conn
             .query_row(
-                &format!("SELECT {RECORD_COLUMNS} FROM captures WHERE id = ?1"),
+                &format!("SELECT {RECORD_COLUMNS} FROM {RECORD_SOURCE} WHERE captures.id = ?1"),
                 params![id.0],
                 |row| Ok(row_to_record(row)),
             )
@@ -728,12 +817,14 @@ impl History for SqliteStore {
         };
 
         let Some(pixels) = pixels else {
-            return Ok(Some(DocumentState::ImageEvicted(EvictedDocument {
-                record: self
-                    .record(id)?
-                    .unwrap_or_else(|| record.to_capture_record()),
-                data,
-            })));
+            return Ok(Some(DocumentState::ImageEvicted(Box::new(
+                EvictedDocument {
+                    record: self
+                        .record(id)?
+                        .unwrap_or_else(|| record.to_capture_record()),
+                    data,
+                },
+            ))));
         };
 
         let header = &record.frame;
@@ -868,6 +959,43 @@ impl History for SqliteStore {
             )
             .map_err(store_err("cannot record recognised text"))?;
         Ok(())
+    }
+
+    fn share_metadata(&self, id: &CaptureId) -> Result<Option<CaptureSharing>> {
+        Ok(self.record(id)?.and_then(|record| record.sharing))
+    }
+
+    fn set_share_metadata(
+        &mut self,
+        id: &CaptureId,
+        sharing: Option<CaptureSharing>,
+    ) -> Result<()> {
+        let mut record = self.require_record(id)?;
+        record.set_sharing(sharing)?;
+        self.layout.write_record(&record)?;
+        self.write_share_index(id, record.sharing.as_ref())
+    }
+
+    fn set_share_remote_status(
+        &mut self,
+        id: &CaptureId,
+        status: RemoteObjectStatus,
+    ) -> Result<()> {
+        let mut record = self.require_record(id)?;
+        record.set_remote_status(status)?;
+        self.layout.write_record(&record)?;
+        self.write_share_index(id, record.sharing.as_ref())
+    }
+
+    fn set_share_deletion_state(
+        &mut self,
+        id: &CaptureId,
+        deletion: RemoteDeletionState,
+    ) -> Result<()> {
+        let mut record = self.require_record(id)?;
+        record.set_deletion(deletion)?;
+        self.layout.write_record(&record)?;
+        self.write_share_index(id, record.sharing.as_ref())
     }
 
     fn stored_image_bytes(&self) -> Result<u64> {
@@ -1073,7 +1201,34 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
         ],
     )
     .map_err(store_err("cannot write capture row"))?;
+    sync_share_row(conn, &CaptureId(record.id.clone()), record.sharing.as_ref())?;
     Ok(())
+}
+
+fn sync_share_row(
+    conn: &Connection,
+    id: &CaptureId,
+    sharing: Option<&CaptureSharing>,
+) -> Result<usize> {
+    match sharing {
+        Some(sharing) => {
+            sharing.validate_for_storage()?;
+            let sharing_json = serde_json::to_string(sharing)
+                .map_err(|e| Error::Storage(format!("cannot serialise sharing metadata: {e}")))?;
+            conn.execute(
+                "INSERT INTO capture_shares (capture_id, sharing_json) VALUES (?1, ?2)
+                 ON CONFLICT (capture_id) DO UPDATE SET sharing_json = excluded.sharing_json",
+                params![id.0, sharing_json],
+            )
+            .map_err(store_err("cannot write sharing metadata"))
+        }
+        None => conn
+            .execute(
+                "DELETE FROM capture_shares WHERE capture_id = ?1",
+                params![id.0],
+            )
+            .map_err(store_err("cannot clear sharing metadata")),
+    }
 }
 
 fn drop_rows_without_records(conn: &Connection, keep: &[String]) -> Result<usize> {
@@ -1134,7 +1289,7 @@ fn like_pattern(needle: &str) -> String {
 }
 
 fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
-    let mut sql = format!("SELECT {RECORD_COLUMNS} FROM captures WHERE 1 = 1");
+    let mut sql = format!("SELECT {RECORD_COLUMNS} FROM {RECORD_SOURCE} WHERE 1 = 1");
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
 
     let like = |sql: &mut String, column: &str, needle: &str, args: &mut Vec<Box<dyn ToSql>>| {
@@ -1143,33 +1298,33 @@ fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
     };
 
     if let Some(text) = &query.text {
-        like(&mut sql, "search_fold", text, &mut args);
+        like(&mut sql, "captures.search_fold", text, &mut args);
     }
     if let Some(app) = &query.app_name {
-        like(&mut sql, "app_fold", app, &mut args);
+        like(&mut sql, "captures.app_fold", app, &mut args);
     }
     if let Some(title) = &query.window_title {
-        like(&mut sql, "title_fold", title, &mut args);
+        like(&mut sql, "captures.title_fold", title, &mut args);
     }
     if let Some(ocr) = &query.ocr_text {
-        like(&mut sql, "ocr_fold", ocr, &mut args);
+        like(&mut sql, "captures.ocr_fold", ocr, &mut args);
     }
     if let Some(after) = query.created_after {
         args.push(Box::new(after.0));
-        sql.push_str(&format!(" AND created_at >= ?{}", args.len()));
+        sql.push_str(&format!(" AND captures.created_at >= ?{}", args.len()));
     }
     if let Some(before) = query.created_before {
         args.push(Box::new(before.0));
-        sql.push_str(&format!(" AND created_at <= ?{}", args.len()));
+        sql.push_str(&format!(" AND captures.created_at <= ?{}", args.len()));
     }
     if query.pinned_only {
-        sql.push_str(" AND pinned = 1");
+        sql.push_str(" AND captures.pinned = 1");
     }
     if query.images_only {
-        sql.push_str(" AND image_hash IS NOT NULL AND image_evicted_at IS NULL");
+        sql.push_str(" AND captures.image_hash IS NOT NULL AND captures.image_evicted_at IS NULL");
     }
 
-    sql.push_str(" ORDER BY created_at DESC, id DESC");
+    sql.push_str(" ORDER BY captures.created_at DESC, captures.id DESC");
     args.push(Box::new(i64::from(query.page.limit)));
     sql.push_str(&format!(" LIMIT ?{}", args.len()));
     args.push(Box::new(i64::from(query.page.offset)));
@@ -1194,6 +1349,7 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let image_evicted_at: Option<i64> = get(row, 10)?;
     let ocr_text: Option<String> = get(row, 11)?;
     let annotation_count: i64 = get(row, 12)?;
+    let sharing_json: Option<String> = get(row, 13)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
@@ -1217,7 +1373,7 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     };
 
     Ok(CaptureRecord {
-        id: CaptureId(id),
+        id: CaptureId(id.clone()),
         created_at: Timestamp(created_at),
         pinned: pinned != 0,
         app_name,
@@ -1228,6 +1384,13 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         image,
         ocr_text,
         annotation_count: usize::try_from(annotation_count).unwrap_or(0),
+        sharing: sharing_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    Error::Storage(format!("cannot read sharing metadata for {id}: {e}"))
+                })
+            })
+            .transpose()?,
     })
 }
 

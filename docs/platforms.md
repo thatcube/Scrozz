@@ -189,3 +189,13 @@ better tested than Windows or Linux code until layer 4 exists. That is a real
 risk, not a solved problem. Layers 1–3 keep it from becoming *rot* — the code
 compiles, runs, and renders on all three — but they do not substitute for someone
 using the app on Windows.
+## Native credential adapters
+
+Cloud-enabled packages select the operating system's credential service:
+macOS Keychain, Windows Credential Manager, and freedesktop Secret Service on
+Linux. CI's native three-platform matrix builds and tests `--all-features`, so
+each adapter is compiled against its real target API. Runtime availability still
+depends on a logged-in keychain/session service; Settings reports that state
+truthfully. A real write/read/delete smoke is opt-in with
+`SCROZZ_TEST_NATIVE_VAULT=1` and must run only in an unlocked interactive
+desktop session.

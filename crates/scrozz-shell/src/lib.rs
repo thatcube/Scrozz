@@ -10,6 +10,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod drag;
+pub mod filesystem;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -22,6 +23,7 @@ pub use drag::{
     DragPreview, DragSession, DragSource, NativeDragSource, NativeSurface, PromisedFile,
     byte_source, native_drag_source,
 };
+pub use filesystem::replace_file;
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,

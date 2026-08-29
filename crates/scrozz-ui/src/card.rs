@@ -174,6 +174,12 @@ pub struct CardContent<'a> {
     pub provenance: Provenance,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
+    /// Whether Upload accepts input for this capture.
+    pub upload_enabled: bool,
+    /// Accessible explanation for a disabled Upload control.
+    pub upload_unavailable_reason: Option<&'a str>,
+    /// Latest action status, shown in the caption.
+    pub status: Option<&'a str>,
 }
 
 impl<'a> CardContent<'a> {
@@ -185,6 +191,9 @@ impl<'a> CardContent<'a> {
             source_px,
             provenance,
             texture: None,
+            upload_enabled: true,
+            upload_unavailable_reason: None,
+            status: None,
         }
     }
 
@@ -199,6 +208,12 @@ impl<'a> CardContent<'a> {
     #[must_use]
     pub fn dimensions(&self) -> String {
         format!("{} × {}", self.source_px.0, self.source_px.1)
+    }
+
+    /// Right-hand caption text.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        self.status.map_or_else(|| self.dimensions(), str::to_owned)
     }
 }
 
@@ -385,7 +400,7 @@ pub fn draw_card(
         );
     }
 
-    let action = draw_chrome(ui, surface, frame, chrome, capture, alpha * reveal);
+    let action = draw_chrome(ui, surface, frame, chrome, capture, content, alpha * reveal);
 
     CardResponse {
         body,
@@ -487,7 +502,7 @@ fn draw_caption(
     painter.text(
         pos2(capture.right() - 13.0, cy),
         Align2::RIGHT_CENTER,
-        content.dimensions(),
+        content.detail(),
         surface.font(Text::Caption),
         fade(Color32::from_rgb(255, 255, 255), alpha * 0.59),
     );
@@ -504,6 +519,7 @@ fn draw_chrome(
     frame: &CardFrame,
     chrome: CardChrome,
     capture: Rect,
+    content: &CardContent<'_>,
     opacity: f32,
 ) -> Option<CardAction> {
     if opacity <= 0.004 {
@@ -576,16 +592,26 @@ fn draw_chrome(
     ];
     for (action, origin) in corners {
         let r = Rect::from_min_size(origin, size);
-        let resp = paint::icon_button(
+        let state = if action == CardAction::Upload && !content.upload_enabled {
+            ControlState::disabled()
+        } else {
+            ControlState::new()
+        };
+        let mut resp = paint::icon_button(
             ui,
             surface,
             r,
             control_id(frame.id, action),
             action.icon(),
             action.label(),
-            ControlState::new(),
+            state,
             settle,
         );
+        if action == CardAction::Upload
+            && let Some(reason) = content.upload_unavailable_reason
+        {
+            resp = resp.on_disabled_hover_text(reason);
+        }
         if resp.clicked() {
             pressed = Some(action);
         }

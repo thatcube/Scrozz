@@ -8,7 +8,9 @@
 use scrozz_store::{
     CaptureId, DocumentState, History as _, ImageState, NewCapture, SearchQuery, SqliteStore,
     Store as _, StoredRecord, Timestamp,
-    test_support::{ScratchDir, richly_annotated_document, sample_document, scratch_dir},
+    test_support::{
+        ScratchDir, richly_annotated_document, sample_document, sample_sharing, scratch_dir,
+    },
 };
 use std::fs;
 use std::io::Write as _;
@@ -398,6 +400,64 @@ fn a_rebuilt_store_is_immediately_writable_again() {
             .window_title
             .as_deref(),
         Some("after the crash")
+    );
+}
+
+#[test]
+fn rebuilding_restores_sharing_metadata_from_durable_records() {
+    let dir = scratch_dir("rebuild-sharing");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let id = store
+        .insert(NewCapture::new(&sample_document(8, 8, 12, 1)))
+        .expect("insert");
+    let sharing = sample_sharing(12);
+    store
+        .set_share_metadata(&id, Some(sharing.clone()))
+        .expect("share");
+    let index = store.layout().index_path();
+    drop(store);
+
+    fs::write(&index, b"broken").expect("corrupt");
+
+    let store = SqliteStore::open(dir.path()).expect("reopen");
+    assert_eq!(
+        store.record(&id).expect("read").expect("present").sharing,
+        Some(sharing)
+    );
+}
+
+#[test]
+fn opening_replays_a_sidecar_share_update_even_when_capture_counts_match() {
+    let dir = scratch_dir("share-sidecar-ahead");
+    let document = sample_document(8, 8, 13, 1);
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let id = store
+        .insert(NewCapture::new(&document))
+        .expect("insert capture");
+    store
+        .set_share_metadata(&id, Some(sample_sharing(13)))
+        .expect("index initial sharing");
+
+    let layout = store.layout().clone();
+    let mut sidecar = layout
+        .read_record(&id)
+        .expect("read sidecar")
+        .expect("sidecar exists");
+    let ahead = sample_sharing(14);
+    sidecar
+        .set_sharing(Some(ahead.clone()))
+        .expect("change durable sharing");
+    layout.write_record(&sidecar).expect("write sidecar first");
+    drop(store);
+
+    let reopened = SqliteStore::open(dir.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .record(&id)
+            .expect("read")
+            .expect("capture")
+            .sharing,
+        Some(ahead)
     );
 }
 

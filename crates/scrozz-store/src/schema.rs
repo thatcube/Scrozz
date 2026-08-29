@@ -37,65 +37,78 @@ pub struct Migration {
 /// `user_version` and a schema drift apart is an interrupted upgrade on a
 /// filesystem that lied about `fsync`, and idempotent rungs make that
 /// recoverable instead of fatal.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial history index",
-    sql: r"
-        -- One row per capture. Rows are NEVER deleted by retention: decision
-        -- D23 evicts `image_hash`, not the capture.
-        CREATE TABLE IF NOT EXISTS captures (
-            id                TEXT    NOT NULL PRIMARY KEY,
-            created_at        INTEGER NOT NULL,
-            stored_at         INTEGER NOT NULL,
-            pinned            INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
-            app_name          TEXT,
-            window_title      TEXT,
-            provenance        TEXT    NOT NULL,
-            target_json       TEXT    NOT NULL,
-            frame_json        TEXT    NOT NULL,
-            -- NULL once the pixels are gone. The document stays either way.
-            image_hash        TEXT,
-            image_bytes       INTEGER NOT NULL DEFAULT 0,
-            image_evicted_at  INTEGER,
-            ocr_text          TEXT,
-            annotation_count  INTEGER NOT NULL DEFAULT 0,
-            -- Case-folded in Rust, because SQL's lower() folds ASCII only.
-            search_fold       TEXT    NOT NULL DEFAULT '',
-            app_fold          TEXT,
-            title_fold        TEXT,
-            ocr_fold          TEXT
-        ) STRICT;
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial history index",
+        sql: r"
+            -- One row per capture. Rows are NEVER deleted by retention: decision
+            -- D23 evicts `image_hash`, not the capture.
+            CREATE TABLE IF NOT EXISTS captures (
+                id                TEXT    NOT NULL PRIMARY KEY,
+                created_at        INTEGER NOT NULL,
+                stored_at         INTEGER NOT NULL,
+                pinned            INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+                app_name          TEXT,
+                window_title      TEXT,
+                provenance        TEXT    NOT NULL,
+                target_json       TEXT    NOT NULL,
+                frame_json        TEXT    NOT NULL,
+                -- NULL once the pixels are gone. The document stays either way.
+                image_hash        TEXT,
+                image_bytes       INTEGER NOT NULL DEFAULT 0,
+                image_evicted_at  INTEGER,
+                ocr_text          TEXT,
+                annotation_count  INTEGER NOT NULL DEFAULT 0,
+                -- Case-folded in Rust, because SQL's lower() folds ASCII only.
+                search_fold       TEXT    NOT NULL DEFAULT '',
+                app_fold          TEXT,
+                title_fold        TEXT,
+                ocr_fold          TEXT
+            ) STRICT;
 
-        -- History is read newest-first far more than any other way.
-        CREATE INDEX IF NOT EXISTS captures_by_recency
-            ON captures (created_at DESC, id DESC);
+            -- History is read newest-first far more than any other way.
+            CREATE INDEX IF NOT EXISTS captures_by_recency
+                ON captures (created_at DESC, id DESC);
 
-        -- Retention's exact question: the oldest unpinned capture that still
-        -- has pixels. A partial index keeps it proportional to the answer.
-        -- `image_hash` is kept after eviction so a capture remembers what its
-        -- pixels were; `image_evicted_at` is what says they are gone.
-        CREATE INDEX IF NOT EXISTS captures_evictable
-            ON captures (created_at ASC, id ASC)
-            WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0;
+            -- Retention's exact question: the oldest unpinned capture that still
+            -- has pixels. A partial index keeps it proportional to the answer.
+            -- `image_hash` is kept after eviction so a capture remembers what its
+            -- pixels were; `image_evicted_at` is what says they are gone.
+            CREATE INDEX IF NOT EXISTS captures_evictable
+                ON captures (created_at ASC, id ASC)
+                WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0;
 
-        CREATE INDEX IF NOT EXISTS captures_by_app ON captures (app_fold);
-        CREATE INDEX IF NOT EXISTS captures_pinned ON captures (pinned) WHERE pinned = 1;
-        CREATE INDEX IF NOT EXISTS captures_by_hash ON captures (image_hash);
+            CREATE INDEX IF NOT EXISTS captures_by_app ON captures (app_fold);
+            CREATE INDEX IF NOT EXISTS captures_pinned ON captures (pinned) WHERE pinned = 1;
+            CREATE INDEX IF NOT EXISTS captures_by_hash ON captures (image_hash);
 
-        -- One row per distinct blob on disk. Two captures of an unchanged
-        -- window share one, so the cap measures disk rather than duplicates.
-        CREATE TABLE IF NOT EXISTS blobs (
-            hash       TEXT    NOT NULL PRIMARY KEY,
-            byte_len   INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        ) STRICT;
+            -- One row per distinct blob on disk. Two captures of an unchanged
+            -- window share one, so the cap measures disk rather than duplicates.
+            CREATE TABLE IF NOT EXISTS blobs (
+                hash       TEXT    NOT NULL PRIMARY KEY,
+                byte_len   INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS store_meta (
-            key   TEXT NOT NULL PRIMARY KEY,
-            value TEXT NOT NULL
-        ) STRICT;
-    ",
-}];
+            CREATE TABLE IF NOT EXISTS store_meta (
+                key   TEXT NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            ) STRICT;
+        ",
+    },
+    Migration {
+        version: 2,
+        name: "capture sharing metadata",
+        sql: r"
+            CREATE TABLE IF NOT EXISTS capture_shares (
+                capture_id    TEXT NOT NULL PRIMARY KEY
+                              REFERENCES captures(id) ON DELETE CASCADE,
+                sharing_json  TEXT NOT NULL
+            ) STRICT;
+        ",
+    },
+];
 
 /// The version a freshly-migrated file ends up at.
 #[must_use]
@@ -338,7 +351,7 @@ mod tests {
         assert_eq!(version, latest_version(MIGRATIONS));
 
         let names = tables(&conn);
-        for expected in ["blobs", "captures", "store_meta"] {
+        for expected in ["blobs", "capture_shares", "captures", "store_meta"] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
         assert_eq!(migrate(&mut conn, MIGRATIONS).expect("again"), version);

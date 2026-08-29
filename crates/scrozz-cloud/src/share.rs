@@ -3,6 +3,7 @@
 use std::{
     fmt,
     net::IpAddr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,16 +18,41 @@ use crate::{
     config::{Branding, ConfigOverrides, ShareConfig},
     credentials::Credentials,
     digest::sha256,
-    encoding::{hex_lower, normalise_prefix, public_url},
+    encoding::{canonical_query, hex_lower, normalise_prefix, public_url},
     error::{Error, Result},
     lifecycle::{
         EXPIRY_TAG, Expiry, ObjectTag, expiry_prefix, lifecycle_prefix_rule_xml,
         lifecycle_rule_xml, lifecycle_versioned_prefix_rule_xml, tag_header,
     },
+    provider::ObjectTarget,
     redact::Secret,
-    sigv4::{AmzDate, presign_get, sign_headers},
+    sigv4::{AmzDate, presign_get, sign_headers_with_query},
     transport::{CancellationToken, HttpRequest, RetryPolicy, Transport, execute_with_retry},
 };
+
+/// Maximum source object accepted by Scrozz's bounded in-memory sharing API.
+pub const MAX_SHARE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Browser viewers embed ciphertext, so password shares use a tighter bound.
+pub const MAX_PASSWORD_SHARE_BYTES: u64 = 256 * 1024 * 1024;
+const MULTIPART_THRESHOLD: usize = 16 * 1024 * 1024;
+const MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: usize = 10_000;
+
+/// Time source used for request signatures and exact link expiry.
+pub trait Clock: Send + Sync {
+    /// Current wall-clock time.
+    fn now(&self) -> SystemTime;
+}
+
+/// Operating-system wall clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
 
 /// How this invocation chooses its link lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,6 +119,8 @@ pub struct ShareResult {
     pub lifecycle_rule: Option<String>,
     /// Whether only ciphertext left the machine.
     pub encrypted: bool,
+    /// Configured and per-share user tags, excluding Scrozz's reserved expiry tag.
+    pub tags: Vec<ObjectTag>,
 }
 
 impl fmt::Debug for ShareResult {
@@ -105,6 +133,7 @@ impl fmt::Debug for ShareResult {
             .field("expires_at", &self.expires_at)
             .field("lifecycle_rule", &self.lifecycle_rule)
             .field("encrypted", &self.encrypted)
+            .field("tags", &self.tags)
             .finish()
     }
 }
@@ -116,6 +145,7 @@ pub struct ShareClient<T> {
     transport: T,
     retry: RetryPolicy,
     cancellation: CancellationToken,
+    clock: Arc<dyn Clock>,
 }
 
 impl<T: fmt::Debug> fmt::Debug for ShareClient<T> {
@@ -126,6 +156,7 @@ impl<T: fmt::Debug> fmt::Debug for ShareClient<T> {
             .field("transport", &self.transport)
             .field("retry", &self.retry)
             .field("cancellation", &self.cancellation)
+            .field("clock", &"[CLOCK]")
             .finish()
     }
 }
@@ -140,6 +171,7 @@ impl<T: Transport> ShareClient<T> {
             transport,
             retry: RetryPolicy::default(),
             cancellation: CancellationToken::default(),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -157,10 +189,35 @@ impl<T: Transport> ShareClient<T> {
         self
     }
 
+    /// Replaces the wall clock for deterministic signing and tests.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
     /// Public non-secret configuration.
     #[must_use]
     pub fn config(&self) -> &ShareConfig {
         &self.config
+    }
+
+    /// Performs a signed, read-only `HeadBucket` request.
+    ///
+    /// This validates endpoint reachability, credentials, region, and bucket
+    /// access without creating or deleting an object.
+    pub fn test_connection(&self) -> Result<()> {
+        let target = self.config.provider.bucket_target(&self.config.bucket)?;
+        self.execute_signed(
+            "HEAD",
+            &target,
+            &[],
+            vec![("host".to_owned(), target.host.clone())],
+            Vec::new(),
+            self.retry,
+            &self.cancellation,
+        )
+        .map(|_| ())
     }
 
     /// Encrypts when requested, tags and signs the PUT, sends it with retries,
@@ -181,23 +238,9 @@ impl<T: Transport> ShareClient<T> {
         input: ShareInput<'_>,
         options: ShareOptions,
     ) -> Result<ShareResult> {
-        if input.bytes.is_empty() {
-            return Err(Error::Config("cannot share an empty capture".to_owned()));
-        }
-        if input.content_type.trim().is_empty() {
-            return Err(Error::Config(
-                "a shared object needs a content type".to_owned(),
-            ));
-        }
-        if input
-            .content_type
-            .bytes()
-            .any(|byte| byte.is_ascii_control())
-        {
-            return Err(Error::Config(
-                "a shared object content type must not contain control characters".to_owned(),
-            ));
-        }
+        let password_protected = options.password.is_some();
+        validate_source_length(input.bytes.len(), password_protected)?;
+        validate_content_type(input.content_type)?;
         let expiry = match options.expiry {
             ExpiryPolicy::Configured => self.config.default_expiry,
             ExpiryPolicy::Never => None,
@@ -217,6 +260,7 @@ impl<T: Transport> ShareClient<T> {
                 "{EXPIRY_TAG:?} is reserved for Scrozz lifecycle expiry"
             )));
         }
+        let result_tags = tags.clone();
         if let Some(expiry) = expiry
             && supports_tags
         {
@@ -272,41 +316,22 @@ impl<T: Transport> ShareClient<T> {
                 false,
             ),
         };
+        if bytes.len() as u64 > MAX_SHARE_BYTES {
+            return Err(Error::Config(format!(
+                "the prepared share is {} bytes; the maximum is {MAX_SHARE_BYTES}",
+                bytes.len()
+            )));
+        }
 
         let target = self.config.provider.object_target(bucket, &key)?;
-        let put_timestamp = AmzDate::from_system_time(SystemTime::now())?;
-        let payload_hash = hex_lower(&sha256(&bytes));
-        let mut headers = vec![
-            ("host".to_owned(), target.host.clone()),
-            ("content-type".to_owned(), content_type),
-        ];
-        if let Some(value) = tagging {
-            headers.push(("x-amz-tagging".to_owned(), value));
-        }
-        let signed = sign_headers(
-            &self.credentials,
-            "PUT",
-            &target.canonical_uri,
-            &self.config.provider.region,
-            &put_timestamp,
-            &payload_hash,
-            headers,
-        )?;
-        execute_with_retry(
-            &self.transport,
-            &HttpRequest {
-                method: "PUT".to_owned(),
-                url: target.url.clone(),
-                headers: signed.headers,
-                body: bytes,
-            },
-            self.retry,
-            &self.cancellation,
-        )?;
+        let response = self.upload_object(&target, bytes, content_type, tagging)?;
 
         let (url, expires_at) = match expiry {
             Some(expiry) => {
-                let signing_time = SystemTime::now();
+                let signing_time = response
+                    .header("date")
+                    .and_then(|value| httpdate::parse_http_date(value).ok())
+                    .unwrap_or_else(|| self.clock.now());
                 let link_timestamp = AmzDate::from_system_time(signing_time)?;
                 let signed_second = signing_time
                     .duration_since(UNIX_EPOCH)
@@ -356,8 +381,309 @@ impl<T: Transport> ShareClient<T> {
                 }
             }),
             encrypted,
+            tags: result_tags,
         })
     }
+
+    fn upload_object(
+        &self,
+        target: &ObjectTarget,
+        bytes: Vec<u8>,
+        content_type: String,
+        tagging: Option<String>,
+    ) -> Result<crate::transport::HttpResponse> {
+        if bytes.len() >= MULTIPART_THRESHOLD {
+            self.multipart_upload(target, bytes, content_type, tagging)
+        } else {
+            let digest = hex_lower(&sha256(&bytes));
+            let mut headers = vec![
+                ("host".to_owned(), target.host.clone()),
+                ("content-type".to_owned(), content_type),
+                ("x-amz-meta-scrozz-sha256".to_owned(), digest),
+            ];
+            if let Some(tagging) = tagging {
+                headers.push(("x-amz-tagging".to_owned(), tagging));
+            }
+            self.execute_signed(
+                "PUT",
+                target,
+                &[],
+                headers,
+                bytes,
+                self.retry,
+                &self.cancellation,
+            )
+        }
+    }
+
+    fn multipart_upload(
+        &self,
+        target: &ObjectTarget,
+        bytes: Vec<u8>,
+        content_type: String,
+        tagging: Option<String>,
+    ) -> Result<crate::transport::HttpResponse> {
+        let parts = bytes.len().div_ceil(MULTIPART_PART_BYTES);
+        if parts == 0 || parts > MAX_MULTIPART_PARTS {
+            return Err(Error::Config(format!(
+                "the upload needs {parts} multipart chunks; S3 accepts at most {MAX_MULTIPART_PARTS}"
+            )));
+        }
+        let digest = hex_lower(&sha256(&bytes));
+        let mut headers = vec![
+            ("host".to_owned(), target.host.clone()),
+            ("content-type".to_owned(), content_type),
+            ("x-amz-meta-scrozz-sha256".to_owned(), digest),
+        ];
+        if let Some(tagging) = tagging {
+            headers.push(("x-amz-tagging".to_owned(), tagging));
+        }
+        // CreateMultipartUpload is not idempotent: retrying after a lost
+        // response can orphan a second upload id. Parts and cleanup are retried;
+        // creation itself is deliberately attempted once.
+        let initiated = self.execute_signed(
+            "POST",
+            target,
+            &[("uploads".to_owned(), String::new())],
+            headers,
+            Vec::new(),
+            RetryPolicy {
+                max_attempts: 1,
+                ..self.retry
+            },
+            &self.cancellation,
+        )?;
+        let upload_id = xml_text(&initiated.body, "UploadId")?;
+
+        let completed = (|| -> Result<crate::transport::HttpResponse> {
+            let mut etags = Vec::with_capacity(parts);
+            for (index, part) in bytes.chunks(MULTIPART_PART_BYTES).enumerate() {
+                if self.cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                let number = index + 1;
+                let response = self.execute_signed(
+                    "PUT",
+                    target,
+                    &[
+                        ("partNumber".to_owned(), number.to_string()),
+                        ("uploadId".to_owned(), upload_id.clone()),
+                    ],
+                    vec![("host".to_owned(), target.host.clone())],
+                    part.to_vec(),
+                    self.retry,
+                    &self.cancellation,
+                )?;
+                let etag = response.header("etag").ok_or_else(|| {
+                    Error::Transport(format!(
+                        "the provider omitted ETag for multipart chunk {number}"
+                    ))
+                })?;
+                if etag.is_empty()
+                    || etag.len() > 256
+                    || etag.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    return Err(Error::Transport(format!(
+                        "the provider returned an invalid ETag for multipart chunk {number}"
+                    )));
+                }
+                etags.push(etag.to_owned());
+            }
+            let mut complete = String::from("<CompleteMultipartUpload>");
+            for (index, etag) in etags.iter().enumerate() {
+                complete.push_str("<Part><PartNumber>");
+                complete.push_str(&(index + 1).to_string());
+                complete.push_str("</PartNumber><ETag>");
+                complete.push_str(&xml_escape(etag));
+                complete.push_str("</ETag></Part>");
+            }
+            complete.push_str("</CompleteMultipartUpload>");
+            let response = self.execute_signed(
+                "POST",
+                target,
+                &[("uploadId".to_owned(), upload_id.clone())],
+                vec![
+                    ("host".to_owned(), target.host.clone()),
+                    ("content-type".to_owned(), "application/xml".to_owned()),
+                ],
+                complete.into_bytes(),
+                RetryPolicy {
+                    max_attempts: 1,
+                    ..self.retry
+                },
+                &self.cancellation,
+            )?;
+            validate_multipart_completion(&response)?;
+            Ok(response)
+        })();
+
+        match completed {
+            Ok(response) => Ok(response),
+            Err(error) => match self.abort_multipart(target, &upload_id) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(Error::Transport(format!(
+                    "{error}; aborting the incomplete multipart upload also failed: {cleanup}"
+                ))),
+            },
+        }
+    }
+
+    fn abort_multipart(&self, target: &ObjectTarget, upload_id: &str) -> Result<()> {
+        let cleanup_cancellation = CancellationToken::default();
+        self.execute_signed(
+            "DELETE",
+            target,
+            &[("uploadId".to_owned(), upload_id.to_owned())],
+            vec![("host".to_owned(), target.host.clone())],
+            Vec::new(),
+            RetryPolicy {
+                max_attempts: 2,
+                ..self.retry
+            },
+            &cleanup_cancellation,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_signed(
+        &self,
+        method: &str,
+        target: &ObjectTarget,
+        query: &[(String, String)],
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        retry: RetryPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::transport::HttpResponse> {
+        let canonical_query = canonical_query(query);
+        let timestamp = AmzDate::from_system_time(self.clock.now())?;
+        let payload_hash = hex_lower(&sha256(&body));
+        let signed = sign_headers_with_query(
+            &self.credentials,
+            method,
+            &target.canonical_uri,
+            &canonical_query,
+            &self.config.provider.region,
+            &timestamp,
+            &payload_hash,
+            headers,
+        )?;
+        let url = if canonical_query.is_empty() {
+            target.url.clone()
+        } else {
+            format!("{}?{canonical_query}", target.url)
+        };
+        execute_with_retry(
+            &self.transport,
+            &HttpRequest {
+                method: method.to_owned(),
+                url,
+                headers: signed.headers,
+                body,
+            },
+            retry,
+            cancellation,
+        )
+    }
+}
+
+fn validate_source_length(length: usize, password_protected: bool) -> Result<()> {
+    if length == 0 {
+        return Err(Error::Config("cannot share an empty capture".to_owned()));
+    }
+    let maximum = if password_protected {
+        MAX_PASSWORD_SHARE_BYTES
+    } else {
+        MAX_SHARE_BYTES
+    };
+    if length as u64 > maximum {
+        let mode = if password_protected {
+            "password-protected share"
+        } else {
+            "share"
+        };
+        return Err(Error::Config(format!(
+            "the {mode} source is {length} bytes; the maximum is {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_content_type(content_type: &str) -> Result<()> {
+    const ARTIFACT_TYPES: &[&str] = &[
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "video/x-matroska",
+    ];
+    if !ARTIFACT_TYPES.contains(&content_type) {
+        return Err(Error::Config(format!(
+            "unsupported artifact content type {content_type:?}; use PNG, JPEG, WebP, MP4, MOV, WebM or Matroska"
+        )));
+    }
+    Ok(())
+}
+
+fn xml_text(body: &[u8], element: &str) -> Result<String> {
+    let text = std::str::from_utf8(body).map_err(|_| {
+        Error::Transport(format!(
+            "the provider returned non-UTF-8 XML for multipart {element}"
+        ))
+    })?;
+    let opening = format!("<{element}>");
+    let closing = format!("</{element}>");
+    let start = text.find(&opening).map(|offset| offset + opening.len());
+    let value = start
+        .and_then(|start| {
+            text[start..]
+                .find(&closing)
+                .map(|end| &text[start..start + end])
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::Transport(format!("the provider response omitted multipart {element}"))
+        })?;
+    Ok(xml_unescape(value))
+}
+
+fn validate_multipart_completion(response: &crate::transport::HttpResponse) -> Result<()> {
+    let text = std::str::from_utf8(&response.body).map_err(|_| {
+        Error::Transport("the multipart completion response was not UTF-8 XML".to_owned())
+    })?;
+    if text.contains("<Error>") || text.contains("<ErrorResult") {
+        return Err(Error::Transport(
+            "the provider returned an error document while completing the multipart upload"
+                .to_owned(),
+        ));
+    }
+    if !text.contains("<CompleteMultipartUploadResult") {
+        return Err(Error::Transport(
+            "the provider did not confirm multipart completion".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 impl<T: Transport> S3Uploader for ShareClient<T> {
@@ -441,9 +767,16 @@ fn viewer_key(key: &str) -> String {
 
 /// Adds a cryptographically random suffix while preserving a file extension.
 pub fn unique_object_key(file_name: &str) -> Result<String> {
-    if file_name.is_empty() {
+    if file_name.is_empty()
+        || file_name.len() > 255
+        || matches!(file_name, "." | "..")
+        || file_name
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'/' | b'\\'))
+    {
         return Err(Error::Config(
-            "a generated object key needs a nonempty file name".to_owned(),
+            "a generated object key needs a 1 to 255 byte file name without controls or path separators"
+                .to_owned(),
         ));
     }
     let mut random = [0u8; 16];
@@ -505,7 +838,20 @@ mod tests {
             self.requests.lock().unwrap().push(request.clone());
             Ok(HttpResponse {
                 status: 200,
-                body: Vec::new(),
+                headers: if request.url.contains("partNumber=") {
+                    vec![("etag".to_owned(), "\"part-etag\"".to_owned())]
+                } else {
+                    Vec::new()
+                },
+                body: if request.method == "POST" && request.url.contains("uploads=") {
+                    b"<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
+                        .to_vec()
+                } else if request.method == "POST" && request.url.contains("uploadId=") {
+                    b"<CompleteMultipartUploadResult><Key>recording.mp4</Key></CompleteMultipartUploadResult>"
+                        .to_vec()
+                } else {
+                    Vec::new()
+                },
             })
         }
     }
@@ -720,6 +1066,283 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("Screenshot-"));
         assert!(first.ends_with(".png"));
+        assert!(unique_object_key("../capture.png").is_err());
+        assert!(unique_object_key("folder/capture.png").is_err());
+    }
+
+    #[test]
+    fn connection_test_is_a_signed_read_only_head_request() {
+        let client = ShareClient::new(config(), credentials(), RecordingTransport::default());
+        client.test_connection().unwrap();
+        let requests = client.transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "HEAD");
+        assert!(requests[0].body.is_empty());
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization"
+                    && value.starts_with("AWS4-HMAC-SHA256"))
+        );
+    }
+
+    #[test]
+    fn large_objects_use_retryable_parts_and_complete_once() {
+        let client = ShareClient::new(config(), credentials(), RecordingTransport::default())
+            .with_retry_policy(RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            });
+        let bytes = vec![7; MULTIPART_THRESHOLD];
+        client
+            .share(
+                ShareInput {
+                    bytes: &bytes,
+                    content_type: "video/mp4",
+                    key: "recording.mp4",
+                },
+                ShareOptions::default(),
+            )
+            .unwrap();
+        let requests = client.transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].method, "POST");
+        assert!(requests[0].url.ends_with("?uploads="));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.contains("partNumber="))
+                .count(),
+            2
+        );
+        let complete = requests.last().unwrap();
+        assert_eq!(complete.method, "POST");
+        assert!(complete.url.contains("uploadId=upload-1"));
+        let body = String::from_utf8_lossy(&complete.body);
+        assert!(body.contains("<PartNumber>1</PartNumber>"), "{body}");
+        assert!(body.contains("&quot;part-etag&quot;"), "{body}");
+    }
+
+    #[derive(Debug, Default)]
+    struct CancellingMultipartTransport {
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl Transport for CancellingMultipartTransport {
+        fn send(
+            &self,
+            request: &HttpRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<HttpResponse> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", request.method, request.url));
+            if request.method == "POST" && request.url.contains("uploads=") {
+                return Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"<UploadId>cancel-me</UploadId>".to_vec(),
+                });
+            }
+            if request.method == "PUT" && request.url.contains("partNumber=") {
+                cancellation.cancel();
+                return Ok(HttpResponse {
+                    status: 503,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                });
+            }
+            Ok(HttpResponse {
+                status: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn cancellation_aborts_an_incomplete_multipart_upload() {
+        let transport = CancellingMultipartTransport::default();
+        let token = CancellationToken::default();
+        let client = ShareClient::new(config(), credentials(), transport)
+            .with_cancellation(token)
+            .with_retry_policy(RetryPolicy {
+                max_attempts: 2,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            });
+        let bytes = vec![9; MULTIPART_THRESHOLD];
+        let result = client.share(
+            ShareInput {
+                bytes: &bytes,
+                content_type: "video/mp4",
+                key: "cancel.mp4",
+            },
+            ShareOptions::default(),
+        );
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        let requests = client.transport.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("DELETE ")
+                    && request.contains("uploadId=cancel-me")),
+            "{requests:?}"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct CompletionErrorTransport {
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl Transport for CompletionErrorTransport {
+        fn send(
+            &self,
+            request: &HttpRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<HttpResponse> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", request.method, request.url));
+            let (status, headers, body) =
+                if request.method == "POST" && request.url.contains("uploads=") {
+                    (
+                        200,
+                        Vec::new(),
+                        b"<UploadId>error-at-complete</UploadId>".to_vec(),
+                    )
+                } else if request.method == "PUT" && request.url.contains("partNumber=") {
+                    (
+                        200,
+                        vec![("etag".to_owned(), "\"part-etag\"".to_owned())],
+                        Vec::new(),
+                    )
+                } else if request.method == "POST" && request.url.contains("uploadId=") {
+                    (
+                        200,
+                        Vec::new(),
+                        b"<Error><Code>InternalError</Code></Error>".to_vec(),
+                    )
+                } else {
+                    (204, Vec::new(), Vec::new())
+                };
+            Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            })
+        }
+    }
+
+    #[test]
+    fn http_200_completion_error_is_aborted_not_reported_as_a_share() {
+        let transport = CompletionErrorTransport::default();
+        let client =
+            ShareClient::new(config(), credentials(), transport).with_retry_policy(RetryPolicy {
+                max_attempts: 1,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            });
+        let bytes = vec![3; MULTIPART_THRESHOLD];
+        let error = client
+            .share(
+                ShareInput {
+                    bytes: &bytes,
+                    content_type: "video/mp4",
+                    key: "complete-error.mp4",
+                },
+                ShareOptions::default(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("error document"), "{error}");
+        let requests = client.transport.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| request.starts_with("DELETE ")
+                && request.contains("uploadId=error-at-complete")),
+            "{requests:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FixedClock(SystemTime);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> SystemTime {
+            self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct DatedTransport;
+
+    impl Transport for DatedTransport {
+        fn send(
+            &self,
+            _request: &HttpRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![(
+                    "date".to_owned(),
+                    "Mon, 01 Jan 2024 00:00:00 GMT".to_owned(),
+                )],
+                body: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn provider_date_anchors_the_exact_presigned_expiry() {
+        let local = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let provider = httpdate::parse_http_date("Mon, 01 Jan 2024 00:00:00 GMT").unwrap();
+        let client =
+            ShareClient::new(config(), credentials(), DatedTransport).with_clock(FixedClock(local));
+        let result = client
+            .share(
+                ShareInput {
+                    bytes: b"x",
+                    content_type: "image/png",
+                    key: "clock.png",
+                },
+                ShareOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.expires_at,
+            Some(provider + Duration::from_secs(86_400))
+        );
+        assert!(result.url.contains("X-Amz-Date=20240101T000000Z"));
+    }
+
+    #[test]
+    fn source_bounds_and_media_types_fail_before_transport() {
+        assert!(validate_source_length(0, false).is_err());
+        assert!(validate_source_length((MAX_SHARE_BYTES + 1) as usize, false).is_err());
+        assert!(validate_source_length((MAX_PASSWORD_SHARE_BYTES + 1) as usize, true).is_err());
+        assert!(validate_content_type("application/octet-stream").is_err());
+    }
+
+    #[test]
+    fn multipart_completion_rejects_s3_error_documents_with_http_200() {
+        let response = HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"<Error><Code>InternalError</Code></Error>".to_vec(),
+        };
+        let error = validate_multipart_completion(&response).unwrap_err();
+        assert!(error.to_string().contains("error document"), "{error}");
+
+        let missing = HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(validate_multipart_completion(&missing).is_err());
     }
 
     #[test]

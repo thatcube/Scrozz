@@ -17,6 +17,7 @@ egui.workspace = true
 eframe.workspace = true
 image.workspace = true
 resvg.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

@@ -524,27 +524,43 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 // ---------------------------------------------------------------------------
 
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
+    let store = settings::SettingsStore::default_location()?;
     match command {
-        SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json())]),
-            settings::all_human(),
-        )),
+        SettingsCommand::Get { key: None } => {
+            let values = store.load()?;
+            Ok(Report::new(
+                Json::obj([("settings", settings::all_json_from(&values))]),
+                settings::all_human_from(&values),
+            ))
+        }
 
         SettingsCommand::Get { key: Some(key) } => {
             let setting = settings::lookup(key)?;
-            Ok(Report::new(setting.to_json(), setting.default.to_string()))
+            let values = store.load()?;
+            let value = values.value(key).unwrap_or(setting.default);
+            let source = if values.is_user_set(key) {
+                "user"
+            } else {
+                "default"
+            };
+            Ok(Report::new(
+                setting.to_json_with(value, source),
+                value.to_owned(),
+            ))
         }
 
         SettingsCommand::Set { key, value } => {
-            // Validate first and completely. A rejected value must be rejected
-            // for the right reason: "that is not a format" is useful, "settings
-            // are not implemented" is not, and the user needs to hear the first
-            // one even while the second is true.
             let setting = settings::lookup(key)?;
             setting.validate(value)?;
-            Err(CliError::not_implemented(
-                format!("saving {key}"),
-                "scrozz-store (settings persistence)",
+            let values = store.update(|settings| settings.set(key, value))?;
+            let effective = values.value(key).unwrap_or(setting.default);
+            Ok(Report::new(
+                Json::obj([
+                    ("key", Json::str(key.as_str())),
+                    ("value", Json::str(effective)),
+                    ("source", Json::str("user")),
+                ]),
+                format!("{key} = {effective}"),
             ))
         }
     }
@@ -969,18 +985,23 @@ mod tests {
 
     #[test]
     fn a_bad_value_is_rejected_for_being_bad_not_for_being_unimplemented() {
-        // The distinction that matters: the user must learn about their mistake
-        // even though persistence is missing.
+        // Invalid values must never reach the persistent document.
         let err = run(&["scrozz", "settings", "set", "capture.format", "gif"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("png"), "{err}");
     }
 
     #[test]
-    fn a_good_value_reports_the_missing_persistence() {
-        let err = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap_err();
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("capture.format"), "{err}");
+    fn a_good_value_is_persistable() {
+        let root =
+            std::env::temp_dir().join(format!("scrozz-command-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = settings::SettingsStore::new(root.join("settings.json"));
+        let updated = store
+            .update(|settings| settings.set("capture.format", "webp"))
+            .unwrap();
+        assert_eq!(updated.value("capture.format"), Some("webp"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // -- hotkey ------------------------------------------------------------

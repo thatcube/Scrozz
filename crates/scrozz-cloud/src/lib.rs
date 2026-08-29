@@ -18,6 +18,7 @@ pub mod redact;
 pub mod share;
 pub mod sigv4;
 pub mod transport;
+pub mod vault;
 
 pub use bundle::{EncryptedPayload, encrypt, render_viewer};
 pub use config::{Branding, ConfigOverrides, ShareConfig};
@@ -33,9 +34,11 @@ pub use lifecycle::{
 pub use provider::{AddressingStyle, ObjectTarget, ProviderConfig, ProviderKind};
 pub use redact::Secret;
 pub use share::{
-    ExpiryPolicy, ShareClient, ShareInput, ShareOptions, ShareResult, client_from_environment,
-    client_from_environment_lazy, unique_object_key,
+    Clock, ExpiryPolicy, MAX_PASSWORD_SHARE_BYTES, MAX_SHARE_BYTES, ShareClient, ShareInput,
+    ShareOptions, ShareResult, SystemClock, client_from_environment, client_from_environment_lazy,
+    unique_object_key,
 };
 #[cfg(feature = "network")]
 pub use transport::UreqTransport;
 pub use transport::{CancellationToken, HttpRequest, HttpResponse, RetryPolicy, Transport};
+pub use vault::{NativeCredentialVault, VaultBackend, VaultBundle, VaultStatus};

@@ -1,5 +1,7 @@
 //! An injectable HTTP transport with bounded retries and cancellation.
 
+#[cfg(feature = "network")]
+use std::net::IpAddr;
 use std::{
     fmt,
     sync::{
@@ -45,20 +47,50 @@ impl fmt::Debug for HttpRequest {
             .collect::<Vec<_>>();
         f.debug_struct("HttpRequest")
             .field("method", &self.method)
-            .field("url", &self.url)
+            .field("url", &redact_url_query(&self.url))
             .field("headers", &headers)
             .field("body_bytes", &self.body.len())
             .finish()
     }
 }
 
-/// The status and bounded response body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The status, response headers, and bounded response body.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     /// HTTP status.
     pub status: u16,
+    /// Lowercase response headers. Values are never logged.
+    pub headers: Vec<(String, String)>,
     /// Response body, when retained.
     pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Finds one response header case-insensitively.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 /// An HTTP implementation. The default crate has only this seam, no client.
@@ -178,7 +210,11 @@ impl UreqTransport {
             .proxy(None)
             .build();
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::with_parts(
+                config,
+                ureq::unversioned::transport::DefaultConnector::default(),
+                SafeResolver,
+            ),
         }
     }
 }
@@ -200,35 +236,138 @@ impl Transport for UreqTransport {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let mut builder = match request.method.as_str() {
-            "PUT" => self.agent.put(&request.url),
+        let response = match request.method.as_str() {
+            "DELETE" => {
+                let mut builder = self.agent.delete(&request.url);
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                builder.call()
+            }
+            "HEAD" => {
+                let mut builder = self.agent.head(&request.url);
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                builder.call()
+            }
+            "POST" => {
+                let mut builder = self.agent.post(&request.url);
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                builder.send(request.body.as_slice())
+            }
+            "PUT" => {
+                let mut builder = self.agent.put(&request.url);
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                builder.send(request.body.as_slice())
+            }
             other => {
                 return Err(Error::Config(format!(
                     "the cloud transport does not send {other} requests"
                 )));
             }
         };
-        for (name, value) in &request.headers {
-            builder = builder.header(name, value);
-        }
-        match builder.send(request.body.as_slice()) {
-            Ok(response) => Ok(HttpResponse {
-                status: response.status().as_u16(),
-                body: Vec::new(),
-            }),
+        match response {
+            Ok(mut response) => {
+                const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+                let status = response.status().as_u16();
+                let headers = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+                    })
+                    .collect();
+                let body = response
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_RESPONSE_BYTES)
+                    .read_to_vec()
+                    .map_err(|error| {
+                        Error::Transport(format!(
+                            "the provider response exceeded 64 KiB or could not be read: {error}"
+                        ))
+                    })?;
+                Ok(HttpResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            }
             Err(ureq::Error::StatusCode(status)) => Ok(HttpResponse {
                 status,
+                headers: Vec::new(),
                 body: Vec::new(),
             }),
             Err(error) => {
                 let mut diagnostic = error.to_string();
+                if url_has_query(&request.url) {
+                    diagnostic = diagnostic.replace(&request.url, &redact_url_query(&request.url));
+                }
                 for (name, value) in &request.headers {
                     if sensitive_header(name) && !value.is_empty() {
                         diagnostic = diagnostic.replace(value, "[REDACTED]");
                     }
                 }
+
                 Err(Error::Transport(diagnostic))
             }
+        }
+    }
+}
+
+fn url_has_query(url: &str) -> bool {
+    url.contains('?')
+}
+
+fn redact_url_query(url: &str) -> String {
+    url.split_once('?')
+        .map_or_else(|| url.to_owned(), |(base, _)| format!("{base}?[REDACTED]"))
+}
+
+#[cfg(feature = "network")]
+#[derive(Debug, Clone, Copy, Default)]
+struct SafeResolver;
+
+#[cfg(feature = "network")]
+impl ureq::unversioned::resolver::Resolver for SafeResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        use ureq::unversioned::resolver::DefaultResolver;
+
+        let resolved = DefaultResolver::default().resolve(uri, config, timeout)?;
+        if resolved
+            .iter()
+            .any(|address| forbidden_destination(address.ip()))
+        {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(resolved)
+    }
+}
+
+#[cfg(feature = "network")]
+fn forbidden_destination(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified()
+                || address.is_multicast()
+                || address.is_link_local()
+                || address.is_broadcast()
+        }
+        IpAddr::V6(address) => {
+            address.is_unspecified() || address.is_multicast() || address.is_unicast_link_local()
         }
     }
 }
@@ -254,6 +393,7 @@ mod tests {
             *self.calls.lock().unwrap() += 1;
             Ok(HttpResponse {
                 status: self.statuses.lock().unwrap().pop_front().unwrap_or(200),
+                headers: Vec::new(),
                 body: Vec::new(),
             })
         }
@@ -330,5 +470,28 @@ mod tests {
     fn network_transport_never_inherits_an_ambient_proxy() {
         let transport = UreqTransport::default();
         assert!(transport.agent.config().proxy().is_none());
+    }
+
+    #[test]
+    fn response_debug_never_prints_header_values_or_body() {
+        let response = HttpResponse {
+            status: 200,
+            headers: vec![("x-provider".into(), "credential-secret".into())],
+            body: b"secret response bytes".to_vec(),
+        };
+        let rendered = format!("{response:?}");
+        assert!(!rendered.contains("credential-secret"), "{rendered}");
+        assert!(!rendered.contains("secret response bytes"), "{rendered}");
+        assert!(rendered.contains("x-provider"), "{rendered}");
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn metadata_and_unspecified_destinations_are_blocked() {
+        assert!(forbidden_destination("169.254.169.254".parse().unwrap()));
+        assert!(forbidden_destination("0.0.0.0".parse().unwrap()));
+        assert!(forbidden_destination("fe80::1".parse().unwrap()));
+        assert!(!forbidden_destination("127.0.0.1".parse().unwrap()));
+        assert!(!forbidden_destination("10.0.0.2".parse().unwrap()));
     }
 }

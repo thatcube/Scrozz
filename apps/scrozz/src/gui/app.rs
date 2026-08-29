@@ -23,7 +23,11 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    sync::mpsc::{Receiver, channel},
+    time::{Duration, Instant},
+};
 
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
@@ -90,6 +94,8 @@ pub struct Config {
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
     pub capture_on_start: Option<CaptureKind>,
+    /// Whether construction must avoid every external service.
+    sealed: bool,
 }
 
 impl Default for Config {
@@ -103,6 +109,7 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
+            sealed: false,
         }
     }
 }
@@ -153,6 +160,7 @@ impl Config {
             ipc: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
+            sealed: true,
         }
     }
 }
@@ -190,6 +198,10 @@ pub struct App {
     started: Instant,
     captures: u64,
     notes: Vec<String>,
+    cloud_settings: scrozz_ui::CloudSettingsModel,
+    settings_open_requested: bool,
+    connection_test: Option<Receiver<CliResult<()>>>,
+    visible_cards: BTreeSet<crate::gui::card::CardId>,
 }
 
 impl App {
@@ -259,6 +271,17 @@ impl App {
                 Err(err) => notes.push(format!("{accelerator} not bound: {err}")),
             }
         }
+        let cloud_settings = if config.sealed {
+            crate::cloud::sealed_settings_model()
+        } else {
+            match crate::cloud::settings_model(scrozz_ui::CloudConnectionState::Idle) {
+                Ok(model) => model,
+                Err(error) => {
+                    notes.push(format!("sharing settings are unavailable: {error}"));
+                    crate::cloud::settings_error_model(error.to_string())
+                }
+            }
+        };
 
         let mut app = Self {
             config,
@@ -270,6 +293,10 @@ impl App {
             started: Instant::now(),
             captures: 0,
             notes,
+            cloud_settings,
+            settings_open_requested: false,
+            connection_test: None,
+            visible_cards: BTreeSet::new(),
         };
 
         if let Some(kind) = app.config.capture_on_start {
@@ -298,6 +325,7 @@ impl App {
             return Tick::Stop;
         }
         self.drain_pipeline();
+        self.drain_connection_test();
         self.drain_cards();
 
         Tick::Continue
@@ -383,12 +411,16 @@ impl App {
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
-                Outcome::Ready(card) => {
+                Outcome::Ready(mut card) => {
                     self.captures += 1;
+                    card.upload_available = self.cloud_settings.upload_enabled;
+                    card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
                     let summary = card.summary();
+                    let id = card.id;
                     if let Err(err) = self.surface.present(*card) {
                         self.note(format!("a card could not be shown: {err}"));
                     } else {
+                        self.visible_cards.insert(id);
                         self.note(summary);
                     }
                 }
@@ -396,12 +428,16 @@ impl App {
                     self.note(format!("{card} failed: {error}"));
                 }
                 Outcome::Started { card, detail } => {
+                    self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                 }
                 Outcome::Done { card, detail } => {
+                    self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                 }
                 Outcome::Refused { card, error } => {
+                    self.surface
+                        .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} refused: {error}"));
                 }
             }
@@ -423,10 +459,23 @@ impl App {
                     self.pipeline.post(Job::Save(id));
                 }
                 CardEvent::Upload(id) => {
-                    self.pipeline.post(Job::Upload(id));
+                    self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    if self.cloud_settings.upload_enabled {
+                        self.surface.set_status(id, Some("Uploading...".to_owned()));
+                        self.pipeline.post(Job::Upload(id));
+                    } else {
+                        let reason = self
+                            .cloud_settings
+                            .unavailable_reason
+                            .clone()
+                            .unwrap_or_else(|| "sharing is unavailable".to_owned());
+                        self.surface.set_status(id, Some(reason.clone()));
+                        self.note(format!("{id} upload unavailable: {reason}"));
+                    }
                 }
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
+                    self.visible_cards.remove(&id);
                     // The bytes are only worth holding while a card can still
                     // ask for them.
                     self.pipeline.post(Job::Release(id));
@@ -463,7 +512,8 @@ impl App {
                 Tick::Continue
             }
             Action::OpenSettings => {
-                self.note("the settings window is not built yet");
+                self.settings_open_requested = true;
+                self.note("opening sharing settings");
                 Tick::Continue
             }
             Action::Quit => {
@@ -497,6 +547,149 @@ impl App {
         let what = what.into();
         tracing::info!("{what}");
         self.notes.push(what);
+    }
+
+    /// Takes a pending request to open or focus Settings.
+    pub fn take_settings_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_open_requested)
+    }
+
+    /// Current secret-free Settings model.
+    #[must_use]
+    pub fn cloud_settings(&self) -> &scrozz_ui::CloudSettingsModel {
+        &self.cloud_settings
+    }
+
+    /// Applies one Settings intent.
+    pub fn apply_cloud_settings(&mut self, event: scrozz_ui::CloudSettingsEvent) {
+        match event {
+            scrozz_ui::CloudSettingsEvent::Save(draft) => {
+                self.invalidate_connection_test();
+                match crate::cloud::save_settings(&draft) {
+                    Ok(()) => {
+                        self.note("sharing settings saved");
+                        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    }
+                    Err(error) => {
+                        self.note(format!("sharing settings were not saved: {error}"));
+                        self.cloud_settings.connection =
+                            scrozz_ui::CloudConnectionState::Failed(error.to_string());
+                    }
+                }
+            }
+            scrozz_ui::CloudSettingsEvent::StoreCredentials(credentials) => {
+                self.invalidate_connection_test();
+                let token = (!credentials.session_token.is_empty())
+                    .then_some(credentials.session_token.as_str());
+                let password = (!credentials.share_password.is_empty())
+                    .then_some(credentials.share_password.as_str());
+                match crate::cloud::store_credentials(
+                    &credentials.access_key_id,
+                    &credentials.secret_access_key,
+                    token,
+                    password,
+                ) {
+                    Ok(()) => {
+                        self.note("provider credentials stored in the native vault");
+                        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    }
+                    Err(error) => {
+                        self.note(format!("provider credentials were not stored: {error}"));
+                        self.cloud_settings.connection =
+                            scrozz_ui::CloudConnectionState::Failed(error.to_string());
+                    }
+                }
+            }
+            scrozz_ui::CloudSettingsEvent::RemoveCredentials => {
+                self.invalidate_connection_test();
+                match crate::cloud::remove_credentials() {
+                    Ok(_) => {
+                        self.note("provider credentials removed from the native vault");
+                        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    }
+                    Err(error) => {
+                        self.note(format!("provider credentials were not removed: {error}"));
+                        self.cloud_settings.connection =
+                            scrozz_ui::CloudConnectionState::Failed(error.to_string());
+                    }
+                }
+            }
+            scrozz_ui::CloudSettingsEvent::TestConnection => {
+                if self.connection_test.is_some() {
+                    return;
+                }
+                let (sender, receiver) = channel();
+                match std::thread::Builder::new()
+                    .name("scrozz-cloud-test".to_owned())
+                    .spawn(move || {
+                        let _ = sender.send(crate::cloud::test_connection());
+                    }) {
+                    Ok(_) => {
+                        self.connection_test = Some(receiver);
+                        self.cloud_settings.connection = scrozz_ui::CloudConnectionState::Testing;
+                    }
+                    Err(error) => {
+                        self.cloud_settings.connection = scrozz_ui::CloudConnectionState::Failed(
+                            format!("could not start the connection test: {error}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_connection_test(&mut self) {
+        let Some(receiver) = &self.connection_test else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                self.connection_test = None;
+                self.note("cloud connection test passed");
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Passed);
+            }
+
+            Ok(Err(error)) => {
+                self.connection_test = None;
+                self.note(format!("cloud connection test failed: {error}"));
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Failed(
+                    error.to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.connection_test = None;
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Failed(
+                    "the connection-test worker stopped without an answer".to_owned(),
+                ));
+            }
+        }
+    }
+
+    fn invalidate_connection_test(&mut self) {
+        self.connection_test = None;
+        if matches!(
+            self.cloud_settings.connection,
+            scrozz_ui::CloudConnectionState::Testing
+        ) {
+            self.cloud_settings.connection = scrozz_ui::CloudConnectionState::Idle;
+        }
+    }
+
+    fn refresh_cloud_settings(&mut self, connection: scrozz_ui::CloudConnectionState) {
+        match crate::cloud::settings_model(connection) {
+            Ok(model) => self.cloud_settings = model,
+            Err(error) => {
+                self.cloud_settings = crate::cloud::settings_error_model(error.to_string());
+            }
+        }
+        for id in self.visible_cards.iter().copied() {
+            self.surface.set_upload_availability(
+                id,
+                self.cloud_settings.upload_enabled,
+                self.cloud_settings.unavailable_reason.clone(),
+            );
+        }
     }
 
     /// How many cards are on screen.
@@ -636,17 +829,37 @@ mod tests {
     #[test]
     fn an_unwired_action_says_so_rather_than_doing_nothing() {
         let (mut app, _) = app();
-        for action in [
-            Action::ToggleRecording,
-            Action::OpenHistory,
-            Action::OpenSettings,
-        ] {
+        for action in [Action::ToggleRecording, Action::OpenHistory] {
             assert_eq!(app.perform(action), Tick::Continue);
         }
         let notes = app.notes().join("\n");
         assert!(notes.contains("recording is not wired up yet"), "{notes}");
         assert!(notes.contains("history window"), "{notes}");
-        assert!(notes.contains("settings window"), "{notes}");
+    }
+
+    #[test]
+    fn settings_action_requests_the_real_settings_viewport() {
+        let (mut app, _) = app();
+        assert!(!app.take_settings_open_request());
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
+        assert!(app.take_settings_open_request());
+        assert!(!app.take_settings_open_request());
+    }
+
+    #[test]
+    fn changing_settings_invalidates_an_inflight_connection_test() {
+        let (mut app, _) = app();
+        let (_sender, receiver) = channel();
+        app.connection_test = Some(receiver);
+        app.cloud_settings.connection = scrozz_ui::CloudConnectionState::Testing;
+
+        app.invalidate_connection_test();
+
+        assert!(app.connection_test.is_none());
+        assert!(matches!(
+            app.cloud_settings.connection,
+            scrozz_ui::CloudConnectionState::Idle
+        ));
     }
 
     #[test]
@@ -683,19 +896,17 @@ mod tests {
     }
 
     #[test]
-    fn uploading_a_card_reaches_the_worker_and_comes_back() {
+    fn uploading_is_blocked_when_the_backend_or_provider_is_unavailable() {
         let (mut app, surface) = app();
         surface.inject(CardEvent::Upload(CardId(43)));
         app.tick();
-
-        for _ in 0..200 {
-            app.drain_pipeline();
-            if app.notes().iter().any(|n| n.contains("card:43 refused")) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("the upload never reached the worker: {:?}", app.notes());
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("card:43 upload unavailable")),
+            "{:?}",
+            app.notes()
+        );
     }
 
     #[test]

@@ -137,8 +137,9 @@ cargo run -p scrozz -- settings get
 cargo run -p scrozz -- --help
 ```
 
-Private sharing is an optional build feature: it adds no account or Scrozz
-service, and uploads only to the S3-compatible endpoint you configure.
+Private sharing is a source-level optional feature and is enabled in distributed
+Scrozz binaries. It adds no account or Scrozz service, and uploads only to the
+S3-compatible endpoint you configure.
 
 ```bash
 export SCROZZ_S3_BUCKET=my-captures
@@ -151,9 +152,12 @@ AWS S3, Cloudflare R2, Backblaze B2 and MinIO presets are built in. Expiring
 private links, client-side password encryption, provider-compatible object
 organization and lifecycle deletion, tags where supported, and custom domains
 are documented in
-**[`docs/private-sharing.md`](docs/private-sharing.md)**. Credential secrets are
-accepted only from environment variables, a credential command's stdout, or
-stdin — never as command-line values or plaintext settings.
+**[`docs/private-sharing.md`](docs/private-sharing.md)**. The Settings window
+stores non-secret provider policy in its versioned settings document and puts
+credentials or an optional default share password only in macOS Keychain,
+Windows Credential Manager, or Linux Secret Service. Environment, credential
+command, and stdin sources remain available to scripts; secrets are never
+command-line values or plaintext settings.
 
 Commands that are not built yet say so and exit with a distinct status rather
 than pretending — `history`, for instance, currently reports that it is not
@@ -215,11 +219,12 @@ operating system. A capture leaves the machine only when you explicitly use the
 optional sharing feature, and then it goes only to the S3-compatible storage you
 configured.
 
-You can check that rather than believe it: the default build compiles no HTTP
-client. Building with `--features cloud` adds optional `ureq` networking for
-authenticated object-storage PUTs; redirects are disabled. `Cargo.lock` lists
-`ureq` because lockfiles include optional dependencies, so verify the compiled
-boundary with `cargo tree -p scrozz --no-default-features`.
+You can check that rather than believe it: the source default build compiles no
+HTTP client. Distributed packages deliberately build with `--features cloud`,
+which adds optional `ureq` networking for authenticated object-storage requests;
+redirects and ambient proxies are disabled. `Cargo.lock` lists optional
+dependencies either way, so verify the boundary with
+`cargo tree -p scrozz --no-default-features`.
 
 **Coding agents did assist with implementation.** Brandon Moore conceived Scrozz,
 researched it, designed the product and its visual identity, made every

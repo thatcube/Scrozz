@@ -14,7 +14,7 @@ use std::{
 };
 
 use scrozz_ui::{
-    OverlayHandle,
+    CloudSettingsWindow, OverlayHandle,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
 };
 
@@ -213,6 +213,7 @@ impl Host for Windowed {
                 Ok(Box::new(Driver {
                     app,
                     overlay,
+                    settings: CloudSettingsWindow::default(),
                     sink,
                     handle: reporting,
                     emit: Some(emit),
@@ -258,6 +259,7 @@ impl Host for Windowed {
 struct Driver {
     app: App,
     overlay: OverlayApp,
+    settings: CloudSettingsWindow,
     sink: Arc<Mutex<Option<Report>>>,
     handle: OverlayHandle,
     emit: Option<Emit>,
@@ -343,6 +345,9 @@ impl eframe::App for Driver {
     /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
+        if self.app.take_settings_open_request() {
+            self.settings.open(self.app.cloud_settings());
+        }
 
         if !self.stopped && self.app.tick() == Tick::Stop {
             self.stopped = true;
@@ -373,6 +378,10 @@ impl eframe::App for Driver {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.overlay.ui(ui, frame);
+        let model = self.app.cloud_settings().clone();
+        for event in self.settings.show(ui.ctx(), &model) {
+            self.app.apply_cloud_settings(event);
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

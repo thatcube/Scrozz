@@ -221,6 +221,10 @@ pub struct Card {
     pub written: Vec<String>,
     /// When the shutter fired.
     pub taken_at: SystemTime,
+    /// Whether the Upload action is currently usable.
+    pub upload_available: bool,
+    /// Explanation for a disabled Upload action.
+    pub upload_unavailable_reason: Option<String>,
 }
 
 impl Card {
@@ -237,6 +241,8 @@ impl Card {
             thumbnail: None,
             written: Vec::new(),
             taken_at: SystemTime::now(),
+            upload_available: false,
+            upload_unavailable_reason: Some("Sharing is not configured.".to_owned()),
         }
     }
 
@@ -341,6 +347,12 @@ pub trait CardSurface {
 
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
+
+    /// Shows or clears action status on a card.
+    fn set_status(&mut self, _id: CardId, _status: Option<String>) {}
+
+    /// Updates one card's Upload capability.
+    fn set_upload_availability(&mut self, _id: CardId, _enabled: bool, _reason: Option<String>) {}
 
     /// Takes one pending interaction, if there is one. Never blocks.
     ///

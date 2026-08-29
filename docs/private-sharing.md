@@ -1,25 +1,30 @@
 # Private sharing
 
-Scrozz has no cloud service. The optional `cloud` feature uploads to
-S3-compatible storage you control and returns either a private presigned URL or
-an already-public/custom-domain URL.
+Scrozz has no cloud service. The `cloud` feature uploads to S3-compatible
+storage you control and returns either a private presigned URL or an
+already-public/custom-domain URL. Distributed binaries enable it; source builds
+can still exclude every network and credential-vault dependency.
 
 ```bash
 cargo run -p scrozz --features cloud -- share capture.png
 ```
 
-The default build remains fully functional and compiles no HTTP client. The
-feature is a deployment choice:
+The Cargo default remains fully functional and compiles no HTTP client. Release
+packaging and `tools/make-app-bundle.sh` deliberately enable cloud:
 
 ```bash
 cargo tree -p scrozz --no-default-features
 cargo tree -p scrozz --features cloud
+tools/make-app-bundle.sh
 ```
 
 ## Public configuration
 
-Command-line flags override the matching `SCROZZ_S3_*` variables. None of these
-values is a secret.
+The platform-adaptive Settings window persists these non-secret values in the
+versioned `Scrozz/settings.json` document. It preserves unknown aggregate
+sections when updating a known value. Precedence is command-line flag, an
+explicitly stored value, matching `SCROZZ_S3_*` variable, then provider default.
+None of these values is a secret.
 
 | Provider | Required configuration | Derived behavior |
 |---|---|---|
@@ -40,7 +45,13 @@ variables rather than forwarding a signed upload to another host.
 
 ## Credentials
 
-Resolution order is fixed:
+The Settings credential pane adds, updates, or removes one provider-profile
+entry in macOS Keychain, Windows Credential Manager, or Linux Secret Service.
+The UI names the real backend and reports missing adapters/session services
+instead of claiming storage succeeded. The entry can also hold the optional
+default encryption password selected by `cloud.protection-mode=vault`.
+
+Script resolution order is fixed:
 
 1. `SCROZZ_S3_ACCESS_KEY_ID` + `SCROZZ_S3_SECRET_ACCESS_KEY`, falling back to
    `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`.
@@ -48,8 +59,12 @@ Resolution order is fixed:
    the access-key id in the environment. The command is executed directly, not
    through a shell; CLI `--credential-arg` values are visible process arguments
    and must contain only non-secret credential-store references.
-3. `--secret-key-stdin`, paired with an access-key id from the environment. Stdin
-   is read only if neither higher-priority source is usable.
+3. `--secret-key-stdin`, paired with an access-key id from the environment.
+4. The selected provider's native-vault entry.
+
+Stdin and the native vault are read only if the higher-priority sources are not
+usable. Native entries are opaque binary credential bundles; they never enter
+settings, history, logs, crash output, or process arguments.
 
 Temporary `SCROZZ_S3_SESSION_TOKEN`/`AWS_SESSION_TOKEN` values are supported.
 Secrets have no value-taking CLI flag, are redacted from `Debug` and request
@@ -59,8 +74,8 @@ have a 30-second timeout. The HTTP client's wire-log targets remain disabled
 even when `RUST_LOG=trace`, preventing signed request headers from reaching
 diagnostic logs.
 
-For example, a platform credential store can supply the secret without exposing
-it in process arguments:
+For example, an external credential store can still supply a secret without
+exposing it in process arguments:
 
 ```bash
 export SCROZZ_S3_ACCESS_KEY_ID=...
@@ -140,12 +155,57 @@ cancellation, and copies the returned bearer link to the clipboard without
 writing it to logs. A clipboard retry reuses the upload while its link remains
 valid; an expired cached link causes a fresh upload and signature.
 
+The card is enabled only when this binary contains the cloud backend and current
+provider settings resolve successfully. Disabled controls expose the reason to
+assistive technology; upload and connection-test failures remain visible on the
+card or Settings pane. Copy and Save use separate jobs and remain available
+after any upload failure.
+
+Editor and recorder integrations replace the card cache through one
+`FinalizedArtifact` seam. Each replacement increments the retained revision;
+cached links are reusable only for the same revision. Upload therefore receives
+the exact finalized bytes, including destructive redaction output, rather than
+re-reading an older source capture. Successful URL, expiry, provider, object id,
+status, deletion state, tags, and media kind are attached to Capture History;
+credentials never are.
+
+Objects below 16 MiB use an idempotent signed PUT. Larger objects use 8 MiB S3
+multipart parts (up to Scrozz's bounded 5 GiB in-memory limit); part retries keep the same part
+number and upload id, and cancellation or failure sends a signed
+`AbortMultipartUpload`. Multipart creation and completion are not blindly
+retried because a lost response is not safely idempotent. Configure the
+provider's abort-incomplete-multipart lifecycle rule as a final backstop.
+
+All provider responses retained for diagnostics are capped at 64 KiB. S3
+endpoints require TLS except literal loopback development addresses, redirects
+and ambient proxies are disabled, and resolved link-local/metadata, multicast,
+broadcast, and unspecified destinations are rejected. A successful provider
+`Date` response anchors the presigned expiry when available, avoiding local
+clock-skew drift.
+
+## Native credential validation
+
+Normal CI compiles and tests the macOS Keychain, Windows Credential Manager, and
+Linux Secret Service adapters on their native runners. The contract tests cover
+opaque encoding, redacted diagnostics, missing entries, and unsupported builds.
+A maintainer may opt into a real, self-cleaning native smoke:
+
+```bash
+SCROZZ_TEST_NATIVE_VAULT=1 cargo test -p scrozz-cloud \
+  --all-features native_vault_smoke_when_explicitly_enabled
+```
+
+The smoke uses a unique temporary profile and deletes it before returning. Run
+it only in a logged-in desktop session with the native vault unlocked.
+
 ## Validation boundary
 
 Automated coverage includes published SigV4 and cryptographic vectors, an
-independent WebCrypto-compatible ciphertext vector, secret-redaction checks, and
-real HTTP exchanges with a loopback fake-S3 server. It does not deploy to or
-mutate a real AWS, R2, B2, or MinIO account.
+independent WebCrypto-compatible ciphertext vector, multipart cleanup,
+secret-redaction checks, and real HTTP exchanges with a loopback fake-S3 server.
+Release packaging also executes a credential-free `--json share` missing-file
+smoke before signing. It does not deploy to or mutate a real AWS, R2, B2, or
+MinIO account.
 
 There is no project server, Scrozz account, telemetry, runtime AI, analytics or
 team-management surface in this feature.

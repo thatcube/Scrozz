@@ -14,7 +14,11 @@ path = "src/main.rs"
 
 [features]
 default = []
-cloud = ["dep:scrozz-cloud", "scrozz-cloud/network"]
+cloud = [
+    "dep:scrozz-cloud",
+    "scrozz-cloud/native-vault",
+    "scrozz-cloud/network",
+]
 
 [dependencies]
 scrozz-core.workspace = true
@@ -39,6 +43,8 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
+fs2.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

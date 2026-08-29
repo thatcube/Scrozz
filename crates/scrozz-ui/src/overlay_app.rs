@@ -283,6 +283,10 @@ pub struct CaptureRequest {
     pub source_px: (u32, u32),
     /// A pre-scaled thumbnail. `None` shows a holding fill until one arrives.
     pub thumbnail: Option<egui::ColorImage>,
+    /// Whether the Upload action is currently usable.
+    pub upload_enabled: bool,
+    /// Explanation reported for a disabled Upload action.
+    pub upload_unavailable_reason: Option<String>,
 }
 
 impl CaptureRequest {
@@ -294,6 +298,8 @@ impl CaptureRequest {
             provenance,
             source_px,
             thumbnail: None,
+            upload_enabled: true,
+            upload_unavailable_reason: None,
         }
     }
 
@@ -315,6 +321,8 @@ impl CaptureRequest {
             provenance,
             source_px,
             thumbnail: Some(thumbnail),
+            upload_enabled: true,
+            upload_unavailable_reason: None,
         })
     }
 
@@ -322,6 +330,14 @@ impl CaptureRequest {
     #[must_use]
     pub fn with_thumbnail(mut self, image: egui::ColorImage) -> Self {
         self.thumbnail = Some(image);
+        self
+    }
+
+    /// Sets Upload capability for this card.
+    #[must_use]
+    pub fn with_upload_availability(mut self, enabled: bool, reason: Option<String>) -> Self {
+        self.upload_enabled = enabled;
+        self.upload_unavailable_reason = reason;
         self
     }
 }
@@ -408,13 +424,15 @@ pub enum OverlayEvent {
 }
 
 /// Something the application asks the overlay to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Dismiss(CardId),
     DismissAll,
     Collapse,
     Expand,
     ToggleDock,
+    SetStatus(CardId, Option<String>),
+    SetUploadAvailability(CardId, bool, Option<String>),
     Close,
 }
 
@@ -485,6 +503,16 @@ impl OverlayHandle {
     /// Collapse or expand, whichever is not current.
     pub fn toggle_dock(&self) {
         self.command(Command::ToggleDock);
+    }
+
+    /// Shows or clears one card's action status.
+    pub fn set_status(&self, id: CardId, status: Option<String>) {
+        self.command(Command::SetStatus(id, status));
+    }
+
+    /// Changes whether one card's Upload control is usable.
+    pub fn set_upload_availability(&self, id: CardId, enabled: bool, reason: Option<String>) {
+        self.command(Command::SetUploadAvailability(id, enabled, reason));
     }
 
     /// Ask the overlay window to close.
@@ -720,6 +748,9 @@ struct Entry {
     source_px: (u32, u32),
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
+    upload_enabled: bool,
+    upload_unavailable_reason: Option<String>,
+    status: Option<String>,
 }
 
 /// The `eframe` application that hosts the capture stack.
@@ -867,6 +898,9 @@ impl OverlayApp {
                     source_px: request.source_px,
                     texture: None,
                     pending: thumb,
+                    upload_enabled: request.upload_enabled,
+                    upload_unavailable_reason: request.upload_unavailable_reason,
+                    status: None,
                 },
             );
             self.emit(OverlayEvent::Pushed { id });
@@ -897,6 +931,17 @@ impl OverlayApp {
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
+                Command::SetStatus(id, status) => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.status = status;
+                    }
+                }
+                Command::SetUploadAvailability(id, enabled, reason) => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.upload_enabled = enabled;
+                        entry.upload_unavailable_reason = reason;
+                    }
+                }
                 Command::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -1081,6 +1126,9 @@ impl eframe::App for OverlayApp {
                 continue;
             };
             let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
+            content.upload_enabled = entry.upload_enabled;
+            content.upload_unavailable_reason = entry.upload_unavailable_reason.as_deref();
+            content.status = entry.status.as_deref();
             if let Some(tex) = &entry.texture {
                 content.texture = Some(tex.id());
             }

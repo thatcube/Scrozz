@@ -80,13 +80,15 @@ These are properties of the shipped application, not promises about intent.
 
 You do not have to take any of it on trust:
 
-- **The default build contains no HTTP client.** `scrozz-cloud` has no default
-  network feature. Building the app with `--features cloud` adds `ureq`; its
-  only application path is an authenticated PUT to the endpoint the user
-  selected or the provider endpoint derived from their configuration, and
-  redirects are disabled. Nothing is contacted until the user explicitly
-  shares a capture. `Cargo.lock` lists `ureq` because lockfiles include optional
-  dependencies even when they are not compiled. Verify the actual default graph with
+- **The source default contains no HTTP client; distributed packages include
+  sharing deliberately.** `scrozz-cloud` has no default network feature.
+  Release binaries and the macOS app bundle build with `--features cloud`, which
+  adds `ureq` plus the target's native credential adapter. Its only application
+  path is an authenticated request to the endpoint selected in Settings or
+  derived from the chosen provider. Redirects and ambient proxies are disabled,
+  and nothing is contacted until the user uploads or tests that connection.
+  `Cargo.lock` lists optional dependencies even when they are not compiled.
+  Verify the source-default graph with
   `cargo tree -p scrozz --no-default-features`.
 - **The source is GPL-3.0** (see [`LICENSE`](LICENSE)), so every line is
   readable, and any derivative must publish its own source too.

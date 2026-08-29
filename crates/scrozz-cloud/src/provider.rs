@@ -277,6 +277,46 @@ impl ProviderConfig {
             canonical_uri,
         })
     }
+
+    /// Builds the authenticated target for a read-only `HeadBucket` probe.
+    pub fn bucket_target(&self, bucket: &str) -> Result<ObjectTarget> {
+        validate_bucket(bucket, self.addressing)?;
+        let addressing = if self.endpoint.scheme == "http"
+            || (self.addressing == AddressingStyle::VirtualHosted && bucket.contains('.'))
+        {
+            AddressingStyle::Path
+        } else {
+            self.addressing
+        };
+        let (host, canonical_uri) = match addressing {
+            AddressingStyle::VirtualHosted => (
+                format!("{bucket}.{}", self.endpoint.authority),
+                if self.endpoint.base_path.is_empty() {
+                    "/".to_owned()
+                } else {
+                    format!("{}/", self.endpoint.base_path)
+                },
+            ),
+            AddressingStyle::Path => (
+                self.endpoint.authority.clone(),
+                format!(
+                    "{}/{}/",
+                    self.endpoint.base_path,
+                    aws_uri_encode(bucket, true)
+                ),
+            ),
+        };
+        let canonical_uri = if canonical_uri.starts_with('/') {
+            canonical_uri
+        } else {
+            format!("/{canonical_uri}")
+        };
+        Ok(ObjectTarget {
+            url: format!("{}://{}{}", self.endpoint.scheme, host, canonical_uri),
+            host,
+            canonical_uri,
+        })
+    }
 }
 
 /// One resolved object request target.

@@ -132,8 +132,8 @@ jobs:
           # Two builds and a lipo, rather than one build, because a universal
           # binary is the only kind that runs natively on both Apple Silicon
           # and the Intel Macs still in use.
-          cargo build --release --locked --target aarch64-apple-darwin --bin scrozz
-          cargo build --release --locked --target x86_64-apple-darwin --bin scrozz
+          cargo build --release --locked --features cloud --target aarch64-apple-darwin --bin scrozz
+          cargo build --release --locked --features cloud --target x86_64-apple-darwin --bin scrozz
           mkdir -p dist
           lipo -create -output dist/scrozz \
             target/aarch64-apple-darwin/release/scrozz \
@@ -143,13 +143,31 @@ jobs:
       - name: Build (single target)
         if: matrix.os != 'macos-latest'
         run: |
-          cargo build --release --locked --target "${{ matrix.target }}" --bin scrozz
+          cargo build --release --locked --features cloud --target "${{ matrix.target }}" --bin scrozz
           mkdir -p dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "target/${{ matrix.target }}/release/scrozz.exe" dist/
           else
             cp "target/${{ matrix.target }}/release/scrozz" dist/
           fi
+
+      - name: Smoke typed missing-file share boundary
+        run: |
+          set -euo pipefail
+          BIN="dist/scrozz"
+          [[ "${{ runner.os }}" == "Windows" ]] && BIN="dist/scrozz.exe"
+          MISSING="$RUNNER_TEMP/scrozz-missing-share.png"
+          rm -f "$MISSING"
+          unset SCROZZ_S3_ACCESS_KEY_ID SCROZZ_S3_SECRET_ACCESS_KEY \
+            SCROZZ_S3_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY \
+            AWS_SESSION_TOKEN
+          set +e
+          OUTPUT="$("$BIN" --json --no-ipc share "$MISSING" 2>&1)"
+          STATUS=$?
+          set -e
+          [[ "$STATUS" == "2" ]]
+          grep -q '"kind":"usage"' <<<"$OUTPUT"
+          ! grep -qi -E 'Unsupported|--features cloud|secret|credential' <<<"$OUTPUT"
 
       # --- macOS signing and notarisation (skipped unless secrets exist) ------
       #

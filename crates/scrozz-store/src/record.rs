@@ -21,13 +21,17 @@
 //! loads its metadata, still lists, still counts its edits, and reports exactly
 //! what it could not decode.
 
+use std::collections::BTreeMap;
+
 use scrozz_annotate::DocumentData;
 use scrozz_core::{CaptureTarget, Error, Provenance, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     CaptureId,
     model::{CaptureRecord, FrameHeader, ImageState, ProvenanceRepr, TargetRepr, Timestamp},
+    sharing::{CaptureSharing, RemoteDeletionState, RemoteObjectStatus},
 };
 
 /// Current sidecar format. Bumped only when old files stop being readable,
@@ -74,12 +78,18 @@ pub struct StoredRecord {
     /// Recognised text.
     #[serde(default)]
     pub ocr_text: Option<String>,
+    /// Optional sharing metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<CaptureSharing>,
     /// The annotation document, exactly as `scrozz-annotate` serialises it.
     ///
     /// Opaque on purpose — see the module documentation. This is the field
     /// decision D23 promises to keep forever.
     #[serde(default = "empty_document")]
     pub document: serde_json::Value,
+    /// Forward-compatible fields a newer build may add.
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 const fn default_format() -> u32 {
@@ -127,8 +137,10 @@ impl StoredRecord {
             image_bytes,
             image_evicted_at: None,
             ocr_text,
+            sharing: None,
             document: serde_json::to_value(document)
                 .map_err(|e| Error::Storage(format!("cannot serialise document: {e}")))?,
+            extra: BTreeMap::new(),
         })
     }
 
@@ -140,6 +152,46 @@ impl StoredRecord {
     pub fn set_document(&mut self, document: &DocumentData) -> Result<()> {
         self.document = serde_json::to_value(document)
             .map_err(|e| Error::Storage(format!("cannot serialise document: {e}")))?;
+        Ok(())
+    }
+
+    /// Replaces the stored sharing metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if the new metadata is not safe to
+    /// persist.
+    pub fn set_sharing(&mut self, sharing: Option<CaptureSharing>) -> Result<()> {
+        if let Some(ref sharing) = sharing {
+            sharing.validate_for_storage()?;
+        }
+        self.sharing = sharing;
+        Ok(())
+    }
+
+    /// Updates only the remote-object status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if no sharing metadata exists yet.
+    pub fn set_remote_status(&mut self, status: RemoteObjectStatus) -> Result<()> {
+        let sharing = self.sharing.as_mut().ok_or_else(|| {
+            Error::Storage(format!("capture {} has no sharing metadata", self.id))
+        })?;
+        sharing.remote_status = status;
+        Ok(())
+    }
+
+    /// Updates only the deletion state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if no sharing metadata exists yet.
+    pub fn set_deletion(&mut self, deletion: RemoteDeletionState) -> Result<()> {
+        let sharing = self.sharing.as_mut().ok_or_else(|| {
+            Error::Storage(format!("capture {} has no sharing metadata", self.id))
+        })?;
+        sharing.deletion = deletion;
         Ok(())
     }
 
@@ -208,6 +260,7 @@ impl StoredRecord {
             image: self.image_state(),
             ocr_text: self.ocr_text.clone(),
             annotation_count: self.annotation_count(),
+            sharing: self.sharing.clone(),
         }
     }
 
@@ -269,6 +322,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_support::sample_sharing;
 
     fn header() -> FrameHeader {
         FrameHeader {
@@ -307,7 +361,7 @@ mod tests {
     }
 
     fn record() -> StoredRecord {
-        StoredRecord::from_parts(
+        let mut record = StoredRecord::from_parts(
             &CaptureId("01ABC".into()),
             Timestamp(1_700_000_000_000),
             Timestamp(1_700_000_000_001),
@@ -322,7 +376,11 @@ mod tests {
             Some("Total: 12.00".into()),
             &document_data(),
         )
-        .expect("record builds")
+        .expect("record builds");
+        record
+            .set_sharing(Some(sample_sharing(7)))
+            .expect("sharing metadata");
+        record
     }
 
     #[test]
@@ -338,6 +396,10 @@ mod tests {
             data.beautification,
             Some(Beautification::padded(8.0, Background::default()))
         );
+        let sharing = back.sharing.expect("sharing");
+        assert_eq!(sharing.provider, crate::ShareProvider::R2);
+        assert_eq!(sharing.remote_object_id.as_str(), "captures/7.png");
+        assert_eq!(sharing.tags.len(), 2);
     }
 
     #[test]
@@ -439,6 +501,117 @@ mod tests {
         assert!(
             record.document_data().is_ok(),
             "a record with no document should still yield an empty one"
+        );
+        assert!(record.sharing.is_none());
+    }
+
+    #[test]
+    fn older_compatible_writes_preserve_unknown_fields_when_rewriting() {
+        let raw = serde_json::json!({
+            "id": "01ABC",
+            "created_at": 1,
+            "stored_at": 2,
+            "provenance": "region",
+            "target": { "kind": "all_displays" },
+            "frame": {
+                "size": { "width": 4.0, "height": 4.0 },
+                "stride": 16,
+                "format": "Rgba8",
+                "color_space": "Srgb",
+                "scale": 1.0
+            },
+            "sharing": {
+                "url": "https://example.invalid/share",
+                "provider": "future-cloud",
+                "remote_object_id": "future/object.png",
+                "remote_status": "archived",
+                "deletion": "purging",
+                "tags": [{ "key": "project", "value": "scrozz" }],
+                "media_kind": "immersive_viewer",
+                "future_nested": { "kept": true }
+            },
+            "future_top_level": { "kept": true }
+        });
+
+        let mut record =
+            StoredRecord::from_json(&serde_json::to_vec(&raw).expect("encode")).expect("decode");
+        record
+            .set_document(&DocumentData::default())
+            .expect("rewrite");
+
+        let rewritten = serde_json::to_value(
+            StoredRecord::from_json(&record.to_json().expect("encode")).expect("decode"),
+        )
+        .expect("value");
+        assert_eq!(rewritten["future_top_level"]["kept"], Value::Bool(true));
+        assert_eq!(
+            rewritten["sharing"]["future_nested"]["kept"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            rewritten["sharing"]["provider"],
+            Value::String("future-cloud".into())
+        );
+        assert_eq!(
+            rewritten["sharing"]["remote_status"],
+            Value::String("archived".into())
+        );
+        assert_eq!(
+            rewritten["sharing"]["media_kind"],
+            Value::String("immersive_viewer".into())
+        );
+    }
+
+    #[test]
+    fn sharing_json_contains_metadata_but_no_credential_fields() {
+        let record = record();
+        let value: Value =
+            serde_json::from_slice(&record.to_json().expect("encode")).expect("json");
+        let sharing = value.get("sharing").expect("sharing");
+        for forbidden in [
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "password",
+        ] {
+            assert!(
+                sharing.get(forbidden).is_none(),
+                "sharing metadata must not persist {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn setting_share_metadata_requires_a_valid_url() {
+        let mut record = StoredRecord::from_parts(
+            &CaptureId("01SAFE".into()),
+            Timestamp(1),
+            Timestamp(1),
+            false,
+            None,
+            None,
+            Provenance::Region,
+            &CaptureTarget::AllDisplays,
+            header(),
+            None,
+            0,
+            None,
+            &DocumentData::default(),
+        )
+        .expect("record");
+        let unsafe_share: CaptureSharing = serde_json::from_value(serde_json::json!({
+            "url": "https://alice:secret@example.com/share",
+            "provider": "aws",
+            "remote_object_id": "safe/object.png",
+            "remote_status": "available",
+            "deletion": "not_requested",
+            "media_kind": "image"
+        }))
+        .expect("decode");
+
+        assert!(
+            record.set_sharing(Some(unsafe_share)).is_err(),
+            "share metadata with an invalid URL must be rejected"
         );
     }
 }

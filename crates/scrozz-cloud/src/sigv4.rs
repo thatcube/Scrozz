@@ -137,6 +137,36 @@ pub fn sign_headers(
     region: &str,
     timestamp: &AmzDate,
     payload_hash: &str,
+    headers: Vec<(String, String)>,
+) -> Result<SignedHeaders> {
+    sign_headers_with_query(
+        credentials,
+        method,
+        canonical_uri,
+        "",
+        region,
+        timestamp,
+        payload_hash,
+        headers,
+    )
+}
+
+/// Signs request headers including an already-canonical query string.
+///
+/// Multipart S3 operations authenticate `uploads`, `uploadId`, and
+/// `partNumber`; omitting those values signs a different request.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "SigV4's canonical request fields must remain explicit at the cryptographic boundary"
+)]
+pub fn sign_headers_with_query(
+    credentials: &Credentials,
+    method: &str,
+    canonical_uri: &str,
+    canonical_query: &str,
+    region: &str,
+    timestamp: &AmzDate,
+    payload_hash: &str,
     mut headers: Vec<(String, String)>,
 ) -> Result<SignedHeaders> {
     upsert(&mut headers, "x-amz-date", timestamp.full());
@@ -145,8 +175,9 @@ pub fn sign_headers(
         upsert(&mut headers, "x-amz-security-token", token);
     }
     let (canonical_headers, signed_names) = canonical_headers(&headers)?;
-    let canonical =
-        format!("{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_names}\n{payload_hash}");
+    let canonical = format!(
+        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_names}\n{payload_hash}"
+    );
     let scope = format!("{}/{region}/s3/aws4_request", timestamp.day());
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",

@@ -2,16 +2,10 @@
 //!
 //! # Why the schema lives here and not in the store
 //!
-//! Nothing persists settings yet. That could mean `scrozz settings` waits for a
-//! store, but it should not: the *schema* is the interesting part and the part
-//! everything else depends on. A key's name, type and default are what the GUI
-//! renders, what `--json` reports, and what a user's dotfiles refer to. Getting
-//! them wrong is expensive to undo; getting them right costs nothing today.
-//!
-//! So `settings get` works now, reporting defaults and saying so, and
-//! `settings set` validates fully before reporting that persistence is missing.
-//! A typo in a key or a value is caught immediately rather than being written
-//! somewhere and silently ignored later.
+//! The schema and versioned JSON document deliberately live together: a key's
+//! name, type and default are what the GUI renders, what `--json` reports, and
+//! what a user's dotfiles refer to. The document stores only validated,
+//! non-secret values and preserves sections owned by aggregate features.
 //!
 //! # Naming
 //!
@@ -19,11 +13,30 @@
 //! the hotkey commands already use, and it survives being a TOML table, a JSON
 //! object path and a command-line argument without being quoted.
 
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use fs2::FileExt as _;
+use serde_json::{Map, Value};
+
 use crate::{
     fault::{CliError, CliResult},
     hotkey_config::Accelerator,
     json::Json,
 };
+
+const SETTINGS_VERSION: u32 = 2;
+const APP_DIR: &str = "Scrozz";
+const FILE_NAME: &str = "settings.json";
+const LOCK_FILE_NAME: &str = ".settings.lock";
+/// Overrides the settings file path for portable installs and isolated tests.
+pub const SETTINGS_FILE_ENV: &str = "SCROZZ_SETTINGS_FILE";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +96,18 @@ impl Setting {
     /// The JSON representation, including the current (always default) value.
     #[must_use]
     pub fn to_json(self) -> Json {
+        self.to_json_with(self.default, "default")
+    }
+
+    /// JSON representation with an effective value and its source.
+    #[must_use]
+    pub fn to_json_with(self, value: &str, source: &str) -> Json {
         let mut fields = vec![
             ("key", Json::str(self.key)),
             ("type", Json::str(self.kind.slug())),
-            ("value", Json::str(self.default)),
+            ("value", Json::str(value)),
             ("default", Json::str(self.default)),
-            // Honest about where the value came from. When persistence lands
-            // this becomes "user" for anything overridden, and a script that
-            // already reads it keeps working.
-            ("source", Json::str("default")),
+            ("source", Json::str(source)),
             ("description", Json::str(self.description)),
         ];
         if let Kind::Choice(options) = self.kind {
@@ -284,6 +300,12 @@ pub const SETTINGS: &[Setting] = &[
         description: "Custom public origin or path used only for non-expiring links.",
     },
     Setting {
+        key: "cloud.url-policy",
+        kind: Kind::Choice(&["private-expiring", "public-base"]),
+        default: "private-expiring",
+        description: "Use provider-enforced expiring links or the configured public base URL.",
+    },
+    Setting {
         key: "cloud.expiry-seconds",
         kind: Kind::Int {
             min: 0,
@@ -291,6 +313,24 @@ pub const SETTINGS: &[Setting] = &[
         },
         default: "86400",
         description: "Presigned-link lifetime; zero means an already-public bucket or CDN.",
+    },
+    Setting {
+        key: "cloud.naming-template",
+        kind: Kind::Text { allow_empty: false },
+        default: "Screenshot-{timestamp}",
+        description: "Object name template; supports {timestamp}, {card}, and {kind}.",
+    },
+    Setting {
+        key: "cloud.tags",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Comma-separated key=value tags added to each uploaded object.",
+    },
+    Setting {
+        key: "cloud.protection-mode",
+        kind: Kind::Choice(&["none", "vault"]),
+        default: "none",
+        description: "Encrypt shares with the default password kept in the native credential vault.",
     },
     Setting {
         key: "cloud.credential-command",
@@ -410,6 +450,334 @@ pub fn all_human() -> String {
         .map(|s| format!("{:width$}  {}", s.key, s.default))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Every effective setting as aligned text.
+#[must_use]
+pub fn all_human_from(settings: &StoredSettings) -> String {
+    let width = SETTINGS
+        .iter()
+        .map(|setting| setting.key.len())
+        .max()
+        .unwrap_or(0);
+    SETTINGS
+        .iter()
+        .map(|setting| {
+            format!(
+                "{:width$}  {}",
+                setting.key,
+                settings.value(setting.key).unwrap_or(setting.default)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Effective settings loaded from the versioned, non-secret settings document.
+///
+/// Unknown keys and root fields are retained byte-for-byte as JSON values when
+/// this version updates a known setting. That is the compatibility seam used by
+/// aggregate builds that add independent settings sections.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredSettings {
+    values: BTreeMap<String, String>,
+    unknown_values: BTreeMap<String, Value>,
+    unknown_root: BTreeMap<String, Value>,
+    document_version: u32,
+}
+
+impl Default for StoredSettings {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            unknown_values: BTreeMap::new(),
+            unknown_root: BTreeMap::new(),
+            document_version: SETTINGS_VERSION,
+        }
+    }
+}
+
+impl StoredSettings {
+    /// Effective value, falling back to the schema default.
+    #[must_use]
+    pub fn value(&self, key: &str) -> Option<&str> {
+        let setting = SETTINGS.iter().find(|setting| setting.key == key)?;
+        Some(
+            self.values
+                .get(key)
+                .map(String::as_str)
+                .unwrap_or(setting.default),
+        )
+    }
+
+    /// Whether this document overrides a schema default.
+    #[must_use]
+    pub fn is_user_set(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
+    /// Validates and changes one known, non-secret value.
+    pub fn set(&mut self, key: &str, value: &str) -> CliResult<()> {
+        let setting = lookup(key)?;
+        setting.validate(value)?;
+        self.values.insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+
+    /// Removes one override so the schema default applies again.
+    pub fn reset(&mut self, key: &str) -> CliResult<()> {
+        lookup(key)?;
+        self.values.remove(key);
+        Ok(())
+    }
+
+    fn from_json(text: &str) -> CliResult<Self> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|error| storage_error(format!("the settings file is unreadable: {error}")))?;
+        reject_credential_fields(&value)?;
+        let mut root = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| storage_error("the settings file must contain a JSON object"))?;
+        let version = root
+            .remove("version")
+            .and_then(|value| value.as_u64())
+            .map_or(0, |version| u32::try_from(version).unwrap_or(u32::MAX));
+        let mut settings = Self {
+            document_version: version.max(SETTINGS_VERSION),
+            ..Self::default()
+        };
+        if let Some(values) = root.remove("values") {
+            let values = values
+                .as_object()
+                .ok_or_else(|| storage_error("settings `values` must contain a JSON object"))?;
+            for (key, value) in values {
+                if let Some(setting) = SETTINGS.iter().find(|setting| setting.key == key) {
+                    let value = scalar_setting(value).ok_or_else(|| {
+                        storage_error(format!("stored setting {key:?} must be a scalar value"))
+                    })?;
+                    setting.validate(&value)?;
+                    settings.values.insert(key.clone(), value);
+                } else {
+                    settings.unknown_values.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        settings.unknown_root = root.into_iter().collect();
+        Ok(settings)
+    }
+
+    fn to_json(&self) -> CliResult<String> {
+        let mut root: Map<String, Value> = self
+            .unknown_root
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        root.insert(
+            "version".to_owned(),
+            Value::Number(self.document_version.into()),
+        );
+        root.insert(
+            "values".to_owned(),
+            Value::Object(
+                self.unknown_values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .chain(
+                        self.values
+                            .iter()
+                            .map(|(key, value)| (key.clone(), Value::String(value.clone()))),
+                    )
+                    .collect(),
+            ),
+        );
+        serde_json::to_string_pretty(&Value::Object(root))
+            .map_err(|error| storage_error(format!("could not render settings: {error}")))
+    }
+}
+
+fn scalar_setting(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn reject_credential_fields(value: &Value) -> CliResult<()> {
+    fn walk(value: &Value) -> Option<&str> {
+        match value {
+            Value::Object(fields) => fields.iter().find_map(|(key, value)| {
+                credential_bearing_key(key)
+                    .then_some(key.as_str())
+                    .or_else(|| walk(value))
+            }),
+            Value::Array(values) => values.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    if let Some(key) = walk(value) {
+        return Err(storage_error(format!(
+            "credential-bearing field {key:?} is forbidden in settings; use the native vault"
+        )));
+    }
+    Ok(())
+}
+
+fn credential_bearing_key(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    ["accesskey", "secret", "sessiontoken", "password"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+fn storage_error(message: impl Into<String>) -> CliError {
+    CliError::Core(scrozz_core::Error::Storage(message.into()))
+}
+
+/// Atomic storage for the aggregate-compatible settings document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsStore {
+    path: PathBuf,
+}
+
+impl SettingsStore {
+    /// Uses an explicit path.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Resolves the platform configuration path.
+    pub fn default_location() -> CliResult<Self> {
+        if let Ok(path) = std::env::var(SETTINGS_FILE_ENV)
+            && !path.trim().is_empty()
+        {
+            return Ok(Self::new(path));
+        }
+        let base = dirs::config_dir()
+            .or_else(dirs::data_dir)
+            .ok_or_else(|| storage_error("no platform config directory is available"))?;
+        Ok(Self::new(base.join(APP_DIR).join(FILE_NAME)))
+    }
+
+    /// The file this store owns.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Loads the latest document. An absent file means schema defaults.
+    pub fn load(&self) -> CliResult<StoredSettings> {
+        self.with_lock(|| self.load_unlocked())
+    }
+
+    /// Atomically updates the latest document under a cross-process lock.
+    pub fn update(
+        &self,
+        change: impl FnOnce(&mut StoredSettings) -> CliResult<()>,
+    ) -> CliResult<StoredSettings> {
+        self.with_lock(|| {
+            let mut settings = self.load_unlocked()?;
+            change(&mut settings)?;
+            self.save_unlocked(&settings)?;
+            Ok(settings)
+        })
+    }
+
+    fn load_unlocked(&self) -> CliResult<StoredSettings> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => StoredSettings::from_json(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(StoredSettings::default())
+            }
+            Err(error) => Err(storage_error(format!(
+                "could not read {}: {error}",
+                self.path.display()
+            ))),
+        }
+    }
+
+    fn save_unlocked(&self, settings: &StoredSettings) -> CliResult<()> {
+        let text = settings.to_json()?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| storage_error(format!("{} has no parent", self.path.display())))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            storage_error(format!("could not create {}: {error}", parent.display()))
+        })?;
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{FILE_NAME}.{}.{sequence}.tmp",
+            std::process::id()
+        ));
+        let write = || -> std::io::Result<()> {
+            let mut file = File::create(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        };
+        write().map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            storage_error(format!("could not write {}: {error}", temporary.display()))
+        })?;
+        scrozz_shell::replace_file(&temporary, &self.path)
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&temporary);
+            })
+            .map_err(CliError::Core)
+    }
+
+    fn with_lock<T>(&self, operation: impl FnOnce() -> CliResult<T>) -> CliResult<T> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| storage_error(format!("{} has no parent", self.path.display())))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            storage_error(format!("could not create {}: {error}", parent.display()))
+        })?;
+        let lock_path = parent.join(LOCK_FILE_NAME);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                storage_error(format!("could not open {}: {error}", lock_path.display()))
+            })?;
+        lock.lock_exclusive().map_err(|error| {
+            storage_error(format!("could not lock {}: {error}", lock_path.display()))
+        })?;
+        let result = operation();
+        let unlock = fs2::FileExt::unlock(&lock).map_err(|error| {
+            storage_error(format!("could not unlock {}: {error}", lock_path.display()))
+        });
+        match (result, unlock) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+}
+
+/// Every effective setting as JSON.
+#[must_use]
+pub fn all_json_from(settings: &StoredSettings) -> Json {
+    Json::arr(SETTINGS.iter().map(|setting| {
+        let value = settings.value(setting.key).unwrap_or(setting.default);
+        let source = if settings.is_user_set(setting.key) {
+            "user"
+        } else {
+            "default"
+        };
+        setting.to_json_with(value, source)
+    }))
 }
 
 #[cfg(test)]
@@ -679,5 +1047,64 @@ mod tests {
             assert!(text.contains(setting.key), "{}", setting.key);
         }
         assert_eq!(text.lines().count(), SETTINGS.len());
+    }
+
+    #[test]
+    fn settings_round_trip_atomically_and_report_user_source() {
+        let root =
+            std::env::temp_dir().join(format!("scrozz-settings-round-trip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = SettingsStore::new(root.join("settings.json"));
+        store
+            .update(|settings| settings.set("cloud.bucket", "screenshots"))
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.value("cloud.bucket"), Some("screenshots"));
+        assert!(loaded.is_user_set("cloud.bucket"));
+        let json = all_json_from(&loaded).to_compact_string();
+        assert!(json.contains(r#""source":"user""#), "{json}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unknown_aggregate_fields_survive_a_known_setting_update() {
+        let input = r#"{
+            "version": 7,
+            "future_root": {"kept": true},
+            "values": {
+                "future.setting": {"shape": [1, 2, 3]},
+                "cloud.bucket": "before"
+            },
+            "after_capture": {"screenshot": {"copy-to-clipboard": true}}
+        }"#;
+        let mut settings = StoredSettings::from_json(input).unwrap();
+        settings.set("cloud.bucket", "after").unwrap();
+        let rendered = settings.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["version"], 7);
+        assert_eq!(value["future_root"]["kept"], true);
+        assert_eq!(value["values"]["future.setting"]["shape"][2], 3);
+        assert_eq!(
+            value["after_capture"]["screenshot"]["copy-to-clipboard"],
+            true
+        );
+        assert_eq!(value["values"]["cloud.bucket"], "after");
+    }
+
+    #[test]
+    fn credential_bearing_fields_are_rejected_without_echoing_values() {
+        for key in [
+            "cloud.secret",
+            "access_key_id",
+            "AccessKeyId",
+            "session_token",
+            "session-token",
+            "sharePassword",
+        ] {
+            let input = format!(r#"{{"version":2,"values":{{"{key}":"never-echo-this"}}}}"#);
+            let error = StoredSettings::from_json(&input).unwrap_err();
+            assert!(error.to_string().contains("native vault"), "{error}");
+            assert!(!error.to_string().contains("never-echo-this"), "{error}");
+        }
     }
 }

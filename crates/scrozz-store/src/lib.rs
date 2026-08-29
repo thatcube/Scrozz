@@ -44,6 +44,7 @@ pub mod layout;
 pub mod model;
 pub mod record;
 pub mod schema;
+pub mod sharing;
 pub mod sqlite_store;
 
 #[doc(hidden)]
@@ -54,6 +55,10 @@ pub use model::{
     CaptureRecord, FrameHeader, ImageState, Page, RetentionReport, SearchQuery, Timestamp,
 };
 pub use record::StoredRecord;
+pub use sharing::{
+    CaptureSharing, RemoteDeletionState, RemoteObjectId, RemoteObjectStatus, ShareProvider,
+    ShareTag, ShareUrl, SharedMediaKind,
+};
 pub use sqlite_store::{
     DocumentState, EvictedDocument, History, NewCapture, RecoveryReport, SqliteStore,
 };
