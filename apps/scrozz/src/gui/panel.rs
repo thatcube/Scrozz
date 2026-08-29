@@ -1,35 +1,34 @@
-//! Turning the overlay's window into a non-activating panel.
+//! Adopting eframe's native overlay window without taking ownership from winit.
 //!
 //! # Why this lives here
 //!
 //! `scrozz-ui` is `#![forbid(unsafe_code)]` and deliberately does not depend on
-//! `scrozz-shell`, so it cannot perform the conversion itself; it exposes a
+//! `scrozz-shell`, so it cannot adopt the native window itself; it exposes a
 //! [`PanelHook`] instead. This crate depends on both, so this is the only place
 //! the two halves can meet.
 //!
 //! # Why it takes a pointer
 //!
-//! [`PanelHook`] is `FnOnce(&eframe::CreationContext<'_>) -> PanelReport`, and
-//! the work is split in two: [`hook`] does the pointer extraction, and
-//! [`convert_ns_view`] does the conversion. The split is where the platform
-//! risk is — the conversion can be exercised without a window, so it is the
-//! part that carries the tests.
+//! [`PanelHook`] is `FnOnce(&eframe::CreationContext<'_>) -> PanelReport`.
+//! [`hook`] extracts the native handle and retains a non-owning adapter for safe
+//! property mutation while winit remains the sole owner of class, delegate, KVO,
+//! close, and release.
 //!
-//! # What the conversion actually does
+//! # Why conversion is forbidden
 //!
-//! AppKit has no "make this window non-activating" switch. The behaviour lives
-//! on `NSPanel` + `NSWindowStyleMaskNonactivatingPanel`, and winit hands us an
-//! `NSWindow`. `scrozz-shell` isa-swizzles the instance into a runtime-built
-//! `NSPanel` subclass and then sets the mask, guarding the swizzle on the two
-//! classes having identical instance sizes and refusing when they do not.
-//!
-//! Refusal is not breakage: the overlay still draws and still works, it just
-//! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
-//! `detail` string rather than being a bool.
+//! Stable winit 0.30 cannot construct its macOS window as an `NSPanel` through
+//! eframe. Runtime `isa` mutation is not an alternative: it disconnects winit
+//! and AppKit KVO registrations and crashes later during delegate/view teardown.
+//! The adapter therefore reports the non-activating capability as unavailable
+//! while preserving every other overlay behavior.
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::collections::{HashMap, HashSet};
-use std::{cell::RefCell, ffi::c_void, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    ffi::c_void,
+    rc::Rc,
+};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use scrozz_core::LogicalRect;
@@ -131,6 +130,22 @@ impl PinPanels {
         }
     }
 
+    /// Restores every adopted child before eframe drops its winit viewports.
+    pub fn prepare_for_winit_teardown(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        for (title, mut retained) in self.windows.drain() {
+            if let Err(err) = retained.window.restore_native_class() {
+                tracing::warn!(window = %title, "could not return pin window to its owner: {err}");
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        {
+            self.pending_logged.clear();
+            self.failures.clear();
+            self.adoption_attempts.clear();
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     fn reconcile_native(&mut self, requests: &[NativePinRequest]) -> PinPanelReport {
         let mut report = PinPanelReport::default();
@@ -214,15 +229,11 @@ impl PinPanels {
             if retained.applied.as_ref() == Some(&desired) {
                 continue;
             }
-            let mut non_activation_warning = None;
             if desired.behavior_changed(retained.applied.as_ref()) {
                 let mut behavior = OverlayBehavior::pinned_capture(desired.locked);
                 behavior.opacity = desired.opacity;
                 behavior.has_shadow = desired.shadow;
                 match retained.window.apply(&behavior) {
-                    Ok(report) if !report.non_activating => {
-                        non_activation_warning = Some(report.detail);
-                    }
                     Ok(_) => {}
                     Err(err) => {
                         record_failure(
@@ -251,11 +262,7 @@ impl PinPanels {
                 continue;
             }
             retained.applied = Some(desired);
-            if let Some(reason) = non_activation_warning {
-                record_failure(&mut self.failures, request, reason, &mut report.failures);
-            } else {
-                self.failures.remove(&request.title);
-            }
+            self.failures.remove(&request.title);
         }
         report
     }
@@ -288,11 +295,7 @@ fn record_failure(
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 impl Drop for PinPanels {
     fn drop(&mut self) {
-        for (title, retained) in &mut self.windows {
-            if let Err(err) = retained.window.restore_native_class() {
-                tracing::warn!(window = %title, "could not restore pin window during teardown: {err}");
-            }
-        }
+        self.prepare_for_winit_teardown();
     }
 }
 
@@ -342,6 +345,7 @@ pub struct BehaviorController {
     overlay: Rc<RefCell<Option<NativeOverlay>>>,
     #[cfg(target_os = "linux")]
     x11_focus: Rc<RefCell<Option<scrozz_shell::X11FocusLease>>>,
+    teardown_started: Rc<Cell<bool>>,
     #[cfg(test)]
     behavior_log: Rc<RefCell<Vec<OverlayBehavior>>>,
     #[cfg(test)]
@@ -359,6 +363,7 @@ pub(crate) enum RecordedNativeAction {
     Behavior(OverlayBehavior),
     Cursor(OverlayCursor),
     Visible(bool),
+    ReturnToOwner,
 }
 
 impl BehaviorController {
@@ -368,6 +373,9 @@ impl BehaviorController {
     /// frame is authoritative on macOS and keeps cards above the Dock while
     /// retaining room below them for shadows.
     pub fn set_frame(&self, frame: LogicalRect) {
+        if self.teardown_started.get() {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(overlay) = self.overlay.borrow_mut().as_mut()
             && let Err(error) = overlay.set_frame(frame)
@@ -386,6 +394,9 @@ impl BehaviorController {
 
     /// Applies a card or selection behavior when a native adapter is retained.
     pub fn apply(&self, behavior: &OverlayBehavior) {
+        if self.teardown_started.get() {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(overlay) = self.overlay.borrow_mut().as_mut()
             && let Err(error) = overlay.apply(behavior)
@@ -426,6 +437,9 @@ impl BehaviorController {
     /// The free function is a best-effort fallback for the moment before the
     /// panel hook installs an overlay at all.
     pub fn set_cursor(&self, cursor: OverlayCursor) {
+        if self.teardown_started.get() {
+            return;
+        }
         #[cfg(all(target_os = "macos", not(test)))]
         {
             let routed = self
@@ -458,6 +472,9 @@ impl BehaviorController {
     /// bookkeeping. The native call is what makes the terminal lifecycle
     /// synchronous from the window server's point of view.
     pub fn set_visible(&self, visible: bool) {
+        if self.teardown_started.get() {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(overlay) = self.overlay.borrow_mut().as_mut()
             && let Err(error) = overlay.set_visible(visible)
@@ -480,7 +497,8 @@ impl BehaviorController {
     /// Retries native behavior that had to wait for queued window commands.
     pub fn refresh(&self) {
         #[cfg(target_os = "linux")]
-        if let Some(focus) = self.x11_focus.borrow_mut().as_mut()
+        if !self.teardown_started.get()
+            && let Some(focus) = self.x11_focus.borrow_mut().as_mut()
             && let Err(error) = focus.refresh()
         {
             tracing::warn!(%error, "could not acquire X11 selector keyboard focus");
@@ -490,21 +508,56 @@ impl BehaviorController {
     /// The native window drags start from, once the window exists.
     #[must_use]
     pub fn native_surface(&self) -> Option<NativeSurface> {
+        if self.teardown_started.get() {
+            return None;
+        }
         *self.surface.borrow()
+    }
+
+    /// Stops native mutation and returns the root window to winit exactly once.
+    pub fn prepare_for_winit_teardown(&self) -> scrozz_core::Result<()> {
+        if self.teardown_started.replace(true) {
+            return Ok(());
+        }
+        self.surface.borrow_mut().take();
+
+        #[cfg(target_os = "macos")]
+        if let Some(mut overlay) = self.overlay.borrow_mut().take() {
+            overlay.restore_native_class()?;
+        }
+
+        #[cfg(target_os = "linux")]
+        self.x11_focus.borrow_mut().take();
+
+        #[cfg(test)]
+        self.action_log
+            .borrow_mut()
+            .push(RecordedNativeAction::ReturnToOwner);
+
+        Ok(())
     }
 
     /// Records the native window, as reported by the creation hook.
     fn install_surface(&self, surface: NativeSurface) {
+        if self.teardown_started.get() {
+            return;
+        }
         *self.surface.borrow_mut() = Some(surface);
     }
 
     #[cfg(target_os = "macos")]
     fn install(&self, overlay: NativeOverlay) {
+        if self.teardown_started.get() {
+            return;
+        }
         *self.overlay.borrow_mut() = Some(overlay);
     }
 
     #[cfg(target_os = "linux")]
     fn install_x11_focus(&self, focus: scrozz_shell::X11FocusLease) {
+        if self.teardown_started.get() {
+            return;
+        }
         *self.x11_focus.borrow_mut() = Some(focus);
     }
 
@@ -530,7 +583,7 @@ impl BehaviorController {
     }
 }
 
-/// Converts the window hosting `ns_view` into a non-activating overlay panel.
+/// Adopts the window hosting `ns_view` without changing its runtime identity.
 ///
 /// `ns_view` is the `ns_view` field of a `RawWindowHandle::AppKit`, which is
 /// what `eframe::CreationContext` reports on macOS. A null pointer is refused
@@ -547,13 +600,13 @@ impl BehaviorController {
 /// `eframe` app creator, which is the only caller.
 #[must_use]
 #[cfg(target_os = "macos")]
-pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
+pub unsafe fn adopt_ns_view(ns_view: *mut c_void) -> PanelReport {
     // SAFETY: forwarded from this function's own contract.
-    unsafe { convert_and_retain_ns_view(ns_view) }.0
+    unsafe { adopt_and_retain_ns_view(ns_view) }.0
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
+unsafe fn adopt_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
     if ns_view.is_null() {
         return (
             PanelReport::unsupported("the window handle carried a null NSView"),
@@ -571,9 +624,6 @@ unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Opti
     };
 
     let report = match overlay.apply(&OverlayBehavior::capture_card()) {
-        // `non_activating` is the only part of the behaviour D27 depends on.
-        // Everything else — level, collection behaviour — can be applied and
-        // the card still behaves; this cannot.
         Ok(report) if report.non_activating => PanelReport::converted(report.detail),
         Ok(report) => PanelReport::unsupported(report.detail),
         Err(err) => PanelReport::unsupported(err.to_string()),
@@ -585,7 +635,7 @@ unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Opti
 }
 
 #[cfg(not(target_os = "macos"))]
-unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
+unsafe fn adopt_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
     if ns_view.is_null() {
         return (
             PanelReport::unsupported("the window handle carried a null native view"),
@@ -600,7 +650,7 @@ unsafe fn convert_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Opti
 
 #[must_use]
 #[cfg(not(target_os = "macos"))]
-pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
+pub unsafe fn adopt_ns_view(ns_view: *mut c_void) -> PanelReport {
     if ns_view.is_null() {
         PanelReport::unsupported("the window handle carried a null NSView")
     } else {
@@ -611,8 +661,8 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
 /// The hook `scrozz-ui` runs while the overlay window is being created.
 ///
 /// Extracts the platform handle from the `CreationContext` and hands it to
-/// [`convert_ns_view`]. That is the whole hook: everything with platform risk
-/// in it lives in the conversion, which is unit-tested without a window.
+/// [`adopt_ns_view`]. That is the whole hook: everything with platform risk in
+/// it lives in the adoption, which is unit-tested without a window.
 ///
 /// The `ns_view` / `ns_window` distinction is the subtle one. `eframe` reports
 /// an **`NSView`**, and `scrozz-shell` offers `from_ns_view` and
@@ -627,20 +677,6 @@ pub fn hook() -> scrozz_ui::PanelHook {
 /// The creation hook plus a handle for later card/selector behavior changes.
 #[must_use]
 pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelHook {
-    hook_with_controller_options(controller, true)
-}
-
-/// The creation hook, with the native conversion optional.
-///
-/// `convert` off still records the native window, because that is what a drag
-/// starts from and dragging a card out has nothing to do with whether the
-/// window is a panel. Switching the conversion off used to switch dragging off
-/// with it, silently, which is not a trade anyone chose.
-#[must_use]
-pub fn hook_with_controller_options(
-    controller: BehaviorController,
-    convert: bool,
-) -> scrozz_ui::PanelHook {
     Box::new(move |cc: &eframe::CreationContext<'_>| {
         let handle = match cc.window_handle() {
             Ok(handle) => handle,
@@ -658,13 +694,6 @@ pub fn hook_with_controller_options(
             controller.install_surface(native);
         }
 
-        if !convert {
-            return PanelReport::unsupported(
-                "the panel conversion is switched off; the window keeps its native \
-                 activation behaviour, but cards can still be dragged out",
-            );
-        }
-
         #[cfg(target_os = "macos")]
         let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
             return PanelReport::unsupported(
@@ -678,7 +707,7 @@ pub fn hook_with_controller_options(
         {
             let (report, overlay) =
                 // SAFETY: the handle borrow keeps the NSView alive for adoption.
-                unsafe { convert_and_retain_ns_view(appkit.ns_view.as_ptr()) };
+                unsafe { adopt_and_retain_ns_view(appkit.ns_view.as_ptr()) };
             if let Some(overlay) = overlay {
                 controller.install(overlay);
             }
@@ -712,8 +741,8 @@ pub fn hook_with_controller_options(
 
 /// Attaches direct keyboard-focus ownership to an eframe X11 window.
 ///
-/// This is separate from panel conversion so the one-shot selector can retain
-/// X11 focus without attempting the macOS-only AppKit conversion.
+/// This is separate from native AppKit adoption so the one-shot selector can
+/// retain X11 focus.
 #[cfg(target_os = "linux")]
 pub fn attach_x11_focus(
     cc: &eframe::CreationContext<'_>,
@@ -768,7 +797,7 @@ mod tests {
         // The one input that would be undefined behaviour if it got through.
         // `scrozz-shell` checks this too; checking it here as well means the
         // guarantee does not depend on which backend the target selects.
-        let report = unsafe { convert_ns_view(std::ptr::null_mut()) };
+        let report = unsafe { adopt_ns_view(std::ptr::null_mut()) };
         assert!(!report.non_activating);
         assert!(report.detail.contains("null"), "{}", report.detail);
     }
@@ -778,7 +807,7 @@ mod tests {
         // The property the whole hook design rests on: a hook that could fail
         // is a hook that can take down the window it was called to configure.
         // Every path returns a report, so the overlay always survives.
-        let report = unsafe { convert_ns_view(std::ptr::null_mut()) };
+        let report = unsafe { adopt_ns_view(std::ptr::null_mut()) };
         assert!(
             !report.detail.is_empty(),
             "a refusal with no reason is indistinguishable from a bug"
@@ -811,6 +840,30 @@ mod tests {
         // start-up, long before `eframe` has a window to hand it.
         let hook = hook();
         drop(hook);
+    }
+
+    #[test]
+    fn returning_a_window_to_winit_is_idempotent_and_terminal() {
+        let controller = BehaviorController::default();
+        controller.apply(&OverlayBehavior::capture_card());
+        controller
+            .prepare_for_winit_teardown()
+            .expect("the mock controller has no native failure");
+        controller
+            .prepare_for_winit_teardown()
+            .expect("a repeated teardown is a no-op");
+        controller.set_visible(true);
+        controller.apply(&OverlayBehavior::selection_overlay());
+
+        assert_eq!(
+            controller.recorded_actions(),
+            vec![
+                RecordedNativeAction::Behavior(OverlayBehavior::capture_card()),
+                RecordedNativeAction::ReturnToOwner,
+            ],
+            "no native mutation may follow the one return-to-owner boundary"
+        );
+        assert!(controller.native_surface().is_none());
     }
 
     fn request() -> NativePinRequest {

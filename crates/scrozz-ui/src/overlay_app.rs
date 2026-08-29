@@ -7,17 +7,14 @@
 //! # The window
 //!
 //! Borderless, fully transparent outside its drawn content, no shadow of its
-//! own, absent from the Dock and the taskbar, always on top, and — the property
-//! that matters most — **non-activating**: clicking a capture card must not pull
-//! focus out of whatever the user is typing in (D27).
+//! own, absent from the Dock and the taskbar, and always on top. Platforms with a
+//! safe native adapter also make it non-activating (D27).
 //!
 //! [`viewport`] builds the [`egui::ViewportBuilder`] that expresses as much of
-//! that as egui can express. The rest is native, and on macOS it means
-//! converting the `NSWindow` into a non-activating `NSPanel` after it exists.
-//! `scrozz-ui` cannot do that itself: it does not depend on `scrozz-shell`, and
-//! it is `#![forbid(unsafe_code)]`. So the conversion is a hook —
-//! [`PanelHook`] — supplied by whoever owns both crates, and its result is
-//! reported back through [`OverlayHandle::panel_report`].
+//! that as egui can express. `scrozz-ui` does not depend on `scrozz-shell` and
+//! is `#![forbid(unsafe_code)]`, so additional native configuration is supplied
+//! through [`PanelHook`]. The hook reports whether non-activation is genuinely
+//! available through [`OverlayHandle::panel_report`].
 //!
 //! # Anchoring
 //!
@@ -1378,6 +1375,7 @@ pub struct OverlayApp {
     pin_support: PinSupport,
     pin_lock_escapes: Vec<LockEscape>,
     pin_topology_probe: Option<PinTopologyProbe>,
+    #[cfg(not(target_os = "macos"))]
     last_pin_topology_refresh: f64,
     /// The value most recently sent to the window, so the command is sent on
     /// change rather than every frame. `None` means native code changed the
@@ -1466,6 +1464,7 @@ impl OverlayApp {
             pin_support: options.pin_support,
             pin_lock_escapes: options.pin_lock_escapes,
             pin_topology_probe: options.pin_topology_probe,
+            #[cfg(not(target_os = "macos"))]
             last_pin_topology_refresh: f64::NEG_INFINITY,
             passthrough_now: None,
             last_seen: 0.0,
@@ -1557,7 +1556,9 @@ impl OverlayApp {
         }
     }
 
-    fn refresh_pin_topology(&mut self) {
+    /// Refreshes display-dependent pin state after a native display-change event
+    /// or immediately before creating a pin.
+    pub fn refresh_pin_topology(&mut self) {
         let topology = self.pin_topology_probe.as_ref().and_then(|probe| probe());
         let Some(topology) = topology else {
             return;
@@ -1580,14 +1581,16 @@ impl OverlayApp {
                 changed.push((id.clone(), entry.surface.state().clone()));
             }
         }
+
         for (pin, state) in changed {
             self.emit(OverlayEvent::PinUpdated { pin, state });
         }
     }
 
-    fn refresh_pin_topology_if_due(&mut self, now: f64) {
+    #[cfg(not(target_os = "macos"))]
+    fn refresh_live_pin_topology_if_due(&mut self, now: f64) {
         const REFRESH_SECONDS: f64 = 1.0;
-        if now - self.last_pin_topology_refresh < REFRESH_SECONDS {
+        if self.pins.is_empty() || now - self.last_pin_topology_refresh < REFRESH_SECONDS {
             return;
         }
         self.last_pin_topology_refresh = now;
@@ -2351,7 +2354,8 @@ impl eframe::App for OverlayApp {
         let ctx = ui.ctx().clone();
         let m = Motion::from_context(&ctx);
 
-        self.refresh_pin_topology_if_due(ctx.input(|input| input.time));
+        #[cfg(not(target_os = "macos"))]
+        self.refresh_live_pin_topology_if_due(ctx.input(|input| input.time));
         self.run_commands(&ctx, &m);
         self.ingest(&m);
         self.reconcile(&ctx);

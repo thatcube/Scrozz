@@ -95,14 +95,12 @@ cancellation.
 
 ## Two things this work could not verify
 
-**1. Whether a non-activating panel can originate a drag.** The overlay is a
-borderless, non-activating always-on-top window so it never steals focus from
-what you are screenshotting. `beginDraggingSessionWithItems:event:source:` is
-documented on `NSView` without qualification, and nothing in AppKit's contract
-says the window must be key — but "not documented as forbidden" is not the same
-as "observed to work", and no test on this machine can close that gap. **If any
-drag fails to start at all, this is the first thing to suspect**, and the fix is
-to activate the panel for the duration of the drag.
+**1. Whether winit's native panel path can originate a drag.** Stable
+winit/eframe currently supplies an ordinary `NSWindow`; Scrozz deliberately does
+not runtime-convert it because doing so breaks KVO teardown. Once eframe exposes
+winit 0.31's native `NSPanel` construction,
+`beginDraggingSessionWithItems:event:source:` still needs the same real-app
+verification before non-activating drag-out can be claimed.
 
 **2. Whether any specific application accepts the drop.** That is precisely what
 the matrix above is for.

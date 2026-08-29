@@ -10,7 +10,7 @@
 
 use std::{
     sync::{Arc, Mutex, mpsc::channel},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use scrozz_core::{
@@ -57,7 +57,6 @@ const VIDEO_EDITOR_TICK: Duration = Duration::from_millis(16);
 /// Fast enough that a stop feels immediate and a finished recording's card
 /// appears at once; slow enough that an idle menu-bar app is still idle.
 const RECORDING_TICK: Duration = Duration::from_millis(50);
-const WORK_AREA_REFRESH: Duration = Duration::from_millis(250);
 
 type SharedGeometry = Arc<Mutex<OverlayGeometry>>;
 const PARKED_ROOT_ORIGIN: f32 = -100_000.0;
@@ -293,7 +292,7 @@ impl Host for Windowed {
     fn run(self: Box<Self>, app: App) -> CliResult<Report> {
         let Self {
             handle,
-            emit,
+            emit: _,
             base_geometry: _,
             geometry: _,
             display_id: _,
@@ -313,10 +312,20 @@ impl Host for Windowed {
         let pin_support = pin_support(&displays);
         let pin_lock_escapes = app.pin_lock_escapes().to_vec();
         tracing::info!(?geometry, "opening the overlay");
+        #[cfg(target_os = "macos")]
+        let display_changes = match scrozz_shell::macos::display::DisplayChangeMonitor::new() {
+            Ok(monitor) => Some(monitor),
+            Err(error) => {
+                tracing::warn!(%error, "display-change notifications are unavailable");
+                None
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let native_activity_start = scrozz_shell::macos::activity::snapshot();
 
         let options = OverlayOptions {
             geometry,
-            panel: panel_hook(native.clone()),
+            panel: Some(crate::gui::panel::hook_with_controller(native.clone())),
             probe: pointer_probe(Arc::clone(&pointer_geometry)),
             displays,
             active_display,
@@ -365,7 +374,6 @@ impl Host for Windowed {
                     overlay,
                     sink,
                     handle: reporting,
-                    emit: Some(emit),
                     selection,
                     settings: scrozz_ui::settings::SettingsWindow::default(),
                     permission: scrozz_ui::permission::PermissionWindow::default(),
@@ -383,7 +391,10 @@ impl Host for Windowed {
                     base_geometry,
                     display_scale,
                     pointer_geometry,
-                    next_work_area_refresh: Instant::now(),
+                    #[cfg(target_os = "macos")]
+                    display_changes,
+                    #[cfg(target_os = "macos")]
+                    native_activity_start,
                     pin_panels: crate::gui::panel::PinPanels::default(),
                     root_mode: RootSurfaceMode::Hidden,
                     card_arm: None,
@@ -391,6 +402,7 @@ impl Host for Windowed {
                     startup_rehide: true,
                     announced: false,
                     stopped: false,
+                    native_teardown_prepared: false,
                     drag_source,
                     active_drag: None,
                     retired_drags: Vec::new(),
@@ -445,10 +457,8 @@ fn initialize_one_shot_context(ctx: &egui::Context) {
 
 /// Runs one interactive selection in its own ordinary eframe window.
 ///
-/// The long-running app reuses its card window instead. This path deliberately
-/// skips panel conversion: the current AppKit conversion cannot be dismantled
-/// safely after winit has installed KVO, while a one-shot window must return to
-/// the caller so the selected target can be captured.
+/// The long-running app reuses its card window instead. This one-shot path keeps
+/// an ordinary winit window and never installs the retained native adapter.
 pub fn select_once(
     options: &SelectionOptions,
     cursor: CursorMode,
@@ -570,7 +580,6 @@ struct Driver {
     overlay: OverlayApp,
     sink: Arc<Mutex<Option<Report>>>,
     handle: OverlayHandle,
-    emit: Option<Emit>,
     selection: ClientOverlayController,
     settings: scrozz_ui::settings::SettingsWindow,
     permission: scrozz_ui::permission::PermissionWindow,
@@ -595,7 +604,10 @@ struct Driver {
     /// Native pixels per logical point on the display owning the card root.
     display_scale: Option<ScaleFactor>,
     pointer_geometry: SharedGeometry,
-    next_work_area_refresh: Instant,
+    #[cfg(target_os = "macos")]
+    display_changes: Option<scrozz_shell::macos::display::DisplayChangeMonitor>,
+    #[cfg(target_os = "macos")]
+    native_activity_start: scrozz_shell::macos::activity::NativeActivitySnapshot,
     pin_panels: crate::gui::panel::PinPanels,
     /// Last presentation role applied to the shared native root window.
     root_mode: RootSurfaceMode,
@@ -608,6 +620,7 @@ struct Driver {
     startup_rehide: bool,
     announced: bool,
     stopped: bool,
+    native_teardown_prepared: bool,
     drag_source: Option<NativeDragSource>,
     active_drag: Option<ActiveDrag>,
     retired_drags: Vec<DragSession>,
@@ -779,12 +792,10 @@ impl Driver {
         }
     }
 
-    /// Says what the panel conversion did, the moment it is known.
+    /// Says whether the native window owner supplied non-activating behavior.
     ///
-    /// Logged on the first tick rather than left to the final report because
-    /// the teardown described in [`Driver::logic`] can end the process before
-    /// any report is written. The one fact worth having is the one most likely
-    /// to be lost, so it is stated as soon as it exists.
+    /// Logged on the first tick so a degraded ordinary-window session is
+    /// explicit rather than silently claiming the panel contract.
     fn announce_panel(&mut self) {
         if self.announced {
             return;
@@ -803,11 +814,65 @@ impl Driver {
         }
     }
 
-    /// Whether the window was swizzled into a panel.
-    fn converted(&self) -> bool {
-        self.handle
-            .panel_report()
-            .is_some_and(|report| report.non_activating)
+    fn refresh_display_state(&mut self) {
+        let (geometry, scale) =
+            refreshed_work_area(self.base_geometry, self.display_scale, &mut self.display_id);
+        if geometry != self.base_geometry || scale != self.display_scale {
+            self.base_geometry = geometry;
+            self.display_scale = scale;
+            self.selection.set_cards_geometry(geometry);
+        }
+        self.overlay.refresh_pin_topology();
+    }
+
+    fn native_display_parameters_changed(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.display_changes
+                .as_mut()
+                .is_some_and(scrozz_shell::macos::display::DisplayChangeMonitor::changed)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    fn finish_shutdown(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        let report = self.app.report();
+        if let Ok(mut slot) = self.sink.lock() {
+            *slot = Some(report);
+        }
+        self.app.shut_down();
+    }
+
+    fn prepare_native_teardown(&mut self) {
+        if self.native_teardown_prepared {
+            return;
+        }
+        self.native_teardown_prepared = true;
+        if let Err(error) = self.color_picker.close() {
+            tracing::warn!(%error, "the system colour picker could not be ordered out");
+        }
+        self.pin_panels.prepare_for_winit_teardown();
+        if let Err(error) = self.native.prepare_for_winit_teardown() {
+            tracing::error!(%error, "the root window could not be returned to winit");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let activity =
+                scrozz_shell::macos::activity::snapshot().since(self.native_activity_start);
+            tracing::info!(
+                screen_preflights = activity.screen_preflights,
+                screen_requests = activity.screen_requests,
+                display_enumerations = activity.display_enumerations,
+                "native lifecycle activity"
+            );
+        }
     }
 
     fn desired_card_target(&self) -> CardSurfaceTarget {
@@ -943,6 +1008,9 @@ impl Driver {
             self.handle.needs_visible_surface(),
             auxiliary_open,
         );
+        if visible_surface_refresh_due(self.root_mode, mode) {
+            self.refresh_display_state();
+        }
         if mode == RootSurfaceMode::Cards {
             self.sync_card_visibility(ctx);
             return;
@@ -1170,6 +1238,12 @@ enum RootSurfaceMode {
     ArmingCards,
     Cards,
     Selector,
+}
+
+fn visible_surface_refresh_due(previous: RootSurfaceMode, next: RootSurfaceMode) -> bool {
+    matches!(next, RootSurfaceMode::Cards | RootSurfaceMode::Selector)
+        && previous != next
+        && !(previous == RootSurfaceMode::ArmingCards && next == RootSurfaceMode::Cards)
 }
 
 const fn root_surface_mode(
@@ -1423,40 +1497,11 @@ impl eframe::App for Driver {
     /// painting would be a tick that stops happening exactly when the app is
     /// doing its actual job — waiting for a hotkey.
     ///
-    /// # Why quitting can leave the process directly
+    /// # Native teardown ordering
     ///
-    /// Closing the window is the ordinary way out, and it is what happens when
-    /// the panel conversion did not run. After a conversion it aborts, and the
-    /// reason is a genuine collision rather than a bug in either party:
-    ///
-    /// - `winit` registers a KVO observer on its window for
-    ///   `effectiveAppearance` (`window_delegate.rs:753`), so it can follow the
-    ///   system theme.
-    /// - Registering a KVO observer makes the Objective-C runtime *isa-swizzle*
-    ///   the observed object into a generated `NSKVONotifying_WinitWindow`
-    ///   subclass. That is how KVO has always worked.
-    /// - The panel conversion isa-swizzles the same object again, to
-    ///   `ScrozzOverlayPanel`. The second swizzle overwrites the first, and the
-    ///   KVO machinery is severed.
-    /// - On teardown `Drop for WindowDelegate` calls
-    ///   `removeObserver:forKeyPath:`, which throws because the object is no
-    ///   longer the class KVO registered. It throws inside `dealloc`, which
-    ///   objc2 declares `extern "C"` and therefore cannot unwind, so the
-    ///   process aborts rather than reporting anything.
-    ///
-    /// The conversion itself succeeds — the window really does become a
-    /// non-activating panel, and behaves correctly for the whole session. Only
-    /// dismantling it fails. So the app quits the way a Cocoa app quits, by
-    /// leaving, after everything of its own is already closed: `shut_down` has
-    /// removed the menu-bar item, stopped the worker, closed the socket and
-    /// flushed the store, and the report is written first. The window is the
-    /// operating system's to reclaim.
-    ///
-    /// This is deliberately narrow. With `SCROZZ_GUI_PANEL=0` the conversion
-    /// does not happen and the ordinary close runs, so the clean path stays
-    /// exercised and nothing else is being masked. The real repair belongs in
-    /// `scrozz-shell`: refuse to swizzle a class whose name already begins
-    /// `NSKVONotifying_`, or preserve the KVO subclass across the change.
+    /// Winit owns the window class, delegate, and KVO registrations.
+    /// [`Self::on_exit`] stops native mutation, orders utility surfaces out, and
+    /// releases Scrozz's retains before eframe drops its viewport map.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.announce_panel();
         self.overlay.logic(ctx);
@@ -1468,14 +1513,9 @@ impl eframe::App for Driver {
         let selector_owns_the_window = self.selection.owns_surface();
         if selector_owned_the_window || selector_owns_the_window {
             self.overlay.invalidate_passthrough_cache();
-        } else if Instant::now() >= self.next_work_area_refresh {
-            self.next_work_area_refresh = Instant::now() + WORK_AREA_REFRESH;
-            let (geometry, scale) =
-                refreshed_work_area(self.base_geometry, self.display_scale, &mut self.display_id);
-            if geometry != self.base_geometry || scale != self.display_scale {
-                self.base_geometry = geometry;
-                self.display_scale = scale;
-            }
+        }
+        if self.native_display_parameters_changed() {
+            self.refresh_display_state();
         }
 
         let editor = self
@@ -1521,25 +1561,8 @@ impl eframe::App for Driver {
         }
         self.sync_root_visibility(ctx);
         if !self.stopped && tick == Tick::Stop {
-            self.stopped = true;
             self.overlay.flush_pin_states(ctx);
-            let report = self.app.report();
-            if let Ok(mut slot) = self.sink.lock() {
-                *slot = Some(report.clone());
-            }
-
-            // Before the window closes, so the menu-bar item never outlives
-            // what the user can see.
-            self.app.shut_down();
-
-            if self.converted() {
-                if let Some(emit) = self.emit.take() {
-                    emit(&report);
-                }
-                tracing::debug!("leaving without dismantling the converted panel");
-                std::process::exit(0);
-            }
-
+            self.finish_shutdown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -1622,6 +1645,11 @@ impl eframe::App for Driver {
         // over the user's whole work area — the "stray window" failure exactly.
         self.overlay.clear_color(visuals)
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.finish_shutdown();
+        self.prepare_native_teardown();
+    }
 }
 
 fn drag_origin(ctx: &egui::Context, pending: &PendingDrag) -> scrozz_core::Result<DragOrigin> {
@@ -1653,29 +1681,6 @@ fn geometry_in_viewport(mut geometry: DragGeometry, origin: egui::Pos2) -> DragG
     geometry.pointer.x -= f64::from(origin.x);
     geometry.pointer.y -= f64::from(origin.y);
     geometry
-}
-
-/// Set to `0` to leave the overlay window as `eframe` made it.
-///
-/// The conversion is what stops a capture card stealing focus (D27), so this
-/// is not a preference — it is a way to isolate the conversion when something
-/// downstream of it misbehaves, and to keep running while it is being fixed.
-pub const PANEL_ENV: &str = "SCROZZ_GUI_PANEL";
-
-/// The native panel conversion, unless it was switched off.
-fn panel_hook(controller: BehaviorController) -> Option<scrozz_ui::PanelHook> {
-    let enabled =
-        std::env::var(PANEL_ENV).map_or(true, |raw| !matches!(raw.as_str(), "0" | "false" | "no"));
-    if !enabled {
-        tracing::warn!(
-            "the panel conversion is disabled; capture cards will pull focus when clicked"
-        );
-    }
-    // Installed either way: the hook is also how the native window reaches the
-    // drag host, and that is not what this switch is about.
-    Some(crate::gui::panel::hook_with_controller_options(
-        controller, enabled,
-    ))
 }
 
 /// Where the overlay window goes.
@@ -1823,7 +1828,7 @@ fn pin_support_from(
         non_activating: matches!(capabilities.non_activating, Support::Yes),
         native_adoption: matches!(
             capabilities.backend,
-            PinBackend::MacPanel | PinBackend::WindowsToolWindow | PinBackend::X11ManagedDock
+            PinBackend::MacWindow | PinBackend::WindowsToolWindow | PinBackend::X11ManagedDock
         ),
         x11_managed_dock: matches!(capabilities.backend, PinBackend::X11ManagedDock),
         detail,
@@ -2258,6 +2263,62 @@ mod tests {
             root_surface_mode(false, true, false, true),
             RootSurfaceMode::Parked,
             "an auxiliary child gets an off-screen parent without exposing it"
+        );
+    }
+
+    #[test]
+    fn idle_and_auxiliary_surfaces_never_schedule_display_enumeration() {
+        for mode in [
+            RootSurfaceMode::Hidden,
+            RootSurfaceMode::Parked,
+            RootSurfaceMode::Cards,
+            RootSurfaceMode::Selector,
+        ] {
+            for _ in 0..240 {
+                assert!(
+                    !visible_surface_refresh_due(mode, mode),
+                    "60 seconds of an unchanged {mode:?} surface must not poll displays"
+                );
+            }
+        }
+        assert!(visible_surface_refresh_due(
+            RootSurfaceMode::Hidden,
+            RootSurfaceMode::Cards
+        ));
+        assert!(visible_surface_refresh_due(
+            RootSurfaceMode::Parked,
+            RootSurfaceMode::Selector
+        ));
+        assert!(
+            !visible_surface_refresh_due(RootSurfaceMode::ArmingCards, RootSurfaceMode::Cards),
+            "the hidden framebuffer barrier is one capture transition, not a second query"
+        );
+    }
+
+    #[test]
+    fn every_eframe_exit_returns_native_windows_before_viewport_drop() {
+        let source = include_str!("host.rs");
+        let driver = source
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .expect("Driver must implement eframe::App");
+        let on_exit = driver
+            .split("fn on_exit")
+            .nth(1)
+            .expect("Driver must own eframe teardown")
+            .split_once("\n    }")
+            .map(|(body, _)| body)
+            .expect("on_exit body");
+
+        assert!(on_exit.contains("self.finish_shutdown()"));
+        assert!(on_exit.contains("self.prepare_native_teardown()"));
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation precedes tests");
+        assert!(
+            !implementation.contains("std::process::exit(0)"),
+            "native teardown must complete instead of bypassing destructors"
         );
     }
 

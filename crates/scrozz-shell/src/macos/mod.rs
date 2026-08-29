@@ -13,6 +13,7 @@
 //! for the display list is a caller bug, but crashing the app over it is worse
 //! than reporting it.
 
+pub mod activity;
 pub mod display;
 pub mod drag;
 pub mod editor;

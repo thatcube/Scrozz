@@ -64,11 +64,12 @@ use scrozz_core::{LogicalRect, Result, ScaleFactor};
 ///
 /// # Platform reality
 ///
-/// - **macOS** — a plain `NSWindow` activates its app on click, so the capture
-///   stack would yank focus out of the user's editor. The correct construct is
-///   an `NSPanel` with `NSWindowStyleMaskNonactivatingPanel`. The selection
-///   overlay additionally needs a level above the menu bar, which is higher than
-///   winit's `WindowLevel::AlwaysOnTop` reaches.
+/// - **macOS** — the correct non-activating construct is an `NSPanel`, but stable
+///   winit/eframe cannot create one. Runtime class mutation breaks winit and
+///   AppKit KVO teardown, so Scrozz preserves the ordinary `NSWindow` identity
+///   and reports non-activation unavailable. The selection overlay additionally
+///   needs a level above the menu bar, which is higher than winit's
+///   `WindowLevel::AlwaysOnTop` reaches.
 /// - **Windows** — `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED` with
 ///   `HWND_TOPMOST`.
 /// - **Linux/X11** — the capture stack may use override-redirect, while movable

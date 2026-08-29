@@ -392,7 +392,11 @@ impl Flow {
     ///
     /// A grant is consumed only after the app first became inactive and then
     /// active again. Repainting an already-active window cannot duplicate a job.
-    pub fn application_active_changed(&mut self, active: bool, access: Access) -> Effect {
+    pub fn application_active_changed(
+        &mut self,
+        active: bool,
+        access: impl FnOnce() -> Access,
+    ) -> Effect {
         let (pending, picker, observed_inactive, system_prompt) = match self.phase {
             Phase::WaitingForSettings {
                 pending,
@@ -427,7 +431,7 @@ impl Flow {
             return Effect::None;
         }
 
-        self.resolve_access(pending, picker, access)
+        self.resolve_access(pending, picker, access())
     }
 
     /// Consumes Apple's completed one-shot capture once.
@@ -691,11 +695,11 @@ mod tests {
     fn a_system_prompt_grant_resumes_after_the_app_returns() {
         let mut flow = denied_flow(PickerAvailability::Available);
         assert_eq!(
-            flow.application_active_changed(false, Access::NotGranted),
+            flow.application_active_changed(false, || Access::NotGranted),
             Effect::None
         );
         assert!(matches!(
-            flow.application_active_changed(true, Access::Granted),
+            flow.application_active_changed(true, || Access::Granted),
             Effect::RunDirectAfterPermission(_)
         ));
     }
@@ -754,17 +758,17 @@ mod tests {
             Effect::OpenSystemSettings
         );
         assert_eq!(
-            flow.application_active_changed(true, Access::Granted),
+            flow.application_active_changed(true, || Access::Granted),
             Effect::None,
             "an already-active repaint is not a return from Settings"
         );
         assert_eq!(
-            flow.application_active_changed(false, Access::Granted),
+            flow.application_active_changed(false, || Access::Granted),
             Effect::None
         );
         let pending = capture(Invocation::Explicit);
         assert_eq!(
-            flow.application_active_changed(true, Access::Granted),
+            flow.application_active_changed(true, || Access::Granted),
             Effect::RunDirectAfterPermission(pending)
         );
     }
@@ -773,13 +777,13 @@ mod tests {
     fn a_settings_grant_is_consumed_exactly_once() {
         let mut flow = denied_flow(PickerAvailability::Available);
         flow.respond(Response::OpenSystemSettings, NOW);
-        flow.application_active_changed(false, Access::NotGranted);
+        flow.application_active_changed(false, || Access::NotGranted);
         assert!(matches!(
-            flow.application_active_changed(true, Access::Granted),
+            flow.application_active_changed(true, || Access::Granted),
             Effect::RunDirectAfterPermission(_)
         ));
         assert_eq!(
-            flow.application_active_changed(true, Access::Granted),
+            flow.application_active_changed(true, || Access::Granted),
             Effect::None
         );
     }
@@ -801,11 +805,91 @@ mod tests {
             ),
             Effect::None
         );
-        flow.application_active_changed(false, Access::Granted);
+        flow.application_active_changed(false, || Access::Granted);
         assert_eq!(
-            flow.application_active_changed(true, Access::Granted),
+            flow.application_active_changed(true, || Access::Granted),
             Effect::RunDirectAfterPermission(capture(Invocation::Explicit))
         );
+    }
+
+    #[test]
+    fn idle_and_unanswered_permission_ui_never_poll_access() {
+        let mut idle = Flow::new(None);
+        let mut idle_checks = 0;
+        for _ in 0..240 {
+            assert_eq!(
+                idle.application_active_changed(true, || {
+                    idle_checks += 1;
+                    Access::Granted
+                }),
+                Effect::None
+            );
+        }
+        assert_eq!(
+            idle_checks, 0,
+            "60 seconds of idle ticks must not query TCC"
+        );
+
+        let mut preflight = Flow::new(None);
+        preflight.begin(
+            capture(Invocation::Explicit),
+            Access::NotGranted,
+            PickerAvailability::Available,
+            NOW,
+        );
+        let mut preflight_checks = 0;
+        for _ in 0..240 {
+            assert_eq!(
+                preflight.application_active_changed(true, || {
+                    preflight_checks += 1;
+                    Access::Granted
+                }),
+                Effect::None
+            );
+        }
+        assert_eq!(
+            preflight_checks, 0,
+            "an unanswered permission choice must not query TCC"
+        );
+    }
+
+    #[test]
+    fn continue_requests_once_and_activation_refreshes_access_once() {
+        let mut flow = Flow::new(None);
+        flow.begin(
+            capture(Invocation::Explicit),
+            Access::NotGranted,
+            PickerAvailability::Available,
+            NOW,
+        );
+        assert_eq!(
+            flow.respond(Response::Continue, NOW),
+            Effect::RequestSystemAccess
+        );
+        assert_eq!(
+            flow.respond(Response::Continue, NOW),
+            Effect::None,
+            "a second click cannot emit a second system request"
+        );
+        flow.system_request_finished(Access::NotGranted);
+
+        let mut checks = 0;
+        flow.application_active_changed(false, || {
+            checks += 1;
+            Access::NotGranted
+        });
+        assert_eq!(checks, 0, "deactivation must not query TCC");
+        flow.application_active_changed(true, || {
+            checks += 1;
+            Access::NotGranted
+        });
+        for _ in 0..240 {
+            flow.application_active_changed(true, || {
+                checks += 1;
+                Access::NotGranted
+            });
+        }
+        assert_eq!(checks, 1, "one activation round trip gets one preflight");
     }
 
     #[test]

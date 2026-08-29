@@ -152,7 +152,7 @@ mod macos {
     pub fn close() -> Result<()> {
         let mtm = crate::macos::main_thread("closing the system colour picker")?;
         if NSColorPanel::sharedColorPanelExists(mtm) {
-            NSColorPanel::sharedColorPanel(mtm).close();
+            NSColorPanel::sharedColorPanel(mtm).orderOut(None);
         }
         Ok(())
     }

@@ -15,8 +15,8 @@ use crate::hotkey::{Compositor, DisplayServer, Session};
 /// Native strategy selected for pin windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinBackend {
-    /// AppKit `NSPanel`, implemented by Scrozz.
-    MacPanel,
+    /// AppKit window retained without changing winit's runtime class.
+    MacWindow,
     /// Win32 child viewport using winit's portable tool-window properties.
     WindowsToolWindow,
     /// Window-manager-managed X11 dock viewport.
@@ -101,13 +101,18 @@ impl PinCapabilities {
 
     fn mac() -> Self {
         Self {
-            backend: PinBackend::MacPanel,
+            backend: PinBackend::MacWindow,
             pin_window: Support::Yes,
             positioning: Support::Yes,
             always_on_top: Support::Yes,
             click_through: Support::Yes,
             native_opacity: Support::Yes,
-            non_activating: Support::Yes,
+            non_activating: Support::No {
+                why: "stable winit owns a KVO-observed NSWindow that cannot be safely \
+                      converted into an NSPanel at runtime",
+                remedy: "use the ordinary floating window until winit's native panel support \
+                         reaches a stable eframe release",
+            },
         }
     }
 
@@ -212,8 +217,8 @@ mod tests {
     #[test]
     fn native_platforms_and_x11_have_distinct_truthful_backends() {
         let mac = PinCapabilities::for_session(&session(DisplayServer::Quartz, Compositor::Other));
-        assert_eq!(mac.backend, PinBackend::MacPanel);
-        assert_eq!(mac.non_activating, Support::Yes);
+        assert_eq!(mac.backend, PinBackend::MacWindow);
+        assert!(!mac.non_activating.available());
         assert_eq!(mac.click_through, Support::Yes);
 
         let windows =

@@ -225,9 +225,8 @@ it after commit, captures, then restores the cards to their prior slots; only th
 new card animates. Immediate fullscreen capture leaves cards visible when the
 backend can exclude Scrozz from the output. Only one selector may own that
 lifecycle at a time. CLI one-shot
-selection uses the same bridge in an ordinary temporary window. That one-shot
-window intentionally skips reversible AppKit panel conversion, so its layering
-across Spaces and fullscreen apps still needs a native smoke run. On X11, both
+selection uses the same bridge in an ordinary temporary window. All stable-winit
+macOS viewports preserve their original runtime class and delegate. On X11, both
 hosts retain their exact override-redirect window ID, take keyboard ownership
 with `SetInputFocus` after the window becomes viewable, and restore the prior
 focus before capture begins unless the user has already focused somewhere else.
@@ -238,7 +237,7 @@ retains terminal-key ownership only until Escape key-up, then restores the arrow
 hides, releases native focus, completes the cancellation handshake, and frees the
 single-selection gate. Menu and global-hotkey routes share this state machine and
 can begin another invocation immediately after restoration.
-AppKit panel order-in/order-out animation is disabled for this utility root.
+AppKit order-in/order-out animation is disabled for this utility root.
 Without that, `isVisible` becomes false before the fade completes while
 CoreGraphics still reports the old fullscreen window; terminal outcomes now
 leave native enumeration on the next bounded window-server turn.
@@ -253,7 +252,7 @@ command.
 
 | Session | Planned host | Current selector result |
 |---|---|---|
-| macOS | Client overlay | Implemented; the long-running window switches between non-activating card and selection behavior |
+| macOS | Client overlay | Implemented with winit-owned ordinary windows; non-activating panel behavior is deferred until stable winit exposes native panel construction through eframe |
 | Windows | Client overlay | Implemented and type-checked; native focus, z-order and mixed-DPI behavior still need a real Windows session |
 | Linux/X11 | Client overlay | Implemented and type-checked, including direct focus ownership/restoration; native keyboard behavior still needs an X11 smoke run |
 | KDE/wlroots Wayland | Layer shell | Unavailable: layer-shell may be advertised, but Scrozz does not yet own a mapped layer-shell rendering surface |
@@ -364,24 +363,26 @@ These are the dangerous class: the call returns success and nothing works.
 
 ---
 
-## Resolved: overlay windows will not steal focus (macOS)
+## Safety boundary: winit owns macOS window identity
 
-The largest architectural risk in D27 was whether a capture card could be clicked
-without pulling focus out of whatever the user was typing in. A plain `NSWindow`
-activates its application on click, and eframe/winit creates exactly that.
+Winit 0.30.13 owns each `WinitWindow`, its delegate, and KVO registrations such
+as `effectiveAppearance`. AppKit can add further observers after eframe's app
+creator returns. Runtime `object_setClass` conversion to an `NSPanel` therefore
+cannot be made lifecycle-safe: it disconnects whichever KVO subclass is current,
+and a later observer removal raises an uncaught `NSRangeException` during
+teardown.
 
-**It works.** An `NSWindow` converts in place to a non-activating `NSPanel`
-(`NSWindowStyleMaskNonactivatingPanel`), verified on this machine against a real
-window: `canBecomeKeyWindow == true`, `canBecomeMainWindow == false`. `winit
-0.30.13`'s window class declares no ivars, so it is convertible by the same path,
-and the conversion is guarded by an instance-size comparison that refuses cleanly
-rather than corrupting memory if that ever stops being true.
+Scrozz never changes the class or delegate of a winit-owned window. The macOS
+adapter retains the window only while applying documented level, collection,
+opacity, sharing, cursor, and order-in/order-out properties, then drops that
+retain before eframe destroys its viewport map. This temporarily leaves capture
+cards as ordinary floating windows that may activate Scrozz when clicked.
 
-Key-ness and activation are deliberately separate: the class always answers
-`canBecomeKeyWindow` so **Escape still works**, while capture cards additionally
-set `becomesKeyOnlyIfNeeded` so a click never takes the user's keystrokes. That
-combination is what makes the Recent Captures Overlay usable *while typing* — the normal
-case, not an edge case.
+Winit's native `NSPanel` construction landed in
+[rust-windowing/winit#4035](https://github.com/rust-windowing/winit/pull/4035)
+for the 0.31 line. Scrozz can restore non-activating behavior after both winit
+0.31 and an eframe release exposing its macOS panel attribute are stable; no
+unrelated KVO or IME patch is vendored in the meantime.
 
 ---
 
@@ -396,7 +397,7 @@ before the next backing surface is allocated.
 
 | Session | Non-activation and stacking | Placement, desktops, and lock limits |
 |---|---|---|
-| macOS | Each child viewport is adopted as the same non-activating `NSPanel` used by the capture stack. Adoption is runtime-checked; a failed conversion is shown inside that pin rather than reported as success. | Native global geometry, opacity, click-through, all Spaces, and fullscreen auxiliary behavior are applied. |
+| macOS | Each child viewport retains its original winit-owned class and delegate. Non-activation is reported unavailable until eframe can request winit's native `NSPanel`; ordinary floating windows are used instead. | Native global geometry, opacity, click-through, all Spaces, and fullscreen auxiliary behavior are applied without runtime class mutation. |
 | Windows | The process-owned HWND is verified by PID plus exact title, then receives `WS_EX_NOACTIVATE`, `WS_EX_TOOLWINDOW`, `WS_EX_LAYERED`, `HWND_TOPMOST`, and a `WM_MOUSEACTIVATE -> MA_NOACTIVATE` subclass. Ambiguous lookup fails closed. | Negative virtual-desktop coordinates work. Explicit placement is disabled on mixed-DPI desktops until the Win32 topology model has one coherent global logical mapping. Windows exposes no supported API to place an ordinary app window on every virtual desktop, so pins stay on their current desktop. A no-activate pin does not promise keyboard nudges while another app owns focus. |
 | X11 | Scrozz requests a managed Dock window, ICCCM `input = false`, removes `WM_TAKE_FOCUS`, and asks for Above, Sticky, SkipTaskbar, and SkipPager. These are window-manager policy hints, not a portable focus guarantee, so the UI says so and lock remains disabled. | The shared X11 coordinate space and detected server scale are used. A WM may ignore placement, stacking, stickiness, or focus hints. Override-redirect is deliberately not used for movable pins because it breaks WM move/resize behavior. |
 | Wayland | An ordinary `xdg_toplevel` cannot promise non-activation or an always-on-top layer. Scrozz does not infer layer-shell availability from a compositor name and does not claim support until it has actually bound the advertised protocol. | `xdg-shell` has no global positioning. wlroots/KWin compositors may offer layer-shell; GNOME/Mutter does not. Until a native adapter exists, compositor window rules are the honest workaround. XWayland is an explicit crispness/fractional-scaling trade-off, never an automatic fallback. |

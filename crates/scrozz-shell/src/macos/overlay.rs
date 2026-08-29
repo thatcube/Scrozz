@@ -1,69 +1,20 @@
-//! Retrofitting a live `NSWindow` into a non-activating floating panel.
+//! Native mutation of winit-owned macOS windows.
 //!
-//! # The problem this solves
+//! Winit 0.30 registers KVO observers on each `WinitWindow`. AppKit may add
+//! further observers later. Changing that object's runtime class with
+//! `object_setClass` severs those registrations and makes delegate or view
+//! teardown throw an uncaught `NSRangeException`. Scrozz therefore preserves
+//! the exact native class and delegate for the complete winit-owned lifetime.
 //!
-//! A plain `NSWindow` **activates its application when clicked**. Scrozz's
-//! capture cards are clickable — they are dragged into other apps, annotated,
-//! dismissed — and if clicking one pulled focus, the user's cursor would jump
-//! out of the sentence they were typing. Per decision D27 that is the whole
-//! difference between a tool that lives beside your work and one that
-//! interrupts it.
-//!
-//! The AppKit construct that does not activate is `NSPanel` with
-//! `NSWindowStyleMaskNonactivatingPanel`. But eframe/winit hands us an
-//! `NSWindow`, already created, already backed by a Metal layer, already
-//! attached to an event loop. So the panel-ness has to be applied *afterwards*.
-//!
-//! # How, and why it is sound
-//!
-//! `object_setClass` — the same trick the `tauri-nspanel` plugin uses. The
-//! instance keeps its memory and its ivars; only its `isa` pointer changes, so
-//! it starts answering `NSPanel`'s methods. This is sound exactly when the new
-//! class has **the same instance layout** as the old one, which holds here
-//! because `NSPanel` declares no ivars over `NSWindow` and neither does the
-//! subclass built below.
-//!
-//! That is a fact about Apple's implementation, not a guarantee in the header,
-//! and winit is free to add ivars to its own `NSWindow` subclass at any
-//! release. So it is **checked at runtime** rather than assumed:
-//! [`make_nonactivating_panel`] compares `class_getInstanceSize` for both
-//! classes and *refuses the swizzle* if they differ, returning an explanation
-//! instead of corrupting the window. A capture stack that steals focus is a
-//! bad day; a capture stack that scribbles past the end of an object is a
-//! crash report nobody can read.
-//!
-//! # Status as of winit 0.30.13
-//!
-//! `WinitWindow` is declared with `impl DeclaredClass for WinitWindow {}` and no
-//! `type Ivars`, which means no additional storage and therefore the same
-//! instance size as `NSWindow`. The conversion is expected to succeed on a
-//! winit window, and is verified to succeed on a plain `NSWindow` by the
-//! doctest on [`make_nonactivating_panel`]. Note that winit overrides
-//! `canBecomeMainWindow` to return YES; the swizzle replaces that with the
-//! override below, which is the point.
-//!
-//! Should a future winit gain ivars, the size check turns that into a clear
-//! error at the call site rather than memory corruption — the second doctest on
-//! [`make_nonactivating_panel`] demonstrates exactly that path against a
-//! deliberately fattened subclass.
-//!
-//! # What the subclass overrides, and why each one
-//!
-//! - `canBecomeKeyWindow` → **YES**. Borderless windows return NO by default,
-//!   and a panel that cannot become key never receives a keystroke — which
-//!   would mean Escape could not cancel the selection overlay. Key status is
-//!   *not* what steals focus.
-//! - `canBecomeMainWindow` → **NO**. Main-window status is what drags the
-//!   application forward. Refusing it is half of "do not steal focus"; the
-//!   `NonactivatingPanel` style mask is the other half.
-//! - `isFloatingPanel` → **YES**. Keeps the panel above its app's ordinary
-//!   windows and out of the standard window ordering.
+//! Stable winit does not yet expose its native `NSPanel` constructor through
+//! eframe, so these windows keep ordinary activation behavior for now. All
+//! other supported native properties remain available.
 
 use std::ffi::c_void;
 
+use objc2::ClassType;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, NSObjectProtocol, Sel};
-use objc2::{ClassType, sel};
+use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationPresentationOptions, NSCursor,
     NSFloatingWindowLevel, NSNormalWindowLevel, NSPanel, NSPopUpMenuWindowLevel,
@@ -80,244 +31,6 @@ use crate::overlay::{
     AppKitRect, OverlayBehavior, OverlayCursor, OverlayLevel, OverlayReport, appkit_to_logical,
     logical_to_appkit,
 };
-
-/// Name of the runtime-built `NSPanel` subclass windows are swizzled into.
-///
-/// A `CStr` because `objc2` 0.6 registers classes by C string, and prefixed
-/// because the Objective-C runtime has one flat global namespace shared with
-/// every framework in the process.
-const PANEL_CLASS_NAME: &std::ffi::CStr = c"ScrozzOverlayPanel";
-
-extern "C" fn can_become_key(_this: &AnyObject, _sel: Sel) -> Bool {
-    Bool::YES
-}
-
-extern "C" fn can_become_main(_this: &AnyObject, _sel: Sel) -> Bool {
-    Bool::NO
-}
-
-extern "C" fn is_floating_panel(_this: &AnyObject, _sel: Sel) -> Bool {
-    Bool::YES
-}
-
-/// Registers (once) and returns the overlay panel class.
-///
-/// Idempotent: the second call finds the class already registered. All callers
-/// are main-thread-only, so there is no registration race to guard against.
-fn overlay_panel_class() -> Result<&'static AnyClass> {
-    if let Some(existing) = AnyClass::get(PANEL_CLASS_NAME) {
-        return Ok(existing);
-    }
-
-    let mut builder = ClassBuilder::new(PANEL_CLASS_NAME, NSPanel::class()).ok_or_else(|| {
-        Error::Platform(
-            "could not allocate the ScrozzOverlayPanel class; a class with that name \
-             already exists with a different superclass"
-                .to_owned(),
-        )
-    })?;
-
-    // SAFETY: each function's Rust signature matches the Objective-C method it
-    // is registered under — `(id self, SEL _cmd) -> BOOL` — and all three are
-    // overrides of existing `NSWindow` methods with exactly that shape, which
-    // `add_method` re-checks against the superclass encoding under
-    // `debug_assertions`.
-    unsafe {
-        builder.add_method(
-            sel!(canBecomeKeyWindow),
-            can_become_key as extern "C" fn(_, _) -> _,
-        );
-        builder.add_method(
-            sel!(canBecomeMainWindow),
-            can_become_main as extern "C" fn(_, _) -> _,
-        );
-        builder.add_method(
-            sel!(isFloatingPanel),
-            is_floating_panel as extern "C" fn(_, _) -> _,
-        );
-    }
-
-    Ok(builder.register())
-}
-
-/// Converts a live `NSWindow` into a non-activating floating `NSPanel`.
-///
-/// Returns a description of what was done, for [`OverlayReport::detail`].
-///
-/// # Errors
-///
-/// Returns [`Error::Platform`] if the panel class cannot be registered, or if
-/// the window's class has a different instance size to the panel subclass — in
-/// which case **nothing is modified**. The message names both sizes so the
-/// cause is diagnosable from a bug report alone.
-///
-/// # Safety
-///
-/// Must be called on the main thread, with a window that is not currently
-/// mid-`-close`. Both hold for a window owned by a live winit event loop.
-///
-/// # Verifying this on a real machine
-///
-/// The example below is the actual proof that the conversion works, and it is a
-/// doctest rather than a `#[test]` for a specific reason: libtest runs every
-/// test on a spawned thread — even under `--test-threads=1` — and AppKit
-/// windows may only be touched from the main thread. A doctest is compiled into
-/// its own `fn main`, so it runs where AppKit needs it to.
-///
-/// The window is never ordered front and the process is marked
-/// [`NSApplicationActivationPolicy::Prohibited`] before it exists, so nothing
-/// appears on screen and nothing can steal focus while the suite runs.
-///
-/// ```
-/// use objc2::runtime::NSObjectProtocol;
-/// use objc2::{ClassType, MainThreadMarker, MainThreadOnly};
-/// use objc2_app_kit::{
-///     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSPanel, NSWindow,
-///     NSWindowStyleMask,
-/// };
-/// use objc2_foundation::{NSPoint, NSRect, NSSize};
-/// use scrozz_shell::macos::overlay::make_nonactivating_panel;
-///
-/// let mtm = MainThreadMarker::new().expect("doctests run on the main thread");
-///
-/// // Belt: a prohibited app has no Dock icon and cannot become active.
-/// NSApplication::sharedApplication(mtm)
-///     .setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
-///
-/// // Braces: `defer: true` means the window server is not asked for a surface
-/// // until the window is ordered in, and it never is.
-/// let window = unsafe {
-///     NSWindow::initWithContentRect_styleMask_backing_defer(
-///         NSWindow::alloc(mtm),
-///         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
-///         NSWindowStyleMask::Borderless,
-///         NSBackingStoreType::Buffered,
-///         true,
-///     )
-/// };
-/// unsafe { window.setReleasedWhenClosed(false) };
-///
-/// assert!(!window.isKindOfClass(NSPanel::class()), "fixture starts as a plain NSWindow");
-///
-/// // SAFETY: main thread, live window, not closing.
-/// let detail = unsafe { make_nonactivating_panel(&window) }
-///     .expect("a plain NSWindow converts into a non-activating panel");
-///
-/// assert!(window.isKindOfClass(NSPanel::class()), "did not become an NSPanel: {detail}");
-/// assert!(
-///     window.styleMask().contains(NSWindowStyleMask::NonactivatingPanel),
-///     "NSWindowStyleMaskNonactivatingPanel was not applied: {detail}"
-/// );
-/// // Key delivers keystrokes; main is what makes an app frontmost. The panel
-/// // must accept the first and refuse the second.
-/// assert!(window.canBecomeKeyWindow(), "a panel that cannot be key cannot read Escape");
-/// assert!(!window.canBecomeMainWindow(), "becoming main is the focus theft this prevents");
-/// assert!(!window.isVisible(), "the fixture must never reach the screen");
-///
-/// window.close();
-/// ```
-///
-/// # What happens to a subclass that adds storage
-///
-/// winit, eframe and tauri all hand back an `NSWindow` *subclass* rather than a
-/// bare `NSWindow`, and a subclass that declares its own ivars has a larger
-/// instance size. Swizzling such an object into this panel class would leave
-/// the runtime believing the object is smaller than it is. That is refused, and
-/// the refusal is the whole reason for the size check:
-///
-/// ```
-/// use objc2::rc::Allocated;
-/// use objc2::runtime::{AnyClass, ClassBuilder, NSObjectProtocol};
-/// use objc2::{ClassType, MainThreadMarker};
-/// use objc2_app_kit::{
-///     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSPanel, NSWindow,
-///     NSWindowStyleMask,
-/// };
-/// use objc2_foundation::{NSPoint, NSRect, NSSize};
-/// use scrozz_shell::macos::overlay::make_nonactivating_panel;
-///
-/// let mtm = MainThreadMarker::new().expect("doctests run on the main thread");
-/// NSApplication::sharedApplication(mtm)
-///     .setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
-///
-/// // Stand in for a toolkit's own window subclass: one extra ivar, so eight
-/// // more bytes per instance than plain NSWindow.
-/// let fat = AnyClass::get(c"ScrozzFatWindowProbe").unwrap_or_else(|| {
-///     let mut builder = ClassBuilder::new(c"ScrozzFatWindowProbe", NSWindow::class())
-///         .expect("the probe class name is unused");
-///     builder.add_ivar::<usize>(c"scrozz_probe_storage");
-///     builder.register()
-/// });
-/// assert!(fat.instance_size() > NSWindow::class().instance_size());
-///
-/// // SAFETY: `+alloc` on a class that descends from NSWindow yields an
-/// // uninitialised NSWindow, which the inherited designated initialiser then
-/// // initialises. `defer: true` and no `orderFront:` mean it never reaches the
-/// // screen.
-/// let window = unsafe {
-///     let allocated: Allocated<NSWindow> = objc2::msg_send![fat, alloc];
-///     NSWindow::initWithContentRect_styleMask_backing_defer(
-///         allocated,
-///         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
-///         NSWindowStyleMask::Borderless,
-///         NSBackingStoreType::Buffered,
-///         true,
-///     )
-/// };
-/// unsafe { window.setReleasedWhenClosed(false) };
-///
-/// // SAFETY: main thread, live window, not closing.
-/// let outcome = unsafe { make_nonactivating_panel(&window) };
-///
-/// let error = outcome.expect_err("a larger subclass must not be swizzled");
-/// let message = error.to_string();
-/// assert!(message.contains("instance layouts differ"), "unhelpful error: {message}");
-/// assert!(message.contains("ScrozzFatWindowProbe"), "the error must name the class: {message}");
-///
-/// // And crucially: nothing was changed. The caller gets a window that still
-/// // works, merely one that will activate the app when clicked.
-/// assert!(!window.isKindOfClass(NSPanel::class()));
-/// assert!(!window.styleMask().contains(NSWindowStyleMask::NonactivatingPanel));
-///
-/// window.close();
-/// ```
-pub unsafe fn make_nonactivating_panel(window: &NSWindow) -> Result<String> {
-    // SAFETY: every Objective-C object is an `AnyObject`; this is a
-    // reinterpretation of the same pointer, not a change of provenance.
-    let object: &AnyObject = unsafe { &*std::ptr::from_ref(window).cast::<AnyObject>() };
-    let current = object.class();
-
-    let panel_class = overlay_panel_class()?;
-    let current_size = current.instance_size();
-    let panel_size = panel_class.instance_size();
-
-    if current_size != panel_size {
-        return Err(Error::Platform(format!(
-            "refusing to isa-swizzle {} ({current_size} bytes) into {} ({panel_size} bytes): \
-             the instance layouts differ, so the window would be reinterpreted as an object \
-             of the wrong size. The window keeps its original class and will activate the \
-             app when clicked.",
-            current.name().to_string_lossy(),
-            PANEL_CLASS_NAME.to_string_lossy(),
-        )));
-    }
-
-    // SAFETY: the instance sizes are equal (checked immediately above), the new
-    // class descends from `NSWindow` exactly as the old one does, and neither
-    // `NSPanel` nor `ScrozzOverlayPanel` declares an ivar, so every byte of the
-    // instance keeps its meaning.
-    let previous = unsafe { AnyObject::set_class(object, panel_class) };
-
-    // The style-mask bit only has meaning on an `NSPanel`, which is why it is
-    // set after the class change and not before.
-    window.setStyleMask(window.styleMask() | NSWindowStyleMask::NonactivatingPanel);
-
-    Ok(format!(
-        "{} -> {} (instance size {current_size} bytes, unchanged)",
-        previous.name().to_string_lossy(),
-        PANEL_CLASS_NAME.to_string_lossy(),
-    ))
-}
 
 /// Resolves an [`OverlayLevel`] to its `NSWindowLevel`.
 ///
@@ -385,7 +98,7 @@ pub fn collection_behavior(behavior: &OverlayBehavior) -> NSWindowCollectionBeha
     mask
 }
 
-/// A native macOS overlay: an `NSWindow` someone else created, retrofitted.
+/// A native macOS overlay: an `NSWindow` someone else created and still owns.
 ///
 /// Holds a strong reference to the window, so it is safe to keep across frames,
 /// but does **not** own it: dropping a `MacOverlay` neither closes nor releases
@@ -393,9 +106,7 @@ pub fn collection_behavior(behavior: &OverlayBehavior) -> NSWindowCollectionBeha
 #[derive(Debug)]
 pub struct MacOverlay {
     window: Retained<NSWindow>,
-    non_activating: bool,
     presentation_lease: Option<PresentationLease>,
-    original_class: Option<&'static AnyClass>,
 }
 
 #[derive(Debug)]
@@ -437,7 +148,8 @@ impl MacOverlay {
     ///
     /// eframe exposes native handles only for the root viewport. Pinned
     /// captures are child viewports, so their stable private titles are the
-    /// bridge that lets the app retrofit each child into its own `NSPanel`.
+    /// bridge that lets the app retain and configure each child without
+    /// changing winit's class or delegate.
     ///
     /// # Errors
     ///
@@ -451,9 +163,7 @@ impl MacOverlay {
             }
             return Ok(Some(Self {
                 window,
-                non_activating: false,
                 presentation_lease: None,
-                original_class: None,
             }));
         }
         Ok(None)
@@ -491,9 +201,7 @@ impl MacOverlay {
         })?;
         Ok(Self {
             window,
-            non_activating: false,
             presentation_lease: None,
-            original_class: None,
         })
     }
 
@@ -522,9 +230,7 @@ impl MacOverlay {
             })?;
         Ok(Self {
             window,
-            non_activating: false,
             presentation_lease: None,
-            original_class: None,
         })
     }
 
@@ -534,24 +240,8 @@ impl MacOverlay {
         &self.window
     }
 
-    /// Whether the window is now a non-activating panel.
-    ///
-    /// `false` means clicking the overlay will pull focus to Scrozz.
-    #[must_use]
-    pub const fn is_non_activating(&self) -> bool {
-        self.non_activating
-    }
-
-    /// Applies a complete overlay behaviour to the window.
-    ///
-    /// Order matters: the class change happens first, because the
-    /// `NonactivatingPanel` style-mask bit is only meaningful on an `NSPanel`,
-    /// and `setStyleMask:` on a plain `NSWindow` would silently do nothing
-    /// useful.
-    ///
-    /// A failed panel conversion is **not** an error: everything else is still
-    /// applied and the outcome is reported in the returned [`OverlayReport`],
-    /// because a floating overlay that takes focus is degraded, not broken.
+    /// Applies a complete overlay behaviour without changing winit's class or
+    /// delegate.
     ///
     /// # Errors
     ///
@@ -566,32 +256,6 @@ impl MacOverlay {
         } else if let Some(lease) = self.presentation_lease.take() {
             lease.release(mtm);
         }
-
-        if self.original_class.is_none() {
-            // SAFETY: every Objective-C object can be viewed as `AnyObject`;
-            // the returned runtime class has process lifetime.
-            let object: &AnyObject =
-                unsafe { &*std::ptr::from_ref(&*self.window).cast::<AnyObject>() };
-            let current = object.class();
-            if current.name() != PANEL_CLASS_NAME {
-                self.original_class = Some(current);
-            }
-        }
-
-        // SAFETY: we are on the main thread (checked above) and hold a strong
-        // reference to a live window.
-        let conversion = unsafe { make_nonactivating_panel(&self.window) };
-        let detail = match conversion {
-            Ok(detail) => {
-                self.non_activating = true;
-                detail
-            }
-            Err(error) => {
-                self.non_activating = false;
-                tracing::warn!(%error, "overlay will activate the app when clicked");
-                error.to_string()
-            }
-        };
 
         let window = &self.window;
         let release_key_focus = behavior.click_through && window.isKeyWindow();
@@ -611,11 +275,8 @@ impl MacOverlay {
         window.setMovable(behavior.movable);
         window.setMovableByWindowBackground(false);
 
-        // `ScrozzOverlayPanel` answers `canBecomeKeyWindow` with YES
-        // unconditionally, because a panel that can never be key can never read
-        // Escape. Whether a *click* takes key status is a separate switch, and
-        // this is it: `becomesKeyOnlyIfNeeded` defers key status until the user
-        // hits a control that actually needs typing.
+        // If a future winit/eframe release constructs a native NSPanel, this
+        // keeps click focus separate from controls that genuinely need typing.
         if let Some(panel) = window.downcast_ref::<NSPanel>() {
             panel.setBecomesKeyOnlyIfNeeded(!behavior.accepts_key);
             panel.setFloatingPanel(behavior.level >= OverlayLevel::Floating);
@@ -624,38 +285,45 @@ impl MacOverlay {
         if release_key_focus {
             // A locked pin must not keep swallowing keys after its pointer input
             // becomes transparent. Ordering it out relinquishes key status;
-            // ordering it straight back does not make a non-activating panel key.
+            // ordering it straight back leaves focus ownership with AppKit.
             window.orderOut(None);
             window.orderFrontRegardless();
         }
 
+        let non_activating = window.isKindOfClass(NSPanel::class())
+            && window
+                .styleMask()
+                .contains(NSWindowStyleMask::NonactivatingPanel);
         Ok(OverlayReport {
-            non_activating: self.non_activating,
-            detail,
+            non_activating,
+            detail: if non_activating {
+                "using the native panel class supplied by the window owner".to_owned()
+            } else {
+                "kept the winit-owned runtime class unchanged; stable winit 0.30 cannot \
+                 construct an NSPanel through eframe"
+                    .to_owned()
+            },
         })
     }
 
-    /// Restore the runtime class that winit/KVO installed before adoption.
+    /// Stops native mutation before returning the window to winit.
     ///
-    /// Child pin windows can close independently. winit removes its KVO
-    /// observer during teardown and expects the `NSKVONotifying_*` subclass it
-    /// registered to still be installed; restoring it before close prevents the
-    /// otherwise-fatal Objective-C exception.
+    /// Winit removes its KVO observers while its delegate is deallocated. Scrozz
+    /// therefore orders the surface out, restores cursor ownership, and releases
+    /// presentation state without changing the runtime class or delegate.
     pub fn restore_native_class(&mut self) -> Result<()> {
-        let _mtm = main_thread("restoring a pinned overlay window")?;
-        let Some(original) = self.original_class.take() else {
-            return Ok(());
-        };
-        let mut style = self.window.styleMask();
-        style.remove(NSWindowStyleMask::NonactivatingPanel);
-        self.window.setStyleMask(style);
-        // SAFETY: this is the exact class pointer read from this same live
-        // instance before conversion; no storage layout or provenance changes.
-        let object: &AnyObject = unsafe { &*std::ptr::from_ref(&*self.window).cast::<AnyObject>() };
-        unsafe {
-            AnyObject::set_class(object, original);
+        let mtm = main_thread("returning an overlay window to winit")?;
+        self.window
+            .setAnimationBehavior(NSWindowAnimationBehavior::None);
+        self.window.setIgnoresMouseEvents(true);
+        self.window.setAcceptsMouseMovedEvents(false);
+        if !self.window.areCursorRectsEnabled() {
+            self.window.enableCursorRects();
         }
-        self.non_activating = false;
+        self.window.orderOut(None);
+        if let Some(lease) = self.presentation_lease.take() {
+            lease.release(mtm);
+        }
         Ok(())
     }
 
@@ -763,6 +431,9 @@ impl MacOverlay {
     /// assert!(!idle.is_key);
     /// assert!(idle.ignores_mouse_events);
     /// assert!(!is_on_screen(), "a terminal overlay remained in CGWindowList");
+    /// overlay
+    ///     .restore_native_class()
+    ///     .expect("return the window to its owner before close");
     /// window.close();
     /// ```
     ///
@@ -771,10 +442,8 @@ impl MacOverlay {
     /// Returns [`Error::Platform`] if called off the main thread.
     pub fn set_visible(&mut self, visible: bool) -> Result<()> {
         let mtm = main_thread("changing overlay visibility")?;
-        // NSPanel otherwise infers a utility-window fade. During that animation
-        // `isVisible` is already false while CoreGraphics can still enumerate
-        // the old fullscreen surface, exactly the external-picker failure this
-        // method exists to prevent.
+        // Disable any utility-window fade. During an animation `isVisible` can
+        // already be false while CoreGraphics still enumerates the old surface.
         self.window
             .setAnimationBehavior(NSWindowAnimationBehavior::None);
         if visible {
@@ -875,7 +544,7 @@ impl MacOverlay {
     ///
     /// // SAFETY: the pointer names the live window `window` keeps retained for
     /// // the rest of this block.
-    /// let overlay = unsafe {
+    /// let mut overlay = unsafe {
     ///     MacOverlay::from_ns_window(Retained::as_ptr(&window).cast_mut().cast())
     /// }
     /// .expect("adopting a live NSWindow never fails");
@@ -909,6 +578,9 @@ impl MacOverlay {
     ///     "returning to Arrow must hand the window back to winit's hover-driven cursor handling"
     /// );
     ///
+    /// overlay
+    ///     .restore_native_class()
+    ///     .expect("return the window to its owner before close");
     /// window.close();
     /// ```
     ///
