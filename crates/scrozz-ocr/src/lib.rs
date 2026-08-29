@@ -247,10 +247,11 @@ impl SystemOcr {
         self.options = options;
     }
 
-    /// Whether this build has an engine integration.
+    /// Whether this build contains an OCR engine integration.
     ///
-    /// Runtime packages can still be absent on Linux; recognition and language
-    /// enumeration report that distinction as [`Error::Unsupported`].
+    /// This is the original const capability API. Call
+    /// [`Self::is_runtime_available`] when installed language models and the
+    /// selected Tesseract runtime must be checked.
     #[must_use]
     pub const fn is_available() -> bool {
         cfg!(any(
@@ -258,6 +259,50 @@ impl SystemOcr {
             target_os = "windows",
             all(target_os = "linux", feature = "tesseract")
         ))
+    }
+
+    /// Whether the engine selected for this process is currently usable.
+    ///
+    /// Linux and portable Windows probe the exact Tesseract runtime selected by
+    /// `PATH` or [`TESSERACT_DIRECTORY_ENV`] on every call, so an environment or
+    /// installation change cannot leave a stale positive answer.
+    #[must_use]
+    pub fn is_runtime_available() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::engine_name().is_ok_and(|engine| match engine {
+                "windows-media-ocr" => {
+                    windows::available_languages().is_ok_and(|languages| !languages.is_empty())
+                }
+                "tesseract" => {
+                    #[cfg(feature = "tesseract")]
+                    {
+                        tesseract::is_available()
+                    }
+                    #[cfg(not(feature = "tesseract"))]
+                    {
+                        false
+                    }
+                }
+                _ => false,
+            })
+        }
+        #[cfg(all(target_os = "linux", feature = "tesseract"))]
+        {
+            tesseract::is_available()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        )))]
+        {
+            false
+        }
     }
 
     /// Backend name suitable for diagnostics and machine output.

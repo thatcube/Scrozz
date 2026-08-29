@@ -29,7 +29,25 @@ struct CommandOutput {
 
 /// Lists the language data installed for Tesseract.
 pub fn available_languages() -> Result<Vec<String>> {
-    let output = run_tesseract(&[OsString::from("--list-langs")], None, COMMAND_TIMEOUT)?;
+    available_languages_at(std::env::var_os(TESSERACT_DIRECTORY_ENV).as_deref())
+}
+
+/// Whether the exact Tesseract runtime selected for this process is usable.
+///
+/// This deliberately probes on every call. `PATH` and
+/// [`TESSERACT_DIRECTORY_ENV`] are runtime configuration, so caching this answer
+/// would keep reporting an installation after either had changed or disappeared.
+pub fn is_available() -> bool {
+    available_languages().is_ok_and(|languages| !languages.is_empty())
+}
+
+fn available_languages_at(directory: Option<&OsStr>) -> Result<Vec<String>> {
+    let output = run_tesseract_at(
+        directory,
+        &[OsString::from("--list-langs")],
+        None,
+        COMMAND_TIMEOUT,
+    )?;
     if !output.status.success() {
         return Err(command_error("list OCR languages", &output.stderr));
     }
@@ -114,8 +132,21 @@ fn run_tesseract(
     input: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<CommandOutput> {
-    let installation =
-        tesseract_installation(std::env::var_os(TESSERACT_DIRECTORY_ENV).as_deref())?;
+    run_tesseract_at(
+        std::env::var_os(TESSERACT_DIRECTORY_ENV).as_deref(),
+        arguments,
+        input,
+        timeout,
+    )
+}
+
+fn run_tesseract_at(
+    directory: Option<&OsStr>,
+    arguments: &[OsString],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<CommandOutput> {
+    let installation = tesseract_installation(directory)?;
     let mut configured_arguments = Vec::with_capacity(arguments.len() + 2);
     if let Some(tessdata) = installation.tessdata {
         configured_arguments.extend([OsString::from("--tessdata-dir"), tessdata.into_os_string()]);
@@ -381,8 +412,9 @@ fn resolve_languages(requested: &[String], installed: &[String]) -> Result<Vec<S
         return Err(Error::Unsupported {
             what: format!("text recognition in {}", requested.join(", ")),
             why: format!(
-                "none of the requested Tesseract language models is installed. Installed \
-                 models: {}. {}",
+                "none of the installed Tesseract models matches the requested language and \
+                 script. Scrozz will not substitute a model written in another script. \
+                 Installed models: {}. {}",
                 installed_description(installed),
                 install_guidance()
             ),
@@ -475,14 +507,38 @@ fn normalize_locale(raw: &str) -> Option<String> {
     if let Some(script) = modifier
         .and_then(|modifier| modifier.split('.').next())
         .and_then(posix_script)
-        && !normalized
-            .split('-')
-            .any(|subtag| subtag.eq_ignore_ascii_case(script))
     {
-        normalized.push('-');
-        normalized.push_str(script);
+        normalized = insert_script_subtag(&normalized, script);
     }
     Some(normalized)
+}
+
+fn insert_script_subtag(tag: &str, script: &str) -> String {
+    let mut subtags = tag.split('-').map(str::to_owned).collect::<Vec<_>>();
+    let Some(language) = subtags.first() else {
+        return tag.to_owned();
+    };
+    let mut index = 1;
+    if matches!(language.len(), 2 | 3) {
+        let mut extlangs = 0;
+        while index < subtags.len()
+            && extlangs < 3
+            && subtags[index].len() == 3
+            && subtags[index]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphabetic())
+        {
+            index += 1;
+            extlangs += 1;
+        }
+    }
+    if subtags.get(index).is_some_and(|candidate| {
+        candidate.len() == 4 && candidate.bytes().all(|byte| byte.is_ascii_alphabetic())
+    }) {
+        return tag.to_owned();
+    }
+    subtags.insert(index, script.to_owned());
+    subtags.join("-")
 }
 
 fn posix_script(modifier: &str) -> Option<&'static str> {
@@ -518,21 +574,26 @@ fn first_configured_language_list<'a>(
 fn tesseract_language_aliases(tag: &str) -> Vec<String> {
     let normalized = tag.replace('_', "-").to_ascii_lowercase();
     let base = normalized.split('-').next().unwrap_or(normalized.as_str());
-    if matches!(base, "nb" | "nob" | "nn" | "nno") {
+    let script = script_subtag(&normalized);
+    if matches!(base, "no" | "nor" | "nb" | "nob" | "nn" | "nno") {
         // Tesseract follows ISO 639-2's collective Norwegian model name even
         // though BCP-47 distinguishes Bokmal and Nynorsk.
-        return vec!["nor".to_string()];
+        return match script {
+            None | Some("latn") => vec!["nor".to_string()],
+            Some(_) => Vec::new(),
+        };
     }
     if matches!(base, "zh" | "zho" | "chi") {
         let subtags = normalized.split('-').skip(1).collect::<Vec<_>>();
-        let traditional = if normalized == "chi-tra" || subtags.contains(&"hant") {
-            true
-        } else if normalized == "chi-sim" || subtags.contains(&"hans") {
-            false
-        } else {
-            subtags
+        let traditional = match script {
+            Some("hant") => true,
+            Some("hans") => false,
+            Some(_) => return Vec::new(),
+            None if normalized == "chi-tra" => true,
+            None if normalized == "chi-sim" => false,
+            None => subtags
                 .iter()
-                .any(|subtag| matches!(*subtag, "hk" | "mo" | "tw"))
+                .any(|subtag| matches!(*subtag, "hk" | "mo" | "tw")),
         };
         return vec![if traditional { "chi_tra" } else { "chi_sim" }.to_string()];
     }
@@ -542,20 +603,94 @@ fn tesseract_language_aliases(tag: &str) -> Vec<String> {
         return Vec::new();
     };
     let model = language.to_639_3();
-    let script = normalized
-        .split('-')
-        .skip(1)
-        .find(|subtag| subtag.len() == 4);
-    let script_model = match (model, script) {
-        ("aze", Some("cyrl")) => Some("aze_cyrl"),
-        ("srp", Some("latn")) => Some("srp_latn"),
-        ("uzb", Some("cyrl")) => Some("uzb_cyrl"),
+    match (model, script) {
+        // These are the script variants published by the standard Tesseract
+        // language data. A script-qualified request gets only a model whose
+        // script is known to match; the base model is not a safe fallback for
+        // the opposite variant.
+        ("aze", Some("cyrl")) => vec!["aze_cyrl".to_string()],
+        ("aze", Some("latn")) => vec!["aze".to_string()],
+        ("deu", Some("latf")) => vec!["deu_latf".to_string()],
+        ("srp", Some("cyrl")) => vec!["srp".to_string()],
+        ("srp", Some("latn")) => vec!["srp_latn".to_string()],
+        ("uzb", Some("cyrl")) => vec!["uzb_cyrl".to_string()],
+        ("uzb", Some("latn")) => vec!["uzb".to_string()],
+        (model, Some(script)) if tesseract_model_script(model) == Some(script) => {
+            vec![model.to_string()]
+        }
+        // For every other explicit script, fail closed unless the installed
+        // model itself matched the requested tag above. Language alone cannot
+        // prove script compatibility (for example, ru-Latn versus rus).
+        (_, Some(_)) => Vec::new(),
+        (_, None) => vec![model.to_string()],
+    }
+}
+
+fn script_subtag(tag: &str) -> Option<&str> {
+    let mut subtags = tag.split('-');
+    let language = subtags.next()?;
+    let mut candidate = subtags.next()?;
+
+    // BCP-47 permits up to three three-letter extlangs immediately after a
+    // two- or three-letter primary language. Script, when present, is the next
+    // field. Once region/variant/extension syntax begins, a later four-letter
+    // value is data, not Script (for example zh-CN-x-Hant).
+    if matches!(language.len(), 2 | 3) {
+        for _ in 0..3 {
+            if candidate.len() == 3 && candidate.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                candidate = subtags.next()?;
+            } else {
+                break;
+            }
+        }
+    }
+
+    (candidate.len() == 4 && candidate.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        .then_some(candidate)
+}
+
+fn tesseract_model_script(model: &str) -> Option<&'static str> {
+    match model {
+        "afr" | "aze" | "bos" | "bre" | "cat" | "ceb" | "ces" | "cos" | "cym" | "dan" | "deu"
+        | "eng" | "enm" | "epo" | "est" | "eus" | "fao" | "fil" | "fin" | "fra" | "frm" | "fry"
+        | "gla" | "gle" | "glg" | "hat" | "hrv" | "hun" | "ind" | "isl" | "ita" | "jav" | "kmr"
+        | "lat" | "lav" | "lit" | "ltz" | "mri" | "msa" | "mlt" | "nld" | "nor" | "oci" | "pol"
+        | "por" | "que" | "ron" | "slk" | "slv" | "spa" | "sqi" | "sun" | "swa" | "swe" | "tgl"
+        | "ton" | "tur" | "uzb" | "vie" | "yor" => Some("latn"),
+        "tat" => Some("latn"),
+        "bel" | "bul" | "kaz" | "kir" | "mkd" | "mon" | "rus" | "srp" | "tgk" | "ukr" => {
+            Some("cyrl")
+        }
+        "deu_latf" => Some("latf"),
+        "ara" | "fas" | "pus" | "snd" | "uig" | "urd" => Some("arab"),
+        "ell" | "grc" => Some("grek"),
+        "heb" | "yid" => Some("hebr"),
+        "hye" => Some("armn"),
+        "kat" => Some("geor"),
+        "bod" | "dzo" => Some("tibt"),
+        "chr" => Some("cher"),
+        "div" => Some("thaa"),
+        "iku" => Some("cans"),
+        "syr" => Some("syrc"),
+        "asm" | "ben" => Some("beng"),
+        "hin" | "mar" | "nep" | "san" => Some("deva"),
+        "guj" => Some("gujr"),
+        "pan" => Some("guru"),
+        "kan" => Some("knda"),
+        "khm" => Some("khmr"),
+        "lao" => Some("laoo"),
+        "mal" => Some("mlym"),
+        "mya" => Some("mymr"),
+        "ori" => Some("orya"),
+        "sin" => Some("sinh"),
+        "tam" => Some("taml"),
+        "tel" => Some("telu"),
+        "tha" => Some("thai"),
+        "amh" | "tir" => Some("ethi"),
+        "jpn" => Some("jpan"),
+        "kor" => Some("kore"),
         _ => None,
-    };
-    script_model.map_or_else(
-        || vec![model.to_string()],
-        |script_model| vec![script_model.to_string(), model.to_string()],
-    )
+    }
 }
 
 fn iso_639_2b_terminology(code: &str) -> &str {
@@ -819,15 +954,34 @@ mod tests {
     fn normalizes_host_locales_before_model_resolution() {
         assert_eq!(normalize_locale("en_US.UTF-8"), Some("en-US".to_string()));
         assert_eq!(
-            normalize_locale("sr_RS@latin.UTF-8"),
-            Some("sr-RS-Latn".to_string())
+            normalize_locale("sr_RS.UTF-8@latin"),
+            Some("sr-Latn-RS".to_string())
         );
         assert_eq!(
             normalize_locale("az_AZ.UTF-8@cyrillic"),
-            Some("az-AZ-Cyrl".to_string())
+            Some("az-Cyrl-AZ".to_string())
+        );
+        assert_eq!(
+            normalize_locale("sr_Latn_RS.UTF-8@latin"),
+            Some("sr-Latn-RS".to_string())
         );
         assert_eq!(normalize_locale("C.UTF-8"), None);
         assert_eq!(normalize_locale("POSIX"), None);
+    }
+
+    #[test]
+    fn posix_script_modifiers_select_only_compatible_models() {
+        let serbian = normalize_locale("sr_RS.UTF-8@latin").expect("Serbian locale");
+        assert_eq!(
+            resolve_languages(&[serbian], &["srp".to_string(), "srp_latn".to_string()]).unwrap(),
+            ["srp_latn"]
+        );
+
+        let azeri = normalize_locale("az_AZ.UTF-8@cyrillic").expect("Azeri locale");
+        assert_eq!(
+            resolve_languages(&[azeri], &["aze".to_string(), "aze_cyrl".to_string()]).unwrap(),
+            ["aze_cyrl"]
+        );
     }
 
     #[test]
@@ -874,9 +1028,142 @@ mod tests {
             vec!["uzb_cyrl"]
         );
         assert_eq!(
-            resolve_languages(&["sr-Latn".to_string()], &["srp".to_string()]).unwrap(),
+            resolve_languages(&["sr-Cyrl".to_string()], &["srp".to_string()]).unwrap(),
             vec!["srp"]
         );
+        assert_eq!(
+            resolve_languages(&["az-Latn".to_string()], &["aze".to_string()]).unwrap(),
+            vec!["aze"]
+        );
+        assert_eq!(
+            resolve_languages(&["uz-Latn".to_string()], &["uzb".to_string()]).unwrap(),
+            vec!["uzb"]
+        );
+    }
+
+    #[test]
+    fn explicit_scripts_never_fall_back_to_opposite_script_models() {
+        for (requested, installed) in [
+            ("sr-Latn", "srp"),
+            ("az-Cyrl", "aze"),
+            ("uz-Cyrl", "uzb"),
+            ("ru-Latn", "rus"),
+            ("nb-Cyrl", "nor"),
+            ("zh-Latn", "chi_sim"),
+        ] {
+            let error =
+                resolve_languages(&[requested.to_string()], &[installed.to_string()]).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                matches!(&error, Error::Unsupported { why, .. } if why.contains("another script")),
+                "{requested} unexpectedly selected {installed}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn bcp47_variants_are_not_mistaken_for_scripts() {
+        assert_eq!(script_subtag("de-ch-1901"), None);
+        assert_eq!(script_subtag("sr-latn-rs"), Some("latn"));
+        assert_eq!(script_subtag("zh-cn-x-hant"), None);
+        assert_eq!(script_subtag("de-de-x-latn"), None);
+        assert_eq!(
+            resolve_languages(&["de-CH-1901".to_string()], &["deu".to_string()]).unwrap(),
+            ["deu"]
+        );
+        assert_eq!(
+            resolve_languages(&["no-Latn".to_string()], &["nor".to_string()]).unwrap(),
+            ["nor"]
+        );
+        assert_eq!(
+            resolve_languages(&["nor-Latn".to_string()], &["nor".to_string()]).unwrap(),
+            ["nor"]
+        );
+        assert_eq!(
+            resolve_languages(&["zh-CN-x-Hant".to_string()], &["chi_sim".to_string()]).unwrap(),
+            ["chi_sim"]
+        );
+        assert_eq!(
+            resolve_languages(&["en-Latn".to_string()], &["eng".to_string()]).unwrap(),
+            ["eng"]
+        );
+        assert_eq!(
+            resolve_languages(&["ru-Cyrl".to_string()], &["rus".to_string()]).unwrap(),
+            ["rus"]
+        );
+        assert_eq!(
+            resolve_languages(&["sw-Latn".to_string()], &["swa".to_string()]).unwrap(),
+            ["swa"]
+        );
+        assert_eq!(
+            resolve_languages(&["mi-Latn".to_string()], &["mri".to_string()]).unwrap(),
+            ["mri"]
+        );
+        assert_eq!(
+            resolve_languages(&["yo-Latn".to_string()], &["yor".to_string()]).unwrap(),
+            ["yor"]
+        );
+        assert_eq!(
+            resolve_languages(&["tl-Latn".to_string()], &["tgl".to_string()]).unwrap(),
+            ["tgl"]
+        );
+        assert_eq!(
+            resolve_languages(&["tt-Latn".to_string()], &["tat".to_string()]).unwrap(),
+            ["tat"]
+        );
+        assert!(matches!(
+            resolve_languages(&["tt-Cyrl".to_string()], &["tat".to_string()]),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(
+            resolve_languages(&["de-Latf".to_string()], &["deu_latf".to_string()]).unwrap(),
+            ["deu_latf"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn availability_rechecks_the_selected_runtime_instead_of_caching_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-tesseract-availability-{}",
+            std::process::id()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let _ = std::fs::remove_dir_all(&root);
+        for directory in [&first, &second] {
+            std::fs::create_dir_all(directory.join("tessdata")).expect("tessdata directory");
+        }
+
+        let executable = first.join("tesseract");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'List of available languages (1):\\neng\\n'\n",
+        )
+        .expect("fake Tesseract");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("fake Tesseract metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).expect("executable fixture");
+
+        assert_eq!(
+            available_languages_at(Some(first.as_os_str())).expect("first runtime"),
+            ["eng"]
+        );
+        assert!(
+            available_languages_at(Some(second.as_os_str())).is_err(),
+            "a different configured runtime must not inherit the first probe"
+        );
+
+        std::fs::remove_file(&executable).expect("remove selected runtime");
+        assert!(
+            available_languages_at(Some(first.as_os_str())).is_err(),
+            "a removed runtime must invalidate availability immediately"
+        );
+        std::fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]

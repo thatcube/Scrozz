@@ -608,7 +608,34 @@ fn forward_to(path: &Path, argv: &[OsString]) -> CliResult<Response> {
     }
 
     let cwd = std::env::current_dir().ok();
-    exchange_until(path, &encode_request(argv, cwd.as_deref()), deadline)
+    let response = exchange_until(path, &encode_request(argv, cwd.as_deref()), deadline)?;
+    normalize_transport_rejection(argv, response)
+}
+
+fn normalize_transport_rejection(argv: &[OsString], response: Response) -> CliResult<Response> {
+    let asked_for_json = argv.iter().any(|argument| argument == OsStr::new("--json"));
+    if !asked_for_json
+        || response.code != crate::exit::Exit::IpcFailed.code()
+        || response.stream != StreamKind::Text
+    {
+        return Ok(response);
+    }
+
+    // Connection-limit rejection happens before the server has read argv, so
+    // only this calling process knows that JSON was requested. Return a local
+    // IPC error and let the ordinary Reporter emit the stable JSON envelope.
+    let bytes = if response.stderr.is_empty() {
+        &response.stdout
+    } else {
+        &response.stderr
+    };
+    let detail = String::from_utf8_lossy(bytes);
+    let detail = detail
+        .trim()
+        .strip_prefix("scrozz:")
+        .map(str::trim)
+        .unwrap_or_else(|| detail.trim());
+    Err(CliError::ipc(detail))
 }
 
 #[cfg(all(unix, test))]
@@ -1008,6 +1035,20 @@ mod tests {
         assert_eq!(response.stream, StreamKind::Json);
         assert_eq!(response.stdout, br#"{"ok":true}"#);
         assert!(response.stderr.is_empty());
+    }
+
+    #[test]
+    fn a_text_transport_rejection_is_reformatted_locally_for_json_callers() {
+        let response = Response {
+            code: crate::exit::Exit::IpcFailed.code(),
+            stream: StreamKind::Text,
+            stdout: Vec::new(),
+            stderr: b"scrozz: the IPC server is full\n".to_vec(),
+        };
+        let error = normalize_transport_rejection(&argv(&["--json", "record", "--stop"]), response)
+            .unwrap_err();
+        assert_eq!(error.exit(), crate::exit::Exit::IpcFailed);
+        assert!(error.to_string().contains("server is full"));
     }
 
     #[test]

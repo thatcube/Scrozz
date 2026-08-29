@@ -64,10 +64,66 @@ if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
 fi
 
 APP_VERSION="${SCROZZ_APP_VERSION:-0.1.0}"
-if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+if [[ ! "$APP_VERSION" =~ $SEMVER_PATTERN ]]; then
   echo "make-app-bundle: invalid CFBundleShortVersionString '$APP_VERSION'" >&2
   exit 1
 fi
+BUNDLE_SHORT_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+VERSION_WITHOUT_BUILD="${APP_VERSION%%+*}"
+if [[ "$VERSION_WITHOUT_BUILD" == *-* ]]; then
+  PRERELEASE="${VERSION_WITHOUT_BUILD#*-}"
+  IFS='.' read -r -a PRERELEASE_PARTS <<<"$PRERELEASE"
+  for part in "${PRERELEASE_PARTS[@]}"; do
+    if [[ "$part" =~ ^0[0-9]+$ ]]; then
+      echo "make-app-bundle: numeric prerelease identifiers cannot have leading zeroes: '$APP_VERSION'" >&2
+      exit 1
+    fi
+  done
+fi
+
+MINIMUM_MACOS_VERSION="12.3"
+DEPLOYMENT_TARGET="${SCROZZ_MACOS_DEPLOYMENT_TARGET:-$MINIMUM_MACOS_VERSION}"
+if [[ ! "$DEPLOYMENT_TARGET" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?$ ]]; then
+  echo "make-app-bundle: invalid macOS deployment target '$DEPLOYMENT_TARGET'" >&2
+  exit 1
+fi
+TARGET_MAJOR="${BASH_REMATCH[1]}"
+TARGET_MINOR="${BASH_REMATCH[2]}"
+if ((10#$TARGET_MAJOR < 12)) ||
+  ((10#$TARGET_MAJOR == 12 && 10#$TARGET_MINOR < 3)); then
+  echo "make-app-bundle: macOS deployment target '$DEPLOYMENT_TARGET' is below the true minimum $MINIMUM_MACOS_VERSION" >&2
+  exit 1
+fi
+
+SIGNING_MODE="${SCROZZ_SIGNING_MODE:-}"
+if [[ -z "$SIGNING_MODE" ]]; then
+  echo "make-app-bundle: SCROZZ_SIGNING_MODE must be explicit" >&2
+  echo "  expected ad-hoc-dev, developer-id-release, or external-release" >&2
+  exit 1
+fi
+SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
+case "$SIGNING_MODE" in
+  ad-hoc-dev) ;;
+  developer-id-release)
+    if [[ "$SIGN_IDENTITY" != "Developer ID Application:"* ]]; then
+      echo "make-app-bundle: developer-id-release requires" >&2
+      echo "  SCROZZ_SIGN_IDENTITY='Developer ID Application: ...'" >&2
+      exit 1
+    fi
+    ;;
+  external-release)
+    if [[ "${SCROZZ_ALLOW_EXTERNAL_SIGNING:-0}" != "1" ]]; then
+      echo "make-app-bundle: external-release requires SCROZZ_ALLOW_EXTERNAL_SIGNING=1" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "make-app-bundle: unknown SCROZZ_SIGNING_MODE '$SIGNING_MODE'" >&2
+    echo "  expected ad-hoc-dev, developer-id-release, or external-release" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "${SCROZZ_BUNDLE_VALIDATE_ONLY:-0}" == "1" ]]; then
   echo "validated: $APP"
@@ -113,7 +169,7 @@ if [[ -d assets/icons/Scrozz.icon && -x "$ICON_DEVELOPER_DIR/usr/bin/actool" ]];
     --platform macosx \
     --enable-icon-stack-fallback-generation=disabled \
     --include-all-app-icons \
-    --minimum-deployment-target 12.3 \
+    --minimum-deployment-target "$DEPLOYMENT_TARGET" \
     --output-partial-info-plist /dev/null
 fi
 
@@ -158,7 +214,11 @@ PLIST
   "$APP/Contents/Info.plist"
 
 /usr/libexec/PlistBuddy \
-  -c "Set :CFBundleShortVersionString $APP_VERSION" \
+  -c "Set :CFBundleShortVersionString $BUNDLE_SHORT_VERSION" \
+  "$APP/Contents/Info.plist"
+
+/usr/libexec/PlistBuddy \
+  -c "Set :LSMinimumSystemVersion $DEPLOYMENT_TARGET" \
   "$APP/Contents/Info.plist"
 
 # Diagnostic/legacy escape hatch only. On macOS 26 this opts back into the
@@ -168,36 +228,21 @@ if [[ "${SCROZZ_INCLUDE_LEGACY_ICON:-0}" == "1" ]]; then
     "$APP/Contents/Info.plist"
 fi
 
-SIGNING_MODE="${SCROZZ_SIGNING_MODE:-ad-hoc-dev}"
 case "$SIGNING_MODE" in
   ad-hoc-dev)
     echo "==> signing with an ad-hoc development identity"
     echo "    Screen Recording consent may be requested again after bytes change."
     codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
+    codesign --verify --strict --verbose=2 "$APP"
     ;;
   developer-id-release)
-    SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
-    if [[ "$SIGN_IDENTITY" != "Developer ID Application:"* ]]; then
-      echo "make-app-bundle: developer-id-release requires" >&2
-      echo "  SCROZZ_SIGN_IDENTITY='Developer ID Application: ...'" >&2
-      exit 1
-    fi
     echo "==> signing with Developer ID release identity '$SIGN_IDENTITY'"
     codesign --force --options runtime --timestamp \
       --sign "$SIGN_IDENTITY" "$APP"
     codesign --verify --strict --verbose=2 "$APP"
     ;;
   external-release)
-    if [[ "${SCROZZ_ALLOW_EXTERNAL_SIGNING:-0}" != "1" ]]; then
-      echo "make-app-bundle: external-release requires SCROZZ_ALLOW_EXTERNAL_SIGNING=1" >&2
-      exit 1
-    fi
     echo "==> leaving bundle unsigned for the caller's immediate release-signing step"
-    ;;
-  *)
-    echo "make-app-bundle: unknown SCROZZ_SIGNING_MODE '$SIGNING_MODE'" >&2
-    echo "  expected ad-hoc-dev, developer-id-release, or external-release" >&2
-    exit 1
     ;;
 esac
 

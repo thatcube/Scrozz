@@ -147,8 +147,8 @@ pub const fn barcode_engine(options: scrozz_ocr::BarcodeOptions) -> scrozz_ocr::
 /// Lets `scrozz ocr` fail with a platform explanation before doing any work,
 /// rather than after reading a file.
 #[must_use]
-pub const fn ocr_available() -> bool {
-    scrozz_ocr::SystemOcr::is_available()
+pub fn ocr_available() -> bool {
+    scrozz_ocr::SystemOcr::is_runtime_available()
 }
 
 /// Decodes an image file into a frame.
@@ -417,10 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn ocr_availability_matches_the_platforms_that_have_an_engine() {
+    fn ocr_availability_matches_the_selected_runtime() {
         assert_eq!(
             ocr_available(),
-            cfg!(any(target_os = "macos", target_os = "windows"))
+            scrozz_ocr::SystemOcr::is_runtime_available()
         );
     }
 

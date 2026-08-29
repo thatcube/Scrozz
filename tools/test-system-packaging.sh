@@ -17,32 +17,109 @@ fail() {
 }
 
 expect_rejected() {
-  if SCROZZ_BUNDLE_VALIDATE_ONLY=1 tools/make-app-bundle.sh "$1" >/dev/null 2>&1; then
+  if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
+    tools/make-app-bundle.sh "$1" >/dev/null 2>&1; then
     fail "unsafe bundle destination was accepted: '$1'"
   fi
 }
 
 expect_build_number_rejected() {
-  if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_BUILD_NUMBER="$1" \
+  if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
+    SCROZZ_BUILD_NUMBER="$1" \
     tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null 2>&1; then
     fail "invalid bundle build number was accepted: '$1'"
   fi
 }
 
 expect_app_version_rejected() {
-  if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_APP_VERSION="$1" \
+  if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
+    SCROZZ_APP_VERSION="$1" \
     tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null 2>&1; then
     fail "invalid bundle app version was accepted: '$1'"
   fi
 }
 
 mkdir -p "$ROOT/safe"
-SCROZZ_BUNDLE_VALIDATE_ONLY=1 \
+SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
   tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null
 SCROZZ_BUNDLE_VALIDATE_ONLY=1 \
+  SCROZZ_SIGNING_MODE=ad-hoc-dev \
   SCROZZ_BUILD_NUMBER=123.4.5 \
-  SCROZZ_APP_VERSION=1.2.3 \
+  SCROZZ_APP_VERSION=1.2.3-beta.4 \
   tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null
+
+if SCROZZ_BUNDLE_VALIDATE_ONLY=1 \
+  tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null 2>&1; then
+  fail "an implicit ad-hoc signing identity was accepted"
+fi
+if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=external-release \
+  tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null 2>&1; then
+  fail "external release signing was accepted without its explicit handoff guard"
+fi
+if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
+  SCROZZ_MACOS_DEPLOYMENT_TARGET=12.2.9 \
+  tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null 2>&1; then
+  fail "a deployment target below macOS 12.3 was accepted"
+fi
+SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
+  SCROZZ_MACOS_DEPLOYMENT_TARGET=12.10 \
+  tools/make-app-bundle.sh "$ROOT/safe/Scrozz.app" >/dev/null
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  GENERATED_APP="$ROOT/generated/Scrozz.app"
+  mkdir -p "$(dirname "$GENERATED_APP")"
+  SCROZZ_PREBUILT_BIN=/usr/bin/true \
+    SCROZZ_APP_VERSION=1.2.3-beta.4 \
+    SCROZZ_BUILD_NUMBER=123.4.5 \
+    SCROZZ_MACOS_DEPLOYMENT_TARGET=12.10 \
+    SCROZZ_SIGNING_MODE=ad-hoc-dev \
+    tools/make-app-bundle.sh "$GENERATED_APP" >/dev/null
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+    "$GENERATED_APP/Contents/Info.plist")" == "1.2.3" ]] ||
+    fail "prerelease macOS bundle did not emit a numeric short version"
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+    "$GENERATED_APP/Contents/Info.plist")" == "12.10" ]] ||
+    fail "macOS bundle did not preserve the structurally valid deployment target"
+  codesign --verify --strict "$GENERATED_APP" ||
+    fail "ad-hoc macOS fixture is not actually signed"
+
+  if SCROZZ_BIN=/usr/bin/true \
+    SCROZZ_APP_VERSION=1.2.3 \
+    SCROZZ_STAMP=validate-only \
+    SCROZZ_SIGNING_MODE=ad-hoc-dev \
+    SCROZZ_BUNDLE_VALIDATE_ONLY=1 \
+    tools/package.sh "$ROOT/validate-only-output" >/dev/null 2>&1; then
+    fail "validate-only mode emitted success-shaped macOS package metadata"
+  fi
+
+  if SCROZZ_PREBUILT_BIN=/usr/bin/true \
+    SCROZZ_APP_VERSION=1.2.3 \
+    SCROZZ_SIGNING_MODE=developer-id-release \
+    SCROZZ_SIGN_IDENTITY='Developer ID Application: Missing Scrozz Test (0000000000)' \
+    tools/make-app-bundle.sh "$GENERATED_APP" >/dev/null 2>&1; then
+    fail "a missing Developer ID identity produced a release bundle"
+  fi
+
+  PACKAGE_OUT="$ROOT/package-output"
+  SCROZZ_BIN=/usr/bin/true \
+    SCROZZ_APP_VERSION=1.2.3-beta.4 \
+    SCROZZ_STAMP=fixture \
+      SCROZZ_SIGNING_MODE=ad-hoc-dev \
+      tools/package.sh "$PACKAGE_OUT" >/dev/null
+    case "$(uname -m)" in
+      arm64|aarch64) PACKAGE_ARCH=aarch64 ;;
+      *) PACKAGE_ARCH=x86_64 ;;
+    esac
+    PACKAGE_METADATA="$PACKAGE_OUT/scrozz-1.2.3-beta.4-fixture-macos-$PACKAGE_ARCH.zip.artifact.json"
+  ruby -rjson -e '
+    metadata = JSON.parse(File.read(ARGV.fetch(0)))
+    raise "native version" unless metadata["native_package_version"] == "1.2.3"
+    raise "container signature" unless metadata["signed"] == false
+    raise "payload signature" unless metadata["payload_signed"] == true
+    raise "identity mode" unless metadata["identity_mode"] == "ad-hoc-dev"
+  ' "$PACKAGE_METADATA" ||
+    fail "macOS package metadata does not distinguish container and payload identity"
+fi
 
 expect_rejected "/"
 expect_rejected "$ROOT/safe/not-an-app"
@@ -60,7 +137,9 @@ expect_build_number_rejected "1;touch $ROOT/scrozz-injected"
 expect_build_number_rejected "1.2.3.4"
 expect_build_number_rejected "build-1"
 expect_app_version_rejected "1.2"
-expect_app_version_rejected "1.2.3-beta"
+expect_app_version_rejected "1.2.3-"
+expect_app_version_rejected "01.2.3"
+expect_app_version_rejected "1.2.3-01"
 expect_app_version_rejected '1.2.3</string><key>Injected</key><true/>'
 
 ln -s / "$ROOT/root-output"
@@ -70,6 +149,9 @@ fi
 
 grep -q 'developer-id-release)' tools/make-app-bundle.sh ||
   fail "Developer ID release signing mode is absent"
+if grep -q 'SCROZZ_SIGNING_MODE:-ad-hoc-dev' tools/make-app-bundle.sh tools/package.sh; then
+  fail "macOS packaging still silently falls back to an ad-hoc identity"
+fi
 grep -q '"signed_manifest": false' tools/package.sh ||
   fail "package metadata does not keep signing explicitly gated"
 
@@ -128,6 +210,8 @@ grep -q 'SCROZZ_MSIX_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no byte-for-byte determinism check"
 grep -q 'SCROZZ_WINDOWS_VERIFY_DETERMINISM' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no all-artifact determinism check"
+grep -Fq '".scz-{0}-{1}" -f $PID, $ScratchToken' "$WINDOWS_PACKAGE" ||
+  fail "Windows package staging can exceed legacy MAX_PATH on ordinary output roots"
 grep -q 'determinism-check.zip' "$WINDOWS_PACKAGE" ||
   fail "portable ZIP is excluded from reproducibility verification"
 grep -Fq 'function Normalize-MsixZipTimestamps' "$WINDOWS_PACKAGE" ||
@@ -160,6 +244,8 @@ grep -q 'foreach (\$PayloadFile in \$TesseractPayloadFiles)' "$WINDOWS_PACKAGE" 
   fail "portable packaging does not limit copied files to the verified manifest"
 grep -q 'Prerelease artifacts require SCROZZ_MSIX_VERSION' "$WINDOWS_PACKAGE" ||
   fail "Windows packaging permits colliding prerelease package versions"
+grep -Fq '1.2.3+build.7' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows packaging tests do not cover semantic build metadata"
 grep -Fq '$NativeMajor = $SemanticMajor + 1' "$WINDOWS_PACKAGE" ||
   fail "local stable MSIX mapping does not make the first component nonzero"
 grep -Fq '$NativeMinor = ($SemanticMinor * 256) + $SemanticPatch' \
@@ -186,6 +272,56 @@ grep -q 'SCROZZ_MSIX_SIGN_PFX' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no external PFX signing hook"
 grep -q 'SCROZZ_MSIX_SIGN_CERT_SHA1' "$WINDOWS_PACKAGE" ||
   fail "Windows package has no certificate-store signing hook"
+grep -q 'PROCESSOR_ARCHITECTURE -eq "ARM64"' "$WINDOWS_PACKAGE" ||
+  fail "Windows package does not prefer host-native ARM64 SDK tools"
+ARCHITECTURE_LOOP_LINE="$(
+  grep -n 'foreach (\$ToolArchitecture in \$ToolArchitectures)' "$WINDOWS_PACKAGE" |
+    head -n 1 | cut -d: -f1
+)"
+DIRECTORY_LOOP_LINE="$(
+  grep -n 'foreach (\$Directory in \$SdkDirectories)' "$WINDOWS_PACKAGE" |
+    head -n 1 | cut -d: -f1
+)"
+[[ -n "$ARCHITECTURE_LOOP_LINE" && -n "$DIRECTORY_LOOP_LINE" &&
+  "$ARCHITECTURE_LOOP_LINE" -lt "$DIRECTORY_LOOP_LINE" ]] ||
+  fail "Windows package searches newer x64 SDKs before older native ARM64 tools"
+grep -q 'SCROZZ_MSIX_IDENTITY_MODE' "$WINDOWS_PACKAGE" ||
+  fail "Windows package does not require an explicit identity mode"
+grep -q 'development identity values are never a release fallback' \
+  "$WINDOWS_PACKAGE" ||
+  fail "Store packaging can silently fall back to a development identity"
+grep -q 'development identity mode rejects Store identity' "$WINDOWS_PACKAGE" ||
+  fail "Development packaging can retain a production Store identity"
+grep -q 'PayloadSignature.SignerCertificate' "$WINDOWS_PACKAGE" ||
+  fail "Store packaging does not bind payload and package signing identities"
+grep -q 'PayloadHasEmbeddedSignature' "$WINDOWS_PACKAGE" ||
+  fail "Store packaging accepts catalog-only executable signatures"
+grep -q 'store-artifact-test' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact tests never produce a signed Store-mode package"
+grep -q 'New-UnsignedPeFixture' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows signing test does not create a fresh unsigned real PE fixture"
+grep -q 'IMAGE_DIRECTORY_ENTRY_SECURITY' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows signing fixture does not remove its inherited Authenticode signature"
+grep -q 'catalog-signed' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows signing fixture cannot use catalog-signed Windows PowerShell"
+grep -q 'TimeDateStamp' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows catalog-signed fixture is not detached from its catalog hash"
+grep -q 'accepted different payload and package signers' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows artifact tests do not reject a mismatched payload signer"
+grep -q -- '-DeleteKey' "$WINDOWS_PACKAGE_TEST" ||
+  fail "Windows signing test leaves its ephemeral private key behind"
+grep -q 'SCROZZ_TEST_ALLOW_UNTRUSTED_SIGNATURE' "$WINDOWS_PACKAGE" ||
+  fail "Windows signing test has no explicit self-signed certificate gate"
+grep -q 'test_signature' "$WINDOWS_PACKAGE" ||
+  fail "self-signed test artifacts are not labelled in metadata"
+grep -q 'Get-CanonicalPayloadContract' "$WINDOWS_PACKAGE" ||
+  fail "self-signed test guard compares mutable manifest serialization"
+if grep -q 'SCROZZ_TEST_ALLOW_UNTRUSTED_SIGNATURE' "$RELEASE_WORKFLOW"; then
+  fail "release packaging enables the self-signed test certificate gate"
+fi
+if grep -q 'Import-Certificate' "$WINDOWS_PACKAGE_TEST"; then
+  fail "Windows signing test writes to a trust store"
+fi
 grep -Fq "signed_manifest = \$false" "$WINDOWS_PACKAGE" ||
   fail "Windows metadata does not keep update signing human-gated"
 if ! grep -Fq -- '-PackageKind "portable"' "$WINDOWS_PACKAGE" ||
@@ -196,12 +332,13 @@ if ! grep -Fq -- '-PackageKind "msix"' "$WINDOWS_PACKAGE" ||
   ! grep -Fq -- '-OcrBackend "windows-media-ocr"' "$WINDOWS_PACKAGE"; then
   fail "MSIX metadata does not declare the Windows.Media.Ocr backend"
 fi
-grep -Fq "Test-ArtifactMetadata \$Portable \"portable\" \"tesseract\" \"1.2.3\" \"\"" \
+grep -Fq 'Test-ArtifactMetadata $Portable "portable" "tesseract" "1.2.3" "" "none"' \
   "$WINDOWS_PACKAGE_TEST" ||
   fail "Windows artifact test does not verify the portable OCR contract"
-grep -Fq "\$Msix \"msix\" \"windows-media-ocr\" \"2.515.65535.0\"" \
-  "$WINDOWS_PACKAGE_TEST" ||
+if ! grep -Fq '"2.515.65535.0"' "$WINDOWS_PACKAGE_TEST" ||
+  ! grep -Fq '"development"' "$WINDOWS_PACKAGE_TEST"; then
   fail "Windows artifact test does not pin the stable Store version mapping"
+fi
 grep -q '"2.515.42.0"' "$WINDOWS_PACKAGE_TEST" ||
   fail "Windows artifact test does not pin a compliant prerelease version"
 grep -q 'accepted a changed Tesseract runtime DLL' "$WINDOWS_PACKAGE_TEST" ||
@@ -296,8 +433,36 @@ grep -q 'cargo metadata --locked --no-deps' "$RELEASE_WORKFLOW" ||
   fail "release workflow does not read the Cargo workspace package version"
 grep -q 'Release version mismatch' "$RELEASE_WORKFLOW" ||
   fail "release workflow does not reject a tag/Cargo version mismatch"
-grep -q 'RELEASE_REF:.*inputs.tag.*github.ref_name' "$RELEASE_WORKFLOW" ||
-  fail "release tag is not passed through the step environment"
+grep -q "format('refs/tags/{0}', steps.tag.outputs.tag)" "$RELEASE_WORKFLOW" ||
+  fail "manual release checkout is not constrained to the tag namespace"
+grep -q 'ref:.*needs.resolve.outputs.sha' "$RELEASE_WORKFLOW" ||
+  fail "release jobs do not build the resolver-pinned tag commit"
+grep -q 'environment: release-signing' "$RELEASE_WORKFLOW" ||
+  fail "release signing is not protected by an approval environment"
+grep -q 'EVENT_COMMIT=.*EVENT_SHA.*\^{commit\}' "$RELEASE_WORKFLOW" ||
+  fail "tag-push releases are not pinned to the event commit"
+grep -q 'git ls-remote --tags origin' "$RELEASE_WORKFLOW" ||
+  fail "draft creation does not revalidate the remote tag"
+grep -q 'REMOTE_SHA.*PINNED_SHA' "$RELEASE_WORKFLOW" ||
+  fail "draft creation can attach artifacts to a moved tag"
+grep -q 'RELEASE_TAG_RULESET_ID' "$RELEASE_WORKFLOW" ||
+  fail "release workflow does not require immutable v* tag rules"
+grep -q 'RELEASE_RULESET_TOKEN' "$RELEASE_WORKFLOW" ||
+  fail "release workflow cannot see tag-ruleset bypass actors"
+grep -q 'environment: release-ruleset-audit' "$RELEASE_WORKFLOW" ||
+  fail "ruleset write-level readback token is not protected by approval"
+grep -q 'Administration write permission' "$RELEASE_WORKFLOW" ||
+  fail "ruleset token permissions are documented incorrectly"
+grep -q 'has("bypass_actors")' "$RELEASE_WORKFLOW" ||
+  fail "release ruleset validation treats hidden bypass actors as absent"
+grep -q 'ref_name.exclude.*length' "$RELEASE_WORKFLOW" ||
+  fail "release tag ruleset permits unprotected tag exclusions"
+grep -q 'index("update")' "$RELEASE_WORKFLOW" ||
+  fail "release tag ruleset does not forbid tag updates"
+grep -q 'index("deletion")' "$RELEASE_WORKFLOW" ||
+  fail "release tag ruleset does not forbid tag deletion"
+grep -q 'bypass_actors.*length' "$RELEASE_WORKFLOW" ||
+  fail "release tag ruleset permits bypass actors"
 if grep -q 'REF=".*inputs.tag' "$RELEASE_WORKFLOW"; then
   fail "release tag is interpolated directly into a shell program"
 fi
@@ -317,11 +482,22 @@ grep -q 'glob("\*.artifact.json")' "$RELEASE_WORKFLOW" ||
   fail "signing summary is not derived from emitted artifact metadata"
 grep -q "metadata\\['payload_signed'\\]" "$RELEASE_WORKFLOW" ||
   fail "signing summary does not distinguish payload signatures"
+grep -q 'SCROZZ_MSIX_IDENTITY_MODE=store' "$RELEASE_WORKFLOW" ||
+  fail "release packaging does not select the fail-closed Store identity mode"
+grep -q 'WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME.*must all be configured' \
+  "$RELEASE_WORKFLOW" ||
+  fail "release packaging does not require the complete Store identity"
 
 if ! ruby -ryaml - "$RELEASE_WORKFLOW" <<'RUBY'
 workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
+resolve = workflow.fetch("jobs").fetch("resolve")
 build = workflow.fetch("jobs").fetch("build")
 draft = workflow.fetch("jobs").fetch("checksums-and-draft")
+raise "ruleset audit environment" unless
+  resolve["environment"] == "release-ruleset-audit"
+raise "build does not depend on resolver" unless build["needs"] == "resolve"
+raise "signing environment" unless build["environment"] == "release-signing"
+raise "resolver outputs" unless resolve.fetch("outputs").keys.sort == %w[sha tag]
 raise "build job secrets" if build.key?("env")
 raise "draft job secrets" if draft.key?("env")
 
@@ -346,7 +522,7 @@ raise "acquisition inherits secrets" if
   build_steps.fetch("Acquire pinned Windows Tesseract payload").key?("env")
 %w[
   Sign\ and\ notarise\ macOS\ app\ (when\ configured)
-  Sign\ Windows\ executable\ (when\ configured)
+  Sign\ Windows\ executable
   Package\ portable\ ZIP\ and\ MSIX
 ].each do |name|
   raise "missing signing env for #{name}" unless

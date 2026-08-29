@@ -296,7 +296,7 @@ pub enum CardEvent {
     Save(CardId),
     /// Swiped left: throw it away.
     Dismiss(CardId),
-    /// Dragged right or up: a drag onto another application has begun.
+    /// The surface requests a native drag hand-off for this card.
     Drag(CardId),
     /// Swiped down: collapse into the capture dock (D20).
     Collapse(CardId),
@@ -338,6 +338,14 @@ pub trait CardSurface {
 
     /// Removes a card, animating it out if the surface animates.
     fn dismiss(&mut self, id: CardId);
+
+    /// Reports that `id`'s native drag finished.
+    ///
+    /// Every outcome must settle the gesture; only a separately confirmed
+    /// accepted outcome may dismiss the card and release its cached bytes.
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        let _ = (id, accepted);
+    }
 
     /// Takes one pending interaction, if there is one. Never blocks.
     ///

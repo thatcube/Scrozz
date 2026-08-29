@@ -23,6 +23,7 @@
 //! receivers are the supported concurrent path, so [`scrozz_shell::Tray::poll`]
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
+use std::sync::mpsc::TrySendError;
 use std::time::{Duration, Instant};
 
 use scrozz_shell::{
@@ -353,24 +354,38 @@ impl App {
     }
 
     fn drain_server(&mut self) -> Tick {
-        // Collected before any is served: serving needs `&mut self`, and the
-        // listener is borrowed for as long as it is being polled.
-        let mut pending = Vec::new();
-        if let Some(server) = &mut self.server {
-            for _ in 0..IPC_REQUESTS_PER_TICK {
+        for _ in 0..IPC_REQUESTS_PER_TICK {
+            let Some(permit) = self.pipeline.reserve_reply() else {
+                break;
+            };
+            let request = {
+                let Some(server) = &mut self.server else {
+                    break;
+                };
                 let Some(request) = server.poll() else {
                     break;
                 };
-                pending.push(request);
-            }
-        }
-
-        for request in pending {
+                request
+            };
             tracing::debug!(?request, "a forwarded command arrived");
-            if !self.pipeline.post(Job::Forward(request)) {
-                tracing::warn!(
-                    "an IPC request was rejected because the worker queue is full or stopped"
-                );
+            if let Err(error) = self.pipeline.try_post(Job::Forward { request, permit }) {
+                let (request, permit, reason) = match *error {
+                    TrySendError::Full(Job::Forward { request, permit }) => (
+                        request,
+                        permit,
+                        "the Scrozz worker queue is full; retry after pending work settles",
+                    ),
+                    TrySendError::Disconnected(Job::Forward { request, permit }) => (
+                        request,
+                        permit,
+                        "the Scrozz worker has stopped; restart the application and retry",
+                    ),
+                    TrySendError::Full(_) | TrySendError::Disconnected(_) => {
+                        unreachable!("only a forwarded request was submitted")
+                    }
+                };
+                tracing::warn!("{reason}");
+                self.pipeline.reject_reserved(request, reason, permit);
             }
         }
 
@@ -444,10 +459,13 @@ impl App {
                     self.note(format!("{id} dismissed"));
                 }
                 CardEvent::Drag(id) => {
-                    // The drag destination owns its copy now, and the overlay
-                    // has already removed the card from its address map.
-                    self.release_card(id);
-                    self.note(format!("{id} dragged out"));
+                    // This branch has no native drag manager. Fail closed:
+                    // reject the hand-off and retain the bytes rather than
+                    // pretending a destination accepted them.
+                    self.surface.settle_drag(id, false);
+                    self.note(format!(
+                        "{id} could not start a native drag; the capture was retained"
+                    ));
                 }
                 // Not yet routed. Collapsing belongs to the stack animation,
                 // while Open needs the annotation editor.
@@ -584,7 +602,14 @@ impl App {
         if let Some(tray) = self.tray.take() {
             tray.close();
         }
-        self.server = None;
+        if let Some(mut server) = self.server.take() {
+            for request in server.shutdown_requests() {
+                self.pipeline.reject_during_shutdown(
+                    request,
+                    "Scrozz is shutting down before this IPC request could run",
+                );
+            }
+        }
         self.pipeline.stop();
     }
 
@@ -712,6 +737,26 @@ mod tests {
     }
 
     #[test]
+    fn an_unaccepted_drag_keeps_the_card_and_reports_the_gap() {
+        let (mut app, surface) = app();
+        app.surface
+            .present(Card::placeholder(CardId(1), CaptureKind::Fullscreen))
+            .expect("recording never refuses");
+
+        surface.inject(CardEvent::Drag(CardId(1)));
+        app.tick();
+
+        assert_eq!(app.showing(), 1);
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("capture was retained")),
+            "{:?}",
+            app.notes()
+        );
+    }
+
+    #[test]
     fn copying_a_card_reaches_the_worker_and_comes_back() {
         let (mut app, surface) = app();
         surface.inject(CardEvent::Copy(CardId(42)));
@@ -775,6 +820,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_screenshot_shortcuts_are_recognised_as_taken() {
         // The negative of the test above: if this stops holding, the one above

@@ -14,10 +14,14 @@ Apps → Startup** and turn on **Scrozz**.
 
 ## Store identity and signing
 
-The checked-in defaults are development identity values. Before a Store build,
-set the exact values assigned by Partner Center:
+Every invocation must set `SCROZZ_MSIX_IDENTITY_MODE` to `development` or
+`store`. Development mode always selects the checked-in local identity values
+and rejects Store identity/signing overrides. Store mode has no fallback: it
+requires the exact Partner Center values, a signed executable, and a
+package-signing credential:
 
 ```text
+SCROZZ_MSIX_IDENTITY_MODE=store
 SCROZZ_MSIX_IDENTITY_NAME
 SCROZZ_MSIX_PUBLISHER
 SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME
@@ -43,8 +47,7 @@ prereleases use the same first two components, `GITHUB_RUN_NUMBER` in the range
 1–65534 as native build, and zero as native revision. This keeps each
 prerelease ordered and unique while reserving 65535 for the stable release.
 
-Signing is deliberately inert unless a human-approved environment supplies one
-of:
+Store mode fails unless a human-approved environment supplies one of:
 
 ```text
 SCROZZ_MSIX_SIGN_PFX
@@ -72,11 +75,13 @@ fields with `1980-01-01 00:00:00`. It does not extract, recompress, reorder, or
 rewrite entries. MakeAppx must successfully unpack the normalized package before
 it can be compared or signed.
 
-Each artifact has an adjacent `.artifact.json` file. Its `package_kind` and
-`ocr_backend` fields make the distribution contract explicit: portable means
-`tesseract`, while MSIX means `windows-media-ocr`. `signed` records the package
-container signature (and is always false for a ZIP); `payload_signed` separately
-records whether the enclosed `scrozz.exe` has a valid Authenticode signature.
+Each artifact has an adjacent `.artifact.json` file. Its `package_kind`,
+`package_identity_mode`, and `ocr_backend` fields make the distribution contract
+explicit: portable has identity mode `none` and uses `tesseract`, while MSIX is
+explicitly `development` or `store` and uses `windows-media-ocr`. `signed`
+records the package container signature (and is always false for a ZIP);
+`payload_signed` separately records whether the enclosed `scrozz.exe` has a
+valid Authenticode signature.
 
 The portable build requires `SCROZZ_TESSERACT_DIR` to be an absolute directory
 matching the checked-in `tesseract-payload.json` checksum manifest. That

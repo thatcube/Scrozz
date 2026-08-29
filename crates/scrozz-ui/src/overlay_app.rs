@@ -411,6 +411,7 @@ pub enum OverlayEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
     Dismiss(CardId),
+    SettleDrag { id: CardId, accepted: bool },
     DismissAll,
     Collapse,
     Expand,
@@ -465,6 +466,14 @@ impl OverlayHandle {
     /// Retire one card.
     pub fn dismiss(&self, id: CardId) {
         self.command(Command::Dismiss(id));
+    }
+
+    /// Reports that the platform drag for `id` has ended.
+    ///
+    /// All outcomes release the gesture. The host separately dismisses only
+    /// after a destination confirms it accepted the drop.
+    pub fn settle_drag(&self, id: CardId, accepted: bool) {
+        self.command(Command::SettleDrag { id, accepted });
     }
 
     /// Retire every card.
@@ -884,6 +893,14 @@ impl OverlayApp {
                         });
                     }
                 }
+                Command::SettleDrag { id, accepted } => {
+                    let changed = self.stack.settle_drag(id, m);
+                    if self.dragging == Some(id) {
+                        self.dragging = None;
+                        ctx.stop_dragging();
+                    }
+                    tracing::debug!(card = id.0, accepted, changed, "overlay drag settled");
+                }
                 Command::DismissAll => {
                     let ids: Vec<CardId> = self.stack.cards().iter().map(|c| c.id()).collect();
                     self.stack.dismiss_all(m);
@@ -1137,10 +1154,6 @@ impl eframe::App for OverlayApp {
                     }),
                     Intent::DragOut => {
                         self.emit(OverlayEvent::DragOut { id: release.id, at });
-                        self.emit(OverlayEvent::Dismissed {
-                            id: release.id,
-                            reason: DismissReason::DragOut,
-                        });
                     }
                     Intent::Collapse | Intent::SpringBack => {}
                 }

@@ -315,7 +315,7 @@ pub enum Intent {
 ///
 /// Each direction carries its own numbers because the directions differ in what
 /// they cost. Collapse is free to undo, so it commits sooner; dismiss and
-/// drag-out both remove a capture from the pile and ask for more conviction.
+/// drag-out both leave the pointer surface and ask for more conviction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GestureConfig {
     /// Travel that commits a leftward dismiss, in points.
@@ -1084,14 +1084,16 @@ impl CaptureStack {
         let rect = self.rect_of_resident(slot, m);
 
         match intent {
-            // Both remove the card from the pile, with the one shared exit
-            // animation (D21). What differs is what the shell does next: a
-            // dismiss is the end of the story, a drag-out hands the capture to
-            // the OS.
-            Intent::Dismiss | Intent::DragOut => {
+            // Dismissal is final here. Drag-out is only a request to the host;
+            // it cannot retire the card until a native destination accepts it.
+            Intent::Dismiss => {
                 let dir = direction.unwrap_or(Dir::Left);
                 self.retire_slot(slot, intent, dir, velocity, m);
             }
+            // A gesture has asked the host to begin a native drag, but no
+            // destination owns the bytes yet. Keep the card resident until the
+            // host reports acceptance and dismisses it explicitly.
+            Intent::DragOut => self.spring_back(slot, m),
             Intent::Collapse => {
                 self.spring_back(slot, m);
                 self.dock.collapse(m);
@@ -1106,6 +1108,29 @@ impl CaptureStack {
             rect,
             velocity,
         })
+    }
+
+    /// Ends `id`'s drag from outside the pointer gesture.
+    ///
+    /// Native drag loops can consume the mouse-up entirely. Naming the card
+    /// prevents a late outcome from cancelling a newer drag on another card.
+    /// Returns whether a held/displaced state actually changed.
+    pub fn settle_drag(&mut self, id: CardId, m: &Motion) -> bool {
+        let mut changed = false;
+        if self.drag.as_ref().is_some_and(|drag| drag.id == id) {
+            self.drag = None;
+            changed = true;
+        }
+        if let Some(slot) = self.slot_of(id)
+            && self
+                .cards
+                .get(slot)
+                .is_some_and(|card| card.drag.is_some() || card.lifted)
+        {
+            self.spring_back(slot, m);
+            changed = true;
+        }
+        changed
     }
 
     /// Abandons a drag without acting on it — a cancelled gesture, a lost

@@ -1319,7 +1319,9 @@ mod tests {
         }
         let err = run(&["scrozz", "ocr", "--capture", "abc"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Unsupported);
-        assert!(err.to_string().contains("no system recogniser"), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("no OCR engine"), "{message}");
+        assert!(message.contains("tesseract"), "{message}");
     }
 
     #[test]

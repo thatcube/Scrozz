@@ -87,6 +87,18 @@ impl Request {
         (command, self.into_reply(response))
     }
 
+    /// Converts an admitted request into an explicit framed IPC rejection.
+    ///
+    /// Queue saturation happens after the socket and request have already been
+    /// accepted. Dropping `self` there would make the client observe an empty
+    /// response rather than a reason it can retry.
+    pub fn reject(mut self, message: impl Into<String>) -> Reply {
+        let error = CliError::ipc(message.into());
+        self.preflight = Some(rejection_response(&self.argv, &error));
+        let (_, reply) = self.execute();
+        reply
+    }
+
     #[cfg(unix)]
     fn into_reply(self, response: Response) -> Reply {
         Reply {
@@ -119,7 +131,13 @@ pub struct Reply {
 impl Reply {
     /// Writes the answer without occupying the capture worker.
     #[cfg(unix)]
-    pub fn send(mut self) {
+    pub fn send(self) {
+        self.send_until(None);
+    }
+
+    /// Writes the answer, also respecting one shared shutdown deadline.
+    #[cfg(unix)]
+    pub(crate) fn send_until(mut self, shutdown_deadline: Option<Instant>) {
         use std::{
             io::{ErrorKind, Write},
             net::Shutdown,
@@ -132,7 +150,8 @@ impl Reply {
             return;
         }
 
-        let deadline = Instant::now() + RESPONSE_DEADLINE;
+        let own_deadline = Instant::now() + RESPONSE_DEADLINE;
+        let deadline = shutdown_deadline.map_or(own_deadline, |shared| shared.min(own_deadline));
         let mut written = 0;
         while written < self.bytes.len() {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -168,6 +187,14 @@ impl Reply {
     /// No listener exists on this platform, so no response can be pending.
     #[cfg(not(unix))]
     pub const fn send(self) {}
+
+    #[cfg(not(unix))]
+    pub(crate) const fn send_until(self, _shutdown_deadline: Option<std::time::Instant>) {}
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test(stream: std::os::unix::net::UnixStream, bytes: Vec<u8>) -> Self {
+        Self { stream, bytes }
+    }
 }
 
 /// Executes a forwarded argument vector, exactly as a local run would.
@@ -256,6 +283,32 @@ fn response_for_error(cli: &Cli, slug: &str, error: &CliError) -> Response {
         json(code, line(error_envelope(slug, error).to_compact_string()))
     } else {
         stderr(code, error.to_human())
+    }
+}
+
+fn rejection_response(argv: &[OsString], error: &CliError) -> Response {
+    use clap::Parser as _;
+
+    let mut with_argv0 = Vec::with_capacity(argv.len() + 1);
+    with_argv0.push(OsString::from("scrozz"));
+    with_argv0.extend_from_slice(argv);
+    if let Ok(cli) = Cli::try_parse_from(&with_argv0) {
+        let slug = cli
+            .command
+            .as_ref()
+            .map_or_else(|| "gui".to_owned(), Command::slug);
+        return response_for_error(&cli, &slug, error);
+    }
+
+    // A malformed command still gets the output shape it explicitly asked
+    // for; the stable fallback slug identifies the transport layer.
+    if argv.iter().any(|argument| argument == "--json") {
+        json(
+            error.exit().code(),
+            line(error_envelope("ipc", error).to_compact_string()),
+        )
+    } else {
+        stderr(error.exit().code(), error.to_human())
     }
 }
 
@@ -387,6 +440,26 @@ impl Pending {
 }
 
 impl Server {
+    #[cfg(unix)]
+    fn poll_pending(&mut self) -> Option<Request> {
+        let pending_budget = self.pending.len().min(PENDING_BUDGET);
+        for _ in 0..pending_budget {
+            let mut pending = self
+                .pending
+                .pop_front()
+                .expect("the pending budget was derived from the queue length");
+            match pending.advance() {
+                PendingProgress::Waiting => self.pending.push_back(pending),
+                PendingProgress::Drop => {}
+                PendingProgress::Ready => return Some(parse_request(pending)),
+                PendingProgress::Reject(message) => {
+                    return Some(rejected_request(pending.stream, message));
+                }
+            }
+        }
+        None
+    }
+
     /// Binds the endpoint, taking over a stale socket if one is left behind.
     ///
     /// # Errors
@@ -477,6 +550,14 @@ impl Server {
     pub fn poll(&mut self) -> Option<Request> {
         use std::io::ErrorKind;
 
+        // Existing accepted sockets are always advanced before more are
+        // accepted. Otherwise a stream of overflow connections could keep
+        // returning early and prevent the five-second deadline on admitted
+        // requests from ever being observed.
+        if let Some(request) = self.poll_pending() {
+            return Some(request);
+        }
+
         for _ in 0..ACCEPT_BUDGET {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -484,8 +565,13 @@ impl Server {
                         tracing::warn!(
                             "refusing an IPC connection because {MAX_PENDING} are already pending"
                         );
-                        drop(stream);
-                        continue;
+                        return Some(rejected_request(
+                            stream,
+                            format!(
+                                "the IPC server already has {MAX_PENDING} incomplete requests; \
+                                 retry after they settle"
+                            ),
+                        ));
                     }
                     if let Err(error) = stream.set_nonblocking(true) {
                         tracing::warn!("could not make an IPC connection nonblocking: {error}");
@@ -504,23 +590,7 @@ impl Server {
                 }
             }
         }
-
-        let pending_budget = self.pending.len().min(PENDING_BUDGET);
-        for _ in 0..pending_budget {
-            let mut pending = self
-                .pending
-                .pop_front()
-                .expect("the pending budget was derived from the queue length");
-            match pending.advance() {
-                PendingProgress::Waiting => self.pending.push_back(pending),
-                PendingProgress::Drop => {}
-                PendingProgress::Ready => return Some(parse_request(pending)),
-                PendingProgress::Reject(message) => {
-                    return Some(rejected_request(pending.stream, message));
-                }
-            }
-        }
-        None
+        self.poll_pending()
     }
 
     /// Nothing arrives without a listener.
@@ -534,6 +604,26 @@ impl Server {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Converts every accepted, unsettled socket into a framed shutdown reply.
+    #[cfg(unix)]
+    pub fn shutdown_requests(&mut self) -> Vec<Request> {
+        self.pending
+            .drain(..)
+            .map(|pending| {
+                rejected_request(
+                    pending.stream,
+                    "Scrozz is shutting down before this IPC request could run".to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// No listener exists on this platform, so no sockets need settlement.
+    #[cfg(not(unix))]
+    pub fn shutdown_requests(&mut self) -> Vec<Request> {
+        Vec::new()
     }
 }
 
@@ -837,6 +927,23 @@ mod tests {
         assert!(body.ends_with('\n'), "{body}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_admitted_request_can_be_rejected_with_a_complete_frame() {
+        use std::{io::Read as _, os::unix::net::UnixStream};
+
+        let (server, mut client) = UnixStream::pair().expect("socket pair");
+        rejected_request(server, "the worker queue is full".to_owned())
+            .reject("the worker queue is full")
+            .send();
+
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).expect("read rejection");
+        let response = ipc::parse_response(&wire).expect("framed rejection");
+        assert_eq!(response.code, crate::exit::Exit::IpcFailed.code());
+        assert!(String::from_utf8_lossy(&response.stderr).contains("worker queue is full"));
+    }
+
     #[test]
     fn a_non_forwardable_command_is_rejected_before_execution() {
         let (_, response) = run(&argv(&["capture", "--dry-run"]), None);
@@ -932,8 +1039,134 @@ mod tests {
                 "the socket should exist while bound"
             );
         }
+
         assert!(!path.exists(), "the socket should be gone after the drop");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_admitted_json_request_gets_a_json_overload_frame() {
+        use std::{io::Read as _, os::unix::net::UnixStream};
+
+        let (server, mut client) = UnixStream::pair().expect("socket pair");
+        Request {
+            argv: argv(&["--json", "record", "--stop"]),
+            cwd: None,
+            preflight: None,
+            stream: server,
+        }
+        .reject("the worker queue is full")
+        .send();
+
+        let mut wire = Vec::new();
+        client.read_to_end(&mut wire).expect("read rejection");
+        let response = ipc::parse_response(&wire).expect("framed rejection");
+        assert_eq!(response.code, crate::exit::Exit::IpcFailed.code());
+        assert_eq!(response.stream, StreamKind::Json);
+        assert!(response.stderr.is_empty());
+        let body = String::from_utf8(response.stdout).expect("JSON response");
+        assert!(body.contains("\"ok\":false"), "{body}");
+        assert!(body.contains("\"command\":\"record.stop\""), "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overflow_rejection_does_not_starve_admitted_deadlines() {
+        use std::{
+            io::Read as _,
+            os::unix::net::UnixStream,
+            time::{Duration, Instant},
+        };
+
+        let dir = scratch("overflow-liveness");
+        let path = dir.join("live.sock");
+        let mut server = Server::bind_at(path.clone()).expect("binding");
+        let mut admitted_clients = Vec::new();
+        for _ in 0..MAX_PENDING {
+            let (stream, client) = UnixStream::pair().expect("socket pair");
+            stream
+                .set_nonblocking(true)
+                .expect("nonblocking server end");
+            server.pending.push_back(Pending {
+                stream,
+                raw: Vec::new(),
+                accepted: Instant::now(),
+            });
+            admitted_clients.push(client);
+        }
+
+        let mut overflow_client = UnixStream::connect(&path).expect("overflow connection");
+        let overflow = server.poll().expect("framed overflow rejection");
+        assert!(overflow.preflight.is_some());
+        overflow.serve();
+        let mut wire = Vec::new();
+        overflow_client
+            .read_to_end(&mut wire)
+            .expect("read overflow rejection");
+        let response = ipc::parse_response(&wire).expect("overflow response frame");
+        assert!(
+            String::from_utf8_lossy(&response.stderr).contains("incomplete requests"),
+            "{response:?}"
+        );
+
+        server
+            .pending
+            .front_mut()
+            .expect("admitted request")
+            .accepted = Instant::now() - Duration::from_secs(6);
+        let _queued_overflow = UnixStream::connect(&path).expect("second overflow connection");
+        let expired = server
+            .poll()
+            .expect("the admitted deadline must win over new overflow");
+        let diagnostic = expired
+            .preflight
+            .as_ref()
+            .map(|response| String::from_utf8_lossy(&response.stderr).into_owned())
+            .unwrap_or_default();
+        assert!(diagnostic.contains("did not complete within 5 seconds"));
+        expired.serve();
+
+        drop(admitted_clients);
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_turns_every_accepted_socket_into_a_framed_rejection() {
+        use std::{io::Read as _, os::unix::net::UnixStream, time::Instant};
+
+        let dir = scratch("shutdown-pending");
+        let path = dir.join("live.sock");
+        let mut server = Server::bind_at(path).expect("binding");
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let (stream, client) = UnixStream::pair().expect("socket pair");
+            server.pending.push_back(Pending {
+                stream,
+                raw: Vec::new(),
+                accepted: Instant::now(),
+            });
+            clients.push(client);
+        }
+
+        let requests = server.shutdown_requests();
+        assert_eq!(requests.len(), clients.len());
+        assert!(server.pending.is_empty());
+        for request in requests {
+            request.serve();
+        }
+        for mut client in clients {
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).expect("read shutdown reply");
+            let response = ipc::parse_response(&wire).expect("shutdown response frame");
+            assert_eq!(response.code, crate::exit::Exit::IpcFailed.code());
+            assert!(String::from_utf8_lossy(&response.stderr).contains("shutting down"));
+        }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]

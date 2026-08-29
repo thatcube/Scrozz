@@ -116,6 +116,13 @@ impl CardSurface for OverlayCards {
         self.forget(id);
     }
 
+    fn settle_drag(&mut self, id: CardId, accepted: bool) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .settle_drag(scrozz_ui::stack::CardId(theirs), accepted);
+        }
+    }
+
     fn poll(&mut self) -> Option<CardEvent> {
         // Anything left from the last batch first: the overlay's ordering is
         // the user's gesture order, and reordering it would let a dismiss
@@ -146,15 +153,10 @@ impl CardSurface for OverlayCards {
                     }
                 }
                 OverlayEvent::Dismissed { id, reason } => {
-                    if let Some(ours) = self.mapped.get(&id.0).copied() {
-                        // A drag that left the pile has already delivered the
-                        // file to wherever it was dropped. Treating it as a
-                        // plain dismissal would be right, but saying which it
-                        // was lets the pipeline release the bytes either way.
-                        out.push(match reason {
-                            DismissReason::DragOut => CardEvent::Drag(ours),
-                            _ => CardEvent::Dismiss(ours),
-                        });
+                    if let Some(ours) = self.mapped.get(&id.0).copied()
+                        && let Some(event) = dismissed_event(ours, reason)
+                    {
+                        out.push(event);
                         self.forget(ours);
                     }
                 }
@@ -173,7 +175,8 @@ impl CardSurface for OverlayCards {
                         out.push(CardEvent::Open(ours));
                     }
                 }
-                OverlayEvent::DragStarted { id, .. } | OverlayEvent::DragOut { id, .. } => {
+                OverlayEvent::DragStarted { .. } => {}
+                OverlayEvent::DragOut { id, .. } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         out.push(CardEvent::Drag(ours));
                     }
@@ -220,6 +223,15 @@ impl CardSurface for OverlayCards {
         } else {
             "scrozz-ui overlay (no window yet)".to_owned()
         }
+    }
+}
+
+const fn dismissed_event(ours: CardId, reason: DismissReason) -> Option<CardEvent> {
+    match reason {
+        // Gesture completion is not proof that a native destination accepted
+        // the bytes. Preserve both mapping and cache until the host settles it.
+        DismissReason::DragOut => None,
+        _ => Some(CardEvent::Dismiss(ours)),
     }
 }
 
@@ -288,6 +300,22 @@ mod tests {
         assert_eq!(surface.pending.len(), 2);
         assert_eq!(surface.pending[0], CardId(7));
         assert_eq!(surface.pending[1], CardId(8));
+    }
+
+    #[test]
+    fn drag_out_dismissal_cannot_release_ownership() {
+        let ours = CardId(9);
+        assert_eq!(dismissed_event(ours, DismissReason::DragOut), None);
+        assert_eq!(
+            dismissed_event(ours, DismissReason::Swipe),
+            Some(CardEvent::Dismiss(ours))
+        );
+
+        let source = include_str!("overlay.rs");
+        assert!(
+            source.contains("DismissReason::DragOut => None"),
+            "drag-out dismissal must not become a cache-release event"
+        );
     }
 
     #[test]

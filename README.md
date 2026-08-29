@@ -107,7 +107,8 @@ that step cleanly without it.
 ```bash
 git clone https://github.com/thatcube/scrozz.git
 cd scrozz
-tools/make-app-bundle.sh          # builds and installs /Applications/Scrozz.app
+SCROZZ_SIGNING_MODE=ad-hoc-dev tools/make-app-bundle.sh
+# builds and installs /Applications/Scrozz.app with an explicit local identity
 open /Applications/Scrozz.app
 ```
 

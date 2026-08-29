@@ -8,17 +8,13 @@
 # "Publish release" after looking at what is in it.
 #
 # ---------------------------------------------------------------------------
-# Signing is scaffolded, not wired up
+# Signing policy
 # ---------------------------------------------------------------------------
-# Every signing step below is gated on a secret being present and is skipped
-# with a notice when it is not. No credential is invented, committed, or
-# implied to exist. The repository secrets Brandon must create himself, if and
-# when he wants signed builds, are listed in each step's comment and summarised
-# in the `checksums-and-draft` job's final output.
-#
-# Until then this workflow produces working *unsigned* binaries, which macOS
-# Gatekeeper and Windows SmartScreen will both complain about. That is the
-# correct state for a project that has not yet decided to pay for certificates.
+# macOS can emit an explicitly unsigned external-signing handoff when its
+# secrets are absent. Windows release artifacts fail closed: the executable,
+# Store identity (including its display name), and MSIX signature must agree.
+# No credential is invented, committed, or silently replaced by a development
+# identity.
 name: Release
 
 on:
@@ -47,11 +43,113 @@ defaults:
     shell: bash
 
 jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    # GitHub hides ruleset bypass actors without Administration write access.
+    # Keep that powerful readback token in this separately approved environment;
+    # the workflow uses it only for GET and never mutates repository settings.
+    environment: release-ruleset-audit
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Validate release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error title=Invalid release tag::$RELEASE_TAG is not a supported version tag."
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            PRERELEASE="${RELEASE_TAG#*-}"
+            IFS='.' read -r -a PRERELEASE_PARTS <<<"$PRERELEASE"
+            for part in "${PRERELEASE_PARTS[@]}"; do
+              if [[ "$part" =~ ^0[0-9]+$ ]]; then
+                echo "::error title=Invalid release tag::Numeric prerelease identifiers cannot have leading zeroes: $RELEASE_TAG"
+                exit 1
+              fi
+            done
+          fi
+          echo "tag=$RELEASE_TAG" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ format('refs/tags/{0}', steps.tag.outputs.tag) }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin release source
+        id: source
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [[ "$SHA" != "$TAG_SHA" ]]; then
+            echo "::error title=Release tag moved::Checkout $SHA does not match tag commit $TAG_SHA."
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            EVENT_COMMIT="$(git rev-parse "$EVENT_SHA^{commit}")"
+            if [[ "$EVENT_COMMIT" != "$TAG_SHA" ]]; then
+              echo "::error title=Release tag moved::The push event named $EVENT_COMMIT, but $RELEASE_TAG now resolves to $TAG_SHA."
+              exit 1
+            fi
+          fi
+          echo "sha=$SHA" >>"$GITHUB_OUTPUT"
+
+      - name: Require immutable release-tag ruleset
+        env:
+          RULESET_ID: ${{ vars.RELEASE_TAG_RULESET_ID }}
+          RULESET_TOKEN: ${{ secrets.RELEASE_RULESET_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RULESET_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=Release tag ruleset missing::Set repository variable RELEASE_TAG_RULESET_ID to an active tag ruleset that forbids updates/deletions of refs/tags/v* with no bypass actors."
+            exit 1
+          fi
+          if [[ -z "$RULESET_TOKEN" ]]; then
+            echo "::error title=Release ruleset token missing::The release-ruleset-audit environment secret RELEASE_RULESET_TOKEN needs Administration write permission because GitHub hides bypass actors from read-level callers. This workflow uses it only for GET."
+            exit 1
+          fi
+          RULESET="$(
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer $RULESET_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets/$RULESET_ID"
+          )"
+          jq -e '
+            .target == "tag" and
+            .enforcement == "active" and
+            has("bypass_actors") and
+            (.bypass_actors | length) == 0 and
+            (.conditions.ref_name.include | index("refs/tags/v*")) != null and
+            (.conditions.ref_name.exclude | length) == 0 and
+            ([.rules[].type] | index("update")) != null and
+            ([.rules[].type] | index("deletion")) != null
+          ' <<<"$RULESET" >/dev/null || {
+            echo "::error title=Release tags are mutable::Ruleset $RULESET_ID must actively block updates and deletion of refs/tags/v* without bypass actors."
+            exit 1
+          }
+
   # ---------------------------------------------------------------------------
   # Build one release artefact per platform.
   # ---------------------------------------------------------------------------
   build:
     name: Build — ${{ matrix.name }}
+    needs: resolve
+    # Configure this environment with a required reviewer before adding signing
+    # secrets. No unapproved job can then reach private release identities.
+    environment: release-signing
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -83,7 +181,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust ${{ env.RUST_VERSION }}
         uses: dtolnay/rust-toolchain@stable
@@ -104,7 +203,7 @@ jobs:
       - name: Determine version
         id: version
         env:
-          RELEASE_REF: ${{ inputs.tag || github.ref_name }}
+          RELEASE_REF: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           REF="$RELEASE_REF"
@@ -415,7 +514,7 @@ jobs:
           echo "SCROZZ_MACOS_PAYLOAD_SIGNED=1" >>"$GITHUB_ENV"
           echo "SCROZZ_MACOS_NOTARIZED=1" >>"$GITHUB_ENV"
 
-      # --- Windows signing (skipped unless secrets exist) ---------------------
+      # --- Windows signing ----------------------------------------------------
       #
       # Requires, as repository secrets:
       #   WINDOWS_CERTIFICATE_PFX       base64 of a code-signing .pfx
@@ -424,7 +523,7 @@ jobs:
       # A cheaper, keyless alternative worth considering before buying an EV
       # certificate is Azure Trusted Signing, which swaps these two secrets for
       # an Azure identity and a different action.
-      - name: Sign Windows executable (when configured)
+      - name: Sign Windows executable
         if: matrix.os == 'windows-latest'
         env:
           WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
@@ -432,8 +531,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "$WINDOWS_CERTIFICATE_PFX" ]]; then
-            echo "::notice title=Windows executable is unsigned::No WINDOWS_CERTIFICATE_PFX secret is set, so executable signing was skipped. SmartScreen will warn on download until a code-signing certificate is configured."
-            exit 0
+            echo "::error title=Windows signing identity is required::Release packaging fails closed instead of publishing a weaker unsigned executable."
+            exit 1
           fi
           PFX="$RUNNER_TEMP/scrozz-executable-signing.pfx"
           trap 'rm -f "$PFX"' EXIT
@@ -554,21 +653,23 @@ jobs:
         run: |
           set -euo pipefail
           export SCROZZ_WINDOWS_VERIFY_DETERMINISM=1
+          export SCROZZ_MSIX_IDENTITY_MODE=store
           export SCROZZ_MSIX_IDENTITY_NAME="$WINDOWS_MSIX_IDENTITY_NAME"
           export SCROZZ_MSIX_PUBLISHER="$WINDOWS_MSIX_PUBLISHER"
           export SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME="$WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME"
 
           PFX="$RUNNER_TEMP/scrozz-msix-signing.pfx"
           trap 'rm -f "$PFX"' EXIT
-          if [[ -n "$WINDOWS_CERTIFICATE_PFX" &&
-                -n "$WINDOWS_MSIX_IDENTITY_NAME" &&
-                -n "$WINDOWS_MSIX_PUBLISHER" ]]; then
-            echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$PFX"
-            export SCROZZ_MSIX_SIGN_PFX="$PFX"
-            export SCROZZ_MSIX_SIGN_PFX_PASSWORD="$WINDOWS_CERTIFICATE_PASSWORD"
-          elif [[ -n "$WINDOWS_CERTIFICATE_PFX" ]]; then
-            echo "::notice title=MSIX is unsigned::Set WINDOWS_MSIX_IDENTITY_NAME and WINDOWS_MSIX_PUBLISHER to the exact Partner Center values before the release workflow signs the MSIX."
+          if [[ -z "$WINDOWS_CERTIFICATE_PFX" ||
+                -z "$WINDOWS_MSIX_IDENTITY_NAME" ||
+                -z "$WINDOWS_MSIX_PUBLISHER" ||
+                -z "$WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME" ]]; then
+            echo "::error title=Complete Store identity is required::WINDOWS_CERTIFICATE_PFX, WINDOWS_MSIX_IDENTITY_NAME, WINDOWS_MSIX_PUBLISHER, and WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME must all be configured. Development identity values are never a release fallback."
+            exit 1
           fi
+          echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$PFX"
+          export SCROZZ_MSIX_SIGN_PFX="$PFX"
+          export SCROZZ_MSIX_SIGN_PFX_PASSWORD="$WINDOWS_CERTIFICATE_PASSWORD"
 
           powershell.exe -NoLogo -NoProfile -NonInteractive \
             -ExecutionPolicy Bypass \
@@ -605,7 +706,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checksums-and-draft:
     name: Draft release
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -614,7 +715,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -662,9 +764,21 @@ jobs:
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PINNED_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
+
+          REMOTE_TAGS="$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          REMOTE_SHA="$(
+            awk '$2 ~ /\^\{\}$/ { print $1; found=1 } END { if (!found) exit 1 }' \
+              <<<"$REMOTE_TAGS" 2>/dev/null ||
+            awk '$2 !~ /\^\{\}$/ { print $1; exit }' <<<"$REMOTE_TAGS"
+          )"
+          if [[ -z "$REMOTE_SHA" || "$REMOTE_SHA" != "$PINNED_SHA" ]]; then
+            echo "::error title=Release tag moved::$TAG now resolves to ${REMOTE_SHA:-nothing}, not the reviewed source $PINNED_SHA."
+            exit 1
+          fi
 
           # --draft is the point of this whole job. Decision D5: agents build
           # and validate, the maintainer decides what ships. Nothing here is
@@ -676,6 +790,7 @@ jobs:
           gh release create "$TAG" \
             --draft \
             --verify-tag \
+            --target "$PINNED_SHA" \
             --title "Scrozz $TAG" \
             --generate-notes \
             artifacts/*

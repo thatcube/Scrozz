@@ -20,7 +20,10 @@ param(
     [string] $TesseractDirectory = $env:SCROZZ_TESSERACT_DIR,
 
     [Parameter()]
-    [string] $TesseractPayloadManifest = ""
+    [string] $TesseractPayloadManifest = "",
+
+    [Parameter()]
+    [string] $IdentityMode = $env:SCROZZ_MSIX_IDENTITY_MODE
 )
 
 Set-StrictMode -Version Latest
@@ -30,11 +33,13 @@ $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $Binary = [IO.Path]::GetFullPath($Binary)
 $OutputRoot = [IO.Path]::GetPathRoot($OutputDirectory)
+$ProductionPayloadManifest = Join-Path `
+    $RepoRoot "packaging\windows\tesseract-payload.json"
 if ([String]::IsNullOrWhiteSpace($TesseractPayloadManifest)) {
-    $TesseractPayloadManifest = Join-Path `
-        $RepoRoot "packaging\windows\tesseract-payload.json"
+    $TesseractPayloadManifest = $ProductionPayloadManifest
 }
 $TesseractPayloadManifest = [IO.Path]::GetFullPath($TesseractPayloadManifest)
+$ProductionPayloadManifest = [IO.Path]::GetFullPath($ProductionPayloadManifest)
 
 if ($OutputDirectory.TrimEnd("\", "/") -eq $OutputRoot.TrimEnd("\", "/")) {
     throw "Refusing to package into a filesystem root: $OutputDirectory"
@@ -79,9 +84,21 @@ if ($Stamp -notmatch "^[0-9A-Za-z._-]+$") {
 }
 if ($Version -notmatch (
         "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)" +
-        "(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+        "(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?" +
+        "(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
     )) {
     throw "Invalid application version: $Version"
+}
+$VersionWithoutBuild = ($Version -split "\+", 2)[0]
+if ($VersionWithoutBuild.Contains("-")) {
+    $Prerelease = ($VersionWithoutBuild -split "-", 2)[1]
+    foreach ($Identifier in $Prerelease.Split(".")) {
+        if ($Identifier -match "^0[0-9]+$") {
+            throw (
+                "Numeric prerelease identifiers cannot have leading zeroes: $Version"
+            )
+        }
+    }
 }
 if ($OutputDirectory.Contains('"') -or
     $OutputDirectory.Contains("`r") -or
@@ -214,19 +231,37 @@ function Confirm-TesseractPayload {
     return $Entries
 }
 
+function Get-CanonicalPayloadContract {
+    param([string] $ManifestPath)
+    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    $Lines = @(
+        foreach ($Entry in @($Manifest.payload_files) | Sort-Object {
+            ([string] $_.path).ToLowerInvariant()
+        }) {
+            "{0}`t{1}" -f (
+                ([string] $Entry.path).ToLowerInvariant()
+            ), (
+                ([string] $Entry.sha256).ToLowerInvariant()
+            )
+        }
+    )
+    return ($Lines -join "`n")
+}
+
 function Convert-ToMsixVersion {
     param([string] $ApplicationVersion)
     $Override = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_VERSION")
     if (-not [String]::IsNullOrWhiteSpace($Override)) {
         $Candidate = $Override
     } else {
-        if ($ApplicationVersion.Contains("-")) {
+        $VersionWithoutBuild = ($ApplicationVersion -split "\+", 2)[0]
+        if ($VersionWithoutBuild.Contains("-")) {
             throw (
                 "Prerelease artifacts require SCROZZ_MSIX_VERSION so distinct " +
                 "prereleases cannot collapse to one Windows package version"
             )
         }
-        $CoreParts = ($ApplicationVersion -split "-", 2)[0].Split(".")
+        $CoreParts = $VersionWithoutBuild.Split(".")
         [UInt64] $SemanticMajor = 0
         [UInt64] $SemanticMinor = 0
         [UInt64] $SemanticPatch = 0
@@ -293,41 +328,50 @@ function Resolve-WindowsSdkTool {
         return $Resolved
     }
 
-    $Command = Get-Command "${Name}.exe" -ErrorAction SilentlyContinue
-    if ($null -ne $Command) {
-        return $Command.Source
-    }
-
     $ProgramFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
     if ([String]::IsNullOrWhiteSpace($ProgramFilesX86)) {
         throw "Windows did not report its Program Files (x86) directory"
     }
     $SdkRoot = Join-Path $ProgramFilesX86 "Windows Kits\10"
-    $Candidates = @(
-        @(
-            foreach ($Directory in @(
-                Get-ChildItem `
-                    -LiteralPath (Join-Path $SdkRoot "bin") `
-                    -Directory `
-                    -ErrorAction SilentlyContinue
-            )) {
-                $Candidate = Join-Path $Directory.FullName "x64\${Name}.exe"
-                if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
-                    $Candidate
-                }
-            }
-        ) | Sort-Object -Descending
+    $NativeArchitecture = if (
+        $env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or
+        $env:PROCESSOR_ARCHITEW6432 -eq "ARM64"
+    ) {
+        "arm64"
+    } else {
+        "x64"
+    }
+    $ToolArchitectures = @($NativeArchitecture)
+    if ($NativeArchitecture -ne "x64") {
+        $ToolArchitectures += "x64"
+    }
+    $SdkDirectories = @(
+        Get-ChildItem `
+            -LiteralPath (Join-Path $SdkRoot "bin") `
+            -Directory `
+            -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending
     )
+    foreach ($ToolArchitecture in $ToolArchitectures) {
+        foreach ($Directory in $SdkDirectories) {
+            $Candidate = Join-Path `
+                $Directory.FullName "$ToolArchitecture\${Name}.exe"
+            if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+                return $Candidate
+            }
+        }
+    }
+    $Command = Get-Command "${Name}.exe" -ErrorAction SilentlyContinue
+    if ($null -ne $Command) {
+        return $Command.Source
+    }
     if ($Name -eq "makeappx") {
-        $Candidates += Join-Path $SdkRoot "App Certification Kit\makeappx.exe"
+        $CertificationKit = Join-Path $SdkRoot "App Certification Kit\makeappx.exe"
+        if (Test-Path -LiteralPath $CertificationKit -PathType Leaf) {
+            return $CertificationKit
+        }
     }
-    $Found = $Candidates | Where-Object {
-        Test-Path -LiteralPath $_ -PathType Leaf
-    } | Select-Object -First 1
-    if ($null -eq $Found) {
-        throw "${Name}.exe was not found. Install the Windows SDK or set $OverrideVariable."
-    }
-    return $Found
+    throw "${Name}.exe was not found. Install the Windows SDK or set $OverrideVariable."
 }
 
 function Write-Utf8NoBom {
@@ -743,7 +787,9 @@ function Write-ArtifactMetadata {
         [string] $NativePackageVersion,
         [bool] $Signed,
         [bool] $PayloadSigned,
-        [string] $IdentityName
+        [string] $IdentityName,
+        [string] $IdentityMode,
+        [bool] $TestSignature
     )
     $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
     $Length = (Get-Item -LiteralPath $Artifact).Length
@@ -764,6 +810,8 @@ function Write-ArtifactMetadata {
         native_package_version = $NativePackageVersion
         ocr_backend = $OcrBackend
         package_identity = $IdentityName
+        package_identity_mode = $IdentityMode
+        test_signature = $TestSignature
         signed = $Signed
         payload_signed = $PayloadSigned
         signed_manifest = $false
@@ -777,12 +825,113 @@ function Write-ArtifactMetadata {
     Write-Host "metadata: $Artifact.artifact.json"
 }
 
-$PackageIdentityName = Get-EnvironmentOrDefault `
-    "SCROZZ_MSIX_IDENTITY_NAME" "com.thatcube.Scrozz"
-$PackagePublisher = Get-EnvironmentOrDefault `
-    "SCROZZ_MSIX_PUBLISHER" "CN=Scrozz Development"
-$PublisherDisplayName = Get-EnvironmentOrDefault `
-    "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME" "Scrozz Development"
+$PackageIdentityName = [Environment]::GetEnvironmentVariable(
+    "SCROZZ_MSIX_IDENTITY_NAME"
+)
+$PackagePublisher = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_PUBLISHER")
+$PublisherDisplayName = [Environment]::GetEnvironmentVariable(
+    "SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME"
+)
+$SignPfx = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_SIGN_PFX")
+$SignThumbprint = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_SIGN_CERT_SHA1")
+$AllowUntrustedTestSignature = (
+    [Environment]::GetEnvironmentVariable(
+        "SCROZZ_TEST_ALLOW_UNTRUSTED_SIGNATURE"
+    ) -eq "1"
+)
+if ($AllowUntrustedTestSignature) {
+    if ($IdentityMode -ne "store") {
+        throw (
+            "SCROZZ_TEST_ALLOW_UNTRUSTED_SIGNATURE is valid only in store " +
+            "identity mode"
+        )
+    }
+    if ($Stamp -notmatch "(^|[._-])test([._-]|$)") {
+        throw (
+            "SCROZZ_TEST_ALLOW_UNTRUSTED_SIGNATURE requires a test-labelled " +
+            "stamp segment"
+        )
+    }
+    $CandidatePayloadContract = Get-CanonicalPayloadContract $TesseractPayloadManifest
+    $ProductionPayloadContract = Get-CanonicalPayloadContract $ProductionPayloadManifest
+    if ($CandidatePayloadContract -eq $ProductionPayloadContract) {
+        throw (
+            "SCROZZ_TEST_ALLOW_UNTRUSTED_SIGNATURE requires a non-production " +
+            "payload manifest"
+        )
+    }
+}
+if ($IdentityMode -notin @("development", "store")) {
+    throw (
+        "SCROZZ_MSIX_IDENTITY_MODE must explicitly be development or store; " +
+        "the packager will not silently select a weaker identity"
+    )
+}
+if ($IdentityMode -eq "development") {
+    if (-not [String]::IsNullOrWhiteSpace($PackageIdentityName) -or
+        -not [String]::IsNullOrWhiteSpace($PackagePublisher) -or
+        -not [String]::IsNullOrWhiteSpace($PublisherDisplayName) -or
+        -not [String]::IsNullOrWhiteSpace($SignPfx) -or
+        -not [String]::IsNullOrWhiteSpace($SignThumbprint)) {
+        throw (
+            "development identity mode rejects Store identity and signing " +
+            "overrides; select store mode explicitly for release identity"
+        )
+    }
+    $PackageIdentityName = "com.thatcube.Scrozz"
+    $PackagePublisher = "CN=Scrozz Development"
+    $PublisherDisplayName = "Scrozz Development"
+} else {
+    foreach ($RequiredIdentity in ([ordered]@{
+        SCROZZ_MSIX_IDENTITY_NAME = $PackageIdentityName
+        SCROZZ_MSIX_PUBLISHER = $PackagePublisher
+        SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME = $PublisherDisplayName
+    }).GetEnumerator()) {
+        if ([String]::IsNullOrWhiteSpace([string] $RequiredIdentity.Value)) {
+            throw (
+                "$($RequiredIdentity.Key) is required in store identity mode; " +
+                "development identity values are never a release fallback"
+            )
+        }
+    }
+    if ([String]::IsNullOrWhiteSpace($SignPfx) -and
+        [String]::IsNullOrWhiteSpace($SignThumbprint)) {
+        throw (
+            "store identity mode requires SCROZZ_MSIX_SIGN_PFX or " +
+            "SCROZZ_MSIX_SIGN_CERT_SHA1"
+        )
+    }
+}
+if (-not [String]::IsNullOrWhiteSpace($SignPfx) -and
+    -not [String]::IsNullOrWhiteSpace($SignThumbprint)) {
+    throw "Set only one of SCROZZ_MSIX_SIGN_PFX and SCROZZ_MSIX_SIGN_CERT_SHA1"
+}
+$ResolvedSignPfx = $null
+$SignPassword = [Environment]::GetEnvironmentVariable(
+    "SCROZZ_MSIX_SIGN_PFX_PASSWORD"
+)
+$SigningCertificate = $null
+if (-not [String]::IsNullOrWhiteSpace($SignPfx)) {
+    $ResolvedSignPfx = [IO.Path]::GetFullPath($SignPfx)
+    if (-not (Test-Path -LiteralPath $ResolvedSignPfx -PathType Leaf)) {
+        throw "SCROZZ_MSIX_SIGN_PFX does not name a file: $ResolvedSignPfx"
+    }
+    $Certificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    $Certificates.Import(
+        $ResolvedSignPfx,
+        $SignPassword,
+        [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+    )
+    $SigningCertificate = @(
+        $Certificates | Where-Object { $_.HasPrivateKey }
+    ) | Select-Object -First 1
+    if ($null -eq $SigningCertificate) {
+        throw "SCROZZ_MSIX_SIGN_PFX contains no certificate with a private key"
+    }
+} elseif (-not [String]::IsNullOrWhiteSpace($SignThumbprint) -and
+    $SignThumbprint -notmatch "^[0-9A-Fa-f]{40}$") {
+    throw "SCROZZ_MSIX_SIGN_CERT_SHA1 must be a 40-digit certificate thumbprint"
+}
 $TesseractPayloadFiles = @(
     Confirm-TesseractPayload `
         -Directory $TesseractDirectory `
@@ -790,7 +939,61 @@ $TesseractPayloadFiles = @(
 )
 $MsixVersion = Convert-ToMsixVersion $Version
 $MsixArchitecture = if ($Architecture -eq "x86_64") { "x64" } else { "arm64" }
-$PayloadSigned = (Get-AuthenticodeSignature -FilePath $Binary).Status -eq "Valid"
+$PayloadSignature = Get-AuthenticodeSignature -FilePath $Binary
+$PayloadHasEmbeddedSignature = (
+    [string] $PayloadSignature.SignatureType -eq "Authenticode"
+)
+$PayloadSigned = (
+    $PayloadHasEmbeddedSignature -and (
+        $PayloadSignature.Status -eq "Valid" -or
+        (
+            $AllowUntrustedTestSignature -and
+            $null -ne $PayloadSignature.SignerCertificate -and
+            $PayloadSignature.Status -in @("NotTrusted", "UnknownError")
+        )
+    )
+)
+if ($IdentityMode -eq "store" -and
+    (-not $PayloadSigned -or $null -eq $PayloadSignature.SignerCertificate)) {
+    throw "store identity mode requires a valid Authenticode signature on scrozz.exe"
+}
+$ExpectedThumbprint = $null
+if ($IdentityMode -eq "store") {
+    $ExpectedThumbprint = if ($null -ne $SigningCertificate) {
+        $SigningCertificate.Thumbprint
+    } else {
+        $SignThumbprint
+    }
+    $PayloadSigner = $PayloadSignature.SignerCertificate
+    if (-not $PayloadSigner.Thumbprint.Equals(
+            $ExpectedThumbprint,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw (
+            "scrozz.exe is signed by $($PayloadSigner.Thumbprint), but the MSIX " +
+            "signing identity is $ExpectedThumbprint"
+        )
+    }
+    if (-not $PayloadSigner.Subject.Equals(
+            $PackagePublisher,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw (
+            "the scrozz.exe signer subject '$($PayloadSigner.Subject)' does not " +
+            "match SCROZZ_MSIX_PUBLISHER '$PackagePublisher'"
+        )
+    }
+    if ($null -ne $SigningCertificate -and
+        -not $SigningCertificate.Subject.Equals(
+            $PackagePublisher,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw (
+            "the MSIX signing certificate subject '$($SigningCertificate.Subject)' " +
+            "does not match SCROZZ_MSIX_PUBLISHER '$PackagePublisher'"
+        )
+    }
+}
 
 if ($PackageIdentityName -notmatch "^[0-9A-Za-z.-]{3,50}$") {
     throw "SCROZZ_MSIX_IDENTITY_NAME is not a valid package identity name"
@@ -805,8 +1008,9 @@ if ((Test-PathWithin $TesseractDirectory $OutputDirectory) -or
 $Name = "scrozz-$Version-$Stamp-windows-$Architecture"
 $Portable = Join-Path $OutputDirectory "$Name.zip"
 $Msix = Join-Path $OutputDirectory "$Name.msix"
+$ScratchToken = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $Scratch = Join-Path $OutputDirectory (
-    ".scrozz-windows-{0}-{1}" -f $PID, [Guid]::NewGuid().ToString("N")
+    ".scz-{0}-{1}" -f $PID, $ScratchToken
 )
 $PortableRoot = Join-Path $Scratch $Name
 $MsixRoot = Join-Path $Scratch "msix"
@@ -904,13 +1108,6 @@ try {
         Assert-IdenticalArtifact $MsixStaged $SecondMsix "MSIX output"
     }
 
-    $SignPfx = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_SIGN_PFX")
-    $SignThumbprint = [Environment]::GetEnvironmentVariable("SCROZZ_MSIX_SIGN_CERT_SHA1")
-    if (-not [String]::IsNullOrWhiteSpace($SignPfx) -and
-        -not [String]::IsNullOrWhiteSpace($SignThumbprint)) {
-        throw "Set only one of SCROZZ_MSIX_SIGN_PFX and SCROZZ_MSIX_SIGN_CERT_SHA1"
-    }
-
     $Signed = $false
     if (-not [String]::IsNullOrWhiteSpace($SignPfx) -or
         -not [String]::IsNullOrWhiteSpace($SignThumbprint)) {
@@ -920,32 +1117,33 @@ try {
         $SignArguments.Add("/fd")
         $SignArguments.Add("SHA256")
         if (-not [String]::IsNullOrWhiteSpace($SignPfx)) {
-            $ResolvedPfx = [IO.Path]::GetFullPath($SignPfx)
-            if (-not (Test-Path -LiteralPath $ResolvedPfx -PathType Leaf)) {
-                throw "SCROZZ_MSIX_SIGN_PFX does not name a file: $ResolvedPfx"
-            }
             $SignArguments.Add("/f")
-            $SignArguments.Add($ResolvedPfx)
-            $Password = [Environment]::GetEnvironmentVariable(
-                "SCROZZ_MSIX_SIGN_PFX_PASSWORD"
-            )
-            if (-not [String]::IsNullOrEmpty($Password)) {
+            $SignArguments.Add($ResolvedSignPfx)
+            if (-not [String]::IsNullOrEmpty($SignPassword)) {
                 $SignArguments.Add("/p")
-                $SignArguments.Add($Password)
+                $SignArguments.Add($SignPassword)
             }
         } else {
-            if ($SignThumbprint -notmatch "^[0-9A-Fa-f]{40}$") {
-                throw "SCROZZ_MSIX_SIGN_CERT_SHA1 must be a 40-digit certificate thumbprint"
-            }
             $SignArguments.Add("/sha1")
             $SignArguments.Add($SignThumbprint)
         }
         $Timestamp = Get-EnvironmentOrDefault `
             "SCROZZ_MSIX_TIMESTAMP_URL" "http://timestamp.digicert.com"
-        $SignArguments.Add("/tr")
-        $SignArguments.Add($Timestamp)
-        $SignArguments.Add("/td")
-        $SignArguments.Add("SHA256")
+        if ($Timestamp -eq "none") {
+            if ([Environment]::GetEnvironmentVariable(
+                    "SCROZZ_ALLOW_UNTIMESTAMPED_SIGNING"
+                ) -ne "1") {
+                throw (
+                    "SCROZZ_MSIX_TIMESTAMP_URL=none requires " +
+                    "SCROZZ_ALLOW_UNTIMESTAMPED_SIGNING=1"
+                )
+            }
+        } else {
+            $SignArguments.Add("/tr")
+            $SignArguments.Add($Timestamp)
+            $SignArguments.Add("/td")
+            $SignArguments.Add("SHA256")
+        }
         $SignArguments.Add($MsixStaged)
         & $SignTool @SignArguments
         if ($LASTEXITCODE -ne 0) {
@@ -953,13 +1151,28 @@ try {
         }
         & $SignTool verify /pa $MsixStaged
         if ($LASTEXITCODE -ne 0) {
-            throw "SignTool verification failed with status $LASTEXITCODE"
+            if (-not $AllowUntrustedTestSignature) {
+                throw "SignTool verification failed with status $LASTEXITCODE"
+            }
+            $PackageSignature = Get-AuthenticodeSignature -FilePath $MsixStaged
+            if ($null -eq $PackageSignature.SignerCertificate -or
+                [string] $PackageSignature.SignatureType -ne "Authenticode" -or
+                -not $PackageSignature.SignerCertificate.Thumbprint.Equals(
+                    $ExpectedThumbprint,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or
+                $PackageSignature.Status -notin @("Valid", "NotTrusted", "UnknownError")) {
+                throw (
+                    "the self-signed test MSIX did not retain the expected " +
+                    "Authenticode signer after SignTool verification failed"
+                )
+            }
         }
         $Signed = $true
     } else {
         Write-Warning (
-            "MSIX is unsigned. Set SCROZZ_MSIX_SIGN_PFX or " +
-            "SCROZZ_MSIX_SIGN_CERT_SHA1 only in a human-approved signing environment."
+            "The explicitly selected development MSIX identity is unsigned. " +
+            "Store identity mode requires a human-approved signing credential."
         )
     }
 
@@ -981,7 +1194,9 @@ try {
         -NativePackageVersion $Version `
         -Signed $false `
         -PayloadSigned $PayloadSigned `
-        -IdentityName ""
+        -IdentityName "" `
+        -IdentityMode "none" `
+        -TestSignature $AllowUntrustedTestSignature
     Write-ArtifactMetadata `
         -Artifact $Msix `
         -Platform "windows-$Architecture" `
@@ -990,7 +1205,9 @@ try {
         -NativePackageVersion $MsixVersion `
         -Signed $Signed `
         -PayloadSigned $PayloadSigned `
-        -IdentityName $PackageIdentityName
+        -IdentityName $PackageIdentityName `
+        -IdentityMode $IdentityMode `
+        -TestSignature $AllowUntrustedTestSignature
 } finally {
     if (Test-Path -LiteralPath $Scratch) {
         Remove-Item -LiteralPath $Scratch -Recurse -Force

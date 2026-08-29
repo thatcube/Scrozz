@@ -26,11 +26,11 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel},
     },
     thread::JoinHandle,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use scrozz_annotate::Document;
@@ -51,11 +51,28 @@ use crate::{
 
 const JOB_QUEUE_CAPACITY: usize = 32;
 const OUTCOME_QUEUE_CAPACITY: usize = 64;
-const REPLY_QUEUE_CAPACITY: usize = 8;
+const REPLY_CAPACITY: usize = 8;
 const RESPONSE_WORKERS: usize = 4;
+const RESPONSE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Cleanup jobs are best-effort under overload, so cached image bytes need an
 // independent hard ceiling.
 const CACHE_CAPACITY: usize = 64;
+
+pub(crate) struct ReplyPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for ReplyPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyPermit").finish_non_exhaustive()
+    }
+}
+
+impl Drop for ReplyPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
@@ -75,7 +92,12 @@ pub enum Job {
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Execute and answer one validated IPC request away from the GUI thread.
-    Forward(Request),
+    Forward {
+        /// Validated request and its client socket.
+        request: Request,
+        /// Capacity reserved before the request entered the worker queue.
+        permit: ReplyPermit,
+    },
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -167,7 +189,48 @@ impl Pipeline {
     /// Returns `false` when bounded backpressure refuses the job or the worker
     /// has stopped.
     pub fn post(&self, job: Job) -> bool {
-        self.jobs.try_send(job).is_ok()
+        self.try_post(job).is_ok()
+    }
+
+    /// Posts a job while preserving ownership when bounded backpressure refuses it.
+    ///
+    /// IPC admission uses this form because a refused [`Request`] still owns a
+    /// live client socket and must receive a framed rejection.
+    pub fn try_post(&self, job: Job) -> Result<(), Box<TrySendError<Job>>> {
+        self.jobs.try_send(job).map_err(Box::new)
+    }
+
+    /// Reserves bounded response capacity before an IPC request is admitted.
+    pub fn reserve_reply(&self) -> Option<ReplyPermit> {
+        self.responder.as_ref()?.try_reserve()
+    }
+
+    /// Settles a request refused by the job queue using its reserved response slot.
+    pub fn reject_reserved(
+        &self,
+        request: Request,
+        reason: impl Into<String>,
+        permit: ReplyPermit,
+    ) {
+        let reply = request.reject(reason);
+        if let Some(responder) = &self.responder {
+            responder.submit(reply, Some(permit));
+        } else {
+            reply.send();
+        }
+    }
+
+    /// Sends a shutdown rejection through the bounded responder pool.
+    ///
+    /// These are queued before the worker is joined; the one global response
+    /// deadline begins only after admitted commands have produced their replies.
+    pub fn reject_during_shutdown(&self, request: Request, reason: impl Into<String>) {
+        let reply = request.reject(reason);
+        if let Some(responder) = &self.responder {
+            responder.submit(reply, None);
+        } else {
+            reply.send();
+        }
     }
 
     /// Takes one finished piece of work, if there is one. Never blocks.
@@ -217,13 +280,13 @@ struct Cached {
 
 struct Worker {
     outcomes: SyncSender<Outcome>,
-    replies: SyncSender<Reply>,
+    replies: Sender<PendingReply>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
 }
 
 impl Worker {
-    fn new(outcomes: SyncSender<Outcome>, replies: SyncSender<Reply>) -> Self {
+    fn new(outcomes: SyncSender<Outcome>, replies: Sender<PendingReply>) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -257,15 +320,15 @@ impl Worker {
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
-                Job::Forward(request) => {
+                Job::Forward { request, permit } => {
                     let (command, reply) = request.execute();
-                    if let Err(error) = self.replies.try_send(reply) {
-                        let reason = match error {
-                            TrySendError::Full(_) => "the IPC response queue is full",
-                            TrySendError::Disconnected(_) => "the IPC response workers stopped",
-                        };
-                        tracing::warn!("{reason}; dropping the waiting client");
-                    }
+                    submit_reply(
+                        &self.replies,
+                        PendingReply {
+                            reply,
+                            _permit: Some(permit),
+                        },
+                    );
                     let _ = self.outcomes.send(Outcome::Forwarded(command));
                 }
 
@@ -401,29 +464,39 @@ impl Worker {
     }
 }
 
+struct PendingReply {
+    reply: Reply,
+    _permit: Option<ReplyPermit>,
+}
+
 struct Responder {
-    sender: Option<SyncSender<Reply>>,
-    stopping: Arc<AtomicBool>,
+    sender: Option<Sender<PendingReply>>,
+    in_flight: Arc<AtomicUsize>,
+    shutdown_deadline: Arc<Mutex<Option<Instant>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Responder {
     fn start() -> CliResult<Self> {
-        let (sender, receiver) = sync_channel::<Reply>(REPLY_QUEUE_CAPACITY);
+        // The channel itself need not block: ReplyPermit bounds all live
+        // request replies. Shutdown rejections are separately bounded by the
+        // server's fixed pending-socket capacity.
+        let (sender, receiver) = channel::<PendingReply>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let stopping = Arc::new(AtomicBool::new(false));
+        let shutdown_deadline = Arc::new(Mutex::new(None));
         let mut responder = Self {
             sender: Some(sender),
-            stopping,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            shutdown_deadline,
             workers: Vec::with_capacity(RESPONSE_WORKERS),
         };
 
         for index in 0..RESPONSE_WORKERS {
             let receiver = Arc::clone(&receiver);
-            let stopping = Arc::clone(&responder.stopping);
+            let shutdown_deadline = Arc::clone(&responder.shutdown_deadline);
             let worker = std::thread::Builder::new()
                 .name(format!("scrozz-ipc-response-{index}"))
-                .spawn(move || response_worker(&receiver, &stopping));
+                .spawn(move || response_worker(&receiver, &shutdown_deadline));
             match worker {
                 Ok(worker) => responder.workers.push(worker),
                 Err(error) => {
@@ -438,15 +511,64 @@ impl Responder {
         Ok(responder)
     }
 
-    fn sender(&self) -> SyncSender<Reply> {
+    fn sender(&self) -> Sender<PendingReply> {
         self.sender
             .as_ref()
             .expect("a live responder has a sender")
             .clone()
     }
 
+    fn try_reserve(&self) -> Option<ReplyPermit> {
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if current >= REPLY_CAPACITY {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ReplyPermit {
+                        in_flight: Arc::clone(&self.in_flight),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn submit(&self, reply: Reply, permit: Option<ReplyPermit>) {
+        let pending = PendingReply {
+            reply,
+            _permit: permit,
+        };
+        if let Some(sender) = &self.sender {
+            submit_reply(sender, pending);
+        } else {
+            pending.reply.send_until(self.deadline());
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.shutdown_deadline.lock().ok().and_then(|value| *value)
+    }
+
+    fn begin_shutdown(&self) {
+        if let Ok(mut deadline) = self.shutdown_deadline.lock()
+            && deadline.is_none()
+        {
+            *deadline = Some(Instant::now() + RESPONSE_SHUTDOWN_TIMEOUT);
+        }
+    }
+
     fn stop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
+        self.begin_shutdown();
+        // Closing the final sender lets workers drain admitted replies. Every
+        // send observes the one shared shutdown deadline, so many slow clients
+        // cannot multiply the shutdown delay.
         self.sender.take();
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -460,21 +582,30 @@ impl Drop for Responder {
     }
 }
 
-fn response_worker(receiver: &Mutex<Receiver<Reply>>, stopping: &AtomicBool) {
+fn submit_reply(sender: &Sender<PendingReply>, pending: PendingReply) {
+    if let Err(error) = sender.send(pending) {
+        tracing::error!("the IPC response workers stopped; answering on the current thread");
+        error.0.reply.send();
+    }
+}
+
+fn response_worker(
+    receiver: &Mutex<Receiver<PendingReply>>,
+    shutdown_deadline: &Mutex<Option<Instant>>,
+) {
     loop {
-        if stopping.load(Ordering::Acquire) {
-            break;
-        }
-        let reply = match receiver.lock() {
+        let pending = match receiver.lock() {
             Ok(receiver) => receiver.recv(),
             Err(_) => {
                 tracing::warn!("the IPC response queue lock was poisoned");
                 break;
             }
         };
-        match reply {
-            Ok(_) if stopping.load(Ordering::Acquire) => break,
-            Ok(reply) => reply.send(),
+        match pending {
+            Ok(pending) => {
+                let deadline = shutdown_deadline.lock().ok().and_then(|value| *value);
+                pending.reply.send_until(deadline);
+            }
             Err(_) => break,
         }
     }
@@ -518,9 +649,76 @@ mod tests {
     }
 
     #[test]
+    fn refused_posting_returns_the_unsettled_job_to_its_caller() {
+        let (jobs, _job_rx) = sync_channel(1);
+        let (_outcome_tx, outcomes) = sync_channel(1);
+        let pipeline = Pipeline {
+            jobs,
+            outcomes,
+            worker: None,
+            responder: None,
+            next_card: 1,
+        };
+        assert!(pipeline.post(Job::Release(CardId(1))));
+
+        match pipeline.try_post(Job::Release(CardId(2))) {
+            Err(error) => match *error {
+                TrySendError::Full(Job::Release(card)) => assert_eq!(card, CardId(2)),
+                other => panic!("expected the refused job back, got {other:?}"),
+            },
+            Ok(()) => panic!("the full queue accepted another job"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn responder_shutdown_drains_every_admitted_reply() {
+        use std::{io::Read as _, os::unix::net::UnixStream, time::Duration};
+
+        let mut responder = Responder::start().expect("response workers");
+        let payload = vec![0x5a; 1024 * 1024];
+        let mut readers = Vec::new();
+
+        for _ in 0..(RESPONSE_WORKERS + 4) {
+            let (server, mut client) = UnixStream::pair().expect("socket pair");
+            responder.submit(Reply::test(server, payload.clone()), None);
+            let expected = payload.clone();
+            readers.push(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).expect("read reply");
+                assert_eq!(received, expected);
+            }));
+        }
+
+        responder.stop();
+        for reader in readers {
+            reader.join().expect("reader");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_capacity_is_reserved_without_blocking_the_gui_thread() {
+        let mut responder = Responder::start().expect("response workers");
+        let permits: Vec<_> = (0..REPLY_CAPACITY)
+            .map(|_| responder.try_reserve().expect("capacity"))
+            .collect();
+        let started = Instant::now();
+        assert!(responder.try_reserve().is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "capacity exhaustion blocked the caller"
+        );
+        drop(permits);
+        assert!(responder.try_reserve().is_some());
+        responder.stop();
+    }
+
+    #[test]
     fn cached_capture_bytes_have_a_fixed_memory_bound() {
         let (outcomes, _outcome_rx) = sync_channel(1);
-        let (replies, _reply_rx) = sync_channel(1);
+        let (replies, _reply_rx) = channel();
         let mut worker = Worker {
             outcomes,
             replies,

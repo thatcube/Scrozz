@@ -230,9 +230,7 @@ fn is_telephone(text: &str) -> bool {
 
 fn contains_date(text: &str) -> bool {
     text.split_ascii_whitespace().any(|part| {
-        is_date(
-            part.trim_matches(|character| matches!(character, '(' | ')' | ',' | ';')),
-        )
+        is_date(part.trim_matches(|character| matches!(character, '(' | ')' | ',' | ';')))
     })
 }
 

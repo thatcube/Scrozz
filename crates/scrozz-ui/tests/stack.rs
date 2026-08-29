@@ -733,7 +733,7 @@ fn a_swipe_left_dismisses_the_card() {
 }
 
 #[test]
-fn a_swipe_right_or_up_begins_a_drag_out() {
+fn a_swipe_right_or_up_requests_a_drag_without_releasing_the_card() {
     for (delta, dir) in [(vec2(240.0, 0.0), Dir::Right), (vec2(0.0, -240.0), Dir::Up)] {
         let mut s = stack();
         let id = s.push(&at(0));
@@ -746,8 +746,34 @@ fn a_swipe_right_or_up_begins_a_drag_out() {
 
         assert_eq!(release.intent, Intent::DragOut, "{dir:?}");
         assert_eq!(release.direction, Some(dir));
-        assert!(s.is_empty(), "the capture leaves the pile with the drag");
+        assert_eq!(s.len(), 1, "gesture intent is not native acceptance");
+        assert!(
+            s.departing().is_empty(),
+            "the capture cannot leave before a native destination accepts it"
+        );
+        s.advance(&at(SETTLED + 4_000));
+        assert!(
+            s.frame_of(id, &at(SETTLED + 4_000)).is_some(),
+            "a refused drag must restore the card"
+        );
     }
+}
+
+#[test]
+fn settling_a_native_drag_releases_a_stuck_gesture_without_dismissing() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let home = s.frame_of(id, &at(SETTLED)).unwrap().rect;
+    let origin = home.center();
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(240.0, 0.0), &at(SETTLED + 60));
+
+    assert!(s.settle_drag(id, &at(SETTLED + 80)));
+    assert_eq!(s.len(), 1);
+    assert!(s.departing().is_empty());
+    s.advance(&at(SETTLED + 4_000));
+    assert_eq!(s.frame_of(id, &at(SETTLED + 4_000)).unwrap().rect, home);
 }
 
 #[test]
