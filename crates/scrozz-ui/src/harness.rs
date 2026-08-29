@@ -2242,7 +2242,8 @@ impl Scene for PlaceholderScene {
             let mut x = left;
             let mut y = rest_y;
             let mut alpha = 1.0_f32;
-            let mut tilt = 0.0_f32;
+            let tilt = 0.0_f32;
+            let mut ghost = None;
 
             match fx.gesture {
                 Gesture::Entering { slot } if slot == card.slot => {
@@ -2274,14 +2275,18 @@ impl Scene for PlaceholderScene {
                 }
                 Gesture::Dragging { slot, offset } if slot == card.slot => {
                     // Right or up is "hand this to another app" (D21). The card
-                    // follows the pointer 1:1 and tilts with travel; epaint has
-                    // no rotation primitive, so the real surface builds the tilt
-                    // from polygons (D22 cost 3) and the stand-in only records
-                    // the angle.
+                    // stays in its slot at half opacity while the native ghost
+                    // follows the pointer. Two full-opacity thumbnails would
+                    // make the hand-off look detached.
                     let p = Self::ease_out(Self::progress(ctx, 320));
-                    x = left + offset.0 * p;
-                    y = rest_y + offset.1 * p;
-                    tilt = offset.0.mul_add(0.00035, 0.0) * p;
+                    alpha = 1.0 - 0.5 * p;
+                    ghost = Some((
+                        egui::Rect::from_min_size(
+                            egui::pos2(left + offset.0 * p, rest_y + offset.1 * p),
+                            egui::vec2(card_w, card_h),
+                        ),
+                        offset.0.mul_add(0.00035, 0.0) * p,
+                    ));
                 }
                 Gesture::Collapsing | Gesture::Expanding => {
                     // Cards must visibly *travel into* the dock; a fade would
@@ -2300,73 +2305,11 @@ impl Scene for PlaceholderScene {
             if !rect.intersects(frame) {
                 continue;
             }
-
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let a = |c: egui::Color32| -> egui::Color32 {
-                egui::Color32::from_rgba_unmultiplied(
-                    c.r(),
-                    c.g(),
-                    c.b(),
-                    (f32::from(c.a()) * alpha).clamp(0.0, 255.0) as u8,
-                )
-            };
-
-            painter.rect_filled(rect, 12.0, a(pal.card));
-            painter.rect_stroke(
-                rect,
-                12.0,
-                egui::Stroke::new(1.0, a(pal.card_edge)),
-                egui::StrokeKind::Inside,
-            );
-
-            // A seeded thumbnail block: varied, never random. The hue mixes the
-            // card's own identity with the *spec* seed, so a fixture keeps its
-            // shape while `--seed` still visibly changes the synthetic content.
-            // If it read only `card.thumb_seed`, the seed would be decoration.
-            let mut rng = ctx.rng_for(&format!("thumb:{}:{}", card.slot, card.thumb_seed));
-            let hue = rng.range_f32(0.0, 1.0);
-            let thumb = egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(8.0, 8.0),
-                egui::vec2(card_h - 16.0, card_h - 16.0),
-            );
-            painter.rect_filled(thumb, 8.0, a(hue_color(hue)));
-
-            let text_x = thumb.right() + 10.0;
-            painter.text(
-                egui::pos2(text_x, rect.top() + 12.0),
-                egui::Align2::LEFT_TOP,
-                &card.title,
-                egui::FontId::proportional(13.0),
-                a(pal.text),
-            );
-            painter.text(
-                egui::pos2(text_x, rect.top() + 30.0),
-                egui::Align2::LEFT_TOP,
-                format!(
-                    "{}x{} - {} - {}",
-                    card.source_px.0,
-                    card.source_px.1,
-                    human_bytes(card.bytes),
-                    relative_age(card.age_secs)
-                ),
-                egui::FontId::proportional(11.0),
-                a(pal.dim),
-            );
-            painter.text(
-                egui::pos2(text_x, rect.top() + 46.0),
-                egui::Align2::LEFT_TOP,
-                format!("slot {} - {}", card.slot, card.kind.slug()),
-                egui::FontId::monospace(10.0),
-                a(pal.dim),
-            );
-            if tilt.abs() > f32::EPSILON {
-                painter.text(
-                    egui::pos2(rect.right() - 8.0, rect.top() + 8.0),
-                    egui::Align2::RIGHT_TOP,
-                    format!("tilt {tilt:+.3} rad"),
-                    egui::FontId::monospace(10.0),
-                    a(pal.accent),
-                );
+            paint_placeholder_card(&painter, card, rect, alpha, tilt, &pal, ctx);
+            if let Some((ghost, ghost_tilt)) = ghost
+                && ghost.intersects(frame)
+            {
+                paint_placeholder_card(&painter, card, ghost, 1.0, ghost_tilt, &pal, ctx);
             }
         }
 
@@ -2477,6 +2420,77 @@ impl Scene for PlaceholderScene {
             );
             y += 58.0;
         }
+    }
+}
+
+fn paint_placeholder_card(
+    painter: &egui::Painter,
+    card: &CardState,
+    rect: egui::Rect,
+    alpha: f32,
+    tilt: f32,
+    pal: &PlaceholderPalette,
+    ctx: &SceneCtx<'_>,
+) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let a = |c: egui::Color32| -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(
+            c.r(),
+            c.g(),
+            c.b(),
+            (f32::from(c.a()) * alpha).clamp(0.0, 255.0) as u8,
+        )
+    };
+    painter.rect_filled(rect, 12.0, a(pal.card));
+    painter.rect_stroke(
+        rect,
+        12.0,
+        egui::Stroke::new(1.0, a(pal.card_edge)),
+        egui::StrokeKind::Inside,
+    );
+    let mut rng = ctx.rng_for(&format!("thumb:{}:{}", card.slot, card.thumb_seed));
+    let hue = rng.range_f32(0.0, 1.0);
+    let thumb = egui::Rect::from_min_size(
+        rect.left_top() + egui::vec2(8.0, 8.0),
+        egui::vec2(rect.height() - 16.0, rect.height() - 16.0),
+    );
+    painter.rect_filled(thumb, 8.0, a(hue_color(hue)));
+    let text_x = thumb.right() + 10.0;
+    painter.text(
+        egui::pos2(text_x, rect.top() + 12.0),
+        egui::Align2::LEFT_TOP,
+        &card.title,
+        egui::FontId::proportional(13.0),
+        a(pal.text),
+    );
+    painter.text(
+        egui::pos2(text_x, rect.top() + 30.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "{}x{} - {} - {}",
+            card.source_px.0,
+            card.source_px.1,
+            human_bytes(card.bytes),
+            relative_age(card.age_secs)
+        ),
+        egui::FontId::proportional(11.0),
+        a(pal.dim),
+    );
+    painter.text(
+        egui::pos2(text_x, rect.top() + 46.0),
+        egui::Align2::LEFT_TOP,
+        format!("slot {} - {}", card.slot, card.kind.slug()),
+        egui::FontId::monospace(10.0),
+        a(pal.dim),
+    );
+    if tilt.abs() > f32::EPSILON {
+        painter.text(
+            egui::pos2(rect.right() - 8.0, rect.top() + 8.0),
+            egui::Align2::RIGHT_TOP,
+            format!("tilt {tilt:+.3} rad"),
+            egui::FontId::monospace(10.0),
+            a(pal.accent),
+        );
     }
 }
 

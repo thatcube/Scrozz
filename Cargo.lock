@@ -3200,6 +3200,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "image",
  "raw-window-handle",
  "scrozz-annotate",
  "scrozz-capture",

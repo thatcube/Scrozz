@@ -1622,6 +1622,14 @@ mod tests {
             96,
         );
         assert_eq!((clamped.x, clamped.y), (0, 49));
+
+        let (card_width, card_height, card_cursor) = preview_geometry(
+            scrozz_core::LogicalSize::new(210.0, 150.0),
+            (70.0, 70.0),
+            192,
+        );
+        assert_eq!((card_width, card_height), (420, 300));
+        assert_eq!((card_cursor.x, card_cursor.y), (140, 140));
     }
 
     /// The one layout fact that can only be checked against the real struct.

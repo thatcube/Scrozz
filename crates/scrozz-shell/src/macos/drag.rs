@@ -673,6 +673,38 @@ mod geometry_tests {
         assert!((frame.x + 84.0 - 115.0).abs() < f64::EPSILON);
         assert!((frame.y + (96.0 - 48.0) - pointer_y).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn a_card_matched_preview_starts_on_the_exact_source_bounds() {
+        let logical = LogicalRect::new(
+            LogicalPoint::new(10.0, 20.0),
+            LogicalSize::new(210.0, 150.0),
+        );
+        let preview =
+            DragPreview::from_png(vec![1], LogicalSize::new(210.0, 150.0)).expect("preview");
+        for (card, pointer, flipped) in [
+            (
+                AppKitRect::new(10.0, 20.0, 210.0, 150.0),
+                LogicalPoint::new(118.0, 95.0),
+                true,
+            ),
+            (
+                AppKitRect::new(10.0, 673.0, 210.0, 150.0),
+                LogicalPoint::new(118.0, 95.0),
+                false,
+            ),
+        ] {
+            let frame = MacDragSource::preview_frame(card, logical, pointer, &preview, flipped);
+            for (actual, expected) in [
+                (frame.x, card.x),
+                (frame.y, card.y),
+                (frame.width, card.width),
+                (frame.height, card.height),
+            ] {
+                assert!((actual - expected).abs() < 1e-9, "{frame:?} != {card:?}");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

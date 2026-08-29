@@ -38,7 +38,9 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use image::imageops::FilterType;
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+use scrozz_export::{FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_shell::{
     DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
     NativeSurface, byte_source, drag::artifact,
@@ -181,7 +183,7 @@ impl DragHost {
         // the old session's file must not be adopted by the new one.
         self.retire_existing(card);
 
-        let payload = payload_for(card, bytes);
+        let payload = payload_for(card, bytes, spot);
         let source = self.source()?;
         match source.begin(payload, spot.origin(surface)) {
             Ok(session) => {
@@ -278,26 +280,119 @@ impl DragHost {
     }
 }
 
-/// The size the drag image is drawn at, in logical points.
-///
-/// Matched to the card so the picture the user is already looking at is the
-/// picture that follows the cursor — a drag image that suddenly changes size at
-/// the moment it detaches reads as a glitch.
-const PREVIEW_EDGE: f64 = 168.0;
+/// Physical edge cap for a drag image prepared synchronously at hand-off.
+const PREVIEW_MAX_EDGE: f64 = 1024.0;
+const PREVIEW_SCALE: f64 = 2.0;
 
 /// Builds the payload for one card.
-fn payload_for(card: CardId, bytes: &CaptureBytes) -> DragPayload {
+fn payload_for(card: CardId, bytes: &CaptureBytes, spot: DragSpot) -> DragPayload {
     let full = Arc::clone(&bytes.full);
     let png = byte_source(move || Ok(full.as_ref().clone()));
     let mut payload = DragPayload::png_capture(&stem_for(card), png);
 
-    if let Some(preview) = &bytes.preview
-        && let Some(size) = preview_size(preview)
-        && let Ok(preview) = DragPreview::from_png(preview.as_ref().clone(), size)
-    {
-        payload = payload.with_preview(preview);
+    if let Some(preview) = &bytes.preview {
+        match preview_for_card(preview, spot) {
+            Ok(preview) => payload = payload.with_preview(preview),
+            Err(error) => {
+                tracing::warn!(%error, "drag: card-matched preview could not be built");
+            }
+        }
     }
     payload
+}
+
+fn preview_for_card(png: &[u8], spot: DragSpot) -> scrozz_core::Result<DragPreview> {
+    let [_, _, width, height] = spot.card;
+    let size = LogicalSize::new(f64::from(width), f64::from(height));
+    if size.is_empty() || !size.width.is_finite() || !size.height.is_finite() {
+        return Err(scrozz_core::Error::InvalidRequest(
+            "drag card geometry cannot produce a preview".to_owned(),
+        ));
+    }
+
+    let scale = PREVIEW_SCALE.min(PREVIEW_MAX_EDGE / size.width.max(size.height));
+    let pixel_width = (size.width * scale).round().max(1.0) as u32;
+    let pixel_height = (size.height * scale).round().max(1.0) as u32;
+    let decoded = image::load_from_memory(png)
+        .map_err(|error| scrozz_core::Error::Codec(format!("preview PNG decode failed: {error}")))?
+        .into_rgba8();
+    let source_width = decoded.width();
+    let source_height = decoded.height();
+    let source_aspect = f64::from(source_width) / f64::from(source_height);
+    let target_aspect = f64::from(pixel_width) / f64::from(pixel_height);
+    let (crop_x, crop_y, crop_width, crop_height) = if source_aspect > target_aspect {
+        let crop_width = (f64::from(source_height) * target_aspect)
+            .round()
+            .clamp(1.0, f64::from(source_width)) as u32;
+        (
+            (source_width - crop_width) / 2,
+            0,
+            crop_width,
+            source_height,
+        )
+    } else {
+        let crop_height = (f64::from(source_width) / target_aspect)
+            .round()
+            .clamp(1.0, f64::from(source_height)) as u32;
+        (
+            0,
+            (source_height - crop_height) / 2,
+            source_width,
+            crop_height,
+        )
+    };
+    let cropped =
+        image::imageops::crop_imm(&decoded, crop_x, crop_y, crop_width, crop_height).to_image();
+    let mut fitted =
+        image::imageops::resize(&cropped, pixel_width, pixel_height, FilterType::Lanczos3);
+    round_preview_corners(
+        fitted.as_mut(),
+        pixel_width,
+        pixel_height,
+        f64::from(scrozz_ui::card::CardChrome::OUTER_RADIUS) * scale,
+    );
+    let image = RgbaImage {
+        width: pixel_width,
+        height: pixel_height,
+        data: fitted.into_raw(),
+    };
+    let png =
+        FrameEncoder::new().encode_rgba(&image, scrozz_core::ColorSpace::Srgb, ImageFormat::Png)?;
+    DragPreview::from_png(png, size)
+}
+
+fn round_preview_corners(pixels: &mut [u8], width: u32, height: u32, radius: f64) {
+    let radius = radius
+        .clamp(0.0, f64::from(width.min(height)) / 2.0)
+        .max(0.5);
+    let right = f64::from(width) - radius;
+    let bottom = f64::from(height) - radius;
+    for y in 0..height {
+        let py = f64::from(y) + 0.5;
+        let dy = if py < radius {
+            radius - py
+        } else if py > bottom {
+            py - bottom
+        } else {
+            0.0
+        };
+        for x in 0..width {
+            let px = f64::from(x) + 0.5;
+            let dx = if px < radius {
+                radius - px
+            } else if px > right {
+                px - right
+            } else {
+                0.0
+            };
+            if dx == 0.0 || dy == 0.0 {
+                continue;
+            }
+            let coverage = (radius + 0.5 - dx.hypot(dy)).clamp(0.0, 1.0);
+            let alpha = &mut pixels[(y as usize * width as usize + x as usize) * 4 + 3];
+            *alpha = (f64::from(*alpha) * coverage).round() as u8;
+        }
+    }
 }
 
 /// The filename a drop target will see, without its extension.
@@ -318,36 +413,28 @@ fn stem_for(card: CardId) -> String {
     )
 }
 
-/// Reads a PNG's dimensions and scales them to fit [`PREVIEW_EDGE`].
-///
-/// Reads the IHDR directly rather than decoding: the drag image is wanted in
-/// the few milliseconds before the session starts, and decoding a thumbnail
-/// just to learn its aspect ratio would be paid on every gesture.
-fn preview_size(png: &[u8]) -> Option<LogicalSize> {
-    // 8-byte signature, 4-byte length, "IHDR", then width and height.
-    let width = u32::from_be_bytes(png.get(16..20)?.try_into().ok()?);
-    let height = u32::from_be_bytes(png.get(20..24)?.try_into().ok()?);
-    if width == 0 || height == 0 {
-        return None;
-    }
-
-    let longest = f64::from(width.max(height));
-    let scale = PREVIEW_EDGE / longest;
-    let size = LogicalSize::new(f64::from(width) * scale, f64::from(height) * scale);
-    (!size.is_empty()).then_some(size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn png(width: u32, height: u32) -> Vec<u8> {
-        let mut bytes = vec![0u8; 24];
-        bytes[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-        bytes[12..16].copy_from_slice(b"IHDR");
-        bytes[16..20].copy_from_slice(&width.to_be_bytes());
-        bytes[20..24].copy_from_slice(&height.to_be_bytes());
-        bytes
+        let image = RgbaImage {
+            width,
+            height,
+            data: (0..width * height)
+                .flat_map(|_| [30, 180, 220, 255])
+                .collect(),
+        };
+        FrameEncoder::new()
+            .encode_rgba(&image, scrozz_core::ColorSpace::Srgb, ImageFormat::Png)
+            .expect("encode fixture")
+    }
+
+    fn spot() -> DragSpot {
+        DragSpot {
+            card: [10.0, 20.0, 210.0, 150.0],
+            pointer: [80.0, 90.0],
+        }
     }
 
     fn capture() -> CaptureBytes {
@@ -360,29 +447,59 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_preview_keeps_its_shape() {
-        let size = preview_size(&png(400, 200)).expect("a 400x200 PNG has a size");
-        assert!((size.width - PREVIEW_EDGE).abs() < 0.001);
-        assert!((size.height - PREVIEW_EDGE / 2.0).abs() < 0.001);
+    fn a_drag_preview_matches_the_card_size_crop_and_rounding() {
+        let preview = preview_for_card(&png(400, 200), spot()).expect("preview");
+        assert_eq!(preview.size(), LogicalSize::new(210.0, 150.0));
+
+        let frame = scrozz_export::decode(preview.png()).expect("decode preview");
+        assert_eq!((frame.width(), frame.height()), (420, 300));
+        let image = scrozz_export::to_straight_rgba8(&frame).expect("straight pixels");
+        assert_eq!(image.pixel(0, 0).expect("corner")[3], 0);
+        assert_eq!(image.pixel(210, 150), Some([30, 180, 220, 255]));
     }
 
     #[test]
-    fn a_tall_preview_is_bounded_by_its_height() {
-        let size = preview_size(&png(200, 400)).expect("a 200x400 PNG has a size");
-        assert!((size.height - PREVIEW_EDGE).abs() < 0.001);
-        assert!((size.width - PREVIEW_EDGE / 2.0).abs() < 0.001);
+    fn extreme_aspect_previews_crop_before_bounded_resize() {
+        let preview = preview_for_card(&png(1, 512), spot()).expect("thin preview");
+        let frame = scrozz_export::decode(preview.png()).expect("decode preview");
+        assert_eq!((frame.width(), frame.height()), (420, 300));
+        assert!(preview.png().len() < 420 * 300 * 4);
     }
 
     #[test]
-    fn a_truncated_png_has_no_preview_size() {
-        assert!(preview_size(&[0x89, b'P', b'N', b'G']).is_none());
-        assert!(preview_size(&png(0, 100)).is_none());
+    fn wide_previews_are_center_cropped_like_the_visible_card() {
+        let width = 400;
+        let height = 200;
+        let image = RgbaImage {
+            width,
+            height,
+            data: (0..height)
+                .flat_map(|_| {
+                    (0..width).flat_map(|x| {
+                        if !(50..350).contains(&x) {
+                            [220, 20, 20, 255]
+                        } else {
+                            [20, 220, 80, 255]
+                        }
+                    })
+                })
+                .collect(),
+        };
+        let png = FrameEncoder::new()
+            .encode_rgba(&image, scrozz_core::ColorSpace::Srgb, ImageFormat::Png)
+            .expect("encode fixture");
+        let preview = preview_for_card(&png, spot()).expect("preview");
+        let frame = scrozz_export::decode(preview.png()).expect("decode preview");
+        let image = scrozz_export::to_straight_rgba8(&frame).expect("straight pixels");
+
+        assert_eq!(image.pixel(0, 150), Some([20, 220, 80, 255]));
+        assert_eq!(image.pixel(419, 150), Some([20, 220, 80, 255]));
     }
 
     #[test]
     fn the_payload_offers_the_full_resolution_bytes_as_a_png_file() {
         let bytes = capture();
-        let payload = payload_for(CardId(7), &bytes);
+        let payload = payload_for(CardId(7), &bytes, spot());
 
         assert!(
             payload.file().file_name().ends_with(".png"),
@@ -395,7 +512,7 @@ mod tests {
     #[test]
     fn the_payload_offers_the_same_bytes_as_image_data() {
         let bytes = capture();
-        let payload = payload_for(CardId(1), &bytes);
+        let payload = payload_for(CardId(1), &bytes, spot());
 
         let image = payload.image().expect("an image flavour is offered");
         assert_eq!(
@@ -406,19 +523,15 @@ mod tests {
     }
 
     #[test]
-    fn the_drag_image_is_the_thumbnail_not_the_capture() {
+    fn the_drag_image_is_a_card_matched_render_of_the_current_thumbnail() {
         let bytes = capture();
-        let payload = payload_for(CardId(1), &bytes);
+        let payload = payload_for(CardId(1), &bytes, spot());
 
         let preview = payload.preview_png().expect("a preview is offered");
+        assert_ne!(preview, bytes.full.as_slice());
         assert_eq!(
-            preview,
-            bytes
-                .preview
-                .as_deref()
-                .map(Vec::as_slice)
-                .expect("a thumbnail"),
-            "the picture that follows the cursor is the small one"
+            payload.preview().expect("preview").size(),
+            LogicalSize::new(210.0, 150.0)
         );
     }
 
@@ -430,7 +543,7 @@ mod tests {
             full: Arc::new(b"png".to_vec()),
             preview: None,
         };
-        let payload = payload_for(CardId(1), &bytes);
+        let payload = payload_for(CardId(1), &bytes, spot());
 
         assert!(payload.preview().is_none());
         assert!(

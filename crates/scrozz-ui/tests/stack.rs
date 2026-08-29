@@ -7,8 +7,8 @@
 use egui::{Rect, Vec2, pos2, vec2};
 use scrozz_ui::motion::Motion;
 use scrozz_ui::stack::{
-    CaptureStack, CardFrame, CardId, CardMetrics, CardState, Dir, GestureConfig, Intent, MAX_SLOTS,
-    MIN_SLOTS, StackLayout, Timing, classify,
+    CaptureStack, CardFrame, CardId, CardMetrics, CardState, DRAG_LOCK_SLOP, DRAG_SOURCE_ALPHA,
+    Dir, GestureConfig, Intent, MAX_SLOTS, MIN_SLOTS, StackLayout, Timing, classify,
 };
 
 // ---------------------------------------------------------------------------
@@ -386,7 +386,7 @@ fn a_fall_does_not_reapply_an_active_drag_transform() {
     let instant = at(SETTLED);
     let origin = stack.frame_of(upper, &instant).unwrap().rect.center();
     assert!(stack.begin_drag(upper, origin, &instant));
-    stack.drag_to(origin + vec2(70.0, 35.0), &instant);
+    stack.drag_to(origin + vec2(-70.0, 35.0), &instant);
     let before = stack.frame_of(upper, &instant).unwrap().rect;
 
     assert!(stack.dismiss(lower, &instant));
@@ -397,10 +397,10 @@ fn a_fall_does_not_reapply_an_active_drag_transform() {
         "dismissal below a held card must not double its drag offset",
     );
 
-    stack.drag_to(origin + vec2(90.0, 55.0), &instant);
+    stack.drag_to(origin + vec2(-90.0, 55.0), &instant);
     let after = stack.frame_of(upper, &instant).unwrap().rect;
     assert!(
-        (after.min - before.min - vec2(20.0, 20.0)).length() < 0.01,
+        (after.min - before.min - vec2(-20.0, 20.0)).length() < 0.01,
         "a falling held card stopped tracking 1:1: {before:?} -> {after:?}"
     );
 }
@@ -894,7 +894,7 @@ fn a_live_gesture_is_only_reported_once_it_has_travelled() {
         "a press that has not moved is not a drag-out"
     );
 
-    s.drag_to(origin + vec2(12.0, 0.0), &at(SETTLED + 10));
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP / 2.0, 0.0), &at(SETTLED + 10));
     assert!(
         s.live_gesture(&at(SETTLED + 10)).is_none(),
         "a twitch is not a drag-out"
@@ -926,31 +926,153 @@ fn a_live_gesture_reports_where_the_card_and_pointer_are_now() {
 
     let live = s.live_gesture(&at(SETTLED + 60)).expect("drag-out");
     assert_eq!(live.pointer, moved, "the drag image follows the pointer");
+    assert_eq!(live.rect, home, "the source must stay pinned to its slot");
+}
+
+#[test]
+fn outward_direction_lock_pins_and_fades_the_source_without_reflow() {
+    let mut s = stack();
+    let lower = s.push(&at(0));
+    let source = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let home = s.frame_of(source, &at(SETTLED)).expect("source").rect;
+    let lower_slot = s.slot_of(lower);
+    let source_slot = s.slot_of(source);
+    let origin = home.center();
+    s.begin_drag(source, origin, &at(SETTLED));
+
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP / 2.0, 1.0), &at(SETTLED + 10));
+    assert_eq!(s.frame_of(source, &at(SETTLED + 10)).unwrap().rect, home);
+    assert!(s.live_gesture(&at(SETTLED + 10)).is_none());
+
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP + 1.0, 1.0), &at(SETTLED + 20));
+    let live = s.live_gesture(&at(SETTLED + 20)).expect("outward lock");
+    assert_eq!(live.direction, Some(Dir::Right));
+    assert_eq!(live.rect, home);
+    assert_eq!(s.slot_of(lower), lower_slot);
+    assert_eq!(s.slot_of(source), source_slot);
+
+    let start = s.frame_of(source, &at(SETTLED + 20)).unwrap();
+    let middle = s.frame_of(source, &at(SETTLED + 80)).unwrap();
+    let faded = s.frame_of(source, &at(SETTLED + 500)).unwrap();
+    assert_eq!(start.rect, home);
+    assert_eq!(middle.rect, home);
+    assert_eq!(faded.rect, home);
+    assert!(start.alpha > middle.alpha && middle.alpha > DRAG_SOURCE_ALPHA);
+    assert!((faded.alpha - DRAG_SOURCE_ALPHA).abs() < 0.001);
+}
+
+#[test]
+fn vertical_leading_motion_locks_without_turning_downward_motion_into_a_drag_out() {
+    for (delta, expected) in [
+        (vec2(1.0, -DRAG_LOCK_SLOP - 1.0), Some(Dir::Up)),
+        (vec2(1.0, DRAG_LOCK_SLOP + 1.0), None),
+    ] {
+        let mut s = stack();
+        let id = s.push(&at(0));
+        s.advance(&at(SETTLED));
+        let origin = s.frame_of(id, &at(SETTLED)).unwrap().rect.center();
+        s.begin_drag(id, origin, &at(SETTLED));
+        s.drag_to(origin + delta, &at(SETTLED + 20));
+        assert_eq!(
+            s.live_gesture(&at(SETTLED + 20))
+                .and_then(|live| live.direction),
+            expected
+        );
+    }
+}
+
+#[test]
+fn reduced_motion_fades_and_restores_the_drag_source_immediately() {
+    let calm = Motion::at_ms(SETTLED).with_reduce_motion(true);
+    let later = Motion::at_ms(SETTLED + 1).with_reduce_motion(true);
+    let mut s = stack();
+    let id = s.push(&calm);
+    s.advance(&calm);
+    let home = s.frame_of(id, &calm).unwrap().rect;
+    let origin = home.center();
+    s.begin_drag(id, origin, &calm);
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP + 1.0, 0.0), &calm);
+    assert_eq!(s.frame_of(id, &calm).unwrap().alpha, DRAG_SOURCE_ALPHA);
+
+    assert!(s.settle_drag(id, &later));
+    assert_eq!(s.frame_of(id, &later).unwrap().alpha, 1.0);
+    assert_eq!(s.frame_of(id, &later).unwrap().rect, home);
+}
+
+#[test]
+fn an_entering_card_freezes_the_exact_visible_rect_when_drag_out_locks() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    let instant = at(120);
+    let visible = s.frame_of(id, &instant).expect("entering card").rect;
+    let origin = visible.center();
+    s.begin_drag(id, origin, &instant);
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP + 1.0, 0.0), &instant);
+
+    assert_eq!(s.live_gesture(&instant).expect("armed").rect, visible);
+    assert_eq!(s.frame_of(id, &at(300)).expect("pinned").rect, visible);
+}
+
+#[test]
+fn accepted_departure_preserves_the_faded_source_alpha() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let origin = s.frame_of(id, &at(SETTLED)).unwrap().rect.center();
+    s.begin_drag(id, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP + 1.0, 0.0), &at(SETTLED));
+    let settled = at(SETTLED + 500);
+    assert_eq!(s.frame_of(id, &settled).unwrap().alpha, DRAG_SOURCE_ALPHA);
+
+    assert!(s.settle_drag(id, &settled));
+    assert!(s.dismiss(id, &settled));
+    let departing = frame_of(&s.frame(&settled), id);
+    assert_eq!(departing.alpha, DRAG_SOURCE_ALPHA);
+}
+
+#[test]
+fn drag_restoration_is_continuous_during_dock_motion() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    s.collapse(&at(SETTLED));
+    let instant = at(SETTLED + 160);
+    let pinned = s.frame_of(id, &instant).unwrap().rect;
+    let origin = pinned.center();
+    s.begin_drag(id, origin, &instant);
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP + 1.0, 0.0), &instant);
+    assert_eq!(s.live_gesture(&instant).unwrap().rect, pinned);
+
+    assert!(s.settle_drag(id, &instant));
     assert_eq!(
-        live.rect,
-        home.translate(travel),
-        "the card has moved with the pointer, not stayed in its slot"
-    );
-    assert!(
-        live.rect.contains(moved),
-        "the grab point is still inside the card: {:?} vs {moved:?}",
-        live.rect
+        s.frame_of(id, &instant).unwrap().rect,
+        pinned,
+        "settling reapplied the dock transform to the pinned source"
     );
 }
 
 #[test]
-fn a_live_gesture_ignores_flick_speed() {
-    // A short sharp flick clears the *velocity* threshold without clearing the
-    // distance one. At release that is a deliberate shortcut and counts as a
-    // drag-out. Mid-gesture it must not, because every drag is briefly fast as
-    // the pointer accelerates and the card has not actually been pulled clear
-    // of the pile yet — arming there would fire on an ordinary shove.
-    //
-    // 60 pt in the last 60 ms is 1000 pt/s against a 420 pt/s threshold, while
-    // 60 pt is comfortably under the 110 pt one, so the two rules genuinely
-    // disagree. The still sample at +40 ms is what puts a measurable interval
-    // inside the 80 ms velocity window; without it the flick reads as
-    // instantaneous and is discarded as noise.
+fn stack_reflow_does_not_jump_a_returning_drag_source() {
+    let mut s = stack();
+    let lower = s.push(&at(0));
+    let source = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let origin = s.frame_of(source, &at(SETTLED)).unwrap().rect.center();
+    s.begin_drag(source, origin, &at(SETTLED));
+    s.drag_to(origin + vec2(DRAG_LOCK_SLOP + 1.0, 0.0), &at(SETTLED));
+    s.settle_drag(source, &at(SETTLED + 200));
+    let instant = at(SETTLED + 260);
+    let before = s.frame_of(source, &instant).unwrap().rect;
+
+    assert!(s.dismiss(lower, &instant));
+    let after = s.frame_of(source, &instant).unwrap().rect;
+
+    assert_eq!(after, before, "reflow attenuated the continuity offset");
+}
+
+#[test]
+fn a_small_outward_direction_lock_arms_without_waiting_for_release_speed() {
     let flick = vec2(60.0, 0.0);
     let origin = pos2(120.0, 900.0);
 
@@ -962,8 +1084,8 @@ fn a_live_gesture_ignores_flick_speed() {
     s.drag_to(origin + flick, &at(SETTLED + 100));
 
     assert!(
-        s.live_gesture(&at(SETTLED + 100)).is_none(),
-        "60 pt covered quickly is still only 60 pt"
+        s.live_gesture(&at(SETTLED + 100)).is_some(),
+        "an outward drag should arm after native slop, not 110 points"
     );
 
     // And the same gesture released right there *is* a drag-out, which is what
@@ -1494,7 +1616,7 @@ fn reduced_timing_tokens_leave_the_state_machine_intact() {
 // dragged again. `settle_drag` is how the host says "that one is over" without
 // having to know whether the release came through.
 
-/// A card lifted out of its slot and carried sideways, mid-gesture.
+/// A card whose outward gesture has armed a native drag, mid-gesture.
 ///
 /// Returns the card and the slot it came from. The slot has to be read
 /// *before* the drag, because a frame taken during one already carries the
@@ -1511,10 +1633,10 @@ fn dragged_out(s: &mut CaptureStack) -> (CardId, Rect) {
         s.live_gesture(&at(SETTLED + 60)).is_some(),
         "the fixture must be a committed drag-out"
     );
-    assert_ne!(
+    assert_eq!(
         frame_of(&s.frame(&at(SETTLED + 60)), id).rect,
         home,
-        "the fixture must actually have moved the card off its slot"
+        "the fixture must keep the source pinned in its slot"
     );
     (id, home)
 }
@@ -1532,12 +1654,17 @@ fn a_rejected_drop_springs_the_card_back() {
     // The card is still on the pile — a refused drop loses nothing — and it is
     // on its way home rather than stranded where the pointer left it.
     assert_eq!(s.len(), 1, "a rejected drop must not discard the card");
+    assert!(
+        frame_of(&s.frame(&at(SETTLED + 100)), id).alpha < 1.0,
+        "restoration should reverse from the faded source"
+    );
     s.advance(&at(SETTLED + 4_000));
     assert_rect_eq(
         frame_of(&s.frame(&at(SETTLED + 4_000)), id).rect,
         home,
         "the card did not return to its slot after a rejected drop",
     );
+    assert_eq!(frame_of(&s.frame(&at(SETTLED + 4_000)), id).alpha, 1.0);
 }
 
 #[test]

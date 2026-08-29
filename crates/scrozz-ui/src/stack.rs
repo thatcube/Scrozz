@@ -407,6 +407,23 @@ pub fn classify(travel: Vec2, velocity: Vec2, cfg: &GestureConfig) -> (Intent, O
     }
 }
 
+fn lock_direction(travel: Vec2) -> Option<Dir> {
+    if travel.length() < DRAG_LOCK_SLOP {
+        return None;
+    }
+    Some(if travel.x.abs() >= travel.y.abs() {
+        if travel.x >= 0.0 {
+            Dir::Right
+        } else {
+            Dir::Left
+        }
+    } else if travel.y >= 0.0 {
+        Dir::Down
+    } else {
+        Dir::Up
+    })
+}
+
 /// The window a release speed is measured over, in seconds.
 ///
 /// Ported from the spike, which found egui's own smoothed pointer velocity
@@ -414,6 +431,12 @@ pub fn classify(travel: Vec2, velocity: Vec2, cfg: &GestureConfig) -> (Intent, O
 /// "drag slowly, stop, release" became an unwanted throw. Differencing over a
 /// short window makes a dead stop read as exactly zero.
 pub const VELOCITY_WINDOW: f32 = 0.080;
+
+/// Pointer travel before a held card commits to one gesture direction.
+pub const DRAG_LOCK_SLOP: f32 = 8.0;
+
+/// Opacity of the stationary source while the native drag ghost is active.
+pub const DRAG_SOURCE_ALPHA: f32 = 0.5;
 
 /// Release speed, measured by differencing over [`VELOCITY_WINDOW`].
 #[derive(Debug, Clone, Default)]
@@ -509,6 +532,8 @@ pub struct Timing {
     pub reveal: Duration,
     /// Easing for the reveal.
     pub reveal_ease: Ease,
+    /// Source thumbnail fading when a native drag takes over or finishes.
+    pub drag_source_fade: Duration,
     /// The pile collapsing into the dock.
     pub collapse: Duration,
     /// The pile coming back out.
@@ -529,6 +554,7 @@ impl Default for Timing {
             spring_back_ease: Ease::SpringOvershoot,
             reveal: Duration::FAST,
             reveal_ease: Ease::OutCubic,
+            drag_source_fade: Duration::FAST,
             collapse: Duration::SLOW,
             expand: Duration::from_millis(280),
         }
@@ -550,6 +576,7 @@ impl Timing {
             fall: Duration::ZERO,
             spring_back: Duration::ZERO,
             reveal: Duration::ZERO,
+            drag_source_fade: Duration::ZERO,
             collapse: Duration::ZERO,
             expand: Duration::ZERO,
             ..Self::default()
@@ -597,11 +624,59 @@ pub struct Card {
     born_slot: usize,
     entry: Option<Timeline>,
     fall: Option<(Timeline, Vec2)>,
-    ret: Option<(Timeline, Vec2)>,
+    ret: Option<ReturnTransition>,
     drag: Option<Vec2>,
+    drag_fade: Option<AlphaTransition>,
     hover_on: bool,
     hover_since: f64,
     lifted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AlphaTransition {
+    timeline: Timeline,
+    from: f32,
+    to: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReturnTransition {
+    timeline: Timeline,
+    from: Rect,
+}
+
+impl AlphaTransition {
+    fn value(self, m: &Motion) -> f32 {
+        self.timeline
+            .value(m)
+            .mul_add(self.to - self.from, self.from)
+            .clamp(0.0, 1.0)
+    }
+}
+
+fn drag_alpha(card: &Card, m: &Motion) -> f32 {
+    card.drag_fade.map_or(1.0, |fade| fade.value(m))
+}
+
+fn start_drag_fade(card: &mut Card, to: f32, m: &Motion, duration: Duration) {
+    let from = drag_alpha(card, m);
+    if (from - to).abs() <= f32::EPSILON {
+        if to >= 1.0 {
+            card.drag_fade = None;
+        }
+        return;
+    }
+    card.drag_fade = Some(AlphaTransition {
+        timeline: Timeline::starting(m, duration, Ease::OutCubic),
+        from,
+        to,
+    });
+}
+
+fn fall_offset(card: &Card, m: &Motion) -> Vec2 {
+    card.fall.map_or(Vec2::ZERO, |(timeline, displacement)| {
+        displacement * (1.0 - timeline.value(m).clamp(0.0, 1.0))
+    })
 }
 
 impl Card {
@@ -646,6 +721,7 @@ pub struct Departing {
     timeline: Timeline,
     dir: Dir,
     intent: Intent,
+    from_alpha: f32,
 }
 
 impl Departing {
@@ -748,6 +824,8 @@ struct ActiveDrag {
     origin: Pos2,
     latest: Pos2,
     velocity: DragVelocity,
+    direction: Option<Dir>,
+    pinned_rect: Option<Rect>,
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +1009,7 @@ impl CaptureStack {
             fall: None,
             ret: None,
             drag: None,
+            drag_fade: None,
             hover_on: false,
             hover_since: m.now(),
             lifted: false,
@@ -980,6 +1059,7 @@ impl CaptureStack {
             return;
         }
         let from = self.rect_of_resident(slot, m);
+        let from_alpha = drag_alpha(&self.cards[slot], m);
 
         // Where each card above is *right now*, captured before the shift —
         // otherwise an interrupted fall restarts from the slot it is about to
@@ -1019,6 +1099,7 @@ impl CaptureStack {
             timeline: Timeline::starting(m, token, self.timing.exit_ease),
             dir,
             intent,
+            from_alpha,
         });
 
         // Everything that was above the departing card now falls one slot.
@@ -1079,6 +1160,8 @@ impl CaptureStack {
             origin: pointer,
             latest: pointer,
             velocity,
+            direction: None,
+            pinned_rect: None,
         });
         let card = &mut self.cards[slot];
         card.drag = Some(Vec2::ZERO);
@@ -1087,20 +1170,48 @@ impl CaptureStack {
         true
     }
 
-    /// Moves the held card with the pointer, 1:1.
+    /// Moves an internal gesture with the pointer after direction lock.
     ///
-    /// No smoothing, no spring: inertia belongs to the release, not to the hold.
-    /// A card that lags the finger feels broken.
+    /// An outward/upward gesture is a native drag source, so the resident card
+    /// stays pinned while the OS-owned ghost follows the pointer.
     pub fn drag_to(&mut self, pointer: Pos2, m: &Motion) {
-        let Some(drag) = self.drag.as_mut() else {
-            return;
+        let (id, offset, direction, newly_locked) = {
+            let Some(drag) = self.drag.as_mut() else {
+                return;
+            };
+            drag.latest = pointer;
+            drag.velocity.push(pointer, m);
+            let offset = pointer - drag.origin;
+            let newly_locked = if drag.direction.is_none() {
+                drag.direction = lock_direction(offset);
+                drag.direction
+            } else {
+                None
+            };
+            (drag.id, offset, drag.direction, newly_locked)
         };
-        drag.latest = pointer;
-        drag.velocity.push(pointer, m);
-        let offset = pointer - drag.origin;
-        let id = drag.id;
+
+        if newly_locked.is_some_and(|direction| direction.intent() == Intent::DragOut)
+            && let Some(slot) = self.slot_of(id)
+        {
+            let pinned = self.rect_of_resident(slot, m);
+            if let Some(drag) = self.drag.as_mut() {
+                drag.pinned_rect = Some(pinned);
+            }
+        }
         if let Some(card) = self.cards.iter_mut().find(|c| c.id == id) {
-            card.drag = Some(offset);
+            if direction.is_some_and(|direction| direction.intent() == Intent::DragOut) {
+                card.drag = Some(Vec2::ZERO);
+                card.lifted = false;
+                if newly_locked.is_some() {
+                    card.entry = None;
+                    card.fall = None;
+                    card.ret = None;
+                    start_drag_fade(card, DRAG_SOURCE_ALPHA, m, self.timing.drag_source_fade);
+                }
+            } else if direction.is_some() {
+                card.drag = Some(offset);
+            }
         }
     }
 
@@ -1122,17 +1233,22 @@ impl CaptureStack {
     #[must_use]
     pub fn live_gesture(&self, m: &Motion) -> Option<LiveGesture> {
         let drag = self.drag.as_ref()?;
+        let direction = drag.direction?;
+        let intent = direction.intent();
         let travel = drag.latest - drag.origin;
-        let (intent, direction) = classify(travel, Vec2::ZERO, &self.gestures);
-        if intent == Intent::SpringBack {
+        if intent != Intent::DragOut && self.gestures.score(direction, travel, Vec2::ZERO) < 1.0 {
             return None;
         }
         let slot = self.slot_of(drag.id)?;
         Some(LiveGesture {
             id: drag.id,
             intent,
-            direction,
-            rect: self.rect_of_resident(slot, m),
+            direction: Some(direction),
+            rect: if intent == Intent::DragOut {
+                drag.pinned_rect.unwrap_or_else(|| self.home_rect(slot))
+            } else {
+                self.rect_of_resident(slot, m)
+            },
             pointer: drag.latest,
         })
     }
@@ -1144,9 +1260,18 @@ impl CaptureStack {
         let drag = self.drag.take()?;
         let travel = drag.latest - drag.origin;
         let velocity = drag.velocity.velocity(m);
-        let (intent, direction) = classify(travel, velocity, &self.gestures);
+        let direction = drag.direction;
+        let intent = direction.map_or(Intent::SpringBack, |direction| {
+            if self.gestures.score(direction, travel, velocity) >= 1.0 {
+                direction.intent()
+            } else {
+                Intent::SpringBack
+            }
+        });
         let slot = self.slot_of(drag.id)?;
-        let rect = self.rect_of_resident(slot, m);
+        let rect = drag
+            .pinned_rect
+            .unwrap_or_else(|| self.rect_of_resident(slot, m));
 
         match intent {
             Intent::Dismiss => {
@@ -1157,12 +1282,12 @@ impl CaptureStack {
             // was already handed off through `live_gesture`; reaching this arm
             // means only release velocity crossed the threshold. Losing the card
             // without delivering a drop is never an acceptable shortcut.
-            Intent::DragOut => self.spring_back(slot, m),
+            Intent::DragOut => self.spring_back(slot, m, drag.pinned_rect),
             Intent::Collapse => {
-                self.spring_back(slot, m);
+                self.spring_back(slot, m, drag.pinned_rect);
                 self.dock.collapse(m);
             }
-            Intent::SpringBack => self.spring_back(slot, m),
+            Intent::SpringBack => self.spring_back(slot, m, drag.pinned_rect),
         }
 
         Some(DragRelease {
@@ -1181,7 +1306,7 @@ impl CaptureStack {
             return;
         };
         if let Some(slot) = self.slot_of(drag.id) {
-            self.spring_back(slot, m);
+            self.spring_back(slot, m, drag.pinned_rect);
         }
     }
 
@@ -1212,7 +1337,10 @@ impl CaptureStack {
         let mut changed = false;
 
         if self.drag.as_ref().is_some_and(|drag| drag.id == id) {
-            self.drag = None;
+            let drag = self.drag.take().expect("the matching drag exists");
+            if let Some(slot) = self.slot_of(id) {
+                self.spring_back(slot, m, drag.pinned_rect);
+            }
             changed = true;
         }
 
@@ -1224,7 +1352,7 @@ impl CaptureStack {
                 .get(slot)
                 .is_some_and(|card| card.drag.is_some() || card.lifted)
         {
-            self.spring_back(slot, m);
+            self.spring_back(slot, m, None);
             changed = true;
         }
 
@@ -1232,19 +1360,29 @@ impl CaptureStack {
     }
 
     /// Sends a card back to its slot from wherever it is.
-    fn spring_back(&mut self, slot: usize, m: &Motion) {
-        let Some(card) = self.cards.get_mut(slot) else {
+    fn spring_back(&mut self, slot: usize, m: &Motion, from: Option<Rect>) {
+        if slot >= self.cards.len() {
             return;
-        };
-        let offset = card.drag.take().unwrap_or(Vec2::ZERO);
+        }
+        let from = from.unwrap_or_else(|| self.rect_of_resident(slot, m));
+        let target = self.base_rect_of_resident(slot, m);
+        let fall_offset = fall_offset(&self.cards[slot], m);
+        let from = from.translate(-fall_offset);
+        let card = &mut self.cards[slot];
+        card.drag = None;
         card.lifted = false;
-        card.ret = if offset == Vec2::ZERO {
+        start_drag_fade(card, 1.0, m, self.timing.drag_source_fade);
+        card.ret = if from == target {
             None
         } else {
-            Some((
-                Timeline::starting(m, self.timing.spring_back, self.timing.spring_back_ease),
-                offset,
-            ))
+            Some(ReturnTransition {
+                timeline: Timeline::starting(
+                    m,
+                    self.timing.spring_back,
+                    self.timing.spring_back_ease,
+                ),
+                from,
+            })
         };
     }
 
@@ -1281,8 +1419,14 @@ impl CaptureStack {
             if card.fall.is_some_and(|(t, _)| !t.is_active(m)) {
                 card.fall = None;
             }
-            if card.ret.is_some_and(|(t, _)| !t.is_active(m)) {
+            if card.ret.is_some_and(|ret| !ret.timeline.is_active(m)) {
                 card.ret = None;
+            }
+            if card
+                .drag_fade
+                .is_some_and(|fade| !fade.timeline.is_active(m) && fade.to >= 1.0)
+            {
+                card.drag_fade = None;
             }
         }
         self.departing.retain(|d| d.timeline.is_active(m));
@@ -1302,7 +1446,10 @@ impl CaptureStack {
             a |= Activity::when_animating(
                 card.entry.is_some_and(|t| t.is_active(m))
                     || card.fall.is_some_and(|(t, _)| t.is_active(m))
-                    || card.ret.is_some_and(|(t, _)| t.is_active(m))
+                    || card.ret.is_some_and(|ret| ret.timeline.is_active(m))
+                    || card
+                        .drag_fade
+                        .is_some_and(|fade| fade.timeline.is_active(m))
                     || m.progress(card.hover_since, self.timing.reveal) < 1.0,
             );
         }
@@ -1341,6 +1488,29 @@ impl CaptureStack {
     /// Where a resident card is, chrome aside.
     fn rect_of_resident(&self, slot: usize, m: &Motion) -> Rect {
         let card = &self.cards[slot];
+        if let Some(pinned) = self
+            .drag
+            .as_ref()
+            .filter(|drag| drag.id == card.id)
+            .and_then(|drag| drag.pinned_rect)
+        {
+            return pinned;
+        }
+        let mut rect = self.base_rect_of_resident(slot, m);
+        if let Some(ret) = card.ret {
+            rect = dock::lerp_rect(ret.from, rect, ret.timeline.value(m).clamp(0.0, 1.0));
+        }
+        if let Some((timeline, displacement)) = card.fall {
+            rect = rect.translate(displacement * (1.0 - timeline.value(m).clamp(0.0, 1.0)));
+        }
+        if let Some(offset) = card.drag {
+            rect = rect.translate(offset);
+        }
+        rect
+    }
+
+    fn base_rect_of_resident(&self, slot: usize, m: &Motion) -> Rect {
+        let card = &self.cards[slot];
         let mut rect = self.home_rect(slot);
 
         // Horizontal entry. Vertical position is untouched by design: entry
@@ -1352,16 +1522,8 @@ impl CaptureStack {
             let x = start + (target - start) * v;
             rect = rect.translate(vec2(x - rect.left(), 0.0));
         }
-        if let Some((t, offset)) = card.ret {
-            rect = rect.translate(offset * (1.0 - t.value(m)));
-        }
-        if let Some(offset) = card.drag {
-            rect = rect.translate(offset);
-        }
         rect = self.dock.absorb(rect, m);
-        card.fall.map_or(rect, |(timeline, displacement)| {
-            rect.translate(displacement * (1.0 - timeline.value(m).clamp(0.0, 1.0)))
-        })
+        rect
     }
 
     fn home_rect(&self, slot: usize) -> Rect {
@@ -1376,7 +1538,7 @@ impl CaptureStack {
             CardState::Dragging
         } else if card.entry.is_some_and(|t| t.is_active(m)) {
             CardState::Entering
-        } else if card.ret.is_some_and(|(t, _)| t.is_active(m)) {
+        } else if card.ret.is_some_and(|ret| ret.timeline.is_active(m)) {
             CardState::Returning
         } else if card.fall.is_some_and(|(t, _)| t.is_active(m)) {
             CardState::Falling
@@ -1405,7 +1567,7 @@ impl CaptureStack {
             id: card.id,
             slot,
             rect,
-            alpha: entry_alpha,
+            alpha: entry_alpha * drag_alpha(card, m),
             reveal: self.timing.reveal_ease.apply(reveal) * flat,
             lift: if card.lifted { 1.0 } else { 0.0 },
             angle,
@@ -1422,7 +1584,7 @@ impl CaptureStack {
             rect: self.dock.absorb(rect, m),
             // Fade over the second half of the travel, so the card is invisible
             // before it reaches the edge rather than clipping against it.
-            alpha: ((1.0 - v) * 2.0).clamp(0.0, 1.0),
+            alpha: d.from_alpha * ((1.0 - v) * 2.0).clamp(0.0, 1.0),
             reveal: 0.0,
             lift: 0.0,
             angle: 0.0,
