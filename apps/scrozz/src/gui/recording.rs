@@ -30,8 +30,8 @@ use std::{
 
 use scrozz_core::{CaptureTarget, Error as CoreError};
 use scrozz_record::{
-    MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
-    RecordingSettings,
+    EngineCapabilities, MachineFailure, Recording, RecordingMachine, RecordingPhase,
+    RecordingRequest, RecordingSettings,
     edit::{EditPlan, VideoDocument},
     handoff::FinalizedMediaHandoff,
     media::DecodedVideoFrame,
@@ -257,6 +257,13 @@ pub struct RecordingState {
     pub sequence: u64,
     /// The last failure presented outside the machine's own lifecycle.
     pub preflight_failure: Option<MachineFailure>,
+    /// Interaction preferences edited by the settings surface but not yet saved.
+    ///
+    /// The settings pane edits a copy rather than the store, so a half-made
+    /// choice — "show all keys" selected on the way to picking a position —
+    /// never reaches the recording engine or the disk. It is written once, when
+    /// the pane closes, a recording starts, or the app shuts down.
+    pub settings_panel: Option<RecordingSettings>,
 }
 
 impl RecordingState {
@@ -283,6 +290,7 @@ impl RecordingState {
             handoff: None,
             sequence: 0,
             preflight_failure: None,
+            settings_panel: None,
         }
     }
 
@@ -352,6 +360,59 @@ impl RecordingState {
             .as_ref()
             .map(|machine| CompletionActions::from_settings(machine.settings()))
             .unwrap_or_default()
+    }
+
+    /// The interaction policy the settings surface should show.
+    ///
+    /// Unsaved pane edits win, then the machine's live configuration, then the
+    /// shipped defaults — which are the permission-free ones, so a platform
+    /// with no engine still shows an honest "nothing is being observed".
+    #[must_use]
+    pub fn settings(&self) -> RecordingSettings {
+        self.settings_panel.unwrap_or_else(|| {
+            self.machine
+                .as_ref()
+                .map_or_else(RecordingSettings::shipped, |machine| *machine.settings())
+        })
+    }
+
+    /// What the native engine can actually observe.
+    #[must_use]
+    pub fn capabilities(&self) -> EngineCapabilities {
+        self.machine
+            .as_ref()
+            .map_or_else(EngineCapabilities::default, RecordingMachine::capabilities)
+    }
+
+    /// Applies an edited policy to the machine and remembers it as unsaved.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the machine says when it will not accept a change —
+    /// which it refuses once a selection, countdown or capture owns it — or the
+    /// unavailability reason when no engine is linked.
+    pub fn apply_settings(&mut self, settings: RecordingSettings) -> scrozz_core::Result<()> {
+        let Some(machine) = self.machine.as_mut() else {
+            return Err(self.unavailable_error());
+        };
+        machine.set_settings(settings)?;
+        self.settings_panel = Some(settings);
+        Ok(())
+    }
+
+    /// Takes the unsaved policy, leaving the surface with nothing pending.
+    pub fn take_settings_panel(&mut self) -> Option<RecordingSettings> {
+        self.settings_panel.take()
+    }
+
+    /// Drops every retained interaction event and its private source.
+    ///
+    /// Called on shutdown so nothing derived from an input tap outlives the
+    /// process that was allowed to observe it.
+    pub fn discard_interactions(&mut self) {
+        if let Some(machine) = self.machine.as_mut() {
+            machine.discard_interactions();
+        }
     }
 
     /// Advances the export job, returning the export if it settled completely.

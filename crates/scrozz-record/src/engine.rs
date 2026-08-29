@@ -44,6 +44,8 @@ pub struct EngineCapabilities {
     pub all_displays: bool,
     /// Can include the pointer when requested.
     pub cursor: bool,
+    /// Can replace the native pointer with the shared smoothed renderer.
+    pub cursor_smoothing: bool,
     /// Can write MP4 output.
     pub mp4: bool,
     /// Supports a hardware H.264 path.
@@ -73,6 +75,7 @@ impl EngineCapabilities {
         region: true,
         all_displays: true,
         cursor: true,
+        cursor_smoothing: false,
         mp4: true,
         h264: true,
         hevc: false,
@@ -95,6 +98,7 @@ impl EngineCapabilities {
         region: true,
         all_displays: true,
         cursor: true,
+        cursor_smoothing: true,
         mp4: true,
         h264: true,
         hevc: true,
@@ -118,6 +122,25 @@ pub trait RecordingEngine: Send + Sync {
     ///
     /// Returns an actionable platform, permission, request, or capability error.
     fn start(&self, request: &RecordingRequest) -> Result<Box<dyn RecordingSession>>;
+
+    /// Starts with the validated product settings in force.
+    ///
+    /// Engines override this when settings require native resources beyond the
+    /// basic request, such as a lifetime-scoped input monitor.
+    fn start_with_settings(
+        &self,
+        request: &RecordingRequest,
+        settings: &RecordingSettings,
+    ) -> Result<Box<dyn RecordingSession>> {
+        if settings.needs_input_monitoring() || settings.cursor_smoothing {
+            return Err(Error::Unsupported {
+                what: "recording interaction overlays".to_owned(),
+                why: "the selected recording engine does not provide a native interaction source"
+                    .to_owned(),
+            });
+        }
+        self.start(request)
+    }
 
     /// Starts with native pull-based overlays when the engine supports them.
     ///
@@ -219,6 +242,7 @@ pub fn validate_capabilities(
     let camera = settings.is_some_and(RecordingSettings::needs_camera);
     let clicks = settings.is_some_and(|value| value.clicks.enabled);
     let keys = settings.is_some_and(|value| value.keystrokes.enabled);
+    let cursor_smoothing = settings.is_some_and(|value| value.cursor_smoothing);
 
     require(!microphone || capabilities.microphone, "microphone capture")?;
     require(
@@ -228,6 +252,10 @@ pub fn validate_capabilities(
     require(!camera || capabilities.camera, "camera capture")?;
     require(!clicks || capabilities.click_capture, "click capture")?;
     require(!keys || capabilities.key_capture, "keystroke capture")?;
+    require(
+        !cursor_smoothing || capabilities.cursor_smoothing,
+        "cursor smoothing",
+    )?;
     Ok(())
 }
 
@@ -405,6 +433,14 @@ impl RecordingEngine for MockEngine {
         &self,
         request: &RecordingRequest,
         _overlays: Box<dyn OverlaySource>,
+    ) -> Result<Box<dyn RecordingSession>> {
+        self.start(request)
+    }
+
+    fn start_with_settings(
+        &self,
+        request: &RecordingRequest,
+        _settings: &RecordingSettings,
     ) -> Result<Box<dyn RecordingSession>> {
         self.start(request)
     }

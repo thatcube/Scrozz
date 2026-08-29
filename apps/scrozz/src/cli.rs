@@ -154,6 +154,7 @@ impl Command {
             Self::Settings(args) => match args.command {
                 SettingsCommand::Get { .. } => "settings.get".into(),
                 SettingsCommand::Set { .. } => "settings.set".into(),
+                SettingsCommand::Reload => "settings.reload".into(),
             },
             Self::Hotkey(args) => match args.command {
                 HotkeyCommand::GenerateConfig { .. } => "hotkey.generate-config".into(),
@@ -1776,14 +1777,17 @@ pub enum SettingsCommand {
         /// The new value.
         value: String,
     },
+
+    /// Tell a running Scrozz instance to reload settings already written locally.
+    #[command(hide = true)]
+    Reload,
 }
 
 impl SettingsArgs {
     /// Whether this invocation modifies stored state.
     ///
-    /// Drives the IPC forwarding policy: a write while the app is running has to
-    /// happen inside that process, or the two disagree about the current value
-    /// until one of them is restarted.
+    /// Drives the IPC forwarding policy. Writes happen locally under the settings
+    /// lock; the caller then sends a payload-free reload notification.
     #[must_use]
     pub const fn is_write(&self) -> bool {
         matches!(self.command, SettingsCommand::Set { .. })

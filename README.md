@@ -132,6 +132,13 @@ build date `YYYY.M.D`, so a build made on August 27, 2026 is **`2026.8.27`** and
 its release tag is **`v2026.8.27`**. Same-day builds share that version and are
 distinguished by the separate numeric build number.
 
+Recording interaction overlays are opt-in. `record.highlight-clicks` and
+`record.show-keystrokes` trigger Input Monitoring only when a recording starts;
+keystrokes default to `record.keystroke-scope=modifiers-only`. The `all` mode can
+expose typed content and is presented with an explicit privacy warning. Scrozz
+retains only display-ready labels in memory for an open editor session, never in
+history, logs, or event sidecars.
+
 ### From the command line
 
 The CLI is not a wrapper around the app; it is the same capability, headless, and

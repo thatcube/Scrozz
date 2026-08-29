@@ -8,6 +8,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use scrozz_core::{Error, LogicalPoint, LogicalRect, LogicalSize, Result};
 
+use crate::interaction::SensitiveLabel;
 use crate::settings::{
     CameraSettings, CameraShape, ClickSettings, ClickStyle, KeystrokeScope, KeystrokeSettings,
     OverlaySize, OverlayTheme, Rgba8,
@@ -161,22 +162,35 @@ pub enum KeystrokeKind {
 }
 
 /// A key label supplied by an input listener.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Keystroke {
     /// Human-readable chord or key.
-    pub label: String,
+    pub label: SensitiveLabel,
     /// Privacy-relevant key classification.
     pub kind: KeystrokeKind,
 }
 
 impl Keystroke {
     /// Creates a key display value.
-    #[must_use]
-    pub fn new(label: impl Into<String>, kind: KeystrokeKind) -> Self {
-        Self {
-            label: label.into(),
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] when the label cannot be retained safely.
+    pub fn new(label: &str, kind: KeystrokeKind) -> Result<Self> {
+        Ok(Self {
+            label: SensitiveLabel::new(label)?,
             kind,
-        }
+        })
+    }
+}
+
+impl std::fmt::Debug for Keystroke {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Keystroke")
+            .field("label", &self.label)
+            .field("kind", &self.kind)
+            .finish()
     }
 }
 
@@ -187,10 +201,10 @@ struct TimedKeystroke {
 }
 
 /// One visible keystroke chip.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct VisibleKeystroke {
     /// Display label.
-    pub label: String,
+    pub label: SensitiveLabel,
     /// Chip size.
     pub size: OverlaySize,
     /// Chip theme.
@@ -199,6 +213,27 @@ pub struct VisibleKeystroke {
     pub age: Duration,
     /// Remaining display time.
     pub remaining: Duration,
+}
+
+impl VisibleKeystroke {
+    /// Display-only key label.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.label.as_str()
+    }
+}
+
+impl std::fmt::Debug for VisibleKeystroke {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VisibleKeystroke")
+            .field("label", &self.label)
+            .field("size", &self.size)
+            .field("theme", &self.theme)
+            .field("age", &self.age)
+            .field("remaining", &self.remaining)
+            .finish()
+    }
 }
 
 /// Deterministic keystroke-chip timeline.
@@ -243,7 +278,7 @@ impl KeystrokeTrack {
         if !self.settings.enabled {
             return Ok(false);
         }
-        if key.label.trim().is_empty() {
+        if key.label.is_empty() {
             return Err(Error::InvalidRequest(
                 "a keystroke chip needs a non-empty label".to_owned(),
             ));
@@ -484,7 +519,7 @@ mod tests {
             !keys
                 .push(
                     Duration::ZERO,
-                    Keystroke::new("⌘K", KeystrokeKind::Modifier)
+                    Keystroke::new("⌘K", KeystrokeKind::Modifier).unwrap()
                 )
                 .unwrap()
         );
@@ -547,14 +582,17 @@ mod tests {
         let mut track = KeystrokeTrack::new(settings).unwrap();
         assert!(
             !track
-                .push(Duration::ZERO, Keystroke::new("p", KeystrokeKind::Text))
+                .push(
+                    Duration::ZERO,
+                    Keystroke::new("p", KeystrokeKind::Text).unwrap(),
+                )
                 .unwrap()
         );
         assert!(
             track
                 .push(
                     Duration::ZERO,
-                    Keystroke::new("⌘P", KeystrokeKind::Modifier)
+                    Keystroke::new("⌘P", KeystrokeKind::Modifier).unwrap()
                 )
                 .unwrap()
         );
@@ -562,7 +600,7 @@ mod tests {
             track
                 .push(
                     Duration::from_millis(1),
-                    Keystroke::new("Escape", KeystrokeKind::NavigationOrEditing)
+                    Keystroke::new("Escape", KeystrokeKind::NavigationOrEditing).unwrap()
                 )
                 .unwrap()
         );
@@ -588,7 +626,7 @@ mod tests {
             track
                 .push(
                     Duration::from_millis(millis),
-                    Keystroke::new(label, KeystrokeKind::Text),
+                    Keystroke::new(label, KeystrokeKind::Text).unwrap(),
                 )
                 .unwrap();
         }

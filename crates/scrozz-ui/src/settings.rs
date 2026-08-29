@@ -5,10 +5,15 @@ use egui::{
     Vec2, WidgetInfo, WidgetType,
 };
 
+use scrozz_record::{EngineCapabilities, RecordingSettings};
+
 use crate::{
     icons::{Icon, IconStore},
+    recording_settings::RecordingSettingsPanel,
     theme::{Appearance, Space, Text, Theme},
 };
+
+pub use crate::recording_settings::RecordingSettingsAction;
 
 const SETTINGS_VIEWPORT: &str = "scrozz-settings";
 const WINDOW_SIZE: Vec2 = Vec2::new(800.0, 600.0);
@@ -75,19 +80,21 @@ pub struct AfterCaptureEdit {
 }
 
 /// All edits raised during one Settings frame.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SettingsEdits {
     /// Shortcut changes.
     pub shortcuts: Vec<ShortcutEdit>,
     /// After Capture changes.
     pub after_capture: Vec<AfterCaptureEdit>,
+    /// Recording interaction changes.
+    pub recording: Vec<RecordingSettingsAction>,
 }
 
 impl SettingsEdits {
     /// Whether the frame requested no changes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.shortcuts.is_empty() && self.after_capture.is_empty()
+        self.shortcuts.is_empty() && self.after_capture.is_empty() && self.recording.is_empty()
     }
 }
 
@@ -198,11 +205,38 @@ pub enum OpenDisposition {
     Reused,
 }
 
+/// Everything the Recording pane needs to draw one frame.
+///
+/// Passed by value because the settings window owns no recording state: the
+/// host reads the live policy from the recording lifecycle each frame and
+/// applies whatever the pane asks for, so the window can never hold a stale
+/// copy of a privacy-relevant setting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecordingPane {
+    /// The policy currently being edited.
+    pub settings: RecordingSettings,
+    /// What the native engine can actually observe.
+    pub capabilities: EngineCapabilities,
+    /// Whether a recording is running, which locks the pane.
+    pub active: bool,
+}
+
+impl Default for RecordingPane {
+    fn default() -> Self {
+        Self {
+            settings: RecordingSettings::shipped(),
+            capabilities: EngineCapabilities::default(),
+            active: false,
+        }
+    }
+}
+
 /// Which pane of the settings window is showing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     #[default]
     AfterCapture,
+    Recording,
     Shortcuts,
     About,
 }
@@ -294,6 +328,7 @@ impl SettingsWindow {
         build: BuildInfo,
         shortcuts: &[ShortcutRow],
         after_capture: &[AfterCaptureRow],
+        recording_pane: RecordingPane,
     ) -> SettingsEdits {
         let mut edits = SettingsEdits::default();
         if !self.open {
@@ -336,6 +371,7 @@ impl SettingsWindow {
                 build,
                 shortcuts,
                 after_capture,
+                recording_pane,
                 platform,
                 &mut self.pane,
                 &mut self.recording,
@@ -399,6 +435,7 @@ pub fn render_preview(
         },
         shortcuts,
         &[],
+        RecordingPane::default(),
         platform,
         &mut pane,
         &mut recording,
@@ -491,6 +528,7 @@ fn draw_settings(
     build: BuildInfo,
     shortcuts: &[ShortcutRow],
     after_capture: &[AfterCaptureRow],
+    recording_pane: RecordingPane,
     platform: SettingsPlatform,
     pane: &mut Pane,
     recording: &mut Option<String>,
@@ -518,6 +556,7 @@ fn draw_settings(
                 build,
                 shortcuts,
                 after_capture,
+                recording_pane,
                 pane,
                 recording,
             )
@@ -557,6 +596,7 @@ fn draw_settings(
                 build,
                 shortcuts,
                 after_capture,
+                recording_pane,
                 pane,
                 recording,
             )
@@ -635,9 +675,10 @@ fn draw_sidebar_navigation(
     }
 }
 
-fn navigation_items() -> [(Pane, &'static str, Icon); 3] {
+fn navigation_items() -> [(Pane, &'static str, Icon); 4] {
     [
         (Pane::AfterCapture, "After Capture", Icon::Copy),
+        (Pane::Recording, "Recording", Icon::Video),
         (Pane::Shortcuts, "Shortcuts", Icon::Settings),
         (Pane::About, "About", Icon::AppWindow),
     ]
@@ -719,6 +760,7 @@ fn draw_body(
     build: BuildInfo,
     shortcuts: &[ShortcutRow],
     after_capture: &[AfterCaptureRow],
+    recording_pane: RecordingPane,
     pane: &Pane,
     recording: &mut Option<String>,
 ) -> SettingsEdits {
@@ -731,6 +773,9 @@ fn draw_body(
                 Pane::AfterCapture => {
                     edits.after_capture = draw_after_capture(ui, theme, after_capture);
                 }
+                Pane::Recording => {
+                    edits.recording = draw_recording(ui, theme, recording_pane);
+                }
                 Pane::Shortcuts => {
                     edits.shortcuts = draw_shortcuts(ui, theme, icons, shortcuts, recording);
                 }
@@ -738,6 +783,28 @@ fn draw_body(
             }
         });
     edits
+}
+
+/// Draws the Recording pane, which owns every interaction-overlay preference.
+///
+/// The pane is a thin host: the panel itself is the one renderer used by the
+/// settings window, the deterministic harness, and the golden plan, so what a
+/// reviewer sees in a golden is the surface the user actually gets.
+fn draw_recording(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    pane: RecordingPane,
+) -> Vec<RecordingSettingsAction> {
+    egui::ScrollArea::vertical()
+        .id_salt("settings-recording-pane")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            RecordingSettingsPanel::new(pane.settings, pane.capabilities, theme)
+                .with_active_recording(pane.active)
+                .show(ui)
+                .actions
+        })
+        .inner
 }
 
 fn draw_shortcuts(
@@ -1941,6 +2008,7 @@ mod tests {
             },
             &[],
             &[],
+            RecordingPane::default(),
         );
         assert!(edits.is_empty());
         assert!(!window.is_recording());

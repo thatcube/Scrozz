@@ -146,6 +146,7 @@ impl TrayAction {
                 | Self::CaptureWindow
                 | Self::CaptureFullscreen
                 | Self::CaptureAllDisplays
+                | Self::ToggleRecording
                 | Self::Quit
                 | Self::OpenHistory
                 | Self::OpenSettings
@@ -177,7 +178,7 @@ impl TrayAction {
             Self::Quit | Self::OpenHistory | Self::OpenSettings | Self::UnlockPinnedCaptures => {
                 true
             }
-            Self::ToggleRecording => false,
+            Self::ToggleRecording => session.server != DisplayServer::Headless,
         }
     }
 }
@@ -519,9 +520,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn implemented_history_is_enabled_in_every_desktop_session() {
+    fn implemented_history_and_recording_are_not_statically_gated() {
         assert!(TrayAction::OpenHistory.is_available());
         assert!(TrayAction::OpenHistory.is_available_for(&Session::detect()));
-        assert!(!TrayAction::ToggleRecording.is_available());
+        assert!(TrayAction::ToggleRecording.is_available());
+        assert_eq!(
+            TrayAction::ToggleRecording.is_available_for(&Session::detect()),
+            Session::detect().server != DisplayServer::Headless
+        );
     }
 }

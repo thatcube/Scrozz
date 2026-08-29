@@ -396,6 +396,129 @@ pub struct Server {
     worker: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
+fn ensure_private_socket_directory(path: &Path) -> CliResult<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CliError::ipc(format!(
+                    "instance socket parent {} is not a real directory",
+                    path.display()
+                )));
+            }
+            // SAFETY: `geteuid` is a side-effect-free POSIX process query.
+            if metadata.uid() != unsafe { geteuid() } {
+                return Err(CliError::ipc(format!(
+                    "instance socket parent {} is owned by another user",
+                    path.display()
+                )));
+            }
+            if metadata.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |error| {
+                        CliError::ipc(format!(
+                            "could not restrict instance socket directory {}: {error}",
+                            path.display()
+                        ))
+                    },
+                )?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(path).map_err(|error| {
+                CliError::ipc(format!(
+                    "could not make private instance socket directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    CliError::ipc(format!(
+                        "could not restrict instance socket directory {}: {error}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
+        Err(error) => {
+            return Err(CliError::ipc(format!(
+                "could not inspect instance socket directory {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+#[cfg(target_os = "macos")]
+fn peer_matches_owner(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    unsafe extern "C" {
+        fn getpeereid(socket: i32, effective_user: *mut u32, effective_group: *mut u32) -> i32;
+    }
+    let mut user = 0_u32;
+    let mut group = 0_u32;
+    // SAFETY: both output pointers are valid and the stream owns a live socket.
+    unsafe { getpeereid(stream.as_raw_fd(), &mut user, &mut group) == 0 && user == geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_matches_owner(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd as _;
+
+    #[repr(C)]
+    struct UCred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+    unsafe extern "C" {
+        fn getsockopt(
+            socket: i32,
+            level: i32,
+            option: i32,
+            value: *mut c_void,
+            length: *mut u32,
+        ) -> i32;
+    }
+    let mut credentials = UCred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: 0,
+    };
+    let mut length = u32::try_from(std::mem::size_of::<UCred>()).unwrap_or(u32::MAX);
+    // Linux uapi constants: SOL_SOCKET=1, SO_PEERCRED=17.
+    let status = unsafe {
+        getsockopt(
+            stream.as_raw_fd(),
+            1,
+            17,
+            std::ptr::from_mut(&mut credentials).cast(),
+            &mut length,
+        )
+    };
+    status == 0
+        && length as usize == std::mem::size_of::<UCred>()
+        // SAFETY: `geteuid` is a side-effect-free POSIX process query.
+        && credentials.uid == unsafe { geteuid() }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn peer_matches_owner(_stream: &std::os::unix::net::UnixStream) -> bool {
+    true
+}
+
 impl Server {
     /// Binds the endpoint, taking over a stale socket if one is left behind.
     ///
@@ -434,18 +557,20 @@ impl Server {
         use std::os::unix::net::UnixListener;
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CliError::ipc(format!(
-                    "could not make {} for the instance socket: {e}",
-                    parent.display()
-                ))
-            })?;
+            ensure_private_socket_directory(parent)?;
         }
 
         clear_stale(&path)?;
 
         let listener = UnixListener::bind(&path)
             .map_err(|e| CliError::ipc(format!("could not listen at {}: {e}", path.display())))?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            CliError::ipc(format!(
+                "could not restrict instance socket {} to its owner: {e}",
+                path.display()
+            ))
+        })?;
         listener.set_nonblocking(true).map_err(|e| {
             CliError::ipc(format!("could not make the instance socket pollable: {e}"))
         })?;
@@ -459,6 +584,12 @@ impl Server {
                 while !worker_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            if !peer_matches_owner(&stream) {
+                                tracing::warn!(
+                                    "rejected an instance-socket client owned by another user"
+                                );
+                                continue;
+                            }
                             if let Some(request) = read_request(stream) {
                                 if request_tx.send(request).is_err() {
                                     break;
@@ -933,6 +1064,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_server_removes_its_socket_when_dropped() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dir = scratch("drop");
         let path = dir.join("drop.sock");
         {
@@ -941,9 +1074,35 @@ mod tests {
                 server.path().exists(),
                 "the socket should exist while bound"
             );
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         assert!(!path.exists(), "the socket should be gone after the drop");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_stand_in_for_the_private_socket_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch("symlink-parent");
+        let real = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        let error = Server::bind_at(alias.join("instance.sock"))
+            .err()
+            .expect("a symlinked IPC parent must fail closed");
+        assert!(error.to_string().contains("not a real directory"));
+        let _ = std::fs::remove_file(alias);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

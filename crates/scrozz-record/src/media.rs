@@ -213,25 +213,26 @@ impl NativeMediaSource {
                 "recording output is retained but not playable".to_owned(),
             ));
         }
-        let file = std::fs::metadata(recording.path()).map_err(|error| {
+        let source_path = recording.editable_source_path();
+        let file = std::fs::metadata(source_path).map_err(|error| {
             Error::Storage(format!(
                 "could not inspect recording {}: {error}",
-                recording.path().display()
+                source_path.display()
             ))
         })?;
         if !file.is_file() {
             return Err(Error::InvalidRequest(format!(
                 "recording source is not a file: {}",
-                recording.path().display()
+                source_path.display()
             )));
         }
         if file.len() == 0 {
             return Err(Error::Codec(format!(
                 "recording source is empty: {}",
-                recording.path().display()
+                source_path.display()
             )));
         }
-        let inspection = platform::inspect(recording.path(), file.len())?;
+        let inspection = platform::inspect(source_path, file.len())?;
         inspection.validate()?;
         let source = Self {
             recording,
@@ -336,7 +337,7 @@ impl NativeMediaSource {
     /// Encoded file path.
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.recording.path()
+        self.recording.editable_source_path()
     }
 
     fn prove_decodable_video(&self) -> Result<()> {

@@ -83,6 +83,7 @@ pub struct VideoEditorSnapshot {
 struct EditorTexture {
     stream_id: u64,
     sequence: u64,
+    interactions: scrozz_record::InteractionEdits,
     handle: TextureHandle,
 }
 
@@ -98,7 +99,12 @@ pub fn show_window(
     theme: &Theme,
 ) -> VideoEditorResponse {
     install_window_style(ui, theme);
-    let preview_texture = editor_texture(ui.ctx(), &snapshot.playback);
+    let preview_texture = editor_texture(
+        ui.ctx(),
+        &snapshot.playback,
+        snapshot.document.recording().interactions(),
+        snapshot.plan.interactions,
+    );
     let transcode = snapshot
         .transcode_status
         .map_or(TranscodeView::Idle, |status| {
@@ -163,15 +169,30 @@ fn window_style(base: &egui::Style, theme: &Theme) -> egui::Style {
     style
 }
 
-fn editor_texture(ctx: &egui::Context, playback: &PlaybackSnapshot) -> Option<SizedTexture> {
+fn editor_texture(
+    ctx: &egui::Context,
+    playback: &PlaybackSnapshot,
+    interactions: Option<&scrozz_record::InteractionRecording>,
+    edits: scrozz_record::InteractionEdits,
+) -> Option<SizedTexture> {
     let preview = playback.frame.as_ref()?;
     let id = egui::Id::new("scrozz-recording-editor-texture");
     let mut state = ctx.data_mut(|data| data.get_temp::<EditorTexture>(id));
     let replace = state.as_ref().is_none_or(|state| {
-        state.stream_id != playback.stream_id || state.sequence != preview.sequence
+        state.stream_id != playback.stream_id
+            || state.sequence != preview.sequence
+            || state.interactions != edits
     });
     if replace {
-        let frame = &preview.frame.image;
+        let mut frame = preview.frame.image.clone();
+        if let Some(interactions) = interactions {
+            scrozz_record::render_interactions(
+                &mut frame,
+                interactions,
+                preview.frame.timestamp,
+                edits,
+            );
+        }
         let width = usize::try_from(frame.width).ok()?;
         let height = usize::try_from(frame.height).ok()?;
         let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.data);
@@ -179,10 +200,12 @@ fn editor_texture(ctx: &egui::Context, playback: &PlaybackSnapshot) -> Option<Si
             state.handle.set(image, egui::TextureOptions::LINEAR);
             state.stream_id = playback.stream_id;
             state.sequence = preview.sequence;
+            state.interactions = edits;
         } else {
             state = Some(EditorTexture {
                 stream_id: playback.stream_id,
                 sequence: preview.sequence,
+                interactions: edits,
                 handle: ctx.load_texture(
                     "scrozz.recording.editor.preview",
                     image,
@@ -1301,6 +1324,12 @@ fn draw_inspector(
         inspector_panel(ui, theme, "Video", |ui| {
             draw_video_controls(ui, theme, document, running, plan, plan_changed);
         });
+        if document.recording().interactions().is_some() {
+            ui.add_space(Space::SM);
+            inspector_panel(ui, theme, "Interactions", |ui| {
+                draw_interaction_controls(ui, theme, document, running, plan, plan_changed);
+            });
+        }
         ui.add_space(Space::SM);
         inspector_panel(ui, theme, "Audio", |ui| {
             draw_audio_controls(ui, theme, document, running, plan, plan_changed);
@@ -1327,6 +1356,15 @@ fn draw_inspector(
                 .show(ui, |ui| {
                     draw_video_controls(ui, theme, document, running, plan, plan_changed);
                 });
+            if document.recording().interactions().is_some() {
+                rule(ui, theme);
+                CollapsingHeader::new("Interactions")
+                    .id_salt("video-editor-stacked-interactions")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        draw_interaction_controls(ui, theme, document, running, plan, plan_changed);
+                    });
+            }
             rule(ui, theme);
             CollapsingHeader::new("Audio")
                 .id_salt("video-editor-stacked-audio")
@@ -1352,6 +1390,94 @@ fn draw_inspector(
                 });
         });
     }
+}
+
+fn draw_interaction_controls(
+    ui: &mut Ui,
+    theme: &Theme,
+    document: &VideoDocument,
+    running: bool,
+    plan: &mut EditPlan,
+    plan_changed: &mut bool,
+) {
+    let Some(interactions) = document.recording().interactions() else {
+        caption(
+            ui,
+            theme,
+            "This recording has no retained interaction timeline.",
+        );
+        return;
+    };
+    if !interactions.is_editable() {
+        caption(
+            ui,
+            theme,
+            "The interaction timeline is available, but its private source is no longer retained.",
+        );
+        return;
+    }
+
+    ui.add_enabled_ui(!running, |ui| {
+        let summary = interactions.summary();
+        ui.add_enabled_ui(summary.cursor_samples > 0, |ui| {
+            if ui
+                .checkbox(&mut plan.interactions.cursor, "Pointer")
+                .on_hover_text("Show or hide the captured pointer without changing the source.")
+                .changed()
+            {
+                if !plan.interactions.cursor {
+                    plan.interactions.smooth_cursor = false;
+                }
+                *plan_changed = true;
+            }
+        });
+        ui.add_enabled_ui(
+            plan.interactions.cursor && summary.cursor_samples > 0,
+            |ui| {
+                if ui
+                .checkbox(
+                    &mut plan.interactions.smooth_cursor,
+                    "Smooth pointer movement",
+                )
+                .on_hover_text(
+                    "Apply deterministic bounded smoothing. Raw pointer timings remain unchanged.",
+                )
+                .changed()
+            {
+                *plan_changed = true;
+            }
+            },
+        );
+        ui.add_enabled_ui(interactions.clicks.enabled, |ui| {
+            if ui
+                .checkbox(&mut plan.interactions.clicks, "Click highlights")
+                .changed()
+            {
+                *plan_changed = true;
+            }
+        });
+        ui.add_enabled_ui(interactions.keystrokes.enabled, |ui| {
+            if ui
+                .checkbox(&mut plan.interactions.keystrokes, "Keystrokes")
+                .changed()
+            {
+                *plan_changed = true;
+            }
+        });
+    });
+    if !interactions.clicks.enabled || !interactions.keystrokes.enabled {
+        caption(
+            ui,
+            theme,
+            "Layers not enabled during capture have no retained events to reveal later.",
+        );
+    }
+    ui.add_space(Space::XS);
+    caption(
+        ui,
+        theme,
+        "Only filtered display labels are held in memory; no key event sidecar is written.",
+    );
 }
 
 fn inspector_panel(ui: &mut Ui, theme: &Theme, title: &str, add_contents: impl FnOnce(&mut Ui)) {

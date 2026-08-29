@@ -1015,6 +1015,7 @@ impl Driver {
             },
             &self.app.shortcut_rows(),
             &self.app.after_capture_rows(),
+            self.app.recording_settings_pane(),
         );
         self.app.set_keyboard_owner(
             KeyboardOwner::ShortcutRecorder,
@@ -1022,6 +1023,7 @@ impl Driver {
         );
         self.app.edit_shortcuts(&edits.shortcuts);
         self.app.edit_after_capture(&edits.after_capture);
+        self.app.edit_recording_settings(&edits.recording);
     }
 }
 

@@ -28,6 +28,8 @@ scrozz-export.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-capture.workspace = true
+scrozz-annotate.workspace = true
+tiny-skia.workspace = true
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
 oxideav-core = { workspace = true, optional = true }
 oxideav-mkv = { workspace = true, optional = true }

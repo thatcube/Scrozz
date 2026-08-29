@@ -155,7 +155,39 @@ fn execute(command: &Command, cli: &Cli) -> CliResult<Outcome> {
         return gui::run(cli).map(Outcome::Local);
     }
 
-    commands::dispatch(command).map(Outcome::Local)
+    let report = commands::dispatch(command)?;
+    if matches!(
+        command,
+        Command::Settings(crate::cli::SettingsArgs {
+            command: crate::cli::SettingsCommand::Set { .. }
+        })
+    ) && !cli.global.no_ipc
+    {
+        notify_running_instance_settings_changed();
+    }
+    Ok(Outcome::Local(report))
+}
+
+/// Tells a running GUI to re-read settings that this process already committed.
+///
+/// The notification contains no setting key or value, so the Input
+/// Monitoring-capable process never acts as a deputy for caller-controlled
+/// privacy settings.
+fn notify_running_instance_settings_changed() {
+    if !matches!(ipc::probe(), ipc::Status::Running) {
+        return;
+    }
+    let argv = vec!["settings".to_owned(), "reload".to_owned()];
+    match ipc::forward(&argv) {
+        Ok(response) if response.code == 0 => {}
+        Ok(response) => tracing::warn!(
+            exit = response.code,
+            "running Scrozz refused the settings reload notification"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not notify running Scrozz about changed settings");
+        }
+    }
 }
 
 /// Hands the invocation to a running instance, if there is one.

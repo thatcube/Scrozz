@@ -1945,6 +1945,10 @@ fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
                 text,
             ))
         }
+        SettingsCommand::Reload => Ok(Report::new(
+            Json::obj([("state", Json::str("reloaded"))]),
+            "Settings reloaded.",
+        )),
     }
 }
 

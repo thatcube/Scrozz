@@ -127,69 +127,102 @@ impl Compositor {
     ) -> Result<CFRetained<CMSampleBuffer>> {
         let pixel_buffer = create_pixel_buffer(self.width, self.height)?;
         write_canvas(&pixel_buffer, self.width, self.height, &self.tiles)?;
-
-        // SAFETY: immutable image-buffer read while the source sample is retained.
-        if let Some(source_image) = unsafe { timing_source.image_buffer() } {
-            source_image.propagate_attachments(&pixel_buffer);
-        }
-        // SAFETY: CoreVideo accepts a CGColorSpace CFType for this documented
-        // attachment and retains it for the output buffer.
-        unsafe {
-            let key = kCVImageBufferCGColorSpaceKey;
-            pixel_buffer.set_attachment(key, &self.color_space, CVAttachmentMode::ShouldPropagate);
-        }
-
-        let mut format: *const CMVideoFormatDescription = null();
-        // SAFETY: output points to writable storage and the retained image buffer
-        // stays alive through format construction.
-        let status = unsafe {
-            CMVideoFormatDescriptionCreateForImageBuffer(
-                None,
-                &pixel_buffer,
-                NonNull::from(&mut format),
-            )
-        };
-        if status != 0 {
-            return Err(Error::Codec(format!(
-                "creating a composite video format failed with status {status}"
-            )));
-        }
-        let format = NonNull::new(format.cast_mut()).ok_or_else(|| {
-            Error::Codec("CoreMedia returned no composite video format".to_owned())
-        })?;
-        // SAFETY: the Create rule transfers one owned retain.
-        let format = unsafe { CFRetained::from_raw(format) };
-
-        // SAFETY: immutable timing reads from a live SCK sample.
-        let mut timing = unsafe {
-            CMSampleTimingInfo {
-                duration: timing_source.duration(),
-                presentationTimeStamp: timing_source.presentation_time_stamp(),
-                decodeTimeStamp: timing_source.decode_time_stamp(),
-            }
-        };
-        let mut sample = null_mut();
-        // SAFETY: all retained inputs and timing storage stay live for the call.
-        let status = unsafe {
-            CMSampleBuffer::create_ready_with_image_buffer(
-                None,
-                &pixel_buffer,
-                &format,
-                NonNull::from(&mut timing),
-                NonNull::from(&mut sample),
-            )
-        };
-        if status != 0 {
-            return Err(Error::Codec(format!(
-                "creating a composite video sample failed with status {status}"
-            )));
-        }
-        let sample = NonNull::new(sample).ok_or_else(|| {
-            Error::Codec("CoreMedia returned no composite video sample".to_owned())
-        })?;
-        // SAFETY: the Create rule transfers one owned retain.
-        Ok(unsafe { CFRetained::from_raw(sample) })
+        sample_with_pixel_buffer(timing_source, pixel_buffer, &self.color_space)
     }
+}
+
+pub(crate) fn clone_bgra_sample(source: &CMSampleBuffer) -> Result<CFRetained<CMSampleBuffer>> {
+    // SAFETY: immutable image-buffer read while the source sample is retained.
+    let image = unsafe { source.image_buffer() }
+        .ok_or_else(|| Error::Codec("video sample had no pixel buffer".to_owned()))?;
+    if CVPixelBufferGetPixelFormatType(&image) != kCVPixelFormatType_32BGRA {
+        return Err(Error::Codec(
+            "copying an overlay frame requires BGRA pixels".to_owned(),
+        ));
+    }
+    let width = CVPixelBufferGetWidth(&image);
+    let height = CVPixelBufferGetHeight(&image);
+    let width_u32 = u32::try_from(width)
+        .map_err(|_| Error::Codec("video sample width exceeds u32".to_owned()))?;
+    let height_u32 = u32::try_from(height)
+        .map_err(|_| Error::Codec("video sample height exceeds u32".to_owned()))?;
+    let pixel_buffer = create_pixel_buffer(width_u32, height_u32)?;
+    copy_pixel_buffer(&image, &pixel_buffer, width, height)?;
+    let color_space_name = unsafe { kCGColorSpaceSRGB };
+    let color_space =
+        CGColorSpace::with_name(Some(color_space_name)).ok_or_else(|| Error::Unsupported {
+            what: "recording overlay color conversion".to_owned(),
+            why: "CoreGraphics did not expose the standard sRGB color space".to_owned(),
+        })?;
+    // SAFETY: every CGColorSpace is a CFType; type erasure preserves ownership.
+    let color_space = unsafe { CFRetained::cast_unchecked::<CFType>(color_space) };
+    sample_with_pixel_buffer(source, pixel_buffer, &color_space)
+}
+
+fn sample_with_pixel_buffer(
+    timing_source: &CMSampleBuffer,
+    pixel_buffer: CFRetained<CVPixelBuffer>,
+    color_space: &CFType,
+) -> Result<CFRetained<CMSampleBuffer>> {
+    // SAFETY: immutable image-buffer read while the source sample is retained.
+    if let Some(source_image) = unsafe { timing_source.image_buffer() } {
+        source_image.propagate_attachments(&pixel_buffer);
+    }
+    // SAFETY: CoreVideo accepts a CGColorSpace CFType for this documented
+    // attachment and retains it for the output buffer.
+    unsafe {
+        let key = kCVImageBufferCGColorSpaceKey;
+        pixel_buffer.set_attachment(key, color_space, CVAttachmentMode::ShouldPropagate);
+    }
+
+    let mut format: *const CMVideoFormatDescription = null();
+    // SAFETY: output points to writable storage and the retained image buffer
+    // stays alive through format construction.
+    let status = unsafe {
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            None,
+            &pixel_buffer,
+            NonNull::from(&mut format),
+        )
+    };
+    if status != 0 {
+        return Err(Error::Codec(format!(
+            "creating a composite video format failed with status {status}"
+        )));
+    }
+    let format = NonNull::new(format.cast_mut())
+        .ok_or_else(|| Error::Codec("CoreMedia returned no composite video format".to_owned()))?;
+    // SAFETY: the Create rule transfers one owned retain.
+    let format = unsafe { CFRetained::from_raw(format) };
+
+    // SAFETY: immutable timing reads from a live SCK sample.
+    let mut timing = unsafe {
+        CMSampleTimingInfo {
+            duration: timing_source.duration(),
+            presentationTimeStamp: timing_source.presentation_time_stamp(),
+            decodeTimeStamp: timing_source.decode_time_stamp(),
+        }
+    };
+    let mut sample = null_mut();
+    // SAFETY: all retained inputs and timing storage stay live for the call.
+    let status = unsafe {
+        CMSampleBuffer::create_ready_with_image_buffer(
+            None,
+            &pixel_buffer,
+            &format,
+            NonNull::from(&mut timing),
+            NonNull::from(&mut sample),
+        )
+    };
+    if status != 0 {
+        return Err(Error::Codec(format!(
+            "creating a composite video sample failed with status {status}"
+        )));
+    }
+    let sample = NonNull::new(sample)
+        .ok_or_else(|| Error::Codec("CoreMedia returned no composite video sample".to_owned()))?;
+    // SAFETY: the Create rule transfers one owned retain.
+    Ok(unsafe { CFRetained::from_raw(sample) })
 }
 
 impl FrameCadence {
@@ -217,6 +250,7 @@ fn copy_bgra(sample: &CMSampleBuffer, destination: PixelRect, pixels: &mut Vec<u
             "multi-display composition requires BGRA ScreenCaptureKit frames".to_owned(),
         ));
     }
+
     let width = CVPixelBufferGetWidth(&image);
     let height = CVPixelBufferGetHeight(&image);
     if width != destination.width as usize || height != destination.height as usize {
@@ -262,6 +296,74 @@ fn copy_bgra(sample: &CMSampleBuffer, destination: PixelRect, pixels: &mut Vec<u
     if unlock != 0 {
         return Err(Error::Codec(format!(
             "unlocking a composite source failed with status {unlock}"
+        )));
+    }
+    result
+}
+
+fn copy_pixel_buffer(
+    source: &CVPixelBuffer,
+    destination: &CVPixelBuffer,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let source_flags = CVPixelBufferLockFlags::ReadOnly;
+    // SAFETY: both retained buffers remain live through matching unlocks.
+    let source_status = unsafe { CVPixelBufferLockBaseAddress(source, source_flags) };
+    if source_status != 0 {
+        return Err(Error::Codec(format!(
+            "locking source overlay frame failed with status {source_status}"
+        )));
+    }
+    let destination_flags = CVPixelBufferLockFlags::empty();
+    // SAFETY: destination is an owned mutable pixel buffer.
+    let destination_status =
+        unsafe { CVPixelBufferLockBaseAddress(destination, destination_flags) };
+    if destination_status != 0 {
+        // SAFETY: balances the successful source lock.
+        unsafe {
+            CVPixelBufferUnlockBaseAddress(source, source_flags);
+        }
+        return Err(Error::Codec(format!(
+            "locking destination overlay frame failed with status {destination_status}"
+        )));
+    }
+    let result = (|| {
+        let source_stride = CVPixelBufferGetBytesPerRow(source);
+        let destination_stride = CVPixelBufferGetBytesPerRow(destination);
+        let row_bytes = width
+            .checked_mul(4)
+            .ok_or_else(|| Error::Codec("overlay frame row size overflowed".to_owned()))?;
+        let source_base = CVPixelBufferGetBaseAddress(source).cast::<u8>();
+        let destination_base = CVPixelBufferGetBaseAddress(destination).cast::<u8>();
+        if source_base.is_null()
+            || destination_base.is_null()
+            || source_stride < row_bytes
+            || destination_stride < row_bytes
+        {
+            return Err(Error::Codec(
+                "overlay frame did not expose packed BGRA storage".to_owned(),
+            ));
+        }
+        for row in 0..height {
+            // SAFETY: both locks expose height rows of their reported strides.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source_base.add(row * source_stride),
+                    destination_base.add(row * destination_stride),
+                    row_bytes,
+                );
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: balances both successful locks above.
+    let destination_unlock =
+        unsafe { CVPixelBufferUnlockBaseAddress(destination, destination_flags) };
+    let source_unlock = unsafe { CVPixelBufferUnlockBaseAddress(source, source_flags) };
+    if destination_unlock != 0 || source_unlock != 0 {
+        return Err(Error::Codec(format!(
+            "unlocking copied overlay frame failed ({source_unlock}, {destination_unlock})"
         )));
     }
     result

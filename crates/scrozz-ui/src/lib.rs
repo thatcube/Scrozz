@@ -91,6 +91,7 @@ pub mod paint;
 pub mod permission;
 pub mod pinned;
 mod recording_controls;
+pub mod recording_settings;
 pub mod select;
 pub mod settings;
 pub mod stack;
@@ -107,6 +108,9 @@ pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureMedia, CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry,
     OverlayHandle, OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+};
+pub use recording_settings::{
+    RecordingSettingsAction, RecordingSettingsPanel, RecordingSettingsResponse,
 };
 pub use select::{
     AxisDirection, DisplayLayout, DragModifiers, FrozenDesktop, FrozenDisplayFrame, FrozenPixel,

@@ -6,7 +6,7 @@ use scrozz_core::{Error, Result};
 pub use scrozz_export::{AnimationFormat, AnimationRepeat, GifDither};
 
 use crate::{
-    Recording,
+    InteractionEdits, InteractionRecording, Recording,
     media::NativeMediaSource,
     settings::{Quality, ResolutionCap},
 };
@@ -677,6 +677,8 @@ pub struct EditPlan {
     pub gif: GifExportSettings,
     /// Software AV1/WebM cadence.
     pub webm: WebmExportSettings,
+    /// Non-destructive interaction layers rendered from the retained event stream.
+    pub interactions: InteractionEdits,
 }
 
 impl EditPlan {
@@ -695,6 +697,10 @@ impl EditPlan {
             output: EditOutput::Video,
             gif: GifExportSettings::default(),
             webm: WebmExportSettings::default(),
+            interactions: document.recording().interactions().map_or_else(
+                InteractionEdits::default,
+                InteractionRecording::default_edits,
+            ),
         })
     }
 
@@ -787,6 +793,11 @@ impl EditPlan {
                 )?;
             }
             EditOutput::Video => {}
+        }
+        if self.interactions.smooth_cursor && !self.interactions.cursor {
+            return Err(Error::InvalidRequest(
+                "cursor smoothing requires the cursor overlay to be enabled".to_owned(),
+            ));
         }
         Ok(())
     }

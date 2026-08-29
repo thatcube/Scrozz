@@ -8,10 +8,11 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
 use objc2::sel;
-use objc2_core_foundation::{CFArray, CFNumber, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID,
-    CGWindowListCreateDescriptionFromArray,
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCreateDescriptionFromArray,
+    kCGWindowBounds,
 };
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
@@ -49,6 +50,10 @@ pub(crate) struct PixelRect {
 impl CaptureContent {
     pub(crate) fn requires_composition(&self) -> bool {
         self.composite
+    }
+
+    pub(crate) const fn interaction_canvas(&self) -> LogicalRect {
+        self.canvas
     }
 
     pub(crate) fn output_rect(
@@ -107,6 +112,34 @@ pub(crate) fn resolve(target: &CaptureTarget) -> Result<CaptureContent> {
     }
 }
 
+pub(crate) fn window_frame(id: u32) -> Option<LogicalRect> {
+    let id = CFNumber::new_i64(i64::from(id));
+    let ids = CFArray::<CFNumber>::from_objects(&[id.as_ref()]);
+    // SAFETY: CoreGraphics requires an array of CFNumber window identifiers.
+    let windows = unsafe { CGWindowListCreateDescriptionFromArray(Some(ids.as_ref())) }?;
+    if windows.count() != 1 {
+        return None;
+    }
+
+    // SAFETY: this API documents each returned array element as a CFDictionary.
+    let description = unsafe { &*windows.value_at_index(0).cast::<CFDictionary>() };
+    // SAFETY: `kCGWindowBounds` is an immortal framework constant and this
+    // dictionary is the documented CGWindow description shape.
+    let bounds = unsafe { description.value(std::ptr::from_ref(kCGWindowBounds).cast()) };
+    if bounds.is_null() {
+        return None;
+    }
+    // SAFETY: the value for kCGWindowBounds is a CGRect dictionary.
+    let bounds = unsafe { &*bounds.cast::<CFDictionary>() };
+    let mut frame = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0));
+    // SAFETY: both pointers are valid for this call.
+    if unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds), &mut frame) } {
+        Some(logical_rect(frame))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn window_exists(id: u32) -> bool {
     let id = CFNumber::new_i64(i64::from(id));
     let ids = CFArray::<CFNumber>::from_objects(&[id.as_ref()]);
@@ -161,13 +194,7 @@ fn window_content(content: &SCShareableContent, window: &SCWindow) -> Result<Cap
     let fallback_scale = window_scale(content, frame);
     let (native_width, native_height, scale) =
         filter_geometry(&filter, fallback_scale, frame.size)?;
-    let canvas = LogicalRect::new(
-        LogicalPoint::new(0.0, 0.0),
-        LogicalSize::new(
-            f64::from(native_width) / scale,
-            f64::from(native_height) / scale,
-        ),
-    );
+    let canvas = logical_rect(frame);
     Ok(CaptureContent {
         sources: vec![CaptureSource {
             filter,

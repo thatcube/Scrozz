@@ -321,6 +321,8 @@ pub enum Scenario {
     VideoWebmFallback,
     /// A failed transcode with salvageable partial output.
     VideoExportFailedPartial,
+    /// Recording interaction preferences with the high-risk all-keys warning.
+    RecordingSettings,
 }
 
 impl Scenario {
@@ -362,6 +364,7 @@ impl Scenario {
         Self::VideoExporting,
         Self::VideoWebmFallback,
         Self::VideoExportFailedPartial,
+        Self::RecordingSettings,
     ];
 
     /// Every scenario, in stable declaration order.
@@ -388,6 +391,7 @@ impl Scenario {
             Self::EditorAnnotating => "editor-annotating",
             Self::EditorColorPopover => "editor-color-popover",
             Self::EditorArrowStyles => "editor-arrow-styles",
+            Self::RecordingSettings => "recording-settings",
             Self::VideoEditing => "video-editing",
             Self::VideoEditingNarrow => "video-editing-narrow",
             Self::VideoExporting => "video-exporting",
@@ -960,6 +964,17 @@ impl Fixture {
                     None,
                     None,
                 ),
+                Scenario::RecordingSettings => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Choose recording interactions",
+                    "Pointer, click and keystroke controls stay compact while the all-keys mode carries an explicit privacy warning.",
+                    instants::REST,
+                    None,
+                    None,
+                ),
                 Scenario::VideoEditing | Scenario::VideoEditingNarrow => (
                     Vec::new(),
                     Gesture::None,
@@ -1244,6 +1259,7 @@ impl Fixture {
             | Scenario::SmartFrameOneClick
             | Scenario::SmartFrameExpanded => (1100.0, 700.0),
             Scenario::SettingsAfterCapture => (780.0, 640.0),
+            Scenario::RecordingSettings => (620.0, 900.0),
             Scenario::VideoEditing
             | Scenario::VideoExporting
             | Scenario::VideoWebmFallback
@@ -2472,6 +2488,10 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        me.register(
+            Scenario::RecordingSettings,
+            Box::new(crate::recording_settings::RecordingSettingsScene),
+        );
         for scenario in [
             Scenario::VideoEditing,
             Scenario::VideoEditingNarrow,
@@ -4458,6 +4478,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorAnnotating,
         Scenario::EditorColorPopover,
         Scenario::EditorArrowStyles,
+        Scenario::RecordingSettings,
         Scenario::VideoEditing,
         Scenario::VideoEditingNarrow,
         Scenario::SettingsAfterCapture,

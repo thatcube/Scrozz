@@ -52,6 +52,7 @@ use scrozz_shell::{
 };
 use scrozz_store::{CaptureId, RetentionPolicy, Timestamp};
 use scrozz_ui::history::{HistoryAction, HistoryViewModel};
+use scrozz_ui::settings::RecordingSettingsAction;
 
 use crate::{
     after_capture::{
@@ -889,16 +890,20 @@ impl App {
         };
 
         // Read once at start-up so the machine has a validated configuration
-        // even before the first recording; the two After Capture cells are
-        // re-read immediately before each recording starts.
-        let mut recording_settings = RecordingSettings::shipped();
-        recording_settings.after_capture = config.after_capture.recording_policy();
-        if let Err(error) = recording_settings.validate() {
-            notes.push(format!(
-                "recording preferences were rejected and shipped defaults are in use: {error}"
-            ));
-            recording_settings = RecordingSettings::shipped();
-        }
+        // even before the first recording; the two After Capture cells and the
+        // interaction policy are re-read immediately before each recording
+        // starts. A rejected document falls back to the shipped defaults, which
+        // are the ones that need no Input Monitoring at all.
+        let recording_settings =
+            match crate::settings::recording_settings_from(&config.after_capture) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    notes.push(format!(
+                    "recording preferences were rejected and shipped defaults are in use: {error}"
+                ));
+                    RecordingSettings::shipped()
+                }
+            };
 
         let shortcuts = config.shortcuts.clone();
         let unlock_hotkey_registered = hotkeys
@@ -1296,7 +1301,10 @@ impl App {
                 "cancel the active export before starting another recording".to_owned(),
             )));
         }
+        self.save_recording_settings_panel()?;
+        self.reload_recording_settings()?;
         Self::ensure_recording_permission()?;
+        self.ensure_recording_input_permission()?;
         self.reset_finished_recording()?;
         self.release_video_editor();
         self.recording.preflight_failure = None;
@@ -1332,7 +1340,7 @@ impl App {
         if matches!(
             command,
             crate::cli::Command::Settings(crate::cli::SettingsArgs {
-                command: SettingsCommand::Set { .. }
+                command: SettingsCommand::Reload
             })
         ) {
             self.reload_persisted_settings();
@@ -3329,7 +3337,13 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        if let Err(error) = self.save_recording_settings_panel() {
+            self.note(format!(
+                "recording settings could not be saved during shutdown: {error}"
+            ));
+        }
         self.settle_recording_before_shutdown();
+        self.recording.discard_interactions();
         self.input_wake_monitor = None;
         self.drain_cards(None);
         self.hotkeys.unregister_all();
@@ -3429,7 +3443,19 @@ impl App {
             self.note("cancel the active export before starting another recording");
             return;
         }
+        if let Err(error) = self.save_recording_settings_panel() {
+            self.present_recording_error(&error);
+            return;
+        }
+        if let Err(error) = self.reload_recording_settings() {
+            self.present_recording_error(&error);
+            return;
+        }
         if let Err(error) = Self::ensure_recording_permission() {
+            self.present_recording_error(&error);
+            return;
+        }
+        if let Err(error) = self.ensure_recording_input_permission() {
             self.present_recording_error(&error);
             return;
         }
@@ -3771,7 +3797,7 @@ impl App {
                 target,
                 destination,
             } => machine.begin_with_destination(target, destination),
-            PendingStart::Request(request) => machine.begin_request(*request),
+            PendingStart::Request(request) => machine.begin_request_with_settings(*request),
         };
         match result {
             Ok(()) => {
@@ -4222,6 +4248,100 @@ impl App {
         Ok(())
     }
 
+    /// Asks for Input Monitoring only when the settings actually need it.
+    ///
+    /// This is the whole permission story for interaction overlays: nothing is
+    /// requested at launch, nothing is requested to open the settings pane, and
+    /// nothing is requested for a recording whose click and keystroke overlays
+    /// are both off — which is what ships.
+    fn ensure_recording_input_permission(&self) -> CliResult<()> {
+        if !self.recording.settings().needs_input_monitoring() {
+            return Ok(());
+        }
+        let permissions = SystemPermissions::new();
+        if !permissions.is_granted(Capability::InputMonitoring) {
+            permissions.request(Capability::InputMonitoring)?;
+        }
+        Ok(())
+    }
+
+    /// Re-reads the persisted interaction policy just before a recording runs.
+    ///
+    /// A settings edit made in another process — `scrozz settings set` — is as
+    /// authoritative as one made in the pane, and reading here is the last
+    /// honest moment before the engine installs anything.
+    fn reload_recording_settings(&mut self) -> CliResult<()> {
+        if self.recording.machine.is_none() {
+            return Ok(());
+        }
+        // With no durable store the in-memory policy *is* the policy; re-reading
+        // a document that was never written would silently undo this session's
+        // choices right before the recording that was about to use them.
+        let Some(store) = self.config.after_capture_store.clone() else {
+            return Ok(());
+        };
+        let persisted = store
+            .load(store.inferred_profile())
+            .map_err(CliError::Core)?;
+        let settings = crate::settings::recording_settings_from(&persisted)?;
+        self.config.after_capture = persisted;
+        self.recording
+            .apply_settings(settings)
+            .map_err(CliError::Core)?;
+        self.recording.settings_panel = None;
+        Ok(())
+    }
+
+    /// Writes any unsaved settings-pane edit through to the settings document.
+    ///
+    /// The edit is already live on the machine, so a run with no durable store
+    /// keeps it for the session rather than losing it here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a usage error for a policy this build rejects, or a storage
+    /// error when the document cannot be replaced atomically.
+    fn save_recording_settings_panel(&mut self) -> CliResult<()> {
+        let Some(settings) = self.recording.take_settings_panel() else {
+            return Ok(());
+        };
+        let Some(store) = self.config.after_capture_store.clone() else {
+            return Ok(());
+        };
+        self.config.after_capture = crate::settings::save_recording_settings(&store, settings)?;
+        Ok(())
+    }
+
+    /// The recording policy and capability the settings pane draws from.
+    #[must_use]
+    pub fn recording_settings_pane(&self) -> scrozz_ui::settings::RecordingPane {
+        scrozz_ui::settings::RecordingPane {
+            settings: self.recording.settings(),
+            capabilities: self.recording.capabilities(),
+            active: self.recording.is_busy(),
+        }
+    }
+
+    /// Applies what the settings pane asked for during one frame.
+    pub fn edit_recording_settings(&mut self, actions: &[RecordingSettingsAction]) {
+        for action in actions {
+            match action {
+                RecordingSettingsAction::Changed(settings) => {
+                    if let Err(error) = self.recording.apply_settings(*settings) {
+                        self.present_recording_error(&CliError::Core(error));
+                    }
+                }
+                RecordingSettingsAction::Close => match self.save_recording_settings_panel() {
+                    Ok(()) => self.note("recording settings saved"),
+                    Err(error) => self.present_recording_error(&error),
+                },
+                RecordingSettingsAction::StartRecording => {
+                    self.begin_recording();
+                }
+            }
+        }
+    }
+
     fn active_recording_target() -> CliResult<CaptureTarget> {
         let backend = crate::platform::capture_backend()?;
         Ok(CaptureTarget::Display(backend.active_display()?.id))
@@ -4622,6 +4742,56 @@ mod tests {
     }
 
     #[test]
+    fn recording_settings_pane_ships_needing_no_input_monitoring() {
+        let (app, _) = app();
+        let pane = app.recording_settings_pane();
+
+        assert!(!pane.settings.clicks.enabled);
+        assert!(!pane.settings.keystrokes.enabled);
+        assert_eq!(
+            pane.settings.keystrokes.scope,
+            scrozz_record::settings::KeystrokeScope::ModifiersOnly
+        );
+        assert!(!pane.settings.needs_input_monitoring());
+        assert!(!pane.active, "an idle app must not lock the pane");
+    }
+
+    #[test]
+    fn a_privacy_choice_reaches_the_engine_without_starting_a_capture() {
+        let (mut app, _) = app();
+        #[cfg(target_os = "macos")]
+        assert!(
+            app.recording.machine.is_some(),
+            "macOS always links a native recording engine"
+        );
+        if app.recording.machine.is_none() {
+            return;
+        }
+
+        let mut changed = app.recording_settings_pane().settings;
+        changed.keystrokes.enabled = true;
+        changed.keystrokes.scope = scrozz_record::settings::KeystrokeScope::All;
+        app.edit_recording_settings(&[RecordingSettingsAction::Changed(changed)]);
+
+        assert!(
+            app.recording.settings().needs_input_monitoring(),
+            "an enabled keystroke overlay is what makes Input Monitoring necessary"
+        );
+        assert_eq!(app.recording.phase(), Some(RecordingPhase::Idle));
+        assert!(
+            app.recording.settings_panel.is_some(),
+            "the edit stays unsaved until the pane closes"
+        );
+
+        app.edit_recording_settings(&[RecordingSettingsAction::Close]);
+        assert!(
+            app.recording.settings_panel.is_none(),
+            "closing the pane settles the edit"
+        );
+        assert_eq!(app.recording.phase(), Some(RecordingPhase::Idle));
+    }
+
+    #[test]
     fn pending_native_input_wakes_an_idle_window_host() {
         let pending = Arc::new(AtomicBool::new(true));
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4839,7 +5009,7 @@ mod tests {
     }
 
     #[test]
-    fn host_reload_applies_settings_written_by_a_forwarded_command() {
+    fn host_reload_applies_settings_written_locally_then_notified_over_ipc() {
         let root = std::env::temp_dir().join(format!(
             "scrozz-app-after-capture-reload-{}",
             std::process::id()
@@ -4864,7 +5034,9 @@ mod tests {
             false,
         );
         store.save(&changed).unwrap();
-        app.reload_persisted_settings();
+        app.observe_forwarded_command(&crate::cli::Command::Settings(crate::cli::SettingsArgs {
+            command: SettingsCommand::Reload,
+        }));
 
         assert!(!app.config.after_capture.is_enabled(
             MediaKind::Screenshot,

@@ -90,7 +90,8 @@ pub struct RecordingMachine {
     phase: RecordingPhase,
     request: Option<RecordingRequest>,
     pending_overlays: Option<Box<dyn OverlaySource>>,
-    overlays_required: bool,
+    run_settings: Option<RecordingSettings>,
+    settings_driven: bool,
     session: Option<Box<dyn RecordingSession>>,
     countdown_remaining: Duration,
     elapsed: Duration,
@@ -145,7 +146,8 @@ impl RecordingMachine {
             phase: RecordingPhase::Idle,
             request: None,
             pending_overlays: None,
-            overlays_required: false,
+            run_settings: None,
+            settings_driven: false,
             session: None,
             countdown_remaining: Duration::ZERO,
             elapsed: Duration::ZERO,
@@ -304,7 +306,34 @@ impl RecordingMachine {
         request.validate()?;
         validate_capabilities(self.capabilities, &request, None)?;
         self.clear_run();
-        self.overlays_required = false;
+        self.settings_driven = false;
+        self.stage_request(&request);
+        self.start_request(request)
+    }
+
+    /// Starts an explicit request while applying this machine's persistent
+    /// interaction settings.
+    ///
+    /// This is used when a CLI request is forwarded into the long-lived GUI:
+    /// command-line media options remain authoritative while click, key, and
+    /// smoothing preferences stay consistent with an in-process recording.
+    pub fn begin_request_with_settings(&mut self, request: RecordingRequest) -> Result<()> {
+        self.require_phase(RecordingPhase::Idle, "begin configured recording")?;
+        request.validate()?;
+        let mut run_settings = self.settings;
+        run_settings.cursor = if request.show_cursor {
+            scrozz_core::CursorMode::Visible
+        } else {
+            scrozz_core::CursorMode::Hidden
+        };
+        if !request.show_cursor {
+            run_settings.cursor_smoothing = false;
+        }
+        run_settings.validate()?;
+        validate_capabilities(self.capabilities, &request, Some(&run_settings))?;
+        self.clear_run();
+        self.run_settings = Some(run_settings);
+        self.settings_driven = true;
         self.stage_request(&request);
         self.start_request(request)
     }
@@ -324,7 +353,7 @@ impl RecordingMachine {
         validate_capabilities(self.capabilities, &request, None)?;
         self.clear_run();
         self.pending_overlays = Some(overlays);
-        self.overlays_required = true;
+        self.settings_driven = false;
         self.stage_request(&request);
         self.start_request(request)
     }
@@ -337,9 +366,7 @@ impl RecordingMachine {
     fn prepare_request(&mut self, request: RecordingRequest) -> Result<()> {
         request.validate()?;
         validate_capabilities(self.capabilities, &request, Some(&self.settings))?;
-        self.overlays_required = self.settings.clicks.enabled
-            || self.settings.keystrokes.enabled
-            || self.settings.camera.enabled;
+        self.settings_driven = true;
         self.stage_request(&request);
 
         let countdown = if self.settings.countdown.enabled {
@@ -368,16 +395,13 @@ impl RecordingMachine {
     }
 
     fn start_request(&mut self, request: RecordingRequest) -> Result<()> {
-        if self.overlays_required && self.pending_overlays.is_none() {
-            let error = Error::InvalidRequest(
-                "enabled recording overlays require an explicit native OverlaySource".into(),
-            );
-            let returned = error.clone();
-            self.enter_failed(error, None, None);
-            return Err(returned);
-        }
         let started = if let Some(overlays) = self.pending_overlays.take() {
             self.engine.start_with_overlays(&request, overlays)
+        } else if self.settings_driven {
+            self.engine.start_with_settings(
+                &request,
+                self.run_settings.as_ref().unwrap_or(&self.settings),
+            )
         } else {
             self.engine.start(&request)
         };
@@ -644,6 +668,12 @@ impl RecordingMachine {
                 None,
             );
         } else {
+            if output.metadata.interaction_editable == Some(false) {
+                self.push_warning(
+                    "the final recording is intact, but interaction toggles are unavailable"
+                        .to_owned(),
+                );
+            }
             self.output = Some(output.clone());
             self.set_phase(RecordingPhase::Finished);
             self.push_event(MachineEvent::Finished(output));
@@ -696,7 +726,8 @@ impl RecordingMachine {
     fn clear_run(&mut self) {
         self.request = None;
         self.pending_overlays = None;
-        self.overlays_required = false;
+        self.run_settings = None;
+        self.settings_driven = false;
         self.session = None;
         self.countdown_remaining = Duration::ZERO;
         self.elapsed = Duration::ZERO;
@@ -809,6 +840,32 @@ impl RecordingMachine {
         Ok(())
     }
 
+    /// Replaces every recording preference before a new selection begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] once a selection, countdown, capture,
+    /// or finalisation owns this machine, or when the settings are malformed.
+    pub fn set_settings(&mut self, settings: RecordingSettings) -> Result<()> {
+        if !matches!(
+            self.phase,
+            RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed
+        ) {
+            return Err(Error::InvalidRequest(
+                "recording settings cannot change after recording selection begins".to_owned(),
+            ));
+        }
+        let settings = settings.validate()?;
+        if settings.cursor_smoothing && !self.capabilities.cursor_smoothing {
+            return Err(Error::Unsupported {
+                what: "cursor smoothing".to_owned(),
+                why: "the selected recording engine did not advertise this capability".to_owned(),
+            });
+        }
+        self.settings = settings;
+        Ok(())
+    }
+
     /// Current or pending platform request.
     #[must_use]
     pub const fn request(&self) -> Option<&RecordingRequest> {
@@ -855,6 +912,20 @@ impl RecordingMachine {
     #[must_use]
     pub const fn failure(&self) -> Option<&MachineFailure> {
         self.failure.as_ref()
+    }
+
+    /// Drops retained interaction data after its editor session closes.
+    pub fn discard_interactions(&mut self) {
+        if let Some(output) = self.output.as_mut() {
+            output.discard_interactions();
+        }
+        if let Some(partial) = self
+            .failure
+            .as_mut()
+            .and_then(|failure| failure.partial.as_mut())
+        {
+            partial.discard_interactions();
+        }
     }
 
     /// Pops one observable event.
@@ -963,6 +1034,14 @@ mod tests {
                 remedy: "open Privacy settings".into(),
             })
         }
+
+        fn start_with_settings(
+            &self,
+            request: &RecordingRequest,
+            _settings: &RecordingSettings,
+        ) -> Result<Box<dyn RecordingSession>> {
+            self.start(request)
+        }
     }
 
     fn phases(machine: &mut RecordingMachine) -> Vec<RecordingPhase> {
@@ -1022,6 +1101,24 @@ mod tests {
         assert_eq!(machine.phase(), RecordingPhase::Recording);
         assert_eq!(machine.countdown_remaining(), Duration::ZERO);
         assert_eq!(machine.request(), Some(&request));
+    }
+
+    #[test]
+    fn forwarded_request_cursor_flags_do_not_rewrite_persisted_settings() {
+        let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
+        let mut settings = settings_without_countdown();
+        settings.cursor = scrozz_core::CursorMode::Visible;
+        settings.cursor_smoothing = true;
+        let mut machine =
+            RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
+                .unwrap();
+        let mut request = RecordingRequest::new(target());
+        request.show_cursor = false;
+
+        machine.begin_request_with_settings(request).unwrap();
+
+        assert_eq!(machine.settings().cursor, scrozz_core::CursorMode::Visible);
+        assert!(machine.settings().cursor_smoothing);
     }
 
     #[test]
@@ -1098,20 +1195,17 @@ mod tests {
     }
 
     #[test]
-    fn enabled_overlays_require_and_use_an_explicit_source() {
+    fn settings_driven_and_explicit_overlay_sources_both_start() {
         let mut settings = settings_without_countdown();
         settings.clicks.enabled = true;
         let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
-        let mut missing =
+        let mut native =
             RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
                 .unwrap();
-        assert!(
-            missing
-                .begin_with_destination(target(), PathBuf::from("missing.mp4"))
-                .expect_err("enabled click overlays cannot disappear")
-                .to_string()
-                .contains("OverlaySource")
-        );
+        native
+            .begin_with_destination(target(), PathBuf::from("native.mp4"))
+            .unwrap();
+        assert_eq!(native.phase(), RecordingPhase::Recording);
 
         let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
         let mut supplied =

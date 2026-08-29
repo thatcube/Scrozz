@@ -60,6 +60,7 @@ impl OverlaySource for SolidOverlays {
             },
             origin: PhysicalPoint::new(4.0, 4.0),
             opacity: 0.75,
+            adaptive_contrast: false,
         }])
     }
 }

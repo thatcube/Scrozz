@@ -1364,9 +1364,17 @@ fn run_gif(
             }
         };
         let Some(sample) = sample else { break };
-        let DecodedMediaSample::Video(frame) = sample else {
+        let DecodedMediaSample::Video(mut frame) = sample else {
             continue;
         };
+        if let Some(interactions) = source.recording().interactions() {
+            crate::interaction_render::composite_interactions(
+                &mut frame.image,
+                interactions,
+                frame.timestamp,
+                plan.interactions,
+            );
+        }
         if let Some(previous) = pending.replace(frame) {
             let boundary = pending
                 .as_ref()
@@ -1517,9 +1525,17 @@ fn run_video(
             Ok(sample) => sample,
             Err(error) => return finish_failed_video(error, writer, output_path),
         };
-        let Some(sample) = sample else { break };
-        let result = match &sample {
+        let Some(mut sample) = sample else { break };
+        let result = match &mut sample {
             DecodedMediaSample::Video(frame) => {
+                if let Some(interactions) = source.recording().interactions() {
+                    crate::interaction_render::composite_interactions(
+                        &mut frame.image,
+                        interactions,
+                        frame.timestamp,
+                        plan.interactions,
+                    );
+                }
                 writer.append_video(frame, plan.trim.start, cancelled)
             }
             DecodedMediaSample::Audio(chunk) if output_channels > 0 => writer.append_audio(
@@ -1620,9 +1636,17 @@ fn run_webm(
             }
         };
         let Some(sample) = sample else { break };
-        let DecodedMediaSample::Video(frame) = sample else {
+        let DecodedMediaSample::Video(mut frame) = sample else {
             continue;
         };
+        if let Some(interactions) = source.recording().interactions() {
+            crate::interaction_render::composite_interactions(
+                &mut frame.image,
+                interactions,
+                frame.timestamp,
+                plan.interactions,
+            );
+        }
         if let Some(previous) = pending.replace(frame) {
             let boundary = pending
                 .as_ref()
