@@ -50,10 +50,9 @@ impl std::fmt::Display for CardId {
 
 /// The longest edge of a card thumbnail, in pixels.
 ///
-/// A card is about 240 pt wide and drawn at up to 2×, so 512 is enough to be
-/// sharp on a Retina panel and small enough that the downscale of a 5K capture
-/// is measured in milliseconds.
-pub const THUMBNAIL_MAX_EDGE: u32 = 512;
+/// The largest density token is 320 pt wide and normally drawn at up to 2×, so
+/// 640 stays sharp on a Retina panel while keeping a 5K downscale bounded.
+pub const THUMBNAIL_MAX_EDGE: u32 = 640;
 
 /// Longest texture edge retained for a native pinned window.
 pub const PIN_TEXTURE_MAX_EDGE: u32 = 2_048;
@@ -726,7 +725,7 @@ mod tests {
         let source = solid(3456, 2234, [1, 2, 3, 255]);
         let thumb = Thumbnail::downscale(3456, 2234, &source, THUMBNAIL_MAX_EDGE);
         assert_eq!(thumb.width(), THUMBNAIL_MAX_EDGE);
-        assert_eq!(thumb.height(), 331);
+        assert_eq!(thumb.height(), 414);
         assert_eq!(
             thumb.pixels().len(),
             (thumb.width() as usize) * (thumb.height() as usize) * 4

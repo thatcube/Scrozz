@@ -6,7 +6,9 @@
 //! those three in sequence is testing the real path a mouse takes, not a
 //! parallel one written for the test's convenience.
 
-use scrozz_annotate::{Annotation, AnnotationKind, Color, Document, RedactStyle, Style};
+use scrozz_annotate::{
+    Annotation, AnnotationKind, ArrowStyle, Color, Document, RedactStyle, Style,
+};
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
@@ -236,7 +238,7 @@ fn dragging_an_arrow_body_moves_both_endpoints_in_arrow_mode() {
     let mut state = arrow_state();
     let before = arrow_points(&state);
 
-    drag(&mut state, at(120.0, 110.0), at(150.0, 130.0));
+    drag(&mut state, at(88.0, 90.0), at(118.0, 110.0));
 
     let after = arrow_points(&state);
     assert_eq!(after.0, at(before.0.x + 30.0, before.0.y + 20.0));
@@ -304,6 +306,67 @@ fn one_endpoint_drag_is_one_undo_step() {
     state.command(Command::Undo).expect("undo endpoint drag");
     assert_eq!(arrow_points(&state), before);
     assert_eq!(state.tool(), Tool::Arrow);
+}
+
+#[test]
+fn curved_arrow_bend_uses_a_distinct_handle_and_one_undo_step() {
+    let mut state = state();
+    state.set_tool(Tool::Arrow);
+    state.set_arrow_style(ArrowStyle::Curved);
+    drag(&mut state, at(40.0, 60.0), at(200.0, 160.0));
+    let endpoints = arrow_points(&state);
+    let handle = state.arrow_bend_handle().expect("bend diamond");
+    let depth = state.undo_depth();
+
+    drag(&mut state, handle, at(handle.x + 25.0, handle.y - 30.0));
+
+    assert_eq!(state.selection_handles().len(), 2);
+    assert_ne!(state.arrow_bend(), 0.28);
+    assert_eq!(state.undo_depth(), depth + 1);
+    assert_eq!(arrow_points(&state), endpoints);
+    state.command(Command::Undo).expect("undo bend");
+    assert!((state.arrow_bend() - 0.28).abs() < 0.01);
+}
+
+#[test]
+fn every_arrow_style_and_named_thickness_becomes_the_future_default() {
+    for style in [
+        ArrowStyle::Bold,
+        ArrowStyle::Curved,
+        ArrowStyle::Sketch,
+        ArrowStyle::Double,
+    ] {
+        let mut state = state();
+        state.set_tool(Tool::Arrow);
+        state.set_arrow_style(style);
+        state.set_stroke_width(14.0);
+        drag(&mut state, at(30.0, 30.0), at(180.0, 120.0));
+        let object = &state.document().annotations()[0];
+        assert_eq!(object.style.arrow_style, style);
+        assert_eq!(object.style.stroke_width, 14.0);
+        assert_eq!(state.tool(), Tool::Arrow);
+    }
+}
+
+#[test]
+fn selected_arrow_style_thickness_and_bend_changes_coalesce_and_undo_together() {
+    let mut state = arrow_state();
+    let id = state.selection().expect("selected arrow");
+    let original = state.document().get(id).unwrap().style;
+    let depth = state.undo_depth();
+
+    state.set_arrow_style(ArrowStyle::Sketch);
+    state.set_stroke_width(14.0);
+    state.set_arrow_bend(-0.35);
+
+    let changed = state.document().get(id).unwrap().style;
+    assert_eq!(changed.arrow_style, ArrowStyle::Sketch);
+    assert_eq!(changed.stroke_width, 14.0);
+    assert_eq!(changed.arrow_bend, -0.35);
+    assert_eq!(state.undo_depth(), depth + 1);
+
+    state.command(Command::Undo).expect("undo arrow appearance");
+    assert_eq!(state.document().get(id).unwrap().style, original);
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,6 +1144,7 @@ fn setting_a_whole_style_replaces_the_defaults() {
         stroke_width: 6.0,
         opacity: 0.8,
         font_size: 30.0,
+        ..Style::default()
     };
     state.set_style(style);
     assert_eq!(state.style().stroke, Color::rgb(9, 9, 9));

@@ -3,7 +3,9 @@
 mod common;
 
 use common::{document, every_annotation, rect};
-use scrozz_annotate::{Annotation, AnnotationKind, Color, Document, RedactStyle, Style};
+use scrozz_annotate::{
+    Annotation, AnnotationKind, ArrowStyle, Color, Document, RedactStyle, Style,
+};
 use scrozz_core::LogicalPoint;
 
 #[test]
@@ -128,6 +130,30 @@ fn arrows_are_hit_along_the_line_not_the_bounding_box() {
     assert!(
         doc.hit_test(LogicalPoint::new(95.0, 5.0)).is_none(),
         "the far corner of an arrow's bounding box is empty space"
+    );
+}
+
+#[test]
+fn curved_arrow_bounds_and_hit_testing_follow_the_bend_and_full_head() {
+    let mut doc = document(240, 180);
+    let id = doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(30.0, 100.0),
+            to: LogicalPoint::new(210.0, 100.0),
+        },
+        Style::stroked()
+            .with_stroke_width(12.0)
+            .with_arrow_style(ArrowStyle::Curved)
+            .with_arrow_bend(-0.5),
+    );
+    let object = doc.get(id).unwrap();
+    let visual = object.visual_bounds();
+    assert!(visual.origin.y < 60.0, "{visual:?}");
+    let bend = object.arrow_bend_handle().unwrap();
+    assert!(object.hit(bend), "the curved body was not hittable");
+    assert!(
+        object.hit(LogicalPoint::new(202.0, 88.0)),
+        "the broad head was not hittable"
     );
 }
 

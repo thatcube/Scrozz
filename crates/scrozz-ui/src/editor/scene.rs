@@ -86,6 +86,12 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
     state.select(arrow);
     if fixture.scenario == crate::harness::Scenario::EditorColorPopover {
         editor.open_color_popover();
+    } else if fixture.scenario == crate::harness::Scenario::EditorArrowStyles {
+        editor
+            .state_mut()
+            .set_arrow_style(scrozz_annotate::ArrowStyle::Curved);
+        editor.state_mut().set_stroke_width(8.0);
+        editor.open_arrow_popover();
     }
 }
 

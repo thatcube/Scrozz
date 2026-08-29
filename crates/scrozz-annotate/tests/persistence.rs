@@ -7,7 +7,8 @@ mod common;
 
 use common::{document, every_annotation, rect, region_capture, window_capture};
 use scrozz_annotate::{
-    Annotation, Background, Beautification, Color, Document, DocumentData, RedactStyle, Style,
+    Annotation, ArrowStyle, Background, Beautification, Color, Document, DocumentData, RedactStyle,
+    Style,
 };
 use scrozz_core::LogicalPoint;
 
@@ -63,6 +64,60 @@ fn round_trip_preserves_fractional_coordinates() {
     assert!((to.x - 300.5).abs() < 1e-12);
     assert!((restored.get(id).unwrap().style.stroke_width - 2.375).abs() < 1e-6);
     assert!((restored.get(id).unwrap().style.opacity - 0.625).abs() < 1e-6);
+}
+
+#[test]
+fn arrow_style_bend_and_sketch_seed_round_trip_with_the_annotation_id() {
+    let mut doc = document(400, 300);
+    let id = doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(10.0, 20.0),
+            to: LogicalPoint::new(300.0, 180.0),
+        },
+        Style::stroked()
+            .with_arrow_style(ArrowStyle::Sketch)
+            .with_arrow_bend(-0.35)
+            .with_stroke_width(14.0),
+    );
+    let json = serde_json::to_string(&doc.data()).unwrap();
+    let restored = Document::from_data(
+        region_capture(400, 300),
+        serde_json::from_str(&json).unwrap(),
+    )
+    .unwrap();
+    let object = restored.get(id).unwrap();
+    assert_eq!(object.id, id);
+    assert_eq!(object.style.arrow_style, ArrowStyle::Sketch);
+    assert_eq!(object.style.arrow_bend, -0.35);
+    assert_eq!(object.style.stroke_width, 14.0);
+}
+
+#[test]
+fn version_two_styles_migrate_to_bold_straight_arrows() {
+    let mut doc = document(120, 90);
+    doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(10.0, 20.0),
+            to: LogicalPoint::new(90.0, 70.0),
+        },
+        Style::stroked(),
+    );
+    let mut value = serde_json::to_value(doc.data()).unwrap();
+    value["version"] = serde_json::json!(2);
+    let style = value["annotations"][0]["style"]
+        .as_object_mut()
+        .expect("style object");
+    style.remove("arrow_style");
+    style.remove("arrow_bend");
+
+    let restored = Document::from_data(
+        region_capture(120, 90),
+        serde_json::from_value(value).unwrap(),
+    )
+    .unwrap();
+    let style = restored.annotations()[0].style;
+    assert_eq!(style.arrow_style, ArrowStyle::Bold);
+    assert_eq!(style.arrow_bend, 0.0);
 }
 
 #[test]

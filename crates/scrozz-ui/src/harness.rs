@@ -239,8 +239,8 @@ pub enum Scenario {
     StackSingle,
     /// A card mid-flight, sliding in from off-screen left into its slot.
     StackEntering,
-    /// A full pile of six capture cards — the target count on a 16-inch
-    /// MacBook Pro (D28).
+    /// A filled pile of capture cards. Six are pinned in the harness for a
+    /// stable visual stress case; the product capacity is work-area-derived.
     StackFull,
     /// A capture arriving into a full pile: the oldest slides out left, the
     /// remainder fall one slot, the new one enters at the top — one coordinated
@@ -261,6 +261,8 @@ pub enum Scenario {
     EditorAnnotating,
     /// The annotation editor with its anchored quick-colour palette open.
     EditorColorPopover,
+    /// The annotation editor with arrow style and thickness controls open.
+    EditorArrowStyles,
     /// The selector overlay at rest before a drag begins.
     SelectorIdle,
     /// The selector overlay while a freehand region is being dragged.
@@ -277,6 +279,8 @@ pub enum Scenario {
     SelectorAllInOne,
     /// The selector overlay spanning mixed-DPI displays without crossing scales.
     SelectorMixedDpi,
+    /// A live vertical pull scrubbing every card toward the collapsed dock.
+    DockScrubbing,
     /// The persisted screenshot/recording action matrix in Settings.
     SettingsAfterCapture,
     /// A pinned capture with its hover controls visible.
@@ -300,6 +304,7 @@ impl Scenario {
             Self::DockCollapsed,
             Self::EditorAnnotating,
             Self::EditorColorPopover,
+            Self::EditorArrowStyles,
             Self::SelectorIdle,
             Self::SelectorDragging,
             Self::SelectorRemembered,
@@ -308,6 +313,7 @@ impl Scenario {
             Self::SelectorMagnifier,
             Self::SelectorAllInOne,
             Self::SelectorMixedDpi,
+            Self::DockScrubbing,
             Self::SettingsAfterCapture,
             Self::PinnedCaptureHover,
             Self::PinnedCaptureLocked,
@@ -332,6 +338,7 @@ impl Scenario {
             Self::EditorAnnotating => "editor-annotating",
             Self::EditorColorPopover => "editor-color-popover",
             Self::SettingsAfterCapture => "settings-after-capture",
+            Self::EditorArrowStyles => "editor-arrow-styles",
             Self::SelectorIdle => "selector-idle",
             Self::SelectorDragging => "selector-dragging",
             Self::SelectorRemembered => "selector-remembered",
@@ -342,6 +349,7 @@ impl Scenario {
             Self::SelectorMixedDpi => "selector-mixed-dpi",
             Self::PinnedCaptureHover => "pinned-capture-hover",
             Self::PinnedCaptureLocked => "pinned-capture-locked",
+            Self::DockScrubbing => "dock-scrubbing",
         }
     }
 
@@ -523,6 +531,8 @@ pub enum Gesture {
     },
     /// The whole pile is travelling into the dock (D20).
     Collapsing,
+    /// A live pointer pull directly scrubs the whole pile toward the dock.
+    Scrubbing,
     /// The pile is travelling back out of the dock.
     Expanding,
 }
@@ -650,6 +660,19 @@ mod instants {
         },
     ];
 
+    pub(super) const SCRUB: &[KeyInstant] = &[
+        KeyInstant {
+            name: "partial",
+            at_ms: 150,
+            expectation: "every visible card is collectively translated, compressed, and faded halfway toward the dock",
+        },
+        KeyInstant {
+            name: "committed",
+            at_ms: 300,
+            expectation: "the collective pull has crossed its completion threshold and only the dock remains",
+        },
+    ];
+
     pub(super) const DRAG: &[KeyInstant] = &[
         KeyInstant {
             name: "lifted",
@@ -673,9 +696,8 @@ impl Fixture {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn for_scenario(scenario: Scenario) -> Self {
-        // Six is the target slot count on a 16-inch MacBook Pro (D28). The real
-        // app computes it from work-area height; the harness pins it so a golden
-        // does not move when the maintainer plugs in a monitor.
+        // The real app computes capacity from card metrics and work-area height.
+        // The harness pins six slots solely as a stable visual stress case.
         let slot_count = 6;
         let size_pt = (420.0, 620.0);
         let seed = DEFAULT_SEED ^ (scenario as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -711,7 +733,7 @@ impl Fixture {
                     Gesture::None,
                     false,
                     false,
-                    "Six captures, stacked",
+                    "Captures, stacked",
                     "A full pile, bottom-anchored and grown upward, newest on top (D28). The hero shot.",
                     instants::REST,
                     None,
@@ -785,6 +807,20 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::DockScrubbing => (
+                    Self::cards(seed, 5),
+                    Gesture::Scrubbing,
+                    false,
+                    false,
+                    "Pull the whole overlay down",
+                    "A clearly vertical pull scrubs every visible card toward the dock with one shared progress. A diagonal outward pull remains an external drag.",
+                    instants::SCRUB,
+                    Some(SequenceSpec {
+                        start_ms: 0,
+                        end_ms: 300,
+                        step_ms: 16,
+                    }),
+                ),
                 Scenario::EditorAnnotating => (
                     Self::cards(seed, 1),
                     Gesture::None,
@@ -812,6 +848,16 @@ impl Fixture {
                     false,
                     "Choose what happens next",
                     "The platform-adaptive After Capture matrix with independent screenshot and recording actions, explicit unavailable states, and fresh-profile defaults.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorArrowStyles => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Shape the arrow",
+                    "Arrow style, bend, and named source-unit thickness controls over the live editor.",
                     instants::REST,
                     None,
                 ),
@@ -917,7 +963,9 @@ impl Fixture {
                 ),
             };
         let size_pt = match scenario {
-            Scenario::EditorAnnotating | Scenario::EditorColorPopover => (900.0, 620.0),
+            Scenario::EditorAnnotating
+            | Scenario::EditorColorPopover
+            | Scenario::EditorArrowStyles => (900.0, 620.0),
             Scenario::SettingsAfterCapture => (780.0, 640.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
@@ -2070,7 +2118,11 @@ impl SceneRegistry {
         ] {
             me.register(scenario, Box::new(crate::select::SelectionScene));
         }
-        for scenario in [Scenario::EditorAnnotating, Scenario::EditorColorPopover] {
+        for scenario in [
+            Scenario::EditorAnnotating,
+            Scenario::EditorColorPopover,
+            Scenario::EditorArrowStyles,
+        ] {
             me.register(scenario, Box::new(crate::editor::EditorScene));
         }
         me.register(
@@ -2253,10 +2305,15 @@ impl Scene for PlaceholderScene {
         // against, so the stand-in obeys it too.
         let margin = 16.0_f32;
         let gap = 10.0_f32;
-        let card_w = (frame.width() - margin * 2.0).min(360.0);
         let slot_h = ((frame.height() - margin * 2.0) - gap * (fx.slot_count as f32 - 1.0))
             / fx.slot_count as f32;
-        let card_h = slot_h.min(96.0);
+        let mut card_h = slot_h.min(crate::stack::CardMetrics::PREFERRED_HEIGHT);
+        let mut card_w = card_h * 1.6;
+        let width_room = frame.width() - margin * 2.0;
+        if card_w > width_room {
+            card_w = width_room;
+            card_h = card_w / 1.6;
+        }
         let left = frame.left() + margin;
         let slot_y = |slot: usize| -> f32 {
             // Slot 0 sits on the bottom edge; higher slots stack upward.
@@ -2274,7 +2331,14 @@ impl Scene for PlaceholderScene {
         let collapse = match fx.gesture {
             Gesture::Collapsing => Self::ease_out(Self::progress(ctx, 460)),
             Gesture::Expanding => 1.0 - Self::ease_out(Self::progress(ctx, 460)),
+            Gesture::Scrubbing if ctx.reduce_motion => 0.0,
+            Gesture::Scrubbing => Self::progress(ctx, 300),
             _ => 0.0,
+        };
+        let scrub_alpha = if fx.gesture == Gesture::Scrubbing {
+            1.0 - Self::progress(ctx, 300) * 0.35
+        } else {
+            1.0
         };
         let docked_now = fx.docked || collapse >= 1.0;
 
@@ -2343,11 +2407,15 @@ impl Scene for PlaceholderScene {
                         offset.0.mul_add(0.00035, 0.0) * p,
                     ));
                 }
-                Gesture::Collapsing | Gesture::Expanding => {
-                    // Cards must visibly *travel into* the dock; a fade would
-                    // break the spatial link the whole gesture depends on (D20).
+                Gesture::Collapsing | Gesture::Expanding | Gesture::Scrubbing => {
+                    // Cards must visibly *travel into* the dock; the scrub fade
+                    // supplements that shared motion rather than replacing it.
                     y = rest_y + (dock_rect.top() - rest_y) * collapse;
-                    alpha = 1.0 - collapse * 0.15;
+                    alpha = if fx.gesture == Gesture::Scrubbing {
+                        scrub_alpha
+                    } else {
+                        1.0 - collapse * 0.15
+                    };
                 }
                 _ => {}
             }
@@ -3977,6 +4045,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorAnnotating,
         Scenario::EditorColorPopover,
         Scenario::SettingsAfterCapture,
+        Scenario::EditorArrowStyles,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

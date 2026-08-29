@@ -203,10 +203,11 @@ that omit exterior shadow pixels from a one-shot capture, omission is the honest
 residual limitation—manufacturing a lookalike shadow would violate this decision.
 
 This governs capture and export pixels, not transient UI around a preview. The
-floating stack normalizes every provenance into the same fixed 210 × 150 point
-container. Each image cover-fills that frame and is centre-cropped and clipped
-to the shared radius. Cropping and chrome exist only in the thumbnail texture
-mapping; they are never written back into the capture.
+floating stack normalizes every provenance into the same adaptive 16:10
+container, preferring 288 × 180 logical points. Each image cover-fills that
+frame and is centre-cropped and clipped to the shared radius. Cropping and
+chrome exist only in the thumbnail texture mapping; they are never written back
+into the capture.
 
 **Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
 another, `inner_radius = outer_radius − padding`. Violating it makes corners look
@@ -799,7 +800,7 @@ that ships.
   happened to catch. This same frame-stepping is what produces animated assets:
   step the clock, dump N frames, encode. Stores accept app-preview video and
   GitHub renders animated WebP.
-- **Named state fixtures.** "Six cards stacked," "dock collapsed," "annotation
+- **Named state fixtures.** "Capture stack full," "dock collapsed," "annotation
   toolbar open," "overflow evicting the oldest card." These serve as the golden
   corpus *and* the marketing scenarios — one list, maintained once.
 - **Sizes as data.** A manifest of store targets, so supporting a new store is a
@@ -940,20 +941,29 @@ The complete behaviour, which is the whole specification:
 never moves upward.** Upward change happens only when a new card arrives at a new
 top slot, and even then it is the arriving card, not existing cards shifting.
 
-**Slot count** is derived from the available work-area height, not hard-coded.
-Six is the target on a 16-inch MacBook Pro and matches the practical ceiling of
-comparable tools. It must clamp sensibly on small displays.
+**Slot count** is derived from the owning display's available work-area height,
+not hard-coded or product-capped. The authoritative formula is
+`floor((usable height + gap) / (card height + gap))`, with a one-card visibility
+floor. A high internal sanity ceiling exists only to contain malformed
+sub-pixel dimensions; it is not a normal capacity policy. A tall display can
+therefore show more than six cards. Shrinking a display retires the oldest cards
+through the existing history path and growing it does not resurrect them.
 
-**Settled geometry is exact:** every card is 210 × 150 points, adjacent cards
-have an 8-point visible gap, the shared left edge is 40 points from the work
-area, and the bottom card is 2 points above the Dock or taskbar. The card layout
-remains constrained to that safe work area, while the transparent native
-viewport extends up to 48 points into available reserved space so the shadow
-fades naturally instead of clipping at the work-area boundary. Cards paint from
-top to bottom, putting each lower thumbnail above the downward shadow of its
-neighbour. The native overlay window is re-anchored after any selector or display
-transition; window-manager placement hints are not accepted as proof that the
-Dock has been excluded.
+**Settled geometry is adaptive:** the preferred card frame is **288 × 180
+logical points** (16:10), with 224 × 140 and 320 × 200 minimum/maximum density
+tokens and proportional downscaling when the work area is constrained. Adjacent
+cards have an 8-point visible gap, the shared left edge is 40 points from the
+work area, and the bottom card is 2 points above the Dock or taskbar. The
+thumbnail preserves source aspect ratio and cover-fills this transient frame;
+preview edges may crop, but capture, copy, save, export, and drag payload pixels
+are never resized or cropped by the card decision. Logical geometry converts to
+each owning display's physical scale exactly once. The card layout remains
+constrained to that safe work area, while the transparent native viewport
+extends into available reserved space so the shadow fades naturally instead of
+clipping at the work-area boundary. Cards paint from top to bottom, putting each
+lower thumbnail above the downward shadow of its neighbour. The native overlay
+window is re-anchored after any selector or display transition; window-manager
+placement hints are not accepted as proof that the Dock has been excluded.
 
 **Why bottom-anchored.** Position encodes recency, and a bottom anchor makes the
 pile physical: things accumulate on top of each other and settle downward under

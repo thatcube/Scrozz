@@ -269,12 +269,11 @@ fn draw_object(
 
     match &object.annotation {
         Annotation::Arrow { from, to } => {
-            let Some((shaft, head)) = shapes::arrow(object, *from, *to, xf) else {
+            let Some(arrow) = shapes::arrow(object, *from, *to, xf) else {
                 return Ok(());
             };
             let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver, into);
-            shapes::stroke_path(canvas, &shaft, &paint, width);
-            shapes::fill_path(canvas, &head, &paint);
+            shapes::fill_path(canvas, &arrow, &paint);
         }
         Annotation::Line { from, to } => {
             let Some(path) = shapes::line(*from, *to, xf) else {

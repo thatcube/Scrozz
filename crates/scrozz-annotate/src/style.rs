@@ -99,6 +99,21 @@ impl Default for Color {
     }
 }
 
+/// Shape language used by an arrow annotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrowStyle {
+    /// Broad head and tapered shaft, the default.
+    #[default]
+    Bold,
+    /// Single head on an editable quadratic curve.
+    Curved,
+    /// Deterministically varied hand-drawn silhouette.
+    Sketch,
+    /// Matching heads at both endpoints.
+    Double,
+}
+
 /// How one annotation is drawn.
 ///
 /// All measurements are logical points, matching the coordinates annotations
@@ -117,6 +132,12 @@ pub struct Style {
     pub opacity: f32,
     /// Cap height for text and counter labels, in logical points.
     pub font_size: f64,
+    /// Arrow shape language. Ignored by non-arrow annotations.
+    #[serde(default)]
+    pub arrow_style: ArrowStyle,
+    /// Signed curve amount relative to arrow length, clamped on use.
+    #[serde(default)]
+    pub arrow_bend: f64,
 }
 
 impl Style {
@@ -185,6 +206,20 @@ impl Style {
         self
     }
 
+    /// This style with a different arrow shape language.
+    #[must_use]
+    pub fn with_arrow_style(mut self, style: ArrowStyle) -> Self {
+        self.arrow_style = style;
+        self
+    }
+
+    /// This style with a different signed arrow bend.
+    #[must_use]
+    pub fn with_arrow_bend(mut self, bend: f64) -> Self {
+        self.arrow_bend = bend;
+        self
+    }
+
     /// Stroke width clamped away from zero and non-finite values.
     #[must_use]
     pub fn effective_stroke_width(&self) -> f64 {
@@ -214,6 +249,16 @@ impl Style {
             16.0
         }
     }
+
+    /// Arrow bend clamped to a useful, non-self-intersecting range.
+    #[must_use]
+    pub fn effective_arrow_bend(&self) -> f64 {
+        if self.arrow_bend.is_finite() {
+            self.arrow_bend.clamp(-0.75, 0.75)
+        } else {
+            0.0
+        }
+    }
 }
 
 impl Default for Style {
@@ -224,6 +269,8 @@ impl Default for Style {
             fill: None,
             opacity: 1.0,
             font_size: 18.0,
+            arrow_style: ArrowStyle::Bold,
+            arrow_bend: 0.0,
         }
     }
 }

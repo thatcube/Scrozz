@@ -3,7 +3,9 @@
 mod common;
 
 use common::{capture_with, flat, near, pixel, rect};
-use scrozz_annotate::{Annotation, Color, Document, Renderer, SkiaRenderer, Style, font};
+use scrozz_annotate::{
+    Annotation, ArrowStyle, Color, Document, Renderer, SkiaRenderer, Style, font,
+};
 use scrozz_core::{Frame, LogicalPoint, Provenance, ScaleFactor};
 
 /// A white canvas to draw black ink onto.
@@ -92,9 +94,105 @@ fn the_arrowhead_scales_with_stroke_width() {
     let thick = measure(8.0);
     assert!(thin > 0 && thick > 0);
     assert!(
-        thick >= thin * 3,
+        thick >= thin * 2,
         "a 4x thicker stroke should give a markedly bigger head: {thick} vs {thin}"
     );
+}
+
+#[test]
+fn arrow_styles_are_distinct_bounded_and_deterministic() {
+    let render = |style: ArrowStyle| {
+        let mut doc = white(220, 160);
+        doc.add(
+            Annotation::Arrow {
+                from: LogicalPoint::new(30.0, 120.0),
+                to: LogicalPoint::new(190.0, 35.0),
+            },
+            ink(Style::stroked()
+                .with_stroke_width(8.0)
+                .with_arrow_style(style)
+                .with_arrow_bend(if style == ArrowStyle::Curved {
+                    0.28
+                } else {
+                    0.0
+                })),
+        );
+        let first = SkiaRenderer::new().render(&doc).unwrap();
+        let second = SkiaRenderer::new().render(&doc).unwrap();
+        assert_eq!(first.data, second.data, "{style:?} changed between renders");
+        first.data
+    };
+
+    let outputs = [
+        render(ArrowStyle::Bold),
+        render(ArrowStyle::Curved),
+        render(ArrowStyle::Sketch),
+        render(ArrowStyle::Double),
+    ];
+    for left in 0..outputs.len() {
+        for right in left + 1..outputs.len() {
+            assert_ne!(outputs[left], outputs[right], "{left} and {right} matched");
+        }
+    }
+}
+
+#[test]
+fn double_arrows_paint_a_broad_head_at_both_endpoints() {
+    let mut doc = white(220, 100);
+    doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(30.0, 50.0),
+            to: LogicalPoint::new(190.0, 50.0),
+        },
+        ink(Style::stroked()
+            .with_stroke_width(6.0)
+            .with_arrow_style(ArrowStyle::Double)),
+    );
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    assert!(column_thickness(&frame, 35) > column_thickness(&frame, 100));
+    assert!(column_thickness(&frame, 185) > column_thickness(&frame, 100));
+}
+
+#[test]
+fn bold_arrow_is_one_continuous_silhouette_from_rounded_tail_to_tip() {
+    let mut doc = white(220, 100);
+    doc.add(
+        Annotation::Arrow {
+            from: LogicalPoint::new(30.0, 50.0),
+            to: LogicalPoint::new(190.0, 50.0),
+        },
+        ink(Style::stroked().with_stroke_width(10.0)),
+    );
+    let frame = SkiaRenderer::new().render(&doc).unwrap();
+    for x in 30..190 {
+        assert_ne!(pixel(&frame, x, 50), [255, 255, 255, 255], "gap at x={x}");
+    }
+    assert!(column_thickness(&frame, 180) > column_thickness(&frame, 60));
+}
+
+#[test]
+fn sketch_variation_is_seeded_by_the_persisted_annotation_id() {
+    let sketch = Style::stroked()
+        .with_stroke_width(8.0)
+        .with_arrow_style(ArrowStyle::Sketch);
+    let arrow = Annotation::Arrow {
+        from: LogicalPoint::new(20.0, 120.0),
+        to: LogicalPoint::new(190.0, 30.0),
+    };
+    let mut first = white(220, 160);
+    first.add(arrow.clone(), sketch);
+    let mut second = white(220, 160);
+    second.add(
+        Annotation::Line {
+            from: LogicalPoint::new(0.0, 0.0),
+            to: LogicalPoint::new(1.0, 1.0),
+        },
+        Style::stroked().with_opacity(0.0),
+    );
+    second.add(arrow, sketch);
+    let first = SkiaRenderer::new().render(&first).unwrap();
+    let second = SkiaRenderer::new().render(&second).unwrap();
+    assert_ne!(first.data, second.data);
 }
 
 #[test]

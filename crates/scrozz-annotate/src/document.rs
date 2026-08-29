@@ -112,7 +112,7 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 }
 
 impl Default for DocumentData {

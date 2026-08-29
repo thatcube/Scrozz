@@ -104,6 +104,7 @@ pub struct EditorUi {
     state: EditorState,
     preview: Preview,
     color_popover: toolbar::ColorPopover,
+    arrow_popover: toolbar::ArrowPopover,
     /// A decision reached while painting, returned at the end of the frame.
     ///
     /// Toolbar clicks are handled where they are drawn, but the frame's result
@@ -120,6 +121,7 @@ impl EditorUi {
             state: EditorState::new(document),
             preview: Preview::default(),
             color_popover: toolbar::ColorPopover::default(),
+            arrow_popover: toolbar::ArrowPopover::default(),
             pending: None,
         }
     }
@@ -180,6 +182,34 @@ impl EditorUi {
         }
     }
 
+    /// Loads persisted custom colours in most-recently-used order.
+    pub fn set_custom_swatches(&mut self, colors: Vec<scrozz_annotate::Color>) {
+        self.color_popover.set_custom(colors);
+    }
+
+    /// Remembers the final system-picker colour, replacing the selected custom
+    /// swatch when the picker was opened from one.
+    pub fn remember_external_color(&mut self, color: scrozz_annotate::Color) {
+        self.apply_external_color(color);
+        self.color_popover.remember(color);
+    }
+
+    /// Remembers a custom colour without applying it to a newly selected object.
+    pub fn remember_custom_color(&mut self, color: scrozz_annotate::Color) {
+        self.color_popover.remember(color);
+    }
+
+    /// Current custom colours in most-recently-used order.
+    #[must_use]
+    pub fn custom_swatches(&self) -> &[scrozz_annotate::Color] {
+        self.color_popover.custom()
+    }
+
+    /// Takes a custom-palette persistence update.
+    pub fn take_custom_swatches_change(&mut self) -> Option<Vec<scrozz_annotate::Color>> {
+        self.color_popover.take_change()
+    }
+
     /// Whether either anchored colour surface is showing.
     #[must_use]
     pub const fn color_popover_is_open(&self) -> bool {
@@ -192,16 +222,33 @@ impl EditorUi {
         self.color_popover.last_rect()
     }
 
+    /// Opens the arrow style and thickness inspector.
+    pub fn open_arrow_popover(&mut self) {
+        self.arrow_popover.open();
+    }
+
+    /// Whether the arrow inspector is showing.
+    #[must_use]
+    pub const fn arrow_popover_is_open(&self) -> bool {
+        self.arrow_popover.is_open()
+    }
+
+    /// The arrow inspector's most recently resolved screen rectangle.
+    #[must_use]
+    pub const fn arrow_popover_rect(&self) -> Option<egui::Rect> {
+        self.arrow_popover.last_rect()
+    }
+
     /// Draws one frame and reports what the host should do.
     pub fn update(&mut self, ui: &mut Ui) -> Intent {
         let theme = theme_for(ui);
         let icons = shared_icons(ui.ctx());
         let surface = crate::paint::Surface::new(&theme, &icons, crate::motion::Motion::at(0.0));
 
-        let color_popover_open = self.color_popover.is_open();
-        let color_control_activation = toolbar::color_control_activation(ui);
-        if !color_popover_open
-            && !color_control_activation
+        let inspector_open = self.color_popover.is_open() || self.arrow_popover.is_open();
+        let inspector_activation = toolbar::inspector_control_activation(ui);
+        if !inspector_open
+            && !inspector_activation
             && let Some(intent) = self.keyboard(ui)
         {
             self.pending = Some(intent);
@@ -216,16 +263,16 @@ impl EditorUi {
             &mut self.state,
             &mut self.preview,
             canvas,
-            !color_popover_open,
+            !inspector_open,
         );
         if let Some(action) = toolbar::draw(
             ui,
             &surface,
             &mut self.state,
             &mut self.color_popover,
+            &mut self.arrow_popover,
             bar,
-            &view,
-            color_popover_open,
+            inspector_open,
         ) {
             self.pending = Some(action);
         }

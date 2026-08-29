@@ -9,7 +9,7 @@ use egui::{
     Align, Color32, Frame, Key, Layout, Margin, Popup, PopupCloseBehavior, Rect, RectAlign,
     Response, ScrollArea, Sense, Stroke, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
-use scrozz_annotate::{Color, Style};
+use scrozz_annotate::{ArrowStyle, Color, Style};
 
 use crate::icons::Icon;
 use crate::paint::{
@@ -17,7 +17,6 @@ use crate::paint::{
 };
 use crate::theme::{Elevation, Radius, Space, Text, corner};
 
-use super::paint::CanvasView;
 use super::state::{EditorState, Intent, Tool};
 
 /// The height of one row of controls, in points.
@@ -34,9 +33,12 @@ const BUTTON: f32 = 30.0;
 
 /// The compact current-colour control's width.
 const COLOR_CONTROL: f32 = 46.0;
+const ARROW_CONTROL: f32 = 46.0;
 
 /// Stable accessibility/focus identity of the compact colour disclosure.
 pub const COLOR_CONTROL_ID: &str = "scrozz-editor-colour";
+/// Stable accessibility/focus identity of the arrow-style disclosure.
+pub const ARROW_CONTROL_ID: &str = "scrozz-editor-arrow-style";
 
 /// The hit target for each colour in the vertical popup.
 const COLOR_ROW: f32 = 34.0;
@@ -49,6 +51,8 @@ const POPOVER_WIDTH: f32 = 42.0;
 
 /// The wider custom-picker fallback.
 const CUSTOM_PICKER_WIDTH: f32 = 292.0;
+const ARROW_POPOVER_WIDTH: f32 = 224.0;
+const ARROW_ROW: f32 = 40.0;
 
 /// Maximum quick-palette height before its swatch rail scrolls.
 const POPOVER_MAX_HEIGHT: f32 = 560.0;
@@ -61,6 +65,7 @@ const TOOLS_W: f32 = Tool::ALL.len() as f32 * (BUTTON + Space::HAIR);
 
 /// The width the compact colour control occupies.
 const COLOR_W: f32 = COLOR_CONTROL;
+const ARROW_W: f32 = ARROW_CONTROL;
 
 /// The space a divider needs: the gap before it, and the gap after.
 const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
@@ -84,6 +89,8 @@ pub const SINGLE_ROW_W: f32 = Space::MD
     + Space::XS
     + DIVIDER_W
     + STROKE
+    + Space::XS
+    + ARROW_W
     + Space::MD
     + ACTIONS_W
     + Space::MD;
@@ -94,8 +101,16 @@ pub const SINGLE_ROW_W: f32 = Space::MD
 /// second. This is the real floor under the editor window's minimum width.
 pub const WRAPPED_W: f32 = {
     let tools = Space::MD + TOOLS_W + Space::MD;
-    let rest =
-        Space::MD + COLOR_W + Space::XS + DIVIDER_W + STROKE + Space::MD + ACTIONS_W + Space::MD;
+    let rest = Space::MD
+        + COLOR_W
+        + Space::XS
+        + DIVIDER_W
+        + STROKE
+        + Space::XS
+        + ARROW_W
+        + Space::MD
+        + ACTIONS_W
+        + Space::MD;
     if tools > rest { tools } else { rest }
 };
 
@@ -136,7 +151,7 @@ pub fn controls_right(bar: Rect) -> f32 {
     if !wrapped {
         x += TOOLS_W + DIVIDER_W;
     }
-    x + COLOR_W + Space::XS + DIVIDER_W + STROKE
+    x + COLOR_W + Space::XS + DIVIDER_W + STROKE + Space::XS + ARROW_W
 }
 
 /// Where the right-hand action group begins, for a bar of this width.
@@ -166,6 +181,16 @@ pub const PALETTE_NAMES: [&str; 10] = [
     "Black", "Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "White",
 ];
 
+/// Named arrow thickness choices, backed by numeric source-unit widths.
+pub const ARROW_THICKNESSES: [(&str, f64); 4] = [
+    ("Thin", 2.0),
+    ("Regular", 4.0),
+    ("Bold", 8.0),
+    ("Heavy", 14.0),
+];
+/// Maximum user colours retained beside the built-in palette.
+pub const MAX_CUSTOM_SWATCHES: usize = 8;
+
 /// Persistent interaction state for the anchored colour popup.
 #[derive(Debug, Default)]
 pub struct ColorPopover {
@@ -173,6 +198,9 @@ pub struct ColorPopover {
     fallback_open: bool,
     focus_on_open: bool,
     last_rect: Option<Rect>,
+    custom: Vec<Color>,
+    custom_changed: bool,
+    pending_replace: Option<Color>,
 }
 
 impl ColorPopover {
@@ -197,6 +225,49 @@ impl ColorPopover {
         self.focus_on_open = false;
     }
 
+    /// Replaces persisted custom swatches, sanitising order and duplicates.
+    pub fn set_custom(&mut self, colors: Vec<Color>) {
+        self.custom.clear();
+        for color in colors {
+            if !self.custom.contains(&color) {
+                self.custom.push(color);
+            }
+            if self.custom.len() == MAX_CUSTOM_SWATCHES {
+                break;
+            }
+        }
+        self.custom_changed = false;
+    }
+
+    /// Current custom swatches in most-recently-used order.
+    #[must_use]
+    pub fn custom(&self) -> &[Color] {
+        &self.custom
+    }
+
+    /// Adds or replaces a custom colour and moves it to the front.
+    pub fn remember(&mut self, color: Color) {
+        if let Some(replaced) = self.pending_replace.take() {
+            self.custom.retain(|existing| *existing != replaced);
+        }
+        self.custom.retain(|existing| *existing != color);
+        self.custom.insert(0, color);
+        self.custom.truncate(MAX_CUSTOM_SWATCHES);
+        self.custom_changed = true;
+    }
+
+    fn remove(&mut self, index: usize) {
+        if index < self.custom.len() {
+            self.custom.remove(index);
+            self.custom_changed = true;
+        }
+    }
+
+    /// Takes a persistence update after an add, replace, remove, or MRU use.
+    pub fn take_change(&mut self) -> Option<Vec<Color>> {
+        std::mem::take(&mut self.custom_changed).then(|| self.custom.clone())
+    }
+
     /// Whether the anchored surface is visible.
     #[must_use]
     pub const fn is_open(&self) -> bool {
@@ -204,6 +275,40 @@ impl ColorPopover {
     }
 
     /// The popup's most recently resolved screen rectangle.
+    #[must_use]
+    pub const fn last_rect(&self) -> Option<Rect> {
+        self.last_rect
+    }
+}
+
+/// Persistent interaction state for the arrow inspector popup.
+#[derive(Debug, Default)]
+pub struct ArrowPopover {
+    open: bool,
+    focus_on_open: bool,
+    last_rect: Option<Rect>,
+}
+
+impl ArrowPopover {
+    /// Opens the arrow style, bend, and thickness inspector.
+    pub fn open(&mut self) {
+        self.open = true;
+        self.focus_on_open = true;
+    }
+
+    /// Closes the inspector.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.focus_on_open = false;
+    }
+
+    /// Whether the inspector is visible.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Most recently resolved screen rectangle.
     #[must_use]
     pub const fn last_rect(&self) -> Option<Rect> {
         self.last_rect
@@ -235,8 +340,8 @@ pub fn draw(
     surface: &Surface<'_>,
     state: &mut EditorState,
     color_popover: &mut ColorPopover,
+    arrow_popover: &mut ArrowPopover,
     bar: Rect,
-    _view: &CanvasView,
     input_blocked: bool,
 ) -> Option<Intent> {
     let palette = surface.palette();
@@ -305,7 +410,7 @@ pub fn draw(
         state.stroke_color(),
         color_popover.open,
     );
-    if color_button.clicked() {
+    if color_button.clicked() && (!input_blocked || color_popover.open) {
         if color_popover.open {
             color_popover.close();
         } else {
@@ -331,6 +436,7 @@ pub fn draw(
         width_rect,
         ui.id().with("editor-stroke"),
         fraction,
+        state.stroke_width(),
     );
     if !input_blocked
         && (response.dragged() || response.clicked())
@@ -341,7 +447,42 @@ pub fn draw(
         let f = ((pos.x - inner_l) / (inner_r - inner_l)).clamp(0.0, 1.0);
         state.set_stroke_width(width_for_fraction(f));
     }
-    response.on_hover_text(format!("Stroke {:.0} pt", state.stroke_width()));
+    if !input_blocked
+        && let Some(width) = stroke_keyboard_width(ui, &response, state.stroke_width())
+    {
+        state.set_stroke_width(width);
+    }
+    response.on_hover_text(format!(
+        "{} · {:.0} pt",
+        thickness_name(state.stroke_width()),
+        state.stroke_width()
+    ));
+    x += STROKE + Space::XS;
+
+    let arrow_context = state.tool() == Tool::Arrow || state.selection_is_arrow();
+    if arrow_context {
+        let arrow_rect = Rect::from_center_size(
+            pos2(x + ARROW_CONTROL / 2.0, cy),
+            vec2(ARROW_CONTROL, BUTTON),
+        );
+        let arrow_button = arrow_control(
+            ui,
+            surface,
+            arrow_rect,
+            state.arrow_style(),
+            arrow_popover.open,
+        );
+        if arrow_button.clicked() && (!input_blocked || arrow_popover.open) {
+            if arrow_popover.open {
+                arrow_popover.close();
+            } else {
+                arrow_popover.open();
+            }
+        }
+        draw_arrow_popover(ui, surface, state, arrow_popover, &arrow_button);
+    } else {
+        arrow_popover.close();
+    }
 
     // Actions, right-aligned. Laid out from the right so the group stays
     // anchored to the window edge as the toolbar grows and shrinks.
@@ -468,6 +609,237 @@ fn color_control(
     response
 }
 
+const ARROW_STYLES: [(ArrowStyle, &str); 4] = [
+    (ArrowStyle::Bold, "Bold"),
+    (ArrowStyle::Curved, "Curved"),
+    (ArrowStyle::Sketch, "Sketch"),
+    (ArrowStyle::Double, "Double"),
+];
+
+fn arrow_style_name(style: ArrowStyle) -> &'static str {
+    ARROW_STYLES
+        .iter()
+        .find_map(|(candidate, label)| (*candidate == style).then_some(*label))
+        .unwrap_or("Bold")
+}
+
+fn arrow_control(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    style: ArrowStyle,
+    open: bool,
+) -> Response {
+    let label = format!("Arrow style: {}", arrow_style_name(style));
+    let response = ui.interact(rect, egui::Id::new(ARROW_CONTROL_ID), Sense::click());
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, open, label.clone()));
+    let palette = surface.palette();
+    if response.hovered() || response.is_pointer_button_down_on() || open {
+        ui.painter().rect_filled(
+            rect,
+            corner(Radius::BUTTON),
+            if response.is_pointer_button_down_on() {
+                palette.active
+            } else {
+                palette.hover
+            },
+        );
+    }
+    if response.has_focus() {
+        focus_ring(ui.painter(), rect, Radius::BUTTON, palette);
+    }
+    paint_arrow_glyph(
+        ui.painter(),
+        Rect::from_center_size(rect.center() - vec2(4.0, 0.0), vec2(22.0, 14.0)),
+        style,
+        palette.text,
+    );
+    let chevron = pos2(rect.right() - Space::SM, rect.center().y);
+    ui.painter().line_segment(
+        [chevron + vec2(-3.0, -1.5), chevron + vec2(0.0, 1.5)],
+        Stroke::new(1.5, palette.text_muted),
+    );
+    ui.painter().line_segment(
+        [chevron + vec2(0.0, 1.5), chevron + vec2(3.0, -1.5)],
+        Stroke::new(1.5, palette.text_muted),
+    );
+    response.on_hover_text(label)
+}
+
+fn paint_arrow_glyph(painter: &egui::Painter, rect: Rect, style: ArrowStyle, color: Color32) {
+    let left = rect.left_center();
+    let right = rect.right_center();
+    let bend = if style == ArrowStyle::Curved {
+        -4.0
+    } else {
+        0.0
+    };
+    let middle = rect.center() + vec2(0.0, bend);
+    let stroke = Stroke::new(
+        if style == ArrowStyle::Sketch {
+            1.5
+        } else {
+            2.5
+        },
+        color,
+    );
+    painter.line_segment([left, middle], stroke);
+    painter.line_segment([middle, right - vec2(4.0, 0.0)], stroke);
+    let head = vec![
+        right,
+        right + vec2(-6.0, -4.0),
+        right + vec2(-5.0, 0.0),
+        right + vec2(-6.0, 4.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
+    if style == ArrowStyle::Double {
+        let head = vec![
+            left,
+            left + vec2(6.0, -4.0),
+            left + vec2(5.0, 0.0),
+            left + vec2(6.0, 4.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
+    }
+}
+
+fn draw_arrow_popover(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    state: &mut EditorState,
+    popover: &mut ArrowPopover,
+    anchor: &Response,
+) {
+    let was_open = popover.open;
+    let mut open = popover.open;
+    let palette = surface.palette();
+    let popup_id = anchor.id.with("inspector");
+    let shown = Popup::from_response(anchor)
+        .id(popup_id)
+        .open_bool(&mut open)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .align(RectAlign::BOTTOM_END)
+        .align_alternatives(&POPOVER_ALIGNS)
+        .gap(Space::SM)
+        .width(ARROW_POPOVER_WIDTH)
+        .layout(Layout::top_down(Align::Min))
+        .frame(Frame::new().inner_margin(Margin::same(Space::SM as i8)))
+        .show(|popup_ui| {
+            popup_ui.set_opacity(1.0);
+            paint_popover_panel(popup_ui, palette);
+            popup_ui.set_min_width(ARROW_POPOVER_WIDTH);
+            popup_ui.label(egui::RichText::new("Arrow style").font(Text::Label.font()));
+            for (index, (style, label)) in ARROW_STYLES.into_iter().enumerate() {
+                let (_, rect) = popup_ui.allocate_space(vec2(ARROW_POPOVER_WIDTH, ARROW_ROW));
+                let response = popup_ui.interact(
+                    rect,
+                    popup_ui.id().with(("arrow-style", index)),
+                    Sense::click(),
+                );
+                response.widget_info(|| {
+                    WidgetInfo::selected(
+                        WidgetType::RadioButton,
+                        true,
+                        state.arrow_style() == style,
+                        format!("{label} arrow"),
+                    )
+                });
+                let selected = state.arrow_style() == style;
+                if selected || response.hovered() {
+                    popup_ui.painter().rect_filled(
+                        rect,
+                        corner(Radius::BUTTON),
+                        if selected {
+                            palette.accent
+                        } else {
+                            palette.hover
+                        },
+                    );
+                }
+                if response.has_focus() {
+                    focus_ring(popup_ui.painter(), rect, Radius::BUTTON, palette);
+                }
+                paint_arrow_glyph(
+                    popup_ui.painter(),
+                    Rect::from_min_size(
+                        rect.left_center() + vec2(Space::SM, -7.0),
+                        vec2(34.0, 14.0),
+                    ),
+                    style,
+                    if selected {
+                        palette.on_accent
+                    } else {
+                        palette.text
+                    },
+                );
+                popup_ui.painter().text(
+                    pos2(rect.left() + 52.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    Text::Button.font(),
+                    if selected {
+                        palette.on_accent
+                    } else {
+                        palette.text
+                    },
+                );
+                if activate_response(popup_ui, &response) {
+                    state.set_arrow_style(style);
+                }
+                if popover.focus_on_open && state.arrow_style() == style {
+                    response.request_focus();
+                }
+            }
+
+            popup_ui.separator();
+            popup_ui.label(egui::RichText::new("Thickness").font(Text::Label.font()));
+            egui::Grid::new("arrow-thickness-grid")
+                .num_columns(2)
+                .spacing(vec2(Space::SM, Space::XS))
+                .show(popup_ui, |ui| {
+                    for (label, width) in ARROW_THICKNESSES {
+                        let selected = (state.stroke_width() - width).abs() < 0.01;
+                        let response =
+                            ui.selectable_label(selected, format!("{label}  {width:.0} pt"));
+                        response.widget_info(|| {
+                            WidgetInfo::selected(
+                                WidgetType::RadioButton,
+                                true,
+                                selected,
+                                format!("{label} thickness, {width:.0} points"),
+                            )
+                        });
+                        if response.clicked() {
+                            state.set_stroke_width(width);
+                        }
+                        if label == "Regular" {
+                            ui.end_row();
+                        }
+                    }
+                });
+
+            popup_ui.add_space(Space::XS);
+            let mut bend = (state.arrow_bend() * 100.0).round() as i32;
+            let response = popup_ui.add(
+                egui::Slider::new(&mut bend, -75..=75)
+                    .text("Bend")
+                    .suffix("%"),
+            );
+            if response.changed() {
+                state.set_arrow_bend(f64::from(bend) / 100.0);
+            }
+        });
+
+    popover.focus_on_open = false;
+    if let Some(shown) = shown {
+        popover.last_rect = Some(shown.response.rect);
+    }
+    popover.open = open;
+    if !open && was_open {
+        anchor.request_focus();
+    }
+}
+
 fn draw_color_popover(
     ui: &mut Ui,
     surface: &Surface<'_>,
@@ -480,7 +852,10 @@ fn draw_color_popover(
     let fallback = popover.fallback_open;
     let mut close_requested = false;
     let mut custom_requested = false;
+    let mut remember_requested = false;
     let mut chosen = None;
+    let mut chosen_custom = None;
+    let mut remove_custom = None;
     let mut next_focus = None;
     let selected = PALETTE
         .iter()
@@ -515,7 +890,12 @@ fn draw_color_popover(
             paint_popover_panel(popup_ui, palette);
             popup_ui.set_min_width(width);
             if fallback {
-                draw_custom_fallback(popup_ui, state, &mut close_requested, popover.focus_on_open);
+                remember_requested = draw_custom_fallback(
+                    popup_ui,
+                    state,
+                    &mut close_requested,
+                    popover.focus_on_open,
+                );
                 return;
             }
 
@@ -542,6 +922,52 @@ fn draw_color_popover(
                         }
                     }
 
+                    if !popover.custom.is_empty() {
+                        popup_ui.add_space(Space::XS);
+                        let separator = Rect::from_center_size(
+                            pos2(popup_ui.max_rect().center().x, popup_ui.cursor().top()),
+                            vec2(COLOR_DOT, 1.0),
+                        );
+                        popup_ui.painter().line_segment(
+                            [separator.left_center(), separator.right_center()],
+                            Stroke::new(1.0, palette.divider),
+                        );
+                        popup_ui.add_space(Space::XS);
+                        for (index, color) in popover.custom.iter().copied().enumerate() {
+                            let name = format!(
+                                "Custom #{:02X}{:02X}{:02X}{:02X}",
+                                color.r, color.g, color.b, color.a
+                            );
+                            let response = preset_swatch(
+                                popup_ui,
+                                surface,
+                                popup_ui.id().with(("custom-colour", index)),
+                                color,
+                                &name,
+                                state.stroke_color() == color,
+                            );
+                            if activate_response(popup_ui, &response) {
+                                chosen = Some(color);
+                                chosen_custom = Some(index);
+                                close_requested = true;
+                            }
+                        }
+                        if let Some(index) = popover
+                            .custom
+                            .iter()
+                            .position(|color| *color == state.stroke_color())
+                        {
+                            let remove = custom_remove_button(
+                                popup_ui,
+                                surface,
+                                popup_ui.id().with("remove-custom-colour"),
+                            );
+                            if activate_response(popup_ui, &remove) {
+                                remove_custom = Some(index);
+                            }
+                        }
+                    }
+
                     popup_ui.add_space(Space::XS);
                     let separator = Rect::from_center_size(
                         pos2(popup_ui.max_rect().center().x, popup_ui.cursor().top()),
@@ -552,9 +978,18 @@ fn draw_color_popover(
                         Stroke::new(1.0, palette.divider),
                     );
                     popup_ui.add_space(Space::XS);
-                    let custom =
-                        custom_color_button(popup_ui, surface, popup_ui.id().with("custom-colour"));
+                    let replacing = popover
+                        .custom
+                        .iter()
+                        .position(|color| *color == state.stroke_color());
+                    let custom = custom_color_button(
+                        popup_ui,
+                        surface,
+                        popup_ui.id().with("custom-colour-picker"),
+                        replacing.is_some(),
+                    );
                     if activate_response(popup_ui, &custom) {
+                        popover.pending_replace = replacing.map(|index| popover.custom[index]);
                         custom_requested = true;
                     }
 
@@ -566,7 +1001,7 @@ fn draw_color_popover(
                         let id = if index < PALETTE.len() {
                             popup_ui.id().with(("colour-preset", index))
                         } else {
-                            popup_ui.id().with("custom-colour")
+                            popup_ui.id().with("custom-colour-picker")
                         };
                         popup_ui.memory_mut(|memory| memory.request_focus(id));
                     }
@@ -581,6 +1016,17 @@ fn draw_color_popover(
         && color != state.stroke_color()
     {
         state.set_stroke_color(color);
+    }
+    if let Some(index) = chosen_custom {
+        popover.pending_replace = None;
+        popover.remember(state.stroke_color());
+        let _ = index;
+    }
+    if let Some(index) = remove_custom {
+        popover.remove(index);
+    }
+    if remember_requested {
+        popover.remember(state.stroke_color());
     }
     if close_requested {
         open = false;
@@ -616,7 +1062,8 @@ fn draw_custom_fallback(
     state: &mut EditorState,
     close: &mut bool,
     focus_on_open: bool,
-) {
+) -> bool {
+    let mut remember = false;
     ui.with_layout(Layout::top_down(Align::Min), |ui| {
         ui.label(
             egui::RichText::new("Custom colour")
@@ -652,8 +1099,10 @@ fn draw_custom_fallback(
         ui.add_space(Space::SM);
         if ui.button("Done").clicked() {
             *close = true;
+            remember = true;
         }
     });
+    remember
 }
 
 fn activate_response(ui: &Ui, response: &Response) -> bool {
@@ -707,10 +1156,25 @@ fn preset_swatch(
     response
 }
 
-fn custom_color_button(ui: &mut Ui, surface: &Surface<'_>, id: egui::Id) -> Response {
+fn custom_color_button(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    id: egui::Id,
+    replacing: bool,
+) -> Response {
     let (_, rect) = ui.allocate_space(vec2(POPOVER_WIDTH, COLOR_ROW));
     let response = ui.interact(rect, id, Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Choose custom colour"));
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            true,
+            if replacing {
+                "Replace selected custom colour"
+            } else {
+                "Add custom colour"
+            },
+        )
+    });
     let palette = surface.palette();
     if response.hovered() {
         ui.painter()
@@ -725,6 +1189,33 @@ fn custom_color_button(ui: &mut Ui, surface: &Surface<'_>, id: egui::Id) -> Resp
         );
     }
     paint_spectrum(ui.painter(), rect.center(), COLOR_DOT / 2.0);
+    response
+}
+
+fn custom_remove_button(ui: &mut Ui, surface: &Surface<'_>, id: egui::Id) -> Response {
+    let (_, rect) = ui.allocate_space(vec2(POPOVER_WIDTH, COLOR_ROW));
+    let response = ui.interact(rect, id, Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::labeled(WidgetType::Button, true, "Remove selected custom colour")
+    });
+    let palette = surface.palette();
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, corner(Radius::BUTTON), palette.hover);
+    }
+    if response.has_focus() {
+        focus_ring(
+            ui.painter(),
+            rect.shrink2(vec2(Space::XS, Space::HAIR)),
+            Radius::BUTTON,
+            palette,
+        );
+    }
+    let center = rect.center();
+    ui.painter().line_segment(
+        [center + vec2(-5.0, 0.0), center + vec2(5.0, 0.0)],
+        Stroke::new(2.0, palette.text_muted),
+    );
     response
 }
 
@@ -824,9 +1315,11 @@ pub fn from_egui(color: Color32) -> Color {
 }
 
 /// Whether the focused colour disclosure owns this frame's keyboard activation.
-pub(super) fn color_control_activation(ui: &Ui) -> bool {
-    ui.memory(|memory| memory.has_focus(egui::Id::new(COLOR_CONTROL_ID)))
-        && ui.input(|input| input.key_pressed(Key::Enter) || input.key_pressed(Key::Space))
+pub(super) fn inspector_control_activation(ui: &Ui) -> bool {
+    ui.memory(|memory| {
+        memory.has_focus(egui::Id::new(COLOR_CONTROL_ID))
+            || memory.has_focus(egui::Id::new(ARROW_CONTROL_ID))
+    }) && ui.input(|input| input.key_pressed(Key::Enter) || input.key_pressed(Key::Space))
 }
 
 enum Action {
@@ -844,6 +1337,54 @@ fn shortcut_hint(label: &str) -> String {
         _ => return label.to_owned(),
     };
     format!("{label}  ({key})")
+}
+
+fn thickness_name(width: f64) -> &'static str {
+    ARROW_THICKNESSES
+        .iter()
+        .min_by(|(_, left), (_, right)| (width - *left).abs().total_cmp(&(width - *right).abs()))
+        .map_or("Regular", |(name, _)| *name)
+}
+
+fn stroke_keyboard_width(ui: &Ui, response: &Response, current: f64) -> Option<f64> {
+    let (mut decrease, mut increase) = (false, false);
+    if response.has_focus() {
+        (decrease, increase) = ui.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::NONE, Key::ArrowLeft)
+                    || input.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                input.consume_key(egui::Modifiers::NONE, Key::ArrowRight)
+                    || input.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+            )
+        });
+    }
+    ui.input(|input| {
+        decrease |= input
+            .accesskit_action_requests(response.id, egui::accesskit::Action::Decrement)
+            .next()
+            .is_some();
+        increase |= input
+            .accesskit_action_requests(response.id, egui::accesskit::Action::Increment)
+            .next()
+            .is_some();
+    });
+    if increase == decrease {
+        return None;
+    }
+    if increase {
+        ARROW_THICKNESSES
+            .into_iter()
+            .find(|(_, width)| *width > current + 0.01)
+            .or_else(|| ARROW_THICKNESSES.last().copied())
+            .map(|(_, width)| width)
+    } else {
+        ARROW_THICKNESSES
+            .into_iter()
+            .rev()
+            .find(|(_, width)| *width < current - 0.01)
+            .or_else(|| ARROW_THICKNESSES.first().copied())
+            .map(|(_, width)| width)
+    }
 }
 
 /// Where a stroke width sits on the control, 0–1.

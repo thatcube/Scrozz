@@ -5,10 +5,11 @@
 //! ask for t = 180 ms directly without stepping through the frames before it.
 
 use egui::{Rect, Vec2, pos2, vec2};
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScaleFactor};
 use scrozz_ui::motion::Motion;
 use scrozz_ui::stack::{
     CaptureStack, CardFrame, CardId, CardMetrics, CardState, DRAG_LOCK_SLOP, DRAG_SOURCE_ALPHA,
-    Dir, GestureConfig, Intent, MAX_SLOTS, MIN_SLOTS, StackLayout, Timing, classify,
+    Dir, GestureConfig, Intent, MIN_SLOTS, StackLayout, Timing, classify,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,23 +100,23 @@ impl NoMoveUp {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn sixteen_inch_macbook_pro_gets_six_slots() {
+fn sixteen_inch_macbook_pro_uses_preferred_sixteen_by_ten_cards() {
     let metrics = CardMetrics::default();
-    assert_eq!(metrics.width, 210.0);
-    assert_eq!(metrics.height, 150.0);
+    assert_eq!(metrics.width, 288.0);
+    assert_eq!(metrics.height, 180.0);
     assert_eq!(metrics.gap, 8.0);
     assert_eq!(metrics.margin, 2.0);
     assert_eq!(metrics.left_margin, 40.0);
-    assert_eq!(StackLayout::new(mbp16(), metrics).slots(), 6);
+    assert_eq!(StackLayout::new(mbp16(), metrics).slots(), 5);
 }
 
 #[test]
 fn slot_count_derives_from_work_area_height() {
     let m = CardMetrics::default();
     let cases = [
-        (1022.0, 6), // 16" MacBook Pro
-        (861.0, 5),  // 13" laptop
-        (745.0, 4),  // 1280x800 panel
+        (1022.0, 5), // 16" MacBook Pro
+        (861.0, 4),  // 13" laptop
+        (745.0, 3),  // 1280x800 panel
         (580.0, 3),  // 1024x600 netbook
         (300.0, 1),  // a sliver
     ];
@@ -126,18 +127,79 @@ fn slot_count_derives_from_work_area_height() {
 }
 
 #[test]
-fn slot_count_clamps_at_both_ends() {
+fn slot_count_has_a_visibility_floor_but_no_product_ceiling() {
     let m = CardMetrics::default();
     assert_eq!(
         StackLayout::new(work_area(100.0), m).slots(),
         MIN_SLOTS,
         "a work area too short for one card still offers one slot"
     );
+    assert_eq!(StackLayout::new(work_area(4000.0), m).slots(), 21);
+}
+
+#[test]
+fn tall_work_areas_keep_more_than_six_recent_captures() {
+    let layout = StackLayout::new(work_area(2200.0), CardMetrics::default());
+    assert_eq!(layout.slots(), 11);
+    assert!(layout.slots() > 6);
+}
+
+#[test]
+fn capacity_matches_the_exact_floor_formula() {
+    let metrics = CardMetrics::default();
+    for count in 1usize..=12 {
+        let occupied = count as f32 * metrics.height + count.saturating_sub(1) as f32 * metrics.gap;
+        let layout = StackLayout::new(work_area(occupied + metrics.margin * 2.0), metrics);
+        assert_eq!(layout.slots(), count);
+    }
+}
+
+#[test]
+fn preferred_cards_adapt_down_without_losing_sixteen_by_ten() {
+    let constrained = Rect::from_min_size(pos2(0.0, 0.0), vec2(250.0, 170.0));
+    let layout = StackLayout::new(constrained, CardMetrics::default());
+    let metrics = layout.metrics();
+    assert!(metrics.width < CardMetrics::PREFERRED_WIDTH);
+    assert!(metrics.height < CardMetrics::PREFERRED_HEIGHT);
+    assert!((metrics.width / metrics.height - 1.6).abs() < 0.001);
+    assert!(layout.slot_rect(0).right() <= constrained.right());
+}
+
+#[test]
+fn moving_from_a_constrained_display_restores_the_requested_card_size() {
+    let constrained = Rect::from_min_size(pos2(0.0, 0.0), vec2(250.0, 170.0));
+    let mut stack = CaptureStack::for_work_area(constrained);
+    assert!(stack.layout().metrics().width < CardMetrics::PREFERRED_WIDTH);
+
+    stack.resize(mbp16(), &at(100));
+
     assert_eq!(
-        StackLayout::new(work_area(4000.0), m).slots(),
-        MAX_SLOTS,
-        "a very tall display does not turn the pile into a file manager"
+        stack.layout().metrics(),
+        CardMetrics::default(),
+        "effective metrics from the old display must not become the next display's preference"
     );
+}
+
+#[test]
+fn density_and_monitor_scale_are_applied_once_in_separate_spaces() {
+    let compact = CardMetrics::for_density(0.5);
+    let regular = CardMetrics::for_density(1.0);
+    let large = CardMetrics::for_density(1.4);
+    assert_eq!(compact.width, CardMetrics::MIN_WIDTH);
+    assert_eq!(regular.width, CardMetrics::PREFERRED_WIDTH);
+    assert_eq!(large.width, CardMetrics::MAX_WIDTH);
+
+    for scale in [1.0, 1.5, 2.0] {
+        let factor = ScaleFactor::new(scale);
+        let physical = LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            LogicalSize::new(f64::from(regular.width), f64::from(regular.height)),
+        )
+        .to_physical(factor)
+        .size;
+        assert_eq!(physical.width, (f64::from(regular.width) * scale).round());
+        assert_eq!(physical.height, (f64::from(regular.height) * scale).round());
+    }
 }
 
 #[test]
@@ -147,8 +209,8 @@ fn slot_count_follows_card_metrics_not_a_constant() {
         gap: 6.0,
         ..CardMetrics::default()
     };
-    // Same work area, smaller cards, more slots — up to the cap.
-    assert_eq!(StackLayout::new(work_area(580.0), small).slots(), MAX_SLOTS);
+    // Same work area, smaller cards, more slots — with no arbitrary item cap.
+    assert_eq!(StackLayout::new(work_area(580.0), small).slots(), 8);
     assert_eq!(
         StackLayout::new(work_area(580.0), CardMetrics::default()).slots(),
         3
@@ -198,7 +260,7 @@ fn live_pushes_use_fixed_size_spacing_and_margins() {
     }
     stack.advance(&at(SETTLED));
 
-    let expected = vec2(210.0, 150.0);
+    let expected = vec2(288.0, 180.0);
     for frame in stack.frame(&at(SETTLED)) {
         assert_eq!(frame.rect.size(), expected);
         assert_eq!(frame.rect.left(), mbp16().left() + 40.0);
@@ -594,11 +656,12 @@ fn dismiss_all_empties_the_pile() {
     for _ in 0..s.capacity() {
         s.push(&at(0));
     }
+    let count = s.len();
     s.advance(&at(SETTLED));
 
     s.dismiss_all(&at(SETTLED));
     assert!(s.is_empty());
-    assert_eq!(s.departing().len(), 6, "every card is on its way out");
+    assert_eq!(s.departing().len(), count, "every card is on its way out");
 
     s.advance(&at(SETTLED * 2));
     assert!(s.departing().is_empty(), "and eventually gone");
@@ -648,14 +711,14 @@ fn a_card_never_moves_up_across_every_operation() {
         }
     }
     // Refill and shrink the display underneath it.
-    for _ in 0..6 {
+    for _ in 0..s.capacity() {
         s.push(&tick(&mut t));
     }
     watcher.check(&s, "refill");
     s.resize(work_area(580.0), &tick(&mut t));
     watcher.check(&s, "shrink to a 3-slot display");
     s.resize(mbp16(), &tick(&mut t));
-    watcher.check(&s, "grow back to 6 slots");
+    watcher.check(&s, "grow back to the taller layout");
 
     // Collapse and expand.
     s.collapse(&tick(&mut t));
@@ -693,7 +756,7 @@ fn growing_the_display_moves_nothing() {
 
     s.resize(work_area(1022.0), &at(SETTLED));
 
-    assert_eq!(s.capacity(), 6, "the taller display offers more slots");
+    assert_eq!(s.capacity(), 5, "the taller display offers more slots");
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(s.slot_of(*id), Some(i), "nothing was reshuffled");
     }
@@ -702,18 +765,19 @@ fn growing_the_display_moves_nothing() {
 
 #[test]
 fn shrinking_the_display_retires_from_the_bottom() {
-    let mut s = stack();
-    let ids: Vec<_> = (0..6).map(|_| s.push(&at(0))).collect();
+    let mut s = CaptureStack::for_work_area(work_area(1400.0));
+    let ids: Vec<_> = (0..s.capacity()).map(|_| s.push(&at(0))).collect();
     s.advance(&at(SETTLED));
 
     s.resize(work_area(580.0), &at(SETTLED));
 
     assert_eq!(s.capacity(), 3);
     assert_eq!(s.len(), 3);
-    for id in &ids[..3] {
-        assert_eq!(s.slot_of(*id), None, "the three oldest were retired");
+    let retired = ids.len() - 3;
+    for id in &ids[..retired] {
+        assert_eq!(s.slot_of(*id), None, "the oldest cards were retired");
     }
-    for (i, id) in ids[3..].iter().enumerate() {
+    for (i, id) in ids[retired..].iter().enumerate() {
         assert_eq!(s.slot_of(*id), Some(i));
     }
     s.check_no_card_moved_up().unwrap();
@@ -729,6 +793,133 @@ fn direction_maps_to_intent() {
     assert_eq!(Dir::Right.intent(), Intent::DragOut);
     assert_eq!(Dir::Up.intent(), Intent::DragOut);
     assert_eq!(Dir::Down.intent(), Intent::Collapse);
+}
+
+fn live_for(delta: Vec2, elapsed_ms: u64) -> Option<(Intent, Option<Dir>)> {
+    let mut stack = stack();
+    let id = stack.push(&at(0));
+    stack.advance(&at(SETTLED));
+    let origin = stack.frame_of(id, &at(SETTLED)).unwrap().rect.center();
+    stack.begin_drag(id, origin, &at(SETTLED));
+    stack.drag_to(origin + delta, &at(SETTLED + elapsed_ms));
+    stack
+        .live_gesture(&at(SETTLED + elapsed_ms))
+        .map(|gesture| (gesture.intent, gesture.direction))
+}
+
+#[test]
+fn collapse_uses_a_narrow_vertical_cone_not_positive_y_alone() {
+    let length = 120.0;
+    let down_right = |degrees: f32| {
+        let radians = degrees.to_radians();
+        vec2(length * radians.cos(), length * radians.sin())
+    };
+    for delta in [
+        down_right(30.0),
+        down_right(45.0),
+        down_right(60.0),
+        vec2(120.0, 20.0),
+        vec2(90.0, -60.0),
+    ] {
+        assert!(
+            matches!(live_for(delta, 120), Some((Intent::DragOut, _))),
+            "{delta:?}"
+        );
+    }
+    for delta in [vec2(0.0, 100.0), vec2(10.0, 100.0)] {
+        assert_eq!(
+            live_for(delta, 120),
+            Some((Intent::Collapse, Some(Dir::Down))),
+            "{delta:?}"
+        );
+    }
+}
+
+#[test]
+fn direction_lock_respects_slop_speed_and_never_switches() {
+    assert_eq!(live_for(vec2(DRAG_LOCK_SLOP - 0.1, 0.0), 5), None);
+    assert_eq!(
+        live_for(vec2(DRAG_LOCK_SLOP + 0.1, 0.0), 5),
+        Some((Intent::DragOut, Some(Dir::Right)))
+    );
+    assert_eq!(
+        live_for(vec2(DRAG_LOCK_SLOP + 0.1, 0.0), 500),
+        Some((Intent::DragOut, Some(Dir::Right)))
+    );
+
+    let mut stack = stack();
+    let id = stack.push(&at(0));
+    stack.advance(&at(SETTLED));
+    let origin = stack.frame_of(id, &at(SETTLED)).unwrap().rect.center();
+    stack.begin_drag(id, origin, &at(SETTLED));
+    stack.drag_to(origin + vec2(4.0, 45.0), &at(SETTLED + 50));
+    stack.drag_to(origin + vec2(100.0, 20.0), &at(SETTLED + 100));
+    assert!(stack.live_gesture(&at(SETTLED + 100)).is_none());
+    assert_eq!(
+        stack.release_drag(&at(SETTLED + 100)).unwrap().intent,
+        Intent::SpringBack
+    );
+}
+
+#[test]
+fn collapse_candidate_scrubs_the_whole_stack_and_can_reverse() {
+    let mut stack = stack();
+    let ids: Vec<_> = (0..3).map(|_| stack.push(&at(0))).collect();
+    stack.advance(&at(SETTLED));
+    let before: Vec<_> = ids
+        .iter()
+        .map(|id| stack.frame_of(*id, &at(SETTLED)).unwrap())
+        .collect();
+    let origin = before[2].rect.center();
+    stack.begin_drag(ids[2], origin, &at(SETTLED));
+    stack.drag_to(origin + vec2(4.0, 44.0), &at(SETTLED + 50));
+    let preview: Vec<_> = ids
+        .iter()
+        .map(|id| stack.frame_of(*id, &at(SETTLED + 50)).unwrap())
+        .collect();
+    for (before, preview) in before.iter().zip(&preview) {
+        assert!(preview.rect.top() > before.rect.top());
+        assert!(preview.rect.height() < before.rect.height());
+        assert!(preview.alpha < before.alpha);
+    }
+    assert_eq!(
+        ids.iter()
+            .map(|id| stack.slot_of(*id).unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    stack.drag_to(origin + vec2(100.0, 20.0), &at(SETTLED + 100));
+    assert!(stack.live_gesture(&at(SETTLED + 100)).is_none());
+    let release = stack.release_drag(&at(SETTLED + 100)).unwrap();
+    assert_eq!(release.intent, Intent::SpringBack);
+    stack.advance(&at(SETTLED + 1_000));
+    for (id, before) in ids.iter().zip(before) {
+        assert_eq!(
+            stack.frame_of(*id, &at(SETTLED + 1_000)).unwrap().rect,
+            before.rect
+        );
+    }
+}
+
+#[test]
+fn reduced_motion_previews_collective_collapse_with_fade_not_travel() {
+    let calm = Motion::at_ms(SETTLED).with_reduce_motion(true);
+    let mut stack = stack();
+    let ids: Vec<_> = (0..3).map(|_| stack.push(&calm)).collect();
+    stack.advance(&calm);
+    let before: Vec<_> = ids
+        .iter()
+        .map(|id| stack.frame_of(*id, &calm).unwrap())
+        .collect();
+    let origin = before[2].rect.center();
+    stack.begin_drag(ids[2], origin, &calm);
+    stack.drag_to(origin + vec2(2.0, 44.0), &calm);
+    for (id, before) in ids.iter().zip(before) {
+        let preview = stack.frame_of(*id, &calm).unwrap();
+        assert_eq!(preview.rect, before.rect);
+        assert!(preview.alpha < before.alpha);
+    }
 }
 
 #[test]
@@ -1382,7 +1573,7 @@ fn collapsing_stows_every_card_without_dismissing_any() {
     s.collapse(&at(SETTLED));
     s.advance(&at(SETTLED * 2));
 
-    assert_eq!(s.len(), 6, "nothing was lost");
+    assert_eq!(s.len(), s.capacity(), "nothing was lost");
     assert!(s.dock().is_collapsed());
 
     let dock_rect = s.layout().dock_rect();
@@ -1578,7 +1769,7 @@ fn the_stack_goes_idle_once_everything_has_landed() {
 fn reduce_motion_reaches_the_end_state_immediately() {
     let mut s = stack();
     let calm = Motion::at_ms(0).with_reduce_motion(true);
-    for _ in 0..6 {
+    for _ in 0..s.capacity() {
         s.push(&calm);
     }
     let frames = s.frame(&calm);
@@ -1594,11 +1785,11 @@ fn reduce_motion_reaches_the_end_state_immediately() {
 fn reduced_timing_tokens_leave_the_state_machine_intact() {
     let layout = StackLayout::new(mbp16(), CardMetrics::default());
     let mut s = CaptureStack::new(layout, Timing::reduced());
-    let ids: Vec<_> = (0..6).map(|_| s.push(&at(0))).collect();
+    let ids: Vec<_> = (0..s.capacity()).map(|_| s.push(&at(0))).collect();
     s.dismiss(ids[2], &at(0));
     s.advance(&at(0));
 
-    assert_eq!(s.len(), 5);
+    assert_eq!(s.len(), ids.len() - 1);
     assert!(s.departing().is_empty(), "the exit finished instantly");
     assert_eq!(s.slot_of(ids[3]), Some(2), "and the pile still closed up");
     s.check_no_card_moved_up().unwrap();

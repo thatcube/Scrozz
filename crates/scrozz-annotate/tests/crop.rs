@@ -181,12 +181,12 @@ fn documents_saved_before_crop_existed_still_load() {
 }
 
 #[test]
-fn crop_is_written_only_in_the_version_that_defines_it() {
+fn crop_is_written_in_the_current_version() {
     let mut doc = coded();
     doc.set_crop(Some(rect(10.0, 10.0, 20.0, 20.0))).unwrap();
     let data = doc.data();
 
-    assert_eq!(data.version, 2);
+    assert_eq!(data.version, DocumentData::VERSION);
     assert!(data.crop.is_some());
 }
 
