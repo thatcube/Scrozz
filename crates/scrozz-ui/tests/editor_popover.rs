@@ -3,7 +3,10 @@
 #![allow(clippy::expect_used)]
 
 use egui::accesskit::{Action, ActionRequest, Node, NodeId, Toggled, TreeId};
-use egui::{Context, Event, Key, Modifiers, PointerButton, RawInput, Rect, pos2, vec2};
+use egui::{
+    Context, Event, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput, Rect, TouchPhase,
+    pos2, vec2,
+};
 use scrozz_annotate::{Annotation, ArrowStyle, Color, Document};
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -203,6 +206,228 @@ fn same_colour_is_a_no_op_and_custom_colour_is_forwarded() {
     let (tree, custom, _) = access_node(&reopened, |label| label == "Add custom colour");
     let (intent, _) = driver.frame(&mut editor, SIZE, vec![activate(tree, custom)]);
     assert_eq!(intent, Intent::CustomColor);
+}
+
+#[test]
+fn zoom_keys_pinch_wheel_and_percentage_menu_are_view_only() {
+    let mut driver = Driver::new(true, 1.0);
+    let mut editor = editor();
+    let revision = editor.state().revision();
+    let command = Modifiers {
+        command: true,
+        ..Modifiers::NONE
+    };
+    let (_, initial) = driver.frame(&mut editor, SIZE, Vec::new());
+    let (tree, zoom, _) = access_node(&initial, |label| label == "100%");
+
+    let _ = driver.frame(&mut editor, SIZE, vec![activate(tree, zoom)]);
+    let (_, menu) = driver.frame(&mut editor, SIZE, Vec::new());
+    let (tree, two_hundred, _) = access_node(&menu, |label| label == "200%");
+    let _ = driver.frame(&mut editor, SIZE, vec![activate(tree, two_hundred)]);
+    assert_eq!(editor.state().zoom(), 2.0);
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::Key {
+            key: Key::Num0,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: command,
+        }],
+    );
+    assert_eq!(editor.state().zoom(), 1.0);
+    assert!(editor.state().is_fit_zoom());
+    assert_eq!(editor.state().pan(), (0.0, 0.0));
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::Key {
+            key: Key::Plus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: command,
+        }],
+    );
+    let keyboard_zoom = editor.state().zoom();
+    assert!(keyboard_zoom > 1.0);
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::Key {
+            key: Key::Minus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: command,
+        }],
+    );
+    assert!(editor.state().zoom() < keyboard_zoom);
+
+    let pointer = pos2(720.0, 420.0);
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::PointerMoved(pointer), Event::Zoom(1.5)],
+    );
+    assert!(editor.state().zoom() > 1.0);
+    assert_ne!(
+        editor.state().pan(),
+        (0.0, 0.0),
+        "pinch zoom did not preserve the off-centre pointer anchor"
+    );
+    let after_pinch = editor.state().zoom();
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![
+            Event::PointerMoved(pointer),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0.0, 40.0),
+                phase: TouchPhase::Move,
+                modifiers: command,
+            },
+        ],
+    );
+    assert_ne!(editor.state().zoom(), after_pinch);
+    assert_eq!(editor.state().revision(), revision);
+    assert!(!editor.state().is_dirty());
+}
+
+#[test]
+fn middle_mouse_space_drag_and_trackpad_scroll_pan_a_zoomed_canvas() {
+    let mut driver = Driver::new(true, 1.0);
+    let mut editor = editor();
+    editor.state_mut().set_zoom(2.0);
+    let start = pos2(520.0, 380.0);
+    let moved = pos2(560.0, 405.0);
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: PointerButton::Middle,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(
+        editor.state().is_panning(),
+        "middle press did not begin pan"
+    );
+    let _ = driver.frame(&mut editor, SIZE, vec![Event::PointerMoved(moved)]);
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::PointerButton {
+            pos: moved,
+            button: PointerButton::Middle,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    let after_middle = editor.state().pan();
+    assert_ne!(after_middle, (0.0, 0.0));
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![
+            Event::PointerMoved(start),
+            Event::Key {
+                key: Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    let _ = driver.frame(&mut editor, SIZE, vec![Event::PointerMoved(moved)]);
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![
+            Event::PointerButton {
+                pos: moved,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::Key {
+                key: Key::Space,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    let after_space = editor.state().pan();
+    assert_ne!(after_space, after_middle);
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![
+            Event::PointerMoved(start),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(13.0, -9.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    assert_ne!(editor.state().pan(), after_space);
+}
+
+#[test]
+fn crop_panel_exposes_dimensions_aspect_snap_cancel_apply_and_revert() {
+    let mut driver = Driver::new(false, 1.0);
+    let mut editor = editor();
+    let revision = editor.state().revision();
+    editor.state_mut().set_tool(Tool::Crop);
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+
+    let _ = access_node(&output, |label| label == "Aspect ratio: Freeform");
+    let _ = access_node(&output, |label| label.starts_with("Crop width:"));
+    let _ = access_node(&output, |label| label.starts_with("Crop height:"));
+    let _ = access_node(&output, |label| label == "Swap");
+    let _ = access_node(&output, |label| label == "Snap to edges");
+    let (tree, cancel, _) = access_node(&output, |label| label == "Cancel");
+    let _ = access_node(&output, |label| label == "Crop");
+
+    let _ = driver.frame(&mut editor, SIZE, vec![activate(tree, cancel)]);
+    assert!(!editor.state().crop_mode());
+    assert_eq!(editor.document().crop(), None);
+    assert_eq!(editor.state().revision(), revision);
+
+    editor.state_mut().set_tool(Tool::Crop);
+    editor.state_mut().set_crop_width(80.0);
+    editor.state_mut().set_crop_height(60.0);
+    editor
+        .state_mut()
+        .command(scrozz_ui::editor::Command::ApplyCrop)
+        .unwrap();
+    editor.state_mut().set_tool(Tool::Crop);
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let _ = access_node(&output, |label| label == "Revert to Original");
 }
 
 #[test]

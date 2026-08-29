@@ -293,6 +293,8 @@ pub enum Scenario {
     HistoryDetail,
     /// Capture history before the first capture exists.
     HistoryEmpty,
+    /// The editor's dedicated crop mode with full chrome and controls.
+    EditorCrop,
 }
 
 impl Scenario {
@@ -326,6 +328,7 @@ impl Scenario {
             Self::HistoryGrid,
             Self::HistoryDetail,
             Self::HistoryEmpty,
+            Self::EditorCrop,
         ]
     }
 
@@ -362,6 +365,7 @@ impl Scenario {
             Self::HistoryGrid => "history-grid",
             Self::HistoryDetail => "history-detail",
             Self::HistoryEmpty => "history-empty",
+            Self::EditorCrop => "editor-crop",
         }
     }
 
@@ -719,6 +723,7 @@ impl Fixture {
             Scenario::HistoryGrid => 9,
             Scenario::HistoryDetail => 10,
             Scenario::HistoryEmpty => 11,
+            Scenario::EditorCrop => 20,
             _ => scenario as u64,
         };
         let seed = DEFAULT_SEED ^ seed_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -879,6 +884,16 @@ impl Fixture {
                     true,
                     "Shape the arrow",
                     "Arrow style, bend, and named source-unit thickness controls over the live editor.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorCrop => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Crop with precision",
+                    "The complete source stays visible behind a rule-of-thirds crop with direct edge handles, dimensions, aspect presets, snap, Cancel, and Crop actions.",
                     instants::REST,
                     None,
                 ),
@@ -2175,6 +2190,7 @@ impl SceneRegistry {
             Scenario::EditorAnnotating,
             Scenario::EditorColorPopover,
             Scenario::EditorArrowStyles,
+            Scenario::EditorCrop,
         ] {
             me.register(scenario, Box::new(crate::editor::EditorScene));
         }
@@ -4132,6 +4148,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorColorPopover,
         Scenario::SettingsAfterCapture,
         Scenario::EditorArrowStyles,
+        Scenario::EditorCrop,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

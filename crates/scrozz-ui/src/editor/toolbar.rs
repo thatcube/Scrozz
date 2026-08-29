@@ -17,7 +17,8 @@ use crate::paint::{
 };
 use crate::theme::{Elevation, Radius, Space, Text, corner};
 
-use super::state::{EditorState, Intent, Tool};
+use super::paint::CanvasView;
+use super::state::{Command, CropAspect, EditorState, Intent, Tool};
 
 /// The height of one row of controls, in points.
 const ROW: f32 = 40.0;
@@ -72,10 +73,8 @@ const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
 
 /// The width of the right-hand action group, at its widest.
 ///
-/// Four buttons, plus the crop confirmation that appears while a crop is
-/// pending. Sized for the wide case so the toolbar does not start overlapping
-/// itself the moment the user drags a crop out.
-const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR) + Space::SM + BUTTON;
+/// Four right-aligned document actions.
+const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR);
 
 /// The width the whole toolbar needs to sit on a single row.
 ///
@@ -535,29 +534,205 @@ pub fn draw(
         rx -= BUTTON + Space::HAIR;
     }
 
-    // Crop confirmation sits beside the actions only while a crop is pending,
-    // because a permanent "apply" button that is disabled 99% of the time is
-    // just noise.
-    if state.pending_crop().is_some() {
-        rx -= Space::SM;
-        let rect = Rect::from_center_size(pos2(rx + BUTTON / 2.0, cy), vec2(BUTTON, BUTTON));
-        let response = icon_button(
-            ui,
-            surface,
-            rect,
-            ui.id().with("editor-apply-crop"),
-            Icon::Check,
-            "Apply crop",
-            ControlState::on(),
-            Reveal::SHOWN,
-        );
-        if response.clicked() && !input_blocked {
-            let _ = state.command(super::state::Command::ApplyCrop);
-        }
-        response.on_hover_text("Apply crop  (Return)");
-    }
-
     intent
+}
+
+/// Draws viewport-only controls over the canvas.
+pub fn draw_view_controls(
+    ui: &Ui,
+    surface: &Surface<'_>,
+    state: &mut EditorState,
+    canvas: Rect,
+    view: &CanvasView,
+) {
+    draw_zoom_control(ui, surface, state, canvas, view);
+    if state.crop_mode() {
+        draw_crop_controls(ui, surface, state, canvas);
+    }
+}
+
+fn draw_zoom_control(
+    ui: &Ui,
+    surface: &Surface<'_>,
+    state: &mut EditorState,
+    canvas: Rect,
+    view: &CanvasView,
+) {
+    let palette = surface.palette();
+    let position = pos2(
+        canvas.left() + Space::SM,
+        canvas.bottom() - BUTTON - Space::SM,
+    );
+    egui::Area::new(egui::Id::new("editor-zoom-control"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(position)
+        .show(ui.ctx(), |ui| {
+            ui.set_opacity(1.0);
+            let frame = Frame::new()
+                .fill(palette.card_fill_raised)
+                .stroke(Stroke::new(1.0, palette.hairline))
+                .corner_radius(corner(Radius::BUTTON))
+                .inner_margin(Margin::symmetric(Space::SM as i8, Space::XS as i8));
+            frame.show(ui, |ui| {
+                let label = format!("{:.0}%", view.scale() * 100.0);
+                ui.menu_button(label, |ui| {
+                    if ui
+                        .selectable_label(state.is_fit_zoom() && state.pan() == (0.0, 0.0), "Fit")
+                        .on_hover_text("Fit the whole image in the editor")
+                        .clicked()
+                    {
+                        let _ = state.command(Command::ZoomReset);
+                        ui.close();
+                    }
+                    ui.separator();
+                    for percent in [25, 50, 75, 100, 125, 200, 400, 800] {
+                        let zoom = percent as f32 / 100.0;
+                        if ui
+                            .selectable_label(
+                                !state.is_fit_zoom() && (view.scale() - zoom).abs() < 0.001,
+                                format!("{percent}%"),
+                            )
+                            .clicked()
+                        {
+                            state.zoom_about(zoom, (0.0, 0.0));
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Zoom level. Pinch or use Command/Ctrl +/-");
+            });
+        });
+}
+
+fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, canvas: Rect) {
+    let palette = surface.palette();
+    let zoom_reserve = 76.0;
+    let width = (canvas.width() - zoom_reserve - Space::LG * 2.0).clamp(1.0, 920.0);
+    let panel_center = canvas.left() + zoom_reserve + (canvas.width() - zoom_reserve) / 2.0;
+    let content = ui.ctx().content_rect();
+    let offset = vec2(
+        panel_center - content.center().x,
+        canvas.bottom() - content.bottom() - Space::SM,
+    );
+    egui::Area::new(egui::Id::new("editor-crop-controls"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, offset)
+        .show(ui.ctx(), |ui| {
+            ui.set_opacity(1.0);
+            ui.set_width(width);
+            ui.set_max_width(width);
+            let frame = Frame::new()
+                .fill(palette.card_fill_raised)
+                .stroke(Stroke::new(1.0, palette.hairline))
+                .corner_radius(corner(Radius::BAR))
+                .inner_margin(Margin::same(Space::SM as i8));
+            frame.show(ui, |ui| {
+                let inner_width = (width - Space::SM * 2.0).max(1.0);
+                ui.set_width(inner_width);
+                ui.set_max_width(inner_width);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Crop");
+                    let mut aspect = state.crop_aspect().unwrap_or_default();
+                    let aspect_response = egui::ComboBox::from_id_salt("crop-aspect")
+                        .selected_text(aspect.label())
+                        .show_ui(ui, |ui| {
+                            for choice in CropAspect::ALL {
+                                ui.selectable_value(&mut aspect, choice, choice.label());
+                            }
+                        });
+                    aspect_response.response.widget_info(|| {
+                        WidgetInfo::labeled(
+                            WidgetType::ComboBox,
+                            true,
+                            format!("Aspect ratio: {}", aspect.label()),
+                        )
+                    });
+                    if state.crop_aspect() != Some(aspect) {
+                        state.set_crop_aspect(aspect);
+                    }
+
+                    if let Some(((width_px, height_px), (source_width, source_height))) =
+                        state.crop_pixel_sizes()
+                    {
+                        let scale = state.document().source.frame.scale.get();
+                        let mut width_px = width_px;
+                        let mut height_px = height_px;
+                        let width_response = ui.add(
+                            egui::DragValue::new(&mut width_px)
+                                .range(1..=source_width)
+                                .speed(1.0)
+                                .prefix("W ")
+                                .suffix(" px"),
+                        );
+                        width_response.widget_info(|| {
+                            WidgetInfo::labeled(
+                                WidgetType::DragValue,
+                                true,
+                                format!("Crop width: {width_px} pixels"),
+                            )
+                        });
+                        width_response
+                            .clone()
+                            .on_hover_text("Crop width in source pixels");
+                        if width_response.changed() {
+                            state.set_crop_width(f64::from(width_px) / scale);
+                        }
+                        let height_response = ui.add(
+                            egui::DragValue::new(&mut height_px)
+                                .range(1..=source_height)
+                                .speed(1.0)
+                                .prefix("H ")
+                                .suffix(" px"),
+                        );
+                        height_response.widget_info(|| {
+                            WidgetInfo::labeled(
+                                WidgetType::DragValue,
+                                true,
+                                format!("Crop height: {height_px} pixels"),
+                            )
+                        });
+                        height_response
+                            .clone()
+                            .on_hover_text("Crop height in source pixels");
+                        if height_response.changed() {
+                            state.set_crop_height(f64::from(height_px) / scale);
+                        }
+                        if ui
+                            .button("Swap")
+                            .on_hover_text("Swap crop width and height")
+                            .clicked()
+                        {
+                            state.swap_crop_dimensions();
+                        }
+                        ui.add(
+                            egui::Label::new(format!("Image {source_width} x {source_height} px"))
+                                .sense(Sense::focusable_noninteractive()),
+                        );
+                    }
+
+                    let mut snap = state.crop_snap_edges();
+                    let snap_response = ui.checkbox(&mut snap, "Snap to edges");
+                    if snap_response.changed() {
+                        state.set_crop_snap_edges(snap);
+                    }
+                    snap_response
+                        .on_hover_text("Hold Command/Ctrl while dragging to disable snapping");
+
+                    if ui.button("Cancel").clicked() {
+                        let _ = state.command(Command::CancelCrop);
+                    }
+                    if state.document().crop().is_some()
+                        && ui.button("Revert to Original").clicked()
+                    {
+                        let _ = state.command(Command::RevertCrop);
+                    }
+                    if ui.button("Crop").clicked() {
+                        let _ = state.command(Command::ApplyCrop);
+                    }
+                });
+            });
+        });
 }
 
 const POPOVER_ALIGNS: [RectAlign; 4] = [
