@@ -40,6 +40,7 @@ fn rendering_is_deterministic() {
             start: Color::rgb(250, 250, 250),
             end: Color::rgb(190, 200, 220),
         },
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -271,15 +272,16 @@ fn a_highlight_leaves_dark_text_readable() {
 }
 
 #[test]
-fn beautification_is_refused_by_the_renderer_for_window_captures() {
-    // Decision D9, enforced a second time. `set_beautification` already refuses,
-    // so reaching this state needs a hand-built sidecar — which is exactly the
-    // route a future importer or a corrupted file would take.
+fn subject_styling_is_refused_by_the_renderer_for_window_captures() {
+    // Decision D9, enforced a second time. Outer canvas is allowed, but anything
+    // that would restyle the native window pixels must still be rejected at render.
     let data = scrozz_annotate::DocumentData {
-        beautification: Some(Beautification::padded(
-            40.0,
-            Background::Solid(Color::WHITE),
-        )),
+        beautification: Some(Beautification {
+            padding: 40.0,
+            corner_radius: 8.0,
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }),
         ..Default::default()
     };
 
@@ -289,7 +291,7 @@ fn beautification_is_refused_by_the_renderer_for_window_captures() {
 
     let err = SkiaRenderer::new()
         .render(&doc)
-        .expect_err("a window capture must never be re-framed");
+        .expect_err("a window capture must never be re-styled");
     assert!(format!("{err}").to_lowercase().contains("window"), "{err}");
 }
 
@@ -317,6 +319,7 @@ fn beautification_pads_the_canvas() {
         corner_radius: 0.0,
         shadow: 0.0,
         background: Background::Solid(Color::rgb(0, 0, 255)),
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -362,6 +365,7 @@ fn a_corner_radius_actually_rounds_the_corner() {
         corner_radius: 16.0,
         shadow: 0.0,
         background: Background::Solid(Color::rgb(0, 0, 255)),
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -388,6 +392,7 @@ fn a_shadow_darkens_the_background_beneath_the_content() {
         corner_radius: 6.0,
         shadow: 18.0,
         background: Background::Solid(Color::WHITE),
+        ..Beautification::default()
     }))
     .unwrap();
 
@@ -413,6 +418,7 @@ fn a_noop_beautification_changes_nothing() {
         corner_radius: 0.0,
         shadow: 0.0,
         background: Background::Transparent,
+        ..Beautification::default()
     }))
     .unwrap();
     let framed = SkiaRenderer::new().render(&doc).unwrap();

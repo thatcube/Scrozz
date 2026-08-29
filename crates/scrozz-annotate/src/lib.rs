@@ -23,11 +23,10 @@
 //! [`render::redact`].
 //!
 //! **Window captures are sacred.** Decision D9: the OS already supplied a
-//! window's true shape and shadow, so synthesising corners, padding or a shadow
-//! on top yields a subtly wrong image. [`Document::may_beautify`] reports it,
-//! [`Document::set_beautification`] refuses it, and
-//! [`render::SkiaRenderer::render_at`] refuses it again so no other route into a
-//! document can get it wrong.
+//! window's true shape and shadow, so the subject may not be cropped, rounded,
+//! bordered, or re-shadowed. Smart Frame may place those byte-stable pixels on an
+//! outer presentation canvas. [`Document::set_beautification`] and
+//! [`render::SkiaRenderer::render_at`] both enforce that distinction.
 //!
 //! # Coordinates
 //!
@@ -70,12 +69,23 @@ pub mod font;
 pub mod geom;
 pub mod history;
 pub mod render;
+pub mod smart_frame;
 pub mod style;
 
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
-pub use document::{AnnotationMut, Background, Beautification, Document, DocumentData};
+pub use document::{
+    Alignment, AnnotationMut, AspectPreset, AutomaticBackground, Background, BackgroundImage,
+    Beautification, BeautificationPreset, BuiltInBackground, Document, DocumentData,
+    ExactOutputSize, SourceInsets, Watermark,
+};
 pub use history::History;
 pub use render::{Renderer, SkiaRenderer};
+pub use smart_frame::{
+    AnalysisCancellation, ContentClass, InsetDecision, MAX_ANALYSIS_SAMPLES, PresetBackground,
+    ResolvedFocus, SensitiveRegionReview, SensitiveRegionSuggestion, SmartFrameAnalysis,
+    SmartFrameMetadata, SmartFramePreset, SmartFramePresetSettings, analyze as analyze_smart_frame,
+    contrast_ratio, provisional as provisional_smart_frame,
+};
 pub use style::{
     ArrowStyle, Color, REDACT_INTENSITY_DEFAULT, REDACT_INTENSITY_MAX, REDACT_INTENSITY_MIN, Style,
 };

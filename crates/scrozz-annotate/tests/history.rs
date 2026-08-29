@@ -266,11 +266,13 @@ fn undo_never_disturbs_the_source_image() {
 
 #[test]
 fn restore_refuses_state_a_document_cannot_hold() {
-    // Beautification is forbidden for window captures (D9). A snapshot carrying
-    // it must be refused rather than quietly applied.
+    // D9 still forbids any snapshot that would restyle native window pixels.
     let mut doc = Document::new(window_capture(100, 100));
     let data = DocumentData {
-        beautification: Some(scrozz_annotate::Beautification::default()),
+        beautification: Some(scrozz_annotate::Beautification {
+            corner_radius: 12.0,
+            ..scrozz_annotate::Beautification::default()
+        }),
         ..DocumentData::default()
     };
     assert!(doc.restore(data).is_err());

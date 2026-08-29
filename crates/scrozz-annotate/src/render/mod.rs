@@ -12,13 +12,15 @@ use tiny_skia::{BlendMode, IntRect, IntSize, Pixmap, Transform};
 
 use crate::{
     annotation::{Annotation, AnnotationObject, RedactStyle},
-    document::Document,
+    document::{Beautification, Document, MAX_RASTER_EDGE, MAX_RASTER_PIXELS},
     style::Color,
 };
 
 use shapes::Scaled;
 
+const MAX_RENDER_WORKING_BYTES: u64 = 768 * 1024 * 1024;
 const MAX_PIXMAP_BYTES: u64 = 256 * 1024 * 1024;
+const BYTES_PER_PIXEL: u64 = 4;
 
 /// Renders a document to pixels.
 pub trait Renderer {
@@ -52,18 +54,46 @@ impl SkiaRenderer {
     /// # Errors
     ///
     /// Returns [`Error::InvalidRequest`] if the source frame is malformed, if
-    /// the output would be zero-sized or unallocatable, or if the document
-    /// carries beautification for a window capture — see decision D9.
+    /// the output would be zero-sized or unallocatable, or if window framing
+    /// would change native subject pixels — see decision D9.
     pub fn render_at(&self, document: &Document, scale: ScaleFactor) -> Result<Frame> {
-        // D9, second gate. `Document::set_beautification` refuses this too, but
-        // a document can also arrive from persistence or from a future editing
-        // path, and shipping a re-shadowed window capture must be impossible
-        // rather than merely unlikely.
-        if document.beautification().is_some() && !document.may_beautify() {
+        self.render_at_with_width(document, scale, None)
+    }
+
+    fn render_at_with_width(
+        &self,
+        document: &Document,
+        scale: ScaleFactor,
+        target_width: Option<u32>,
+    ) -> Result<Frame> {
+        if document.source.provenance.forbids_compositing()
+            && document
+                .beautification()
+                .is_some_and(|beautification| !beautification.preserves_subject_pixels())
+        {
             return Err(Error::InvalidRequest(
-                "beautification is not permitted for window captures (decision D9)".to_owned(),
+                "window Smart Frame may add only an outer canvas; native pixels must remain untouched (decision D9)"
+                    .to_owned(),
             ));
         }
+
+        let logical = document.logical_size();
+        let width = checked_render_dimension(logical.width * scale.get(), "width")?;
+        let height = checked_render_dimension(logical.height * scale.get(), "height")?;
+        let retained_background_bytes = match document.beautification() {
+            Some(beautification) => {
+                beautification.validate()?;
+                retained_background_bytes(beautification)?
+            }
+            None => 0,
+        };
+        preflight_render(
+            &document.source.frame,
+            width,
+            height,
+            false,
+            retained_background_bytes,
+        )?;
 
         let source = raster::to_pixmap(&document.source.frame)?;
         let bounds = document.logical_bounds();
@@ -71,13 +101,7 @@ impl SkiaRenderer {
         let source_size = scaled_size(bounds, scale)?;
         let crop = crop_rect(bounds, content, scale, source_size)?;
 
-        // Composite in the source's full filtering domain before cropping.
-        // Otherwise a one-pixel crop inside a blur or mosaic leaves that source
-        // pixel unchanged and turns a destructive redaction into a no-op.
         let mut canvas = new_pixmap(source_size.0, source_size.1, "source-sized output")?;
-        // One working space for the whole composite: the capture's own. Source
-        // pixels are already in it and are never resampled; only the
-        // annotations, authored in sRGB, have to be converted on the way in.
         let into = ColorTransform::new(ColorSpace::Srgb, document.source.frame.color_space);
         let xf = Scaled::with_origin(scale.get(), bounds.origin);
         draw_source(&mut canvas, &source, bounds, xf);
@@ -85,22 +109,57 @@ impl SkiaRenderer {
         for object in document.annotations() {
             draw_object(&mut canvas, object, xf, into)?;
         }
+        drop(source);
 
         let canvas = if content == bounds {
             canvas
         } else {
             crop_canvas(canvas, crop)?
         };
+        let retained_source_bytes =
+            u64::try_from(document.source.frame.data.len()).map_err(|_| {
+                Error::InvalidRequest("source buffer size is not addressable".to_owned())
+            })?;
         let canvas = match document.beautification() {
-            Some(beautification) => beautify::apply(&canvas, beautification, scale.get(), into)?,
-            None => canvas,
+            Some(beautification) if !beautification.is_noop() => {
+                beautify::apply_with_retained_bytes(
+                    &canvas,
+                    beautification,
+                    beautify::ApplyOptions {
+                        scale: scale.get(),
+                        source_scale: document.source.frame.scale.get(),
+                        target_color_space: document.source.frame.color_space,
+                        preserve_source_pixels: document.source.provenance.forbids_compositing(),
+                        retained_source_bytes,
+                        target_width,
+                    },
+                )?
+            }
+            Some(_) | None => canvas,
+        };
+        if let Some(target_width) = target_width
+            && canvas.width() != target_width
+        {
+            return Err(Error::InvalidRequest(format!(
+                "rendered width is {}, expected {target_width}",
+                canvas.width()
+            )));
+        }
+
+        let color_space = if document.source.frame.color_space == ColorSpace::Unknown
+            || document.beautification().is_some_and(|beautification| {
+                matches!(
+                    &beautification.background,
+                    crate::Background::Image(image)
+                        if image.color_space() == ColorSpace::Unknown
+                )
+            }) {
+            ColorSpace::Unknown
+        } else {
+            document.source.frame.color_space
         };
 
-        Ok(raster::from_pixmap(
-            canvas,
-            document.source.frame.color_space,
-            scale,
-        ))
+        Ok(raster::from_pixmap(canvas, color_space, scale))
     }
 
     /// Composites the document scaled so its output is `width` pixels wide.
@@ -115,13 +174,17 @@ impl SkiaRenderer {
                 "export width must be greater than zero".to_owned(),
             ));
         }
-        let logical = document.content_size();
+        let logical = document.output_logical_size();
         if logical.width <= 0.0 {
             return Err(Error::InvalidRequest(
                 "cannot scale a source with no width".to_owned(),
             ));
         }
-        self.render_at(document, ScaleFactor::new(f64::from(width) / logical.width))
+        self.render_at_with_width(
+            document,
+            ScaleFactor::new(f64::from(width) / logical.width),
+            Some(width),
+        )
     }
 }
 
@@ -130,6 +193,72 @@ impl Renderer for SkiaRenderer {
     fn render(&self, document: &Document) -> Result<Frame> {
         self.render_at(document, document.source.frame.scale)
     }
+}
+
+fn checked_render_dimension(value: f64, name: &str) -> Result<u32> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(MAX_RASTER_EDGE) {
+        return Err(Error::InvalidRequest(format!(
+            "rendered {name} {value} is not addressable"
+        )));
+    }
+    Ok(value.round().max(1.0) as u32)
+}
+
+fn preflight_render(
+    source: &Frame,
+    output_width: u32,
+    output_height: u32,
+    converts_source: bool,
+    retained_background_bytes: u64,
+) -> Result<()> {
+    let source_pixels = u64::from(source.width())
+        .checked_mul(u64::from(source.height()))
+        .ok_or_else(|| Error::InvalidRequest("source raster area overflowed".to_owned()))?;
+    let output_pixels = u64::from(output_width)
+        .checked_mul(u64::from(output_height))
+        .ok_or_else(|| Error::InvalidRequest("output raster area overflowed".to_owned()))?;
+    for (label, pixels) in [("source", source_pixels), ("output", output_pixels)] {
+        if pixels > MAX_RASTER_PIXELS {
+            return Err(Error::InvalidRequest(format!(
+                "{label} raster has {pixels} pixels; the limit is {MAX_RASTER_PIXELS}"
+            )));
+        }
+    }
+
+    let source_raster = source_pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| Error::InvalidRequest("source raster size overflowed".to_owned()))?;
+    let output_raster = output_pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| Error::InvalidRequest("output raster size overflowed".to_owned()))?;
+    let retained = u64::try_from(source.data.len())
+        .map_err(|_| Error::InvalidRequest("source buffer size is not addressable".to_owned()))?;
+    let source_copies = if converts_source { 2 } else { 1 };
+    let peak = source_raster
+        .checked_mul(source_copies)
+        .and_then(|bytes| bytes.checked_add(retained))
+        .and_then(|bytes| bytes.checked_add(retained_background_bytes))
+        .and_then(|bytes| bytes.checked_add(output_raster))
+        .ok_or_else(|| Error::InvalidRequest("render working set overflowed".to_owned()))?;
+    if peak > MAX_RENDER_WORKING_BYTES {
+        return Err(Error::InvalidRequest(format!(
+            "render needs about {} MiB of working memory; the limit is {} MiB",
+            peak.div_ceil(1024 * 1024),
+            MAX_RENDER_WORKING_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+fn retained_background_bytes(beautification: &Beautification) -> Result<u64> {
+    let crate::Background::Image(image) = &beautification.background else {
+        return Ok(0);
+    };
+    u64::from(image.width())
+        .checked_mul(u64::from(image.height()))
+        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        .and_then(|bytes| bytes.checked_add(image.encoded_len() as u64))
+        .ok_or_else(|| Error::InvalidRequest("background working set overflowed".to_owned()))
 }
 
 fn scaled_size(bounds: LogicalRect, scale: ScaleFactor) -> Result<(u32, u32)> {

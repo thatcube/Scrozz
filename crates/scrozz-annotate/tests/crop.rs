@@ -226,8 +226,8 @@ fn enlarging_a_tiny_crop_refuses_an_unsafe_full_domain_allocation() {
 
     let error = SkiaRenderer::new()
         .render_to_width(&doc, 1_000)
-        .expect_err("a multi-gigabyte filtering domain must be refused");
-    assert!(error.to_string().contains("render limit"), "{error}");
+        .expect_err("a huge cropped export must still be refused");
+    assert!(error.to_string().contains("not addressable"), "{error}");
 }
 
 #[test]
@@ -266,15 +266,29 @@ fn crop_applies_before_beautification() {
 
 #[test]
 fn cropping_a_window_capture_does_not_smuggle_in_compositing() {
-    // Decision D9. Crop is a legitimate operation on a window capture; it must
-    // not become a fourth route to beautifying one.
+    // Decision D9. Crop is a legitimate operation on a window capture, and
+    // Smart Frame may still add only an outer canvas afterwards. Subject styling
+    // remains forbidden.
     let capture = common::window_capture(100, 100);
     let mut doc = Document::new(capture);
     doc.set_crop(Some(rect(10.0, 10.0, 50.0, 50.0))).unwrap();
-    assert!(!doc.may_beautify());
-    assert!(doc.set_beautification(Some(Default::default())).is_err());
+    assert!(doc.may_beautify());
+    doc.set_beautification(Some(scrozz_annotate::Beautification::padded(
+        8.0,
+        scrozz_annotate::Background::Solid(scrozz_annotate::Color::WHITE),
+    )))
+    .unwrap();
+    assert!(
+        doc.set_beautification(Some(scrozz_annotate::Beautification {
+            padding: 8.0,
+            corner_radius: 6.0,
+            background: scrozz_annotate::Background::Solid(scrozz_annotate::Color::WHITE),
+            ..scrozz_annotate::Beautification::default()
+        }))
+        .is_err()
+    );
     let frame = SkiaRenderer::new().render(&doc).unwrap();
-    assert_eq!((frame.width(), frame.height()), (50, 50));
+    assert_eq!((frame.width(), frame.height()), (50 + 16, 50 + 16));
 }
 
 #[test]

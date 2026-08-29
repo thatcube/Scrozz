@@ -1,0 +1,385 @@
+//! Smart Frame analysis: deterministic, conservative, and bounded.
+
+use std::collections::BTreeMap;
+
+use scrozz_annotate::{
+    AnalysisCancellation, Background, Beautification, InsetDecision, MAX_ANALYSIS_SAMPLES,
+    SmartFramePreset, SmartFramePresetSettings, analyze_smart_frame, contrast_ratio,
+};
+use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
+
+fn rgba_frame(width: u32, height: u32, fill: [u8; 4], color_space: ColorSpace) -> Frame {
+    Frame {
+        data: fill
+            .into_iter()
+            .cycle()
+            .take(width as usize * height as usize * 4)
+            .collect(),
+        size: PhysicalSize::new(f64::from(width), f64::from(height)),
+        stride: width as usize * 4,
+        format: PixelFormat::Rgba8,
+        color_space,
+        scale: ScaleFactor::IDENTITY,
+    }
+}
+
+fn paint_rect(frame: &mut Frame, left: u32, top: u32, right: u32, bottom: u32, color: [u8; 4]) {
+    let width = frame.width() as usize;
+    for y in top..bottom {
+        for x in left..right {
+            let offset = (y as usize * width + x as usize) * 4;
+            frame.data[offset..offset + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+#[test]
+fn analysis_is_byte_deterministic() {
+    let mut frame = rgba_frame(320, 180, [246, 247, 249, 255], ColorSpace::Srgb);
+    paint_rect(&mut frame, 72, 42, 286, 148, [29, 35, 48, 255]);
+    let cancellation = AnalysisCancellation::default();
+
+    let a = analyze_smart_frame(&frame, Provenance::Region, &cancellation).unwrap();
+    let b = analyze_smart_frame(&frame, Provenance::Region, &cancellation).unwrap();
+
+    assert_eq!(a, b);
+    assert!(a.beautification.auto_balance);
+    assert!(matches!(
+        a.beautification.background,
+        Background::Automatic(_)
+    ));
+}
+
+#[test]
+fn transparent_outer_margin_is_trimmed_in_source_space() {
+    let mut frame = rgba_frame(100, 80, [0, 0, 0, 0], ColorSpace::DisplayP3);
+    paint_rect(&mut frame, 10, 8, 90, 72, [220, 80, 40, 255]);
+
+    let result =
+        analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+    let inset = result.beautification.inset;
+    assert_eq!(
+        (inset.left, inset.top, inset.right, inset.bottom),
+        (10.0, 8.0, 10.0, 8.0)
+    );
+    assert_eq!(
+        result
+            .beautification
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .inset_decision,
+        InsetDecision::TransparentMargin
+    );
+}
+
+#[test]
+fn one_meaningful_edge_pixel_prevents_an_unsafe_inset() {
+    let mut frame = rgba_frame(120, 80, [250, 250, 250, 255], ColorSpace::Srgb);
+    paint_rect(&mut frame, 20, 12, 100, 68, [35, 40, 55, 255]);
+    paint_rect(&mut frame, 2, 40, 3, 41, [35, 40, 55, 255]);
+
+    let result =
+        analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+
+    assert_eq!(
+        result.beautification.inset.left, 0.0,
+        "a non-background edge pixel must stop the scan before the minimum safe margin"
+    );
+}
+
+#[test]
+fn one_sided_content_moves_toward_the_visual_center() {
+    let mut frame = rgba_frame(200, 100, [20, 22, 27, 255], ColorSpace::Srgb);
+    paint_rect(&mut frame, 150, 20, 194, 80, [245, 245, 245, 255]);
+
+    let result =
+        analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+    let focus = result.beautification.smart_frame.unwrap().focus;
+    assert!(
+        focus.x > 6_000,
+        "right-heavy content should resolve right of centre"
+    );
+}
+
+#[test]
+fn already_balanced_content_snaps_to_exact_center() {
+    let mut frame = rgba_frame(200, 100, [20, 22, 27, 255], ColorSpace::Srgb);
+    paint_rect(&mut frame, 60, 20, 140, 80, [245, 245, 245, 255]);
+
+    let result =
+        analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+    let focus = result.beautification.smart_frame.unwrap().focus;
+    assert_eq!((focus.x, focus.y), (5_000, 5_000));
+}
+
+#[test]
+fn automatic_background_has_resolved_contrast_and_space_metadata() {
+    let frame = rgba_frame(160, 90, [18, 28, 46, 255], ColorSpace::DisplayP3);
+    let result = analyze_smart_frame(
+        &frame,
+        Provenance::Display,
+        &AnalysisCancellation::default(),
+    )
+    .unwrap();
+    let Background::Automatic(background) = result.beautification.background else {
+        panic!("automatic background");
+    };
+
+    assert_eq!(background.source_color_space, ColorSpace::DisplayP3);
+    assert!(contrast_ratio(background.start, background.edge_reference) >= 3.0);
+    assert!(contrast_ratio(background.end, background.edge_reference) >= 3.0);
+    assert!(background.minimum_contrast_x100 >= 300);
+}
+
+#[test]
+fn equivalent_wide_gamut_and_srgb_inputs_resolve_the_same_palette() {
+    let srgb = rgba_frame(96, 64, [210, 54, 128, 255], ColorSpace::Srgb);
+    let source = scrozz_export::to_straight_rgba8(&srgb).unwrap();
+    let s =
+        analyze_smart_frame(&srgb, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+    let Background::Automatic(s) = s.beautification.background else {
+        panic!("sRGB automatic background");
+    };
+    for space in [ColorSpace::DisplayP3, ColorSpace::Rec2020] {
+        let converted =
+            scrozz_export::convert_color_space(&source, ColorSpace::Srgb, space).unwrap();
+        let wide = Frame {
+            data: converted.data,
+            size: PhysicalSize::new(96.0, 64.0),
+            stride: 96 * 4,
+            format: PixelFormat::Rgba8,
+            color_space: space,
+            scale: ScaleFactor::IDENTITY,
+        };
+        let result =
+            analyze_smart_frame(&wide, Provenance::Region, &AnalysisCancellation::default())
+                .unwrap();
+        let Background::Automatic(wide) = result.beautification.background else {
+            panic!("{space:?} automatic background");
+        };
+        for (left, right) in [
+            (s.start.r, wide.start.r),
+            (s.start.g, wide.start.g),
+            (s.start.b, wide.start.b),
+            (s.end.r, wide.end.r),
+            (s.end.g, wide.end.g),
+            (s.end.b, wide.end.b),
+        ] {
+            assert!(
+                left.abs_diff(right) <= 3,
+                "{space:?} palette diverged: {left} vs {right}"
+            );
+        }
+    }
+}
+
+#[test]
+fn window_analysis_only_adds_an_outer_presentation_canvas() {
+    let frame = rgba_frame(240, 160, [80, 100, 140, 255], ColorSpace::DisplayP3);
+    let result =
+        analyze_smart_frame(&frame, Provenance::Window, &AnalysisCancellation::default()).unwrap();
+    let beauty = result.beautification;
+
+    assert!(beauty.padding > 0.0);
+    assert!(beauty.preserves_subject_pixels());
+    assert_eq!(
+        beauty.smart_frame.unwrap().inset_decision,
+        InsetDecision::WindowPreserved
+    );
+}
+
+#[test]
+fn cancellation_is_an_outcome_not_a_partial_result() {
+    let frame = rgba_frame(640, 480, [20, 30, 40, 255], ColorSpace::Srgb);
+    let cancellation = AnalysisCancellation::default();
+    cancellation.cancel();
+    let error = analyze_smart_frame(&frame, Provenance::Region, &cancellation)
+        .expect_err("cancelled analysis");
+    assert!(error.is_cancellation());
+}
+
+#[test]
+fn preset_round_trip_preserves_unknown_fields_but_never_pixels() {
+    let mut beauty = Beautification {
+        background: Background::Automatic(Default::default()),
+        ..Beautification::default()
+    };
+    let mut settings = SmartFramePresetSettings::from_beautification(&beauty).unwrap();
+    settings.extensions.insert(
+        "future_control".to_owned(),
+        serde_json::json!({"enabled": true}),
+    );
+    let mut preset = SmartFramePreset::new("my-frame", "My Frame", settings).unwrap();
+    preset
+        .extensions
+        .insert("future".to_owned(), serde_json::json!(7));
+
+    let json = serde_json::to_string(&preset).unwrap();
+    let restored: SmartFramePreset = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.extensions["future"], 7);
+    assert_eq!(
+        restored.settings.extensions["future_control"]["enabled"],
+        true
+    );
+    let rebuilt =
+        SmartFramePresetSettings::from_beautification(&restored.settings.to_beautification())
+            .unwrap();
+    assert_eq!(rebuilt.extensions["future_control"]["enabled"], true);
+    assert!(!json.contains("pixels_png"));
+
+    let image =
+        scrozz_annotate::BackgroundImage::new(1, 1, vec![0, 0, 0, 255], ColorSpace::Srgb).unwrap();
+    beauty.background = Background::Image(image);
+    assert!(SmartFramePresetSettings::from_beautification(&beauty).is_err());
+}
+
+#[test]
+fn near_identical_dimensions_change_adaptive_tokens_smoothly() {
+    let a = analyze_smart_frame(
+        &rgba_frame(1000, 600, [40, 44, 52, 255], ColorSpace::Srgb),
+        Provenance::Display,
+        &AnalysisCancellation::default(),
+    )
+    .unwrap();
+    let b = analyze_smart_frame(
+        &rgba_frame(1001, 601, [40, 44, 52, 255], ColorSpace::Srgb),
+        Provenance::Display,
+        &AnalysisCancellation::default(),
+    )
+    .unwrap();
+    assert!((a.beautification.padding - b.beautification.padding).abs() <= 2.0);
+    assert!((a.beautification.corner_radius - b.beautification.corner_radius).abs() <= 2.0);
+    assert!((a.beautification.shadow - b.beautification.shadow).abs() <= 2.0);
+}
+
+#[test]
+fn diverse_capture_shapes_stay_bounded_and_deterministic() {
+    for (width, height, dark, transparent) in [
+        (2048, 240, true, false),
+        (240, 2048, false, false),
+        (1024, 768, true, true),
+        (640, 480, false, false),
+    ] {
+        let fill = if transparent {
+            [0, 0, 0, 0]
+        } else if dark {
+            [18, 22, 30, 255]
+        } else {
+            [244, 242, 236, 255]
+        };
+        let mut frame = rgba_frame(width, height, fill, ColorSpace::Srgb);
+        let object = if width > height {
+            (width * 2 / 3, height / 4, width - 8, height * 3 / 4)
+        } else {
+            (width / 4, height * 2 / 3, width * 3 / 4, height - 8)
+        };
+        paint_rect(
+            &mut frame,
+            object.0,
+            object.1,
+            object.2,
+            object.3,
+            [230, 75, 90, 255],
+        );
+        let first =
+            analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default())
+                .unwrap();
+        let second =
+            analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default())
+                .unwrap();
+        assert_eq!(first, second);
+        let metadata = first.beautification.smart_frame.unwrap();
+        assert!(u64::from(metadata.analysis_samples) <= MAX_ANALYSIS_SAMPLES);
+        assert!((24.0..=96.0).contains(&first.beautification.padding));
+        assert!((8.0..=24.0).contains(&first.beautification.corner_radius));
+        assert!((10.0..=28.0).contains(&first.beautification.shadow));
+    }
+}
+
+#[test]
+fn disconnected_objects_contribute_to_one_stable_focus() {
+    let mut frame = rgba_frame(300, 160, [28, 30, 36, 255], ColorSpace::Srgb);
+    paint_rect(&mut frame, 20, 20, 70, 80, [245, 245, 245, 255]);
+    paint_rect(&mut frame, 220, 90, 286, 148, [210, 70, 120, 255]);
+    let result =
+        analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+    let focus = result.beautification.smart_frame.unwrap().focus;
+    assert!((3_500..=7_500).contains(&focus.x));
+    assert!((3_000..=7_500).contains(&focus.y));
+}
+
+#[test]
+fn detailed_photo_like_edges_disable_automatic_inset() {
+    let mut frame = rgba_frame(256, 160, [0, 0, 0, 255], ColorSpace::Srgb);
+    for y in 0..frame.height() as usize {
+        for x in 0..frame.width() as usize {
+            let offset = y * frame.stride + x * 4;
+            let seed = (x as u32)
+                .wrapping_mul(73)
+                .wrapping_add((y as u32).wrapping_mul(151));
+            frame.data[offset..offset + 4].copy_from_slice(&[
+                seed as u8,
+                seed.rotate_left(7) as u8,
+                seed.rotate_left(13) as u8,
+                255,
+            ]);
+        }
+    }
+    let result =
+        analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
+    assert!(result.beautification.inset.is_zero());
+    assert_eq!(
+        result.beautification.smart_frame.unwrap().inset_decision,
+        InsetDecision::LowConfidence
+    );
+}
+
+#[test]
+fn malformed_and_oversized_analysis_inputs_are_refused() {
+    let malformed = Frame {
+        data: vec![0; 3],
+        size: PhysicalSize::new(100.0, 100.0),
+        stride: 400,
+        format: PixelFormat::Rgba8,
+        color_space: ColorSpace::Srgb,
+        scale: ScaleFactor::IDENTITY,
+    };
+    assert!(
+        analyze_smart_frame(
+            &malformed,
+            Provenance::Region,
+            &AnalysisCancellation::default()
+        )
+        .is_err()
+    );
+
+    let oversized = Frame {
+        data: Vec::new(),
+        size: PhysicalSize::new(40_000_001.0, 1.0),
+        stride: 40_000_001 * 4,
+        format: PixelFormat::Rgba8,
+        color_space: ColorSpace::Srgb,
+        scale: ScaleFactor::IDENTITY,
+    };
+    let error = analyze_smart_frame(
+        &oversized,
+        Provenance::Region,
+        &AnalysisCancellation::default(),
+    )
+    .expect_err("area bound is checked before reading the empty buffer");
+    assert!(error.to_string().contains("malformed") || error.to_string().contains("limit"));
+}
+
+#[test]
+fn preset_schema_rejects_future_versions_without_losing_unknown_values() {
+    let preset = SmartFramePreset {
+        version: u32::MAX,
+        id: "future".to_owned(),
+        name: "Future".to_owned(),
+        extensions: BTreeMap::from([("vendor".to_owned(), serde_json::json!("kept"))]),
+        ..SmartFramePreset::default()
+    };
+    assert!(preset.validate().is_err());
+    assert_eq!(preset.extensions["vendor"], "kept");
+}

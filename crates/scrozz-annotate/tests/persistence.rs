@@ -284,6 +284,7 @@ fn round_trip_preserves_beautification() {
             start: Color::rgb(240, 120, 40),
             end: Color::rgb(30, 40, 160),
         },
+        ..Beautification::default()
     }))
     .expect("region captures may be beautified");
 
@@ -325,14 +326,17 @@ fn a_sidecar_from_the_future_is_refused_rather_than_misread() {
 }
 
 #[test]
-fn a_window_sidecar_carrying_beautification_is_refused() {
+fn a_window_sidecar_that_restyles_subject_pixels_is_refused() {
     // Decision D9. A document can arrive from disk, so refusing only at the
-    // setter would leave a route in.
+    // setter would leave a route in. Outer canvas is fine; re-styling the native
+    // window pixels is not.
     let data = DocumentData {
-        beautification: Some(Beautification::padded(
-            40.0,
-            Background::Solid(Color::WHITE),
-        )),
+        beautification: Some(Beautification {
+            padding: 40.0,
+            corner_radius: 8.0,
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }),
         ..DocumentData::default()
     };
 
@@ -341,22 +345,35 @@ fn a_window_sidecar_carrying_beautification_is_refused() {
 }
 
 #[test]
-fn beautification_is_refused_for_window_captures() {
+fn window_captures_allow_outer_canvas_but_refuse_subject_styling() {
     let mut doc = Document::new(window_capture(100, 100));
-    assert!(!doc.may_beautify());
+    assert!(doc.may_beautify());
+    assert!(!doc.may_style_subject());
+
+    doc.set_beautification(Some(Beautification::padded(
+        32.0,
+        Background::Solid(Color::WHITE),
+    )))
+    .expect("outer canvas is allowed for window captures");
 
     let err = doc
-        .set_beautification(Some(Beautification::padded(
-            32.0,
-            Background::Solid(Color::WHITE),
-        )))
-        .expect_err("D9 forbids compositing onto a window capture");
+        .set_beautification(Some(Beautification {
+            padding: 32.0,
+            corner_radius: 12.0,
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }))
+        .expect_err("D9 forbids restyling native window pixels");
     assert!(
         format!("{err}").to_lowercase().contains("window"),
         "the refusal should say why: {err}"
     );
-    assert!(
-        doc.beautification().is_none(),
+    assert_eq!(
+        doc.beautification(),
+        Some(&Beautification::padded(
+            32.0,
+            Background::Solid(Color::WHITE)
+        )),
         "the refusal must not half-apply"
     );
 

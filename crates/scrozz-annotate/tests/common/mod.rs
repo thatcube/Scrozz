@@ -86,7 +86,7 @@ pub fn region_capture(width: u32, height: u32) -> Capture {
     )
 }
 
-/// A window capture — beautification is forbidden by decision D9.
+/// A window capture — Smart Frame may add only an outer canvas under decision D9.
 pub fn window_capture(width: u32, height: u32) -> Capture {
     capture_with(
         flat(width, height, [200, 200, 200, 255]),
