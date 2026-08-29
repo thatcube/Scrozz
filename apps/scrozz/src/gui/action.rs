@@ -140,6 +140,8 @@ pub enum Action {
     OpenHistory,
     /// Open settings.
     OpenSettings,
+    /// Unlock every click-through pinned capture.
+    UnlockPins,
     /// Quit.
     Quit,
 }
@@ -163,6 +165,7 @@ impl Action {
             TrayAction::ToggleRecording => Self::ToggleRecording,
             TrayAction::OpenHistory => Self::OpenHistory,
             TrayAction::OpenSettings => Self::OpenSettings,
+            TrayAction::UnlockPinnedCaptures => Self::UnlockPins,
             TrayAction::Quit => Self::Quit,
         }
     }
@@ -175,6 +178,7 @@ impl Action {
             Self::ToggleRecording => "record.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
+            Self::UnlockPins => "pins.unlock",
             Self::Quit => "app.quit",
         }
     }
@@ -192,27 +196,29 @@ impl Action {
         Self::all().into_iter().find(|action| action.id() == id)
     }
 
-    /// The CLI invocation equivalent to this action.
+    /// The CLI invocation equivalent to this action, when one exists.
     ///
     /// Used for the compositor config lines Scrozz generates on wlroots, where
     /// there is no global-shortcut portal and the user must bind the CLI
     /// themselves (D11). It is the same string in the settings pane and in the
     /// generated `sway` config, because it is produced here once.
     #[must_use]
-    pub fn command_line(&self) -> String {
-        match self {
-            Self::Capture(CaptureKind::AllInOne) => {
-                "scrozz capture --interactive all-in-one".to_owned()
-            }
-            Self::Capture(CaptureKind::Region) => "scrozz capture --interactive".to_owned(),
-            Self::Capture(CaptureKind::Window) => "scrozz capture --interactive window".to_owned(),
-            Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active".to_owned(),
-            Self::Capture(CaptureKind::AllDisplays) => "scrozz capture --all-displays".to_owned(),
-            Self::ToggleRecording => "scrozz record --toggle".to_owned(),
-            Self::OpenHistory => "scrozz history list".to_owned(),
-            Self::OpenSettings => "scrozz settings show".to_owned(),
-            Self::Quit => "scrozz quit".to_owned(),
-        }
+    pub fn command_line(&self) -> Option<String> {
+        let line = match self {
+            Self::Capture(CaptureKind::AllInOne) => "scrozz capture --interactive all-in-one",
+            Self::Capture(CaptureKind::Region) => "scrozz capture --interactive",
+            Self::Capture(CaptureKind::Window) => "scrozz capture --interactive window",
+            Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active",
+            Self::Capture(CaptureKind::AllDisplays) => "scrozz capture --all-displays",
+            Self::ToggleRecording => "scrozz record --toggle",
+            Self::OpenHistory => "scrozz history list",
+            Self::OpenSettings => "scrozz settings show",
+            // This must execute in the live GUI process. Pretending a second
+            // `scrozz gui` invocation unlocks pins would create a false escape.
+            Self::UnlockPins => return None,
+            Self::Quit => "scrozz quit",
+        };
+        Some(line.to_owned())
     }
 
     /// Whether this action ends the process.
@@ -231,7 +237,7 @@ impl Action {
     ) -> bool {
         match self {
             Self::Capture(kind) => kind.is_available(capabilities, session, capture_backend_ready),
-            Self::Quit | Self::OpenSettings => true,
+            Self::Quit | Self::OpenSettings | Self::UnlockPins => true,
             Self::ToggleRecording | Self::OpenHistory => false,
         }
     }
@@ -361,7 +367,7 @@ mod tests {
             let bindable = action.shortcut().is_some();
             let expected = !matches!(
                 action,
-                Action::Quit | Action::OpenSettings | Action::OpenHistory
+                Action::Quit | Action::OpenSettings | Action::OpenHistory | Action::UnlockPins
             );
             assert_eq!(
                 bindable, expected,
@@ -435,10 +441,14 @@ mod tests {
     }
 
     #[test]
-    fn every_action_generates_a_command_line() {
+    fn external_actions_generate_command_lines() {
         for action in Action::all() {
-            let line = action.command_line();
-            assert!(line.starts_with("scrozz "), "{line}");
+            if action == Action::UnlockPins {
+                assert_eq!(action.command_line(), None);
+            } else {
+                let line = action.command_line().expect("external action");
+                assert!(line.starts_with("scrozz "), "{line}");
+            }
         }
     }
 

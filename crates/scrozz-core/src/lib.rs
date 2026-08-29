@@ -30,6 +30,7 @@ pub mod color;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod pin;
 pub mod product_copy;
 pub mod selection;
 pub mod target;
@@ -41,6 +42,11 @@ pub use frame::{ColorSpace, Frame, PixelFormat};
 pub use geometry::{
     Logical, LogicalPoint, LogicalRect, LogicalSize, Physical, PhysicalPoint, PhysicalRect,
     PhysicalSize, Point, Rect, ScaleFactor, Size,
+};
+pub use pin::{
+    Direction as PinDirection, DisplaySet, LockEscape, LockEscapeRequired, MAX_OPACITY,
+    MIN_OPACITY, NudgeStep, Opacity, PinBorder, PinChrome, PinChromePolicy, PinId, PinScale,
+    PinState, PinnedSurface,
 };
 pub use selection::{
     AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, DimensionLabelMode, MIN_SELECTION,

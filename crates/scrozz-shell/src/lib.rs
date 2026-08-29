@@ -19,6 +19,7 @@ pub mod macos;
 
 pub mod overlay;
 pub mod permissions;
+pub mod pin;
 pub mod selection;
 pub mod sound;
 pub mod tray;
@@ -68,7 +69,9 @@ use scrozz_core::{LogicalRect, Result};
 ///   winit's `WindowLevel::AlwaysOnTop` reaches.
 /// - **Windows** — `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED` with
 ///   `HWND_TOPMOST`.
-/// - **Linux/X11** — override-redirect plus `_NET_WM_WINDOW_TYPE_DOCK`.
+/// - **Linux/X11** — the capture stack may use override-redirect, while movable
+///   pinned captures use a window-manager-managed `_NET_WM_WINDOW_TYPE_DOCK`;
+///   keeping pins managed is what makes `_NET_WM_MOVERESIZE` dragging work.
 /// - **Linux/Wayland** — clients **cannot set absolute window position**;
 ///   `xdg_shell` omits it deliberately. Overlays require the `wlr-layer-shell`
 ///   protocol, which KDE implements and GNOME/Mutter does not. Per decision D8

@@ -12,7 +12,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scrozz_core::{
-    CaptureTarget, ColorSpace, DisplayId, Error, LogicalRect, PhysicalSize, PixelFormat,
+    CaptureTarget, ColorSpace, DisplayId, Error, LogicalRect, PhysicalSize, PinState, PixelFormat,
     Provenance, Result, ScaleFactor, WindowId,
 };
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,8 @@ pub struct CaptureRecord {
     pub created_at: Timestamp,
     /// Exempt from eviction. Decision D23: pinned captures are never evicted.
     pub pinned: bool,
+    /// On-screen pinned-window state, if this retention pin is also displayed.
+    pub screen_pin: Option<PinState>,
     /// Owning application, where the platform reported one.
     pub app_name: Option<String>,
     /// Window title, where the platform reported one.

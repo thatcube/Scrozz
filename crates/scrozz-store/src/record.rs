@@ -22,7 +22,7 @@
 //! what it could not decode.
 
 use scrozz_annotate::DocumentData;
-use scrozz_core::{CaptureTarget, Error, Provenance, Result};
+use scrozz_core::{CaptureTarget, Error, PinState, Provenance, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -50,6 +50,9 @@ pub struct StoredRecord {
     /// Exempt from eviction.
     #[serde(default)]
     pub pinned: bool,
+    /// Durable geometry and behavior of an on-screen pin.
+    #[serde(default)]
+    pub screen_pin: Option<PinState>,
     /// Owning application.
     #[serde(default)]
     pub app_name: Option<String>,
@@ -118,6 +121,7 @@ impl StoredRecord {
             created_at: created_at.0,
             stored_at: stored_at.0,
             pinned,
+            screen_pin: None,
             app_name,
             window_title,
             provenance: provenance.into(),
@@ -200,6 +204,7 @@ impl StoredRecord {
             id: CaptureId(self.id.clone()),
             created_at: Timestamp(self.created_at),
             pinned: self.pinned,
+            screen_pin: self.screen_pin.clone(),
             app_name: self.app_name.clone(),
             window_title: self.window_title.clone(),
             provenance: self.provenance.into(),
@@ -327,7 +332,16 @@ mod tests {
 
     #[test]
     fn records_round_trip_through_json() {
-        let original = record();
+        let mut original = record();
+        original.screen_pin = Some(scrozz_core::PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(12.5, 24.0),
+                LogicalSize::new(400.0, 200.0),
+            ),
+            scrozz_core::PinScale::new(0.5),
+            Some(DisplayId("main".into())),
+        ));
+        original.pinned = true;
         let bytes = original.to_json().expect("encode");
         let back = StoredRecord::from_json(&bytes).expect("decode");
         assert_eq!(original, back);

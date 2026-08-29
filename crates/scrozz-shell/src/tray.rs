@@ -57,13 +57,15 @@ pub enum TrayAction {
     OpenHistory,
     /// Open settings — an ordinary, movable window, per D27.
     OpenSettings,
+    /// Unlock every click-through pinned capture.
+    UnlockPinnedCaptures,
     /// Quit Scrozz.
     Quit,
 }
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::CaptureAllInOne,
         Self::CaptureRegion,
         Self::CaptureWindow,
@@ -72,6 +74,7 @@ impl TrayAction {
         Self::ToggleRecording,
         Self::OpenHistory,
         Self::OpenSettings,
+        Self::UnlockPinnedCaptures,
         Self::Quit,
     ];
 
@@ -91,6 +94,7 @@ impl TrayAction {
             Self::ToggleRecording => "record.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
+            Self::UnlockPinnedCaptures => "pins.unlock",
             Self::Quit => "app.quit",
         }
     }
@@ -107,6 +111,7 @@ impl TrayAction {
             Self::ToggleRecording => scrozz_core::product_copy::RECORD_SCREEN,
             Self::OpenHistory => scrozz_core::product_copy::CAPTURE_HISTORY,
             Self::OpenSettings => scrozz_core::product_copy::SETTINGS,
+            Self::UnlockPinnedCaptures => "Unlock Pinned Captures",
             Self::Quit => scrozz_core::product_copy::QUIT_SCROZZ,
         }
     }
@@ -134,6 +139,7 @@ impl TrayAction {
                 | Self::CaptureAllDisplays
                 | Self::Quit
                 | Self::OpenSettings
+                | Self::UnlockPinnedCaptures
         )
     }
 
@@ -158,7 +164,7 @@ impl TrayAction {
                 session.server,
                 DisplayServer::Wayland | DisplayServer::Headless
             ),
-            Self::Quit | Self::OpenSettings => true,
+            Self::Quit | Self::OpenSettings | Self::UnlockPinnedCaptures => true,
             Self::ToggleRecording | Self::OpenHistory => false,
         }
     }
@@ -191,6 +197,7 @@ pub const fn menu_model() -> &'static [TrayEntry] {
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::OpenHistory),
         TrayEntry::Item(TrayAction::OpenSettings),
+        TrayEntry::Item(TrayAction::UnlockPinnedCaptures),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::Quit),
     ]

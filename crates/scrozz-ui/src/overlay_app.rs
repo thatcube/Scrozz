@@ -57,16 +57,22 @@
 //! call — including a timed wake when something is merely waiting.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use egui::{Pos2, Rect, Vec2};
-use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
+use scrozz_core::{
+    Display, DisplayId, DisplaySet, Frame as CaptureFrame, LockEscape, LogicalPoint, LogicalRect,
+    LogicalSize, PinChromePolicy, PinId, PinState, PinnedSurface, PixelFormat, Provenance,
+    ScaleFactor,
+};
 
 use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
+use crate::pinned;
 use crate::stack::{CaptureStack, CardFrame, CardId, CardState, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 
@@ -79,6 +85,10 @@ pub const RESAMPLE_SECS: f32 = 0.35;
 /// A 6-card stack of full-resolution 5K captures is well over a gigabyte of
 /// texture. Cards are 210 pt wide, so 512 px is already generous at 2×.
 pub const THUMBNAIL_PX: u32 = 512;
+
+/// Native window drags can report a new frame on every repaint. Persist only
+/// after movement settles so one gesture produces one durable update.
+const PIN_GEOMETRY_SETTLE_SECS: f64 = 0.2;
 
 // ---------------------------------------------------------------------------
 // Native hook
@@ -168,6 +178,20 @@ pub type PanelHook = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> PanelReport
 /// Required on macOS for [`Passthrough::Auto`] to track precisely; see the
 /// module documentation.
 pub type PointerProbe = Arc<dyn Fn() -> Option<Pos2> + Send + Sync>;
+
+/// A fresh display/capability snapshot for pinned child windows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PinTopology {
+    /// Connected displays in global logical coordinates.
+    pub displays: DisplaySet,
+    /// Display that should receive a newly-created pin.
+    pub active_display: Option<DisplayId>,
+    /// Native behavior available for this topology.
+    pub support: PinSupport,
+}
+
+/// Queries the current display topology without caching startup state.
+pub type PinTopologyProbe = Arc<dyn Fn() -> Option<PinTopology> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -265,17 +289,33 @@ pub struct OverlayOptions {
     pub panel: Option<PanelHook>,
     /// Longest thumbnail edge in pixels.
     pub thumbnail_px: u32,
+    /// Connected displays used for pin placement and restoration.
+    pub displays: DisplaySet,
+    /// Display that receives newly-created pins.
+    pub active_display: Option<DisplayId>,
+    /// Truthful native-window capabilities for pinned captures.
+    pub pin_support: PinSupport,
+    /// Routes registered outside a click-through pin window.
+    pub pin_lock_escapes: Vec<LockEscape>,
+    /// Optional live display query for pin creation and hot-plug reconciliation.
+    pub pin_topology_probe: Option<PinTopologyProbe>,
 }
 
 impl Default for OverlayOptions {
     fn default() -> Self {
+        let geometry = OverlayGeometry::default();
         Self {
-            geometry: OverlayGeometry::default(),
+            geometry,
             appearance: Appearance::Dark,
             passthrough: Passthrough::default(),
             probe: None,
             panel: None,
             thumbnail_px: THUMBNAIL_PX,
+            displays: fallback_displays(geometry),
+            active_display: None,
+            pin_support: PinSupport::portable(),
+            pin_lock_escapes: Vec::new(),
+            pin_topology_probe: None,
         }
     }
 }
@@ -289,8 +329,71 @@ impl std::fmt::Debug for OverlayOptions {
             .field("probe", &self.probe.is_some())
             .field("panel", &self.panel.is_some())
             .field("thumbnail_px", &self.thumbnail_px)
+            .field("displays", &self.displays)
+            .field("active_display", &self.active_display)
+            .field("pin_support", &self.pin_support)
+            .field("pin_lock_escapes", &self.pin_lock_escapes)
+            .field("pin_topology_probe", &self.pin_topology_probe.is_some())
             .finish()
     }
+}
+
+/// Capabilities of the platform adapter that hosts pinned child windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinSupport {
+    /// Whether a native child window can be created at all.
+    pub windows: bool,
+    /// Whether global logical positions can be read and set.
+    pub positioning: bool,
+    /// Whether the adapter can keep a pin above ordinary application windows.
+    pub always_on_top: bool,
+    /// Whether opacity is applied to the whole native window.
+    pub native_opacity: bool,
+    /// Whether locked pins can pass pointer input through.
+    pub click_through: bool,
+    /// Whether clicks avoid activating the application.
+    pub non_activating: bool,
+    /// Whether the native child should advertise a managed X11 dock type.
+    pub x11_managed_dock: bool,
+    /// Human-readable capability detail for feedback and diagnostics.
+    pub detail: String,
+}
+
+impl PinSupport {
+    /// Portable egui/winit behavior used by tests and non-specialized hosts.
+    #[must_use]
+    pub fn portable() -> Self {
+        Self {
+            windows: true,
+            positioning: true,
+            always_on_top: true,
+            native_opacity: false,
+            click_through: true,
+            non_activating: false,
+            x11_managed_dock: false,
+            detail: "portable child viewport; native adoption not reported".into(),
+        }
+    }
+
+    fn limitation_notice(&self) -> Option<String> {
+        (!self.positioning || !self.always_on_top).then(|| self.detail.clone())
+    }
+}
+
+fn fallback_displays(geometry: OverlayGeometry) -> DisplaySet {
+    let rect = geometry.work_area;
+    let logical = LogicalRect::new(
+        LogicalPoint::new(f64::from(rect.min.x), f64::from(rect.min.y)),
+        LogicalSize::new(f64::from(rect.width()), f64::from(rect.height())),
+    );
+    DisplaySet::new(vec![Display {
+        id: DisplayId("overlay-work-area".into()),
+        name: "Overlay work area".into(),
+        bounds: logical,
+        work_area: logical,
+        scale: ScaleFactor::IDENTITY,
+        is_primary: true,
+    }])
 }
 
 // ---------------------------------------------------------------------------
@@ -300,12 +403,16 @@ impl std::fmt::Debug for OverlayOptions {
 /// A capture handed to the overlay.
 #[derive(Clone, Debug)]
 pub struct CaptureRequest {
+    /// Durable capture identity used by persistence when this becomes a pin.
+    pub pin_id: Option<PinId>,
     /// File name shown in the caption.
     pub name: String,
     /// Where the pixels came from. Decides the chrome (D9).
     pub provenance: Provenance,
     /// The capture's own pixel dimensions, shown in the caption.
     pub source_px: (u32, u32),
+    /// Source pixels per logical point.
+    pub source_scale: f64,
     /// A pre-scaled thumbnail. `None` shows a holding fill until one arrives.
     pub thumbnail: Option<egui::ColorImage>,
 }
@@ -315,9 +422,11 @@ impl CaptureRequest {
     #[must_use]
     pub fn new(name: impl Into<String>, provenance: Provenance, source_px: (u32, u32)) -> Self {
         Self {
+            pin_id: None,
             name: name.into(),
             provenance,
             source_px,
+            source_scale: 1.0,
             thumbnail: None,
         }
     }
@@ -336,9 +445,11 @@ impl CaptureRequest {
         let source_px = (frame.width(), frame.height());
         let thumbnail = thumbnail(frame, max_edge)?;
         Some(Self {
+            pin_id: None,
             name: name.into(),
             provenance,
             source_px,
+            source_scale: frame.scale.get(),
             thumbnail: Some(thumbnail),
         })
     }
@@ -347,6 +458,24 @@ impl CaptureRequest {
     #[must_use]
     pub fn with_thumbnail(mut self, image: egui::ColorImage) -> Self {
         self.thumbnail = Some(image);
+        self
+    }
+
+    /// Assign the authoritative capture identity used by pin persistence.
+    #[must_use]
+    pub fn with_pin_id(mut self, id: impl Into<PinId>) -> Self {
+        self.pin_id = Some(id.into());
+        self
+    }
+
+    /// Override source pixels per logical point.
+    #[must_use]
+    pub fn with_source_scale(mut self, scale: f64) -> Self {
+        self.source_scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
         self
     }
 }
@@ -370,7 +499,7 @@ pub enum DismissReason {
 }
 
 /// Something the user did to the overlay.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum OverlayEvent {
     /// A capture entered the pile.
@@ -407,8 +536,38 @@ pub enum OverlayEvent {
     },
     /// Pin this capture so overflow will not retire it.
     PinRequested {
-        /// The card.
+        /// Source card.
         id: CardId,
+        /// Durable capture identity.
+        pin: PinId,
+        /// Initial durable geometry and presentation state.
+        state: PinState,
+    },
+    /// A pin's durable geometry or presentation changed.
+    PinUpdated {
+        /// Durable capture identity.
+        pin: PinId,
+        /// Current durable state.
+        state: PinState,
+    },
+    /// A pin was closed and should no longer restore.
+    PinClosed {
+        /// Durable capture identity.
+        pin: PinId,
+    },
+    /// A requested pin could not be created.
+    PinUnavailable {
+        /// Source card identity.
+        card: CardId,
+        /// Truthful platform reason.
+        reason: String,
+    },
+    /// The compositor cannot honor or report explicit pin positioning.
+    PinPositioningUnavailable {
+        /// Durable capture identity.
+        pin: PinId,
+        /// Truthful platform reason.
+        reason: String,
     },
     /// A drag began on a card. The host starts the platform drag here.
     DragStarted {
@@ -452,15 +611,40 @@ pub enum OverlayEvent {
 }
 
 /// Something the application asks the overlay to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum Command {
     Dismiss(CardId),
-    SettleDrag { id: CardId, accepted: bool },
+    SettleDrag {
+        id: CardId,
+        accepted: bool,
+    },
     DismissAll,
     Collapse,
     Expand,
     ToggleDock,
+    RestorePin {
+        request: CaptureRequest,
+        state: PinState,
+    },
+    RefreshPinTexture {
+        pin: PinId,
+        image: egui::ColorImage,
+    },
+    DiscardPin(PinId),
+    ClosePin(PinId),
+    UnlockPins,
     Close,
+}
+
+/// Native state the host must apply to one child viewport.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativePinRequest {
+    /// Exact unique title used to discover the native child window.
+    pub title: String,
+    /// Durable state to apply.
+    pub state: PinState,
+    /// Whether this pin may carry a native shadow.
+    pub shadow: bool,
 }
 
 #[derive(Default)]
@@ -470,6 +654,7 @@ struct Shared {
     commands: Mutex<Vec<Command>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
+    native_pins: Mutex<Vec<NativePinRequest>>,
 }
 
 /// The application's grip on a running overlay.
@@ -565,6 +750,44 @@ impl OverlayHandle {
     /// Collapse or expand, whichever is not current.
     pub fn toggle_dock(&self) {
         self.command(Command::ToggleDock);
+    }
+
+    /// Restore a persisted pin into its own native child viewport.
+    pub fn restore_pin(&self, request: CaptureRequest, state: PinState) {
+        self.command(Command::RestorePin { request, state });
+    }
+
+    /// Replace a live pin's pixels without touching its newer UI-owned state.
+    pub fn refresh_pin_texture(&self, pin: impl Into<PinId>, image: egui::ColorImage) {
+        self.command(Command::RefreshPinTexture {
+            pin: pin.into(),
+            image,
+        });
+    }
+
+    /// Roll back a new pin without emitting a second persistence mutation.
+    pub fn discard_pin(&self, id: impl Into<PinId>) {
+        self.command(Command::DiscardPin(id.into()));
+    }
+
+    /// Close one pin and clear its durable pinned state.
+    pub fn close_pin(&self, id: impl Into<PinId>) {
+        self.command(Command::ClosePin(id.into()));
+    }
+
+    /// Unlock every click-through pin through the required external escape.
+    pub fn unlock_pins(&self) {
+        self.command(Command::UnlockPins);
+    }
+
+    /// Current child-window descriptors for native host reconciliation.
+    #[must_use]
+    pub fn native_pin_requests(&self) -> Vec<NativePinRequest> {
+        self.shared
+            .native_pins
+            .lock()
+            .map(|requests| requests.clone())
+            .unwrap_or_default()
     }
 
     /// Ask the overlay window to close.
@@ -834,14 +1057,44 @@ struct Entry {
     name: String,
     provenance: Provenance,
     source_px: (u32, u32),
+    pin_id: Option<PinId>,
+    source_scale: f64,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
+}
+
+struct PinnedEntry {
+    name: String,
+    surface: PinnedSurface,
+    texture: Option<egui::TextureHandle>,
+    pending: Option<egui::ColorImage>,
+    positioning_notice: Option<String>,
+    native_frame_changed_at: Option<f64>,
+}
+
+impl PinnedEntry {
+    fn from_request(
+        request: CaptureRequest,
+        surface: PinnedSurface,
+        limitation_notice: Option<String>,
+    ) -> Self {
+        Self {
+            name: request.name,
+            surface,
+            texture: None,
+            pending: request.thumbnail,
+            positioning_notice: limitation_notice,
+            native_frame_changed_at: None,
+        }
+    }
 }
 
 /// The `eframe` application that hosts the capture stack.
 pub struct OverlayApp {
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
+    pins: HashMap<PinId, PinnedEntry>,
+    pinned_cards: HashSet<CardId>,
     handle: OverlayHandle,
     theme: Theme,
     icons: IconStore,
@@ -849,6 +1102,12 @@ pub struct OverlayApp {
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
     thumbnail_px: u32,
+    displays: DisplaySet,
+    active_display: Option<DisplayId>,
+    pin_support: PinSupport,
+    pin_lock_escapes: Vec<LockEscape>,
+    pin_topology_probe: Option<PinTopologyProbe>,
+    last_pin_topology_refresh: f64,
     /// The value most recently sent to the window, so the command is sent on
     /// change rather than every frame. `None` means native code changed the
     /// window behind this renderer and the next frame must reassert its choice.
@@ -907,6 +1166,8 @@ impl OverlayApp {
         Self {
             stack: CaptureStack::for_work_area(options.geometry.local()),
             content: HashMap::new(),
+            pins: HashMap::new(),
+            pinned_cards: HashSet::new(),
             handle,
             theme,
             icons: IconStore::new(ctx),
@@ -914,6 +1175,12 @@ impl OverlayApp {
             passthrough: options.passthrough,
             probe: options.probe,
             thumbnail_px: options.thumbnail_px.max(1),
+            displays: options.displays,
+            active_display: options.active_display,
+            pin_support: options.pin_support,
+            pin_lock_escapes: options.pin_lock_escapes,
+            pin_topology_probe: options.pin_topology_probe,
+            last_pin_topology_refresh: f64::NEG_INFINITY,
             passthrough_now: None,
             last_seen: 0.0,
             hovered: None,
@@ -961,6 +1228,86 @@ impl OverlayApp {
         self.passthrough_now = None;
     }
 
+    /// Emits authoritative pin state immediately before the host shuts down.
+    ///
+    /// This bypasses the movement-settle debounce and observes close requests
+    /// already present in the current raw input, so neither the latest native
+    /// position nor a close gesture is lost when the worker stops this frame.
+    pub fn flush_pin_states(&mut self, ctx: &egui::Context) {
+        let zoom_factor = ctx.zoom_factor();
+        let mut ids: Vec<PinId> = self.pins.keys().cloned().collect();
+        ids.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut changed = Vec::new();
+        let mut closed = Vec::new();
+        for id in ids {
+            let viewport =
+                ctx.input(|input| input.raw.viewports.get(&pin_viewport_id(&id)).cloned());
+            if viewport
+                .as_ref()
+                .is_some_and(egui::ViewportInfo::close_requested)
+            {
+                closed.push(id);
+                continue;
+            }
+            let Some(entry) = self.pins.get_mut(&id) else {
+                continue;
+            };
+            if self.pin_support.positioning
+                && let Some(rect) = viewport.and_then(|info| info.outer_rect)
+            {
+                entry.surface.sync_native_frame(
+                    pinned::native_logical_rect(rect, zoom_factor),
+                    &self.displays,
+                );
+            }
+            entry.native_frame_changed_at = None;
+            changed.push((id, entry.surface.state().clone()));
+        }
+        for (pin, state) in changed {
+            self.emit(OverlayEvent::PinUpdated { pin, state });
+        }
+        for pin in closed {
+            self.close_pin(ctx, &pin);
+        }
+    }
+
+    fn refresh_pin_topology(&mut self) {
+        let topology = self.pin_topology_probe.as_ref().and_then(|probe| probe());
+        let Some(topology) = topology else {
+            return;
+        };
+        if topology.displays.displays().is_empty() {
+            return;
+        }
+        let limitation_notice = topology.support.limitation_notice();
+        self.displays = topology.displays;
+        self.active_display = topology.active_display;
+        self.pin_support = topology.support;
+
+        let mut changed = Vec::new();
+        for (id, entry) in &mut self.pins {
+            let before = entry.surface.state().clone();
+            let _ = entry.surface.reconcile(&self.displays);
+            entry.positioning_notice = limitation_notice.clone();
+            if entry.surface.state() != &before {
+                entry.native_frame_changed_at = None;
+                changed.push((id.clone(), entry.surface.state().clone()));
+            }
+        }
+        for (pin, state) in changed {
+            self.emit(OverlayEvent::PinUpdated { pin, state });
+        }
+    }
+
+    fn refresh_pin_topology_if_due(&mut self, now: f64) {
+        const REFRESH_SECONDS: f64 = 1.0;
+        if now - self.last_pin_topology_refresh < REFRESH_SECONDS {
+            return;
+        }
+        self.last_pin_topology_refresh = now;
+        self.refresh_pin_topology();
+    }
+
     fn emit(&self, event: OverlayEvent) {
         if let Ok(mut q) = self.handle.shared.outbox.lock() {
             q.push(event);
@@ -997,6 +1344,8 @@ impl OverlayApp {
                     name: request.name,
                     provenance: request.provenance,
                     source_px: request.source_px,
+                    pin_id: request.pin_id,
+                    source_scale: request.source_scale,
                     texture: None,
                     pending: thumb,
                 },
@@ -1043,6 +1392,17 @@ impl OverlayApp {
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
+                Command::RestorePin { request, state } => {
+                    self.restore_pin(request, state);
+                }
+                Command::RefreshPinTexture { pin, image } => {
+                    if let Some(entry) = self.pins.get_mut(&pin) {
+                        entry.pending = Some(image);
+                    }
+                }
+                Command::DiscardPin(id) => self.discard_pin(ctx, &id),
+                Command::ClosePin(id) => self.close_pin(ctx, &id),
+                Command::UnlockPins => self.unlock_pins(ctx),
                 Command::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -1068,10 +1428,12 @@ impl OverlayApp {
         gone.sort_unstable_by_key(|id| id.0);
         for id in gone {
             self.content.remove(&id);
-            self.emit(OverlayEvent::Dismissed {
-                id,
-                reason: DismissReason::Overflow,
-            });
+            if !self.pinned_cards.remove(&id) {
+                self.emit(OverlayEvent::Dismissed {
+                    id,
+                    reason: DismissReason::Overflow,
+                });
+            }
         }
 
         for (id, entry) in &mut self.content {
@@ -1082,6 +1444,261 @@ impl OverlayApp {
                     egui::TextureOptions::LINEAR,
                 ));
             }
+        }
+
+        for (id, entry) in &mut self.pins {
+            if let Some(image) = entry.pending.take() {
+                entry.texture = Some(ctx.load_texture(
+                    format!("scrozz.pin.{}", id.0),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+    }
+
+    fn begin_pin(&mut self, card: CardId, m: &Motion) {
+        self.refresh_pin_topology();
+        if !self.pin_support.windows {
+            self.emit(OverlayEvent::PinUnavailable {
+                card,
+                reason: self.pin_support.detail.clone(),
+            });
+            return;
+        }
+        let Some(source) = self.content.get(&card) else {
+            return;
+        };
+        let Some(pin) = source.pin_id.clone() else {
+            self.emit(OverlayEvent::PinUnavailable {
+                card,
+                reason: "this capture is not in durable history, so it cannot restore as a pin"
+                    .into(),
+            });
+            return;
+        };
+        let Some(display) = self
+            .active_display
+            .as_ref()
+            .and_then(|id| self.displays.get(id))
+            .or_else(|| self.displays.displays().iter().find(|d| d.is_primary))
+            .or_else(|| self.displays.displays().first())
+        else {
+            self.emit(OverlayEvent::PinUnavailable {
+                card,
+                reason: "no connected display is available for pin placement".into(),
+            });
+            return;
+        };
+        let scale = if source.source_scale.is_finite() && source.source_scale > 0.0 {
+            source.source_scale
+        } else {
+            1.0
+        };
+        let natural = LogicalSize::new(
+            f64::from(source.source_px.0.max(1)) / scale,
+            f64::from(source.source_px.1.max(1)) / scale,
+        );
+        let policy = chrome_policy(source.provenance);
+        let surface = PinnedSurface::on_display(
+            pin.clone(),
+            natural,
+            display,
+            policy,
+            self.pin_lock_escapes.clone(),
+        );
+        let state = surface.state().clone();
+        let entry = PinnedEntry {
+            name: source.name.clone(),
+            surface,
+            texture: source.texture.clone(),
+            pending: source.pending.clone(),
+            positioning_notice: self.pin_support.limitation_notice(),
+            native_frame_changed_at: None,
+        };
+        self.pins.insert(pin.clone(), entry);
+        self.pinned_cards.insert(card);
+        self.emit(OverlayEvent::PinRequested {
+            id: card,
+            pin,
+            state,
+        });
+        let _ = self.stack.dismiss(card, m);
+    }
+
+    fn restore_pin(&mut self, request: CaptureRequest, state: PinState) {
+        if !self.pin_support.windows {
+            tracing::warn!(
+                detail = %self.pin_support.detail,
+                "persisted pin was not restored because native pin windows are unavailable"
+            );
+            return;
+        }
+        let Some(id) = request.pin_id.clone() else {
+            tracing::warn!("persisted pin restore omitted its durable capture identity");
+            return;
+        };
+        let requested_locked = state.locked;
+        let policy = chrome_policy(request.provenance);
+        let Some(mut surface) = PinnedSurface::restore(
+            id.clone(),
+            state,
+            policy,
+            self.pin_lock_escapes.clone(),
+            &self.displays,
+        ) else {
+            tracing::warn!(pin = %id, "persisted pin was not restored because no display exists");
+            return;
+        };
+        let unlocked_for_platform = surface.state().locked && !self.pin_support.click_through;
+        if unlocked_for_platform {
+            let _ = surface.set_locked(false);
+        }
+        let normalized = surface.state().clone();
+        self.pins.insert(
+            id.clone(),
+            PinnedEntry::from_request(request, surface, self.pin_support.limitation_notice()),
+        );
+        if requested_locked && !normalized.locked {
+            self.emit(OverlayEvent::PinUpdated {
+                pin: id,
+                state: normalized,
+            });
+        }
+    }
+
+    fn close_pin(&mut self, ctx: &egui::Context, id: &PinId) {
+        if self.pins.remove(id).is_none() {
+            return;
+        }
+        ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
+        self.emit(OverlayEvent::PinClosed { pin: id.clone() });
+    }
+
+    fn discard_pin(&mut self, ctx: &egui::Context, id: &PinId) {
+        if self.pins.remove(id).is_some() {
+            ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
+        }
+    }
+
+    fn unlock_pins(&mut self, ctx: &egui::Context) {
+        let mut changed = Vec::new();
+        for (id, entry) in &mut self.pins {
+            if entry.surface.state().locked {
+                let _ = entry.surface.set_locked(false);
+                ctx.send_viewport_cmd_to(
+                    pin_viewport_id(id),
+                    egui::ViewportCommand::MousePassthrough(false),
+                );
+                changed.push((id.clone(), entry.surface.state().clone()));
+            }
+        }
+        for (pin, state) in changed {
+            self.emit(OverlayEvent::PinUpdated { pin, state });
+        }
+    }
+
+    fn draw_pins(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        let mut ids: Vec<PinId> = self.pins.keys().cloned().collect();
+        ids.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut changed = Vec::new();
+        let mut closed = Vec::new();
+        let mut unavailable = Vec::new();
+        let mut native = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let title = pin_window_title(&id);
+            let Some(entry) = self.pins.get_mut(&id) else {
+                continue;
+            };
+            let zoom_factor = ctx.zoom_factor();
+            let builder = pin_viewport(
+                &title,
+                entry.surface.state(),
+                &self.pin_support,
+                zoom_factor,
+            );
+            let positioning = self.pin_support.positioning;
+            let native_opacity = self.pin_support.native_opacity;
+            let displays = &self.displays;
+            let theme = &self.theme;
+            let (result, native_frame_changed) =
+                ctx.show_viewport_immediate(pin_viewport_id(&id), builder, |ui, _class| {
+                    let native_frame_changed = positioning
+                        && ui
+                            .input(|input| input.viewport().outer_rect)
+                            .is_some_and(|rect| {
+                                entry.surface.sync_native_frame(
+                                    pinned::native_logical_rect(rect, zoom_factor),
+                                    displays,
+                                )
+                            });
+                    let mut response = pinned::draw(
+                        ui,
+                        pinned::PinFrame {
+                            name: &entry.name,
+                            texture: entry.texture.as_ref().map(egui::TextureHandle::id),
+                            surface: &mut entry.surface,
+                            displays,
+                            positioning,
+                            native_opacity,
+                            click_through: self.pin_support.click_through,
+                            theme,
+                            chrome_visibility: pinned::ChromeVisibility::Auto,
+                        },
+                    );
+                    if ui.input(|input| input.viewport().close_requested()) {
+                        response.close = true;
+                    }
+                    if let Some(notice) = &entry.positioning_notice {
+                        draw_pin_notice(ui, notice, theme);
+                    }
+                    (response, native_frame_changed)
+                });
+
+            if result.positioning_unavailable {
+                let reason = self.pin_support.detail.clone();
+                entry.positioning_notice = Some(reason.clone());
+                unavailable.push((id.clone(), reason));
+            }
+            if result.changed {
+                entry.native_frame_changed_at = None;
+                changed.push((id.clone(), entry.surface.state().clone()));
+            } else if native_frame_changed {
+                entry.native_frame_changed_at = Some(now);
+                ctx.request_repaint_after(Duration::from_secs_f64(PIN_GEOMETRY_SETTLE_SECS));
+            } else if let Some(changed_at) = entry.native_frame_changed_at {
+                let remaining = PIN_GEOMETRY_SETTLE_SECS - (now - changed_at);
+                if remaining <= 0.0 {
+                    entry.native_frame_changed_at = None;
+                    changed.push((id.clone(), entry.surface.state().clone()));
+                } else {
+                    ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+                }
+            }
+            if result.close {
+                closed.push(id.clone());
+            } else {
+                native.push(NativePinRequest {
+                    title,
+                    state: entry.surface.state().clone(),
+                    shadow: entry.surface.state().chrome.shadow,
+                });
+            }
+        }
+
+        for (pin, state) in changed {
+            self.emit(OverlayEvent::PinUpdated { pin, state });
+        }
+        for (pin, reason) in unavailable {
+            self.emit(OverlayEvent::PinPositioningUnavailable { pin, reason });
+        }
+        for pin in closed {
+            self.close_pin(ctx, &pin);
+        }
+        if let Ok(mut requests) = self.handle.shared.native_pins.lock() {
+            *requests = native;
         }
     }
 
@@ -1132,12 +1749,16 @@ impl OverlayApp {
     }
 
     fn handle_action(&mut self, id: CardId, action: CardAction, m: &Motion) {
+        if action == CardAction::Pin {
+            self.begin_pin(id, m);
+            return;
+        }
         let (event, dismiss) = match action {
             CardAction::Copy => (Some(OverlayEvent::CopyRequested { id }), true),
             CardAction::Save => (Some(OverlayEvent::SaveRequested { id }), true),
             CardAction::Annotate => (Some(OverlayEvent::AnnotateRequested { id }), false),
             CardAction::Upload => (Some(OverlayEvent::UploadRequested { id }), false),
-            CardAction::Pin => (Some(OverlayEvent::PinRequested { id }), false),
+            CardAction::Pin => unreachable!("pin actions return above"),
             CardAction::Close => (None, true),
         };
         if let Some(event) = event {
@@ -1208,6 +1829,84 @@ fn sort_card_frames_for_painting(frames: &mut [CardFrame]) {
     });
 }
 
+fn chrome_policy(provenance: Provenance) -> PinChromePolicy {
+    if provenance.forbids_compositing() {
+        PinChromePolicy::Forbidden
+    } else {
+        PinChromePolicy::Allowed
+    }
+}
+
+fn pin_window_title(id: &PinId) -> String {
+    format!("Scrozz Pinned Capture [{}]", id.0)
+}
+
+fn pin_viewport_id(id: &PinId) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(("scrozz-pinned-capture", &id.0))
+}
+
+fn pin_viewport(
+    title: &str,
+    state: &PinState,
+    support: &PinSupport,
+    zoom_factor: f32,
+) -> egui::ViewportBuilder {
+    let frame = pinned::viewport_rect(state.frame, zoom_factor);
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_app_id("com.scrozz.pinned-capture")
+        .with_inner_size(frame.size())
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_active(false)
+        .with_taskbar(false)
+        .with_close_button(false)
+        .with_minimize_button(false)
+        .with_maximize_button(false)
+        .with_has_shadow(state.chrome.shadow)
+        .with_movable_by_background(false)
+        .with_drag_and_drop(false)
+        .with_clamp_size_to_monitor_size(true)
+        .with_mouse_passthrough(state.locked && support.click_through);
+    if support.positioning {
+        builder = builder.with_position(frame.min);
+    }
+    if support.always_on_top {
+        builder = builder.with_always_on_top();
+    }
+    if support.x11_managed_dock {
+        builder = builder.with_window_type(egui::X11WindowType::Dock);
+    }
+    builder
+}
+
+fn draw_pin_notice(ui: &egui::Ui, text: &str, theme: &Theme) {
+    let max = ui.max_rect();
+    let rect = Rect::from_center_size(
+        Pos2::new(max.center().x, max.min.y + 68.0),
+        Vec2::new((max.width() - 16.0).clamp(0.0, 390.0), 34.0),
+    );
+    if rect.width() <= 0.0 {
+        return;
+    }
+    ui.painter()
+        .rect_filled(rect, corner(Radius::BUTTON), theme.palette.card_fill_raised);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        theme.font(crate::theme::Text::Caption),
+        theme.palette.text,
+    );
+    ui.interact(
+        rect,
+        ui.id().with("pin-positioning-notice"),
+        egui::Sense::hover(),
+    )
+    .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+}
+
 impl eframe::App for OverlayApp {
     /// Fully transparent. eframe's default is a dark translucent wash, which on
     /// an overlay is a grey sheet over the entire work area.
@@ -1219,9 +1918,11 @@ impl eframe::App for OverlayApp {
         let ctx = ui.ctx().clone();
         let m = Motion::from_context(&ctx);
 
+        self.refresh_pin_topology_if_due(ctx.input(|input| input.time));
         self.run_commands(&ctx, &m);
         self.ingest(&m);
         self.reconcile(&ctx);
+        self.draw_pins(&ctx);
         self.stack.advance(&m);
 
         let was_empty = self.stack.is_empty();
@@ -1588,5 +2289,21 @@ mod tests {
         assert!(!PanelReport::default().non_activating);
         assert!(!PanelReport::unsupported("none").non_activating);
         assert!(PanelReport::converted("NSPanel").non_activating);
+    }
+
+    #[test]
+    fn positioning_or_stacking_gaps_are_visible_immediately() {
+        let mut support = PinSupport::portable();
+        support.positioning = false;
+        support.always_on_top = false;
+        support.detail = "the compositor controls placement and stacking".into();
+        assert_eq!(
+            support.limitation_notice().as_deref(),
+            Some("the compositor controls placement and stacking")
+        );
+
+        support.positioning = true;
+        support.always_on_top = true;
+        assert!(support.limitation_notice().is_none());
     }
 }

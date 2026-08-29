@@ -4,9 +4,11 @@
 //! these tests run genuinely parallel connections against one store and insist
 //! that no caller ever sees `SQLITE_BUSY` leak out as an error.
 
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
+use std::time::Duration;
 
+use rusqlite::{TransactionBehavior, params};
 use scrozz_store::{
     History as _, NewCapture, RetentionPolicy, SearchQuery, SqliteStore, Store as _, Timestamp,
     test_support::{sample_document, scratch_dir},
@@ -237,6 +239,62 @@ fn concurrent_pin_and_read_never_produce_a_torn_view() {
 
     toggler.join().expect("toggler");
     reader.join().expect("reader");
+}
+
+#[test]
+fn a_pin_update_cannot_overwrite_a_concurrent_sidecar_edit() {
+    let dir = scratch_dir("pin-does-not-lose-edit");
+    let mut seed = SqliteStore::open(dir.path()).expect("open");
+    let document = sample_document(8, 8, 17, 1);
+    let id = seed.insert(NewCapture::new(&document)).expect("insert");
+    let layout = seed.layout().clone();
+    drop(seed);
+
+    let mut contender = SqliteStore::open(dir.path()).expect("second writer");
+    let mut blocker = rusqlite::Connection::open(layout.index_path()).expect("index");
+    let tx = blocker
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("hold the shared writer lock");
+
+    let contender_id = id.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let pin_writer = thread::spawn(move || {
+        started_tx.send(()).expect("signal");
+        contender
+            .set_pinned(&contender_id, true)
+            .expect("pin waits for the concurrent edit");
+    });
+    started_rx.recv().expect("pin writer started");
+    // Before the fix, set_pinned read the sidecar and then blocked on this
+    // transaction. Give it enough time to reach that deterministic lock wait.
+    thread::sleep(Duration::from_millis(200));
+
+    let mut latest = layout
+        .read_record(&id)
+        .expect("read sidecar")
+        .expect("record");
+    latest.ocr_text = Some("new text from the other writer".into());
+    layout
+        .write_record(&latest)
+        .expect("write authoritative edit");
+    tx.execute(
+        "UPDATE captures SET ocr_text = ?2 WHERE id = ?1",
+        params![id.0, latest.ocr_text],
+    )
+    .expect("update index");
+    tx.commit().expect("release writer lock");
+    pin_writer.join().expect("pin writer");
+
+    let persisted = layout
+        .read_record(&id)
+        .expect("read final sidecar")
+        .expect("record survives");
+    assert!(persisted.pinned);
+    assert_eq!(
+        persisted.ocr_text.as_deref(),
+        Some("new text from the other writer"),
+        "the pin writer must read only after owning the shared write lock"
+    );
 }
 
 #[test]

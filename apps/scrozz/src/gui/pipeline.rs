@@ -50,11 +50,11 @@ use std::{
 
 use scrozz_annotate::{Document, DocumentData};
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError, Provenance,
-    ScaleFactor, SelectionMode, SelectionOptions,
+    Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError, PinState,
+    Provenance, ScaleFactor, SelectionMode, SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
-use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
+use scrozz_store::{CaptureId, DocumentState, History, NewCapture, Page, SearchQuery, SqliteStore};
 use scrozz_ui::editor::RevisionedFrame;
 
 use crate::{
@@ -65,7 +65,7 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{CaptureKind, CaptureOrigin},
-        card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
+        card::{Card, CardId, PIN_TEXTURE_MAX_EDGE, PinnedCapture, THUMBNAIL_MAX_EDGE, Thumbnail},
         selection::CaptureSelector,
     },
     platform,
@@ -141,8 +141,72 @@ pub enum Job {
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Persist a new pin using the capture associated with a live card.
+    PinCard {
+        /// Live card identity.
+        card: CardId,
+        /// Durable capture identity supplied by the overlay request.
+        capture: CaptureId,
+        /// Initial durable pin state.
+        state: PinState,
+    },
+    /// Persist a changed pin or clear a closed one.
+    SetPin {
+        /// Durable history identity.
+        capture: CaptureId,
+        /// `None` means the pin closed.
+        state: Option<PinState>,
+    },
+    /// Clear a pin after every previously queued worker write, then acknowledge it.
+    TerminalUnpin {
+        /// Durable history identity.
+        capture: CaptureId,
+        /// Completion is reported directly so an IPC reply cannot race persistence.
+        reply: Sender<CliResult<()>>,
+    },
+    /// Unlock every persisted pin after all previously queued worker writes.
+    UnlockPins {
+        /// Completion is reported directly to the external escape route.
+        reply: Sender<CliResult<u64>>,
+    },
+    #[doc(hidden)]
+    FlushPins,
     /// Finish, so the thread can be joined.
     Stop,
+}
+
+#[derive(Default)]
+struct PendingPinUpdates {
+    states: Mutex<HashMap<CaptureId, Option<PinState>>>,
+}
+
+impl PendingPinUpdates {
+    /// Keeps only the newest state per capture and reports whether the worker
+    /// needs a wake-up.
+    fn queue(&self, capture: CaptureId, state: Option<PinState>) -> bool {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let needs_wakeup = states.is_empty();
+        states.insert(capture, state);
+        needs_wakeup
+    }
+
+    fn take(&self) -> HashMap<CaptureId, Option<PinState>> {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *states)
+    }
+
+    fn cancel(&self, capture: &CaptureId) {
+        self.states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(capture);
+    }
 }
 
 /// What the capture thread produced.
@@ -202,6 +266,29 @@ pub enum Outcome {
         /// Why.
         error: CliError,
     },
+    /// A persisted pin is ready to restore or refresh on screen.
+    PinReady(Box<PinnedCapture>),
+    /// Higher-resolution pixels for a newly created pin.
+    PinTextureReady {
+        /// Durable history identity.
+        capture: CaptureId,
+        /// Pixels only; geometry and presentation remain UI-owned.
+        texture: Thumbnail,
+    },
+    /// The first durable pin write failed, so the visible viewport must roll back.
+    PinCreationFailed {
+        /// Durable pin identity to remove from the overlay.
+        capture: CaptureId,
+        /// Explicit storage or identity error.
+        error: CliError,
+    },
+    /// Persisting a pin update failed.
+    PinPersistenceFailed {
+        /// Capture whose sidecar could not be updated.
+        capture: CaptureId,
+        /// Explicit storage error.
+        error: CliError,
+    },
 }
 
 /// A finalized card plus every isolated ambient action result.
@@ -216,6 +303,7 @@ pub struct ReadyCapture {
 /// A handle to the capture thread.
 pub struct Pipeline {
     jobs: Sender<Job>,
+    pending_pin_updates: Arc<PendingPinUpdates>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
     next_card: u64,
@@ -247,11 +335,14 @@ impl Pipeline {
         let (outcome_tx, outcomes) = channel();
         let vault = CaptureVault::new();
         let worker_vault = vault.clone();
+        let pending_pin_updates = Arc::new(PendingPinUpdates::default());
+        let worker_pin_updates = Arc::clone(&pending_pin_updates);
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
-                Worker::new(outcome_tx, selector, worker_vault, history_enabled).run(&job_rx);
+                Worker::new(outcome_tx, selector, worker_vault, history_enabled)
+                    .run(&job_rx, &worker_pin_updates);
             })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
@@ -261,6 +352,7 @@ impl Pipeline {
 
         Ok(Self {
             jobs,
+            pending_pin_updates,
             outcomes,
             worker: Some(worker),
             next_card: 1,
@@ -286,7 +378,57 @@ impl Pipeline {
 
     /// Posts a job. Returns `false` if the worker has gone.
     pub fn post(&self, job: Job) -> bool {
+        if let Job::SetPin { capture, state } = job {
+            if state.is_none() {
+                // Closing is terminal for all geometry already queued by that
+                // viewport. If the worker took an older state concurrently,
+                // this direct job follows it in the channel and clears it.
+                self.pending_pin_updates.cancel(&capture);
+                return self.jobs.send(Job::SetPin { capture, state }).is_ok();
+            }
+            if !self.pending_pin_updates.queue(capture, state) {
+                return true;
+            }
+            if self.jobs.send(Job::FlushPins).is_ok() {
+                return true;
+            }
+            self.pending_pin_updates.take();
+            return false;
+        }
         self.jobs.send(job).is_ok()
+    }
+
+    /// Clears a pin after all older worker jobs and waits for the durable result.
+    pub fn terminal_unpin(&self, capture: CaptureId) -> CliResult<()> {
+        self.pending_pin_updates.cancel(&capture);
+        let (reply, result) = channel();
+        self.jobs
+            .send(Job::TerminalUnpin { capture, reply })
+            .map_err(|_| {
+                CliError::Core(CoreError::Platform(
+                    "the capture worker stopped before it could persist the unpin".into(),
+                ))
+            })?;
+        result.recv().map_err(|_| {
+            CliError::Core(CoreError::Platform(
+                "the capture worker stopped without acknowledging the unpin".into(),
+            ))
+        })?
+    }
+
+    /// Unlocks all pins after all older worker jobs and waits for persistence.
+    pub fn unlock_pins(&self) -> CliResult<u64> {
+        let (reply, result) = channel();
+        self.jobs.send(Job::UnlockPins { reply }).map_err(|_| {
+            CliError::Core(CoreError::Platform(
+                "the capture worker stopped before it could unlock pins".into(),
+            ))
+        })?;
+        result.recv().map_err(|_| {
+            CliError::Core(CoreError::Platform(
+                "the capture worker stopped without acknowledging the unlock".into(),
+            ))
+        })?
     }
 
     /// Takes one finished piece of work, if there is one. Never blocks.
@@ -343,6 +485,8 @@ struct Cached {
     /// round-trip a colour profile — and a capture that was known to be
     /// Display P3 must not silently become unlabelled on its way to the editor.
     color_space: ColorSpace,
+    /// Durable history identity used to validate a card-to-pin transition.
+    capture_id: Option<CaptureId>,
 }
 
 struct ScreenshotExecutor<'a> {
@@ -472,6 +616,7 @@ impl CaptureVault {
                 target: capture.target.clone(),
                 scale: capture.frame.scale,
                 color_space: capture.frame.color_space,
+                capture_id: None,
             },
         );
         Ok(())
@@ -618,15 +763,17 @@ impl Worker {
             }
         };
 
-        Self {
+        let mut worker = Self {
             outcomes,
             selector,
             store,
             vault,
-        }
+        };
+        worker.restore_existing_pins();
+        worker
     }
 
-    fn run(mut self, jobs: &Receiver<Job>) {
+    fn run(mut self, jobs: &Receiver<Job>, pending_pin_updates: &PendingPinUpdates) {
         while let Ok(job) = jobs.recv() {
             match job {
                 Job::Capture {
@@ -655,6 +802,35 @@ impl Worker {
                 Job::SaveImage { card, rendered } => self.save_image(card, &rendered),
                 Job::Save(card) => self.save(card),
                 Job::Release(card) => self.vault.forget(card),
+                Job::PinCard {
+                    card,
+                    capture,
+                    state,
+                } => self.pin_card(card, &capture, &state),
+                Job::SetPin { capture, state } => {
+                    self.set_pin(&capture, state.as_ref());
+                }
+                Job::TerminalUnpin { capture, reply } => {
+                    let _ = reply.send(self.persist_pin(&capture, None));
+                }
+                Job::UnlockPins { reply } => {
+                    let result = self
+                        .store
+                        .as_mut()
+                        .ok_or_else(|| {
+                            CliError::Core(CoreError::Storage(
+                                "history is unavailable, so pinned state cannot be persisted"
+                                    .into(),
+                            ))
+                        })
+                        .and_then(|store| store.unlock_screen_pins().map_err(CliError::from));
+                    let _ = reply.send(result);
+                }
+                Job::FlushPins => {
+                    for (capture, state) in pending_pin_updates.take() {
+                        self.set_pin(&capture, state.as_ref());
+                    }
+                }
                 Job::Stop => break,
             }
         }
@@ -831,6 +1007,7 @@ impl Worker {
         // Encoded here, on the worker, because the only caller is a drag and a
         // drag has no time to spare once it has started.
         let preview = thumbnail.as_ref().and_then(preview_png).map(Arc::new);
+        let capture_id = self.remember(&capture);
         self.vault.store(
             card,
             Cached {
@@ -845,10 +1022,10 @@ impl Worker {
                 target: capture.target.clone(),
                 scale: capture.frame.scale,
                 color_space: capture.frame.color_space,
+                capture_id: capture_id.clone(),
             },
         );
 
-        let capture_id = self.remember(&capture);
         let written = actions
             .steps
             .iter()
@@ -1050,6 +1227,151 @@ impl Worker {
         })
     }
 
+    fn pin_card(&mut self, card: CardId, capture: &CaptureId, state: &PinState) {
+        let cached_capture = self.vault.cached(card).and_then(|cached| cached.capture_id);
+        if cached_capture.as_ref() != Some(capture) {
+            let error = CliError::usage(format!(
+                "{card} does not own persisted capture {}",
+                capture.0
+            ));
+            let _ = self.outcomes.send(Outcome::PinCreationFailed {
+                capture: capture.clone(),
+                error,
+            });
+            self.vault.forget(card);
+            return;
+        }
+        let result = self.persist_pin(capture, Some(state));
+        match result {
+            Ok(()) => {
+                if let Some(texture) = self.load_pin_texture(capture) {
+                    let _ = self.outcomes.send(Outcome::PinTextureReady {
+                        capture: capture.clone(),
+                        texture,
+                    });
+                }
+                self.vault.forget(card);
+            }
+            Err(error) => {
+                let _ = self.outcomes.send(Outcome::PinCreationFailed {
+                    capture: capture.clone(),
+                    error,
+                });
+                self.vault.forget(card);
+            }
+        }
+    }
+
+    fn set_pin(&mut self, capture: &CaptureId, state: Option<&PinState>) {
+        if let Err(error) = self.persist_pin(capture, state) {
+            let _ = self.outcomes.send(Outcome::PinPersistenceFailed {
+                capture: capture.clone(),
+                error,
+            });
+        }
+    }
+
+    fn persist_pin(&mut self, capture: &CaptureId, state: Option<&PinState>) -> CliResult<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Err(CliError::Core(CoreError::Storage(
+                "history is unavailable, so pinned state cannot be persisted".into(),
+            )));
+        };
+        store.set_screen_pin(capture, state)?;
+        Ok(())
+    }
+
+    fn restore_existing_pins(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let query = SearchQuery {
+            pinned_only: true,
+            page: Page::new(10_000, 0),
+            ..SearchQuery::default()
+        };
+        let records = match store.search(&query) {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::warn!("could not enumerate persisted pinned captures: {err}");
+                return;
+            }
+        };
+        let ids: Vec<CaptureId> = records
+            .into_iter()
+            .filter(|record| record.screen_pin.is_some())
+            .map(|record| record.id)
+            .collect();
+        for id in ids {
+            if let Some(pin) = self.load_pin(&id) {
+                let _ = self.outcomes.send(Outcome::PinReady(Box::new(pin)));
+            }
+        }
+    }
+
+    fn load_pin(&mut self, id: &CaptureId) -> Option<PinnedCapture> {
+        let store = self.store.as_mut()?;
+        let record = match store.record(id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!(capture = %id.0, "could not read persisted pin: {err}");
+                return None;
+            }
+        };
+        let state = record.screen_pin.clone()?;
+        let texture = match store.document(id) {
+            Ok(Some(DocumentState::Complete(document))) => {
+                Thumbnail::from_frame(&document.source.frame, PIN_TEXTURE_MAX_EDGE).ok()
+            }
+            Ok(Some(DocumentState::ImageEvicted(_))) | Ok(None) => {
+                tracing::warn!(
+                    capture = %id.0,
+                    "pinned capture source pixels are unavailable; restoring a placeholder"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(capture = %id.0, "could not load persisted pin pixels: {err}");
+                None
+            }
+        };
+        Some(PinnedCapture {
+            id: id.clone(),
+            name: record
+                .window_title
+                .clone()
+                .or(record.app_name.clone())
+                .unwrap_or_else(|| format!("Capture {}", id.0)),
+            provenance: record.provenance,
+            source_width: record.frame.size.width.round().max(1.0) as u32,
+            source_height: record.frame.size.height.round().max(1.0) as u32,
+            scale: record.frame.scale.get(),
+            state,
+            texture,
+        })
+    }
+
+    fn load_pin_texture(&mut self, id: &CaptureId) -> Option<Thumbnail> {
+        let store = self.store.as_mut()?;
+        match store.document(id) {
+            Ok(Some(DocumentState::Complete(document))) => {
+                Thumbnail::from_frame(&document.source.frame, PIN_TEXTURE_MAX_EDGE).ok()
+            }
+            Ok(Some(DocumentState::ImageEvicted(_))) | Ok(None) => {
+                tracing::warn!(
+                    capture = %id.0,
+                    "pinned capture source pixels are unavailable"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(capture = %id.0, "could not load persisted pin pixels: {err}");
+                None
+            }
+        }
+    }
+
     fn answer(&self, card: CardId, result: CliResult<String>) {
         let message = match result {
             Ok(detail) => Outcome::Done { card, detail },
@@ -1194,6 +1516,7 @@ mod tests {
                 target: CaptureTarget::AllDisplays,
                 scale: ScaleFactor::new(2.0),
                 color_space: ColorSpace::DisplayP3,
+                capture_id: None,
             },
         );
         worker.open(card);
@@ -1232,6 +1555,7 @@ mod tests {
                 target: CaptureTarget::AllDisplays,
                 scale: ScaleFactor::new(2.0),
                 color_space: ColorSpace::Srgb,
+                capture_id: None,
             },
         );
         worker.open(card);
@@ -1265,6 +1589,7 @@ mod tests {
                 target: CaptureTarget::AllDisplays,
                 scale: ScaleFactor::IDENTITY,
                 color_space: ColorSpace::Unknown,
+                capture_id: None,
             },
         );
         worker.open(card);
@@ -1296,6 +1621,7 @@ mod tests {
                 target: CaptureTarget::Window(scrozz_core::WindowId("test-window".to_owned())),
                 scale: ScaleFactor::IDENTITY,
                 color_space: ColorSpace::Srgb,
+                capture_id: None,
             },
         );
         worker.open(card);
@@ -1331,6 +1657,7 @@ mod tests {
                 target: CaptureTarget::Region(bounds),
                 scale: ScaleFactor::IDENTITY,
                 color_space: ColorSpace::Srgb,
+                capture_id: None,
             },
         );
         worker.open(card);
@@ -1358,6 +1685,7 @@ mod tests {
                 target: CaptureTarget::AllDisplays,
                 scale: ScaleFactor::IDENTITY,
                 color_space: ColorSpace::Srgb,
+                capture_id: None,
             },
         );
         worker.open(CardId(9));
@@ -1421,6 +1749,100 @@ mod tests {
         let pipeline = start_pipeline();
         assert!(pipeline.post(Job::Release(CardId(1))));
         assert!(pipeline.post(Job::Release(CardId(1))));
+    }
+
+    #[test]
+    fn an_initial_pin_write_failure_requests_visible_rollback() {
+        let (outcomes, outcome_rx) = channel();
+        let card = CardId(9);
+        let capture = CaptureId("capture-9".into());
+        let vault = CaptureVault::new();
+        vault.store(
+            card,
+            Cached {
+                bytes: CaptureBytes {
+                    generation: None,
+                    revision: 0,
+                    full: Arc::new(Vec::new()),
+                    preview: None,
+                },
+                rendered: None,
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::IDENTITY,
+                color_space: ColorSpace::Srgb,
+                capture_id: Some(capture.clone()),
+            },
+        );
+        let mut worker = Worker {
+            outcomes,
+            selector: Arc::new(RefusingSelector),
+            store: None,
+            vault,
+        };
+        let state = PinState::new(
+            scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(320.0, 180.0),
+            ),
+            scrozz_core::PinScale::ORIGINAL,
+            None,
+        );
+
+        worker.pin_card(card, &capture, &state);
+
+        match outcome_rx.recv().expect("rollback outcome") {
+            Outcome::PinCreationFailed {
+                capture: failed,
+                error,
+            } => {
+                assert_eq!(failed, capture);
+                assert!(error.to_string().contains("history is unavailable"));
+            }
+            other => panic!("expected pin creation failure, got {other:?}"),
+        }
+        assert!(worker.vault.get(card).is_none());
+    }
+
+    #[test]
+    fn repeated_pin_updates_coalesce_to_the_latest_state() {
+        let pending = PendingPinUpdates::default();
+        let capture = CaptureId("capture-geometry".into());
+        let first = PinState::new(
+            scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(320.0, 180.0),
+            ),
+            scrozz_core::PinScale::ORIGINAL,
+            None,
+        );
+        let mut latest = first.clone();
+        latest.frame.origin.x = 240.0;
+
+        assert!(pending.queue(capture.clone(), Some(first)));
+        assert!(!pending.queue(capture.clone(), Some(latest.clone())));
+
+        let updates = pending.take();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates.get(&capture), Some(&Some(latest)));
+    }
+
+    #[test]
+    fn terminal_unpin_cancels_geometry_waiting_for_a_flush() {
+        let pending = PendingPinUpdates::default();
+        let capture = CaptureId("capture-closing".into());
+        let state = PinState::new(
+            scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(320.0, 180.0),
+            ),
+            scrozz_core::PinScale::ORIGINAL,
+            None,
+        );
+
+        assert!(pending.queue(capture.clone(), Some(state)));
+        pending.cancel(&capture);
+        assert!(pending.take().is_empty());
     }
 
     /// Waits briefly for the worker, so the test does not depend on scheduling.

@@ -144,6 +144,7 @@ impl Command {
                 HistoryCommand::Get { .. } => "history.get".into(),
                 HistoryCommand::Delete { .. } => "history.delete".into(),
                 HistoryCommand::Pin { .. } => "history.pin".into(),
+                HistoryCommand::UnlockPins => "history.unlock-pins".into(),
             },
             Self::Ocr(_) => "ocr".into(),
             Self::Settings(args) => match args.command {
@@ -1077,6 +1078,9 @@ pub enum HistoryCommand {
         #[arg(long)]
         unpin: bool,
     },
+
+    /// Unlock every on-screen pin without needing its capture id.
+    UnlockPins,
 }
 
 // ---------------------------------------------------------------------------
@@ -2223,6 +2227,15 @@ mod tests {
             panic!("expected pin")
         };
         assert!(unpin);
+    }
+
+    #[test]
+    fn history_unlock_pins_needs_no_capture_id() {
+        let Some(Command::History(args)) = parse(&["scrozz", "history", "unlock-pins"]).command
+        else {
+            panic!("expected history")
+        };
+        assert!(matches!(args.command, HistoryCommand::UnlockPins));
     }
 
     // -- ocr --------------------------------------------------------------

@@ -243,6 +243,110 @@ fn a_record_written_before_the_commit_landed_is_adopted_on_the_next_open() {
 }
 
 #[test]
+fn an_unresolved_marker_forces_full_sidecar_reconciliation() {
+    let dir = scratch_dir("unknown-index-marker");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let document = sample_document(8, 8, 3, 0);
+    let id = store
+        .insert(NewCapture::new(&document).titled("cached title"))
+        .expect("insert");
+    let mut sidecar = store
+        .layout()
+        .read_record(&id)
+        .expect("read sidecar")
+        .expect("sidecar exists");
+    sidecar.window_title = Some("authoritative title".into());
+    store
+        .layout()
+        .write_record(&sidecar)
+        .expect("simulate durable sidecar write");
+    let pending = dir.path().join("pending-index");
+    fs::create_dir_all(&pending).expect("create marker directory");
+    fs::write(pending.join("legacy.pending"), []).expect("plant unidentified marker");
+    drop(store);
+
+    let store = SqliteStore::open(dir.path()).expect("reopen");
+
+    assert_eq!(
+        store
+            .record(&id)
+            .expect("read")
+            .expect("present")
+            .window_title
+            .as_deref(),
+        Some("authoritative title")
+    );
+    assert!(
+        fs::read_dir(pending)
+            .expect("read markers")
+            .next()
+            .is_none(),
+        "full reconciliation clears the unresolved marker"
+    );
+}
+
+#[test]
+fn garbage_collection_repairs_pending_references_before_unlinking_blobs() {
+    let dir = scratch_dir("pending-reference-before-gc");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let document = sample_document(8, 8, 4, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let hash = match store.record(&id).expect("read").expect("present").image {
+        ImageState::Present { hash, .. } => hash,
+        other => panic!("expected pixels, got {other:?}"),
+    };
+    let conn = rusqlite::Connection::open(store.layout().index_path()).expect("open index");
+    conn.execute(
+        "UPDATE captures SET image_evicted_at = 1 WHERE id = ?1",
+        [&id.0],
+    )
+    .expect("make cache stale");
+    drop(conn);
+    let pending = dir.path().join("pending-index");
+    fs::create_dir_all(&pending).expect("create marker directory");
+    fs::write(pending.join("gc.pending"), format!("{}\n", id.0)).expect("plant marker");
+
+    let reclaimed = store.collect_garbage().expect("collect");
+
+    assert_eq!(reclaimed, 0);
+    assert!(
+        store
+            .layout()
+            .blob_path(&hash)
+            .expect("blob path")
+            .is_file(),
+        "the sidecar still references the blob"
+    );
+    assert!(store.image(&id).expect("read").is_some());
+}
+
+#[test]
+fn delete_repairs_pending_shared_references_before_unlinking_blobs() {
+    let dir = scratch_dir("pending-reference-before-delete");
+    let mut store = SqliteStore::open(dir.path()).expect("open");
+    let document = sample_document(8, 8, 5, 0);
+    let first = store.insert(NewCapture::new(&document)).expect("insert");
+    let second = store.insert(NewCapture::new(&document)).expect("insert");
+    let conn = rusqlite::Connection::open(store.layout().index_path()).expect("open index");
+    conn.execute(
+        "UPDATE captures SET image_evicted_at = 1 WHERE id = ?1",
+        [&second.0],
+    )
+    .expect("make cache stale");
+    drop(conn);
+    let pending = dir.path().join("pending-index");
+    fs::create_dir_all(&pending).expect("create marker directory");
+    fs::write(pending.join("delete.pending"), format!("{}\n", second.0)).expect("plant marker");
+
+    assert!(store.delete(&first).expect("delete"));
+
+    assert!(
+        store.image(&second).expect("read").is_some(),
+        "the remaining sidecar keeps its shared blob reachable"
+    );
+}
+
+#[test]
 fn an_index_row_whose_record_vanished_is_dropped_instead_of_haunting_history() {
     let dir = scratch_dir("orphan-row");
     let mut store = SqliteStore::open(dir.path()).expect("open");

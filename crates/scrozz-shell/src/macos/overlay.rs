@@ -393,6 +393,7 @@ pub struct MacOverlay {
     window: Retained<NSWindow>,
     non_activating: bool,
     presentation_lease: Option<PresentationLease>,
+    original_class: Option<&'static AnyClass>,
 }
 
 #[derive(Debug)]
@@ -430,6 +431,32 @@ impl PresentationLease {
 }
 
 impl MacOverlay {
+    /// Finds and adopts one of this process's windows by its exact title.
+    ///
+    /// eframe exposes native handles only for the root viewport. Pinned
+    /// captures are child viewports, so their stable private titles are the
+    /// bridge that lets the app retrofit each child into its own `NSPanel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] off the main thread.
+    pub fn find_by_title(title: &str) -> Result<Option<Self>> {
+        let mtm = main_thread("finding a pinned overlay window")?;
+        let application = NSApplication::sharedApplication(mtm);
+        for window in application.windows().iter() {
+            if window.title().to_string() != title {
+                continue;
+            }
+            return Ok(Some(Self {
+                window,
+                non_activating: false,
+                presentation_lease: None,
+                original_class: None,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Adopts the window hosting an `NSView`.
     ///
     /// This is the path from `raw-window-handle`: eframe reports
@@ -464,6 +491,7 @@ impl MacOverlay {
             window,
             non_activating: false,
             presentation_lease: None,
+            original_class: None,
         })
     }
 
@@ -494,6 +522,7 @@ impl MacOverlay {
             window,
             non_activating: false,
             presentation_lease: None,
+            original_class: None,
         })
     }
 
@@ -536,6 +565,17 @@ impl MacOverlay {
             lease.release(mtm);
         }
 
+        if self.original_class.is_none() {
+            // SAFETY: every Objective-C object can be viewed as `AnyObject`;
+            // the returned runtime class has process lifetime.
+            let object: &AnyObject =
+                unsafe { &*std::ptr::from_ref(&*self.window).cast::<AnyObject>() };
+            let current = object.class();
+            if current.name() != PANEL_CLASS_NAME {
+                self.original_class = Some(current);
+            }
+        }
+
         // SAFETY: we are on the main thread (checked above) and hold a strong
         // reference to a live window.
         let conversion = unsafe { make_nonactivating_panel(&self.window) };
@@ -552,6 +592,7 @@ impl MacOverlay {
         };
 
         let window = &self.window;
+        let release_key_focus = behavior.click_through && window.isKeyWindow();
         window.setLevel(level_value(behavior.level));
         window.setCollectionBehavior(collection_behavior(behavior));
         window.setHidesOnDeactivate(behavior.hides_on_deactivate);
@@ -559,6 +600,7 @@ impl MacOverlay {
         window.setAcceptsMouseMovedEvents(!behavior.click_through);
         window.setOpaque(behavior.opaque);
         window.setHasShadow(behavior.has_shadow);
+        window.setAlphaValue(behavior.opacity.get());
         window.setMovable(behavior.movable);
         window.setMovableByWindowBackground(false);
 
@@ -572,10 +614,42 @@ impl MacOverlay {
             panel.setFloatingPanel(behavior.level >= OverlayLevel::Floating);
         }
 
+        if release_key_focus {
+            // A locked pin must not keep swallowing keys after its pointer input
+            // becomes transparent. Ordering it out relinquishes key status;
+            // ordering it straight back does not make a non-activating panel key.
+            window.orderOut(None);
+            window.orderFrontRegardless();
+        }
+
         Ok(OverlayReport {
             non_activating: self.non_activating,
             detail,
         })
+    }
+
+    /// Restore the runtime class that winit/KVO installed before adoption.
+    ///
+    /// Child pin windows can close independently. winit removes its KVO
+    /// observer during teardown and expects the `NSKVONotifying_*` subclass it
+    /// registered to still be installed; restoring it before close prevents the
+    /// otherwise-fatal Objective-C exception.
+    pub fn restore_native_class(&mut self) -> Result<()> {
+        let _mtm = main_thread("restoring a pinned overlay window")?;
+        let Some(original) = self.original_class.take() else {
+            return Ok(());
+        };
+        let mut style = self.window.styleMask();
+        style.remove(NSWindowStyleMask::NonactivatingPanel);
+        self.window.setStyleMask(style);
+        // SAFETY: this is the exact class pointer read from this same live
+        // instance before conversion; no storage layout or provenance changes.
+        let object: &AnyObject = unsafe { &*std::ptr::from_ref(&*self.window).cast::<AnyObject>() };
+        unsafe {
+            AnyObject::set_class(object, original);
+        }
+        self.non_activating = false;
+        Ok(())
     }
 
     /// Sets just the stacking level.

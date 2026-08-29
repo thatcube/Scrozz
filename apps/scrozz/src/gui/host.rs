@@ -14,12 +14,13 @@ use std::{
 };
 
 use scrozz_core::{
-    Capture, CaptureRequest, CursorMode, Display, DisplayId, Error as CoreError, RegionSelector,
-    SelectionHost, SelectionOptions, SelectionOutcome,
+    Capture, CaptureRequest, CursorMode, Display, DisplayId, DisplaySet, Error as CoreError,
+    LogicalPoint, LogicalRect, LogicalSize, RegionSelector, ScaleFactor, SelectionHost,
+    SelectionOptions, SelectionOutcome,
 };
 use scrozz_ui::{
     OverlayHandle,
-    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
+    overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions, PinSupport, PinTopology},
 };
 
 use crate::{
@@ -244,12 +245,20 @@ impl Host for Windowed {
             selection,
             native,
         } = *self;
+        let (displays, active_display) = pin_displays(geometry);
+        let pin_support = pin_support(&displays);
+        let pin_lock_escapes = app.pin_lock_escapes().to_vec();
         tracing::info!(?geometry, "opening the overlay");
 
         let options = OverlayOptions {
             geometry,
             panel: panel_hook(native.clone()),
             probe: pointer_probe(Arc::clone(&pointer_geometry)),
+            displays,
+            active_display,
+            pin_support,
+            pin_lock_escapes,
+            pin_topology_probe: Some(Arc::new(query_pin_topology)),
             ..Default::default()
         };
 
@@ -285,6 +294,7 @@ impl Host for Windowed {
                     pointer_geometry,
                     next_work_area_refresh: Instant::now(),
                     pending_native_frame: None,
+                    pin_panels: crate::gui::panel::PinPanels::default(),
                     announced: false,
                     stopped: false,
                 }))
@@ -480,6 +490,7 @@ struct Driver {
     /// Work-area frame to apply natively on the pass after queued viewport
     /// commands have reached winit.
     pending_native_frame: Option<OverlayGeometry>,
+    pin_panels: crate::gui::panel::PinPanels,
     announced: bool,
     stopped: bool,
 }
@@ -741,6 +752,7 @@ impl eframe::App for Driver {
         }
         if !self.stopped && tick == Tick::Stop {
             self.stopped = true;
+            self.overlay.flush_pin_states(ctx);
             let report = self.app.report();
             if let Ok(mut slot) = self.sink.lock() {
                 *slot = Some(report.clone());
@@ -824,6 +836,8 @@ impl eframe::App for Driver {
                 tracing::debug!(started, "drag: began within the gesture frame");
             }
         }
+        self.pin_panels
+            .reconcile(&self.handle.native_pin_requests());
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -870,6 +884,7 @@ fn work_area() -> (OverlayGeometry, Option<DisplayId>) {
                 let geometry = geometry_for_display(&display);
                 return (geometry, Some(display.id));
             }
+
             Err(err) => {
                 tracing::warn!(%err, "no work area; using the default overlay geometry");
             }
@@ -877,6 +892,96 @@ fn work_area() -> (OverlayGeometry, Option<DisplayId>) {
     }
 
     (OverlayGeometry::default(), None)
+}
+
+fn pin_displays(geometry: OverlayGeometry) -> (DisplaySet, Option<DisplayId>) {
+    if let Some(topology) = query_pin_topology() {
+        return (topology.displays, topology.active_display);
+    }
+
+    let rect = geometry.work_area;
+    let logical = LogicalRect::new(
+        LogicalPoint::new(f64::from(rect.min.x), f64::from(rect.min.y)),
+        LogicalSize::new(f64::from(rect.width()), f64::from(rect.height())),
+    );
+    let id = DisplayId("overlay-work-area".into());
+    (
+        DisplaySet::new(vec![Display {
+            id: id.clone(),
+            name: "Overlay work area".into(),
+            bounds: logical,
+            work_area: logical,
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        }]),
+        Some(id),
+    )
+}
+
+fn query_pin_topology() -> Option<PinTopology> {
+    let backend = crate::platform::capture_backend().ok()?;
+    let active_display = backend.active_display().ok().map(|display| display.id);
+    let displays = DisplaySet::new(backend.displays().ok()?);
+    if displays.displays().is_empty() {
+        return None;
+    }
+    let support = pin_support(&displays);
+    Some(PinTopology {
+        displays,
+        active_display,
+        support,
+    })
+}
+
+fn pin_support(displays: &DisplaySet) -> PinSupport {
+    pin_support_from(scrozz_shell::pin::PinCapabilities::detect(), displays)
+}
+
+fn pin_support_from(
+    capabilities: scrozz_shell::pin::PinCapabilities,
+    displays: &DisplaySet,
+) -> PinSupport {
+    use scrozz_shell::pin::{PinBackend, Support};
+
+    let mixed_dpi_windows = capabilities.backend == PinBackend::WindowsToolWindow
+        && displays.displays().first().is_some_and(|first| {
+            displays.displays()[1..]
+                .iter()
+                .any(|display| (display.scale.get() - first.scale.get()).abs() > f64::EPSILON)
+        });
+    let positioning = capabilities.positioning.available() && !mixed_dpi_windows;
+    let mut gaps = Vec::new();
+    append_support_gap("global positioning", &capabilities.positioning, &mut gaps);
+    append_support_gap("always on top", &capabilities.always_on_top, &mut gaps);
+    if mixed_dpi_windows {
+        gaps.push(
+            "global positioning: mixed-DPI Windows desktops need a native Win32 coordinate \
+             adapter; Windows will place this pin until that adapter lands, or matching display \
+             scales can be used"
+                .into(),
+        );
+    }
+    let detail = if gaps.is_empty() {
+        format!("{:?} pinned windows", capabilities.backend)
+    } else {
+        gaps.join("; ")
+    };
+    PinSupport {
+        windows: capabilities.pin_window.available(),
+        positioning,
+        always_on_top: capabilities.always_on_top.available(),
+        native_opacity: matches!(capabilities.native_opacity, Support::Yes),
+        click_through: capabilities.click_through.available(),
+        non_activating: matches!(capabilities.non_activating, Support::Yes),
+        x11_managed_dock: matches!(capabilities.backend, PinBackend::X11ManagedDock),
+        detail,
+    }
+}
+
+fn append_support_gap(label: &str, support: &scrozz_shell::pin::Support, gaps: &mut Vec<String>) {
+    if let scrozz_shell::pin::Support::No { why, remedy } = support {
+        gaps.push(format!("{label}: {why}; {remedy}"));
+    }
 }
 
 /// An exact pointer source for the click-through logic, if one is available.
@@ -1069,6 +1174,21 @@ mod tests {
         );
     }
 
+    fn display(id: &str, x: f64, scale: f64) -> Display {
+        let bounds = LogicalRect::new(
+            LogicalPoint::new(x, 0.0),
+            LogicalSize::new(1_920.0, 1_080.0),
+        );
+        Display {
+            id: DisplayId(id.into()),
+            name: id.into(),
+            bounds,
+            work_area: bounds,
+            scale: ScaleFactor::new(scale),
+            is_primary: id == "primary",
+        }
+    }
+
     #[test]
     fn a_headless_run_ends_by_itself() {
         // The property every automated run depends on. If this ever stops
@@ -1100,6 +1220,29 @@ mod tests {
         // A gap message that does not name the remedy is just an apology.
         assert!(WINDOW_GAP.contains("eframe"));
         assert!(WINDOW_GAP.contains("apps/scrozz/Cargo.toml"));
+    }
+
+    #[test]
+    fn mixed_dpi_windows_degrades_global_positioning_truthfully() {
+        let session = scrozz_shell::Session {
+            server: scrozz_shell::DisplayServer::Windows,
+            compositor: scrozz_shell::Compositor::Other,
+            desktop: String::new(),
+        };
+        let capabilities = scrozz_shell::pin::PinCapabilities::for_session(&session);
+        let mixed = DisplaySet::new(vec![
+            display("primary", 0.0, 1.0),
+            display("retina", 1_920.0, 2.0),
+        ]);
+        let support = pin_support_from(capabilities.clone(), &mixed);
+        assert!(!support.positioning);
+        assert!(support.detail.contains("mixed-DPI Windows"));
+
+        let uniform = DisplaySet::new(vec![
+            display("primary", 0.0, 1.25),
+            display("second", 1_920.0, 1.25),
+        ]);
+        assert!(pin_support_from(capabilities, &uniform).positioning);
         assert!(WINDOW_GAP.contains("SCROZZ_GUI_HEADLESS"));
     }
 

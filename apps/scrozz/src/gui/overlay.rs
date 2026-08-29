@@ -23,10 +23,11 @@
 use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
+use scrozz_store::CaptureId;
 use scrozz_ui::{CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX};
 
 use crate::gui::{
-    card::{Card, CardEvent, CardId, CardSurface},
+    card::{Card, CardEvent, CardId, CardSurface, PinnedCapture, Thumbnail},
     drag::DragSpot,
     panel::BehaviorController,
 };
@@ -48,6 +49,8 @@ pub struct OverlayCards {
     mapped: HashMap<u64, CardId>,
     /// Ours to the overlay's, so a dismissal we initiate can be addressed.
     reverse: HashMap<CardId, u64>,
+    /// Durable pin identity to the card that created it.
+    pinned: HashMap<String, CardId>,
     /// Translated events beyond the one this poll returned.
     ///
     /// `drain_events` empties the overlay's outbox in one go, so a batch of
@@ -65,6 +68,7 @@ impl OverlayCards {
             pending: VecDeque::new(),
             mapped: HashMap::new(),
             reverse: HashMap::new(),
+            pinned: HashMap::new(),
             queued: VecDeque::new(),
         }
     }
@@ -91,29 +95,7 @@ impl OverlayCards {
 
 impl CardSurface for OverlayCards {
     fn present(&mut self, card: Card) -> scrozz_core::Result<()> {
-        let name = card.file_name();
-        let provenance = card.provenance;
-
-        // The pixels handed to the overlay are the thumbnail, not the capture.
-        // A 3456×2234 frame is about thirty megabytes; the card draws it at
-        // roughly 300 points wide. Shipping the full frame across so egui can
-        // throw away 99% of it would cost a copy of every capture, held for as
-        // long as the card is on screen.
-        let request = match card.thumbnail.as_ref().and_then(Thumb::frame) {
-            Some(frame) => CaptureRequest::from_frame(
-                name.clone(),
-                provenance,
-                &frame,
-                // Already at or below this; passing it keeps the overlay's
-                // guarantee about texture size rather than assuming ours.
-                THUMBNAIL_PX,
-            )
-            .unwrap_or_else(|| CaptureRequest::new(name.clone(), provenance, card.source_px())),
-            // No pixels yet: the card still appears, with a holding fill. A
-            // capture that happened should be visible even if thumbnailing
-            // failed, because the file on disk is fine.
-            None => CaptureRequest::new(name, provenance, card.source_px()),
-        };
+        let request = request_for_card(&card);
 
         self.pending.push_back(card.id);
         self.handle.push(request);
@@ -135,6 +117,56 @@ impl CardSurface for OverlayCards {
             self.handle
                 .settle_drag(scrozz_ui::stack::CardId(theirs), accepted);
         }
+    }
+
+    fn restore_pin(&mut self, pin: PinnedCapture) -> scrozz_core::Result<()> {
+        let mut request = match pin.texture.as_ref().and_then(Thumb::frame) {
+            Some(frame) => CaptureRequest::from_frame(
+                pin.name.clone(),
+                pin.provenance,
+                &frame,
+                crate::gui::card::PIN_TEXTURE_MAX_EDGE,
+            )
+            .unwrap_or_else(|| {
+                CaptureRequest::new(
+                    "Pinned capture",
+                    pin.provenance,
+                    (pin.source_width, pin.source_height),
+                )
+            }),
+            None => CaptureRequest::new(
+                pin.name,
+                pin.provenance,
+                (pin.source_width, pin.source_height),
+            ),
+        }
+        .with_pin_id(pin.id.0.clone())
+        .with_source_scale(pin.scale);
+        request.source_px = (pin.source_width, pin.source_height);
+        self.handle.restore_pin(request, pin.state);
+        Ok(())
+    }
+
+    fn refresh_pin_texture(
+        &mut self,
+        capture: &CaptureId,
+        texture: Thumbnail,
+    ) -> scrozz_core::Result<()> {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [texture.width() as usize, texture.height() as usize],
+            texture.pixels(),
+        );
+        self.handle.refresh_pin_texture(capture.0.clone(), image);
+        Ok(())
+    }
+
+    fn discard_pin(&mut self, capture: &CaptureId) {
+        self.handle.discard_pin(capture.0.clone());
+        self.pinned.remove(&capture.0);
+    }
+
+    fn unlock_pins(&mut self) {
+        self.handle.unlock_pins();
     }
 
     fn poll(&mut self) -> Option<CardEvent> {
@@ -266,9 +298,33 @@ impl OverlayCards {
                 // translation for them would be worse than leaving the gap
                 // visible.
                 OverlayEvent::UploadRequested { .. }
-                | OverlayEvent::PinRequested { .. }
                 | OverlayEvent::DockExpanded
                 | OverlayEvent::Emptied => {}
+                OverlayEvent::PinRequested { id, pin, state } => {
+                    if let Some(ours) = self.mapped.get(&id.0).copied() {
+                        self.pinned.insert(pin.0.clone(), ours);
+                        self.forget(ours);
+                        out.push(CardEvent::Pin(ours, CaptureId(pin.0), state));
+                    }
+                }
+                OverlayEvent::PinUpdated { pin, state } => {
+                    out.push(CardEvent::PinChanged(CaptureId(pin.0), state));
+                }
+                OverlayEvent::PinClosed { pin } => {
+                    self.pinned.remove(&pin.0);
+                    out.push(CardEvent::Unpin(CaptureId(pin.0)));
+                }
+                OverlayEvent::PinUnavailable { card, reason } => {
+                    if let Some(ours) = self.mapped.get(&card.0).copied() {
+                        out.push(CardEvent::PinUnavailable { card: ours, reason });
+                    }
+                }
+                OverlayEvent::PinPositioningUnavailable { pin, reason } => {
+                    out.push(CardEvent::PinPositioningUnavailable {
+                        capture: CaptureId(pin.0),
+                        reason,
+                    });
+                }
                 _ => {}
             }
         }
@@ -276,6 +332,39 @@ impl OverlayCards {
         // `drain_events` took everything, so nothing translated may be dropped.
         self.queued.extend(out);
     }
+}
+
+/// The chrome a capture kind should get.
+///
+/// Per D9 a window capture keeps the shape and shadow the OS gave it, and a
+/// region capture must never gain a synthetic one, so this is not cosmetic.
+fn request_for_card(card: &Card) -> CaptureRequest {
+    let name = card.file_name();
+    let provenance = card.provenance;
+
+    // The pixels handed to the overlay are the thumbnail, not the capture.
+    // Preserve the capture's full dimensions separately: pin geometry is based
+    // on the source, while egui only needs a bounded texture.
+    let mut request = match card.thumbnail.as_ref().and_then(Thumb::frame) {
+        Some(frame) => CaptureRequest::from_frame(
+            name.clone(),
+            provenance,
+            &frame,
+            // Already at or below this; passing it keeps the overlay's
+            // guarantee about texture size rather than assuming ours.
+            THUMBNAIL_PX,
+        )
+        .unwrap_or_else(|| CaptureRequest::new(name.clone(), provenance, card.source_px())),
+        // No pixels yet: the card still appears, with a holding fill. A capture
+        // that happened should be visible even if thumbnailing failed.
+        None => CaptureRequest::new(name, provenance, card.source_px()),
+    }
+    .with_source_scale(card.scale);
+    request.source_px = card.source_px();
+    if let Some(capture) = &card.capture_id {
+        request = request.with_pin_id(capture.0.clone());
+    }
+    request
 }
 
 /// Reading a [`crate::gui::Thumbnail`] as a frame the UI can scale.
@@ -344,6 +433,24 @@ mod tests {
         assert_eq!(frame.height(), 2);
         assert_eq!(frame.stride, 8);
         assert_eq!(frame.format, PixelFormat::Rgba8);
+    }
+
+    #[test]
+    fn thumbnail_requests_keep_authoritative_capture_dimensions() {
+        let mut card = card(4);
+        card.source_width = 3_456;
+        card.source_height = 2_234;
+        card.scale = 2.0;
+        card.thumbnail = Thumbnail::from_rgba(2, 2, vec![255; 16]);
+
+        let request = request_for_card(&card);
+
+        assert_eq!(request.source_px, (3_456, 2_234));
+        assert_eq!(request.source_scale, 2.0);
+        assert_eq!(
+            request.thumbnail.as_ref().map(|image| image.size),
+            Some([2, 2])
+        );
     }
 
     #[test]

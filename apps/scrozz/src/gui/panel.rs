@@ -27,6 +27,8 @@
 //! takes focus when clicked. That is the whole reason [`PanelReport`] carries a
 //! `detail` string rather than being a bool.
 
+#[cfg(target_os = "macos")]
+use std::collections::{HashMap, HashSet};
 use std::{cell::RefCell, ffi::c_void, rc::Rc};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -34,7 +36,100 @@ use scrozz_core::LogicalRect;
 #[cfg(target_os = "macos")]
 use scrozz_shell::OverlayWindow;
 use scrozz_shell::{NativeOverlay, NativeSurface, OverlayBehavior, OverlayCursor};
-use scrozz_ui::PanelReport;
+use scrozz_ui::{PanelReport, overlay_app::NativePinRequest};
+
+/// Native child-window adapters retained for the lifetime of pinned viewports.
+#[derive(Default)]
+pub struct PinPanels {
+    #[cfg(target_os = "macos")]
+    windows: HashMap<String, NativeOverlay>,
+    #[cfg(target_os = "macos")]
+    pending_logged: HashSet<String>,
+}
+
+impl PinPanels {
+    /// Adopt newly-created pin viewports and apply their current native state.
+    pub fn reconcile(&mut self, requests: &[NativePinRequest]) {
+        #[cfg(target_os = "macos")]
+        self.reconcile_macos(requests);
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = requests;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconcile_macos(&mut self, requests: &[NativePinRequest]) {
+        let live: HashSet<&str> = requests
+            .iter()
+            .map(|request| request.title.as_str())
+            .collect();
+        let stale: Vec<String> = self
+            .windows
+            .keys()
+            .filter(|title| !live.contains(title.as_str()))
+            .cloned()
+            .collect();
+        for title in stale {
+            if let Some(mut overlay) = self.windows.remove(&title)
+                && let Err(err) = overlay.restore_native_class()
+            {
+                tracing::warn!(window = %title, "could not restore pin window before close: {err}");
+            }
+            self.pending_logged.remove(&title);
+        }
+
+        for request in requests {
+            if !self.windows.contains_key(&request.title) {
+                match NativeOverlay::find_by_title(&request.title) {
+                    Ok(Some(window)) => {
+                        self.windows.insert(request.title.clone(), window);
+                        self.pending_logged.remove(&request.title);
+                    }
+                    Ok(None) => {
+                        if self.pending_logged.insert(request.title.clone()) {
+                            tracing::debug!(
+                                window = %request.title,
+                                "pin child viewport is not native-visible yet; adoption will retry"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            window = %request.title,
+                            "could not discover pin child viewport: {err}"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            let Some(window) = self.windows.get_mut(&request.title) else {
+                continue;
+            };
+            let mut behavior = OverlayBehavior::pinned_capture(request.state.locked);
+            behavior.opacity = request.state.opacity;
+            behavior.has_shadow = request.shadow;
+            if let Err(err) = window.apply(&behavior) {
+                tracing::warn!(window = %request.title, "could not apply native pin behavior: {err}");
+            }
+            if let Err(err) = window.set_frame(request.state.frame) {
+                tracing::warn!(window = %request.title, "could not apply native pin geometry: {err}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PinPanels {
+    fn drop(&mut self) {
+        for (title, window) in &mut self.windows {
+            if let Err(err) = window.restore_native_class() {
+                tracing::warn!(window = %title, "could not restore pin window during teardown: {err}");
+            }
+        }
+    }
+}
 
 /// The raw native window a drag can be begun from, if this platform has one.
 ///

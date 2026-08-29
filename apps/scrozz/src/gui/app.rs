@@ -29,13 +29,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use scrozz_core::{Capture, Error as CoreError, SelectionCapabilities};
+use clap::Parser as _;
+use scrozz_core::{Capture, Error as CoreError, LockEscape, SelectionCapabilities};
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, HotkeyEvent, KeyState, Permissions, ScreenshotSound,
     Session, SystemPermissions, Tray, TrayAction,
     hotkey::{DesiredBinding, Rejection},
     play_screenshot_sound,
 };
+use scrozz_store::CaptureId;
 
 use crate::{
     after_capture::{
@@ -441,6 +443,9 @@ pub struct App {
     /// A native modal drag can consume mouse-up and modifier-release events.
     /// The window host clears that stale egui input before another interaction.
     modal_drag_input_release_pending: bool,
+    pin_lock_escapes: Vec<LockEscape>,
+    terminally_unpinned: HashSet<CaptureId>,
+    suppress_locked_restores: bool,
     started: Instant,
     captures: u64,
     sound_warning_shown: bool,
@@ -731,6 +736,12 @@ impl App {
         };
 
         let shortcuts = config.shortcuts.clone();
+        let unlock_hotkey_registered = hotkeys
+            .bindings()
+            .any(|(_, action)| action == Action::UnlockPins.id())
+            && hotkeys.is_bound_to_os();
+        let pin_lock_escapes =
+            established_lock_escapes(server.is_some(), tray.is_some(), unlock_hotkey_registered);
         let mut app = Self {
             config,
             surface,
@@ -743,6 +754,9 @@ impl App {
             selector,
             drag: DragHost::new(),
             modal_drag_input_release_pending: false,
+            pin_lock_escapes,
+            terminally_unpinned: HashSet::new(),
+            suppress_locked_restores: false,
             started: Instant::now(),
             captures: 0,
             sound_warning_shown: false,
@@ -783,6 +797,11 @@ impl App {
         }
 
         Ok(app)
+    }
+
+    /// Routes that were successfully established outside pinned windows.
+    pub(crate) fn pin_lock_escapes(&self) -> &[LockEscape] {
+        &self.pin_lock_escapes
     }
 
     /// Services every source once. Never blocks.
@@ -988,6 +1007,37 @@ impl App {
 
         for request in pending {
             tracing::debug!(?request, "a forwarded command arrived");
+            let mut with_argv0 = Vec::with_capacity(request.argv.len() + 1);
+            with_argv0.push("scrozz".to_owned());
+            with_argv0.extend(request.argv.iter().cloned());
+            let needs_live_pin_state = Cli::try_parse_from(with_argv0)
+                .ok()
+                .and_then(|cli| cli.command)
+                .is_some_and(|command| {
+                    forwarded_unpin(&command).is_some() || forwarded_unlock_pins(&command)
+                });
+
+            if needs_live_pin_state {
+                let command = request.serve_with(|command| {
+                    if let Some(id) = forwarded_unpin(command) {
+                        let capture = CaptureId(id.to_owned());
+                        self.terminally_unpinned.insert(capture.clone());
+                        self.surface.discard_pin(&capture);
+                        self.pipeline.terminal_unpin(capture)?;
+                        self.note(format!("pinned capture {id} closed after forwarded unpin"));
+                    }
+                    if forwarded_unlock_pins(command) {
+                        self.unlock_all_pins()?;
+                        self.note("pinned captures unlocked from the command line");
+                    }
+                    Ok(())
+                });
+                if let Some(command) = command {
+                    self.observe_forwarded_command(&command);
+                }
+                continue;
+            }
+
             let submitted = self
                 .forwarder
                 .as_ref()
@@ -1004,21 +1054,7 @@ impl App {
             }
         }
         for command in completed.into_iter().flatten() {
-            self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
-            if matches!(
-                command,
-                crate::cli::Command::Settings(crate::cli::SettingsArgs {
-                    command: SettingsCommand::Set { .. }
-                })
-            ) {
-                self.reload_persisted_settings();
-            }
-            if matches!(command, crate::cli::Command::Gui) {
-                // A second `scrozz gui` means "show yourself", not "start
-                // again". There is nothing to show yet, so it is a no-op
-                // that has at least been answered rather than ignored.
-                self.note("a second launch was answered by this instance");
-            }
+            self.observe_forwarded_command(&command);
         }
 
         // A forwarded command never ends this process. `scrozz quit` is not a
@@ -1026,6 +1062,21 @@ impl App {
         // the application the user can see, not a request that arrived on a
         // socket.
         Tick::Continue
+    }
+
+    fn observe_forwarded_command(&mut self, command: &crate::cli::Command) {
+        self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+        if matches!(
+            command,
+            crate::cli::Command::Settings(crate::cli::SettingsArgs {
+                command: SettingsCommand::Set { .. }
+            })
+        ) {
+            self.reload_persisted_settings();
+        }
+        if matches!(command, crate::cli::Command::Gui) {
+            self.note("a second launch was answered by this instance");
+        }
     }
 
     fn reload_persisted_settings(&mut self) {
@@ -1198,6 +1249,46 @@ impl App {
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
                 }
+                Outcome::PinReady(mut pin) => {
+                    if self.terminally_unpinned.contains(&pin.id) {
+                        continue;
+                    }
+                    if self.suppress_locked_restores {
+                        pin.state.locked = false;
+                    }
+                    let capture = pin.id.0.clone();
+                    if let Err(err) = self.surface.restore_pin(*pin) {
+                        self.note(format!(
+                            "pinned capture {capture} could not be shown: {err}"
+                        ));
+                    } else {
+                        self.note(format!("pinned capture {capture} restored"));
+                    }
+                }
+                Outcome::PinTextureReady { capture, texture } => {
+                    if self.terminally_unpinned.contains(&capture) {
+                        continue;
+                    }
+                    if let Err(err) = self.surface.refresh_pin_texture(&capture, texture) {
+                        self.note(format!(
+                            "pinned capture {} texture could not be refreshed: {err}",
+                            capture.0
+                        ));
+                    }
+                }
+                Outcome::PinCreationFailed { capture, error } => {
+                    self.surface.discard_pin(&capture);
+                    self.note(format!(
+                        "pinned capture {} was closed because it could not be persisted: {error}",
+                        capture.0
+                    ));
+                }
+                Outcome::PinPersistenceFailed { capture, error } => {
+                    self.note(format!(
+                        "pinned capture {} could not be persisted: {error}",
+                        capture.0
+                    ));
+                }
             }
         }
     }
@@ -1234,6 +1325,44 @@ impl App {
                 // is one that can perform it.
                 CardEvent::Collapse(id) => {
                     self.note(format!("{id}: {event:?} is not routed yet"));
+                }
+                CardEvent::Pin(id, capture, state) => {
+                    if self.terminally_unpinned.contains(&capture) {
+                        self.pipeline.post(Job::Release(id));
+                        continue;
+                    }
+                    self.pipeline.post(Job::PinCard {
+                        card: id,
+                        capture,
+                        state,
+                    });
+                    self.note(format!("{id} pinned"));
+                }
+                CardEvent::PinChanged(capture, state) => {
+                    if self.terminally_unpinned.contains(&capture) {
+                        continue;
+                    }
+                    self.pipeline.post(Job::SetPin {
+                        capture,
+                        state: Some(state),
+                    });
+                }
+                CardEvent::Unpin(capture) => {
+                    self.terminally_unpinned.insert(capture.clone());
+                    self.pipeline.post(Job::SetPin {
+                        capture: capture.clone(),
+                        state: None,
+                    });
+                    self.note(format!("pinned capture {} closed", capture.0));
+                }
+                CardEvent::PinUnavailable { card, reason } => {
+                    self.note(format!("{card} could not be pinned: {reason}"));
+                }
+                CardEvent::PinPositioningUnavailable { capture, reason } => {
+                    self.note(format!(
+                        "pinned capture {} cannot be positioned: {reason}",
+                        capture.0
+                    ));
                 }
             }
         }
@@ -1463,6 +1592,15 @@ impl App {
             Action::OpenSettings => {
                 self.settings_requested = true;
                 self.note("settings requested");
+                Tick::Continue
+            }
+            Action::UnlockPins => {
+                match self.unlock_all_pins() {
+                    Ok(_) => self.note("pinned captures unlocked"),
+                    Err(error) => {
+                        self.note(format!("pinned captures could not be unlocked: {error}"))
+                    }
+                }
                 Tick::Continue
             }
             Action::Quit => {
@@ -1868,6 +2006,12 @@ impl App {
         if let Some(pending) = self.permission_resume.take() {
             self.queue_direct_capture(pending);
         }
+    }
+
+    fn unlock_all_pins(&mut self) -> CliResult<u64> {
+        self.suppress_locked_restores = true;
+        self.surface.unlock_pins();
+        self.pipeline.unlock_pins()
     }
 
     fn note(&mut self, what: impl Into<String>) {
@@ -2312,6 +2456,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.drain_cards(None);
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
@@ -2335,6 +2480,41 @@ impl App {
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
+}
+
+fn established_lock_escapes(
+    ipc_bound: bool,
+    tray_created: bool,
+    unlock_hotkey_registered: bool,
+) -> Vec<LockEscape> {
+    let mut escapes = Vec::new();
+    if tray_created {
+        escapes.push(LockEscape::TrayMenu);
+    }
+    if ipc_bound {
+        escapes.push(LockEscape::CommandLine);
+    }
+    if unlock_hotkey_registered {
+        escapes.push(LockEscape::GlobalHotkey);
+    }
+    escapes
+}
+
+fn forwarded_unpin(command: &crate::cli::Command) -> Option<&str> {
+    let crate::cli::Command::History(history) = command else {
+        return None;
+    };
+    let crate::cli::HistoryCommand::Pin { id, unpin: true } = &history.command else {
+        return None;
+    };
+    Some(id)
+}
+
+fn forwarded_unlock_pins(command: &crate::cli::Command) -> bool {
+    let crate::cli::Command::History(history) = command else {
+        return false;
+    };
+    matches!(&history.command, crate::cli::HistoryCommand::UnlockPins)
 }
 
 impl Drop for App {
@@ -3169,6 +3349,48 @@ mod tests {
         assert!(app.tray.is_none(), "no menu-bar item");
         assert!(app.server.is_none(), "no socket");
         assert_eq!(app.config.bindings.len(), 0, "no keyboard registration");
+        assert!(
+            app.pin_lock_escapes().is_empty(),
+            "configured resources are not lock escapes until they exist"
+        );
+    }
+
+    #[test]
+    fn only_a_forwarded_unpin_requests_live_viewport_removal() {
+        let unpin = Cli::try_parse_from(["scrozz", "history", "pin", "capture-1", "--unpin"])
+            .expect("valid unpin")
+            .command
+            .expect("command");
+        assert_eq!(forwarded_unpin(&unpin), Some("capture-1"));
+
+        let pin = Cli::try_parse_from(["scrozz", "history", "pin", "capture-1"])
+            .expect("valid pin")
+            .command
+            .expect("command");
+        assert_eq!(forwarded_unpin(&pin), None);
+    }
+
+    #[test]
+    fn id_free_unlock_command_is_a_live_lock_escape() {
+        let unlock = Cli::try_parse_from(["scrozz", "history", "unlock-pins"])
+            .expect("valid unlock")
+            .command
+            .expect("command");
+        assert!(forwarded_unlock_pins(&unlock));
+        assert_eq!(forwarded_unpin(&unlock), None);
+    }
+
+    #[test]
+    fn only_established_external_routes_are_lock_escapes() {
+        assert!(established_lock_escapes(false, false, false).is_empty());
+        assert_eq!(
+            established_lock_escapes(true, true, true),
+            vec![
+                LockEscape::TrayMenu,
+                LockEscape::CommandLine,
+                LockEscape::GlobalHotkey
+            ]
+        );
     }
 
     #[test]

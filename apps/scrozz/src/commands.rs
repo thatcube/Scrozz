@@ -25,6 +25,7 @@ use scrozz_core::{
 };
 use scrozz_export::{Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
+use scrozz_store::{CaptureId, Store};
 
 use crate::{
     after_capture::{AfterCaptureSettings, current_availability},
@@ -613,14 +614,47 @@ fn history(command: &HistoryCommand) -> CliResult<Report> {
             "deleting a stored capture",
             "scrozz-store (the Store trait exposes no delete)",
         )),
-        HistoryCommand::Pin { .. } => {
-            let _store = platform::store()?;
-            Err(CliError::not_implemented(
-                "pinning a capture",
-                "scrozz-store",
-            ))
+        HistoryCommand::Pin { id, unpin } => {
+            let mut store = platform::store()?;
+            set_history_pin(&mut store, id, *unpin)
+        }
+        HistoryCommand::UnlockPins => {
+            let mut store = platform::store()?;
+            unlock_history_pins(&mut store)
         }
     }
+}
+
+fn set_history_pin(store: &mut impl Store, id: &str, unpin: bool) -> CliResult<Report> {
+    let pinned = !unpin;
+    store.set_pinned(&CaptureId(id.to_owned()), pinned)?;
+    Ok(Report::new(
+        Json::obj([
+            ("id", Json::str(id)),
+            ("pinned", Json::Bool(pinned)),
+            ("screen_pin_cleared", Json::Bool(unpin)),
+        ]),
+        if pinned {
+            format!("Pinned {id}.")
+        } else {
+            format!("Unpinned {id}.")
+        },
+    ))
+}
+
+fn unlock_history_pins(store: &mut scrozz_store::SqliteStore) -> CliResult<Report> {
+    let unlocked = store.unlock_screen_pins()?;
+    Ok(Report::new(
+        Json::obj([(
+            "unlocked",
+            Json::Int(i64::try_from(unlocked).unwrap_or(i64::MAX)),
+        )]),
+        match unlocked {
+            0 => "No pinned captures were locked.".into(),
+            1 => "Unlocked 1 pinned capture.".into(),
+            count => format!("Unlocked {count} pinned captures."),
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1068,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
+    use scrozz_store::{
+        History as _, NewCapture, SqliteStore,
+        test_support::{sample_document, scratch_dir},
+    };
 
     use super::*;
     use crate::{cli::Cli, exit::Exit, test_env};
@@ -1077,6 +1115,62 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    #[test]
+    fn history_pin_updates_retention_and_unpin_clears_it() {
+        let dir = scratch_dir("cli-history-pin");
+        let mut store = SqliteStore::open_ephemeral(dir.path()).expect("store");
+        let id = store
+            .insert(NewCapture::new(&sample_document(8, 8, 3, 0)))
+            .expect("insert");
+
+        let pinned = set_history_pin(&mut store, &id.0, false).expect("pin");
+        assert_eq!(pinned.human, format!("Pinned {}.", id.0));
+        assert!(store.record(&id).expect("record").expect("present").pinned);
+
+        let unpinned = set_history_pin(&mut store, &id.0, true).expect("unpin");
+        assert_eq!(unpinned.human, format!("Unpinned {}.", id.0));
+        assert!(!store.record(&id).expect("record").expect("present").pinned);
+        assert!(
+            unpinned
+                .data
+                .to_compact_string()
+                .contains(r#""screen_pin_cleared":true"#)
+        );
+    }
+
+    #[test]
+    fn history_unlock_pins_unlocks_every_pin_without_ids() {
+        let dir = scratch_dir("cli-history-unlock-pins");
+        let mut store = SqliteStore::open_ephemeral(dir.path()).expect("store");
+        let mut ids = Vec::new();
+        for seed in [21, 22] {
+            let id = store
+                .insert(NewCapture::new(&sample_document(8, 8, seed, 0)))
+                .expect("insert");
+            let mut state = scrozz_core::PinState::new(
+                scrozz_core::LogicalRect::new(
+                    scrozz_core::LogicalPoint::new(10.0, 20.0),
+                    scrozz_core::LogicalSize::new(320.0, 180.0),
+                ),
+                scrozz_core::PinScale::ORIGINAL,
+                None,
+            );
+            state.locked = true;
+            store.set_screen_pin(&id, Some(&state)).expect("lock pin");
+            ids.push(id);
+        }
+
+        let report = unlock_history_pins(&mut store).expect("unlock");
+        assert_eq!(report.human, "Unlocked 2 pinned captures.");
+        for id in ids {
+            let record = store.record(&id).expect("read").expect("record");
+            assert!(
+                !record.screen_pin.expect("screen pin retained").locked,
+                "unlocking must retain the pin and only clear its lock"
+            );
+        }
     }
 
     // -- dry-run capture ---------------------------------------------------

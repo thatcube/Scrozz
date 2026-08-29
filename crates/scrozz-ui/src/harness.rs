@@ -279,6 +279,10 @@ pub enum Scenario {
     SelectorMixedDpi,
     /// The persisted screenshot/recording action matrix in Settings.
     SettingsAfterCapture,
+    /// A pinned capture with its hover controls visible.
+    PinnedCaptureHover,
+    /// A click-through pin showing its external unlock guidance.
+    PinnedCaptureLocked,
 }
 
 impl Scenario {
@@ -305,6 +309,8 @@ impl Scenario {
             Self::SelectorAllInOne,
             Self::SelectorMixedDpi,
             Self::SettingsAfterCapture,
+            Self::PinnedCaptureHover,
+            Self::PinnedCaptureLocked,
         ]
     }
 
@@ -334,6 +340,8 @@ impl Scenario {
             Self::SelectorMagnifier => "selector-magnifier",
             Self::SelectorAllInOne => "selector-all-in-one",
             Self::SelectorMixedDpi => "selector-mixed-dpi",
+            Self::PinnedCaptureHover => "pinned-capture-hover",
+            Self::PinnedCaptureLocked => "pinned-capture-locked",
         }
     }
 
@@ -887,8 +895,27 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::PinnedCaptureHover => (
+                    vec![],
+                    Gesture::None,
+                    false,
+                    false,
+                    "A capture, pinned above your work",
+                    "One capture in its own native window with hover controls for opacity, scale, locking, and close.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::PinnedCaptureLocked => (
+                    vec![],
+                    Gesture::None,
+                    false,
+                    false,
+                    "Pinned and click-through",
+                    "A locked pin ignores pointer input and always names the external Unlock Pinned Captures escape.",
+                    instants::REST,
+                    None,
+                ),
             };
-
         let size_pt = match scenario {
             Scenario::EditorAnnotating | Scenario::EditorColorPopover => (900.0, 620.0),
             Scenario::SettingsAfterCapture => (780.0, 640.0),
@@ -900,6 +927,7 @@ impl Fixture {
             | Scenario::SelectorMagnifier
             | Scenario::SelectorAllInOne => (720.0, 420.0),
             Scenario::SelectorMixedDpi => (800.0, 320.0),
+            Scenario::PinnedCaptureHover | Scenario::PinnedCaptureLocked => (420.0, 270.0),
             _ => size_pt,
         };
 
@@ -2048,6 +2076,14 @@ impl SceneRegistry {
         me.register(
             Scenario::SettingsAfterCapture,
             Box::new(crate::settings::AfterCaptureSettingsScene),
+        );
+        me.register(
+            Scenario::PinnedCaptureHover,
+            Box::new(crate::pinned::PinnedScene::hover()),
+        );
+        me.register(
+            Scenario::PinnedCaptureLocked,
+            Box::new(crate::pinned::PinnedScene::locked()),
         );
         me
     }
