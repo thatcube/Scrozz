@@ -320,7 +320,7 @@ impl SelectionState {
 
     #[must_use]
     pub(crate) fn overlay_label(&self) -> String {
-        let mut label = format!("Selection overlay, {} mode", self.mode.label());
+        let mut label = format!("Selection overlay, {}", self.mode.label());
         match self.mode {
             SelectionMode::Region => {
                 if let Some(rect) = self.region {
@@ -715,7 +715,7 @@ impl SelectionState {
     pub fn set_mode(&mut self, mode: SelectionMode) -> bool {
         if !self.capabilities.supports(mode) {
             self.announcement = Some(SelectionAnnouncement(format!(
-                "{} capture is unavailable",
+                "{} is unavailable",
                 mode.label()
             )));
             return false;
@@ -727,7 +727,7 @@ impl SelectionState {
             let _ = self.restore_remembered();
         }
         self.announcement = Some(SelectionAnnouncement(format!(
-            "{} mode. {}",
+            "{}. {}",
             mode.label(),
             mode.description()
         )));
@@ -966,7 +966,7 @@ impl SelectionState {
     fn selected_announcement(&self, outcome: &SelectionOutcome) -> String {
         match outcome.mode {
             SelectionMode::Region => format!(
-                "Region selected {}",
+                "Area selected {}",
                 outcome.rect.map_or_else(String::new, describe_rect)
             ),
             SelectionMode::Display => outcome

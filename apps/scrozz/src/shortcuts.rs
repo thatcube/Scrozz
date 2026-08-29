@@ -116,12 +116,12 @@ impl ShortcutAction {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::CaptureAllInOne => "All-in-One",
-            Self::CaptureRegion => "Region",
-            Self::CaptureWindow => "Window",
-            Self::CaptureFullscreen => "Display",
-            Self::CaptureAllDisplays => "All Displays",
-            Self::ToggleRecording => "Start / Stop Recording",
+            Self::CaptureAllInOne => scrozz_core::product_copy::ALL_IN_ONE,
+            Self::CaptureRegion => scrozz_core::product_copy::CAPTURE_AREA,
+            Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
+            Self::CaptureFullscreen => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
+            Self::CaptureAllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+            Self::ToggleRecording => scrozz_core::product_copy::RECORD_SCREEN,
         }
     }
 
@@ -802,7 +802,9 @@ mod tests {
             }
         );
         assert!(
-            problem.to_string().contains("Region"),
+            problem
+                .to_string()
+                .contains(scrozz_core::product_copy::CAPTURE_AREA),
             "the message must name the other row: {problem}"
         );
     }

@@ -99,15 +99,15 @@ impl TrayAction {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::CaptureAllInOne => "All-in-One Capture…",
-            Self::CaptureRegion => "Capture Region",
-            Self::CaptureWindow => "Capture Window",
-            Self::CaptureFullscreen => "Capture Fullscreen",
-            Self::CaptureAllDisplays => "Capture All Displays",
-            Self::ToggleRecording => "Start Recording",
-            Self::OpenHistory => "History…",
-            Self::OpenSettings => "Settings…",
-            Self::Quit => "Quit Scrozz",
+            Self::CaptureAllInOne => scrozz_core::product_copy::ALL_IN_ONE,
+            Self::CaptureRegion => scrozz_core::product_copy::CAPTURE_AREA,
+            Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
+            Self::CaptureFullscreen => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
+            Self::CaptureAllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+            Self::ToggleRecording => scrozz_core::product_copy::RECORD_SCREEN,
+            Self::OpenHistory => scrozz_core::product_copy::CAPTURE_HISTORY,
+            Self::OpenSettings => scrozz_core::product_copy::SETTINGS,
+            Self::Quit => scrozz_core::product_copy::QUIT_SCROZZ,
         }
     }
 
@@ -486,7 +486,7 @@ pub const fn recording_label(recording: bool) -> &'static str {
     if recording {
         "Stop Recording"
     } else {
-        "Start Recording"
+        scrozz_core::product_copy::RECORD_SCREEN
     }
 }
 

@@ -103,6 +103,7 @@ impl std::ops::Deref for RevisionedFrame {
 pub struct EditorUi {
     state: EditorState,
     preview: Preview,
+    color_popover: toolbar::ColorPopover,
     /// A decision reached while painting, returned at the end of the frame.
     ///
     /// Toolbar clicks are handled where they are drawn, but the frame's result
@@ -118,6 +119,7 @@ impl EditorUi {
         Self {
             state: EditorState::new(document),
             preview: Preview::default(),
+            color_popover: toolbar::ColorPopover::default(),
             pending: None,
         }
     }
@@ -156,26 +158,75 @@ impl EditorUi {
         RevisionedFrame::from_document(self.document(), revision)
     }
 
+    /// Opens the anchored quick-colour palette.
+    pub fn open_color_popover(&mut self) {
+        self.color_popover.open();
+    }
+
+    /// Opens the egui custom-colour fallback.
+    pub fn open_custom_color_fallback(&mut self) {
+        self.color_popover.open_fallback();
+    }
+
+    /// Closes the colour palette after a native picker takes over.
+    pub fn native_color_picker_started(&mut self) {
+        self.color_popover.close();
+    }
+
+    /// Applies a colour returned by a platform picker.
+    pub fn apply_external_color(&mut self, color: scrozz_annotate::Color) {
+        if self.state.stroke_color() != color {
+            self.state.set_stroke_color(color);
+        }
+    }
+
+    /// Whether either anchored colour surface is showing.
+    #[must_use]
+    pub const fn color_popover_is_open(&self) -> bool {
+        self.color_popover.is_open()
+    }
+
+    /// The anchored popup's most recently resolved screen rectangle.
+    #[must_use]
+    pub const fn color_popover_rect(&self) -> Option<egui::Rect> {
+        self.color_popover.last_rect()
+    }
+
     /// Draws one frame and reports what the host should do.
     pub fn update(&mut self, ui: &mut Ui) -> Intent {
         let theme = theme_for(ui);
         let icons = shared_icons(ui.ctx());
         let surface = crate::paint::Surface::new(&theme, &icons, crate::motion::Motion::at(0.0));
 
-        if let Some(intent) = self.keyboard(ui) {
+        let color_popover_open = self.color_popover.is_open();
+        let color_control_activation = toolbar::color_control_activation(ui);
+        if !color_popover_open
+            && !color_control_activation
+            && let Some(intent) = self.keyboard(ui)
+        {
             self.pending = Some(intent);
         }
 
         let full = ui.available_rect_before_wrap();
-        // The toolbar wraps rather than overlapping itself, so how much room it
-        // needs depends on how wide the window is.
-        let toolbar_h = toolbar::height_for(full.width());
-        let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), toolbar_h));
-        let canvas =
-            egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
+        let (bar, canvas) = editor_layout(full);
 
-        let view = paint::draw_canvas(ui, &surface, &mut self.state, &mut self.preview, canvas);
-        if let Some(action) = toolbar::draw(ui, &surface, &mut self.state, bar, &view) {
+        let view = paint::draw_canvas(
+            ui,
+            &surface,
+            &mut self.state,
+            &mut self.preview,
+            canvas,
+            !color_popover_open,
+        );
+        if let Some(action) = toolbar::draw(
+            ui,
+            &surface,
+            &mut self.state,
+            &mut self.color_popover,
+            bar,
+            &view,
+            color_popover_open,
+        ) {
             self.pending = Some(action);
         }
 
@@ -202,6 +253,16 @@ impl EditorUi {
         }
         result
     }
+}
+
+/// The stable toolbar/canvas split. Foreground popups never participate.
+#[must_use]
+pub fn editor_layout(full: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let toolbar_h = toolbar::height_for(full.width());
+    let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), toolbar_h));
+    let canvas =
+        egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
+    (bar, canvas)
 }
 
 /// The icon store for a context, built once and kept alive in egui's memory.
@@ -383,6 +444,15 @@ pub struct EditorWindow {
     title: String,
 }
 
+/// Whether an explicit editor action created or reused the stable viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenDisposition {
+    /// The viewport was closed.
+    FirstOpen,
+    /// The stable viewport already existed and will be raised.
+    Reused,
+}
+
 impl EditorWindow {
     /// A closed editor window.
     #[must_use]
@@ -397,15 +467,28 @@ impl EditorWindow {
     }
 
     /// Opens the window, or raises it if it is already showing.
-    pub fn open(&mut self, title: impl Into<String>) {
+    pub fn open(&mut self, title: impl Into<String>) -> OpenDisposition {
+        let disposition = if self.open {
+            OpenDisposition::Reused
+        } else {
+            OpenDisposition::FirstOpen
+        };
         self.title = title.into();
         self.open = true;
         self.focus_requested = true;
+        disposition
     }
 
     /// Closes the window.
     pub fn close(&mut self) {
         self.open = false;
+    }
+
+    /// Returns keyboard focus after a system picker closes.
+    pub fn request_foreground(&mut self) {
+        if self.open {
+            self.focus_requested = true;
+        }
     }
 
     /// Shows the window, calling `build` to draw its contents.
@@ -419,13 +502,7 @@ impl EditorWindow {
         } else {
             format!("Annotate — {}", self.title)
         };
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size(MIN_WINDOW_SIZE);
-        if focus {
-            builder = builder.with_active(true);
-        }
+        let builder = Self::viewport_builder(title, focus);
         let mut close = false;
         let mut build = build;
         ctx.show_viewport_immediate(
@@ -438,12 +515,90 @@ impl EditorWindow {
                 {
                     close = true;
                 }
+                Self::emit_foreground(editor_ui.ctx(), focus);
                 build(editor_ui);
             },
         );
         if close {
             self.open = false;
         }
+    }
+
+    fn viewport_builder(title: String, active: bool) -> egui::ViewportBuilder {
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_app_id("com.thatcube.Scrozz.editor")
+            .with_inner_size([1040.0, 720.0])
+            .with_min_inner_size(MIN_WINDOW_SIZE)
+            .with_resizable(true)
+            .with_decorations(true)
+            .with_window_level(egui::WindowLevel::Normal);
+        if active {
+            builder.with_active(true)
+        } else {
+            builder
+        }
+    }
+
+    fn emit_foreground(ctx: &egui::Context, requested: bool) {
+        if requested {
+            // Emitted only in response to Open/Edit or picker focus return. Normal
+            // repaints and worker completions do not keep stealing the foreground.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn first_open_and_reuse_both_request_foregrounding() {
+        let mut window = EditorWindow::new();
+        assert_eq!(window.open("card:1"), OpenDisposition::FirstOpen);
+        assert!(std::mem::take(&mut window.focus_requested));
+
+        assert_eq!(window.open("card:1"), OpenDisposition::Reused);
+        assert!(std::mem::take(&mut window.focus_requested));
+    }
+
+    #[test]
+    fn the_editor_is_an_explicitly_normal_level_window() {
+        let active = EditorWindow::viewport_builder("Annotate".to_owned(), true);
+        assert_eq!(active.window_level, Some(egui::WindowLevel::Normal));
+        assert_eq!(active.active, Some(true));
+        assert_eq!(
+            EditorWindow::viewport_builder("Annotate".to_owned(), false).active,
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_focus_is_emitted_only_when_requested() {
+        let count = |requested| {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                EditorWindow::emit_foreground(ui.ctx(), requested);
+            });
+            output.textures_delta.clear();
+            output
+                .viewport_output
+                .into_values()
+                .flat_map(|viewport| viewport.commands)
+                .filter(|command| matches!(command, egui::ViewportCommand::Focus))
+                .count()
+        };
+        assert_eq!(count(false), 0);
+        assert_eq!(count(true), 1);
+    }
+
+    #[test]
+    fn repainting_does_not_rearm_foreground_focus() {
+        let mut window = EditorWindow::new();
+        let _ = window.open("card:1");
+        assert!(std::mem::take(&mut window.focus_requested));
+        assert!(!window.focus_requested);
     }
 }
 

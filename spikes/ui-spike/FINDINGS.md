@@ -32,7 +32,7 @@ Look at the pixels first; this document is the argument, the screenshots are the
 
 | Screenshot | What it shows |
 |---|---|
-| `quick_stack_dark.png` | **Primary.** Quick Access Overlay as a drag-first **stack** of captures — physical card-stack with depth falloff, a prominent grab tab, a count badge, and the secondary action bar. The headline result. |
+| `quick_stack_dark.png` | **Primary.** Recent Captures Overlay as a drag-first **stack** of captures — physical card-stack with depth falloff, a prominent grab tab, a count badge, and the secondary action bar. The headline result. |
 | `quick_drag_dark.png` | **The hero interaction.** A capture dragged straight out of the corner stack into another app (Messages), with a drag-count badge, grab cursor, and motion trail. This is the "almost more intuitive than copy" gesture the maintainer called core. |
 | `quick_swipe_dark.png` | **Swipe-to-dismiss.** The top capture flung downward off the stack, opaque, rotated, with faint ghost echoes tracing its path so the gesture reads in a still frame. |
 | `quick_stack_light.png` | Light-mode stack — proves the token system has range. |

@@ -302,43 +302,43 @@ pub const SETTINGS: &[Setting] = &[
         key: "hotkey.capture-all-in-one",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureAllInOne.default_accelerator_setting(),
-        description: "Hotkey for the all-in-one capture selector.",
+        description: scrozz_core::product_copy::SHORTCUT_ALL_IN_ONE,
     },
     Setting {
         key: "hotkey.capture-region",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureRegion.default_accelerator_setting(),
-        description: "Hotkey for an interactive region capture.",
+        description: scrozz_core::product_copy::SHORTCUT_CAPTURE_AREA,
     },
     Setting {
         key: "hotkey.capture-window",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureWindow.default_accelerator_setting(),
-        description: "Hotkey for an interactive window capture.",
+        description: scrozz_core::product_copy::SHORTCUT_CAPTURE_WINDOW,
     },
     Setting {
         key: "hotkey.capture-display",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureFullscreen.default_accelerator_setting(),
-        description: "Hotkey for capturing the active display.",
+        description: scrozz_core::product_copy::SHORTCUT_CAPTURE_FULLSCREEN,
     },
     Setting {
         key: "hotkey.capture-all-displays",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureAllDisplays.default_accelerator_setting(),
-        description: "Hotkey for capturing every display.",
+        description: scrozz_core::product_copy::SHORTCUT_CAPTURE_ALL_DISPLAYS,
     },
     Setting {
         key: "hotkey.record-toggle",
         kind: Kind::Accelerator,
         default: ShortcutAction::ToggleRecording.default_accelerator_setting(),
-        description: "Hotkey for starting or stopping a recording. Empty means unassigned.",
+        description: scrozz_core::product_copy::SHORTCUT_RECORD_SCREEN,
     },
     Setting {
         key: "hotkey.record-start",
         kind: Kind::Accelerator,
         default: "Super+Shift+R",
-        description: "Hotkey for starting a recording.",
+        description: scrozz_core::product_copy::SHORTCUT_RECORD_SCREEN,
     },
     Setting {
         key: "hotkey.record-stop",
@@ -553,7 +553,7 @@ mod tests {
         for setting in SETTINGS {
             assert!(!setting.description.is_empty(), "{}", setting.key);
             assert!(
-                setting.description.ends_with('.'),
+                setting.description.ends_with('.') || setting.description.ends_with('…'),
                 "{} reads as a fragment",
                 setting.key
             );

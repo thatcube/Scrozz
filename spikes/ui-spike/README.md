@@ -24,7 +24,7 @@ Four surfaces, built with a bespoke dark-glass design-token theme (no default
 egui styling), real vendored fonts (Inter) and real vendored SVG icons (Tabler,
 rasterised through `resvg` — no emoji/glyph substitutes):
 
-1. **Quick Access Overlay** (primary) — the post-capture corner UI, modelled as a
+1. **Recent Captures Overlay** (primary) — the post-capture corner UI, modelled as a
    **drag-first stack**: multiple captures physically stacked with depth falloff, a
    prominent grab tab, a count badge, and a secondary action bar (copy · save ·
    annotate · pin · cloud-upload · close). Rendered in three states — **stack**
@@ -50,7 +50,7 @@ source "$HOME/.cargo/env"
 cargo run
 ```
 
-That opens the interactive window on the **live capture stack** — a real,
+That opens the interactive window on the **live Recent Captures Overlay** — a real,
 animated, hand-drivable surface. Everything below moves; grab a card and throw
 it.
 

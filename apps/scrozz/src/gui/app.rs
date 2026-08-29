@@ -302,6 +302,9 @@ pub struct App {
     forwarder: Option<Forwarder>,
     selector: Arc<dyn CaptureSelector>,
     drag: DragHost,
+    /// A native modal drag can consume mouse-up and modifier-release events.
+    /// The window host clears that stale egui input before another interaction.
+    modal_drag_input_release_pending: bool,
     started: Instant,
     captures: u64,
     sound_warning_shown: bool,
@@ -495,6 +498,7 @@ impl App {
             forwarder,
             selector,
             drag: DragHost::new(),
+            modal_drag_input_release_pending: false,
             started: Instant::now(),
             captures: 0,
             sound_warning_shown: false,
@@ -521,7 +525,7 @@ impl App {
         }
 
         if let Some(kind) = app.config.capture_on_start {
-            app.begin_capture(kind);
+            app.begin_capture(kind, "startup");
         }
 
         Ok(app)
@@ -580,7 +584,7 @@ impl App {
         }
 
         for entry in pending {
-            if self.perform(Action::from_tray(entry)) == Tick::Stop {
+            if self.perform_from(Action::from_tray(entry), "menu") == Tick::Stop {
                 return Tick::Stop;
             }
         }
@@ -690,7 +694,7 @@ impl App {
 
         for id in pending {
             if let Some(action) = Action::from_id(&id) {
-                self.perform(action);
+                self.perform_from(action, "hotkey");
             } else {
                 tracing::warn!(action = %id, "a hotkey fired for an action this build does not know");
             }
@@ -958,6 +962,7 @@ impl App {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.surface.settle_drag(card, false);
+                self.modal_drag_input_release_pending = true;
                 self.note(format!("{card} could not be rendered for drag: {error}"));
                 return;
             }
@@ -973,6 +978,7 @@ impl App {
             // the failure this whole path exists to remove.
             Err(why) => {
                 self.surface.settle_drag(card, false);
+                self.modal_drag_input_release_pending = true;
                 self.note(format!("{card} could not be dragged: {why}"));
             }
         }
@@ -1017,6 +1023,7 @@ impl App {
         for (card, outcome) in self.drag.poll() {
             let accepted = matches!(outcome, DragOutcome::Accepted { .. });
             self.surface.settle_drag(card, accepted);
+            self.modal_drag_input_release_pending = true;
 
             match outcome {
                 DragOutcome::Accepted { .. } => {
@@ -1047,12 +1054,26 @@ impl App {
         }
     }
 
+    /// Takes the request to retire input swallowed by a completed native drag.
+    ///
+    /// AppKit and `DoDragDrop` own a modal loop and may consume the release edge
+    /// for both the mouse button and drag modifiers. The eframe host must clear
+    /// those persistent states before a selector waits for quiescent input.
+    #[must_use]
+    pub fn take_modal_drag_input_release(&mut self) -> bool {
+        std::mem::take(&mut self.modal_drag_input_release_pending)
+    }
+
     /// Carries out one action.
     fn perform(&mut self, action: Action) -> Tick {
-        tracing::debug!(action = action.id(), "performing");
+        self.perform_from(action, "direct")
+    }
+
+    fn perform_from(&mut self, action: Action, origin: &'static str) -> Tick {
+        tracing::debug!(action = action.id(), origin, "performing");
         match action {
             Action::Capture(kind) => {
-                self.begin_capture(kind);
+                self.begin_capture(kind, origin);
                 Tick::Continue
             }
             Action::ToggleRecording => {
@@ -1078,7 +1099,7 @@ impl App {
         }
     }
 
-    fn begin_capture(&mut self, kind: CaptureKind) {
+    fn begin_capture(&mut self, kind: CaptureKind, origin: &'static str) {
         // D15: ask at first use, not at launch. This must happen on the main
         // thread before the capture job is posted: the missing piece that made
         // Scrozz report PermissionDenied in an invisible log without ever
@@ -1093,6 +1114,7 @@ impl App {
         }
 
         let card = self.pipeline.allocate();
+        tracing::debug!(%card, capture = kind.label(), origin, "capture job queued");
         if !self.pipeline.post(Job::Capture { kind, card }) {
             self.note("the capture worker has gone");
         }
@@ -2340,6 +2362,10 @@ mod tests {
             }),
             "a pre-native refusal left the card held"
         );
+        assert!(
+            app.take_modal_drag_input_release(),
+            "a failed handoff can still lose the release edge"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2439,5 +2465,25 @@ mod tests {
             "the same outcome was acted on twice: {:?}",
             surface.trace()
         );
+    }
+
+    #[test]
+    fn every_native_drag_outcome_requests_one_modal_input_release() {
+        for outcome in [
+            DragOutcome::Accepted(scrozz_shell::DragOperation::Copy),
+            DragOutcome::Cancelled,
+            DragOutcome::Rejected,
+            DragOutcome::Failed("test failure".to_owned()),
+        ] {
+            let (mut app, _) = app();
+            app.drag.adopt_finished(CardId(3), outcome);
+            app.drain_drags();
+
+            assert!(app.take_modal_drag_input_release());
+            assert!(
+                !app.take_modal_drag_input_release(),
+                "one drag ending requested more than one input reset"
+            );
+        }
     }
 }

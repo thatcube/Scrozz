@@ -87,8 +87,9 @@ pub struct GlobalArgs {
     /// Never hand the command to an already-running Scrozz instance.
     ///
     /// By default a capture taken while the menu-bar app is running is performed
-    /// *by* that app, so the result joins the existing capture stack instead of
-    /// starting a second copy of Scrozz. This forces the work to happen here.
+    /// *by* that app, so the result joins the existing Recent Captures Overlay
+    /// instead of starting a second copy of Scrozz. This forces the work to happen
+    /// here.
     #[arg(long, global = true)]
     pub no_ipc: bool,
 }
@@ -99,16 +100,16 @@ pub enum Command {
     /// Take a still capture.
     Capture(CaptureArgs),
 
-    /// Record the screen.
+    /// Record Screen.
     Record(RecordArgs),
 
     /// List what can be captured.
     List(ListArgs),
 
-    /// Work with the capture history.
+    /// Work with Capture History.
     History(HistoryArgs),
 
-    /// Recognise text in a capture or an image file.
+    /// Capture Text (OCR) from a capture or image file.
     Ocr(OcrArgs),
 
     /// Read and write settings.
@@ -322,7 +323,7 @@ pub struct TargetArgs {
     #[arg(long)]
     pub all_displays: bool,
 
-    /// Pick the target on screen. Defaults to a region.
+    /// Pick the target on screen. Defaults to Capture Area (`region`).
     ///
     /// On Wayland, interactive window selection requires a separate portal-owned
     /// capture handoff and is refused until that handoff is available.
@@ -339,13 +340,13 @@ pub struct TargetArgs {
 /// Which interactive picker to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum InteractiveMode {
-    /// Drag out a rectangle.
+    /// Capture Area by dragging out a rectangle.
     Region,
-    /// Click a window.
+    /// Capture Window by clicking it.
     Window,
-    /// Click a display.
+    /// Capture Fullscreen by clicking a display.
     Display,
-    /// Open the heads-up display with every capture mode available.
+    /// Open All-in-One… with every capture mode available.
     AllInOne,
 }
 
@@ -691,7 +692,7 @@ pub struct CaptureArgs {
     #[arg(long)]
     pub cursor: bool,
 
-    /// Wait this many seconds before capturing.
+    /// Self-Timer: wait this many seconds before capturing.
     ///
     /// `allow_hyphen_values` so that `--delay -1` reaches the validator and is
     /// rejected as a bad delay, rather than being reported by clap as an unknown
@@ -718,7 +719,7 @@ pub struct CaptureArgs {
     )]
     pub freeze: Option<bool>,
 
-    /// Start from the last region so it can be adjusted and captured again.
+    /// Capture Previous Area, opening the last area for adjustment first.
     #[arg(long)]
     pub retake: bool,
 
@@ -1267,7 +1268,7 @@ pub enum HotkeyAction {
     CaptureDisplay,
     /// Capture every display at once.
     CaptureAllDisplays,
-    /// Start recording a region.
+    /// Record Screen.
     RecordStart,
     /// Stop the recording in progress.
     RecordStop,
@@ -1348,11 +1349,11 @@ impl HotkeyAction {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::CaptureRegion => "Capture a region",
-            Self::CaptureWindow => "Capture a window",
-            Self::CaptureDisplay => "Capture the display under the pointer",
-            Self::CaptureAllDisplays => "Capture every display",
-            Self::RecordStart => "Start recording a region",
+            Self::CaptureRegion => scrozz_core::product_copy::CAPTURE_AREA,
+            Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
+            Self::CaptureDisplay => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
+            Self::CaptureAllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+            Self::RecordStart => scrozz_core::product_copy::RECORD_SCREEN,
             Self::RecordStop => "Stop recording",
         }
     }
@@ -1379,6 +1380,41 @@ mod tests {
         // Catches duplicate arg ids, bad group references and malformed
         // conflicts at test time rather than on a user's first invocation.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn help_uses_the_approved_capture_vocabulary_without_renaming_cli_values() {
+        let mut command = Cli::command();
+        let root_help = command.render_help().to_string();
+        assert!(root_help.contains(scrozz_core::product_copy::RECORD_SCREEN));
+        assert!(root_help.contains("Capture Text (OCR)"));
+        assert!(root_help.contains("Capture History"));
+
+        let capture = command
+            .find_subcommand_mut("capture")
+            .expect("capture subcommand");
+        let capture_help = capture.render_long_help().to_string();
+        for expected in [
+            scrozz_core::product_copy::CAPTURE_AREA,
+            scrozz_core::product_copy::CAPTURE_PREVIOUS_AREA,
+            scrozz_core::product_copy::SELF_TIMER,
+            scrozz_core::product_copy::ALL_IN_ONE,
+        ] {
+            assert!(
+                capture_help.contains(expected),
+                "{expected}\n{capture_help}"
+            );
+        }
+
+        assert_eq!(
+            InteractiveMode::Region.initial_mode(),
+            SelectionMode::Region
+        );
+        assert_eq!(HotkeyAction::CaptureRegion.slug(), "capture-region");
+        assert_eq!(
+            HotkeyAction::CaptureRegion.arguments(),
+            ["capture", "--interactive", "region"]
+        );
     }
 
     // -- dispatch ---------------------------------------------------------

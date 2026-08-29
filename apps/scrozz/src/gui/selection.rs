@@ -23,6 +23,7 @@ use scrozz_ui::{
 };
 
 const BRIDGE_POLL: Duration = Duration::from_millis(25);
+const INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A selector owned by the long-running app.
 ///
@@ -255,6 +256,30 @@ enum BridgeEvent {
     Cancel,
 }
 
+impl BridgeEvent {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::BeginCapture { .. } => "begin-capture",
+            Self::Begin { .. } => "begin-selection",
+            Self::Prepared { .. } => "prepared",
+            Self::PreparationFailed { .. } => "preparation-failed",
+            Self::CaptureFinished { .. } => "capture-finished",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    const fn id(&self) -> Option<u64> {
+        match self {
+            Self::BeginCapture { id, .. }
+            | Self::Begin { id, .. }
+            | Self::Prepared { id, .. }
+            | Self::PreparationFailed { id }
+            | Self::CaptureFinished { id, .. } => Some(*id),
+            Self::Cancel => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Completion {
     RestoreCards,
@@ -267,6 +292,7 @@ pub struct ClientOverlayController {
     phase: ControllerPhase,
     cards: OverlayGeometry,
     completion: Completion,
+    cancelled_preparations: Vec<u64>,
 }
 
 enum ControllerPhase {
@@ -293,6 +319,7 @@ enum ControllerPhase {
         prepared: Box<PreparedSelection>,
         decision: Sender<Result<SelectionOutcome>>,
         saw_quiet_frame: bool,
+        ready_since: Instant,
     },
     Selecting {
         id: u64,
@@ -305,6 +332,7 @@ enum ControllerPhase {
         decision: Sender<Result<SelectionOutcome>>,
         result: Result<SelectionOutcome>,
         viewports: SelectorViewports,
+        release_since: Instant,
     },
     HideAfterDecision {
         id: u64,
@@ -352,6 +380,7 @@ impl ClientOverlaySelector {
             phase: ControllerPhase::Cards,
             cards,
             completion,
+            cancelled_preparations: Vec::new(),
         };
         (selector, controller)
     }
@@ -646,15 +675,99 @@ impl ClientOverlayController {
 
     /// Advances lifecycle handshakes and applies viewport/native behavior.
     pub fn logic(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            // A one-shot worker can queue Begin before the first eframe pass.
+            // Drain it before acknowledging the hide, so Escape disconnects
+            // that handshake instead of starting native preparation anyway.
+            while let Ok(event) = self.events.try_recv() {
+                self.handle_event(ctx, native, event);
+            }
+            if self.cancel_pending_with_escape(ctx, native) {
+                native.refresh();
+                return;
+            }
+        }
         self.advance(ctx, native);
         while let Ok(event) = self.events.try_recv() {
             self.handle_event(ctx, native, event);
+        }
+        if self.cancel_pending_with_escape(ctx, native) {
+            native.refresh();
+            return;
         }
         native.refresh();
         if let Some(cursor) = self.pending_selection_cursor() {
             native.set_cursor(cursor);
             ctx.request_repaint();
         }
+    }
+
+    fn cancel_pending_with_escape(
+        &mut self,
+        ctx: &egui::Context,
+        native: &crate::gui::panel::BehaviorController,
+    ) -> bool {
+        if !ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            return false;
+        }
+
+        let phase = std::mem::replace(&mut self.phase, ControllerPhase::Cards);
+        match phase {
+            ControllerPhase::HideBeforePreparation { id, .. } => {
+                // Dropping the hidden acknowledgement disconnects the worker's
+                // receive before it can enter native preparation.
+                self.restore_cards_after_cancel(ctx, native);
+                tracing::debug!(
+                    capture_id = id,
+                    phase = "hide-before-preparation",
+                    "selection cancelled"
+                );
+                true
+            }
+            ControllerPhase::WaitingForPreparation { id, .. }
+            | ControllerPhase::PreparingWithCards { id, .. } => {
+                self.cancelled_preparations.push(id);
+                self.restore_cards_after_cancel(ctx, native);
+                tracing::debug!(capture_id = id, phase = "preparing", "selection cancelled");
+                true
+            }
+            ControllerPhase::ReadyToSelect {
+                id,
+                prepared,
+                decision,
+                ..
+            } => {
+                native.set_cursor(OverlayCursor::Arrow);
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                prepared.viewports.hide_and_release_input(ctx);
+                let _ = decision.send(Err(Error::Cancelled));
+                self.phase = ControllerPhase::AwaitingCapture { id };
+                tracing::debug!(capture_id = id, phase = "ready", "selection cancelled");
+                true
+            }
+            other => {
+                self.phase = other;
+                false
+            }
+        }
+    }
+
+    fn restore_cards_after_cancel(
+        &mut self,
+        ctx: &egui::Context,
+        native: &crate::gui::panel::BehaviorController,
+    ) {
+        native.set_cursor(OverlayCursor::Arrow);
+        native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+        if self.completion == Completion::CloseWindow {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else {
+            configure_viewport(ctx, native, self.cards, false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        ctx.request_repaint();
+        self.phase = ControllerPhase::Cards;
     }
 
     fn pending_selection_cursor(&self) -> Option<OverlayCursor> {
@@ -667,6 +780,22 @@ impl ClientOverlayController {
             _ => return None,
         };
         (cursor == OverlayCursor::Crosshair).then_some(cursor)
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.phase {
+            ControllerPhase::Cards => "cards",
+            ControllerPhase::HideBeforeCapture { .. } => "hide-before-capture",
+            ControllerPhase::HideBeforePreparation { .. } => "hide-before-preparation",
+            ControllerPhase::WaitingForPreparation { .. } => "waiting-for-preparation",
+            ControllerPhase::PreparingWithCards { .. } => "preparing-with-cards",
+            ControllerPhase::ReadyToSelect { .. } => "ready-to-select",
+            ControllerPhase::Selecting { .. } => "selecting",
+            ControllerPhase::ReleaseBeforeHide { .. } => "release-before-hide",
+            ControllerPhase::HideAfterDecision { .. } => "hide-after-decision",
+            ControllerPhase::AwaitingCapture { .. } => "awaiting-capture",
+            ControllerPhase::RestoringCards { .. } => "restoring-cards",
+        }
     }
 
     /// Draws the selector when a prepared selection owns the window.
@@ -726,6 +855,7 @@ impl ClientOverlayController {
                 decision,
                 result,
                 viewports,
+                release_since: Instant::now(),
             };
         }
     }
@@ -755,10 +885,22 @@ impl ClientOverlayController {
                 prepared,
                 decision,
                 saw_quiet_frame,
+                ready_since,
             } => {
                 let quiet = input_is_quiescent(ctx, egui::ViewportId::ROOT);
                 if quiet && saw_quiet_frame {
                     activate_selection(ctx, native, id, prepared, decision)
+                } else if ready_since.elapsed() >= INPUT_DRAIN_TIMEOUT {
+                    tracing::warn!(
+                        capture_id = id,
+                        phase = "ready",
+                        "selector input did not settle before the lifecycle deadline; cancelling"
+                    );
+                    native.set_cursor(OverlayCursor::Arrow);
+                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    prepared.viewports.hide_and_release_input(ctx);
+                    let _ = decision.send(Err(Error::Cancelled));
+                    ControllerPhase::AwaitingCapture { id }
                 } else {
                     ctx.request_repaint();
                     ControllerPhase::ReadyToSelect {
@@ -766,6 +908,7 @@ impl ClientOverlayController {
                         prepared,
                         decision,
                         saw_quiet_frame: quiet,
+                        ready_since,
                     }
                 }
             }
@@ -774,17 +917,28 @@ impl ClientOverlayController {
                 decision,
                 result,
                 viewports,
+                release_since,
             } => {
                 native.set_cursor(OverlayCursor::Arrow);
-                if !selector_input_is_quiescent(ctx, &viewports) {
+                if !selector_input_is_quiescent(ctx, &viewports)
+                    && release_since.elapsed() < INPUT_DRAIN_TIMEOUT
+                {
                     ctx.request_repaint();
                     ControllerPhase::ReleaseBeforeHide {
                         id,
                         decision,
                         result,
                         viewports,
+                        release_since,
                     }
                 } else {
+                    if !selector_input_is_quiescent(ctx, &viewports) {
+                        tracing::warn!(
+                            capture_id = id,
+                            phase = "release",
+                            "selector input release timed out; forcing overlay cleanup"
+                        );
+                    }
                     native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     viewports.hide_and_release_input(ctx);
                     ControllerPhase::HideAfterDecision {
@@ -817,6 +971,12 @@ impl ClientOverlayController {
         native: &crate::gui::panel::BehaviorController,
         event: BridgeEvent,
     ) {
+        tracing::debug!(
+            selector_phase = self.phase_name(),
+            selector_event = event.name(),
+            capture_id = ?event.id(),
+            "selector lifecycle event"
+        );
         match event {
             BridgeEvent::BeginCapture {
                 id,
@@ -876,6 +1036,7 @@ impl ClientOverlayController {
                     prepared,
                     decision,
                     saw_quiet_frame: false,
+                    ready_since: Instant::now(),
                 };
             }
             BridgeEvent::Prepared {
@@ -892,7 +1053,24 @@ impl ClientOverlayController {
                     prepared,
                     decision,
                     saw_quiet_frame: false,
+                    ready_since: Instant::now(),
                 };
+            }
+            BridgeEvent::Prepared { id, decision, .. }
+                if self.cancelled_preparations.contains(&id) =>
+            {
+                self.cancelled_preparations
+                    .retain(|cancelled| *cancelled != id);
+                let _ = decision.send(Err(Error::Cancelled));
+                tracing::debug!(
+                    capture_id = id,
+                    "discarded preparation completed after cancellation"
+                );
+            }
+            BridgeEvent::PreparationFailed { id } if self.cancelled_preparations.contains(&id) => {
+                self.cancelled_preparations
+                    .retain(|cancelled| *cancelled != id);
+                tracing::debug!(capture_id = id, "preparation failed after cancellation");
             }
             BridgeEvent::PreparationFailed { id }
                 if matches!(
@@ -938,9 +1116,16 @@ impl ClientOverlayController {
                     self.phase = ControllerPhase::RestoringCards { restored };
                 }
             }
-            BridgeEvent::CaptureFinished { restored, .. }
+            BridgeEvent::CaptureFinished { id, restored }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
+                self.cancelled_preparations
+                    .retain(|cancelled| *cancelled != id);
+                if self.completion == Completion::CloseWindow {
+                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 let _ = restored.send(());
             }
             BridgeEvent::Cancel => {
@@ -965,6 +1150,25 @@ impl ClientOverlayController {
             }
         }
     }
+}
+
+/// Clears persistent input left behind by a platform-owned modal drag loop.
+///
+/// Both AppKit and `DoDragDrop` may consume the mouse-up and modifier-release
+/// events that terminate a drag. egui otherwise keeps those inputs down forever,
+/// and the next selection's launch-click barrier can never become quiescent.
+pub fn release_modal_drag_input(ctx: &egui::Context) {
+    ctx.input_mut_for(egui::ViewportId::ROOT, |input| {
+        let had_stale_input = input.pointer.any_down()
+            || !input.keys_down.is_empty()
+            || input.modifiers != egui::Modifiers::NONE;
+        input.pointer = egui::PointerState::default();
+        input.keys_down.clear();
+        input.modifiers = egui::Modifiers::NONE;
+        if had_stale_input {
+            tracing::debug!("retired input state consumed by the native drag loop");
+        }
+    });
 }
 
 fn selection_cursor(options: &SelectionOptions) -> OverlayCursor {
@@ -1440,6 +1644,26 @@ mod tests {
             server,
             compositor,
             desktop: String::new(),
+        }
+    }
+
+    fn prepared_region(options: SelectionOptions) -> PreparedSelection {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let displays = vec![Display {
+            id: DisplayId("main".to_owned()),
+            name: "Main".to_owned(),
+            bounds,
+            work_area: bounds,
+            scale: ScaleFactor::new(2.0),
+            is_primary: true,
+        }];
+        PreparedSelection {
+            viewports: selector_viewports_for(&displays, false).expect("test display has geometry"),
+            options,
+            displays,
+            windows: Vec::new(),
+            frozen: Vec::new(),
+            frozen_sources: Vec::new(),
         }
     }
 
@@ -2104,6 +2328,270 @@ mod tests {
                 "{key:?} release must unlock selector focus restoration"
             );
         }
+    }
+
+    #[test]
+    fn modal_drag_input_release_unblocks_the_next_region_selection() {
+        let prepare: Arc<PrepareFn> = Arc::new(|options, _| Ok(prepared_region(options)));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        let pointer = egui::pos2(60.0, 60.0);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                ],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        assert!(ctx.input(|input| input.pointer.any_down()));
+
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select_for_capture(
+                &SelectionOptions::region(),
+                CursorMode::Hidden,
+                false,
+            );
+            worker_selector.capture_finished();
+            result
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::ReadyToSelect { .. })
+        });
+        controller.logic(&ctx, &native);
+        assert!(
+            matches!(&controller.phase, ControllerPhase::ReadyToSelect { .. }),
+            "the launch barrier should still see the drag's swallowed release"
+        );
+
+        release_modal_drag_input(&ctx);
+        assert!(input_is_quiescent(&ctx, egui::ViewportId::ROOT));
+        controller.logic(&ctx, &native);
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::Selecting { .. }
+        ));
+
+        selector.cancel();
+        controller.logic(&ctx, &native);
+        assert!(worker.join().expect("selection worker").is_err());
+    }
+
+    #[test]
+    fn escape_unwinds_a_region_waiting_at_the_input_barrier() {
+        let prepare: Arc<PrepareFn> = Arc::new(|options, _| Ok(prepared_region(options)));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select_for_capture(
+                &SelectionOptions::region(),
+                CursorMode::Hidden,
+                false,
+            );
+            worker_selector.capture_finished();
+            result
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::ReadyToSelect { .. })
+        });
+
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
+        ));
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Cards)
+        });
+        assert!(worker.join().expect("selection worker").is_err());
+    }
+
+    #[test]
+    fn escape_also_cancels_a_begin_event_queued_on_the_same_frame() {
+        let prepare: Arc<PrepareFn> = Arc::new(|options, _| Ok(prepared_region(options)));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select_for_capture(
+                &SelectionOptions::region(),
+                CursorMode::Hidden,
+                false,
+            );
+            worker_selector.capture_finished();
+            result
+        });
+        wait_until(|| {
+            selector
+                .gate
+                .0
+                .lock()
+                .is_ok_and(|gate| gate.active.is_some())
+        });
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+
+        controller.logic(&ctx, &native);
+        assert!(
+            matches!(&controller.phase, ControllerPhase::Cards),
+            "queued Begin escaped cancellation and entered {:?}",
+            controller.phase_name()
+        );
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Cards)
+                && selector
+                    .gate
+                    .0
+                    .lock()
+                    .is_ok_and(|gate| gate.active.is_none())
+        });
+        assert!(worker.join().expect("selection worker").is_err());
+    }
+
+    #[test]
+    fn cancelled_one_shot_capture_closes_when_its_worker_finishes() {
+        let prepare: Arc<PrepareFn> = Arc::new(|options, _| Ok(prepared_region(options)));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::CloseWindow,
+            prepare,
+        );
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        let (restored_tx, restored_rx) = channel();
+        selector
+            .events
+            .send(BridgeEvent::CaptureFinished {
+                id: 1,
+                restored: restored_tx,
+            })
+            .expect("controller receiver");
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            controller.logic(&ctx, &native);
+        });
+        output.textures_delta.clear();
+
+        restored_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("one-shot restoration acknowledgement");
+        assert!(
+            output
+                .viewport_output
+                .into_values()
+                .flat_map(|viewport| viewport.commands)
+                .any(|command| matches!(command, egui::ViewportCommand::Close))
+        );
+    }
+
+    #[test]
+    fn an_input_barrier_deadline_cancels_instead_of_holding_the_overlay() {
+        let prepare: Arc<PrepareFn> = Arc::new(|options, _| Ok(prepared_region(options)));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            prepare,
+        );
+        let ctx = egui::Context::default();
+        let native = crate::gui::panel::BehaviorController::default();
+        let pointer = egui::pos2(60.0, 60.0);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        output.textures_delta.clear();
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select_for_capture(
+                &SelectionOptions::region(),
+                CursorMode::Hidden,
+                false,
+            );
+            worker_selector.capture_finished();
+            result
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::ReadyToSelect { .. })
+        });
+        if let ControllerPhase::ReadyToSelect { ready_since, .. } = &mut controller.phase {
+            *ready_since = Instant::now() - INPUT_DRAIN_TIMEOUT;
+        }
+
+        controller.logic(&ctx, &native);
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
+        ));
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(&controller.phase, ControllerPhase::Cards)
+        });
+        assert!(worker.join().expect("selection worker").is_err());
     }
 
     #[test]

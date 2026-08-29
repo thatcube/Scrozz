@@ -296,7 +296,7 @@ fn window_mode_enter_selects_the_hovered_window() {
     assert!(state.set_mode(SelectionMode::Window));
     assert_eq!(
         state.take_announcement().unwrap().0,
-        "Window mode. Point at a window to choose it"
+        "Capture Window. Point at a window to capture it"
     );
     state.hover(LogicalPoint::new(144.0, 120.0));
 

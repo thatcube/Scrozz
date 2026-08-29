@@ -723,9 +723,48 @@ fn native_menu_keeps_every_implemented_capture_action_enabled() {
 
 #[test]
 fn the_recording_entry_says_what_the_click_will_do() {
-    assert_eq!(recording_label(false), "Start Recording");
+    assert_eq!(
+        recording_label(false),
+        scrozz_core::product_copy::RECORD_SCREEN
+    );
     assert_eq!(recording_label(true), "Stop Recording");
     assert_eq!(TrayAction::ToggleRecording.label(), recording_label(false));
+}
+
+#[test]
+fn menu_copy_matches_the_product_vocabulary() {
+    use scrozz_core::product_copy;
+
+    assert_eq!(
+        TrayAction::CaptureAllInOne.label(),
+        product_copy::ALL_IN_ONE
+    );
+    assert_eq!(
+        TrayAction::CaptureRegion.label(),
+        product_copy::CAPTURE_AREA
+    );
+    assert_eq!(
+        TrayAction::CaptureWindow.label(),
+        product_copy::CAPTURE_WINDOW
+    );
+    assert_eq!(
+        TrayAction::CaptureFullscreen.label(),
+        product_copy::CAPTURE_FULLSCREEN
+    );
+    assert_eq!(
+        TrayAction::CaptureAllDisplays.label(),
+        product_copy::CAPTURE_ALL_DISPLAYS
+    );
+    assert_eq!(
+        TrayAction::ToggleRecording.label(),
+        product_copy::RECORD_SCREEN
+    );
+    assert_eq!(
+        TrayAction::OpenHistory.label(),
+        product_copy::CAPTURE_HISTORY
+    );
+    assert_eq!(TrayAction::OpenSettings.label(), product_copy::SETTINGS);
+    assert_eq!(TrayAction::Quit.label(), product_copy::QUIT_SCROZZ);
 }
 
 #[test]

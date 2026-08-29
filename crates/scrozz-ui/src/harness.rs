@@ -259,6 +259,8 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// The annotation editor with its anchored quick-colour palette open.
+    EditorColorPopover,
     /// The selector overlay at rest before a drag begins.
     SelectorIdle,
     /// The selector overlay while a freehand region is being dragged.
@@ -291,6 +293,7 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::EditorColorPopover,
             Self::SelectorIdle,
             Self::SelectorDragging,
             Self::SelectorRemembered,
@@ -318,6 +321,7 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::EditorColorPopover => "editor-color-popover",
             Self::SelectorIdle => "selector-idle",
             Self::SelectorDragging => "selector-dragging",
             Self::SelectorRemembered => "selector-remembered",
@@ -779,6 +783,16 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::EditorColorPopover => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Choose a colour without losing the canvas",
+                    "The anchored quick-colour palette floats beside the compact toolbar control without shifting editor layout.",
+                    instants::REST,
+                    None,
+                ),
                 Scenario::SelectorIdle => (
                     Vec::new(),
                     Gesture::None,
@@ -862,7 +876,7 @@ impl Fixture {
             };
 
         let size_pt = match scenario {
-            Scenario::EditorAnnotating => (900.0, 620.0),
+            Scenario::EditorAnnotating | Scenario::EditorColorPopover => (900.0, 620.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
             | Scenario::SelectorRemembered
@@ -903,7 +917,7 @@ impl Fixture {
     /// Builds `n` cards deterministically from `seed`.
     fn cards(seed: u64, n: usize) -> Vec<CardState> {
         const TITLES: [(&str, CardKind); 6] = [
-            ("Region", CardKind::Image),
+            ("Area", CardKind::Image),
             ("Safari — Pricing", CardKind::Image),
             ("Screen recording", CardKind::Video),
             ("Scrolling capture", CardKind::ScrollingCapture),
@@ -2013,10 +2027,9 @@ impl SceneRegistry {
         ] {
             me.register(scenario, Box::new(crate::select::SelectionScene));
         }
-        me.register(
-            Scenario::EditorAnnotating,
-            Box::new(crate::editor::EditorScene),
-        );
+        for scenario in [Scenario::EditorAnnotating, Scenario::EditorColorPopover] {
+            me.register(scenario, Box::new(crate::editor::EditorScene));
+        }
         me
     }
 
@@ -3796,6 +3809,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::EditorColorPopover,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

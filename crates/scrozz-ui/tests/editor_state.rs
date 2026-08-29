@@ -12,7 +12,8 @@ use scrozz_core::{
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
 use scrozz_ui::editor::{
-    Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_SIZE, MIN_ZOOM, TextEdit, Tool,
+    Caret, Command, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, TextEdit,
+    Tool,
 };
 
 /// A flat capture, 400x300 logical at 2x, big enough that the minimum-size
@@ -139,6 +140,170 @@ fn a_drawing_tool_stays_in_hand_after_a_stroke() {
     state.set_tool(Tool::Arrow);
     drag(&mut state, at(10.0, 10.0), at(90.0, 70.0));
     assert_eq!(state.tool(), Tool::Arrow, "the tool reverted after one use");
+}
+
+fn arrow_state() -> EditorState {
+    let mut state = state();
+    state.set_tool(Tool::Arrow);
+    drag(&mut state, at(40.0, 60.0), at(200.0, 160.0));
+    state
+}
+
+fn arrow_points(state: &EditorState) -> (LogicalPoint, LogicalPoint) {
+    match state.document().annotations()[0].annotation {
+        Annotation::Arrow { from, to } => (from, to),
+        _ => panic!("the fixture is not an arrow"),
+    }
+}
+
+#[test]
+fn an_arrow_has_no_handles_unselected_and_exactly_two_selected() {
+    let mut state = arrow_state();
+    assert_eq!(
+        state.selection_handles(),
+        vec![
+            (Handle::ArrowStart, at(40.0, 60.0)),
+            (Handle::ArrowEnd, at(200.0, 160.0)),
+        ]
+    );
+
+    state.select(None);
+    assert!(state.selection_handles().is_empty());
+}
+
+#[test]
+fn the_arrow_tool_selects_an_existing_arrow_without_switching_tools() {
+    let mut state = arrow_state();
+    let id = state.document().annotations()[0].id;
+    state.select(None);
+
+    state.pointer_pressed(at(120.0, 110.0));
+    state.pointer_released();
+
+    assert_eq!(state.selection(), Some(id));
+    assert_eq!(state.tool(), Tool::Arrow);
+    assert_eq!(state.document().len(), 1, "the click created another arrow");
+}
+
+#[test]
+fn either_arrow_endpoint_can_be_dragged_directly() {
+    for (handle, moved) in [
+        (Handle::ArrowStart, at(20.0, 30.0)),
+        (Handle::ArrowEnd, at(250.0, 190.0)),
+    ] {
+        let mut state = arrow_state();
+        let before = arrow_points(&state);
+        let grab = state
+            .selection_handles()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == handle)
+            .map(|(_, point)| point)
+            .expect("the endpoint handle exists");
+
+        drag(&mut state, grab, moved);
+
+        let after = arrow_points(&state);
+        match handle {
+            Handle::ArrowStart => {
+                assert_eq!(after.0, moved);
+                assert_eq!(after.1, before.1);
+            }
+            Handle::ArrowEnd => {
+                assert_eq!(after.0, before.0);
+                assert_eq!(after.1, moved);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(state.tool(), Tool::Arrow);
+        assert_eq!(state.selection_handles().len(), 2);
+    }
+}
+
+#[test]
+fn overlapping_arrow_handles_choose_the_nearest_endpoint() {
+    let mut state = state();
+    state.set_tool(Tool::Arrow);
+    drag(&mut state, at(100.0, 100.0), at(103.0, 100.0));
+    assert_eq!(state.selection_handles().len(), 2);
+
+    drag(&mut state, at(103.0, 100.0), at(120.0, 100.0));
+
+    assert_eq!(arrow_points(&state), (at(100.0, 100.0), at(120.0, 100.0)));
+}
+
+#[test]
+fn dragging_an_arrow_body_moves_both_endpoints_in_arrow_mode() {
+    let mut state = arrow_state();
+    let before = arrow_points(&state);
+
+    drag(&mut state, at(120.0, 110.0), at(150.0, 130.0));
+
+    let after = arrow_points(&state);
+    assert_eq!(after.0, at(before.0.x + 30.0, before.0.y + 20.0));
+    assert_eq!(after.1, at(before.1.x + 30.0, before.1.y + 20.0));
+    assert_eq!(state.tool(), Tool::Arrow);
+}
+
+#[test]
+fn empty_arrow_clicks_and_subthreshold_drags_create_nothing() {
+    let mut state = state();
+    state.set_tool(Tool::Arrow);
+
+    state.pointer_pressed(at(280.0, 220.0));
+    state.pointer_released();
+    drag(
+        &mut state,
+        at(280.0, 220.0),
+        at(280.0 + MIN_DRAG / 2.0, 220.0),
+    );
+    assert!(state.document().is_empty());
+
+    drag(
+        &mut state,
+        at(280.0, 220.0),
+        at(280.0 + MIN_DRAG * 2.0, 220.0),
+    );
+    assert_eq!(state.document().len(), 1);
+    assert_eq!(state.tool(), Tool::Arrow);
+}
+
+#[test]
+fn arrow_endpoint_hit_targets_stay_screen_sized_across_zoom() {
+    let mut state = arrow_state();
+    let endpoint = arrow_points(&state).1;
+
+    state.set_view_scale(0.25);
+    assert_eq!(
+        state.handle_at(at(endpoint.x + 20.0, endpoint.y)),
+        Some(Handle::ArrowEnd),
+        "a 5pt screen offset should still reach the endpoint when zoomed out"
+    );
+
+    state.set_view_scale(4.0);
+    assert_eq!(
+        state.handle_at(at(endpoint.x + 1.0, endpoint.y)),
+        Some(Handle::ArrowEnd)
+    );
+    assert_eq!(
+        state.handle_at(at(endpoint.x + 5.0, endpoint.y)),
+        None,
+        "a 20pt screen offset should not hit an oversized invisible target"
+    );
+}
+
+#[test]
+fn one_endpoint_drag_is_one_undo_step() {
+    let mut state = arrow_state();
+    let before = arrow_points(&state);
+    let depth = state.undo_depth();
+    let start = before.0;
+
+    drag(&mut state, start, at(10.0, 20.0));
+
+    assert_eq!(state.undo_depth(), depth + 1);
+    state.command(Command::Undo).expect("undo endpoint drag");
+    assert_eq!(arrow_points(&state), before);
+    assert_eq!(state.tool(), Tool::Arrow);
 }
 
 // ---------------------------------------------------------------------------

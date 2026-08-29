@@ -192,7 +192,7 @@ non-destructive. This is the single largest surface area in the product.
 
 ---
 
-## 5. Quick Access Overlay
+## 5. Recent Captures Overlay
 
 The post-capture floating thumbnail. Small surface, enormous share of daily-use satisfaction.
 
@@ -453,8 +453,8 @@ The Shortcuts tab shows CleanShot binds *composite actions*, not just modes:
 - Capture Area & Save
 - **Capture Previous Area** — re-shoot the last region without reselecting
 - **Restore Last Capture** — bring back the overlay you just dismissed
-- Toggle Desktop Icons
-- Open Capture History
+- Hide Desktop Icons
+- Capture History…
 
 > **Implication for Scrozz.** These map one-to-one onto D11's CLI: every
 > composite action is a CLI invocation with flags, and a keybinding is just a way

@@ -275,6 +275,27 @@ fn annotations_change_the_rendered_pixels() {
 }
 
 #[test]
+fn arrow_selection_handles_never_enter_the_rendered_output() {
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Arrow);
+    editor
+        .state_mut()
+        .pointer_pressed(LogicalPoint::new(40.0, 40.0));
+    editor
+        .state_mut()
+        .pointer_dragged(LogicalPoint::new(180.0, 120.0), false);
+    editor.state_mut().pointer_released();
+    assert_eq!(editor.state().selection_handles().len(), 2);
+    let selected = editor.render().expect("selected render");
+
+    editor.state_mut().select(None);
+    let unselected = editor.render().expect("unselected render");
+
+    assert_eq!(selected.revision(), unselected.revision());
+    assert_eq!(selected.frame().data, unselected.frame().data);
+}
+
+#[test]
 fn rendering_twice_gives_the_same_bytes() {
     let mut editor = editor();
     editor.state_mut().set_tool(Tool::Arrow);

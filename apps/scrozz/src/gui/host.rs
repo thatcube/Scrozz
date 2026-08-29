@@ -269,6 +269,8 @@ impl Host for Windowed {
                     settings: scrozz_ui::settings::SettingsWindow::default(),
                     editor: scrozz_ui::editor::EditorWindow::new(),
                     editing: None,
+                    color_picker: scrozz_shell::SystemColorPicker::default(),
+                    color_picker_generation: None,
                     native,
                     display_id,
                     pointer_geometry,
@@ -453,6 +455,9 @@ struct Driver {
     editor: scrozz_ui::editor::EditorWindow,
     /// The editor's document, and the card it came from.
     editing: Option<Editing>,
+    color_picker: scrozz_shell::SystemColorPicker,
+    /// Editor generation that opened the modeless system colour panel.
+    color_picker_generation: Option<u64>,
     native: BehaviorController,
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
@@ -493,12 +498,42 @@ impl Driver {
         self.app
             .set_keyboard_owner(KeyboardOwner::Editor, self.editor.is_open());
 
+        let picker_event = match self.color_picker.poll() {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(%error, "the system colour picker could not be read");
+                None
+            }
+        };
+
         let Some(editing) = self.editing.as_mut() else {
             return;
         };
         let card = editing.card;
         let generation = editing.generation;
         let editor = &mut editing.editor;
+        if let Some(event) = picker_event {
+            match event {
+                scrozz_shell::ColorPickerEvent::Changed([r, g, b, a])
+                    if self.color_picker_generation == Some(generation) =>
+                {
+                    editor.apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
+                }
+                scrozz_shell::ColorPickerEvent::Closed {
+                    color: [r, g, b, a],
+                    changed,
+                } => {
+                    if self.color_picker_generation == Some(generation) {
+                        if changed {
+                            editor.apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
+                        }
+                        self.editor.request_foreground();
+                    }
+                    self.color_picker_generation = None;
+                }
+                scrozz_shell::ColorPickerEvent::Changed(_) => {}
+            }
+        }
         let mut intent = Intent::None;
         self.editor.show(ctx, |ui| {
             let got = editor.update(ui);
@@ -520,11 +555,32 @@ impl Driver {
                 }
                 Err(error) => tracing::warn!(%error, "the annotated image could not be rendered"),
             },
+            Intent::CustomColor => {
+                let color = editor.state().stroke_color();
+                match self.color_picker.open([color.r, color.g, color.b, color.a]) {
+                    Ok(true) => {
+                        self.color_picker_generation = Some(generation);
+                        editor.native_color_picker_started();
+                    }
+                    Ok(false) => editor.open_custom_color_fallback(),
+                    Err(error) => {
+                        tracing::warn!(%error, "the system colour picker could not open");
+                        editor.open_custom_color_fallback();
+                    }
+                }
+            }
         }
 
         self.app
             .prepare_editor(EditorSnapshot::new(card, generation, editor));
+        if self.color_picker.is_open() {
+            ctx.request_repaint_after(IDLE);
+        }
         if !self.editor.is_open() {
+            if let Err(error) = self.color_picker.close() {
+                tracing::warn!(%error, "the system colour picker could not close");
+            }
+            self.color_picker_generation = None;
             self.editing = None;
         }
     }
@@ -641,10 +697,17 @@ impl eframe::App for Driver {
             .as_ref()
             .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor));
         let tick = self.app.tick_with_editor(editor);
+        if self.app.take_modal_drag_input_release() {
+            crate::gui::selection::release_modal_drag_input(ctx);
+        }
         if self.app.take_settings_request() {
             self.settings.open();
         }
         if let Some(request) = self.app.take_editor_request() {
+            if let Err(error) = self.color_picker.close() {
+                tracing::warn!(%error, "the system colour picker could not close");
+            }
+            self.color_picker_generation = None;
             let title = format!("{}", request.card);
             self.editing = Some(Editing {
                 card: request.card,
@@ -653,7 +716,7 @@ impl eframe::App for Driver {
                     request.capture,
                 )),
             });
-            self.editor.open(title);
+            let _ = self.editor.open(title);
         }
         if !self.stopped && tick == Tick::Stop {
             self.stopped = true;

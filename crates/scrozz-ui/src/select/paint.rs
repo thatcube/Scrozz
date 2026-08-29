@@ -22,8 +22,10 @@ use super::{
     state::SelectionState,
 };
 
-const HUD_HEIGHT: f32 = 84.0;
+const HUD_TOP: f32 = 32.0;
 const BUTTON_HEIGHT: f32 = 34.0;
+const HUD_BUTTON_WIDTH: f32 = 160.0;
+const HUD_MIN_BUTTON_WIDTH: f32 = 148.0;
 const HANDLE_SIZE: f32 = 10.0;
 const FULL_UV: Rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
 
@@ -454,9 +456,9 @@ fn draw_size_readout(
             WidgetType::Button,
             true,
             if confirms {
-                format!("Capture selected region, {label}")
+                format!("Capture selected area, {label}")
             } else {
-                format!("Selected region, {label}")
+                format!("Selected area, {label}")
             },
         )
     });
@@ -569,15 +571,13 @@ fn draw_hud(
     state: &SelectionState,
 ) -> HudPaintResult {
     let entries = hud.entries();
-    let width = 98.0 * entries.len() as f32
-        + Space::SM * (entries.len().saturating_sub(1)) as f32
-        + Space::XL * 2.0;
+    let layout = hud_layout(canvas_rect.width(), entries.len());
     let rect = Rect::from_min_size(
         pos2(
-            canvas_rect.center().x - width / 2.0,
+            canvas_rect.center().x - layout.width / 2.0,
             canvas_rect.top() + Space::LG,
         ),
-        vec2(width, HUD_HEIGHT),
+        vec2(layout.width, layout.height),
     );
     chrome::glass_panel(ui.painter(), rect, Radius::CARD, &theme.palette, true);
     ui.painter().text(
@@ -592,15 +592,20 @@ fn draw_hud(
         .ctx()
         .pointer_latest_pos()
         .is_some_and(|pointer| rect.contains(pointer));
-    let mut x = rect.left() + Space::XL;
-    for entry in entries {
-        let button_rect =
-            Rect::from_min_size(pos2(x, rect.top() + 32.0), vec2(98.0, BUTTON_HEIGHT));
+    for (index, entry) in entries.into_iter().enumerate() {
+        let column = index % layout.columns;
+        let row = index / layout.columns;
+        let button_rect = Rect::from_min_size(
+            pos2(
+                rect.left() + Space::XL + column as f32 * (layout.button_width + Space::SM),
+                rect.top() + HUD_TOP + row as f32 * (BUTTON_HEIGHT + Space::SM),
+            ),
+            vec2(layout.button_width, BUTTON_HEIGHT),
+        );
         let response = hud_button(ui, button_rect, theme, entry);
         if response.clicked() && entry.enabled {
             action = OverlayAction::Mode(entry.mode);
         }
-        x += 98.0 + Space::SM;
     }
     HudPaintResult {
         action,
@@ -608,8 +613,42 @@ fn draw_hud(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HudLayout {
+    columns: usize,
+    button_width: f32,
+    width: f32,
+    height: f32,
+}
+
+fn hud_layout(canvas_width: f32, entries: usize) -> HudLayout {
+    let usable = (canvas_width - Space::SM * 2.0).max(Space::XL * 2.0 + 1.0);
+    let max_columns = ((((usable - Space::XL * 2.0).max(1.0) + Space::SM)
+        / (HUD_MIN_BUTTON_WIDTH + Space::SM))
+        .floor() as usize)
+        .clamp(1, entries.max(1));
+    let columns = max_columns;
+    let rows = entries.div_ceil(columns);
+    let button_width = ((usable - Space::XL * 2.0 - Space::SM * columns.saturating_sub(1) as f32)
+        / columns as f32)
+        .clamp(1.0, HUD_BUTTON_WIDTH);
+    let width = button_width * columns as f32
+        + Space::SM * columns.saturating_sub(1) as f32
+        + Space::XL * 2.0;
+    let height = HUD_TOP
+        + BUTTON_HEIGHT * rows as f32
+        + Space::SM * rows.saturating_sub(1) as f32
+        + Space::LG;
+    HudLayout {
+        columns,
+        button_width,
+        width,
+        height,
+    }
+}
+
 fn hud_title(state: &SelectionState) -> String {
-    let mut parts = vec![format!("{} mode", state.mode().label())];
+    let mut parts = vec![state.mode().label().to_owned()];
     if let Some(exact) = state.options_ref().constraint.exact {
         parts.push(format!("{} × {}", exact.width as i32, exact.height as i32));
     }
@@ -743,5 +782,21 @@ mod tests {
     #[test]
     fn all_in_one_keeps_its_targeting_scrim() {
         assert!(should_draw_scrim(true));
+    }
+
+    #[test]
+    fn all_in_one_wraps_before_narrow_viewports_clip_commands() {
+        let wide = hud_layout(800.0, 4);
+        assert_eq!(wide.columns, 4);
+        assert!(wide.width <= 800.0);
+
+        let narrow = hud_layout(380.0, 4);
+        assert_eq!(narrow.columns, 2);
+        assert!(narrow.width <= 380.0);
+        assert!(narrow.button_width >= HUD_MIN_BUTTON_WIDTH);
+
+        let portrait = hud_layout(280.0, 4);
+        assert_eq!(portrait.columns, 1);
+        assert!(portrait.width <= 280.0);
     }
 }

@@ -591,7 +591,7 @@ fn accessibility_activation_commits_the_current_non_region_target() {
         .iter()
         .find(|(_, node)| {
             node.label()
-                .is_some_and(|label| label.starts_with("Selection overlay, All displays mode"))
+                .is_some_and(|label| label.starts_with("Selection overlay, Capture All Displays"))
         })
         .map(|(id, _)| *id)
         .expect("the selector canvas should be an accessible control");

@@ -286,6 +286,46 @@ mod tests {
     }
 
     #[test]
+    fn shortcuts_hud_and_menu_share_the_approved_capture_copy() {
+        use scrozz_core::product_copy;
+
+        for (shortcut, mode, expected) in [
+            (
+                ShortcutAction::CaptureRegion,
+                SelectionMode::Region,
+                product_copy::CAPTURE_AREA,
+            ),
+            (
+                ShortcutAction::CaptureWindow,
+                SelectionMode::Window,
+                product_copy::CAPTURE_WINDOW,
+            ),
+            (
+                ShortcutAction::CaptureFullscreen,
+                SelectionMode::Display,
+                product_copy::CAPTURE_FULLSCREEN,
+            ),
+            (
+                ShortcutAction::CaptureAllDisplays,
+                SelectionMode::AllDisplays,
+                product_copy::CAPTURE_ALL_DISPLAYS,
+            ),
+        ] {
+            assert_eq!(shortcut.label(), expected);
+            assert_eq!(shortcut.tray().label(), expected);
+            assert_eq!(mode.label(), expected);
+        }
+        assert_eq!(
+            ShortcutAction::CaptureAllInOne.label(),
+            product_copy::ALL_IN_ONE
+        );
+        assert_eq!(
+            ShortcutAction::ToggleRecording.label(),
+            product_copy::RECORD_SCREEN
+        );
+    }
+
+    #[test]
     fn the_actions_without_shortcuts_are_the_ones_reachable_from_the_tray() {
         for action in Action::all() {
             let bindable = action.shortcut().is_some();

@@ -146,10 +146,10 @@ impl SelectionMode {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Region => "Region",
-            Self::Window => "Window",
-            Self::Display => "Display",
-            Self::AllDisplays => "All displays",
+            Self::Region => crate::product_copy::CAPTURE_AREA,
+            Self::Window => crate::product_copy::CAPTURE_WINDOW,
+            Self::Display => crate::product_copy::CAPTURE_FULLSCREEN,
+            Self::AllDisplays => crate::product_copy::CAPTURE_ALL_DISPLAYS,
         }
     }
 
@@ -160,8 +160,8 @@ impl SelectionMode {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Region => "Drag to choose a rectangle",
-            Self::Window => "Point at a window to choose it",
+            Self::Region => "Drag to choose an area",
+            Self::Window => "Point at a window to capture it",
             Self::Display => "Capture the display under the pointer",
             Self::AllDisplays => "Capture every display side by side",
         }

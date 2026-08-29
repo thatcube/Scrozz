@@ -28,7 +28,7 @@ use egui_kittest::Harness;
 use icons::IconStore;
 use surfaces::Surface;
 
-/// Renders the Quick Access Overlay (the primary surface) over the in-egui
+/// Renders the Recent Captures Overlay (the primary surface) over the in-egui
 /// wallpaper backdrop and snapshots it deterministically.
 #[test]
 fn quick_access_headless_snapshot() {

@@ -102,7 +102,7 @@ impl Surface {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Quick Access Overlay (primary) — a drag-first stack of captures.
+// 1. Recent Captures Overlay (primary) — a drag-first stack of captures.
 //
 // The overlay is NOT a single card with a button row. It's a physical stack of
 // recent screenshots in the corner: the top one grabbable and draggable straight
@@ -288,7 +288,7 @@ fn menu(ui: &mut Ui, icons: &IconStore, pal: &Palette, card: Rect) {
 
     use Mod::*;
     let rows = [
-        Row::Item { icon: "layout-grid", label: "All-in-One", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "A" }), hover: false },
+        Row::Item { icon: "layout-grid", label: "All-in-One…", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "A" }), hover: false },
         Row::Item { icon: "viewfinder", label: "Capture Area", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "4" }), hover: true },
         Row::Item { icon: "app-window", label: "Capture Window", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "5" }), hover: false },
         Row::Item { icon: "device-desktop", label: "Capture Fullscreen", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "3" }), hover: false },
@@ -297,9 +297,9 @@ fn menu(ui: &mut Ui, icons: &IconStore, pal: &Palette, card: Rect) {
         Row::Item { icon: "video", label: "Record Screen", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "7" }), hover: false },
         Row::Divider,
         Row::Item { icon: "scan", label: "Capture Text (OCR)", sc: Some(Shortcut { mods: &[Shift, Cmd], key: "8" }), hover: false },
-        Row::Item { icon: "history", label: "History", sc: Some(Shortcut { mods: &[Cmd], key: "Y" }), hover: false },
+        Row::Item { icon: "history", label: "Capture History…", sc: Some(Shortcut { mods: &[Cmd], key: "Y" }), hover: false },
         Row::Divider,
-        Row::Item { icon: "settings", label: "Preferences…", sc: Some(Shortcut { mods: &[Cmd], key: "," }), hover: false },
+        Row::Item { icon: "settings", label: "Settings…", sc: Some(Shortcut { mods: &[Cmd], key: "," }), hover: false },
         Row::Item { icon: "power", label: "Quit Scrozz", sc: Some(Shortcut { mods: &[Cmd], key: "Q" }), hover: false },
     ];
 

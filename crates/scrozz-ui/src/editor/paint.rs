@@ -241,6 +241,7 @@ pub fn draw_canvas(
     state: &mut EditorState,
     preview: &mut Preview,
     area: Rect,
+    interactive: bool,
 ) -> CanvasView {
     let palette = surface.palette();
     let painter = ui.painter_at(area);
@@ -287,12 +288,22 @@ pub fn draw_canvas(
         StrokeKind::Outside,
     );
 
-    let response = ui.interact(area, ui.id().with("editor-canvas"), Sense::click_and_drag());
+    let response = ui.interact(
+        area,
+        ui.id().with("editor-canvas"),
+        if interactive {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
     let view = CanvasView {
         hovered: response.hovered(),
         ..view
     };
-    gestures(ui, state, &response, &view);
+    if interactive {
+        gestures(ui, state, &response, &view);
+    }
 
     let chrome = ui.painter_at(area);
     draw_crop_scrim(&chrome, state, &view, palette);
@@ -302,7 +313,9 @@ pub fn draw_canvas(
     // instruction queued for the next label the user makes.
     let interrupt = state.take_ime_interrupt();
     draw_caret(ui, &chrome, state, &view, palette, interrupt);
-    cursor(ui, state, &response);
+    if interactive {
+        cursor(ui, state, &response);
+    }
     view
 }
 
@@ -510,7 +523,7 @@ fn thirds(painter: &egui::Painter, rect: Rect) {
     }
 }
 
-/// Draws the selection outline and its eight resize handles.
+/// Draws the selection chrome.
 fn draw_selection(
     painter: &egui::Painter,
     state: &EditorState,
@@ -520,6 +533,23 @@ fn draw_selection(
     let Some(bounds) = state.selection_bounds() else {
         return;
     };
+    let handles = state.selection_handles();
+    let arrow = handles
+        .first()
+        .is_some_and(|(handle, _)| matches!(handle, Handle::ArrowStart | Handle::ArrowEnd));
+    if arrow {
+        let r = HANDLE_RADIUS as f32;
+        for (_, position) in handles {
+            let at = super::to_screen(position, view.image, view.content);
+            // Dark under-ring + white keyline + accent centre: three contrasts,
+            // so the endpoint stays visible over any captured pixel.
+            painter.circle_filled(at, r + 2.0, Color32::from_black_alpha(100));
+            painter.circle_filled(at, r + 1.0, Color32::WHITE);
+            painter.circle_filled(at, r - 0.5, palette.accent);
+            painter.circle_stroke(at, r - 0.5, Stroke::new(1.0, palette.accent_press));
+        }
+        return;
+    }
     let rect = rect_to_screen(bounds, view.image, view.content).expand(2.0);
     // A dark under-stroke keeps the selection visible over a light capture, and
     // the accent over a dark one; a single colour disappears against one or the
@@ -538,8 +568,8 @@ fn draw_selection(
     );
 
     let r = HANDLE_RADIUS as f32;
-    for handle in Handle::ALL {
-        let at = super::to_screen(handle.position(&bounds), view.image, view.content);
+    for (handle, position) in handles {
+        let at = super::to_screen(position, view.image, view.content);
         let at = pos2(
             at.x + handle_bias(handle.moves_left(), handle.moves_right()) * 2.0,
             at.y + handle_bias(handle.moves_top(), handle.moves_bottom()) * 2.0,

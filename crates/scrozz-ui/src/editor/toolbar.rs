@@ -5,14 +5,17 @@
 //! stay put while the canvas underneath changes size, and a layout that reflows
 //! would make every golden a hostage to text metrics.
 
-use egui::{Rect, Ui, pos2, vec2};
+use egui::{
+    Align, Color32, Frame, Key, Layout, Margin, Popup, PopupCloseBehavior, Rect, RectAlign,
+    Response, ScrollArea, Sense, Stroke, Ui, WidgetInfo, WidgetType, pos2, vec2,
+};
 use scrozz_annotate::{Color, Style};
 
 use crate::icons::Icon;
 use crate::paint::{
-    ControlState, Reveal, Surface, color_swatch, divider_v, glass_panel, icon_button, stroke_width,
+    ControlState, Reveal, Surface, divider_v, focus_ring, glass_panel, icon_button, stroke_width,
 };
-use crate::theme::{Radius, Space, corner};
+use crate::theme::{Elevation, Radius, Space, Text, corner};
 
 use super::paint::CanvasView;
 use super::state::{EditorState, Intent, Tool};
@@ -29,8 +32,26 @@ pub const HEIGHT_WRAPPED: f32 = ROW * 2.0 + Space::MD;
 /// A tool or action button's side, in points.
 const BUTTON: f32 = 30.0;
 
-/// A colour swatch's side, in points.
-const SWATCH: f32 = 18.0;
+/// The compact current-colour control's width.
+const COLOR_CONTROL: f32 = 46.0;
+
+/// Stable accessibility/focus identity of the compact colour disclosure.
+pub const COLOR_CONTROL_ID: &str = "scrozz-editor-colour";
+
+/// The hit target for each colour in the vertical popup.
+const COLOR_ROW: f32 = 34.0;
+
+/// The painted swatch diameter inside a popup row.
+const COLOR_DOT: f32 = 22.0;
+
+/// The popup's narrow preset rail.
+const POPOVER_WIDTH: f32 = 42.0;
+
+/// The wider custom-picker fallback.
+const CUSTOM_PICKER_WIDTH: f32 = 292.0;
+
+/// Maximum quick-palette height before its swatch rail scrolls.
+const POPOVER_MAX_HEIGHT: f32 = 560.0;
 
 /// The stroke-width slider's length, in points.
 const STROKE: f32 = 104.0;
@@ -38,8 +59,8 @@ const STROKE: f32 = 104.0;
 /// The width the tool palette occupies, including its trailing gap.
 const TOOLS_W: f32 = Tool::ALL.len() as f32 * (BUTTON + Space::HAIR);
 
-/// The width the colour swatches occupy, including their trailing gaps.
-const SWATCHES_W: f32 = PALETTE.len() as f32 * (SWATCH + Space::SM);
+/// The width the compact colour control occupies.
+const COLOR_W: f32 = COLOR_CONTROL;
 
 /// The space a divider needs: the gap before it, and the gap after.
 const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
@@ -59,7 +80,7 @@ const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR) + Space::SM + B
 pub const SINGLE_ROW_W: f32 = Space::MD
     + TOOLS_W
     + DIVIDER_W
-    + SWATCHES_W
+    + COLOR_W
     + Space::XS
     + DIVIDER_W
     + STROKE
@@ -74,7 +95,7 @@ pub const SINGLE_ROW_W: f32 = Space::MD
 pub const WRAPPED_W: f32 = {
     let tools = Space::MD + TOOLS_W + Space::MD;
     let rest =
-        Space::MD + SWATCHES_W + Space::XS + DIVIDER_W + STROKE + Space::MD + ACTIONS_W + Space::MD;
+        Space::MD + COLOR_W + Space::XS + DIVIDER_W + STROKE + Space::MD + ACTIONS_W + Space::MD;
     if tools > rest { tools } else { rest }
 };
 
@@ -115,7 +136,7 @@ pub fn controls_right(bar: Rect) -> f32 {
     if !wrapped {
         x += TOOLS_W + DIVIDER_W;
     }
-    x + SWATCHES_W + Space::XS + DIVIDER_W + STROKE
+    x + COLOR_W + Space::XS + DIVIDER_W + STROKE
 }
 
 /// Where the right-hand action group begins, for a bar of this width.
@@ -126,22 +147,68 @@ pub fn actions_left(bar: Rect) -> f32 {
 
 pub use super::state::{STROKE_MAX, STROKE_MIN};
 
-/// The annotation palette.
-///
-/// Eight colours, not a picker. A picker is a second window and a colour space
-/// argument; eight well-chosen colours cover every real annotation and can be
-/// reached with one click. The first is Scrozz's accent, so the default needs
-/// no choosing at all.
-pub const PALETTE: [Color; 8] = [
+/// The annotation quick palette, ordered like a compact artist's rail.
+pub const PALETTE: [Color; 10] = [
+    Color::BLACK,
     Color::ACCENT,
     Color::rgb(0xFF, 0x9F, 0x0A),
     Color::rgb(0xFF, 0xD6, 0x0A),
     Color::rgb(0x30, 0xD1, 0x58),
+    Color::rgb(0x64, 0xD2, 0xFF),
     Color::rgb(0x0A, 0x84, 0xFF),
     Color::rgb(0xBF, 0x5A, 0xF2),
+    Color::rgb(0xFF, 0x37, 0x5F),
     Color::WHITE,
-    Color::BLACK,
 ];
+
+/// Screen-reader names corresponding to [`PALETTE`].
+pub const PALETTE_NAMES: [&str; 10] = [
+    "Black", "Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "White",
+];
+
+/// Persistent interaction state for the anchored colour popup.
+#[derive(Debug, Default)]
+pub struct ColorPopover {
+    open: bool,
+    fallback_open: bool,
+    focus_on_open: bool,
+    last_rect: Option<Rect>,
+}
+
+impl ColorPopover {
+    /// Opens the quick palette and focuses the current colour.
+    pub fn open(&mut self) {
+        self.open = true;
+        self.fallback_open = false;
+        self.focus_on_open = true;
+    }
+
+    /// Opens the cross-platform custom-colour fallback.
+    pub fn open_fallback(&mut self) {
+        self.open = true;
+        self.fallback_open = true;
+        self.focus_on_open = true;
+    }
+
+    /// Closes every colour surface.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.fallback_open = false;
+        self.focus_on_open = false;
+    }
+
+    /// Whether the anchored surface is visible.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The popup's most recently resolved screen rectangle.
+    #[must_use]
+    pub const fn last_rect(&self) -> Option<Rect> {
+        self.last_rect
+    }
+}
 
 /// The icon that stands for each tool.
 #[must_use]
@@ -167,8 +234,10 @@ pub fn draw(
     ui: &mut Ui,
     surface: &Surface<'_>,
     state: &mut EditorState,
+    color_popover: &mut ColorPopover,
     bar: Rect,
     _view: &CanvasView,
+    input_blocked: bool,
 ) -> Option<Intent> {
     let palette = surface.palette();
     glass_panel(ui.painter(), bar, 0.0, palette, true);
@@ -201,7 +270,7 @@ pub fn draw(
             state_flags,
             Reveal::SHOWN,
         );
-        if response.clicked() {
+        if response.clicked() && !input_blocked {
             picked = Some(tool);
         }
         let label = tool.label();
@@ -222,28 +291,32 @@ pub fn draw(
         x += Space::SM + Space::XS;
     }
 
-    // Colour.
-    let mut chosen = None;
-    for (index, color) in PALETTE.into_iter().enumerate() {
-        let rect = Rect::from_center_size(pos2(x + SWATCH / 2.0, cy), vec2(SWATCH, SWATCH));
-        let selected = state.stroke_color() == color;
-        let response = color_swatch(
-            ui,
-            surface,
-            rect,
-            ui.id().with(("editor-color", index)),
-            to_egui(color),
-            "Colour",
-            selected,
-        );
-        if response.clicked() {
-            chosen = Some(color);
+    // Colour. One stable-width control; the palette lives in a foreground
+    // popup so opening it cannot move any toolbar or canvas geometry.
+    let color_rect = Rect::from_center_size(
+        pos2(x + COLOR_CONTROL / 2.0, cy),
+        vec2(COLOR_CONTROL, BUTTON),
+    );
+    let color_button = color_control(
+        ui,
+        surface,
+        color_rect,
+        egui::Id::new(COLOR_CONTROL_ID),
+        state.stroke_color(),
+        color_popover.open,
+    );
+    if color_button.clicked() {
+        if color_popover.open {
+            color_popover.close();
+        } else {
+            color_popover.open();
         }
-        x += SWATCH + Space::SM;
     }
-    if let Some(color) = chosen {
-        state.set_stroke_color(color);
+    let custom = draw_color_popover(ui, surface, state, color_popover, &color_button);
+    if custom {
+        return Some(Intent::CustomColor);
     }
+    x += COLOR_CONTROL;
 
     x += Space::XS;
     divider_v(ui.painter(), x, row_top(cy), row_bottom(cy), palette);
@@ -259,7 +332,8 @@ pub fn draw(
         ui.id().with("editor-stroke"),
         fraction,
     );
-    if (response.dragged() || response.clicked())
+    if !input_blocked
+        && (response.dragged() || response.clicked())
         && let Some(pos) = response.interact_pointer_pos()
     {
         let inner_l = width_rect.left() + Space::MD;
@@ -305,7 +379,7 @@ pub fn draw(
             flags,
             Reveal::SHOWN,
         );
-        if response.clicked() && enabled {
+        if response.clicked() && enabled && !input_blocked {
             match action {
                 Action::Undo => {
                     let _ = state.command(super::state::Command::Undo);
@@ -336,13 +410,423 @@ pub fn draw(
             ControlState::on(),
             Reveal::SHOWN,
         );
-        if response.clicked() {
+        if response.clicked() && !input_blocked {
             let _ = state.command(super::state::Command::ApplyCrop);
         }
         response.on_hover_text("Apply crop  (Return)");
     }
 
     intent
+}
+
+const POPOVER_ALIGNS: [RectAlign; 4] = [
+    RectAlign::BOTTOM_START,
+    RectAlign::TOP_START,
+    RectAlign::BOTTOM_END,
+    RectAlign::TOP_END,
+];
+
+fn color_control(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: egui::Id,
+    color: Color,
+    open: bool,
+) -> Response {
+    let label = format!("Colour: {}. Open colour palette", color_name(color));
+    let response = ui.interact(rect, id, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, open, label.clone()));
+    let palette = surface.palette();
+    let painter = ui.painter();
+    if response.has_focus() {
+        focus_ring(painter, rect, Radius::BUTTON, palette);
+    }
+    if response.hovered() || response.is_pointer_button_down_on() || open {
+        painter.rect_filled(
+            rect,
+            corner(Radius::BUTTON),
+            if response.is_pointer_button_down_on() {
+                palette.active
+            } else {
+                palette.hover
+            },
+        );
+    }
+    let center = pos2(rect.left() + Space::MD, rect.center().y);
+    paint_color_dot(painter, center, 9.0, to_egui(color), palette, false);
+    let chevron = pos2(rect.right() - Space::MD, rect.center().y);
+    let ink = palette.text_muted;
+    painter.line_segment(
+        [chevron + vec2(-3.0, -1.5), chevron + vec2(0.0, 1.5)],
+        Stroke::new(1.5, ink),
+    );
+    painter.line_segment(
+        [chevron + vec2(0.0, 1.5), chevron + vec2(3.0, -1.5)],
+        Stroke::new(1.5, ink),
+    );
+    response
+}
+
+fn draw_color_popover(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    state: &mut EditorState,
+    popover: &mut ColorPopover,
+    anchor: &Response,
+) -> bool {
+    let was_open = popover.open;
+    let mut open = popover.open;
+    let fallback = popover.fallback_open;
+    let mut close_requested = false;
+    let mut custom_requested = false;
+    let mut chosen = None;
+    let mut next_focus = None;
+    let selected = PALETTE
+        .iter()
+        .position(|color| *color == state.stroke_color())
+        .unwrap_or(PALETTE.len());
+    let palette = surface.palette();
+    // The margin still belongs to the container; the panel itself is painted
+    // after overriding egui's ambient Area fade so foreground and background
+    // appear together on the same deterministic frame.
+    let frame = Frame::new().inner_margin(Margin::same(Space::XS as i8));
+    let popup_id = anchor.id.with("palette");
+    let width = if fallback {
+        CUSTOM_PICKER_WIDTH
+    } else {
+        POPOVER_WIDTH
+    };
+    let shown = Popup::from_response(anchor)
+        .id(popup_id)
+        .open_bool(&mut open)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .align(RectAlign::BOTTOM_START)
+        .align_alternatives(&POPOVER_ALIGNS)
+        .gap(Space::SM)
+        .width(width)
+        .layout(Layout::top_down(Align::Center))
+        .frame(frame)
+        .show(|popup_ui| {
+            // Scrozz motion comes from named tokens, not egui's ambient Area
+            // fade. An immediate native-menu appearance is deterministic and
+            // does not leave a frozen-time golden at zero opacity.
+            popup_ui.set_opacity(1.0);
+            paint_popover_panel(popup_ui, palette);
+            popup_ui.set_min_width(width);
+            if fallback {
+                draw_custom_fallback(popup_ui, state, &mut close_requested, popover.focus_on_open);
+                return;
+            }
+
+            let max_height = (popup_ui.ctx().content_rect().height() - Space::XL * 2.0)
+                .clamp(COLOR_ROW * 3.0, POPOVER_MAX_HEIGHT);
+            ScrollArea::vertical()
+                .max_height(max_height)
+                .auto_shrink([false, true])
+                .show(popup_ui, |popup_ui| {
+                    popup_ui.spacing_mut().item_spacing.y = 0.0;
+                    for (index, (color, name)) in PALETTE.into_iter().zip(PALETTE_NAMES).enumerate()
+                    {
+                        let response = preset_swatch(
+                            popup_ui,
+                            surface,
+                            popup_ui.id().with(("colour-preset", index)),
+                            color,
+                            name,
+                            state.stroke_color() == color,
+                        );
+                        if activate_response(popup_ui, &response) {
+                            chosen = Some(color);
+                            close_requested = true;
+                        }
+                    }
+
+                    popup_ui.add_space(Space::XS);
+                    let separator = Rect::from_center_size(
+                        pos2(popup_ui.max_rect().center().x, popup_ui.cursor().top()),
+                        vec2(COLOR_DOT, 1.0),
+                    );
+                    popup_ui.painter().line_segment(
+                        [separator.left_center(), separator.right_center()],
+                        Stroke::new(1.0, palette.divider),
+                    );
+                    popup_ui.add_space(Space::XS);
+                    let custom =
+                        custom_color_button(popup_ui, surface, popup_ui.id().with("custom-colour"));
+                    if activate_response(popup_ui, &custom) {
+                        custom_requested = true;
+                    }
+
+                    if popover.focus_on_open {
+                        next_focus = Some(selected);
+                    }
+
+                    if let Some(index) = next_focus {
+                        let id = if index < PALETTE.len() {
+                            popup_ui.id().with(("colour-preset", index))
+                        } else {
+                            popup_ui.id().with("custom-colour")
+                        };
+                        popup_ui.memory_mut(|memory| memory.request_focus(id));
+                    }
+                });
+        });
+
+    popover.focus_on_open = false;
+    if let Some(shown) = shown {
+        popover.last_rect = Some(shown.response.rect);
+    }
+    if let Some(color) = chosen
+        && color != state.stroke_color()
+    {
+        state.set_stroke_color(color);
+    }
+    if close_requested {
+        open = false;
+    }
+    popover.open = open;
+    if !open {
+        popover.fallback_open = false;
+        if was_open {
+            anchor.request_focus();
+        }
+    }
+    custom_requested
+}
+
+fn paint_popover_panel(ui: &Ui, palette: &crate::theme::Palette) {
+    let rect = ui.max_rect().expand(Space::XS);
+    let rounding = corner(Radius::BAR);
+    if let Some((ambient, _)) = Elevation::Lifted.shadows(palette) {
+        ui.painter().add(ambient.as_shape(rect, rounding));
+    }
+    ui.painter()
+        .rect_filled(rect, rounding, palette.card_fill_raised);
+    ui.painter().rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(1.0, palette.hairline),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn draw_custom_fallback(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    close: &mut bool,
+    focus_on_open: bool,
+) {
+    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+        ui.label(
+            egui::RichText::new("Custom colour")
+                .font(Text::Label.font())
+                .color(ui.visuals().text_color()),
+        );
+        ui.add_space(Space::XS);
+        let mut color = to_egui(state.stroke_color());
+        let visual_changed = egui::color_picker::color_picker_color32(
+            ui,
+            &mut color,
+            egui::color_picker::Alpha::OnlyBlend,
+        );
+        ui.add_space(Space::XS);
+        let [mut red, mut green, mut blue, mut alpha] = color.to_srgba_unmultiplied();
+        let red_response = ui.add(egui::Slider::new(&mut red, 0..=255).text("Red"));
+        let channels_changed = red_response.changed()
+            | ui.add(egui::Slider::new(&mut green, 0..=255).text("Green"))
+                .changed()
+            | ui.add(egui::Slider::new(&mut blue, 0..=255).text("Blue"))
+                .changed()
+            | ui.add(egui::Slider::new(&mut alpha, 0..=255).text("Opacity"))
+                .changed();
+        if focus_on_open {
+            red_response.request_focus();
+        }
+        if visual_changed || channels_changed {
+            let color = Color::rgba(red, green, blue, alpha);
+            if color != state.stroke_color() {
+                state.set_stroke_color(color);
+            }
+        }
+        ui.add_space(Space::SM);
+        if ui.button("Done").clicked() {
+            *close = true;
+        }
+    });
+}
+
+fn activate_response(ui: &Ui, response: &Response) -> bool {
+    response.clicked()
+        || (response.has_focus()
+            && ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, Key::Enter)
+                    || input.consume_key(egui::Modifiers::NONE, Key::Space)
+            }))
+}
+
+fn preset_swatch(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    id: egui::Id,
+    color: Color,
+    name: &str,
+    selected: bool,
+) -> Response {
+    let (_, rect) = ui.allocate_space(vec2(POPOVER_WIDTH, COLOR_ROW));
+    let response = ui.interact(rect, id, Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::RadioButton,
+            true,
+            selected,
+            format!("{name} colour"),
+        )
+    });
+    let palette = surface.palette();
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, corner(Radius::BUTTON), palette.hover);
+    }
+    if response.has_focus() {
+        focus_ring(
+            ui.painter(),
+            rect.shrink2(vec2(Space::XS, Space::HAIR)),
+            Radius::BUTTON,
+            palette,
+        );
+    }
+    paint_color_dot(
+        ui.painter(),
+        rect.center(),
+        COLOR_DOT / 2.0,
+        to_egui(color),
+        palette,
+        selected,
+    );
+    response
+}
+
+fn custom_color_button(ui: &mut Ui, surface: &Surface<'_>, id: egui::Id) -> Response {
+    let (_, rect) = ui.allocate_space(vec2(POPOVER_WIDTH, COLOR_ROW));
+    let response = ui.interact(rect, id, Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Choose custom colour"));
+    let palette = surface.palette();
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, corner(Radius::BUTTON), palette.hover);
+    }
+    if response.has_focus() {
+        focus_ring(
+            ui.painter(),
+            rect.shrink2(vec2(Space::XS, Space::HAIR)),
+            Radius::BUTTON,
+            palette,
+        );
+    }
+    paint_spectrum(ui.painter(), rect.center(), COLOR_DOT / 2.0);
+    response
+}
+
+fn paint_color_dot(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    color: Color32,
+    palette: &crate::theme::Palette,
+    selected: bool,
+) {
+    if selected {
+        painter.circle_stroke(
+            center,
+            radius + 4.0,
+            Stroke::new(4.0, palette.card_fill_raised),
+        );
+        painter.circle_stroke(center, radius + 4.0, Stroke::new(2.0, palette.focus_ring));
+    }
+    painter.circle_filled(center, radius, color);
+    painter.circle_stroke(center, radius, Stroke::new(1.0, palette.text_muted));
+    if selected {
+        let ink = contrasting_ink(color);
+        painter.line_segment(
+            [center + vec2(-4.0, 0.0), center + vec2(-1.0, 3.0)],
+            Stroke::new(2.0, ink),
+        );
+        painter.line_segment(
+            [center + vec2(-1.0, 3.0), center + vec2(5.0, -4.0)],
+            Stroke::new(2.0, ink),
+        );
+    }
+}
+
+fn paint_spectrum(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    const HUES: [Color32; 12] = [
+        Color32::from_rgb(255, 59, 48),
+        Color32::from_rgb(255, 149, 0),
+        Color32::from_rgb(255, 204, 0),
+        Color32::from_rgb(52, 199, 89),
+        Color32::from_rgb(0, 199, 190),
+        Color32::from_rgb(50, 173, 230),
+        Color32::from_rgb(0, 122, 255),
+        Color32::from_rgb(88, 86, 214),
+        Color32::from_rgb(175, 82, 222),
+        Color32::from_rgb(255, 45, 85),
+        Color32::from_rgb(255, 55, 95),
+        Color32::from_rgb(255, 59, 48),
+    ];
+    let mut mesh = egui::epaint::Mesh::default();
+    let center_index = mesh.vertices.len() as u32;
+    mesh.colored_vertex(center, Color32::WHITE);
+    for (index, color) in HUES.into_iter().enumerate() {
+        let angle = std::f32::consts::TAU * index as f32 / (HUES.len() - 1) as f32;
+        mesh.colored_vertex(center + vec2(angle.cos(), angle.sin()) * radius, color);
+    }
+    for index in 0..HUES.len() - 1 {
+        mesh.add_triangle(
+            center_index,
+            center_index + index as u32 + 1,
+            center_index + index as u32 + 2,
+        );
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    painter.circle_stroke(
+        center,
+        radius,
+        Stroke::new(1.0, Color32::from_black_alpha(70)),
+    );
+}
+
+fn contrasting_ink(color: Color32) -> Color32 {
+    let luminance =
+        0.299 * f32::from(color.r()) + 0.587 * f32::from(color.g()) + 0.114 * f32::from(color.b());
+    if luminance > 150.0 {
+        Color32::from_rgb(20, 20, 24)
+    } else {
+        Color32::WHITE
+    }
+}
+
+fn color_name(color: Color) -> String {
+    PALETTE
+        .iter()
+        .position(|preset| *preset == color)
+        .map_or_else(
+            || format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b),
+            |index| PALETTE_NAMES[index].to_owned(),
+        )
+}
+
+/// Converts an egui colour back into the annotation style model.
+#[must_use]
+pub fn from_egui(color: Color32) -> Color {
+    let [red, green, blue, alpha] = color.to_srgba_unmultiplied();
+    Color::rgba(red, green, blue, alpha)
+}
+
+/// Whether the focused colour disclosure owns this frame's keyboard activation.
+pub(super) fn color_control_activation(ui: &Ui) -> bool {
+    ui.memory(|memory| memory.has_focus(egui::Id::new(COLOR_CONTROL_ID)))
+        && ui.input(|input| input.key_pressed(Key::Enter) || input.key_pressed(Key::Space))
 }
 
 enum Action {

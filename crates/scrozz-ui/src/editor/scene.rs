@@ -45,7 +45,10 @@ impl Scene for EditorScene {
         // the pass that created it uploads and frees within one texture delta,
         // so the preview would paint as nothing at all. Keeping it also means
         // the warm-up passes settle a real editor rather than four fresh ones.
-        let id = egui::Id::new("scrozz-editor-scene");
+        // Scenario-local: the golden renderer reuses one egui context across the
+        // corpus, and an annotating scene must not donate its closed popover to
+        // the dedicated open-popover scenario that follows it.
+        let id = egui::Id::new(("scrozz-editor-scene", ctx.fixture.scenario.slug()));
         let editor = match ui.ctx().data(|data| data.get_temp::<Shared>(id)) {
             Some(existing) => existing,
             None => {
@@ -72,11 +75,18 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
     }
     let state = editor.state_mut();
     state.set_tool(super::Tool::Arrow);
-    // Select the first annotation so the golden shows the handles, which are
-    // most of what distinguishes this surface from a plain preview.
-    let first = state.document().annotations().first().map(|o| o.id);
-    state.set_tool(super::Tool::Select);
-    state.select(first);
+    // Keep Arrow in hand while selecting the sample arrow, so the golden proves
+    // the tool can edit an existing arrow and paints endpoint chrome only.
+    let arrow = state
+        .document()
+        .annotations()
+        .iter()
+        .find(|object| matches!(object.annotation, Annotation::Arrow { .. }))
+        .map(|object| object.id);
+    state.select(arrow);
+    if fixture.scenario == crate::harness::Scenario::EditorColorPopover {
+        editor.open_color_popover();
+    }
 }
 
 /// A document with one of each interesting annotation on a synthetic capture.

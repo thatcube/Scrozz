@@ -20,7 +20,7 @@ const ICON_SIZE: f32 = 132.0;
 pub struct ShortcutRow {
     /// Stable identifier the host uses to route an edit back to an action.
     pub id: String,
-    /// Human name of the action, e.g. `Capture Region`.
+    /// Human name of the action, e.g. `Capture Area`.
     pub label: String,
     /// The configured accelerator; empty means deliberately unassigned.
     pub accelerator: String,

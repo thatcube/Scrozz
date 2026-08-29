@@ -206,6 +206,10 @@ impl Tool {
 /// Which corner or edge of a selection a drag is pulling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Handle {
+    /// The geometric start of an arrow.
+    ArrowStart,
+    /// The geometric tip of an arrow.
+    ArrowEnd,
     /// Top-left corner.
     TopLeft,
     /// Top edge.
@@ -225,7 +229,7 @@ pub enum Handle {
 }
 
 impl Handle {
-    /// Every handle, clockwise from the top-left.
+    /// Every rectangular handle, clockwise from the top-left.
     pub const ALL: [Self; 8] = [
         Self::TopLeft,
         Self::Top,
@@ -237,6 +241,9 @@ impl Handle {
         Self::Left,
     ];
 
+    /// The two handles an arrow exposes.
+    pub const ARROW: [Self; 2] = [Self::ArrowStart, Self::ArrowEnd];
+
     /// Where this handle sits on a rectangle.
     #[must_use]
     pub fn position(self, rect: &LogicalRect) -> LogicalPoint {
@@ -244,6 +251,8 @@ impl Handle {
         let (r, b) = (geom::max_x(rect), geom::max_y(rect));
         let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
         match self {
+            Self::ArrowStart => LogicalPoint::new(l, t),
+            Self::ArrowEnd => LogicalPoint::new(r, b),
             Self::TopLeft => LogicalPoint::new(l, t),
             Self::Top => LogicalPoint::new(cx, t),
             Self::TopRight => LogicalPoint::new(r, t),
@@ -286,6 +295,9 @@ impl Handle {
     /// looks like it is doing, and what every other editor does.
     #[must_use]
     pub fn resize(self, rect: &LogicalRect, dx: f64, dy: f64) -> LogicalRect {
+        if matches!(self, Self::ArrowStart | Self::ArrowEnd) {
+            return *rect;
+        }
         let mut l = rect.origin.x;
         let mut t = rect.origin.y;
         let mut r = geom::max_x(rect);
@@ -326,6 +338,11 @@ enum Drag {
         handle: Handle,
         grab: LogicalPoint,
         start: LogicalRect,
+    },
+    ArrowEndpoint {
+        handle: Handle,
+        from: LogicalPoint,
+        to: LogicalPoint,
     },
     Cropping {
         origin: LogicalPoint,
@@ -475,6 +492,8 @@ pub enum Intent {
     Copy,
     /// Save the flattened render.
     Save,
+    /// Open the platform's custom colour picker.
+    CustomColor,
 }
 
 /// The editor's whole mutable state.
@@ -608,9 +627,15 @@ impl EditorState {
         // of it — and refusing the tool change would strand the user instead.
         let _ = self.settle_text();
         self.tool = tool;
-        // Select is the only tool where a selection is meaningful; keeping one
-        // while a drawing tool is active would show handles the user cannot use.
-        if tool != Tool::Select {
+        // Arrow is the one drawing tool that also edits its own existing
+        // objects. Every other drawing tool clears selection because its handles
+        // would be controls the active tool cannot use.
+        let keeps_arrow = tool == Tool::Arrow
+            && self
+                .selection
+                .and_then(|id| self.document.get(id))
+                .is_some_and(|object| matches!(object.annotation, Annotation::Arrow { .. }));
+        if tool != Tool::Select && !keeps_arrow {
             self.selection = None;
         }
     }
@@ -683,6 +708,25 @@ impl EditorState {
         self.selection
             .and_then(|id| self.document.get(id))
             .map(scrozz_annotate::AnnotationObject::bounds)
+    }
+
+    /// The editor-chrome handles for the current selection.
+    ///
+    /// Arrows expose exactly their two geometric endpoints. Every other
+    /// resizable annotation uses the rectangular handle family.
+    #[must_use]
+    pub fn selection_handles(&self) -> Vec<(Handle, LogicalPoint)> {
+        let Some(object) = self.selection.and_then(|id| self.document.get(id)) else {
+            return Vec::new();
+        };
+        if let Annotation::Arrow { from, to } = &object.annotation {
+            return vec![(Handle::ArrowStart, *from), (Handle::ArrowEnd, *to)];
+        }
+        let bounds = object.bounds();
+        Handle::ALL
+            .into_iter()
+            .map(|handle| (handle, handle.position(&bounds)))
+            .collect()
     }
 
     /// Selects an annotation, or clears the selection with `None`.
@@ -1185,6 +1229,9 @@ impl EditorState {
         if !self.settle_text() && self.press_opens_a_label(point) {
             return;
         }
+        if self.tool == Tool::Arrow && self.press_arrow(point) {
+            return;
+        }
         let changed = match self.tool {
             Tool::Select => {
                 self.press_select(point);
@@ -1303,6 +1350,36 @@ impl EditorState {
                     grab,
                     start,
                 };
+            }
+            Drag::ArrowEndpoint { handle, from, to } => {
+                let fixed = match handle {
+                    Handle::ArrowStart => to,
+                    Handle::ArrowEnd => from,
+                    _ => unreachable!("only arrow endpoints enter this drag"),
+                };
+                let point = if constrain {
+                    constrain_to_axis(fixed, point)
+                } else {
+                    point
+                };
+                if let Some(id) = self.selection
+                    && let Some(mut object) = self.document.get_mut(id)
+                    && let Annotation::Arrow {
+                        from: current_from,
+                        to: current_to,
+                    } = object.annotation()
+                {
+                    let target = match handle {
+                        Handle::ArrowStart => current_from,
+                        Handle::ArrowEnd => current_to,
+                        _ => unreachable!("only arrow endpoints enter this drag"),
+                    };
+                    if *target != point && geom::distance(fixed, point) >= MIN_DRAG {
+                        *target = point;
+                        changed = true;
+                    }
+                }
+                self.drag = Drag::ArrowEndpoint { handle, from, to };
             }
             Drag::Cropping { origin, .. } => {
                 self.drag = Drag::Cropping {
@@ -1424,6 +1501,22 @@ impl EditorState {
                     false
                 }
             }
+            Drag::ArrowEndpoint { from, to, .. } => {
+                if let Some(id) = self.selection
+                    && let Some(mut object) = self.document.get_mut(id)
+                    && let Annotation::Arrow {
+                        from: current_from,
+                        to: current_to,
+                    } = object.annotation()
+                {
+                    let changed = *current_from != from || *current_to != to;
+                    *current_from = from;
+                    *current_to = to;
+                    changed
+                } else {
+                    false
+                }
+            }
             _ => false,
         };
         self.history.seal();
@@ -1444,11 +1537,13 @@ impl EditorState {
     /// clicks a hundred points away.
     #[must_use]
     pub fn handle_at(&self, point: LogicalPoint) -> Option<Handle> {
-        let bounds = self.selection_bounds()?;
         let tolerance = self.handle_tolerance();
-        Handle::ALL
+        self.selection_handles()
             .into_iter()
-            .find(|h| geom::distance(h.position(&bounds), point) <= tolerance)
+            .map(|(handle, position)| (handle, geom::distance(position, point)))
+            .filter(|(_, distance)| *distance <= tolerance)
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(handle, _)| handle)
     }
 
     /// [`HANDLE_TOLERANCE`] expressed in document points at the current zoom.
@@ -1618,16 +1713,60 @@ impl EditorState {
     // Internals
     // -----------------------------------------------------------------------
 
-    fn press_select(&mut self, point: LogicalPoint) {
-        if let Some(handle) = self.handle_at(point)
-            && let Some(start) = self.selection_bounds()
+    fn press_arrow(&mut self, point: LogicalPoint) -> bool {
+        if let Some(handle @ (Handle::ArrowStart | Handle::ArrowEnd)) = self.handle_at(point)
+            && let Some(object) = self.selection.and_then(|id| self.document.get(id))
+            && let Annotation::Arrow { from, to } = &object.annotation
         {
-            self.drag = Drag::Resizing {
+            self.drag = Drag::ArrowEndpoint {
                 handle,
-                grab: point,
-                start,
+                from: *from,
+                to: *to,
             };
-            return;
+            return true;
+        }
+
+        let hit = self.document.hit_test_all(point).into_iter().find(|id| {
+            self.document
+                .get(*id)
+                .is_some_and(|object| matches!(object.annotation, Annotation::Arrow { .. }))
+        });
+        let Some(id) = hit else {
+            self.selection = None;
+            return false;
+        };
+        self.selection = Some(id);
+        if let Some(object) = self.document.get(id) {
+            self.style = object.style;
+            self.drag = Drag::Moving {
+                grab: point,
+                start: object.bounds(),
+            };
+        }
+        true
+    }
+
+    fn press_select(&mut self, point: LogicalPoint) {
+        if let Some(handle) = self.handle_at(point) {
+            if matches!(handle, Handle::ArrowStart | Handle::ArrowEnd)
+                && let Some(object) = self.selection.and_then(|id| self.document.get(id))
+                && let Annotation::Arrow { from, to } = &object.annotation
+            {
+                self.drag = Drag::ArrowEndpoint {
+                    handle,
+                    from: *from,
+                    to: *to,
+                };
+                return;
+            }
+            if let Some(start) = self.selection_bounds() {
+                self.drag = Drag::Resizing {
+                    handle,
+                    grab: point,
+                    start,
+                };
+                return;
+            }
         }
         match self.document.hit_test(point) {
             Some(id) => {
