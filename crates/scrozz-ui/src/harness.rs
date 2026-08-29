@@ -297,6 +297,12 @@ pub enum Scenario {
     EditorCrop,
     /// The single secure Redact tool with its intensity control.
     EditorRedact,
+    /// The editor before Smart Frame is activated.
+    SmartFrameUntouched,
+    /// One-click Smart Frame result with progressive controls closed.
+    SmartFrameOneClick,
+    /// Smart Frame draft with the complete advanced inspector.
+    SmartFrameExpanded,
 }
 
 impl Scenario {
@@ -332,6 +338,9 @@ impl Scenario {
             Self::HistoryEmpty,
             Self::EditorCrop,
             Self::EditorRedact,
+            Self::SmartFrameUntouched,
+            Self::SmartFrameOneClick,
+            Self::SmartFrameExpanded,
         ]
     }
 
@@ -370,6 +379,9 @@ impl Scenario {
             Self::HistoryEmpty => "history-empty",
             Self::EditorCrop => "editor-crop",
             Self::EditorRedact => "editor-redact",
+            Self::SmartFrameUntouched => "smart-frame-untouched",
+            Self::SmartFrameOneClick => "smart-frame-one-click",
+            Self::SmartFrameExpanded => "smart-frame-expanded",
         }
     }
 
@@ -729,6 +741,9 @@ impl Fixture {
             Scenario::HistoryEmpty => 11,
             Scenario::EditorCrop => 20,
             Scenario::EditorRedact => 21,
+            Scenario::SmartFrameUntouched => 30,
+            Scenario::SmartFrameOneClick => 31,
+            Scenario::SmartFrameExpanded => 32,
             _ => scenario as u64,
         };
         let seed = DEFAULT_SEED ^ seed_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -912,6 +927,36 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::SmartFrameUntouched => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Before Smart Frame",
+                    "The annotation editor with its Smart Frame panel visible but no draft activated.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SmartFrameOneClick => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "One click, balanced framing",
+                    "A one-click Smart Frame draft with Auto Balance on, Automatic background, and progressive controls closed.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SmartFrameExpanded => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Full Smart Frame inspector",
+                    "Smart Frame draft with the complete advanced inspector: background, canvas, alignment, subject, watermark, and privacy review.",
+                    instants::REST,
+                    None,
+                ),
                 Scenario::SelectorIdle => (
                     Vec::new(),
                     Gesture::None,
@@ -1047,6 +1092,9 @@ impl Fixture {
             Scenario::EditorAnnotating
             | Scenario::EditorColorPopover
             | Scenario::EditorArrowStyles => (900.0, 620.0),
+            Scenario::SmartFrameUntouched
+            | Scenario::SmartFrameOneClick
+            | Scenario::SmartFrameExpanded => (1100.0, 700.0),
             Scenario::SettingsAfterCapture => (780.0, 640.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
@@ -2207,6 +2255,9 @@ impl SceneRegistry {
             Scenario::EditorArrowStyles,
             Scenario::EditorCrop,
             Scenario::EditorRedact,
+            Scenario::SmartFrameUntouched,
+            Scenario::SmartFrameOneClick,
+            Scenario::SmartFrameExpanded,
         ] {
             me.register(scenario, Box::new(crate::editor::EditorScene));
         }
@@ -4166,6 +4217,9 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorArrowStyles,
         Scenario::EditorCrop,
         Scenario::EditorRedact,
+        Scenario::SmartFrameUntouched,
+        Scenario::SmartFrameOneClick,
+        Scenario::SmartFrameExpanded,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),
@@ -4197,6 +4251,21 @@ pub fn golden_plan() -> Vec<GoldenCase> {
                       unavailable checkbox"
             .to_owned(),
     });
+
+    for scenario in [
+        Scenario::SmartFrameUntouched,
+        Scenario::SmartFrameOneClick,
+        Scenario::SmartFrameExpanded,
+    ] {
+        cases.push(GoldenCase {
+            name: format!("{}--compact", scenario.slug()),
+            spec: RenderSpec::golden(scenario, VirtualClock::ZERO).with_size_pt((760.0, 560.0)),
+            expectation: format!(
+                "{} in a compact editor: primary actions and labels remain visible without a dense default panel",
+                scenario.slug()
+            ),
+        });
+    }
 
     cases
 }

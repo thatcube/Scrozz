@@ -42,7 +42,7 @@ pub use paint::{CanvasView, Preview, to_color_image};
 pub use scene::EditorScene;
 pub use state::{
     CROP_SNAP_TOLERANCE, Caret, Command, CropAspect, EditorState, Handle, Intent, MAX_ZOOM,
-    MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, TextEdit, Tool, ZOOM_STEP,
+    MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, SmartFrameDraft, TextEdit, Tool, ZOOM_STEP,
 };
 pub use toolbar::{PALETTE, STROKE_MAX, STROKE_MIN};
 
@@ -106,11 +106,9 @@ pub struct EditorUi {
     color_popover: toolbar::ColorPopover,
     arrow_popover: toolbar::ArrowPopover,
     /// A decision reached while painting, returned at the end of the frame.
-    ///
-    /// Toolbar clicks are handled where they are drawn, but the frame's result
-    /// is a single value; parking it here keeps `update` linear instead of
-    /// threading a return through every painter.
     pending: Option<Intent>,
+    /// Whether the Smart Frame side panel is shown.
+    show_smart_frame: bool,
 }
 
 impl EditorUi {
@@ -123,6 +121,7 @@ impl EditorUi {
             color_popover: toolbar::ColorPopover::default(),
             arrow_popover: toolbar::ArrowPopover::default(),
             pending: None,
+            show_smart_frame: false,
         }
     }
 
@@ -239,6 +238,41 @@ impl EditorUi {
         self.arrow_popover.last_rect()
     }
 
+    // ── Smart Frame public API ──────────────────────────────────
+
+    /// Delivers a completed Smart Frame analysis to the editor.
+    ///
+    /// The host calls this from a background thread completion handler with
+    /// the `revision` tag that was in the [`Intent::AnalyzeSmartFrame`] it
+    /// acted on. Stale or cancelled results are silently dropped.
+    pub fn deliver_analysis(
+        &mut self,
+        revision: u64,
+        result: std::result::Result<scrozz_annotate::SmartFrameAnalysis, String>,
+    ) {
+        self.state.finish_smart_frame_analysis(revision, result);
+    }
+
+    /// Delivers reviewed sensitive-region suggestions.
+    pub fn deliver_sensitive_review(&mut self, review: scrozz_annotate::SensitiveRegionReview) {
+        self.state.set_sensitive_review(review);
+    }
+
+    /// Enables or disables the Smart Frame side panel.
+    ///
+    /// The host calls this to show the panel when the user wants to frame their
+    /// capture. It is also set automatically when the one-click button in the
+    /// panel is pressed.
+    pub fn set_smart_frame_visible(&mut self, visible: bool) {
+        self.show_smart_frame = visible;
+    }
+
+    /// Whether the Smart Frame side panel is visible.
+    #[must_use]
+    pub const fn smart_frame_visible(&self) -> bool {
+        self.show_smart_frame
+    }
+
     /// Draws one frame and reports what the host should do.
     pub fn update(&mut self, ui: &mut Ui) -> Intent {
         let theme = theme_for(ui);
@@ -249,7 +283,8 @@ impl EditorUi {
         let inspector_activation = toolbar::inspector_control_activation(ui);
 
         let full = ui.available_rect_before_wrap();
-        let (bar, canvas) = editor_layout(full);
+        let show_sf_panel = self.show_smart_frame || self.state.has_smart_frame_draft();
+        let (bar, canvas, sf_panel) = editor_layout_with_smart_frame(full, show_sf_panel);
 
         let view = paint::draw_canvas(
             ui,
@@ -269,6 +304,13 @@ impl EditorUi {
             inspector_was_open,
         ) {
             self.pending = Some(action);
+        }
+        // Smart Frame right panel.
+        if let Some(panel_rect) = sf_panel
+            && let Some(sf_intent) =
+                toolbar::draw_smart_frame_panel(ui, &surface, &mut self.state, panel_rect)
+        {
+            self.pending = Some(sf_intent);
         }
         toolbar::draw_view_controls(ui, &surface, &mut self.state, canvas, &view);
         let inspector_open = self.color_popover.is_open() || self.arrow_popover.is_open();
@@ -313,6 +355,28 @@ pub fn editor_layout(full: egui::Rect) -> (egui::Rect, egui::Rect) {
     let canvas =
         egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
     (bar, canvas)
+}
+
+/// Width of the Smart Frame side panel in points.
+const SMART_FRAME_PANEL_W: f32 = 320.0;
+
+/// Layout with an optional Smart Frame right panel.
+#[must_use]
+fn editor_layout_with_smart_frame(
+    full: egui::Rect,
+    show_panel: bool,
+) -> (egui::Rect, egui::Rect, Option<egui::Rect>) {
+    let toolbar_h = toolbar::height_for(full.width());
+    let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), toolbar_h));
+    let below = egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
+    if show_panel && below.width() > SMART_FRAME_PANEL_W + 200.0 {
+        let panel_left = below.right() - SMART_FRAME_PANEL_W;
+        let canvas = egui::Rect::from_min_max(below.min, egui::pos2(panel_left, below.bottom()));
+        let panel = egui::Rect::from_min_max(egui::pos2(panel_left, below.top()), below.max);
+        (bar, canvas, Some(panel))
+    } else {
+        (bar, below, None)
+    }
 }
 
 /// The icon store for a context, built once and kept alive in egui's memory.

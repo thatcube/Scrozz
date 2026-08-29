@@ -22,7 +22,11 @@
 //! exactly one step.
 
 use scrozz_annotate::{
-    Annotation, AnnotationId, AnnotationKind, ArrowStyle, Color, Document, History,
+    AnalysisCancellation, Background, DocumentData, SensitiveRegionReview, SmartFrameAnalysis,
+    SmartFramePreset, SmartFramePresetSettings, SourceInsets, provisional_smart_frame,
+};
+use scrozz_annotate::{
+    Annotation, AnnotationId, AnnotationKind, ArrowStyle, Beautification, Color, Document, History,
     REDACT_INTENSITY_DEFAULT, RedactStyle, Style, geom,
 };
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Result};
@@ -574,7 +578,7 @@ impl Command {
 }
 
 /// What the editor wants its host to do, after handling a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum Intent {
     /// Nothing; stay open.
     #[default]
@@ -587,6 +591,86 @@ pub enum Intent {
     Save,
     /// Open the platform's custom colour picker.
     CustomColor,
+    /// Request asynchronous Smart Frame analysis.
+    ///
+    /// The host schedules [`analyze_smart_frame`](scrozz_annotate::analyze_smart_frame)
+    /// on a background thread with the given [`DocumentData`] (beautification
+    /// stripped so the analysis starts from unframed content) and
+    /// [`AnalysisCancellation`]. It delivers the result back via
+    /// [`EditorUi::deliver_analysis`](super::EditorUi::deliver_analysis).
+    AnalyzeSmartFrame {
+        /// Monotonic revision tag. Stale deliveries are silently dropped.
+        revision: u64,
+        /// Document snapshot with `beautification: None`.
+        data: Box<DocumentData>,
+        /// Cooperative cancellation token shared with the analysis thread.
+        cancellation: AnalysisCancellation,
+    },
+    /// A Smart Frame preset was created or updated.
+    UpsertPreset(Box<SmartFramePreset>),
+    /// A Smart Frame preset was deleted.
+    DeletePreset(String),
+    /// Request a sensitive-region review for the current revision.
+    RequestSensitiveReview {
+        /// Monotonic revision tag.
+        revision: u64,
+        /// Document snapshot.
+        data: Box<DocumentData>,
+    },
+}
+
+impl PartialEq for Intent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None)
+            | (Self::Close, Self::Close)
+            | (Self::Copy, Self::Copy)
+            | (Self::Save, Self::Save)
+            | (Self::CustomColor, Self::CustomColor) => true,
+            (
+                Self::AnalyzeSmartFrame { revision: a, .. },
+                Self::AnalyzeSmartFrame { revision: b, .. },
+            ) => a == b,
+            (Self::UpsertPreset(a), Self::UpsertPreset(b)) => a == b,
+            (Self::DeletePreset(a), Self::DeletePreset(b)) => a == b,
+            (
+                Self::RequestSensitiveReview { revision: a, .. },
+                Self::RequestSensitiveReview { revision: b, .. },
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Intent {}
+
+/// Internal state of a Smart Frame draft that has not yet been applied.
+#[derive(Debug, Clone)]
+pub struct SmartFrameDraft {
+    /// The beautification that was active before the draft opened.
+    before: Option<Beautification>,
+    /// Monotonic revision tag for the in-flight analysis request.
+    analysis_revision: u64,
+    /// Cooperative cancellation for the in-flight analysis.
+    cancellation: AnalysisCancellation,
+    /// Whether an analysis request is still outstanding.
+    analysis_pending: bool,
+    /// Set when the user edits a control after the last analysis request.
+    edited_after_request: bool,
+    /// Human-readable explanation of the inset decision.
+    inset_explanation: String,
+    /// Whether a returning analysis should replace all settings or only the
+    /// automatic-background portion.
+    analysis_scope: AnalysisScope,
+}
+
+/// What a returning analysis result should replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisScope {
+    /// Replace the entire beautification with the analysis result.
+    All,
+    /// Replace only the background and metadata, keeping manual edits.
+    AutomaticOnly,
 }
 
 /// The editor's whole mutable state.
@@ -633,6 +717,25 @@ pub struct EditorState {
     revision: u64,
     view_revision: u64,
     dirty: bool,
+    // ── Smart Frame ──
+    /// The in-progress Smart Frame draft, if one is open.
+    smart_frame: Option<SmartFrameDraft>,
+    /// Monotonic counter for analysis generation tags.
+    next_analysis_generation: u64,
+    /// Beautification undo stack (separate from annotation history).
+    framing_undo: Vec<Option<Beautification>>,
+    /// Beautification redo stack.
+    framing_redo: Vec<Option<Beautification>>,
+    /// User-created cross-capture presets.
+    custom_presets: Vec<SmartFramePreset>,
+    /// Currently selected preset id.
+    selected_preset: Option<String>,
+    /// Name field for the preset editor.
+    preset_name: String,
+    /// Reviewed sensitive-region suggestions, if delivered.
+    sensitive_review: Option<SensitiveRegionReview>,
+    /// Whether the advanced Smart Frame inspector panel is expanded.
+    pub(super) advanced_open: bool,
 }
 
 impl EditorState {
@@ -661,6 +764,15 @@ impl EditorState {
             revision: 0,
             view_revision: 0,
             dirty: false,
+            smart_frame: None,
+            next_analysis_generation: 1,
+            framing_undo: Vec::new(),
+            framing_redo: Vec::new(),
+            custom_presets: Vec::new(),
+            selected_preset: None,
+            preset_name: String::new(),
+            sensitive_review: None,
+            advanced_open: false,
         }
     }
 
@@ -2559,6 +2671,412 @@ impl EditorState {
     const fn touch_view(&mut self) {
         self.view_revision = self.view_revision.wrapping_add(1);
     }
+
+    // ── Smart Frame ──────────────────────────────────────────────
+
+    /// Whether a Smart Frame draft is currently open.
+    #[must_use]
+    pub fn has_smart_frame_draft(&self) -> bool {
+        self.smart_frame.is_some()
+    }
+
+    /// Whether the draft's analysis is still pending.
+    #[must_use]
+    pub fn smart_frame_analysis_pending(&self) -> bool {
+        self.smart_frame
+            .as_ref()
+            .is_some_and(|d| d.analysis_pending)
+    }
+
+    /// The draft's inset explanation, if a draft is open.
+    #[must_use]
+    pub fn smart_frame_inset_explanation(&self) -> Option<&str> {
+        self.smart_frame
+            .as_ref()
+            .map(|d| d.inset_explanation.as_str())
+    }
+
+    /// Custom presets loaded for this editor session.
+    #[must_use]
+    pub fn custom_presets(&self) -> &[SmartFramePreset] {
+        &self.custom_presets
+    }
+
+    /// Loads custom presets at open time.
+    pub fn set_custom_presets(&mut self, presets: Vec<SmartFramePreset>) {
+        self.custom_presets = presets;
+    }
+
+    /// Currently selected preset id.
+    #[must_use]
+    pub fn selected_preset(&self) -> Option<&str> {
+        self.selected_preset.as_deref()
+    }
+
+    /// The preset-name text field value.
+    #[must_use]
+    pub fn preset_name(&self) -> &str {
+        &self.preset_name
+    }
+
+    /// Sets the preset-name text field.
+    pub fn set_preset_name(&mut self, name: String) {
+        self.preset_name = name;
+    }
+
+    /// Reviewed sensitive-region suggestions.
+    #[must_use]
+    pub fn sensitive_review(&self) -> Option<&SensitiveRegionReview> {
+        self.sensitive_review.as_ref()
+    }
+
+    /// Delivers reviewed sensitive-region suggestions.
+    pub fn set_sensitive_review(&mut self, review: SensitiveRegionReview) {
+        self.sensitive_review = Some(review);
+    }
+
+    /// Whether framing undo is available.
+    #[must_use]
+    pub fn can_undo_framing(&self) -> bool {
+        !self.framing_undo.is_empty()
+    }
+
+    /// Whether framing redo is available.
+    #[must_use]
+    pub fn can_redo_framing(&self) -> bool {
+        !self.framing_redo.is_empty()
+    }
+
+    /// One-click Smart Frame: sets an immediate provisional draft with Auto
+    /// Balance on and Automatic background, requests analysis, and returns the
+    /// intent the host must fulfil.
+    ///
+    /// Opening/analysis preview does not dirty the document or spend a revision.
+    pub fn begin_smart_frame(&mut self) -> Intent {
+        let before = self.document.beautification().cloned();
+        let generation = self.next_analysis_generation;
+        self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
+        let cancellation = AnalysisCancellation::default();
+        let provisional = provisional_smart_frame(
+            self.document.logical_size(),
+            self.document.source.frame.scale.get(),
+            self.document.source.provenance,
+            self.document.source.frame.color_space,
+        );
+        self.document
+            .set_beautification(Some(provisional))
+            .expect("the provisional recipe is provenance-safe");
+        self.smart_frame = Some(SmartFrameDraft {
+            before,
+            analysis_revision: generation,
+            cancellation: cancellation.clone(),
+            analysis_pending: true,
+            edited_after_request: false,
+            inset_explanation: "Analysing this revision...".to_owned(),
+            analysis_scope: AnalysisScope::All,
+        });
+        self.touch();
+        self.advanced_open = false;
+        let mut data = self.document.data();
+        data.beautification = None;
+        Intent::AnalyzeSmartFrame {
+            revision: generation,
+            data: Box::new(data),
+            cancellation,
+        }
+    }
+
+    /// Starts or switches to a specific beautification configuration.
+    ///
+    /// Cancels any in-flight analysis, preserves the original `before` snapshot,
+    /// and applies D9 restrictions on window captures.
+    pub fn begin_with(&mut self, mut config: Beautification) {
+        let before = self.smart_frame.as_ref().map_or_else(
+            || self.document.beautification().cloned(),
+            |d| d.before.clone(),
+        );
+        self.cancel_analysis();
+        if !self.document.may_style_subject() {
+            config.inset = SourceInsets::default();
+            config.corner_radius = 0.0;
+            config.shadow = 0.0;
+            config.border_width = 0.0;
+        }
+        match self.document.set_beautification(Some(config)) {
+            Ok(()) => {
+                self.smart_frame = Some(SmartFrameDraft {
+                    before,
+                    analysis_revision: 0,
+                    cancellation: AnalysisCancellation::default(),
+                    analysis_pending: false,
+                    edited_after_request: true,
+                    inset_explanation: "Preset values are editable until Apply".to_owned(),
+                    analysis_scope: AnalysisScope::All,
+                });
+                self.touch();
+            }
+            Err(error) => tracing::warn!(%error, "begin_with failed"),
+        }
+    }
+
+    /// Restarts analysis (e.g. after "Refresh automatic choices").
+    pub fn restart_analysis(&mut self) -> Option<Intent> {
+        let before = self.smart_frame.as_ref()?.before.clone();
+        self.cancel_analysis();
+        let generation = self.next_analysis_generation;
+        self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
+        let cancellation = AnalysisCancellation::default();
+        let provisional = provisional_smart_frame(
+            self.document.logical_size(),
+            self.document.source.frame.scale.get(),
+            self.document.source.provenance,
+            self.document.source.frame.color_space,
+        );
+        self.document
+            .set_beautification(Some(provisional))
+            .expect("the provisional recipe is provenance-safe");
+        self.smart_frame = Some(SmartFrameDraft {
+            before,
+            analysis_revision: generation,
+            cancellation: cancellation.clone(),
+            analysis_pending: true,
+            edited_after_request: false,
+            inset_explanation: "Analysing this revision...".to_owned(),
+            analysis_scope: AnalysisScope::All,
+        });
+        self.touch();
+        let mut data = self.document.data();
+        data.beautification = None;
+        Some(Intent::AnalyzeSmartFrame {
+            revision: generation,
+            data: Box::new(data),
+            cancellation,
+        })
+    }
+
+    /// Delivers an analysis result. Stale, cancelled, or post-edit results are
+    /// silently dropped.
+    pub fn finish_smart_frame_analysis(
+        &mut self,
+        revision: u64,
+        result: std::result::Result<SmartFrameAnalysis, String>,
+    ) {
+        let Some(draft) = self.smart_frame.as_mut() else {
+            return;
+        };
+        if draft.analysis_revision != revision
+            || draft.edited_after_request
+            || draft.cancellation.is_cancelled()
+        {
+            return;
+        }
+        draft.analysis_pending = false;
+        match result {
+            Ok(analysis) => {
+                draft.inset_explanation = analysis.inset_explanation;
+                let beautification = match draft.analysis_scope {
+                    AnalysisScope::All => analysis.beautification,
+                    AnalysisScope::AutomaticOnly => {
+                        let mut current =
+                            self.document.beautification().cloned().unwrap_or_default();
+                        current.background = analysis.beautification.background;
+                        current.smart_frame = analysis.beautification.smart_frame;
+                        current
+                    }
+                };
+                match self.document.set_beautification(Some(beautification)) {
+                    Ok(()) => self.touch(),
+                    Err(error) => tracing::warn!(%error, "analysis result rejected"),
+                }
+            }
+            Err(error) if error.to_lowercase().contains("cancel") => {}
+            Err(error) => {
+                draft.inset_explanation =
+                    "Inset left at zero because analysis did not complete".to_owned();
+                tracing::warn!(%error, "smart frame analysis failed");
+            }
+        }
+    }
+
+    /// Requests an automatic-background-only analysis (used when the user
+    /// switches to Automatic background in the inspector).
+    pub fn request_automatic_background_analysis(&mut self) -> Option<Intent> {
+        let draft = self.smart_frame.as_mut()?;
+        draft.cancellation.cancel();
+        let generation = self.next_analysis_generation;
+        self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
+        let cancellation = AnalysisCancellation::default();
+        draft.analysis_revision = generation;
+        draft.cancellation = cancellation.clone();
+        draft.analysis_pending = true;
+        draft.edited_after_request = false;
+        draft.analysis_scope = AnalysisScope::AutomaticOnly;
+        draft.inset_explanation = "Resolving a capture-aware background...".to_owned();
+        let mut data = self.document.data();
+        data.beautification = None;
+        Some(Intent::AnalyzeSmartFrame {
+            revision: generation,
+            data: Box::new(data),
+            cancellation,
+        })
+    }
+
+    /// Marks the draft as manually edited, cancelling any in-flight analysis.
+    pub fn mark_draft_edited(&mut self) {
+        if let Some(draft) = &mut self.smart_frame {
+            draft.cancellation.cancel();
+            draft.analysis_pending = false;
+            draft.edited_after_request = true;
+        }
+        self.touch();
+    }
+
+    /// Applies the current Smart Frame draft as one content revision / undo step.
+    pub fn apply_smart_frame(&mut self) {
+        let Some(draft) = self.smart_frame.take() else {
+            return;
+        };
+        draft.cancellation.cancel();
+        let after = self.document.beautification().cloned();
+        if after != draft.before {
+            self.framing_undo.push(draft.before);
+            self.framing_redo.clear();
+            self.dirty = true;
+            self.touch();
+        }
+    }
+
+    /// Cancels the Smart Frame draft, restoring the exact pre-draft document.
+    pub fn cancel_smart_frame(&mut self) {
+        let Some(draft) = self.smart_frame.take() else {
+            return;
+        };
+        draft.cancellation.cancel();
+        if self.document.set_beautification(draft.before).is_ok() {
+            self.touch();
+        }
+    }
+
+    /// Reverts all framing (undoable: pushes onto framing undo stack).
+    pub fn revert_framing(&mut self) {
+        self.cancel_smart_frame();
+        let before = self.document.beautification().cloned();
+        if before.is_some() && self.document.set_beautification(None).is_ok() {
+            self.framing_undo.push(before);
+            self.framing_redo.clear();
+            self.dirty = true;
+            self.touch();
+        }
+    }
+
+    /// Undoes one framing step.
+    pub fn undo_framing(&mut self) {
+        self.cancel_smart_frame();
+        let Some(previous) = self.framing_undo.pop() else {
+            return;
+        };
+        let current = self.document.beautification().cloned();
+        if self.document.set_beautification(previous).is_ok() {
+            self.framing_redo.push(current);
+            self.dirty = true;
+            self.touch();
+        }
+    }
+
+    /// Redoes one framing step.
+    pub fn redo_framing(&mut self) {
+        self.cancel_smart_frame();
+        let Some(next) = self.framing_redo.pop() else {
+            return;
+        };
+        let current = self.document.beautification().cloned();
+        if self.document.set_beautification(next).is_ok() {
+            self.framing_undo.push(current);
+            self.dirty = true;
+            self.touch();
+        }
+    }
+
+    /// Cancels the cooperative analysis without tearing down the draft.
+    fn cancel_analysis(&mut self) {
+        if let Some(draft) = &self.smart_frame {
+            draft.cancellation.cancel();
+        }
+    }
+
+    /// Builds a preset from the current beautification.
+    pub fn build_preset(&self, duplicate: bool) -> Result<SmartFramePreset> {
+        let name = if duplicate {
+            format!("{} copy", self.preset_name.trim())
+        } else {
+            self.preset_name.trim().to_owned()
+        };
+        let beauty = self.document.beautification().ok_or_else(|| {
+            scrozz_core::Error::InvalidRequest("start a Smart Frame draft first".to_owned())
+        })?;
+        let mut settings = SmartFramePresetSettings::from_beautification(beauty)?;
+        let selected = self
+            .selected_preset
+            .as_deref()
+            .and_then(|id| self.custom_presets.iter().find(|p| p.id == id));
+        if let Some(sel) = selected {
+            settings.extensions = sel.settings.extensions.clone();
+        }
+        let existing_id = (!duplicate)
+            .then(|| selected.filter(|p| p.name == name).map(|p| p.id.clone()))
+            .flatten();
+        let id = existing_id.unwrap_or_else(|| unique_preset_id(&name, &self.custom_presets));
+        let mut preset = SmartFramePreset::new(id, name, settings)?;
+        if let Some(sel) = selected {
+            preset.extensions = sel.extensions.clone();
+        }
+        Ok(preset)
+    }
+
+    /// Inserts or updates a preset in the local list.
+    pub fn upsert_local_preset(&mut self, preset: SmartFramePreset) {
+        self.selected_preset = Some(preset.id.clone());
+        if let Some(existing) = self.custom_presets.iter_mut().find(|p| p.id == preset.id) {
+            *existing = preset;
+        } else {
+            self.custom_presets.push(preset);
+        }
+        self.custom_presets.sort_by_key(|p| p.name.to_lowercase());
+    }
+
+    /// Deletes a preset by id.
+    pub fn delete_preset(&mut self, preset_id: &str) {
+        self.custom_presets.retain(|p| p.id != preset_id);
+        if self.selected_preset.as_deref() == Some(preset_id) {
+            self.selected_preset = None;
+        }
+    }
+
+    /// Sets the selected preset id.
+    pub fn set_selected_preset(&mut self, id: Option<String>) {
+        self.selected_preset = id;
+    }
+
+    /// Applies a beautification change from the inspector, marking the draft
+    /// edited. Returns an intent if an automatic background re-analysis is
+    /// needed.
+    pub fn apply_beautification_edit(&mut self, config: Beautification) -> Option<Intent> {
+        let automatic_switched = self
+            .document
+            .beautification()
+            .is_some_and(|b| !matches!(b.background, Background::Automatic(_)))
+            && matches!(config.background, Background::Automatic(_));
+        match self.document.set_beautification(Some(config)) {
+            Ok(()) => {
+                self.mark_draft_edited();
+                if automatic_switched {
+                    return self.request_automatic_background_analysis();
+                }
+            }
+            Err(error) => tracing::warn!(%error, "beautification edit rejected"),
+        }
+        None
+    }
 }
 
 /// The nearest `char` boundary at or before `at`, never past the end.
@@ -2867,4 +3385,28 @@ fn axis_lock(dx: f64, dy: f64) -> (f64, f64) {
     } else {
         (0.0, dy)
     }
+}
+
+/// Generates a stable, slug-like preset id that does not collide with existing
+/// presets.
+fn unique_preset_id(name: &str, presets: &[SmartFramePreset]) -> String {
+    let base: String = name
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let base = base.trim_matches('-');
+    if base.is_empty() {
+        return format!("preset-{}", presets.len());
+    }
+    if !presets.iter().any(|p| p.id == base) {
+        return base.to_owned();
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}-{n}");
+        if !presets.iter().any(|p| p.id == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
 }

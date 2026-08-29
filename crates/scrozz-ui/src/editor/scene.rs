@@ -97,6 +97,38 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
         state.pointer_released();
         return;
     }
+    // ── Smart Frame scenarios ──
+    if fixture.scenario == crate::harness::Scenario::SmartFrameUntouched {
+        editor.set_smart_frame_visible(true);
+        return;
+    }
+    if fixture.scenario == crate::harness::Scenario::SmartFrameOneClick
+        || fixture.scenario == crate::harness::Scenario::SmartFrameExpanded
+    {
+        editor.set_smart_frame_visible(true);
+        // Activate Smart Frame one-click, run analysis synchronously.
+        let intent = editor.state_mut().begin_smart_frame();
+        if let super::state::Intent::AnalyzeSmartFrame {
+            revision,
+            cancellation,
+            ..
+        } = intent
+        {
+            let result = scrozz_annotate::analyze_smart_frame(
+                &editor.state().document().source.frame,
+                editor.state().document().source.provenance,
+                &cancellation,
+            )
+            .map_err(|e| e.to_string());
+            editor
+                .state_mut()
+                .finish_smart_frame_analysis(revision, result);
+        }
+        if fixture.scenario == crate::harness::Scenario::SmartFrameExpanded {
+            editor.state_mut().advanced_open = true;
+        }
+        return;
+    }
     state.set_tool(super::Tool::Arrow);
     // Keep Arrow in hand while selecting the sample arrow, so the golden proves
     // the tool can edit an existing arrow and paints endpoint chrome only.

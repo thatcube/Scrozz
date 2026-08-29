@@ -1,0 +1,241 @@
+//! Smart Frame behavior contracts ported from the reviewed monolithic editor.
+
+use scrozz_annotate::{
+    Background, Beautification, BeautificationPreset, Document, SmartFrameAnalysis,
+    SmartFramePreset, SmartFramePresetSettings,
+};
+use scrozz_core::{
+    Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
+    PhysicalSize, PixelFormat, Provenance, ScaleFactor,
+};
+use scrozz_ui::editor::{EditorState, Intent};
+
+fn document(provenance: Provenance) -> Document {
+    let size = LogicalSize::new(480.0, 300.0);
+    let w = (size.width * 2.0) as u32;
+    let h = (size.height * 2.0) as u32;
+    let data = vec![128u8; w as usize * h as usize * 4];
+    Document::new(Capture {
+        frame: Frame {
+            data,
+            size: PhysicalSize::new(f64::from(w), f64::from(h)),
+            stride: w as usize * 4,
+            format: PixelFormat::Rgba8,
+            color_space: ColorSpace::Srgb,
+            scale: ScaleFactor::new(2.0),
+        },
+        provenance,
+        target: CaptureTarget::Region(LogicalRect::new(LogicalPoint::new(0.0, 0.0), size)),
+    })
+}
+
+#[test]
+fn smart_frame_starts_as_an_immediate_default_on_draft() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let before = state.document().data();
+    let revision_before = state.revision();
+
+    let intent = state.begin_smart_frame();
+    let Intent::AnalyzeSmartFrame {
+        revision,
+        data,
+        cancellation,
+        ..
+    } = &intent
+    else {
+        panic!("expected AnalyzeSmartFrame intent");
+    };
+
+    assert_eq!(*revision, 1);
+    assert!(!cancellation.is_cancelled());
+    assert!(
+        data.beautification.is_none(),
+        "analysis receives no old frame"
+    );
+    let draft = state.document().beautification().expect("visible draft");
+    assert!(draft.auto_balance, "Smart Frame's main value starts on");
+    assert!(matches!(draft.background, Background::Automatic(_)));
+    // Opening a draft bumps revision for preview but does not dirty the
+    // document for persistence purposes until Apply.
+    assert!(
+        !state.is_dirty(),
+        "opening a draft is not a persistent edit"
+    );
+
+    state.cancel_smart_frame();
+    assert_eq!(state.document().data(), before);
+}
+
+#[test]
+fn cancel_restores_exact_document() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let before = state.document().data();
+    let _ = state.begin_smart_frame();
+    assert!(state.document().beautification().is_some());
+
+    state.cancel_smart_frame();
+    assert_eq!(state.document().data(), before);
+    assert!(!state.is_dirty());
+}
+
+#[test]
+fn apply_is_one_undoable_revision() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let before = state.document().data();
+    state.begin_with(Beautification::preset(BeautificationPreset::Social));
+    state.apply_smart_frame();
+
+    assert!(state.is_dirty());
+    assert!(state.can_undo_framing());
+    assert!(state.document().beautification().is_some());
+
+    state.undo_framing();
+    assert_eq!(
+        state.document().data().beautification,
+        before.beautification
+    );
+    state.redo_framing();
+    assert_eq!(
+        state.document().beautification(),
+        Some(&Beautification::preset(BeautificationPreset::Social))
+    );
+}
+
+#[test]
+fn stale_analysis_never_replaces_newer_draft() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame {
+        revision: stale, ..
+    } = state.begin_smart_frame()
+    else {
+        panic!("expected analysis intent");
+    };
+    state.cancel_smart_frame();
+
+    let Intent::AnalyzeSmartFrame {
+        revision: current, ..
+    } = state.begin_smart_frame()
+    else {
+        panic!("expected analysis intent");
+    };
+    assert_ne!(stale, current);
+    let expected = state.document().beautification().cloned();
+
+    state.finish_smart_frame_analysis(
+        stale,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification::preset(BeautificationPreset::Story),
+            inset_explanation: "stale".to_owned(),
+        }),
+    );
+    assert_eq!(state.document().beautification(), expected.as_ref());
+}
+
+#[test]
+fn manual_preset_choice_cancels_in_flight_analysis() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame {
+        revision,
+        cancellation,
+        ..
+    } = state.begin_smart_frame()
+    else {
+        panic!("expected analysis intent");
+    };
+
+    state.begin_with(Beautification::preset(BeautificationPreset::Editorial));
+    assert!(cancellation.is_cancelled());
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification::preset(BeautificationPreset::Story),
+            inset_explanation: "stale".to_owned(),
+        }),
+    );
+    assert_eq!(
+        state.document().beautification(),
+        Some(&Beautification::preset(BeautificationPreset::Editorial))
+    );
+}
+
+#[test]
+fn d9_window_preserves_subject_controls() {
+    let mut state = EditorState::new(document(Provenance::Window));
+    let _ = state.begin_smart_frame();
+    let beauty = state.document().beautification().expect("outer frame");
+    assert!(beauty.padding > 0.0);
+    assert!(beauty.preserves_subject_pixels());
+    assert!(state.document().may_beautify());
+    assert!(!state.document().may_style_subject());
+}
+
+#[test]
+fn preset_build_and_upsert() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    state.begin_with(Beautification::preset(BeautificationPreset::Clean));
+    state.set_preset_name("My preset".to_owned());
+    let preset = state.build_preset(false).expect("build preset");
+    assert_eq!(preset.name, "My preset");
+
+    state.upsert_local_preset(preset.clone());
+    assert_eq!(state.custom_presets().len(), 1);
+    assert_eq!(state.selected_preset(), Some(preset.id.as_str()));
+}
+
+#[test]
+fn renaming_selected_preset_creates_new_instead_of_overwriting() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    state.begin_with(Beautification::preset(BeautificationPreset::Clean));
+
+    let original = SmartFramePreset::new(
+        "quiet",
+        "Quiet",
+        SmartFramePresetSettings::from_beautification(state.document().beautification().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    state.set_custom_presets(vec![original]);
+    state.set_selected_preset(Some("quiet".to_owned()));
+    state.set_preset_name("Quiet for docs".to_owned());
+
+    let renamed = state.build_preset(false).unwrap();
+    assert_ne!(renamed.id, "quiet");
+    assert_eq!(renamed.name, "Quiet for docs");
+}
+
+#[test]
+fn sensitive_review_is_delivered_without_auto_redacting() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let review = scrozz_annotate::SensitiveRegionReview {
+        revision: 1,
+        suggestions: vec![scrozz_annotate::SensitiveRegionSuggestion {
+            id: "s1".to_owned(),
+            bounds: LogicalRect::new(LogicalPoint::new(10.0, 10.0), LogicalSize::new(50.0, 20.0)),
+            category: "email address".to_owned(),
+            confidence: 90,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    state.set_sensitive_review(review.clone());
+    let got = state.sensitive_review().expect("review delivered");
+    assert_eq!(got.suggestions.len(), 1);
+    // Smart Frame NEVER auto-redacts; annotations are unchanged.
+    assert!(state.document().annotations().is_empty());
+}
+
+#[test]
+fn revert_framing_is_undoable() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    state.begin_with(Beautification::preset(BeautificationPreset::Social));
+    state.apply_smart_frame();
+    assert!(state.document().beautification().is_some());
+
+    state.revert_framing();
+    assert!(state.document().beautification().is_none());
+    assert!(state.can_undo_framing());
+
+    state.undo_framing();
+    assert!(state.document().beautification().is_some());
+}
