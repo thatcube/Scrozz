@@ -3025,7 +3025,9 @@ mod tests {
         controller.logic(&ctx, &native);
         assert!(matches!(
             &controller.phase,
-            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
+            ControllerPhase::AwaitingCapture { .. }
+                | ControllerPhase::RestoringCards { .. }
+                | ControllerPhase::Cards
         ));
         wait_until(|| {
             controller.logic(&ctx, &native);

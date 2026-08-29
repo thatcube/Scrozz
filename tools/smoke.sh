@@ -102,6 +102,10 @@ cleanup() { rm -rf "$SMOKE_TMP"; }
 trap cleanup EXIT
 
 export SCROZZ_IPC_SOCKET="$SMOKE_TMP/scrozz.sock"
+export HOME="$SMOKE_TMP/home"
+export XDG_CONFIG_HOME="$SMOKE_TMP/config"
+export XDG_DATA_HOME="$SMOKE_TMP/data"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
 
 PASS=0
 FAIL=0
@@ -234,23 +238,13 @@ fi
 
 # --- 3. the store ----------------------------------------------------------
 #
-# This is the database check, and it looks like a no-op until you read
-# commands::history: `HistoryCommand::List` calls `platform::store()?` — which
-# runs SqliteStore::open_default(), resolving the per-user data directory,
-# creating it, opening the file and applying the schema — and only then returns
-# NotImplemented because the *listing* is unwritten.
-#
-# So exit 12 means every one of those steps worked. A broken data-directory
-# resolution or an unwritable path would surface as exit 9 (`storage`) instead,
-# and that is precisely the class of bug that only appears on a platform whose
-# path conventions differ from the developer's. Asserting 12 rather than
-# "non-zero" is what makes this a real test.
+# History is implemented. Run it against the isolated profile above so a smoke
+# test never migrates or reads the developer's real captures.
 run_scrozz --json history list
-if expect_status "store-opens" 12 "the store opens, the listing is unwritten"; then
+if expect_status "store-opens" 0 "the store opens and returns an empty first page"; then
   case "$OUT" in
-    *'"kind":"not-implemented"'*) pass "store-opens" "sqlite opened; listing unimplemented (exit 12)" ;;
-    *'"kind":"storage"'*) fail "store-opens" "the store itself failed: $(echo "$OUT" | head -c 160)" ;;
-    *) fail "store-opens" "unexpected error kind: $(echo "$OUT" | head -c 160)" ;;
+    *'"ok":true'*'"total":0'*'"captures":[]'*) pass "store-opens" "sqlite opened and listed isolated history" ;;
+    *) fail "store-opens" "unexpected history response: $(echo "$OUT" | head -c 160)" ;;
   esac
 fi
 
