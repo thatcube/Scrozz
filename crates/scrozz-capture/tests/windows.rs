@@ -378,6 +378,8 @@ fn composite_placement_rebases_a_negative_desktop_origin_to_zero() {
 /// A window that should pass every rule, to be spoiled one field at a time.
 fn good_window() -> WindowFacts {
     WindowFacts {
+        owner_process_id: 4242,
+        current_process_id: 9999,
         visible: true,
         minimized: false,
         cloaked: false,
@@ -402,6 +404,13 @@ fn every_rejection_has_a_case_that_triggers_it() {
     // Written as a table so that adding a `Rejection` variant without a test is
     // obvious in review.
     let cases: Vec<(Rejection, WindowFacts)> = vec![
+        (
+            Rejection::CurrentProcess,
+            WindowFacts {
+                owner_process_id: 9999,
+                ..good_window()
+            },
+        ),
         (
             Rejection::NotVisible,
             WindowFacts {

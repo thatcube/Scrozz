@@ -47,9 +47,9 @@ use self::randr::RandrExtension;
 /// in the picker.
 #[derive(Debug, Clone, Copy)]
 struct Atoms {
-    net_client_list: u32,
     net_client_list_stacking: u32,
     net_wm_name: u32,
+    net_wm_pid: u32,
     net_workarea: u32,
     net_current_desktop: u32,
     net_frame_extents: u32,
@@ -61,9 +61,9 @@ struct Atoms {
 impl Atoms {
     fn intern(conn: &RustConnection) -> Result<Self> {
         let names: [&[u8]; 9] = [
-            b"_NET_CLIENT_LIST",
             b"_NET_CLIENT_LIST_STACKING",
             b"_NET_WM_NAME",
+            b"_NET_WM_PID",
             b"_NET_WORKAREA",
             b"_NET_CURRENT_DESKTOP",
             b"_NET_FRAME_EXTENTS",
@@ -85,9 +85,9 @@ impl Atoms {
         }
 
         Ok(Self {
-            net_client_list: atoms[0],
-            net_client_list_stacking: atoms[1],
-            net_wm_name: atoms[2],
+            net_client_list_stacking: atoms[0],
+            net_wm_name: atoms[1],
+            net_wm_pid: atoms[2],
             net_workarea: atoms[3],
             net_current_desktop: atoms[4],
             net_frame_extents: atoms[5],
@@ -365,6 +365,11 @@ impl X11Backend {
         .and_then(|(_, bytes)| ewmh::application_name(&bytes))
     }
 
+    fn window_process_id(&self, window: u32) -> Option<u32> {
+        self.property(window, self.atoms.net_wm_pid, u32::from(AtomEnum::CARDINAL))
+            .and_then(|(_, bytes)| ewmh::parse_u32_list(&bytes).first().copied())
+    }
+
     fn is_mapped(&self, window: u32) -> bool {
         xproto::get_window_attributes(&self.conn, window)
             .ok()
@@ -563,28 +568,26 @@ impl TargetEnumerator for X11Backend {
             )
             .map(|(_, bytes)| ewmh::stacking_to_front_first(ewmh::parse_u32_list(&bytes)));
 
-        let handles = match stacking {
-            Some(list) if !list.is_empty() => list,
-            _ => self
-                .property(
-                    self.root,
-                    self.atoms.net_client_list,
-                    u32::from(AtomEnum::WINDOW),
-                )
-                .map(|(_, bytes)| ewmh::parse_u32_list(&bytes))
+        let handles =
+            stacking
+                .filter(|list| !list.is_empty())
                 .ok_or_else(|| Error::Unsupported {
                     what: "listing windows".into(),
-                    why: "this X11 session has no EWMH-compliant window manager, so no window \
-                          list is published; capture a display or a region instead"
-                        .into(),
-                })?,
-        };
+                    why:
+                        "this X11 window manager does not publish the native EWMH stacking order; \
+                      capture a display or a region instead"
+                            .into(),
+                })?;
 
         let displays = self.display_table()?;
+        let current_process_id = std::process::id();
 
         Ok(handles
             .into_iter()
             .filter_map(|handle| {
+                if self.window_process_id(handle) == Some(current_process_id) {
+                    return None;
+                }
                 let mapped = self.is_mapped(handle);
                 let state = self
                     .property(handle, self.atoms.wm_state, 0)

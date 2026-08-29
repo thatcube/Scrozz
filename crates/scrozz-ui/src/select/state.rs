@@ -58,6 +58,7 @@ pub struct SelectionState {
     active_display: Option<DisplayId>,
     hovered_display: Option<DisplayId>,
     hovered_window: Option<WindowId>,
+    highlight_revision: u64,
     last_pointer: Option<LogicalPoint>,
     phase: Phase,
     drag_modifiers: DragModifiers,
@@ -168,6 +169,7 @@ impl SelectionState {
             active_display,
             hovered_display: None,
             hovered_window: None,
+            highlight_revision: 0,
             last_pointer: None,
             phase: Phase::Idle,
             drag_modifiers: DragModifiers::default(),
@@ -298,6 +300,16 @@ impl SelectionState {
             .and_then(|window| self.window(window))
     }
 
+    /// Monotonic revision of the target highlight visible in window/display mode.
+    ///
+    /// Pointer movement inside the same target does not advance this. The UI uses
+    /// it to request one corrective render pass only when the outline itself
+    /// changed.
+    #[must_use]
+    pub const fn highlight_revision(&self) -> u64 {
+        self.highlight_revision
+    }
+
     #[must_use]
     pub(crate) fn focus_rect(&self) -> Option<LogicalRect> {
         match self.mode {
@@ -370,6 +382,14 @@ impl SelectionState {
         self.hovered_window = self
             .window_at_point_on(point, self.hovered_display.as_ref())
             .map(|window| window.id.clone());
+        let highlight_changed = match self.mode {
+            SelectionMode::Window => previous_window != self.hovered_window,
+            SelectionMode::Display => previous_display != self.hovered_display,
+            SelectionMode::Region | SelectionMode::AllDisplays => false,
+        };
+        if highlight_changed {
+            self.highlight_revision = self.highlight_revision.wrapping_add(1);
+        }
         if self.mode != SelectionMode::Region || self.region.is_none() {
             if let Some(window) = self.hovered_window() {
                 self.active_display = Some(window.display.clone());
@@ -720,6 +740,9 @@ impl SelectionState {
             )));
             return false;
         }
+        if self.mode != mode {
+            self.highlight_revision = self.highlight_revision.wrapping_add(1);
+        }
         self.mode = mode;
         self.phase = Phase::Idle;
         self.axis_lock = None;
@@ -936,9 +959,25 @@ impl SelectionState {
         point: LogicalPoint,
         display: Option<&DisplayId>,
     ) -> Option<&Window> {
+        let display_coordinates_are_ambiguous = display.is_some()
+            && self
+                .layout
+                .displays()
+                .iter()
+                .filter(|candidate| geom::contains_point(candidate.bounds, point))
+                .nth(1)
+                .is_some();
+        // `windows` is an invocation-scoped native z-order snapshot. Finding
+        // the first eligible frame makes occlusion fall out naturally: an
+        // underlying window wins only where every eligible window above it is
+        // absent. A window spanning adjacent displays remains selectable from
+        // either viewport. We restrict by owning display only where mixed-DPI
+        // logical layouts overlap and the same numeric point is genuinely
+        // ambiguous between two native viewports.
         self.windows.iter().find(|window| {
             window.is_visible
-                && display.is_none_or(|display| window.display == *display)
+                && (!display_coordinates_are_ambiguous
+                    || display.is_none_or(|display| window.display == *display))
                 && geom::contains_point(window.bounds, point)
         })
     }

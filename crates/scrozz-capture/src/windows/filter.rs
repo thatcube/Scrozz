@@ -38,6 +38,10 @@ pub const MIN_WINDOW_EDGE: i32 = 16;
 /// A plain data struct so the rules can be tested without a `HWND`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowFacts {
+    /// Process that owns the window.
+    pub owner_process_id: u32,
+    /// Scrozz's process for this enumeration.
+    pub current_process_id: u32,
     /// `IsWindowVisible`.
     pub visible: bool,
     /// `IsIconic` — minimised windows have no capturable surface.
@@ -110,6 +114,8 @@ pub fn is_ignored_class(class_name: &str) -> bool {
 /// Why a window was excluded, for `tracing` and for tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejection {
+    /// Owned by Scrozz itself: cards, settings, pickers, and overlays.
+    CurrentProcess,
     /// `IsWindowVisible` was false.
     NotVisible,
     /// Minimised, so there is nothing to capture.
@@ -140,6 +146,9 @@ pub enum Rejection {
 ///
 /// Returns the first [`Rejection`] that applies.
 pub fn classify(facts: &WindowFacts) -> Result<(), Rejection> {
+    if facts.owner_process_id != 0 && facts.owner_process_id == facts.current_process_id {
+        return Err(Rejection::CurrentProcess);
+    }
     if !facts.visible {
         return Err(Rejection::NotVisible);
     }

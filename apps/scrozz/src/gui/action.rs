@@ -31,6 +31,36 @@ pub enum CaptureKind {
     AllDisplays,
 }
 
+/// Where a live-app capture request entered the shared dispatcher.
+///
+/// This is diagnostic context only. It must never alter selector or capture
+/// semantics; keeping it on the job makes route-specific lifecycle regressions
+/// visible without forking the implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureOrigin {
+    /// Clicked in the menu-bar/tray menu.
+    MenuBar,
+    /// Fired by a registered global shortcut.
+    GlobalHotkey,
+    /// Requested by the app's automated startup option.
+    Startup,
+    /// Called directly by an internal caller or test.
+    Direct,
+}
+
+impl CaptureOrigin {
+    /// Stable spelling used in diagnostic traces.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MenuBar => "menu-bar",
+            Self::GlobalHotkey => "global-hotkey",
+            Self::Startup => "startup",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 impl CaptureKind {
     /// Every kind, in menu order.
     pub const ALL: [Self; 5] = [

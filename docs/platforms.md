@@ -121,6 +121,29 @@ choices, where the pre-overlay
 display frame can be returned exactly (and cropped for a region). Window mode
 stays live so the backend can preserve the window's native isolation, shape and
 shadow; all-display mode stays live so the backend owns mixed-scale composition.
+Frozen frames and thumbnails are presentation data only: they are never inserted
+into the window target list and cannot become a desktop-sized capture candidate.
+
+Window selection has a stricter invocation boundary than the other modes. The
+selector takes a fresh native target snapshot before it sends any event that can
+raise, resize, show or create a Scrozz picker surface. That snapshot is consumed
+once and never cached for a later command. On macOS, ScreenCaptureKit supplies
+capturable identity, frame and visibility while CoreGraphics supplies the
+current Space's exact front-to-back on-screen order; the two are joined by
+`CGWindowID`. Scrozz's own process is excluded before the snapshot reaches the
+UI. Pointer hit testing preserves that order and chooses the first visible
+eligible frame containing the pointer, so an underlying window is reachable only
+through an exposed portion and a fully covered window is not reachable. The
+Finder desktop, when ScreenCaptureKit exposes it as a normal window, remains
+behind ranked application windows and is reachable only on exposed desktop.
+Pointer interaction is resolved after the HUD is laid out so controls can exclude
+the canvas underneath them. When that changes a window/display target, the
+selector compares a monotonic highlight revision with the revision just painted
+and discards exactly that stale pass. Egui immediately paints one replacement
+pass in the same rendered frame; movement within the same target advances no
+revision and schedules no replacement. This avoids relying on a later event-loop
+wake after a native menu closes, without turning the picker into a continuous
+repaint loop.
 
 Mixed-DPI desktops stay in logical coordinates while the user selects. A region
 wholly contained by one display retains that display's measured scale for exact
@@ -131,13 +154,14 @@ display. This avoids both negative-origin errors and the common 1.0x/1.5x
 boundary mismatch.
 
 The app reuses its existing eframe loop instead of starting a nested event loop:
-the capture worker blocks on the synchronous selector trait while the main
-thread hides capture cards for every interactive mode, waits for the launcher
-input to become quiescent, prepares any frozen pixels,
-shows the desktop-sized selector, hides it after commit, captures, then restores
-the cards to their prior slots; only the new card animates. Immediate fullscreen
-capture leaves cards visible when the backend can exclude Scrozz from the output.
-Only one selector may own that lifecycle at a time. CLI one-shot
+the capture worker blocks on the synchronous selector trait, snapshots native
+targets, and only then asks the main thread to hide capture cards for an
+interactive mode. After a card-free frame it prepares presentation pixels, waits
+for launcher input to become quiescent, shows the desktop-sized selector, hides
+it after commit, captures, then restores the cards to their prior slots; only the
+new card animates. Immediate fullscreen capture leaves cards visible when the
+backend can exclude Scrozz from the output. Only one selector may own that
+lifecycle at a time. CLI one-shot
 selection uses the same bridge in an ordinary temporary window. That one-shot
 window intentionally skips reversible AppKit panel conversion, so its layering
 across Spaces and fullscreen apps still needs a native smoke run. On X11, both
@@ -146,6 +170,11 @@ with `SetInputFocus` after the window becomes viewable, and restore the prior
 focus before capture begins unless the user has already focused somewhere else.
 The selector consumes terminal key, modifier and pointer releases before
 restoring focus, so no half of the finishing gesture reaches the prior app.
+Escape releases pointer input in the handling pass. The transparent selector
+retains terminal-key ownership only until Escape key-up, then restores the arrow,
+hides, releases native focus, completes the cancellation handshake, and frees the
+single-selection gate. Menu and global-hotkey routes share this state machine and
+can begin another invocation immediately after restoration.
 
 Shortcut settings and runtime actions are separate names:
 `hotkey.capture-region` persists the accelerator, while `capture.region` is the
@@ -179,6 +208,15 @@ Window enumeration and the selector both refuse truthfully until capture has a
 targetless portal-owned handoff. Wayland region cropping likewise requires real
 portal stream position and size; missing geometry is an error, never guessed.
 All-display composition remains separate capture-backend work.
+
+Native privacy remains authoritative. macOS Screen Recording permission can
+redact titles or refuse enumeration until granted, and protected/DRM windows may
+be omitted, return blank pixels, or fail capture even when their frame is visible.
+Windows can similarly withhold metadata for higher-integrity or protected
+processes. Scrozz does not bypass those controls or substitute pixels from a
+different target. Minimized, off-screen, and other-Space windows are never
+pointer-selectable; a window closing or moving Spaces after the snapshot is
+reported as a gone target instead of silently selecting another window.
 
 Selector geometry, state, input, accessibility labels, frozen-pixel sampling and
 deterministic harness scenes are covered headlessly. The remaining native gaps

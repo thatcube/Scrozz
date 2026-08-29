@@ -250,7 +250,7 @@ unsafe fn inspect_window(hwnd: HWND, state: &EnumState) -> Option<WindowRecord> 
         handle: hwnd,
         bounds,
         title: (!facts.title.is_empty()).then(|| facts.title.clone()),
-        application: unsafe { window_application(hwnd) },
+        application: unsafe { window_application(facts.owner_process_id) },
         monitor,
     })
 }
@@ -259,8 +259,12 @@ unsafe fn collect_facts(hwnd: HWND, shell: HWND) -> WindowFacts {
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     let root_owner = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
     let rect = unsafe { window_bounds(hwnd) }.unwrap_or(DeviceRect::new(0, 0, 0, 0));
+    let mut owner_process_id = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut owner_process_id)) };
 
     WindowFacts {
+        owner_process_id,
+        current_process_id: std::process::id(),
         visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
         minimized: unsafe { IsIconic(hwnd) }.as_bool(),
         cloaked: unsafe { is_cloaked(hwnd) },
@@ -352,9 +356,7 @@ unsafe fn class_name(hwnd: HWND) -> String {
 /// processes and for anything running at a higher integrity level, and a
 /// missing application name is not a reason to hide a window the user can
 /// plainly see.
-unsafe fn window_application(hwnd: HWND) -> Option<String> {
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+unsafe fn window_application(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
