@@ -15,6 +15,9 @@ the cross-platform feasibility analysis, and the build backlog.
 - `lzhgus/Capso` README — the closest existing OSS attempt (macOS-only, Swift 6, **BSL 1.1**)
 
 **UI reference library:** `~/.copilot/scrozz-ui-reference/` (start at `INDEX.md`).
+Agents use it through [`reference-workflow.md`](reference-workflow.md): references
+define observable behavior and calibrate quality, while Scrozz's visuals remain
+original.
 The complete library stays outside the repository. D17 permits a narrowly scoped,
 user-supplied image under `docs/reference/` when the audit needs concrete visual
 evidence for one behavior; it remains documentation, never a Scrozz product asset.

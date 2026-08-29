@@ -11,7 +11,7 @@ Items the agent marked "unverified" are exactly that.
 
 Cross-reference:
   docs/feature-audit.md              — authoritative feature inventory
-  docs/research/architecture-blueprint.md — externally supplied proposal
+  docs/research/Cross-Platform Screenshot App Architecture.md — externally supplied proposal
 -->
 
 # Scrozz Low-Level Capture/Recording/OCR Stack: Landscape Report (August 2026)

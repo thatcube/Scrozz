@@ -72,14 +72,17 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Save, clipboard, encoding | ✅ | 🟡 | 🟡 | Shared, platform-agnostic code — one implementation, tested everywhere |
 | Menu-bar / tray app | ✅ | 🟡 | 🟡 | One cross-platform tray item; only the macOS one has been run by a person |
 | Global hotkeys | ✅ | 🟡 | 🟠 | Works where the desktop allows it. Wayland cannot grab keys, so Scrozz refuses and hands you the exact compositor config line to bind the CLI instead ([D11](docs/decisions.md)) |
-| Capture stack overlay | ✅ | ⬜ | ⬜ | The native overlay window is retrofitted on macOS only; elsewhere it reports unsupported rather than silently doing nothing. GNOME/Wayland cannot position overlays at all — the adaptation is [D31](docs/decisions.md) |
-| Drag-out to another app | 🟡 | ⬜ | ⬜ | The hero interaction ([D12](docs/decisions.md)): promised-file drag exists on macOS; other backends are planned, not written |
+| Recent Captures Overlay | ✅ | ⬜ | ⬜ | The native overlay is hands-on verified on macOS; Windows/Linux native window behavior remains in platform validation. GNOME/Wayland cannot position overlays at all — the adaptation is [D31](docs/decisions.md) |
+| Drag-out to another app | ✅ | 🟡 | ⬜ | Native macOS drag is hands-on verified; Windows delayed rendering is implemented but still needs native testing; Linux remains open |
+| Pinned captures | 🟡 | 🟡 | 🟠 | Pin, lock, opacity, zoom and persistence are implemented; native focus and window-manager behavior still need the full platform matrix |
 | Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
-| Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
+| Capture history | 🟡 | 🟡 | 🟡 | Persistence, retention, restore/delete/filter UI and editable annotation documents are implemented; aggregate hands-on validation is in progress |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
-| Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
-| Screen recording | ⬜ | ⬜ | ⬜ | Contracts only. Hardware encoders only, for licence reasons |
-| Scrolling capture | ⬜ | ⬜ | ⬜ | No clean implementation exists on any platform; deliberately deferred |
+| Annotation editor | 🟡 | 🟡 | 🟡 | Full editor UI, history, crop, zoom, arrows, text, secure Redact and revision-safe copy/save/drag are implemented; final aggregate and platform validation remain |
+| Screen recording | 🟠 | 🟠 | 🟠 | Native recording engines and editor playback exist; macOS editor/export corrections and Windows/Linux runtime closure remain active |
+| Scrolling capture | 🟠 | 🟠 | 🟠 | Acquisition, alignment and stitching are under active integration; native app coverage and Wayland constraints remain |
+| Beautification | 🟡 | 🟡 | 🟡 | Background, padding and destination-aware export work exists on a reviewed feature branch and awaits aggregate validation |
+| BYO sharing | 🟠 | 🟠 | 🟠 | S3-compatible upload core exists; provider settings, credential-vault integration, history metadata and release packaging are active work |
 
 **What 🟡 rests on, precisely.** Three automated layers, described in full in
 [`docs/platforms.md`](docs/platforms.md): every target type-checks from a single
