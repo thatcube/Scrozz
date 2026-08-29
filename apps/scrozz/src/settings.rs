@@ -573,6 +573,24 @@ pub fn screenshot_sound(persisted: &AfterCaptureSettings) -> CliResult<Screensho
     screenshot_sound_from(&selected, &custom)
 }
 
+/// Resolves the source-image retention policy without renaming persisted keys.
+pub fn retention_policy(
+    persisted: &AfterCaptureSettings,
+) -> CliResult<scrozz_store::RetentionPolicy> {
+    let shortcuts = Shortcuts::default();
+    let bytes = resolve(lookup("history.max-image-bytes")?, &shortcuts, persisted)
+        .0
+        .parse::<u64>()
+        .map_err(|_| {
+            CliError::usage("history.max-image-bytes must be a non-negative whole number")
+        })?;
+    let age = resolve(lookup("history.max-image-age")?, &shortcuts, persisted).0;
+    Ok(scrozz_store::RetentionPolicy {
+        max_image_bytes: bytes,
+        max_image_age: scrozz_store::RetentionWindow::from_token(&age)?,
+    })
+}
+
 fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSound> {
     match selected {
         "8-bit" => Ok(ScreenshotSound::EightBit),
@@ -671,12 +689,11 @@ mod tests {
         // D23 fixes the default at 10 GB in `scrozz-store`. Two numbers that
         // must agree should be checked, not hoped about.
         let setting = lookup("history.max-image-bytes").unwrap();
+        let age = lookup("history.max-image-age").unwrap();
         assert_eq!(
             setting.default.parse::<u64>().unwrap(),
             scrozz_store::RetentionPolicy::default().max_image_bytes
         );
-
-        let age = lookup("history.max-image-age").unwrap();
         assert_eq!(
             scrozz_store::RetentionWindow::from_token(age.default).unwrap(),
             scrozz_store::RetentionPolicy::default().max_image_age
@@ -690,6 +707,21 @@ mod tests {
                 .iter()
                 .map(|window| window.as_token())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn persisted_retention_values_resolve_without_renaming_legacy_keys() {
+        let mut persisted = AfterCaptureSettings::fresh();
+        persisted.set_value("history.max-image-bytes", "4096");
+        persisted.set_value("history.max-image-age", "1-week");
+
+        assert_eq!(
+            retention_policy(&persisted).unwrap(),
+            scrozz_store::RetentionPolicy {
+                max_image_bytes: 4096,
+                max_image_age: scrozz_store::RetentionWindow::OneWeek,
+            }
         );
     }
 

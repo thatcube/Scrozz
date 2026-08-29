@@ -294,7 +294,9 @@ pub enum Job {
     },
     /// Permanently delete a stored capture.
     Delete(CaptureId),
-    /// Enforce the current source-image retention policy.
+    /// Replace the live source-image retention policy and enforce it now.
+    ///
+    /// The worker also applies this policy after every future capture.
     EnforceRetention(RetentionPolicy),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
@@ -586,6 +588,25 @@ impl Pipeline {
         history_enabled: bool,
         waker: Option<SurfaceWaker>,
     ) -> CliResult<Self> {
+        Self::start_with_history_waker_and_retention(
+            selector,
+            history_enabled,
+            waker,
+            RetentionPolicy::default(),
+        )
+    }
+
+    /// Starts both workers with explicit history, wake, and retention behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::Core`] under the same conditions as [`Self::start`].
+    pub fn start_with_history_waker_and_retention(
+        selector: Arc<dyn CaptureSelector>,
+        history_enabled: bool,
+        waker: Option<SurfaceWaker>,
+        retention_policy: RetentionPolicy,
+    ) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (history_queries, history_rx) = channel();
         let (outcome_tx, outcomes) = channel();
@@ -599,8 +620,15 @@ impl Pipeline {
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
-                Worker::new(outcome_tx, selector, worker_vault, history_enabled, waker)
-                    .run(&job_rx, &worker_pin_updates);
+                Worker::new(
+                    outcome_tx,
+                    selector,
+                    worker_vault,
+                    history_enabled,
+                    waker,
+                    retention_policy,
+                )
+                .run(&job_rx, &worker_pin_updates);
             })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
@@ -751,6 +779,14 @@ impl Pipeline {
                 "the capture worker stopped without acknowledging the unlock".into(),
             ))
         })?
+    }
+
+    /// Replaces the live policy and asks the worker to enforce it immediately.
+    ///
+    /// Completion or failure arrives as a retention history outcome.
+    #[must_use]
+    pub fn set_retention_policy(&self, policy: RetentionPolicy) -> bool {
+        self.post(Job::EnforceRetention(policy))
     }
 
     /// Posts a coalescible history read on a worker independent of capture.
@@ -1049,6 +1085,7 @@ struct Worker {
     store: Option<SqliteStore>,
     vault: CaptureVault,
     pin_generations: HashMap<CaptureId, PinGeneration>,
+    retention_policy: RetentionPolicy,
 }
 
 struct CaptureLifecycle {
@@ -1085,6 +1122,7 @@ impl Worker {
         vault: CaptureVault,
         history_enabled: bool,
         waker: Option<SurfaceWaker>,
+        retention_policy: RetentionPolicy,
     ) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
@@ -1113,12 +1151,18 @@ impl Worker {
             store,
             vault,
             pin_generations: HashMap::new(),
+            retention_policy,
         };
         worker.restore_existing_pins();
         worker
     }
 
     fn run(mut self, jobs: &Receiver<Job>, pending_pin_updates: &PendingPinUpdates) {
+        if self.store.is_some()
+            && let Err(error) = self.enforce_current_retention()
+        {
+            tracing::warn!("initial source-image retention could not run: {error}");
+        }
         while let Ok(job) = jobs.recv() {
             match job {
                 Job::Capture {
@@ -1221,7 +1265,7 @@ impl Worker {
                 Job::PrepareHistoryDrag(capture) => self.prepare_history_drag(capture),
                 Job::SetPinned { capture, pinned } => self.set_pinned(capture, pinned),
                 Job::Delete(capture) => self.delete(capture),
-                Job::EnforceRetention(policy) => self.enforce_retention(&policy),
+                Job::EnforceRetention(policy) => self.set_retention_policy(policy),
                 Job::Stop => break,
             }
         }
@@ -1561,6 +1605,7 @@ impl Worker {
 
     /// Persists a capture, or explains in the log why it was not.
     fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
+        let policy = self.retention_policy.clone();
         let store = self.store.as_mut()?;
         let document = Document::new(capture.clone());
         match store.insert(NewCapture::of_kind(
@@ -1568,7 +1613,7 @@ impl Worker {
             scrozz_store::MediaKind::Screenshot,
         )) {
             Ok(id) => {
-                if let Err(err) = store.enforce_retention(&RetentionPolicy::default()) {
+                if let Err(err) = store.enforce_retention(&policy) {
                     tracing::warn!("capture was stored but retention could not run: {err}");
                 }
                 Some(id)
@@ -1840,15 +1885,20 @@ impl Worker {
         self.answer_history(HistoryOperation::Delete, capture, result);
     }
 
-    fn enforce_retention(&mut self, policy: &RetentionPolicy) {
-        let result = self
-            .history_store()
-            .and_then(|store| Ok(store.enforce_retention(policy)?))
-            .map(|()| "source-image retention enforced".to_owned());
+    fn set_retention_policy(&mut self, policy: RetentionPolicy) {
+        self.retention_policy = policy;
+        let result = self.enforce_current_retention();
         match result {
             Ok(detail) => self.history_done(HistoryOperation::Retention, None, None, detail),
             Err(error) => self.history_failed(HistoryOperation::Retention, None, error),
         }
+    }
+
+    fn enforce_current_retention(&mut self) -> CliResult<String> {
+        let policy = self.retention_policy.clone();
+        self.history_store()
+            .and_then(|store| Ok(store.enforce_retention(&policy)?))
+            .map(|()| "source-image retention enforced".to_owned())
     }
 
     fn history_store(&mut self) -> CliResult<&mut SqliteStore> {
@@ -2548,6 +2598,7 @@ mod tests {
             store: None,
             vault,
             pin_generations: HashMap::new(),
+            retention_policy: RetentionPolicy::default(),
         };
         (worker, inbox)
     }
@@ -2863,6 +2914,7 @@ mod tests {
                 store: Some(store),
                 vault: CaptureVault::new(),
                 pin_generations: HashMap::new(),
+                retention_policy: RetentionPolicy::default(),
             },
             receiver,
         )
@@ -2881,6 +2933,77 @@ mod tests {
         let second = pipeline.allocate();
         assert_ne!(first, second);
         assert_eq!(first, CardId(1));
+        assert_eq!(second, CardId(2));
+    }
+
+    #[test]
+    fn a_live_policy_update_evicts_existing_images_and_governs_future_captures() {
+        let (_dir, mut worker, outcomes) = worker_with_store("pipeline-retention-update");
+        let first = worker
+            .remember(&sample_document(8, 8, 1, 0).source)
+            .expect("store existing capture");
+        assert!(
+            worker
+                .store
+                .as_mut()
+                .unwrap()
+                .image(&first)
+                .unwrap()
+                .is_some()
+        );
+
+        let policy = RetentionPolicy {
+            max_image_bytes: 0,
+            max_image_age: scrozz_store::RetentionWindow::Forever,
+        };
+        worker.set_retention_policy(policy.clone());
+        assert_eq!(worker.retention_policy, policy);
+        assert!(
+            worker
+                .store
+                .as_mut()
+                .unwrap()
+                .image(&first)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            received(&outcomes),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::Retention,
+                ..
+            }
+        ));
+
+        let future = worker
+            .remember(&sample_document(8, 8, 2, 0).source)
+            .expect("store future capture");
+        let store = worker.store.as_mut().unwrap();
+        assert!(store.image(&future).unwrap().is_none());
+        assert!(store.record(&future).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_startup_policy_is_enforced_before_the_first_job() {
+        let (dir, mut worker, _outcomes) = worker_with_store("pipeline-startup-retention");
+        let capture = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .insert(NewCapture::new(&sample_document(8, 8, 3, 0)))
+            .expect("store capture before worker startup");
+        worker.retention_policy = RetentionPolicy {
+            max_image_bytes: 0,
+            max_image_age: scrozz_store::RetentionWindow::Forever,
+        };
+
+        let (jobs, receiver) = channel();
+        jobs.send(Job::Stop).unwrap();
+        worker.run(&receiver, &PendingPinUpdates::default());
+
+        let mut reopened = SqliteStore::open(dir.path()).expect("reopen history");
+        assert!(reopened.image(&capture).unwrap().is_none());
+        assert!(reopened.record(&capture).unwrap().is_some());
     }
 
     #[test]
@@ -3365,6 +3488,7 @@ mod tests {
             store: Some(store),
             vault,
             pin_generations: HashMap::new(),
+            retention_policy: RetentionPolicy::default(),
         };
 
         let card = worker
@@ -3413,6 +3537,7 @@ mod tests {
             store: Some(store),
             vault,
             pin_generations: HashMap::new(),
+            retention_policy: RetentionPolicy::default(),
         };
         let card = worker
             .finish_capture(
@@ -3497,6 +3622,7 @@ mod tests {
             store: None,
             vault,
             pin_generations: HashMap::new(),
+            retention_policy: RetentionPolicy::default(),
         };
         let state = PinState::new(
             scrozz_core::LogicalRect::new(
@@ -3613,6 +3739,7 @@ mod tests {
             store: None,
             vault: CaptureVault::new(),
             pin_generations: HashMap::new(),
+            retention_policy: RetentionPolicy::default(),
         };
 
         assert!(worker.claim_pin_generation(&capture, PinGeneration(3)));

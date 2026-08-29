@@ -42,7 +42,7 @@ use scrozz_shell::{
     hotkey::{DesiredBinding, Rejection},
     play_screenshot_sound,
 };
-use scrozz_store::{CaptureId, Timestamp};
+use scrozz_store::{CaptureId, RetentionPolicy, Timestamp};
 use scrozz_ui::history::{HistoryAction, HistoryViewModel};
 
 use crate::{
@@ -156,6 +156,8 @@ pub struct Config {
     pub after_capture_store: Option<AfterCaptureStore>,
     /// A startup problem that forced the action policy back to safe defaults.
     pub after_capture_warning: Option<String>,
+    /// Source-image retention applied by the history worker.
+    pub retention_policy: RetentionPolicy,
 }
 
 impl Default for Config {
@@ -173,6 +175,7 @@ impl Default for Config {
             after_capture: AfterCaptureSettings::fresh(),
             after_capture_store: AfterCaptureStore::default_location().ok(),
             after_capture_warning: None,
+            retention_policy: RetentionPolicy::default(),
         }
     }
 }
@@ -204,6 +207,19 @@ impl Config {
                         InstallProfile::Existing => AfterCaptureSettings::legacy(),
                     };
                 }
+            }
+        }
+        match crate::settings::retention_policy(&config.after_capture) {
+            Ok(policy) => config.retention_policy = policy,
+            Err(error) => {
+                let warning =
+                    format!("History retention settings are invalid; using defaults: {error}");
+                config.after_capture_warning = Some(
+                    config
+                        .after_capture_warning
+                        .take()
+                        .map_or(warning.clone(), |existing| format!("{existing}; {warning}")),
+                );
             }
         }
         match crate::settings::screenshot_sound(&config.after_capture) {
@@ -269,6 +285,10 @@ impl Config {
             after_capture: AfterCaptureSettings::legacy(),
             after_capture_store: None,
             after_capture_warning: None,
+            retention_policy: RetentionPolicy {
+                max_image_bytes: u64::MAX,
+                max_image_age: scrozz_store::RetentionWindow::Forever,
+            },
         }
     }
 }
@@ -725,10 +745,11 @@ impl App {
         permission_ui_available: bool,
     ) -> CliResult<Self> {
         let waker = surface.waker();
-        let pipeline = Pipeline::start_with_history_and_waker(
+        let pipeline = Pipeline::start_with_history_waker_and_retention(
             Arc::clone(&selector),
             config.history,
             waker.clone(),
+            config.retention_policy.clone(),
         )?;
         let mut notes = Vec::new();
         if let Some(warning) = config.after_capture_warning.clone() {
@@ -1195,18 +1216,29 @@ impl App {
             return;
         };
         match store.load(store.inferred_profile()) {
-            Ok(settings) => match crate::settings::screenshot_sound(&settings) {
-                Ok(sound) => {
-                    self.config.after_capture = settings;
-                    self.config.screenshot_sound = sound;
-                    self.note("persisted settings reloaded");
+            Ok(settings) => {
+                let resolved = crate::settings::screenshot_sound(&settings).and_then(|sound| {
+                    crate::settings::retention_policy(&settings).map(|retention| (sound, retention))
+                });
+                match resolved {
+                    Ok((sound, retention)) => {
+                        if self.set_retention_policy(retention) {
+                            self.config.after_capture = settings;
+                            self.config.screenshot_sound = sound;
+                            self.note("persisted settings reloaded");
+                        } else {
+                            self.note(
+                                "persisted settings changed but the capture worker could not apply history retention",
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.note(format!(
+                            "persisted settings changed but could not be applied: {error}"
+                        ));
+                    }
                 }
-                Err(error) => {
-                    self.note(format!(
-                        "persisted settings changed but could not be applied: {error}"
-                    ));
-                }
-            },
+            }
             Err(error) => {
                 self.note(format!(
                     "persisted settings changed but could not be reloaded: {error}"
@@ -2896,6 +2928,27 @@ impl App {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut history)
+    }
+
+    /// The source-image policy currently applied to new captures.
+    #[must_use]
+    pub fn retention_policy(&self) -> &RetentionPolicy {
+        &self.config.retention_policy
+    }
+
+    /// Replaces the history worker's live policy and enforces it immediately.
+    ///
+    /// Returns `false` only if the worker has already stopped.
+    #[must_use]
+    pub fn set_retention_policy(&mut self, policy: RetentionPolicy) -> bool {
+        if self.config.retention_policy == policy {
+            return true;
+        }
+        if !self.pipeline.set_retention_policy(policy.clone()) {
+            return false;
+        }
+        self.config.retention_policy = policy;
+        true
     }
 
     /// Shared state rendered by the secondary history viewport.

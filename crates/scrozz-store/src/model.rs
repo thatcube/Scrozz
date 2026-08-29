@@ -263,6 +263,38 @@ impl RetentionWindow {
         ]
     }
 
+    /// Converts the day counts used by persisted settings into a retention
+    /// window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] when `days` is not one of the values
+    /// represented by [`RetentionWindow`].
+    pub fn from_days(days: u32) -> Result<Self> {
+        match days {
+            0 => Ok(Self::Forever),
+            1 => Ok(Self::OneDay),
+            3 => Ok(Self::ThreeDays),
+            7 => Ok(Self::OneWeek),
+            30 => Ok(Self::OneMonth),
+            other => Err(Error::InvalidRequest(format!(
+                "unsupported history image age {other} days; expected one of: 0, 1, 3, 7, 30"
+            ))),
+        }
+    }
+
+    /// The exact day count persisted by settings.
+    #[must_use]
+    pub const fn as_days(self) -> u32 {
+        match self {
+            Self::Forever => 0,
+            Self::OneDay => 1,
+            Self::ThreeDays => 3,
+            Self::OneWeek => 7,
+            Self::OneMonth => 30,
+        }
+    }
+
     /// The stable token stored in settings and accepted by the CLI.
     #[must_use]
     pub const fn as_token(self) -> &'static str {
@@ -700,6 +732,22 @@ mod tests {
     #[test]
     fn unknown_provenance_token_is_a_storage_error_not_a_panic() {
         assert!(ProvenanceRepr::from_token("teleported").is_err());
+    }
+
+    #[test]
+    fn persisted_day_values_map_exactly_and_reject_every_other_value() {
+        for (days, expected) in [
+            (0, RetentionWindow::Forever),
+            (1, RetentionWindow::OneDay),
+            (3, RetentionWindow::ThreeDays),
+            (7, RetentionWindow::OneWeek),
+            (30, RetentionWindow::OneMonth),
+        ] {
+            assert_eq!(RetentionWindow::from_days(days).unwrap(), expected);
+            assert_eq!(expected.as_days(), days);
+        }
+        let error = RetentionWindow::from_days(2).unwrap_err().to_string();
+        assert!(error.contains("0, 1, 3, 7, 30"), "{error}");
     }
 
     #[test]
