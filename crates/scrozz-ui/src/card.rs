@@ -6,11 +6,10 @@
 //!
 //! # What a card is made of
 //!
-//! At rest a card is only the capture (D12). On hover a scrim fades in carrying
-//! a vertical pair of equally weighted neutral pills — **Copy** and **Save** —
-//! and four smaller corner buttons with the same treatment for pin, close,
-//! annotate and upload (D21). The card body *is* the drag handle; there is no
-//! separate grab affordance.
+//! At rest a card is only the capture (D12). On hover a screenshot adds the
+//! equal-priority **Copy** and **Save** pills plus corner actions; a recording
+//! keeps only video-appropriate corner actions. The card body *is* the drag
+//! handle; there is no separate grab affordance.
 //!
 //! # Motion applies to the card, not to its buttons
 //!
@@ -27,13 +26,18 @@
 //! capture type. That intentionally crops only the transient preview; the
 //! capture handed to the clipboard, file encoder and editor is untouched.
 
+use std::time::Duration;
+
 use egui::epaint::{Mesh, Vertex};
-use egui::{Color32, Id, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{
+    Color32, FontId, Id, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
+};
 use scrozz_core::Provenance;
 
 use crate::icons::Icon;
 use crate::motion::fade;
 use crate::paint::{self, Reveal, Surface};
+use crate::recording_controls::format_duration;
 use crate::stack::{CardFrame, CardId, MAX_LEAN};
 use crate::theme::{Radius, Space, corner};
 
@@ -54,6 +58,16 @@ pub const SHADOW_BLEED: f32 = 48.0;
 const COMPACT_CHROME_W: f32 = 154.0;
 /// Height below which the two-row chrome collapses to icon-only controls.
 const COMPACT_CHROME_H: f32 = 72.0;
+/// Diameter of the resting play badge on a full-size card, in points.
+const PLAY_BADGE: f32 = 46.0;
+/// Smallest legible play badge; below this the badge is dropped entirely.
+const PLAY_BADGE_MIN: f32 = 22.0;
+/// Alpha of the play badge's disc.
+const PLAY_BADGE_SCRIM: f32 = 150.0;
+/// Alpha of the duration chip's plate.
+const DURATION_CHIP_SCRIM: f32 = 168.0;
+/// Point size of the duration chip's label.
+const DURATION_TEXT: f32 = 11.0;
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
@@ -147,6 +161,65 @@ pub struct CardGeometry {
 // Content and results
 // ---------------------------------------------------------------------------
 
+/// What kind of finished media a card is presenting.
+///
+/// The card geometry, cover-fill and drag handle are identical for both: a
+/// recording is a capture like any other, and D9's "preview treatment never
+/// changes exported pixels" rule applies unchanged. Only two things differ — a
+/// video says it is a video (play badge and duration), and its bottom-left
+/// hover action opens the video editor rather than the annotation editor.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum CardMedia {
+    /// A still image capture.
+    #[default]
+    Image,
+    /// A finalized recording whose durable media file outlives the card.
+    Video {
+        /// Native container duration, shown as the card's duration chip.
+        duration: Duration,
+        /// Whether the durable source carries audio.
+        has_audio: bool,
+    },
+}
+
+impl CardMedia {
+    /// A video card for a recording of `duration`.
+    #[must_use]
+    pub const fn video(duration: Duration, has_audio: bool) -> Self {
+        Self::Video {
+            duration,
+            has_audio,
+        }
+    }
+
+    /// Whether this card presents playable video.
+    #[must_use]
+    pub const fn is_video(self) -> bool {
+        matches!(self, Self::Video { .. })
+    }
+
+    /// The duration to display, when there is one.
+    #[must_use]
+    pub const fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Image => None,
+            Self::Video { duration, .. } => Some(duration),
+        }
+    }
+
+    /// The hover action occupying the bottom-left corner for this media.
+    ///
+    /// One place decides it, so a video can never sprout an annotation editor
+    /// it has no document for, and a screenshot can never offer a trim UI.
+    #[must_use]
+    pub const fn edit_action(self) -> CardAction {
+        match self {
+            Self::Image => CardAction::Annotate,
+            Self::Video { .. } => CardAction::Edit,
+        }
+    }
+}
+
 /// Everything the painter needs to know about one capture.
 ///
 /// A borrowed view, not an owner: the overlay keeps the textures and strings, and
@@ -159,6 +232,8 @@ pub struct CardContent<'a> {
     pub source_px: (u32, u32),
     /// Where the pixels came from. Decides the chrome (D9).
     pub provenance: Provenance,
+    /// Whether this card is a still or a recording.
+    pub media: CardMedia,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
 }
@@ -171,6 +246,7 @@ impl<'a> CardContent<'a> {
             name,
             source_px,
             provenance,
+            media: CardMedia::Image,
             texture: None,
         }
     }
@@ -179,6 +255,13 @@ impl<'a> CardContent<'a> {
     #[must_use]
     pub fn with_texture(mut self, texture: egui::TextureId) -> Self {
         self.texture = Some(texture);
+        self
+    }
+
+    /// The same content presented as the given media kind.
+    #[must_use]
+    pub const fn with_media(mut self, media: CardMedia) -> Self {
+        self.media = media;
         self
     }
 
@@ -199,6 +282,8 @@ pub enum CardAction {
     Save,
     /// Open the annotation editor.
     Annotate,
+    /// Open the video editor for a recording.
+    Edit,
     /// Upload and produce a link.
     Upload,
     /// Pin the card so the stack will not retire it.
@@ -215,6 +300,7 @@ impl CardAction {
             Self::Copy => "copy",
             Self::Save => "save",
             Self::Annotate => "annotate",
+            Self::Edit => "edit",
             Self::Upload => "upload",
             Self::Pin => "pin",
             Self::Close => "close",
@@ -228,6 +314,7 @@ impl CardAction {
             Self::Copy => "Copy",
             Self::Save => "Save",
             Self::Annotate => "Annotate",
+            Self::Edit => "Edit",
             Self::Upload => "Upload",
             Self::Pin => "Pin",
             Self::Close => "Close",
@@ -241,6 +328,7 @@ impl CardAction {
             Self::Copy => Icon::Copy,
             Self::Save => Icon::DeviceFloppy,
             Self::Annotate => Icon::Pencil,
+            Self::Edit => Icon::Video,
             Self::Upload => Icon::CloudUpload,
             Self::Pin => Icon::Pin,
             Self::Close => Icon::X,
@@ -355,9 +443,18 @@ pub fn draw_card(
 
     let capture = geometry.capture;
     draw_capture(ui, surface, content, chrome, capture, angle, alpha);
+    draw_media_marks(ui, content, capture, alpha);
 
     let reveal = frame.reveal.clamp(0.0, 1.0) * flat;
-    let action = draw_chrome(ui, surface, frame, chrome, rect, alpha * reveal);
+    let action = draw_chrome(
+        ui,
+        surface,
+        frame,
+        chrome,
+        content.media,
+        rect,
+        alpha * reveal,
+    );
 
     CardResponse {
         body,
@@ -423,6 +520,87 @@ fn draw_capture(
     }
 }
 
+/// Says "this is a recording" without claiming anything about its contents.
+///
+/// Drawn after the poster and before the hover chrome, so the same scrim that
+/// dims the thumbnail dims these too rather than leaving a badge floating over
+/// a darkened card. A still capture draws nothing here at all.
+fn draw_media_marks(ui: &Ui, content: &CardContent<'_>, capture: Rect, alpha: f32) {
+    let CardMedia::Video { duration, .. } = content.media else {
+        return;
+    };
+    if alpha <= 0.004 {
+        return;
+    }
+    draw_play_badge(ui, capture, alpha);
+    draw_duration_chip(ui, capture, duration, alpha);
+}
+
+fn draw_play_badge(ui: &Ui, capture: Rect, alpha: f32) {
+    let diameter = PLAY_BADGE
+        .min(capture.width() * 0.34)
+        .min(capture.height() * 0.42);
+    if diameter < PLAY_BADGE_MIN {
+        return;
+    }
+    let painter = ui.painter();
+    let centre = capture.center();
+    let radius = diameter * 0.5;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scrim = (PLAY_BADGE_SCRIM * alpha).round().clamp(0.0, 255.0) as u8;
+    painter.circle_filled(centre, radius, Color32::from_black_alpha(scrim));
+    painter.circle_stroke(
+        centre,
+        radius,
+        Stroke::new(1.0, Color32::WHITE.gamma_multiply(alpha * 0.28)),
+    );
+
+    // A hand-built triangle rather than an icon: the glyph has to sit on the
+    // disc's optical centre, which is right of its geometric one, and no icon
+    // asset can express that offset.
+    let edge = diameter * 0.34;
+    let half = edge * 0.5;
+    let nudge = edge * 0.16;
+    let tip = pos2(centre.x + half + nudge, centre.y);
+    let top = pos2(centre.x - half + nudge, centre.y - edge * 0.58);
+    let bottom = pos2(centre.x - half + nudge, centre.y + edge * 0.58);
+    painter.add(Shape::convex_polygon(
+        vec![top, tip, bottom],
+        Color32::WHITE.gamma_multiply(alpha),
+        Stroke::NONE,
+    ));
+}
+
+fn draw_duration_chip(ui: &Ui, capture: Rect, duration: Duration, alpha: f32) {
+    let label = format_duration(duration);
+    let painter = ui.painter();
+    let font = FontId::proportional(DURATION_TEXT);
+    let galley = painter.layout_no_wrap(
+        label,
+        font,
+        Color32::WHITE.gamma_multiply(alpha.clamp(0.0, 1.0)),
+    );
+    let padding = vec2(Space::XS, 2.0);
+    let plate = Rect::from_min_size(Pos2::ZERO, galley.size() + padding * 2.0);
+    if plate.width() > capture.width() - Space::SM || plate.height() > capture.height() - Space::SM
+    {
+        return;
+    }
+    let origin = pos2(
+        capture.right() - Space::XS - plate.width(),
+        capture.bottom() - Space::XS - plate.height(),
+    );
+    let plate = Rect::from_min_size(origin, plate.size());
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scrim = (DURATION_CHIP_SCRIM * alpha).round().clamp(0.0, 255.0) as u8;
+    painter.rect_filled(
+        plate,
+        corner(Radius::pill(plate.height())),
+        Color32::from_black_alpha(scrim),
+    );
+    painter.galley(plate.min + padding, galley, Color32::WHITE);
+}
+
 /// The hover chrome: a scrim, two equal neutral pills, four matching corner buttons.
 ///
 /// Returns the action pressed this frame. The controls themselves are drawn by
@@ -433,6 +611,7 @@ fn draw_chrome(
     surface: &Surface<'_>,
     frame: &CardFrame,
     chrome: CardChrome,
+    media: CardMedia,
     container: Rect,
     opacity: f32,
 ) -> Option<CardAction> {
@@ -460,7 +639,12 @@ fn draw_chrome(
 
     if inner.width() < COMPACT_CHROME_W || inner.height() < COMPACT_CHROME_H {
         let rects = compact_primary_rects(inner)?;
-        for (rect, action) in rects.into_iter().zip([CardAction::Copy, CardAction::Save]) {
+        let actions = if media.is_video() {
+            [CardAction::Edit, CardAction::Close]
+        } else {
+            [CardAction::Copy, CardAction::Save]
+        };
+        for (rect, action) in rects.into_iter().zip(actions) {
             let response = paint::card_icon_button(
                 ui,
                 surface,
@@ -477,29 +661,31 @@ fn draw_chrome(
         return pressed;
     }
 
-    // Copy and Save share one equal-priority treatment.
-    for (r, action) in primary_pill_rects(inner)?
-        .into_iter()
-        .zip([CardAction::Copy, CardAction::Save])
-    {
-        let resp = paint::card_pill_button(
-            ui,
-            surface,
-            r,
-            control_id(frame.id, action),
-            action.icon(),
-            action.label(),
-            lift,
-        );
-        if resp.clicked() {
-            pressed = Some(action);
+    if !media.is_video() {
+        // Copy and Save share one equal-priority treatment for still images.
+        for (r, action) in primary_pill_rects(inner)?
+            .into_iter()
+            .zip([CardAction::Copy, CardAction::Save])
+        {
+            let resp = paint::card_pill_button(
+                ui,
+                surface,
+                r,
+                control_id(frame.id, action),
+                action.icon(),
+                action.label(),
+                lift,
+            );
+            if resp.clicked() {
+                pressed = Some(action);
+            }
         }
     }
 
     // Smaller matching controls occupy the corners. Close follows native window
     // convention: left on macOS, right on Windows and Linux.
     let size = vec2(ICON_BTN, ICON_BTN);
-    let corners = corner_actions();
+    let corners = corner_actions(media);
     let origins = [
         inner.left_top(),
         pos2(inner.right() - ICON_BTN, inner.top()),
@@ -507,6 +693,9 @@ fn draw_chrome(
         pos2(inner.right() - ICON_BTN, inner.bottom() - ICON_BTN),
     ];
     for (action, origin) in corners.into_iter().zip(origins) {
+        let Some(action) = action else {
+            continue;
+        };
         let r = Rect::from_min_size(origin, size);
         let resp = paint::card_icon_button(
             ui,
@@ -525,17 +714,36 @@ fn draw_chrome(
     pressed
 }
 
-fn corner_actions_for(close_on_left: bool) -> [CardAction; 4] {
+/// The four corner slots, in origin order: top-left, top-right, bottom-left,
+/// bottom-right.
+///
+/// Two slots vary with the media, and both for the same reason — a control that
+/// is drawn and then always fails is worse than one that was never offered:
+///
+/// * **Bottom-left** is the edit affordance. A still gets **Annotate**, a
+///   recording gets **Edit**; [`CardMedia::edit_action`] is the one place that
+///   decision is made.
+/// * **Pin** is empty for a recording. Pin to Screen holds a still image in a
+///   floating window and has nothing to show for a video, which is exactly what
+///   the After Capture matrix already says about `record.pin-to-screen`.
+fn corner_actions_for(close_on_left: bool, media: CardMedia) -> [Option<CardAction>; 4] {
+    let pin = (!media.is_video()).then_some(CardAction::Pin);
+    let close = Some(CardAction::Close);
     let top = if close_on_left {
-        [CardAction::Close, CardAction::Pin]
+        [close, pin]
     } else {
-        [CardAction::Pin, CardAction::Close]
+        [pin, close]
     };
-    [top[0], top[1], CardAction::Annotate, CardAction::Upload]
+    [
+        top[0],
+        top[1],
+        Some(media.edit_action()),
+        Some(CardAction::Upload),
+    ]
 }
 
-fn corner_actions() -> [CardAction; 4] {
-    corner_actions_for(cfg!(target_os = "macos"))
+fn corner_actions(media: CardMedia) -> [Option<CardAction>; 4] {
+    corner_actions_for(cfg!(target_os = "macos"), media)
 }
 
 fn primary_pill_rects(inner: Rect) -> Option<[Rect; 2]> {
@@ -758,10 +966,43 @@ mod tests {
 
     #[test]
     fn close_follows_mac_and_windows_corner_conventions() {
-        assert_eq!(corner_actions_for(true)[0], CardAction::Close);
-        assert_eq!(corner_actions_for(true)[1], CardAction::Pin);
-        assert_eq!(corner_actions_for(false)[0], CardAction::Pin);
-        assert_eq!(corner_actions_for(false)[1], CardAction::Close);
+        assert_eq!(
+            corner_actions_for(true, CardMedia::Image),
+            [
+                Some(CardAction::Close),
+                Some(CardAction::Pin),
+                Some(CardAction::Annotate),
+                Some(CardAction::Upload),
+            ]
+        );
+        assert_eq!(
+            corner_actions_for(false, CardMedia::Image),
+            [
+                Some(CardAction::Pin),
+                Some(CardAction::Close),
+                Some(CardAction::Annotate),
+                Some(CardAction::Upload),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_recording_card_offers_edit_and_never_offers_pin() {
+        let video = CardMedia::video(Duration::from_secs(9), false);
+        for close_on_left in [true, false] {
+            let corners = corner_actions_for(close_on_left, video);
+            assert!(
+                !corners.contains(&Some(CardAction::Pin)),
+                "Pin to Screen holds a still image and would always fail here"
+            );
+            assert!(corners.contains(&Some(CardAction::Close)), "close stays");
+            assert!(
+                corners.contains(&Some(CardAction::Edit)),
+                "the bottom-left slot opens the video editor"
+            );
+            assert!(!corners.contains(&Some(CardAction::Annotate)));
+            assert_eq!(corners[2], Some(CardAction::Edit), "bottom-left slot");
+        }
     }
 
     #[test]

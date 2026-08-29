@@ -45,6 +45,7 @@ eframe = { version = "=0.36.1", default-features = false, features = [
     "wayland",
 ] }
 egui = "=0.36.1"
+futures-util = "0.3"
 # Needed to reach the underlying NSView from eframe's CreationContext, which is
 # how the overlay window is converted to a non-activating NSPanel (D27).
 raw-window-handle = "0.6"
@@ -53,10 +54,12 @@ thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = [
+    "gif",
     "png",
     "jpeg",
     "webp",
 ] }
+gif = "0.14"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -85,6 +88,7 @@ objc2-screen-capture-kit = "0.3"
 objc2-vision = "0.3"
 objc2-av-foundation = "0.3"
 objc2-core-media = "0.3"
+objc2-media-toolbox = "0.3"
 dispatch2 = "0.3"
 
 # --- Windows ---

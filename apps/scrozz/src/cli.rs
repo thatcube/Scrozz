@@ -447,6 +447,21 @@ impl TargetArgs {
     pub fn is_interactive(&self) -> bool {
         matches!(self.resolve(), Ok(TargetSpec::Interactive(_)))
     }
+
+    /// Whether no target flag was given at all.
+    ///
+    /// [`Self::resolve`] answers "interactive region" for an empty set, which is
+    /// right for a capture hotkey and wrong for a recording: `scrozz record`
+    /// with no arguments should start recording, not open a picker. Recording
+    /// asks this first and supplies its own default.
+    #[must_use]
+    pub const fn is_unspecified(&self) -> bool {
+        self.region.is_none()
+            && self.window.is_none()
+            && self.display.is_none()
+            && !self.all_displays
+            && self.interactive.is_none()
+    }
 }
 
 fn parse_display_selector(raw: &str) -> CliResult<DisplaySelector> {

@@ -128,7 +128,7 @@ use crate::drag::formats::{
 };
 use crate::drag::{
     DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession,
-    DragSource, check_origin, preview_hotspot,
+    DragSource, PreparedDragFile, check_origin, preview_hotspot,
 };
 
 /// `DoDragDrop` returned because the user released over a target.
@@ -1523,24 +1523,29 @@ impl DragSource for WinDragSource {
             ));
         }
 
-        // The one encode and the one write, exactly as on macOS.
-        let (artifact, bytes) = payload.materialise(&artifact_root())?;
-        let file_bytes = std::sync::Arc::new(bytes);
+        // Screenshots are encoded and materialised once. Durable recordings are
+        // referenced in place, avoiding a full-file read and duplicate write on
+        // the UI thread.
+        let PreparedDragFile {
+            path,
+            bytes,
+            artifact,
+        } = payload.prepare_file(&artifact_root())?;
 
         // The registered "PNG" flavour comes from the image producer, never
         // from the file. Empty means the payload had no image to offer and the
         // format is withheld rather than filled with something that is not one.
         let png = payload
-            .image_png(&file_bytes)?
+            .prepared_image_png(bytes.as_ref())?
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
 
         let session = DragSession::new();
-        // Attached before anything can fail, so every exit path owns the file.
-        session.attach_artifact(artifact);
-
-        let path = session
-            .artifact_path()
-            .ok_or_else(|| Error::Platform("the drag file went missing".to_owned()))?;
+        if let Some(artifact) = artifact {
+            // Attached before anything can fail, so every exit path owns the
+            // temporary screenshot file. Durable media is retained by its
+            // capture-history owner.
+            session.attach_artifact(artifact);
+        }
 
         let data: IDataObject = CaptureData::new(&path, &png).into();
         let source: IDropSource = CaptureSource.into();

@@ -15,7 +15,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use scrozz_core::Provenance;
-use scrozz_ui::card::{self, CardChrome, CardContent};
+use scrozz_ui::card::{self, CardAction, CardChrome, CardContent, CardMedia};
 use scrozz_ui::harness::{
     Background, Image, Profile, RenderSpec, Scenario, Scene, SceneCtx, SceneRegistry,
     SoftwareRenderer, VirtualClock,
@@ -81,6 +81,7 @@ struct CardScene {
     name: &'static str,
     provenance: Provenance,
     source_px: (u32, u32),
+    media: CardMedia,
     reveal: f32,
     lift: f32,
     angle: f32,
@@ -92,6 +93,7 @@ impl CardScene {
             name: "capture-01.png",
             provenance,
             source_px: (1600, 1000),
+            media: CardMedia::Image,
             reveal: 0.0,
             lift: 0.0,
             angle: 0.0,
@@ -103,10 +105,16 @@ impl CardScene {
             name: "capture-01.png",
             provenance,
             source_px: (1600, 1000),
+            media: CardMedia::Image,
             reveal: 1.0,
             lift: 0.0,
             angle: 0.0,
         }
+    }
+
+    const fn recording(mut self, seconds: u64) -> Self {
+        self.media = CardMedia::video(std::time::Duration::from_secs(seconds), true);
+        self
     }
 
     const fn with_metadata(mut self, name: &'static str, source_px: (u32, u32)) -> Self {
@@ -145,7 +153,8 @@ impl Scene for CardScene {
             angle: self.angle,
             state: CardState::Resting,
         };
-        let content = CardContent::new(self.name, self.source_px, self.provenance);
+        let content =
+            CardContent::new(self.name, self.source_px, self.provenance).with_media(self.media);
 
         card::draw_card(ui, &surface, &frame, &content);
     }
@@ -491,4 +500,124 @@ fn overlay_options_default_to_recoverable_click_through() {
         "no pointer probe unless the app supplies one"
     );
     assert!(options.panel.is_none(), "no panel hook unless supplied");
+}
+
+// ---------------------------------------------------------------------------
+// Recording cards
+// ---------------------------------------------------------------------------
+
+/// A card must be able to say "this is a video" while it is resting.
+///
+/// The whole reason a recording enters the ordinary card stack rather than a
+/// surface of its own is that it *is* an ordinary capture — so the only thing
+/// distinguishing it has to be visible without hovering, and cannot be the
+/// geometry, which is shared.
+#[test]
+fn a_recording_card_marks_itself_at_rest_and_a_screenshot_does_not() {
+    let still = render(CardScene::resting(Provenance::Display));
+    let video = render(CardScene::resting(Provenance::Display).recording(12));
+
+    let rect = card_rect();
+    assert!(
+        images_differ(&still, &video),
+        "a recording card must be distinguishable from a screenshot without hovering"
+    );
+
+    // The play badge lands on the card's optical centre.
+    let centre = luminance_at(&video, rect.center().x, rect.center().y);
+    let still_centre = luminance_at(&still, rect.center().x, rect.center().y);
+    assert!(
+        centre > still_centre,
+        "the play glyph should be lighter than the holding fill beneath it: \
+         {centre} vs {still_centre}"
+    );
+
+    // And the duration chip lands in the bottom-right of the same preview.
+    let chip = luminance_at(&video, rect.right() - 22.0, rect.bottom() - 12.0);
+    let still_chip = luminance_at(&still, rect.right() - 22.0, rect.bottom() - 12.0);
+    assert!(
+        chip != still_chip,
+        "the duration chip should change the bottom-right corner of the preview"
+    );
+}
+
+/// The card's silhouette must not change just because it holds a video.
+#[test]
+fn a_recording_card_keeps_the_shared_card_geometry() {
+    let rect = card_rect();
+    let still = render(CardScene::resting(Provenance::Display));
+    let video = render(CardScene::resting(Provenance::Display).recording(12));
+
+    for (x, y) in [
+        (rect.left() - 6.0, rect.center().y),
+        (rect.right() + 6.0, rect.center().y),
+        (rect.center().x, rect.top() - 6.0),
+        (rect.center().x, rect.bottom() + 6.0),
+        (rect.left() + 1.0, rect.top() + 1.0),
+        (rect.right() - 1.0, rect.bottom() - 1.0),
+    ] {
+        assert_eq!(
+            alpha_at(&still, x, y),
+            alpha_at(&video, x, y),
+            "the card outline at ({x}, {y}) must not depend on its media kind"
+        );
+    }
+}
+
+/// The bottom-left hover slot is the edit affordance, and it differs by media.
+///
+/// This is the one action that has to change: a recording has no annotation
+/// document, and a screenshot has nothing to trim.
+#[test]
+fn the_edit_action_follows_the_media_and_nothing_else_does() {
+    assert_eq!(CardMedia::Image.edit_action(), CardAction::Annotate);
+    assert_eq!(
+        CardMedia::video(std::time::Duration::from_secs(3), false).edit_action(),
+        CardAction::Edit
+    );
+    assert_eq!(CardAction::Edit.slug(), "edit");
+    assert_eq!(CardAction::Edit.label(), "Edit");
+    assert_ne!(CardAction::Edit.icon(), CardAction::Annotate.icon());
+
+    // Hovering a video still shows the shared chrome, so Copy, Save, Pin and
+    // Close remain exactly where the user already expects them.
+    let still = render(CardScene::hovered(Provenance::Display));
+    let video = render(CardScene::hovered(Provenance::Display).recording(90));
+    assert!(
+        images_differ(&still, &video),
+        "the hover chrome must reflect the media it belongs to"
+    );
+}
+
+/// A duration must be readable at a glance, and long recordings must not
+/// silently wrap into an hours-shaped string a card cannot fit.
+#[test]
+fn duration_is_carried_by_the_media_value_itself() {
+    let media = CardMedia::video(std::time::Duration::from_secs(754), false);
+    assert_eq!(media.duration(), Some(std::time::Duration::from_secs(754)));
+    assert!(media.is_video());
+    assert!(!CardMedia::Image.is_video());
+    assert_eq!(CardMedia::Image.duration(), None);
+    assert_eq!(CardMedia::default(), CardMedia::Image);
+}
+
+fn images_differ(left: &Image, right: &Image) -> bool {
+    let rect = card_rect();
+    let mut y = rect.top();
+    while y < rect.bottom() {
+        let mut x = rect.left();
+        while x < rect.right() {
+            if left.pixel(px(x), px(y)) != right.pixel(px(x), px(y)) {
+                return true;
+            }
+            x += 1.0;
+        }
+        y += 1.0;
+    }
+    false
+}
+
+fn luminance_at(image: &Image, x: f32, y: f32) -> u32 {
+    let [r, g, b, _] = image.pixel(px(x), px(y));
+    u32::from(r) + u32::from(g) + u32::from(b)
 }

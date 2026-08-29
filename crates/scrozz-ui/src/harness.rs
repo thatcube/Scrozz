@@ -68,8 +68,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use scrozz_core::{Error, Result};
+use scrozz_record::{
+    Recording,
+    edit::{ChannelBehavior, EditPlan, SourceMetadata, TrimRange, VideoDocument},
+    settings::{Quality, ResolutionCap},
+    transcode::{TranscodeFailure, TranscodeOutput},
+};
 
 // ===========================================================================
 // Frozen time and seeded randomness
@@ -303,45 +311,60 @@ pub enum Scenario {
     SmartFrameOneClick,
     /// Smart Frame draft with the complete advanced inspector.
     SmartFrameExpanded,
+    /// A loaded recording with transport, trim, and export controls.
+    VideoEditing,
+    /// The editor collapsed into its narrow stacked arrangement.
+    VideoEditingNarrow,
+    /// A GIF export in progress.
+    VideoExporting,
+    /// A failed transcode with salvageable partial output.
+    VideoExportFailedPartial,
 }
 
 impl Scenario {
     /// Every scenario, in a stable order.
+    pub const ALL: &'static [Self] = &[
+        Self::StackSingle,
+        Self::StackEntering,
+        Self::StackFull,
+        Self::StackOverflowEvicting,
+        Self::StackDismissing,
+        Self::StackDragging,
+        Self::DockCollapsing,
+        Self::DockCollapsed,
+        Self::EditorAnnotating,
+        Self::EditorColorPopover,
+        Self::EditorArrowStyles,
+        Self::SelectorIdle,
+        Self::SelectorDragging,
+        Self::SelectorRemembered,
+        Self::SelectorExact,
+        Self::SelectorAspect,
+        Self::SelectorMagnifier,
+        Self::SelectorAllInOne,
+        Self::SelectorMixedDpi,
+        Self::DockScrubbing,
+        Self::SettingsAfterCapture,
+        Self::PinnedCaptureHover,
+        Self::PinnedCaptureLocked,
+        Self::HistoryGrid,
+        Self::HistoryDetail,
+        Self::HistoryEmpty,
+        Self::EditorCrop,
+        Self::EditorRedact,
+        Self::SmartFrameUntouched,
+        Self::SmartFrameOneClick,
+        Self::SmartFrameExpanded,
+        Self::VideoEditing,
+        Self::VideoEditingNarrow,
+        Self::VideoExporting,
+        Self::VideoExportFailedPartial,
+    ];
+
+    /// Every scenario, in stable declaration order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
-        &[
-            Self::StackSingle,
-            Self::StackEntering,
-            Self::StackFull,
-            Self::StackOverflowEvicting,
-            Self::StackDismissing,
-            Self::StackDragging,
-            Self::DockCollapsing,
-            Self::DockCollapsed,
-            Self::EditorAnnotating,
-            Self::EditorColorPopover,
-            Self::EditorArrowStyles,
-            Self::SelectorIdle,
-            Self::SelectorDragging,
-            Self::SelectorRemembered,
-            Self::SelectorExact,
-            Self::SelectorAspect,
-            Self::SelectorMagnifier,
-            Self::SelectorAllInOne,
-            Self::SelectorMixedDpi,
-            Self::DockScrubbing,
-            Self::SettingsAfterCapture,
-            Self::PinnedCaptureHover,
-            Self::PinnedCaptureLocked,
-            Self::HistoryGrid,
-            Self::HistoryDetail,
-            Self::HistoryEmpty,
-            Self::EditorCrop,
-            Self::EditorRedact,
-            Self::SmartFrameUntouched,
-            Self::SmartFrameOneClick,
-            Self::SmartFrameExpanded,
-        ]
+        Self::ALL
     }
 
     /// The stable slug used in filenames, CLI arguments and baseline names.
@@ -361,8 +384,11 @@ impl Scenario {
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
             Self::EditorColorPopover => "editor-color-popover",
-            Self::SettingsAfterCapture => "settings-after-capture",
             Self::EditorArrowStyles => "editor-arrow-styles",
+            Self::VideoEditing => "video-editing",
+            Self::VideoEditingNarrow => "video-editing-narrow",
+            Self::VideoExporting => "video-exporting",
+            Self::VideoExportFailedPartial => "video-export-failed-partial",
             Self::SelectorIdle => "selector-idle",
             Self::SelectorDragging => "selector-dragging",
             Self::SelectorRemembered => "selector-remembered",
@@ -374,6 +400,7 @@ impl Scenario {
             Self::PinnedCaptureHover => "pinned-capture-hover",
             Self::PinnedCaptureLocked => "pinned-capture-locked",
             Self::DockScrubbing => "dock-scrubbing",
+            Self::SettingsAfterCapture => "settings-after-capture",
             Self::HistoryGrid => "history-grid",
             Self::HistoryDetail => "history-detail",
             Self::HistoryEmpty => "history-empty",
@@ -569,6 +596,42 @@ pub enum Gesture {
     Expanding,
 }
 
+/// Recording-specific value fixture carried by [`Fixture`].
+#[derive(Debug, Clone)]
+pub enum RecordingFixture {
+    /// Video transport, edits, and export state.
+    Editor(VideoEditorFixture),
+}
+
+/// Deterministic video-editor values.
+#[derive(Debug, Clone)]
+pub struct VideoEditorFixture {
+    /// Loaded recording document.
+    pub document: VideoDocument,
+    /// Non-destructive edit plan.
+    pub plan: EditPlan,
+    /// Export state.
+    pub export: EditorExportFixture,
+}
+
+/// Deterministic transcoder state for editor scenes.
+#[derive(Debug, Clone)]
+pub enum EditorExportFixture {
+    /// No export has begun.
+    Idle,
+    /// Export in progress.
+    Running {
+        /// Normalized progress.
+        progress: f32,
+    },
+    /// Complete export.
+    Finished(TranscodeOutput),
+    /// Failed export and any salvageable output.
+    Failed(TranscodeFailure),
+    /// Cancelled export.
+    Cancelled,
+}
+
 /// The frozen, seeded state a [`Scene`] draws.
 ///
 /// A fixture is the *entire* world the surface may observe. If a surface needs
@@ -594,6 +657,8 @@ pub struct Fixture {
     pub docked: bool,
     /// Whether the annotation toolbar is open.
     pub annotating: bool,
+    /// Recording-specific values for recording and editor scenarios.
+    pub recording: Option<RecordingFixture>,
     /// Seed for anything else the scene needs.
     pub seed: u64,
     /// Logical size of the surface, in points, before profile scaling.
@@ -744,11 +809,15 @@ impl Fixture {
             Scenario::SmartFrameUntouched => 30,
             Scenario::SmartFrameOneClick => 31,
             Scenario::SmartFrameExpanded => 32,
+            Scenario::VideoEditing => 40,
+            Scenario::VideoEditingNarrow => 41,
+            Scenario::VideoExporting => 42,
+            Scenario::VideoExportFailedPartial => 43,
             _ => scenario as u64,
         };
         let seed = DEFAULT_SEED ^ seed_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
-        let (cards, gesture, docked, annotating, title, intent, key_instants, sequence) =
+        let (cards, gesture, docked, annotating, title, intent, key_instants, sequence, recording) =
             match scenario {
                 Scenario::StackSingle => (
                     Self::cards(seed, 1),
@@ -758,6 +827,7 @@ impl Fixture {
                     "A capture, waiting",
                     "The resting state after one capture: a single card at the bottom slot, no chrome, nothing else on screen (D27).",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::StackEntering => (
@@ -773,6 +843,7 @@ impl Fixture {
                         end_ms: 560,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::StackFull => (
                     Self::cards(seed, 6),
@@ -782,6 +853,7 @@ impl Fixture {
                     "Captures, stacked",
                     "A full pile, bottom-anchored and grown upward, newest on top (D28). The hero shot.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::StackOverflowEvicting => (
@@ -797,6 +869,7 @@ impl Fixture {
                         end_ms: 560,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::StackDismissing => (
                     Self::cards(seed, 4),
@@ -811,6 +884,7 @@ impl Fixture {
                         end_ms: 560,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::StackDragging => (
                     Self::cards(seed, 3),
@@ -828,6 +902,7 @@ impl Fixture {
                         end_ms: 400,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::DockCollapsing => (
                     Self::cards(seed, 5),
@@ -842,6 +917,7 @@ impl Fixture {
                         end_ms: 520,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::DockCollapsed => (
                     Self::cards(seed, 5),
@@ -851,6 +927,7 @@ impl Fixture {
                     "Out of the way, not gone",
                     "The dock: same width as a card, roughly one-sixth the height, upward chevron. Clicking or swiping up brings the captures back (D20).",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::DockScrubbing => (
@@ -866,6 +943,7 @@ impl Fixture {
                         end_ms: 300,
                         step_ms: 16,
                     }),
+                    None,
                 ),
                 Scenario::EditorAnnotating => (
                     Self::cards(seed, 1),
@@ -876,6 +954,40 @@ impl Fixture {
                     "The annotation toolbar open over a capture. Annotations stay editable forever with no user-facing project file (D14).",
                     instants::REST,
                     None,
+                    None,
+                ),
+                Scenario::VideoEditing | Scenario::VideoEditingNarrow => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Trim and export a recording",
+                    "The real video editor exposes transport, seek, trim, quality, resolution, and audio edits as values.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
+                ),
+                Scenario::VideoExporting => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Exporting a GIF",
+                    "A GIF export reports deterministic progress while editing and audio controls are correctly disabled.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
+                ),
+                Scenario::VideoExportFailedPartial => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Partial export recovered",
+                    "A transcoder failure reports its error and exposes the salvageable partial artifact.",
+                    instants::REST,
+                    None,
+                    Some(Self::editor_fixture(scenario)),
                 ),
                 Scenario::EditorColorPopover => (
                     Self::cards(seed, 1),
@@ -885,6 +997,7 @@ impl Fixture {
                     "Choose a colour without losing the canvas",
                     "The anchored quick-colour palette floats beside the compact toolbar control without shifting editor layout.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SettingsAfterCapture => (
@@ -896,6 +1009,7 @@ impl Fixture {
                     "The platform-adaptive After Capture matrix with independent screenshot and recording actions, explicit unavailable states, and fresh-profile defaults.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::EditorArrowStyles => (
                     Self::cards(seed, 1),
@@ -905,6 +1019,7 @@ impl Fixture {
                     "Shape the arrow",
                     "Arrow style, bend, and named source-unit thickness controls over the live editor.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::EditorCrop => (
@@ -916,6 +1031,7 @@ impl Fixture {
                     "The complete source stays visible behind a rule-of-thirds crop with direct edge handles, dimensions, aspect presets, snap, Cancel, and Crop actions.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::EditorRedact => (
                     Self::cards(seed, 1),
@@ -925,6 +1041,7 @@ impl Fixture {
                     "Redact irreversibly",
                     "One privacy tool with continuous Low-to-High intensity. Every level writes an opaque randomized mosaic through the export renderer.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SmartFrameUntouched => (
@@ -936,6 +1053,7 @@ impl Fixture {
                     "The annotation editor with its Smart Frame panel visible but no draft activated.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SmartFrameOneClick => (
                     Self::cards(seed, 1),
@@ -945,6 +1063,7 @@ impl Fixture {
                     "One click, balanced framing",
                     "A one-click Smart Frame draft with Auto Balance on, Automatic background, and progressive controls closed.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SmartFrameExpanded => (
@@ -956,6 +1075,7 @@ impl Fixture {
                     "Smart Frame draft with the complete advanced inspector: background, canvas, alignment, subject, watermark, and privacy review.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorIdle => (
                     Vec::new(),
@@ -965,6 +1085,7 @@ impl Fixture {
                     "Choose a region",
                     "The selector overlay at rest over a frozen display, ready for a new region drag.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorDragging => (
@@ -976,6 +1097,7 @@ impl Fixture {
                     "A region drag in progress, showing the scrim cutout, resize handles, and live pixel-size readout.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorRemembered => (
                     Vec::new(),
@@ -985,6 +1107,7 @@ impl Fixture {
                     "Retake the last region",
                     "A remembered selection restored for adjustment before the next capture.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorExact => (
@@ -996,6 +1119,7 @@ impl Fixture {
                     "An exact-size region being positioned without resizing, preserving the requested physical output dimensions.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorAspect => (
                     Vec::new(),
@@ -1005,6 +1129,7 @@ impl Fixture {
                     "Lock the aspect ratio",
                     "A live region drag constrained to a locked aspect ratio.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorMagnifier => (
@@ -1016,6 +1141,7 @@ impl Fixture {
                     "The pixel loupe sampling the frozen desktop at the owning display's real scale.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::SelectorAllInOne => (
                     Vec::new(),
@@ -1025,6 +1151,7 @@ impl Fixture {
                     "One shortcut, every mode",
                     "The All-in-One selector HUD exposing region, window, display, and all-displays capture modes with capability gating.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::SelectorMixedDpi => (
@@ -1036,6 +1163,7 @@ impl Fixture {
                     "A region held wholly within one measured display on a mixed-DPI desktop, rather than pretending a cross-display span has one scale.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::PinnedCaptureHover => (
                     vec![],
@@ -1045,6 +1173,7 @@ impl Fixture {
                     "A capture, pinned above your work",
                     "One capture in its own native window with hover controls for opacity, scale, locking, and close.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::PinnedCaptureLocked => (
@@ -1056,6 +1185,7 @@ impl Fixture {
                     "A locked pin ignores pointer input and always names the external Unlock Pinned Captures escape.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::HistoryGrid => (
                     Vec::new(),
@@ -1065,6 +1195,7 @@ impl Fixture {
                     "Find any capture again",
                     "The ordinary history window, showing a filterable page of screenshots, recordings, and GIFs.",
                     instants::REST,
+                    None,
                     None,
                 ),
                 Scenario::HistoryDetail => (
@@ -1076,6 +1207,7 @@ impl Fixture {
                     "History detail exposes restore, edit, copy, save, drag, pin, and delete without hiding the surrounding timeline.",
                     instants::REST,
                     None,
+                    None,
                 ),
                 Scenario::HistoryEmpty => (
                     Vec::new(),
@@ -1085,6 +1217,7 @@ impl Fixture {
                     "History starts with the first capture",
                     "The empty history window explains what will appear here instead of presenting a dead grid.",
                     instants::REST,
+                    None,
                     None,
                 ),
             };
@@ -1096,6 +1229,10 @@ impl Fixture {
             | Scenario::SmartFrameOneClick
             | Scenario::SmartFrameExpanded => (1100.0, 700.0),
             Scenario::SettingsAfterCapture => (780.0, 640.0),
+            Scenario::VideoEditing
+            | Scenario::VideoExporting
+            | Scenario::VideoExportFailedPartial => (1180.0, 820.0),
+            Scenario::VideoEditingNarrow => (760.0, 900.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
             | Scenario::SelectorRemembered
@@ -1119,6 +1256,7 @@ impl Fixture {
             gesture,
             docked,
             annotating,
+            recording,
             seed,
             size_pt,
             key_instants,
@@ -1134,6 +1272,75 @@ impl Fixture {
             .copied()
             .map(Self::for_scenario)
             .collect()
+    }
+
+    fn editor_fixture(scenario: Scenario) -> RecordingFixture {
+        let recording =
+            Recording::synthetic("Scrozz walkthrough.mp4", 94.0, "deterministic UI fixture")
+                .expect("the fixed editor recording is valid");
+        let mut document = VideoDocument::open_fixture(
+            recording,
+            SourceMetadata {
+                width: 2560,
+                height: 1440,
+                fps: 60.0,
+                audio_channels: 2,
+            },
+        )
+        .expect("the fixed editor source metadata is valid");
+        document
+            .seek(Duration::from_secs(37))
+            .expect("the fixed editor cursor is in range");
+
+        let mut plan = EditPlan::video(&document).expect("the fixed editor duration is non-zero");
+        plan.trim = TrimRange::new(
+            Duration::from_secs(4),
+            Duration::from_secs(86),
+            document.duration(),
+        )
+        .expect("the fixed editor trim is in range");
+        plan.quality = Quality::High;
+        plan.resolution = ResolutionCap::Fhd1080;
+        plan.audio.volume = 0.82;
+        plan.audio.channels = ChannelBehavior::StereoToMono;
+
+        let export = match scenario {
+            Scenario::VideoEditing | Scenario::VideoEditingNarrow => EditorExportFixture::Idle,
+            Scenario::VideoExporting => {
+                plan = EditPlan::gif(&document).expect("the fixed GIF plan is valid");
+                plan.trim = TrimRange::new(
+                    Duration::from_secs(4),
+                    Duration::from_secs(18),
+                    document.duration(),
+                )
+                .expect("the fixed GIF trim is in range");
+                plan.quality = Quality::Balanced;
+                plan.resolution = ResolutionCap::Hd720;
+                EditorExportFixture::Running { progress: 0.62 }
+            }
+            Scenario::VideoExportFailedPartial => {
+                let partial = TranscodeOutput::synthetic_partial(
+                    "Scrozz walkthrough partial.mp4",
+                    8_294_400,
+                    "deterministic UI fixture",
+                    "the output trailer could not be written",
+                )
+                .expect("the fixed partial export is valid");
+                EditorExportFixture::Failed(TranscodeFailure {
+                    error: Arc::new(Error::Codec(
+                        "hardware encoder stopped before finalisation".to_owned(),
+                    )),
+                    partial: Some(partial),
+                })
+            }
+            _ => EditorExportFixture::Idle,
+        };
+
+        RecordingFixture::Editor(VideoEditorFixture {
+            document,
+            plan,
+            export,
+        })
     }
 
     /// Builds `n` cards deterministically from `seed`.
@@ -2237,6 +2444,14 @@ impl SceneRegistry {
         //
         // Until then every scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
+        for scenario in [
+            Scenario::VideoEditing,
+            Scenario::VideoEditingNarrow,
+            Scenario::VideoExporting,
+            Scenario::VideoExportFailedPartial,
+        ] {
+            me.register(scenario, Box::new(crate::video_editor::VideoEditorScene));
+        }
         for scenario in [
             Scenario::SelectorIdle,
             Scenario::SelectorDragging,
@@ -4213,8 +4428,10 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
         Scenario::EditorColorPopover,
-        Scenario::SettingsAfterCapture,
         Scenario::EditorArrowStyles,
+        Scenario::VideoEditing,
+        Scenario::VideoEditingNarrow,
+        Scenario::SettingsAfterCapture,
         Scenario::EditorCrop,
         Scenario::EditorRedact,
         Scenario::SmartFrameUntouched,
@@ -4231,6 +4448,15 @@ pub fn golden_plan() -> Vec<GoldenCase> {
             ),
         });
     }
+
+    cases.push(GoldenCase {
+        name: "video-editing--reduce-motion".to_owned(),
+        spec: RenderSpec::golden(Scenario::VideoEditing, VirtualClock::ZERO)
+            .with_reduce_motion(true),
+        expectation:
+            "the complete editor remains usable with all movement disabled and no control hidden"
+                .to_owned(),
+    });
 
     // A 1x render, because grayscale text AA (D22 cost 4) is at its worst at 1x
     // and that is precisely where a font or gamma regression will first show.

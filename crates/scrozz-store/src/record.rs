@@ -76,7 +76,8 @@ pub struct StoredRecord {
     pub target: TargetRepr,
     /// Frame geometry.
     pub frame: Option<FrameHeader>,
-    /// Recording metadata retained opaquely by non-recording builds.
+    /// Video metadata retained opaquely so a future shape can round-trip through
+    /// an older build without losing fields.
     #[serde(default)]
     pub video: Option<serde_json::Value>,
     /// Content address of the source pixels, if they were ever stored.
@@ -232,7 +233,10 @@ impl StoredRecord {
             provenance: self.provenance.into(),
             target: self.target.clone().into(),
             frame: self.frame.clone(),
-            video: self.video.clone(),
+            video: self
+                .video
+                .clone()
+                .and_then(|value| serde_json::from_value(value).ok()),
             image: self.image_state(),
             ocr_text: self.ocr_text.clone(),
             annotation_count: self.annotation_count(),
@@ -255,6 +259,16 @@ impl StoredRecord {
         .flatten()
         {
             haystack.push_str(&part.to_lowercase());
+            haystack.push('\n');
+        }
+        if let Some(video) = self
+            .video
+            .clone()
+            .and_then(|value| serde_json::from_value::<crate::model::VideoMetadata>(value).ok())
+        {
+            haystack.push_str(&video.path.to_string_lossy().to_lowercase());
+            haystack.push('\n');
+            haystack.push_str(&video.engine.to_lowercase());
             haystack.push('\n');
         }
         haystack
@@ -380,18 +394,29 @@ mod tests {
 
     #[test]
     fn non_recording_builds_round_trip_video_metadata_without_interpreting_it() {
+        use crate::model::{VideoCompletion, VideoMetadata};
+
         let mut original = record();
         original.media_kind = MediaKind::Video;
         original.frame = None;
         original.app_identifier = Some("com.example.recorder".into());
         original.window_shadow = Some(false);
-        original.video = Some(serde_json::json!({
-            "path": "/retained/media.mov",
-            "duration_secs": 6.75,
-            "engine": "AVFoundation",
-            "completion": "Complete",
-            "size": {"width": 1728.0, "height": 1116.0}
-        }));
+        original.video = Some(
+            serde_json::to_value(VideoMetadata {
+                path: "/retained/media.mov".into(),
+                duration_secs: 6.75,
+                engine: "AVFoundation".into(),
+                completion: VideoCompletion::Complete,
+                size: Some(PhysicalSize::new(1728.0, 1116.0)),
+                frames: Some(184),
+                audio_channels: Some(2),
+                file_size_bytes: Some(123_456),
+                codec: Some("h264".to_owned()),
+                quality: Some("balanced".to_owned()),
+                resolution: Some("native".to_owned()),
+            })
+            .unwrap(),
+        );
 
         let bytes = original.to_json().expect("encode video sidecar");
         let back = StoredRecord::from_json(&bytes).expect("decode video sidecar");
@@ -399,12 +424,33 @@ mod tests {
         assert_eq!(back, original);
         assert!(back.frame.is_none());
         assert_eq!(
-            back.video
+            back.to_capture_record()
+                .video
                 .as_ref()
-                .and_then(|video| video.get("duration_secs"))
-                .and_then(serde_json::Value::as_f64),
+                .map(|video| video.duration_secs),
             Some(6.75)
         );
+    }
+
+    #[test]
+    fn unknown_video_metadata_round_trips_without_hiding_the_record() {
+        let mut original = record();
+        original.media_kind = MediaKind::Video;
+        original.frame = None;
+        original.video = Some(serde_json::json!({
+            "completion": "Complete",
+            "path": "/retained/legacy.mov",
+            "future_codec_state": {"profile": "future"}
+        }));
+
+        let bytes = original.to_json().unwrap();
+        let mut back = StoredRecord::from_json(&bytes).unwrap();
+        assert!(back.to_capture_record().video.is_none());
+        back.pinned = true;
+        let rewritten = StoredRecord::from_json(&back.to_json().unwrap()).unwrap();
+
+        assert_eq!(rewritten.video, original.video);
+        assert!(rewritten.pinned);
     }
 
     #[test]

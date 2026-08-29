@@ -238,7 +238,12 @@ impl Action {
         match self {
             Self::Capture(kind) => kind.is_available(capabilities, session, capture_backend_ready),
             Self::Quit | Self::OpenHistory | Self::OpenSettings | Self::UnlockPins => true,
-            Self::ToggleRecording => false,
+            // Recording is wired end to end, but only where a native engine
+            // exists. Asked of the recording crate rather than assumed, so a
+            // build with no engine still shows a truthfully disabled item
+            // instead of one that fails when pressed.
+            Self::ToggleRecording => scrozz_record::detect_native_engine()
+                .is_some_and(|engine| engine.capabilities().video),
         }
     }
 
@@ -289,6 +294,20 @@ impl ShortcutAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_availability_follows_the_native_engine_rather_than_a_constant() {
+        let session = Session::detect();
+        assert_eq!(
+            Action::ToggleRecording.is_available(
+                SelectionCapabilities::CLIENT_OVERLAY,
+                &session,
+                true
+            ),
+            scrozz_record::detect_native_engine().is_some_and(|engine| engine.capabilities().video),
+            "the menu item must reflect what this build can actually record"
+        );
+    }
 
     #[test]
     fn every_tray_item_maps_to_an_action() {

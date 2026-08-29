@@ -53,6 +53,21 @@ checked in full on native Linux CI. The helper identifies this failure mode and
 prints the narrower command instead of implying that missing metadata is a Rust
 compile error.
 
+Recorded-media preview is intentionally asymmetric. macOS uses `AVAssetReader`
+for bounded RGBA decode, `AVPlayer` as the authoritative media clock and audio
+renderer, and a MediaToolbox audio tap so preview and export share gain, mute,
+and channel edits. Windows and Linux compile the same playback contract but
+report an explicit unsupported capability until their native decode and audio
+adapters are complete; they never substitute a synthetic clock or static source
+thumbnail for playback.
+
+Completed recordings cross into the aggregate UI through
+`scrozz_record::handoff::FinalizedMediaHandoff`. The handoff carries durable
+ownership, a canonical video path, a bounded poster with explicit color
+metadata, duration, dimensions, file size, audio presence, and
+video-appropriate actions. Card geometry remains owned by the modern adaptive
+Recent Captures Overlay.
+
 Keeping `bundled` is deliberate: it means shipped builds carry no system SQLite
 dependency, which matters far more than local cross-check coverage of a crate
 that has no platform code in it.

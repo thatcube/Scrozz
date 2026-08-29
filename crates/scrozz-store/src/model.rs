@@ -9,7 +9,10 @@
 //! a record can never fail because the image went away, because the record was
 //! never holding the image.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use scrozz_core::{
     CaptureTarget, ColorSpace, DisplayId, Error, LogicalRect, PhysicalSize, PinState, PixelFormat,
@@ -145,6 +148,147 @@ impl ImageState {
             Self::Present { byte_len, .. } => *byte_len,
             Self::Evicted { .. } | Self::Absent => 0,
         }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Video metadata types
+// ───────────────────────────────────────────────────────────────────────────
+
+/// How much media a retained partial video file contains.
+///
+/// The store's own copy of the recording layer's concept: a partial file that
+/// contains at least one playable fragment is worth keeping in history and
+/// opening in the editor; one that never got past container initialisation is
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSalvageability {
+    /// Container metadata only; no playable media.
+    InitialisationOnly,
+    /// At least one complete media fragment is playable.
+    Playable,
+}
+
+impl VideoSalvageability {
+    /// Whether playback or editing can safely open this output.
+    #[must_use]
+    pub const fn is_playable(self) -> bool {
+        matches!(self, Self::Playable)
+    }
+}
+
+/// Whether a recording finalised completely or left retained partial output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VideoCompletion {
+    /// The encoder and container finalised normally.
+    Complete,
+    /// A retained file exists but finalisation did not fully succeed.
+    Partial {
+        /// How much of the retained file is usable.
+        salvageability: VideoSalvageability,
+        /// Actionable explanation of what could not be finalised.
+        reason: String,
+    },
+}
+
+impl VideoCompletion {
+    /// Whether the video is playable (complete or salvageable partial).
+    #[must_use]
+    pub fn is_playable(&self) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Partial { salvageability, .. } => salvageability.is_playable(),
+        }
+    }
+}
+
+/// Typed metadata for a video recording persisted in history.
+///
+/// The `path` is an **externally-owned durable media file**. History never
+/// deletes it: eviction and deletion remove only sidecar/index/poster data.
+/// The path must be absolute, canonical, point to an existing regular file, and
+/// be non-empty at insert time. After insertion the file may be moved or
+/// deleted by the user; history will report it missing but will never unlink it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoMetadata {
+    /// Absolute path to the durable media file.
+    pub path: PathBuf,
+    /// Active media duration in seconds, excluding pauses.
+    pub duration_secs: f64,
+    /// Name of the engine that produced the recording.
+    pub engine: String,
+    /// Whether finalisation completed normally.
+    pub completion: VideoCompletion,
+    /// Encoded frame dimensions, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<PhysicalSize>,
+    /// Video frames successfully submitted to the encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u64>,
+    /// Encoded audio channels (`0` means the file is silent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_channels: Option<u16>,
+    /// Final on-disk byte count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+    /// Resolved codec, never `Auto` for real output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// Quality rung used by the encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    /// Resolution policy applied before encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+}
+
+impl VideoMetadata {
+    /// Validates that the path is non-empty, absolute, canonical and points to
+    /// an existing regular file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if validation fails.
+    pub fn validate_path(&self) -> Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Err(Error::InvalidRequest(
+                "video metadata path must not be empty".into(),
+            ));
+        }
+        if !self.path.is_absolute() {
+            return Err(Error::InvalidRequest(format!(
+                "video metadata path must be absolute: {}",
+                self.path.display()
+            )));
+        }
+        let canonical = self.path.canonicalize().map_err(|e| {
+            Error::InvalidRequest(format!(
+                "video metadata path cannot be canonicalised: {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        if canonical != self.path {
+            return Err(Error::InvalidRequest(format!(
+                "video metadata path is not canonical: {} (canonical: {})",
+                self.path.display(),
+                canonical.display()
+            )));
+        }
+        let meta = std::fs::metadata(&self.path).map_err(|e| {
+            Error::InvalidRequest(format!(
+                "video metadata path is not accessible: {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        if !meta.is_file() {
+            return Err(Error::InvalidRequest(format!(
+                "video metadata path is not a regular file: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -399,8 +543,11 @@ pub struct CaptureRecord {
     pub target: CaptureTarget,
     /// Frame geometry, absent for native video rows.
     pub frame: Option<FrameHeader>,
-    /// Opaque native video metadata retained by non-recording builds.
-    pub video: Option<serde_json::Value>,
+    /// Typed video metadata, or `None` for screenshots and GIFs.
+    ///
+    /// Legacy rows whose `video_json` column is `NULL` surface here as `None`
+    /// and remain listable — they simply carry no video details.
+    pub video: Option<VideoMetadata>,
     /// Whether the pixels are still here.
     pub image: ImageState,
     /// Recognised text, if OCR has run.

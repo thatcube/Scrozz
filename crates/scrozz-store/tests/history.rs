@@ -703,3 +703,267 @@ fn an_image_state_reports_what_actually_happened_to_the_pixels() {
         other => panic!("expected present pixels, got {other:?}"),
     }
 }
+
+// ─── Video recording tests ──────────────────────────────────────────────────
+
+use scrozz_store::{NewRecording, VideoCompletion, VideoMetadata, VideoSalvageability};
+
+fn sample_video_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("recording.mov");
+    std::fs::write(&path, b"fake video content").expect("write test video");
+    std::fs::canonicalize(&path).expect("canonicalize")
+}
+
+fn sample_video_metadata(path: &std::path::Path) -> VideoMetadata {
+    VideoMetadata {
+        path: path.to_path_buf(),
+        duration_secs: 6.75,
+        engine: "AVFoundation".into(),
+        completion: VideoCompletion::Complete,
+        size: Some(scrozz_core::PhysicalSize::new(1728.0, 1116.0)),
+        frames: Some(405),
+        audio_channels: Some(2),
+        file_size_bytes: Some(123_456),
+        codec: Some("h264".to_owned()),
+        quality: Some("balanced".to_owned()),
+        resolution: Some("native".to_owned()),
+    }
+}
+
+#[test]
+fn a_recording_round_trips_through_history() {
+    let (dir, mut store) = store("recording-round-trip");
+    let video_path = sample_video_file(dir.path());
+    let meta = sample_video_metadata(&video_path);
+
+    let id = store
+        .insert_recording(
+            NewRecording::new(meta.clone())
+                .from_app("Scrozz")
+                .with_app_identifier("com.scrozz.app")
+                .titled("My recording")
+                .with_window_shadow(false)
+                .taken_at(Timestamp(1_700_000_000_000)),
+        )
+        .expect("insert recording");
+
+    let record = store.record(&id).expect("read").expect("present");
+    assert_eq!(record.media_kind, MediaKind::Video);
+    assert_eq!(record.app_name.as_deref(), Some("Scrozz"));
+    assert_eq!(record.app_identifier.as_deref(), Some("com.scrozz.app"));
+    assert_eq!(record.window_title.as_deref(), Some("My recording"));
+    assert_eq!(record.window_shadow, Some(false));
+    assert!(record.frame.is_none());
+    assert_eq!(record.image, ImageState::Absent);
+    let video = record.video.expect("video metadata present");
+    assert_eq!(video.duration_secs, 6.75);
+    assert_eq!(video.engine, "AVFoundation");
+    assert!(matches!(video.completion, VideoCompletion::Complete));
+    assert_eq!(video.size.map(|s| s.width), Some(1728.0));
+    assert_eq!(video.frames, Some(405));
+    assert_eq!(video.audio_channels, Some(2));
+    assert_eq!(video.file_size_bytes, Some(123_456));
+    assert_eq!(video.codec.as_deref(), Some("h264"));
+    assert_eq!(video.quality.as_deref(), Some("balanced"));
+    assert_eq!(video.resolution.as_deref(), Some("native"));
+}
+
+#[test]
+fn recording_insert_rejects_empty_path() {
+    let (_dir, mut store) = store("recording-empty-path");
+    let meta = VideoMetadata {
+        path: std::path::PathBuf::new(),
+        duration_secs: 1.0,
+        engine: "test".into(),
+        completion: VideoCompletion::Complete,
+        size: None,
+        frames: None,
+        audio_channels: None,
+        file_size_bytes: None,
+        codec: None,
+        quality: None,
+        resolution: None,
+    };
+    let err = store
+        .insert_recording(NewRecording::new(meta))
+        .expect_err("empty path must fail");
+    assert!(format!("{err}").contains("empty"), "{err}");
+}
+
+#[test]
+fn recording_insert_rejects_relative_path() {
+    let (_dir, mut store) = store("recording-relative-path");
+    let meta = VideoMetadata {
+        path: "relative/video.mov".into(),
+        duration_secs: 1.0,
+        engine: "test".into(),
+        completion: VideoCompletion::Complete,
+        size: None,
+        frames: None,
+        audio_channels: None,
+        file_size_bytes: None,
+        codec: None,
+        quality: None,
+        resolution: None,
+    };
+    let err = store
+        .insert_recording(NewRecording::new(meta))
+        .expect_err("relative path must fail");
+    assert!(format!("{err}").contains("absolute"), "{err}");
+}
+
+#[test]
+fn recording_insert_rejects_nonexistent_path() {
+    let (_dir, mut store) = store("recording-missing-path");
+    let meta = VideoMetadata {
+        path: "/definitely/not/a/real/file.mov".into(),
+        duration_secs: 1.0,
+        engine: "test".into(),
+        completion: VideoCompletion::Complete,
+        size: None,
+        frames: None,
+        audio_channels: None,
+        file_size_bytes: None,
+        codec: None,
+        quality: None,
+        resolution: None,
+    };
+    let err = store
+        .insert_recording(NewRecording::new(meta))
+        .expect_err("nonexistent path must fail");
+    assert!(
+        format!("{err}").contains("canonical") || format!("{err}").contains("accessible"),
+        "{err}"
+    );
+}
+
+#[test]
+fn legacy_null_video_json_rows_remain_listable() {
+    let (dir, mut store) = store("legacy-null-video");
+    // Insert a normal screenshot — it has video: None (NULL video_json).
+    let document = sample_document(8, 8, 1, 0);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+
+    let record = store.record(&id).expect("read").expect("present");
+    assert!(record.video.is_none());
+    assert_eq!(record.media_kind, MediaKind::Screenshot);
+
+    // The capture is listable.
+    let all = store.search(&SearchQuery::all()).expect("search");
+    assert_eq!(all.len(), 1);
+    assert!(all[0].video.is_none());
+}
+
+#[test]
+fn unknown_video_json_degrades_only_that_row() {
+    let (dir, mut store) = store("unknown-video-json");
+    let video_path = sample_video_file(dir.path());
+    let id = store
+        .insert_recording(NewRecording::new(sample_video_metadata(&video_path)))
+        .expect("insert recording");
+    let screenshot = store
+        .insert(NewCapture::new(&sample_document(8, 8, 2, 0)))
+        .expect("insert screenshot");
+    let index = store.layout().index_path().to_path_buf();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(index).expect("open raw index");
+    conn.execute(
+        "UPDATE captures SET video_json = ?1 WHERE id = ?2",
+        rusqlite::params![
+            r#"{"completion":"Complete","path":"/future/video.mov"}"#,
+            id.0
+        ],
+    )
+    .expect("write future metadata");
+    drop(conn);
+
+    let reopened = SqliteStore::open(dir.path()).expect("reopen");
+    let page = reopened.search(&SearchQuery::all()).expect("list history");
+    assert_eq!(page.len(), 2);
+    assert!(
+        page.iter()
+            .find(|record| record.id == id)
+            .is_some_and(|record| record.video.is_none())
+    );
+    assert!(page.iter().any(|record| record.id == screenshot));
+}
+
+#[test]
+fn deleting_a_recording_does_not_delete_the_durable_media_file() {
+    let (dir, mut store) = store("recording-delete-preserves-media");
+    let video_path = sample_video_file(dir.path());
+    let meta = sample_video_metadata(&video_path);
+
+    let id = store
+        .insert_recording(NewRecording::new(meta).taken_at(Timestamp(1_700_000_000_000)))
+        .expect("insert recording");
+
+    assert!(store.delete(&id).expect("delete"));
+    assert!(
+        video_path.exists(),
+        "deletion must never unlink the externally-owned durable media file"
+    );
+}
+
+#[test]
+fn partial_video_completion_round_trips() {
+    let (dir, mut store) = store("recording-partial");
+    let video_path = sample_video_file(dir.path());
+    let meta = VideoMetadata {
+        path: video_path.clone(),
+        duration_secs: 3.0,
+        engine: "test".into(),
+        completion: VideoCompletion::Partial {
+            salvageability: VideoSalvageability::Playable,
+            reason: "encoder interrupted".into(),
+        },
+        size: None,
+        frames: None,
+        audio_channels: None,
+        file_size_bytes: None,
+        codec: None,
+        quality: None,
+        resolution: None,
+    };
+    let id = store
+        .insert_recording(NewRecording::new(meta))
+        .expect("insert");
+
+    let record = store.record(&id).expect("read").expect("present");
+    match &record.video.expect("metadata").completion {
+        VideoCompletion::Partial {
+            salvageability,
+            reason,
+        } => {
+            assert!(salvageability.is_playable());
+            assert!(reason.contains("interrupted"));
+        }
+        other => panic!("expected partial, got {other:?}"),
+    }
+}
+
+#[test]
+fn sidecar_recovery_preserves_recording_metadata() {
+    let (dir, mut store) = store("recording-recovery");
+    let video_path = sample_video_file(dir.path());
+    let meta = sample_video_metadata(&video_path);
+
+    let id = store
+        .insert_recording(
+            NewRecording::new(meta.clone())
+                .from_app("Scrozz")
+                .taken_at(Timestamp(1_700_000_000_000)),
+        )
+        .expect("insert");
+
+    // Force a full index rebuild from sidecars.
+    let report = store.recover().expect("recovery");
+    assert_eq!(report.records_recovered, 1);
+
+    let record = store.record(&id).expect("read").expect("present");
+    assert_eq!(record.media_kind, MediaKind::Video);
+    let video = record.video.expect("metadata survives recovery");
+    assert_eq!(video.duration_secs, 6.75);
+    assert_eq!(video.engine, "AVFoundation");
+}

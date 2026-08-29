@@ -1232,13 +1232,25 @@ fn draw_after_capture_cell(
     );
 }
 
+/// A three-word summary of a full unavailability reason.
+///
+/// The long reason is the accessible name and the hover text; this is what fits
+/// under a checkbox column. Matched most specific first, because several
+/// reasons legitimately mention the same feature.
 fn unavailable_summary(reason: &str) -> &'static str {
-    if reason.contains("Screen recording") {
-        "Recording not available"
-    } else if reason.contains("provider") {
+    if reason.contains("provider") {
         "Provider required"
-    } else if reason.contains("only for screenshots") {
+    } else if reason.contains("does not apply to a recording")
+        || reason.contains("only for screenshots")
+        || reason.contains("only to screenshots")
+    {
         "Screenshots only"
+    } else if reason.contains("clipboard flavour") {
+        "No file clipboard"
+    } else if reason.contains("second automatic export") {
+        "Already saved"
+    } else if reason.contains("Screen recording") {
+        "Recording not available"
     } else if reason.contains("Pin to Screen") {
         "Not implemented"
     } else {
@@ -1500,8 +1512,8 @@ impl crate::harness::Scene for AfterCaptureSettingsScene {
 }
 
 fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
-    const RECORDING_UNAVAILABLE: &str =
-        "Screen recording is not implemented in this build, so recording actions cannot run yet.";
+    const COPY_RECORDING_UNAVAILABLE: &str = "Copying a recording needs a platform file-reference clipboard flavour, which is not implemented in this build.";
+    const SAVE_RECORDING_UNAVAILABLE: &str = "A recording is already written to its destination when it finalizes, so a second automatic export is not implemented in this build.";
     const UPLOAD_UNAVAILABLE: &str =
         "No cloud upload provider is implemented or configured in this build.";
     const PIN_UNAVAILABLE: &str = "Pin to Screen is not implemented in this build.";
@@ -1524,6 +1536,10 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
         screenshot: available(false),
         recording: unavailable(false, "Smart Frame applies only to screenshots."),
     }];
+    // The recording column mirrors the application's own availability table:
+    // the two cells recording actually honours are live, and every other cell
+    // names the specific capability that is missing rather than claiming that
+    // recording itself is unimplemented.
     rows.extend([
         (
             "show-recent-captures-overlay",
@@ -1531,6 +1547,7 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             "Keep the completed capture in the nonactivating recent-captures corner surface.",
             true,
             true,
+            None,
             None,
         ),
         (
@@ -1540,6 +1557,7 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             true,
             false,
             None,
+            Some(COPY_RECORDING_UNAVAILABLE),
         ),
         (
             "save-automatically",
@@ -1548,6 +1566,7 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             false,
             false,
             None,
+            Some(SAVE_RECORDING_UNAVAILABLE),
         ),
         (
             "upload-and-copy-link",
@@ -1555,6 +1574,7 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             "Use the configured cloud provider, then copy its shareable link.",
             false,
             false,
+            Some(UPLOAD_UNAVAILABLE),
             Some(UPLOAD_UNAVAILABLE),
         ),
         (
@@ -1564,6 +1584,7 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             false,
             false,
             None,
+            None,
         ),
         (
             "pin-to-screen",
@@ -1572,27 +1593,35 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             false,
             false,
             Some(PIN_UNAVAILABLE),
+            Some("Pin to Screen holds a still image and does not apply to a recording."),
         ),
     ]
     .into_iter()
     .map(
-        |(slug, label, description, screenshot_enabled, recording_enabled, unavailable_reason)| {
-            let screenshot = unavailable_reason.map_or_else(
+        |(
+            slug,
+            label,
+            description,
+            screenshot_enabled,
+            recording_enabled,
+            screenshot_unavailable,
+            recording_unavailable,
+        )| {
+            let screenshot = screenshot_unavailable.map_or_else(
                 || available(screenshot_enabled),
                 |reason| unavailable(screenshot_enabled, reason),
             );
-            let recording_reason = if slug == "pin-to-screen" {
-                "Pin to Screen is available only for screenshots."
-            } else {
-                RECORDING_UNAVAILABLE
-            };
+            let recording = recording_unavailable.map_or_else(
+                || available(recording_enabled),
+                |reason| unavailable(recording_enabled, reason),
+            );
             AfterCaptureRow {
                 screenshot_id: format!("capture.{slug}"),
                 recording_id: (slug != "pin-to-screen").then(|| format!("record.{slug}")),
                 label: label.to_owned(),
                 description: description.to_owned(),
                 screenshot,
-                recording: unavailable(recording_enabled, recording_reason),
+                recording,
             }
         },
     )
@@ -1932,7 +1961,8 @@ mod tests {
     #[test]
     fn preview_matrix_uses_approved_vocabulary_and_explicit_unavailable_states() {
         let rows = preview_after_capture_rows();
-        assert_eq!(rows.len(), 6);
+        // Smart Frame plus the six-cell After Capture matrix.
+        assert_eq!(rows.len(), 7);
         assert!(
             rows.iter().all(|row| !row.label.contains("Quick Access")),
             "{rows:?}"
@@ -1953,6 +1983,31 @@ mod tests {
             .unwrap();
         assert!(pin.recording_id.is_none());
         assert!(!pin.recording.available);
+
+        // The recording column must never say recording itself is missing:
+        // the overlay and the editor are wired, and the other cells name their
+        // own specific gap.
+        for row in &rows {
+            let reason = row.recording.unavailable_reason.as_deref().unwrap_or("");
+            assert!(
+                !reason.contains("Screen recording is not implemented"),
+                "{} still claims recording is unimplemented",
+                row.label
+            );
+        }
+        let overlay = rows
+            .iter()
+            .find(|row| row.label == "Show Recent Captures Overlay")
+            .unwrap();
+        assert!(overlay.recording.available && overlay.recording.enabled);
+        assert_eq!(
+            overlay.recording_id.as_deref(),
+            Some("record.show-recent-captures-overlay")
+        );
+
+        let editor = rows.iter().find(|row| row.label == "Open Editor").unwrap();
+        assert!(editor.recording.available && !editor.recording.enabled);
+        assert_eq!(editor.recording_id.as_deref(), Some("record.open-editor"));
     }
 
     #[test]

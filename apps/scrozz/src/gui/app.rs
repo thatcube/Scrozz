@@ -37,7 +37,13 @@ use clap::Parser as _;
 use scrozz_annotate::{
     AnalysisCancellation, Document, DocumentData, SmartFrameAnalysis, SmartFramePreset,
 };
-use scrozz_core::{Error as CoreError, LockEscape, SelectionCapabilities};
+use scrozz_core::{
+    CaptureTarget, Error as CoreError, LockEscape, SelectionCapabilities, SelectionMode,
+};
+use scrozz_record::{
+    MachineEvent, Recording, RecordingMachine, RecordingPhase, RecordingSettings,
+    handoff::FinalizedMediaHandoff, playback::sync_document,
+};
 use scrozz_shell::{
     Accelerator, Capability, DragPayload, GlobalHotkeys, HotkeyEvent, KeyState, Permissions,
     ScreenshotSound, Session, SystemPermissions, Tray, TrayAction,
@@ -52,13 +58,13 @@ use crate::{
         ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, InstallProfile,
         MediaKind, current_availability,
     },
-    cli::{Cli, SettingsCommand},
+    cli::{Cli, InteractiveMode, SettingsCommand},
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind, CaptureOrigin},
         card::{
-            CardEvent, CardId, CardSurface, PIN_TEXTURE_MAX_EDGE, PinGeneration, SurfaceWaker,
-            Thumbnail,
+            Card, CardEvent, CardId, CardSurface, PIN_TEXTURE_MAX_EDGE, PinGeneration,
+            SurfaceWaker, Thumbnail,
         },
         drag::{DragHost, DragSpot},
         permission::{
@@ -69,8 +75,12 @@ use crate::{
             CaptureBytes, DragGeometry, DragSubject, HistoryOperation, Job, Outcome,
             PinEditorSnapshot, Pipeline, PreparedHistoryDrag,
         },
+        recording::{
+            ActiveVideoEditor, ArmedStart, Completion, FinalisedRecording, PendingSelection,
+            PendingStart, RecordingState, SelectionStart,
+        },
         selection::CaptureSelector,
-        server::{Forwarder, Server},
+        server::{Forwarder, Request, Server},
     },
     json::Json,
     report::Report,
@@ -87,6 +97,7 @@ use scrozz_ui::{
         AfterCaptureCell, AfterCaptureEdit, AfterCaptureMedia, AfterCaptureRow, ShortcutEdit,
         ShortcutRow,
     },
+    video_editor::{VideoEditorAction, VideoEditorSnapshot},
 };
 
 /// The binding table a set of configured shortcuts asks for.
@@ -569,6 +580,11 @@ pub struct App {
     history: Arc<Mutex<HistoryViewModel>>,
     prepared_history_drags: HashMap<CaptureId, PreparedHistoryDrag>,
     pending_drags: VecDeque<PendingDrag>,
+    recording: RecordingState,
+    /// Durable recordings currently shown as cards, by card identity.
+    recorded_media: HashMap<CardId, FinalizedMediaHandoff>,
+    /// The history row the next recording card should be attributed to.
+    recorded_history_id: Option<CaptureId>,
 }
 
 /// A capture the annotation editor has been asked to open.
@@ -870,6 +886,18 @@ impl App {
             }
         };
 
+        // Read once at start-up so the machine has a validated configuration
+        // even before the first recording; the two After Capture cells are
+        // re-read immediately before each recording starts.
+        let mut recording_settings = RecordingSettings::shipped();
+        recording_settings.after_capture = config.after_capture.recording_policy();
+        if let Err(error) = recording_settings.validate() {
+            notes.push(format!(
+                "recording preferences were rejected and shipped defaults are in use: {error}"
+            ));
+            recording_settings = RecordingSettings::shipped();
+        }
+
         let shortcuts = config.shortcuts.clone();
         let unlock_hotkey_registered = hotkeys
             .bindings()
@@ -922,6 +950,9 @@ impl App {
             history: Arc::new(Mutex::new(HistoryViewModel::new(Timestamp::now()))),
             prepared_history_drags: HashMap::new(),
             pending_drags: VecDeque::new(),
+            recording: RecordingState::new(recording_settings),
+            recorded_media: HashMap::new(),
+            recorded_history_id: None,
         };
         app.refresh_tray_shortcuts();
 
@@ -976,6 +1007,7 @@ impl App {
             return Tick::Stop;
         }
         self.with_history(|history| history.advance_clock(Timestamp::now()));
+        self.advance_recording();
         self.drain_pipeline();
         self.drain_cards(editor);
         self.drain_drags();
@@ -1120,7 +1152,7 @@ impl App {
 
     fn action_for_hotkey_event(&mut self, event: HotkeyEvent) -> Option<Action> {
         if self.assignment_guard.as_ref().is_some_and(|guard| {
-            guard.accelerator == event.accelerator && Instant::now() <= guard.expires
+            guard.accelerator == event.accelerator && Instant::now() < guard.expires
         }) {
             if event.state == KeyState::Released {
                 self.assignment_guard = None;
@@ -1158,12 +1190,22 @@ impl App {
             let mut with_argv0 = Vec::with_capacity(request.argv.len() + 1);
             with_argv0.push("scrozz".to_owned());
             with_argv0.extend(request.argv.iter().cloned());
-            let needs_live_pin_state = Cli::try_parse_from(with_argv0)
+            let parsed = Cli::try_parse_from(with_argv0)
                 .ok()
-                .and_then(|cli| cli.command)
-                .is_some_and(|command| {
-                    forwarded_unpin(&command).is_some() || forwarded_unlock_pins(&command)
-                });
+                .and_then(|cli| cli.command);
+            let needs_live_pin_state = parsed.as_ref().is_some_and(|command| {
+                forwarded_unpin(command).is_some() || forwarded_unlock_pins(command)
+            });
+
+            // A recording belongs to this process, so a forwarded `record`
+            // cannot be run on the worker like an ordinary command: it has to
+            // reach the one machine that owns the lifecycle.
+            if let Some(crate::cli::Command::Record(args)) = parsed
+                && !args.dry_run
+            {
+                self.serve_forwarded_recording(&args, request);
+                continue;
+            }
 
             if needs_live_pin_state {
                 let command = request.serve_with(|command| {
@@ -1210,6 +1252,76 @@ impl App {
         // the application the user can see, not a request that arrived on a
         // socket.
         Tick::Continue
+    }
+
+    /// Answers a forwarded `record`, honouring the same IPC contract as before.
+    ///
+    /// `--stop` is parked until the recording actually finalises, because the
+    /// answer is what the file turned out to contain. A start answers as soon
+    /// as it is armed: the caller asked for a recording to begin, and it has.
+    fn serve_forwarded_recording(&mut self, args: &crate::cli::RecordArgs, request: Request) {
+        if args.stop {
+            if !self.recording.is_busy() {
+                request.answer(&Err(CliError::Core(CoreError::InvalidRequest(
+                    "no recording is in progress, so there is nothing to stop".to_owned(),
+                ))));
+                return;
+            }
+            self.begin_recording_finalisation(Some(request));
+            return;
+        }
+        let result = self.start_forwarded_recording(args);
+        request.answer(&result);
+    }
+
+    fn start_forwarded_recording(&mut self, args: &crate::cli::RecordArgs) -> CliResult<Report> {
+        if self.recording.machine.is_none() {
+            return Err(CliError::Core(self.recording.unavailable_error()));
+        }
+        if self.recording.is_busy() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "a recording is already in progress; stop it before starting another".to_owned(),
+            )));
+        }
+        if self
+            .recording
+            .editor
+            .as_ref()
+            .is_some_and(ActiveVideoEditor::is_exporting)
+        {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "cancel the active export before starting another recording".to_owned(),
+            )));
+        }
+        Self::ensure_recording_permission()?;
+        self.reset_finished_recording()?;
+        self.release_video_editor();
+        self.recording.preflight_failure = None;
+        self.recording.tick = Instant::now();
+        self.recording.completion = None;
+
+        // An explicit CLI target is honoured exactly as typed; only an
+        // interactive one opens the selector.
+        if let crate::cli::TargetSpec::Interactive(mode) =
+            crate::commands::recording_target_spec(args)?
+        {
+            self.begin_recording_selection(SelectionStart::Request(Box::new(args.clone())), mode)?;
+            return Ok(Report::new(
+                Json::obj([
+                    ("state", Json::str("selecting")),
+                    ("mode", Json::str(crate::commands::interactive_slug(mode))),
+                ]),
+                format!(
+                    "Selecting a {} to record.",
+                    crate::commands::interactive_slug(mode)
+                ),
+            ));
+        }
+
+        let prepared = crate::commands::prepare_recording_args(args)?;
+        let report = prepared.started_report();
+        self.arm_recording_start(PendingStart::Request(Box::new(prepared.request)));
+        Ok(report)
     }
 
     fn observe_forwarded_command(&mut self, command: &crate::cli::Command) {
@@ -1269,6 +1381,11 @@ impl App {
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
+                Outcome::HistoryRecording {
+                    capture,
+                    path,
+                    duration_secs,
+                } => self.open_history_recording(&capture, path, duration_secs),
                 Outcome::Ready(ready) => {
                     self.captures += 1;
                     if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
@@ -1614,6 +1731,9 @@ impl App {
         }
 
         for event in pending {
+            if self.route_recorded_card_event(&event) {
+                continue;
+            }
             match event {
                 CardEvent::Copy(id) => {
                     self.post_card_output(id, CardOutput::Copy, editor);
@@ -1733,6 +1853,19 @@ impl App {
         }
     }
 
+    /// Whether a history row is a recording, as the loaded page reports it.
+    ///
+    /// A row that is not on the current page answers `false` and takes the
+    /// still path, which fails with a named error rather than guessing —
+    /// history actions are only ever raised from rows the user can see.
+    fn history_entry_is_recording(&self, capture: &CaptureId) -> bool {
+        self.history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .media_kind_of(capture)
+            == Some(scrozz_store::MediaKind::Video)
+    }
+
     fn drain_history(&mut self) {
         let actions = self.with_history(HistoryViewModel::drain_actions);
         for action in actions {
@@ -1747,10 +1880,18 @@ impl App {
         match action {
             HistoryAction::Query { request, query } => self.pipeline.query_history(request, query),
             HistoryAction::Restore(capture) => {
+                // A recording has no raster to rebuild a still card from, so
+                // restoring one opens the media it actually has.
+                if self.history_entry_is_recording(&capture) {
+                    return self.pipeline.post(Job::OpenHistoryRecording { capture });
+                }
                 let card = self.pipeline.allocate();
                 self.pipeline.post(Job::Restore { capture, card })
             }
             HistoryAction::OpenEditor(capture) => {
+                if self.history_entry_is_recording(&capture) {
+                    return self.pipeline.post(Job::OpenHistoryRecording { capture });
+                }
                 let card = self.pipeline.allocate();
                 self.pipeline.post(Job::OpenHistoryEditor { capture, card })
             }
@@ -1898,7 +2039,11 @@ impl App {
         let mut started = 0;
         for event in armed {
             if let CardEvent::Drag { card, at } = event {
-                self.begin_drag(card, at, editor);
+                if self.recorded_media.contains_key(&card) {
+                    self.begin_recorded_drag(card, at);
+                } else {
+                    self.begin_drag(card, at, editor);
+                }
                 started += 1;
             }
         }
@@ -1989,6 +2134,7 @@ impl App {
                 DragOutcome::Accepted { .. } => {
                     self.surface.dismiss(card);
                     self.pipeline.post(Job::Release(card));
+                    self.recorded_media.remove(&card);
                     self.note(format!("{card} dropped"));
                 }
                 // The card stays. Said out loud rather than logged quietly:
@@ -2037,10 +2183,7 @@ impl App {
                 Tick::Continue
             }
             Action::ToggleRecording => {
-                // Recording is `scrozz-record`, which is behind the same guard
-                // and has no session to toggle yet. Saying so beats a menu item
-                // that does nothing.
-                self.note("recording is not wired up yet");
+                self.toggle_recording();
                 Tick::Continue
             }
             Action::OpenHistory => {
@@ -3181,6 +3324,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.settle_recording_before_shutdown();
         self.input_wake_monitor = None;
         self.drain_cards(None);
         self.hotkeys.unregister_all();
@@ -3201,11 +3345,1074 @@ impl App {
         self.pipeline.stop();
     }
 
+    // -----------------------------------------------------------------------
+    // Recording
+    // -----------------------------------------------------------------------
+
+    /// Starts, cancels or stops a recording, depending on where one is.
+    ///
+    /// One entry point for the tray item, the global hotkey and a forwarded
+    /// `record --toggle`, because all three mean the same thing to the user and
+    /// three code paths would eventually disagree about what "toggle" does
+    /// while a countdown is running.
+    fn toggle_recording(&mut self) {
+        if self.recording.pending_start.is_some() {
+            self.begin_recording_finalisation(None);
+            return;
+        }
+        let Some(phase) = self.recording.phase() else {
+            let error = CliError::Core(self.recording.unavailable_error());
+            self.present_recording_error(&error);
+            return;
+        };
+        match phase {
+            RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed => {
+                self.begin_recording();
+            }
+            RecordingPhase::Selecting => self.cancel_recording_selection(),
+            RecordingPhase::Countdown => {
+                let result = self
+                    .recording
+                    .machine
+                    .as_mut()
+                    .expect("a phase came from this machine")
+                    .cancel_countdown();
+                self.finish_recording_action(result, "recording countdown cancelled");
+            }
+            RecordingPhase::Recording | RecordingPhase::Paused => {
+                self.begin_recording_finalisation(None);
+            }
+            RecordingPhase::Finalising => self.note("recording is already finalising"),
+        }
+    }
+
+    fn cancel_recording_selection(&mut self) {
+        if let Some(selection) = self.recording.selection.as_mut() {
+            // The selector is a synchronous, modal contract owned by another
+            // thread; there is no supported way to retract a selection request
+            // that is already on screen. Marking it is the honest thing: the
+            // answer is discarded when it arrives, and the user is told the one
+            // gesture that closes the window they are looking at.
+            selection.cancel_requested = true;
+            self.note(
+                "recording cancelled; press Escape to dismiss the selection overlay still on screen",
+            );
+            return;
+        }
+        let result = self
+            .recording
+            .machine
+            .as_mut()
+            .expect("a selecting phase came from this machine")
+            .cancel_selection();
+        self.finish_recording_action(result, "recording selection cancelled");
+    }
+
+    /// Begins a GUI recording: permission, destination, then a target.
+    ///
+    /// The order matters. Permission is asked for before anything is reserved,
+    /// so a refusal leaves no orphan file; the destination is reserved before
+    /// the selector opens, so a selection is never thrown away because the
+    /// capture folder turned out to be unwritable.
+    fn begin_recording(&mut self) {
+        if self
+            .recording
+            .editor
+            .as_ref()
+            .is_some_and(ActiveVideoEditor::is_exporting)
+        {
+            self.note("cancel the active export before starting another recording");
+            return;
+        }
+        if let Err(error) = Self::ensure_recording_permission() {
+            self.present_recording_error(&error);
+            return;
+        }
+        let destination = match crate::output::default_recording_path() {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.present_recording_error(&error);
+                return;
+            }
+        };
+        if let Err(error) = self.reset_finished_recording() {
+            self.present_recording_error(&error);
+            return;
+        }
+        self.release_video_editor();
+        self.recording.preflight_failure = None;
+        self.recording.tick = Instant::now();
+        self.recording.completion = None;
+
+        // The current selector is the same one screenshots use, so a recording
+        // is framed with the same magnifier, aspect locks and remembered region
+        // the user already knows. Only a build whose selector cannot draw a
+        // region falls back to a display.
+        if self.selection_capabilities.supports(SelectionMode::Region) {
+            if let Err(error) = self.begin_recording_selection(
+                SelectionStart::Settings { destination },
+                InteractiveMode::AllInOne,
+            ) {
+                self.present_recording_error(&error);
+            }
+            return;
+        }
+        match Self::active_recording_target() {
+            Ok(target) => self.arm_recording_start(PendingStart::Settings {
+                target,
+                destination,
+            }),
+            Err(error) => self.present_recording_error(&error),
+        }
+    }
+
+    fn reset_finished_recording(&mut self) -> CliResult<()> {
+        let needs_reset = matches!(
+            self.recording.phase(),
+            Some(RecordingPhase::Finished | RecordingPhase::Failed)
+        );
+        if !needs_reset {
+            return Ok(());
+        }
+        self.recording
+            .machine
+            .as_mut()
+            .expect("a phase came from this machine")
+            .reset()
+            .map_err(CliError::Core)
+    }
+
+    fn arm_recording_start(&mut self, start: PendingStart) {
+        self.recording.pending_start = Some(ArmedStart {
+            start,
+            armed_tick: self.recording.sequence,
+        });
+        self.note("recording start armed until the capture surfaces are down");
+    }
+
+    fn begin_recording_selection(
+        &mut self,
+        start: SelectionStart,
+        mode: InteractiveMode,
+    ) -> CliResult<()> {
+        if self.recording.selection.is_some() || self.recording.pending_start.is_some() {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "a recording selection or start is already pending".to_owned(),
+            )));
+        }
+        let unavailable = self.recording.unavailable_error();
+        let machine = self
+            .recording
+            .machine
+            .as_mut()
+            .ok_or(CliError::Core(unavailable))?;
+        machine.begin_selection().map_err(CliError::Core)?;
+
+        let selector = Arc::clone(&self.selector);
+        let (send, result) = std::sync::mpsc::channel();
+        if let Err(error) = std::thread::Builder::new()
+            .name("scrozz-recording-selector".to_owned())
+            .spawn(move || {
+                let selected = crate::commands::select_recording_target_with_memory(
+                    mode,
+                    Some(selector.as_ref()),
+                    true,
+                );
+                let _ = send.send(selected);
+            })
+        {
+            let _ = machine.cancel_selection();
+            return Err(CliError::Core(CoreError::Platform(format!(
+                "could not start the recording selector: {error}"
+            ))));
+        }
+        self.recording.selection = Some(PendingSelection {
+            start,
+            result,
+            cancel_requested: false,
+        });
+        self.note("recording target selection started");
+        Ok(())
+    }
+
+    fn finish_recording_action(&mut self, result: scrozz_core::Result<()>, success: &str) {
+        match result {
+            Ok(()) => {
+                self.recording.preflight_failure = None;
+                self.note(success);
+            }
+            Err(error) => self.present_recording_error(&CliError::Core(error)),
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    /// Services every recording-owned worker once, then advances the clock.
+    ///
+    /// Called from [`App::tick`] before card events, so a recording that
+    /// finished on this tick has already produced its card by the time the
+    /// surface is drained.
+    fn advance_recording(&mut self) {
+        self.recording.sequence = self.recording.sequence.wrapping_add(1);
+        self.finish_pending_recording();
+        self.advance_video_playback();
+        self.recording.advance_export();
+        self.finish_recording_selection();
+        self.start_pending_recording();
+
+        let now = Instant::now();
+        let delta = now.saturating_duration_since(self.recording.tick);
+        self.recording.tick = now;
+        let result = self
+            .recording
+            .machine
+            .as_mut()
+            .map(|machine| machine.tick(delta));
+        if let Some(Err(error)) = result {
+            self.note(format!("recording tick failed: {error}"));
+        }
+
+        let stopped_without_terminal_event = self
+            .recording
+            .machine
+            .as_ref()
+            .is_some_and(RecordingMachine::requires_finalisation);
+        if stopped_without_terminal_event && self.recording.finalisation.is_none() {
+            self.begin_recording_finalisation(None);
+            return;
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn advance_video_playback(&mut self) {
+        let result = self.recording.editor.as_mut().map(|editor| {
+            let snapshot = editor.playback.poll()?.clone();
+            sync_document(&mut editor.document, &snapshot)
+        });
+        if let Some(Err(error)) = result {
+            self.note(format!("recording preview failed: {error}"));
+        }
+    }
+
+    fn finish_recording_selection(&mut self) {
+        let received = self
+            .recording
+            .selection
+            .as_ref()
+            .map(|selection| selection.result.try_recv());
+        let mut result = match received {
+            None | Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return,
+            Some(Ok(result)) => result,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                Err(CliError::Core(CoreError::Platform(
+                    "the recording selector stopped without returning a target".to_owned(),
+                )))
+            }
+        };
+        let selection = self
+            .recording
+            .selection
+            .take()
+            .expect("a completed selector result has pending state");
+        if selection.cancel_requested {
+            result = Err(CliError::Core(CoreError::Cancelled));
+        }
+        let reset = self
+            .recording
+            .machine
+            .as_mut()
+            .ok_or_else(|| {
+                CoreError::InvalidRequest("no recording machine owns the selection".to_owned())
+            })
+            .and_then(RecordingMachine::cancel_selection);
+        if let Err(error) = reset {
+            let error = CliError::Core(error);
+            self.present_recording_error(&error);
+            self.recording.fail(&error);
+            return;
+        }
+        let target = match result {
+            Ok(target) => target,
+            Err(error) => {
+                self.present_recording_error(&error);
+                self.recording.fail(&error);
+                return;
+            }
+        };
+        let start = match selection.start {
+            SelectionStart::Settings { destination } => PendingStart::Settings {
+                target,
+                destination,
+            },
+            SelectionStart::Request(args) => {
+                match crate::commands::prepare_recording_args_for_target(&args, target) {
+                    Ok(prepared) => PendingStart::Request(Box::new(prepared.request)),
+                    Err(error) => {
+                        self.present_recording_error(&error);
+                        self.recording.fail(&error);
+                        return;
+                    }
+                }
+            }
+        };
+        self.arm_recording_start(start);
+    }
+
+    /// Starts an armed recording, one tick after it was armed.
+    ///
+    /// The tick gap is the whole point: the selector's window and the card
+    /// surface are still composited in the frame the target was chosen in, and
+    /// an encoder started there records Scrozz's own UI.
+    fn start_pending_recording(&mut self) {
+        let ready = self
+            .recording
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| pending.armed_tick < self.recording.sequence);
+        if !ready {
+            return;
+        }
+        let pending = self
+            .recording
+            .pending_start
+            .take()
+            .expect("readiness came from the pending start");
+
+        if self.recording.editor_is_open() {
+            let error = CliError::Core(CoreError::InvalidRequest(
+                "close the video editor before starting a recording".to_owned(),
+            ));
+            self.present_recording_error(&error);
+            self.recording.fail(&error);
+            return;
+        }
+
+        // Read at the last honest moment, so a change made while the selector
+        // was open applies to this recording rather than the previous one.
+        let policy = self.config.after_capture.recording_policy();
+        if let Err(error) = self.recording.apply_after_capture(policy) {
+            let error = CliError::Core(error);
+            self.present_recording_error(&error);
+            self.recording.fail(&error);
+            return;
+        }
+
+        let machine = self
+            .recording
+            .machine
+            .as_mut()
+            .expect("a pending start requires a recording machine");
+        let result = match pending.start {
+            PendingStart::Settings {
+                target,
+                destination,
+            } => machine.begin_with_destination(target, destination),
+            PendingStart::Request(request) => machine.begin_request(*request),
+        };
+        match result {
+            Ok(()) => {
+                self.recording.preflight_failure = None;
+                self.note("recording started");
+            }
+            Err(error) => {
+                let error = CliError::Core(error);
+                self.present_recording_error(&error);
+                self.recording.fail(&error);
+            }
+        }
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    /// Stops a recording and hands finalisation to its own thread.
+    ///
+    /// `reply` is a forwarded `record --stop` waiting for the answer: it cannot
+    /// be answered here, because the answer is whatever the file turns out to
+    /// contain once the encoder has drained.
+    fn begin_recording_finalisation(&mut self, reply: Option<Request>) {
+        if let Some(selection) = self.recording.selection.as_mut() {
+            selection.cancel_requested = true;
+            if let Some(reply) = reply {
+                self.recording.replies.push(reply);
+            }
+            self.note("recording selection cancelled before native capture");
+            return;
+        }
+        if self.recording.pending_start.take().is_some() {
+            if let Some(reply) = reply {
+                self.recording.replies.push(reply);
+            }
+            self.recording.completion =
+                Some(Completion::Failed("the recording was cancelled".to_owned()));
+            self.note("pending recording start cancelled before native capture");
+            self.recording.reply_waiters();
+            return;
+        }
+
+        let actions = self.recording.completion_actions();
+        let result = self
+            .recording
+            .machine
+            .as_mut()
+            .ok_or_else(|| {
+                CoreError::InvalidRequest(
+                    "no recording is in progress, so there is nothing to stop".to_owned(),
+                )
+            })
+            .and_then(RecordingMachine::begin_finalising);
+        let session = match result {
+            Ok(session) => session,
+            Err(error) => {
+                self.note(format!("recording action failed: {error}"));
+                if let Some(request) = reply {
+                    request.answer(&Err(CliError::Core(error)));
+                }
+                return;
+            }
+        };
+
+        let (send, receive) = std::sync::mpsc::channel();
+        self.recording.finalisation = Some(receive);
+        if let Some(reply) = reply {
+            self.recording.replies.push(reply);
+        }
+        self.note("recording finalisation started");
+        crate::gui::recording::spawn_finalisation(session, actions, send);
+        self.drain_recording_events();
+        self.refresh_recording_tray();
+    }
+
+    fn finish_pending_recording(&mut self) {
+        let received = self
+            .recording
+            .finalisation
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        let message = match received {
+            Some(Ok(message)) => message,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => return,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.recording.finalisation = None;
+                let result = self.recording.machine.as_mut().map(|machine| {
+                    machine.complete_finalising(Err(CoreError::Platform(
+                        "the recording finaliser ended without returning a result".to_owned(),
+                    )))
+                });
+                if let Some(Err(error)) = result {
+                    self.note(format!("could not finish recording state: {error}"));
+                }
+                self.drain_recording_events();
+                return;
+            }
+        };
+        self.recording.finalisation = None;
+        self.apply_finalised_recording(message);
+    }
+
+    fn apply_finalised_recording(&mut self, message: FinalisedRecording) {
+        match message.handoff {
+            Ok(Some(handoff)) => self.recording.handoff = Some(handoff),
+            Ok(None) => {}
+            Err(error) => self.note(format!(
+                "recording was saved but its aggregate media handoff failed: {error}"
+            )),
+        }
+        let completed = self
+            .recording
+            .machine
+            .as_mut()
+            .map(|machine| machine.complete_finalising(message.result));
+        match completed {
+            Some(Ok(())) | None => {}
+            Some(Err(error)) => self.note(format!("could not finish recording state: {error}")),
+        }
+        self.drain_recording_events();
+    }
+
+    fn drain_recording_events(&mut self) {
+        let fallback_target = self
+            .recording
+            .machine
+            .as_ref()
+            .and_then(RecordingMachine::request)
+            .map(|request| request.target.clone());
+        let events = self
+            .recording
+            .machine
+            .as_mut()
+            .map(|machine| machine.drain_events().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for event in events {
+            match event {
+                MachineEvent::PhaseChanged(_) => {}
+                MachineEvent::FirstFrame => self.note("recording captured its first frame"),
+                MachineEvent::Warning(message) => {
+                    self.note(format!("recording warning: {message}"));
+                }
+                MachineEvent::ClockDrift(drift) => self.note(format!(
+                    "recording clock drift: engine is {:+.3}s from the authoritative clock",
+                    drift.delta_secs
+                )),
+                MachineEvent::Finished(output) => {
+                    self.retain_recording_completion(output, fallback_target.as_ref());
+                }
+                MachineEvent::Failed(failure) => {
+                    let partial = failure.partial.clone();
+                    let where_partial = partial
+                        .as_ref()
+                        .map(|output| format!("; partial output is at {}", output.path.display()));
+                    self.note(format!(
+                        "recording failed: {}{}",
+                        failure.error,
+                        where_partial.unwrap_or_default()
+                    ));
+                    if let Some(output) = partial {
+                        self.retain_recording_completion(output, fallback_target.as_ref());
+                    } else {
+                        self.recording.completion =
+                            Some(Completion::Failed(failure.error.to_string()));
+                    }
+                }
+            }
+        }
+        self.recording.reply_waiters();
+    }
+
+    /// Turns finished output into a card, a history row, and maybe an editor.
+    ///
+    /// Every step is independent: an editor that will not open must not stop
+    /// the card appearing, and a history row that will not write must not make
+    /// a saved recording look like a failed one.
+    fn retain_recording_completion(
+        &mut self,
+        output: Recording,
+        fallback_target: Option<&CaptureTarget>,
+    ) {
+        let path = output.path.clone();
+        let actions = self.recording.completion_actions();
+        self.release_video_editor();
+
+        if actions.open_editor {
+            match ActiveVideoEditor::open(&output) {
+                Ok(Some(editor)) => {
+                    self.recording.editor = Some(editor);
+                    self.note("recording opened in the video editor");
+                }
+                Ok(None) => self.note(
+                    "recording was saved but has no playable media to open in the video editor",
+                ),
+                Err(error) => self.note(format!(
+                    "recording was saved but could not be opened in the video editor: {error}"
+                )),
+            }
+        }
+
+        // History first, so the card can carry its durable identity and
+        // "reveal in history" works from the moment it appears.
+        let finished = crate::commands::finish_recording(&output, fallback_target);
+        self.recorded_history_id = finished.history_id;
+
+        if actions.recent_captures_overlay {
+            self.present_recorded_media();
+        } else {
+            self.recording.handoff = None;
+            self.recorded_history_id = None;
+        }
+
+        match finished.report {
+            Ok(report) => {
+                self.note(format!("recording saved to {}", path.display()));
+                self.recording.completion = Some(Completion::Finished(Box::new(report)));
+            }
+            Err(error) => {
+                self.note(format!("recording output was not accepted: {error}"));
+                self.recording.completion = Some(Completion::Failed(error.to_string()));
+            }
+        }
+        self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+    }
+
+    /// Puts the completed recording onto the modern card stack.
+    ///
+    /// Takes the handoff rather than borrowing it, so a card is created exactly
+    /// once. The durable path travels with the card as its written location:
+    /// dismissing the card releases nothing, because the card never owned the
+    /// bytes in the first place.
+    fn present_recorded_media(&mut self) {
+        let Some(handoff) = self.take_finalized_media_handoff() else {
+            return;
+        };
+        let id = self.pipeline.allocate();
+        let capture_id = self.recorded_history_id.take();
+        let card = Card::from_finalized_media(id, capture_id, &handoff);
+        let path = handoff.path.clone();
+        self.recorded_media.insert(id, handoff);
+        match self.surface.present(card) {
+            Ok(()) => {
+                self.captures += 1;
+                self.note(format!("recording card shown for {}", path.display()));
+            }
+            Err(error) => {
+                self.recorded_media.remove(&id);
+                self.note(format!(
+                    "recording was saved to {} but its card could not be shown: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    /// The durable recording a card is showing, if it is showing one.
+    #[must_use]
+    pub fn recorded_media(&self, card: CardId) -> Option<&FinalizedMediaHandoff> {
+        self.recorded_media.get(&card)
+    }
+
+    /// Handles a card gesture that belongs to a recording rather than a still.
+    ///
+    /// Returns `true` when the event was a recording's, so the ordinary capture
+    /// path is not asked to find pixels that were never in the worker's cache.
+    fn route_recorded_card_event(&mut self, event: &CardEvent) -> bool {
+        let Some(card) = event.card() else {
+            return false;
+        };
+        if !self.recorded_media.contains_key(&card) {
+            return false;
+        }
+        match event {
+            CardEvent::Open(_) => {
+                self.open_recorded_media(card);
+                true
+            }
+            CardEvent::Drag { at, .. } => {
+                self.begin_recorded_drag(card, *at);
+                true
+            }
+            CardEvent::Dismiss(_) => {
+                // The card goes; the video stays exactly where it was written.
+                self.surface.dismiss(card);
+                self.recorded_media.remove(&card);
+                self.note(format!("{card} dismissed; its recording is untouched"));
+                true
+            }
+            CardEvent::Copy(_) | CardEvent::Save(_) | CardEvent::Pin(..) => {
+                let availability = current_availability(
+                    MediaKind::Recording,
+                    match event {
+                        CardEvent::Copy(_) => AfterCaptureAction::CopyToClipboard,
+                        CardEvent::Save(_) => AfterCaptureAction::SaveAutomatically,
+                        _ => AfterCaptureAction::PinToScreen,
+                    },
+                );
+                // Never falls through to the still path: a recording card has
+                // no entry in the worker's pixel vault, so the ordinary handler
+                // would answer with "this card owns no persisted capture",
+                // which is true and completely unhelpful.
+                if let CardEvent::Pin(card, capture, _) = event {
+                    self.surface.fail_pin(
+                        capture,
+                        availability
+                            .reason
+                            .unwrap_or("Pin to Screen does not apply to a recording.")
+                            .to_owned(),
+                    );
+                    let _ = card;
+                }
+                self.note(
+                    availability
+                        .reason
+                        .unwrap_or("this recording action is unavailable in this build"),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Opens a stored recording in the video editor.
+    ///
+    /// The duration comes from the history row rather than being re-derived:
+    /// the editor's own document reads the real container, and this value only
+    /// has to be good enough to report the failure honestly if it cannot.
+    fn open_history_recording(
+        &mut self,
+        capture: &CaptureId,
+        path: std::path::PathBuf,
+        duration_secs: f64,
+    ) {
+        if self.recording.editor_is_open() {
+            self.note("the video editor is already open");
+            return;
+        }
+        match Recording::native(path.clone(), duration_secs, "history")
+            .and_then(|recording| ActiveVideoEditor::open(&recording))
+        {
+            Ok(Some(editor)) => {
+                self.recording.editor = Some(editor);
+                self.note(format!(
+                    "history capture {} opened in the video editor",
+                    capture.0
+                ));
+            }
+            Ok(None) => self.note(format!(
+                "history capture {} has no playable media to edit",
+                capture.0
+            )),
+            Err(error) => self.note(format!(
+                "could not open {} in the video editor: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn open_recorded_media(&mut self, card: CardId) {
+        let Some(handoff) = self.recorded_media.get(&card) else {
+            return;
+        };
+        let path = handoff.path.clone();
+        if self.recording.editor_is_open() {
+            self.note("the video editor is already open");
+            return;
+        }
+        match Recording::native(path.clone(), handoff.duration.as_secs_f64(), "handoff")
+            .and_then(|recording| ActiveVideoEditor::open(&recording))
+        {
+            Ok(Some(editor)) => {
+                self.recording.editor = Some(editor);
+                self.note(format!("video editor opened for {}", path.display()));
+            }
+            Ok(None) => self.note(format!("{} has no playable media to edit", path.display())),
+            Err(error) => self.note(format!(
+                "could not open {} in the video editor: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn begin_recorded_drag(&mut self, card: CardId, at: DragSpot) {
+        if !self.drag.is_attached()
+            && let Some(surface) = self.surface.native_surface()
+        {
+            self.drag.attach(surface);
+        }
+        let Some(handoff) = self.recorded_media.get(&card) else {
+            return;
+        };
+        let path = handoff.path.clone();
+        let poster = poster_png(&handoff.poster);
+        match self.drag.begin_media(card, at, &path, poster.as_deref()) {
+            Ok(()) => tracing::debug!(%card, path = %path.display(), "recording drag started"),
+            Err(why) => {
+                self.surface.settle_drag(card, false);
+                self.modal_drag_input_release_pending = true;
+                self.note(format!("{card} could not be dragged: {why}"));
+            }
+        }
+    }
+
+    fn present_recording_error(&mut self, error: &CliError) {
+        self.recording.preflight_failure = Some(crate::gui::recording::preflight_failure(error));
+        self.note(format!("recording action failed: {error}"));
+    }
+
+    fn ensure_recording_permission() -> CliResult<()> {
+        let permissions = SystemPermissions::new();
+        if !permissions.is_granted(Capability::ScreenRecording) {
+            permissions.request(Capability::ScreenRecording)?;
+        }
+        Ok(())
+    }
+
+    fn active_recording_target() -> CliResult<CaptureTarget> {
+        let backend = crate::platform::capture_backend()?;
+        Ok(CaptureTarget::Display(backend.active_display()?.id))
+    }
+
+    fn refresh_recording_tray(&self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        tray.set_recording(self.recording.is_active());
+    }
+
+    fn release_video_editor(&mut self) {
+        for problem in self.recording.release_editor() {
+            self.note(problem);
+        }
+    }
+
+    /// The completed video waiting to enter the aggregate capture stack.
+    ///
+    /// **This is the whole seam.** Everything the recording lifecycle wants the
+    /// modern card stack to know arrives here as one validated, durable value,
+    /// and nothing else crosses. Starting another recording does not clear it:
+    /// the owner takes it explicitly, so a card can never be silently lost to a
+    /// second recording that happened first.
+    #[must_use]
+    pub const fn finalized_media_handoff(&self) -> Option<&FinalizedMediaHandoff> {
+        self.recording.handoff.as_ref()
+    }
+
+    /// Transfers the completed video to the aggregate capture owner.
+    pub fn take_finalized_media_handoff(&mut self) -> Option<FinalizedMediaHandoff> {
+        self.recording.handoff.take()
+    }
+
+    /// The video editor state one viewport pass needs, if one is open.
+    #[must_use]
+    pub fn video_editor_snapshot(&self) -> Option<VideoEditorSnapshot> {
+        self.recording
+            .editor
+            .as_ref()
+            .map(ActiveVideoEditor::snapshot)
+    }
+
+    /// Whether the recording editor window should be showing.
+    #[must_use]
+    pub const fn video_editor_is_open(&self) -> bool {
+        self.recording.editor_is_open()
+    }
+
+    /// Whether recording is busy enough that other surfaces must not park it.
+    #[must_use]
+    pub fn recording_is_busy(&self) -> bool {
+        self.recording.is_busy()
+    }
+
+    /// Applies one action raised by the video editor viewport.
+    pub fn handle_video_editor_action(&mut self, action: VideoEditorAction) {
+        use crate::gui::recording::action_allowed_during_export;
+
+        if action == VideoEditorAction::Close {
+            if self
+                .recording
+                .editor
+                .as_ref()
+                .is_some_and(ActiveVideoEditor::is_exporting)
+            {
+                self.note("cancel the active export before closing the video editor");
+                return;
+            }
+            self.release_video_editor();
+            if let Err(error) = self.reset_finished_recording() {
+                self.note(format!("could not close the video editor: {error}"));
+            }
+            self.note("video editor closed");
+            return;
+        }
+        if self
+            .recording
+            .editor
+            .as_ref()
+            .is_some_and(ActiveVideoEditor::is_exporting)
+            && !action_allowed_during_export(&action)
+        {
+            self.note("wait for the active export or cancel it before changing the editor");
+            return;
+        }
+        let Some(editor) = self.recording.editor.as_mut() else {
+            self.note("the video editor no longer has a recording");
+            return;
+        };
+
+        let mut problem = None;
+        let mut reveal = None;
+        match action {
+            VideoEditorAction::Close => unreachable!("close returns before the editor is borrowed"),
+            VideoEditorAction::Play => match editor.playback.play() {
+                Ok(()) => editor.document.play(),
+                Err(error) => problem = Some(format!("could not play the recording: {error}")),
+            },
+            VideoEditorAction::Pause => {
+                editor.playback.pause();
+                editor.document.pause();
+            }
+            VideoEditorAction::Seek(position) => {
+                if let Err(error) = editor
+                    .playback
+                    .seek(position)
+                    .and_then(|()| editor.document.seek(position))
+                {
+                    problem = Some(format!("could not seek the recording: {error}"));
+                }
+            }
+            VideoEditorAction::SetRate(rate) => {
+                if let Err(error) = editor.playback.set_rate(rate) {
+                    problem = Some(format!(
+                        "could not change the recording playback rate: {error}"
+                    ));
+                }
+            }
+            VideoEditorAction::PlanChanged(plan) => {
+                editor.plan = plan;
+                problem = editor
+                    .playback
+                    .set_plan(&editor.document, plan)
+                    .err()
+                    .map(|error| format!("could not update the recording preview: {error}"));
+                editor.transcode_status = None;
+                editor.transcode_progress = 0.0;
+                editor.transcode_output = None;
+                editor.transcode_failure = None;
+            }
+            VideoEditorAction::Export(plan) => {
+                editor.playback.pause();
+                editor.document.pause();
+                editor.plan = plan;
+                editor.transcode_progress = 0.0;
+                editor.transcode_output = None;
+                editor.transcode_failure = None;
+                match crate::gui::recording::start_export(&editor.document, &plan) {
+                    Ok(job) => {
+                        editor.transcode_status = Some(job.status());
+                        editor.transcode_job = Some(job);
+                    }
+                    Err(error) => {
+                        editor.transcode_status =
+                            Some(scrozz_record::transcode::TranscodeStatus::Failed);
+                        editor.transcode_failure =
+                            Some(scrozz_record::transcode::TranscodeFailure {
+                                error: Arc::new(error),
+                                partial: None,
+                            });
+                    }
+                }
+            }
+            VideoEditorAction::CancelExport => {
+                if let Some(job) = editor.transcode_job.as_mut()
+                    && let Err(error) = job.cancel()
+                {
+                    problem = Some(format!("could not cancel the video export: {error}"));
+                }
+            }
+            VideoEditorAction::RevealOutput | VideoEditorAction::RevealPartialOutput => {
+                reveal = editor
+                    .transcode_output
+                    .as_ref()
+                    .map(|output| output.path.clone())
+                    .or_else(|| {
+                        editor
+                            .transcode_failure
+                            .as_ref()
+                            .and_then(|failure| failure.partial.as_ref())
+                            .map(|output| output.path.clone())
+                    })
+                    .or_else(|| Some(editor.document.recording().path().to_path_buf()));
+            }
+        }
+        if let Some(problem) = problem {
+            self.note(problem);
+        }
+        if let Some(path) = reveal {
+            self.reveal_recording_path(&path);
+        }
+    }
+
+    fn reveal_recording_path(&mut self, path: &std::path::Path) {
+        match crate::gui::recording::reveal_file(path) {
+            Ok(()) => self.note(format!("revealed recording at {}", path.display())),
+            Err(error) => self.note(format!(
+                "could not reveal recording at {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn settle_recording_before_shutdown(&mut self) {
+        let cancellation = self
+            .recording
+            .editor
+            .as_mut()
+            .and_then(|editor| editor.transcode_job.as_mut())
+            .map(|job| job.cancel());
+        if let Some(Err(error)) = cancellation {
+            self.note(format!(
+                "video export cancellation was already settling during shutdown: {error}"
+            ));
+        }
+        let deadline = Instant::now() + crate::gui::recording::SHUTDOWN_FINALISE_TIMEOUT;
+        while self
+            .recording
+            .editor
+            .as_ref()
+            .is_some_and(ActiveVideoEditor::is_exporting)
+            && Instant::now() < deadline
+        {
+            self.recording.advance_export();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        if let Some(receiver) = self.recording.finalisation.take() {
+            match receiver.recv_timeout(crate::gui::recording::SHUTDOWN_FINALISE_TIMEOUT) {
+                Ok(message) => self.apply_finalised_recording(message),
+                Err(_) => {
+                    if let Some(machine) = self.recording.machine.as_mut() {
+                        let _ = machine.complete_finalising(Err(CoreError::Platform(
+                            "the recording finaliser ended during shutdown".to_owned(),
+                        )));
+                    }
+                    self.drain_recording_events();
+                }
+            }
+        } else if matches!(
+            self.recording.phase(),
+            Some(RecordingPhase::Recording | RecordingPhase::Paused)
+        ) {
+            // A recording in flight when the app quits is finished here rather
+            // than abandoned: the alternative is a half-written container the
+            // user never asked for and cannot play.
+            let session = self
+                .recording
+                .machine
+                .as_mut()
+                .expect("the phase came from this machine")
+                .begin_finalising();
+            match session {
+                Ok(session) => {
+                    let result = session.stop();
+                    if let Some(machine) = self.recording.machine.as_mut() {
+                        let _ = machine.complete_finalising(result);
+                    }
+                    self.drain_recording_events();
+                }
+                Err(error) => self.note(format!(
+                    "could not finalise the recording during shutdown: {error}"
+                )),
+            }
+        }
+        self.release_video_editor();
+    }
+
     /// Every note recorded so far.
     #[must_use]
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
+}
+
+/// Encodes a bounded poster as PNG for a drag thumbnail.
+///
+/// Returns `None` rather than failing the drag: a drag with no thumbnail still
+/// carries the file, and a drag that refuses to start because a preview could
+/// not be encoded would be strictly worse.
+fn poster_png(poster: &scrozz_record::handoff::VideoPoster) -> Option<Vec<u8>> {
+    let image = scrozz_export::RgbaImage {
+        width: poster.width,
+        height: poster.height,
+        data: poster.bytes.clone(),
+    };
+    scrozz_export::FrameEncoder::new()
+        .encode_rgba(
+            &image,
+            scrozz_core::ColorSpace::Srgb,
+            scrozz_export::ImageFormat::Png,
+        )
+        .map_err(|error| {
+            tracing::debug!(%error, "the recording drag preview could not be encoded");
+        })
+        .ok()
 }
 
 fn established_lock_escapes(
@@ -4280,11 +5487,248 @@ mod tests {
     }
 
     #[test]
-    fn an_unwired_action_says_so_rather_than_doing_nothing() {
+    fn toggling_recording_reaches_the_machine_and_never_silently_does_nothing() {
         let (mut app, _) = app();
         assert_eq!(app.perform(Action::ToggleRecording), Tick::Continue);
         let notes = app.notes().join("\n");
-        assert!(notes.contains("recording is not wired up yet"), "{notes}");
+
+        // Whatever this build can do, it must say something specific: either it
+        // refused for a nameable reason, or it actually started the lifecycle.
+        assert!(
+            !notes.contains("not wired up"),
+            "recording must never report itself as unimplemented: {notes}"
+        );
+        assert!(
+            notes.contains("recording")
+                || notes.contains("Recording")
+                || notes.contains("Screen Recording"),
+            "toggling recording said nothing at all: {notes}"
+        );
+        assert!(
+            app.finalized_media_handoff().is_none(),
+            "no recording has finished, so nothing may be waiting for a card"
+        );
+    }
+
+    /// Builds a validated durable handoff over a real file on disk.
+    ///
+    /// Deliberately *not* a synthetic value: the seam's whole contract is that
+    /// the file outlives the recorder, so a fixture that never touches the
+    /// filesystem would test nothing.
+    fn durable_handoff(root: &std::path::Path) -> FinalizedMediaHandoff {
+        std::fs::create_dir_all(root).expect("scratch directory");
+        let path = root.join("Scrozz Recording.mp4");
+        std::fs::write(&path, b"durable-finalized-media").expect("durable media");
+        FinalizedMediaHandoff {
+            path: std::fs::canonicalize(&path).expect("canonical durable media"),
+            ownership: scrozz_record::handoff::FinalizedMediaOwnership::ApplicationRetained,
+            media_kind: scrozz_record::handoff::FinalizedMediaKind::Video,
+            poster: scrozz_record::handoff::VideoPoster {
+                timestamp: Duration::ZERO,
+                width: 2,
+                height: 2,
+                stride: 8,
+                pixel_format: scrozz_core::PixelFormat::Rgba8,
+                color_space: scrozz_core::ColorSpace::Srgb,
+                bytes: vec![255; 16],
+            },
+            duration: Duration::from_secs(12),
+            dimensions: (1920, 1080),
+            file_size_bytes: 23,
+            audio_present: true,
+            open_action: scrozz_record::handoff::FinalizedVideoAction::OpenEditor,
+        }
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "scrozz-recording-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn the_handoff_seam_is_taken_once_and_never_replayed() {
+        let (mut app, _) = app();
+        assert!(app.take_finalized_media_handoff().is_none());
+        assert!(app.finalized_media_handoff().is_none());
+        assert!(!app.video_editor_is_open());
+        assert!(app.video_editor_snapshot().is_none());
+
+        let root = scratch("seam");
+        app.recording.handoff = Some(durable_handoff(&root));
+        assert!(app.finalized_media_handoff().is_some());
+        let taken = app.take_finalized_media_handoff().expect("handoff");
+        assert_eq!(
+            taken.media_kind,
+            scrozz_record::handoff::FinalizedMediaKind::Video
+        );
+        assert!(
+            app.take_finalized_media_handoff().is_none(),
+            "the seam hands the recording over exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_finished_recording_becomes_a_video_card_whose_media_outlives_it() {
+        let (mut app, surface) = app();
+        let root = scratch("card");
+        let handoff = durable_handoff(&root);
+        let media = handoff.path.clone();
+
+        app.recording.handoff = Some(handoff);
+        app.present_recorded_media();
+
+        let cards = surface.presented();
+        assert_eq!(cards.len(), 1, "one finished recording makes one card");
+        let card = &cards[0];
+        assert_eq!(
+            card.media,
+            scrozz_ui::card::CardMedia::video(Duration::from_secs(12), true),
+            "the card carries the recording's duration and audio flag"
+        );
+        assert_eq!(card.source_px(), (1920, 1080), "encoded source dimensions");
+        assert!(
+            card.thumbnail.is_some(),
+            "the bounded poster becomes the card's thumbnail with no decode here"
+        );
+        assert_eq!(
+            card.written,
+            vec![media.to_string_lossy().into_owned()],
+            "the card points at the durable file rather than owning a copy"
+        );
+        assert!(
+            app.finalized_media_handoff().is_none(),
+            "the handoff was consumed by the card it produced"
+        );
+
+        // Dismissing the card must not remove the video.
+        app.recorded_media
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .for_each(|id| {
+                assert!(app.route_recorded_card_event(&CardEvent::Dismiss(id)));
+            });
+        assert!(
+            media.is_file(),
+            "dismissing a recording card must never delete its durable media"
+        );
+        assert!(app.recorded_media.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_frame_video_drag_uses_the_media_path_not_the_image_vault() {
+        let (mut app, surface) = app();
+        let root = scratch("drag-card");
+        app.recording.handoff = Some(durable_handoff(&root));
+        app.present_recorded_media();
+        let card = *app.recorded_media.keys().next().expect("video card");
+        surface.arm(CardEvent::Drag {
+            card,
+            at: drag_spot(),
+        });
+
+        assert_eq!(app.pump_drag_starts(), 1);
+        let notes = app.notes().join("\n");
+        assert!(
+            !notes.contains("has no capture to drag"),
+            "video drag fell through to the screenshot vault: {notes}"
+        );
+        assert!(
+            app.recorded_media.contains_key(&card),
+            "a refused native drag must keep the durable card"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recording_card_actions_are_honestly_gated_rather_than_silently_ignored() {
+        let (mut app, _) = app();
+        let root = scratch("actions");
+        app.recording.handoff = Some(durable_handoff(&root));
+        app.present_recorded_media();
+        let card = *app
+            .recorded_media
+            .keys()
+            .next()
+            .expect("a recording card exists");
+
+        let before = app.notes().len();
+        assert!(app.route_recorded_card_event(&CardEvent::Copy(card)));
+        assert!(app.route_recorded_card_event(&CardEvent::Save(card)));
+        assert!(app.route_recorded_card_event(&CardEvent::Pin(
+            card,
+            CaptureId("recording-01".to_owned()),
+            scrozz_core::PinState::new(
+                scrozz_core::LogicalRect::new(
+                    scrozz_core::LogicalPoint::new(0.0, 0.0),
+                    scrozz_core::LogicalSize::new(288.0, 180.0),
+                ),
+                scrozz_core::PinScale::fit(scrozz_core::LogicalSize::new(288.0, 180.0), 288.0),
+                None,
+            ),
+        )));
+        let said = app.notes()[before..].join("\n");
+        assert!(
+            said.contains("clipboard") && said.contains("destination"),
+            "each unavailable recording action must name its own gap: {said}"
+        );
+        assert!(
+            said.contains("still image"),
+            "Pin must be refused with its own reason rather than falling through \
+             to the still path's \"card owns no persisted capture\": {said}"
+        );
+
+        // An unrelated card is not claimed by the recording path at all.
+        let stranger = app.pipeline.allocate();
+        assert!(!app.route_recorded_card_event(&CardEvent::Copy(stranger)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn after_capture_policy_reaches_the_machine_as_two_independent_switches() {
+        let (mut app, _) = app();
+        let mut settings = AfterCaptureSettings::fresh();
+        settings.set(
+            MediaKind::Recording,
+            AfterCaptureAction::ShowRecentCapturesOverlay,
+            false,
+        );
+        settings.set(MediaKind::Recording, AfterCaptureAction::OpenEditor, true);
+        app.config.after_capture = settings;
+
+        let policy = app.config.after_capture.recording_policy();
+        assert!(!policy.recent_captures_overlay && policy.open_editor);
+
+        // The editor alone is a legal configuration: nothing forces a card.
+        assert!(
+            current_availability(MediaKind::Recording, AfterCaptureAction::OpenEditor).available
+        );
+        assert!(
+            current_availability(
+                MediaKind::Recording,
+                AfterCaptureAction::ShowRecentCapturesOverlay
+            )
+            .available
+        );
+    }
+
+    #[test]
+    fn shutting_down_settles_recording_without_a_machine() {
+        let (mut app, _) = app();
+        // No engine, no editor, no finalisation: shutdown must still be a
+        // no-op rather than a panic, because this is the ordinary path on a
+        // platform with no recording backend.
+        app.shut_down();
+        app.shut_down();
     }
 
     #[test]

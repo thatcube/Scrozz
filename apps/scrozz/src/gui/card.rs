@@ -30,6 +30,7 @@ use std::{
 
 use scrozz_core::{ColorSpace, Frame, PinState, Provenance, Transform as ColorTransform};
 use scrozz_store::CaptureId;
+use scrozz_ui::card::CardMedia;
 
 use crate::gui::action::CaptureKind;
 
@@ -245,6 +246,12 @@ fn span(index: u32, out: u32, source: u32) -> (u32, u32) {
 pub struct Card {
     /// Session-local identifier.
     pub id: CardId,
+    /// Whether this card shows a still or a finished recording.
+    ///
+    /// A recording carries its own durable media file, which the card only
+    /// points at: dismissing the card, or deleting the history row, never
+    /// removes it.
+    pub media: CardMedia,
     /// Where it lives in history, once the store has it.
     ///
     /// `None` means the capture happened but was not persisted — a store that
@@ -298,6 +305,7 @@ impl Card {
     pub fn placeholder(id: CardId, kind: CaptureKind) -> Self {
         Self {
             id,
+            media: CardMedia::Image,
             capture_id: None,
             kind,
             provenance: match kind {
@@ -314,16 +322,52 @@ impl Card {
         }
     }
 
+    /// A card for a finished recording, built from its durable handoff.
+    ///
+    /// The poster is already bounded by the handoff, so nothing is decoded or
+    /// resampled here. The durable path becomes the card's written location,
+    /// which is what makes drag-out and reveal point at the real video rather
+    /// than at a copy this card would own.
+    #[must_use]
+    pub fn from_finalized_media(
+        id: CardId,
+        capture_id: Option<CaptureId>,
+        handoff: &scrozz_record::handoff::FinalizedMediaHandoff,
+    ) -> Self {
+        let poster = &handoff.poster;
+        Self {
+            id,
+            media: CardMedia::video(handoff.duration, handoff.audio_present),
+            capture_id,
+            kind: CaptureKind::Fullscreen,
+            provenance: Provenance::Display,
+            source_width: handoff.dimensions.0,
+            source_height: handoff.dimensions.1,
+            scale: 1.0,
+            thumbnail: Thumbnail::from_rgba(poster.width, poster.height, poster.bytes.clone()),
+            written: vec![handoff.path.to_string_lossy().into_owned()],
+            taken_at: SystemTime::now(),
+        }
+    }
+
     /// A one-line description, for logs and for accessibility labels.
     #[must_use]
     pub fn summary(&self) -> String {
-        let mut text = format!(
-            "{} capture {}×{} at {}×",
-            self.kind.label(),
-            self.source_width,
-            self.source_height,
-            self.scale
-        );
+        let mut text = match self.media {
+            CardMedia::Image => format!(
+                "{} capture {}×{} at {}×",
+                self.kind.label(),
+                self.source_width,
+                self.source_height,
+                self.scale
+            ),
+            CardMedia::Video { duration, .. } => format!(
+                "video recording {}×{}, {:.1}s",
+                self.source_width,
+                self.source_height,
+                duration.as_secs_f64()
+            ),
+        };
         if !self.written.is_empty() {
             text.push_str(" → ");
             text.push_str(&self.written.join(", "));

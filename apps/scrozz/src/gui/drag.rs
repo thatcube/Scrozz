@@ -36,14 +36,18 @@
 //! explain. So [`DragArtifact`] keeps the file for a retention window and this
 //! host sweeps it afterwards, every tick, until it is gone.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use image::imageops::FilterType;
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_export::{FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_shell::{
-    DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
-    NativeSurface, byte_source, drag::artifact,
+    DragFormat, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession, DragSource,
+    NativeDragSource, NativeSurface, byte_source, drag::artifact,
 };
 
 use crate::gui::{card::CardId, pipeline::CaptureBytes};
@@ -200,6 +204,51 @@ impl DragHost {
         }
     }
 
+    /// Starts a native drag carrying a finished recording's durable file.
+    ///
+    /// The payload promises the MP4 and **offers no image flavour at all**.
+    /// That omission is the point: advertising the video's bytes as
+    /// `public.png` would publish a corrupt image to every target that prefers
+    /// pixels over paths, and advertising the poster instead would drop a
+    /// screenshot where the user dragged a video. The poster is used only for
+    /// the thumbnail that follows the pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable explanation if there is no window yet, or the
+    /// platform refused to start a session. Either leaves the card where it was.
+    pub fn begin_media(
+        &mut self,
+        card: CardId,
+        spot: DragSpot,
+        media: &Path,
+        poster_png: Option<&[u8]>,
+    ) -> Result<(), String> {
+        if let Some(why) = &self.unavailable {
+            return Err(why.clone());
+        }
+        let surface = self
+            .surface
+            .ok_or_else(|| "the overlay window is not on screen yet".to_owned())?;
+        self.retire_existing(card);
+
+        let payload = media_payload(media, spot, poster_png);
+        let source = self.source()?;
+        match source.begin(payload, spot.origin(surface)) {
+            Ok(session) => {
+                self.live.insert(
+                    card,
+                    InFlight {
+                        session,
+                        reported: false,
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Services every drag in flight. Never blocks.
     ///
     /// Returns **every** drag that has reached an outcome, with that outcome,
@@ -295,6 +344,32 @@ fn payload_for(card: CardId, bytes: &CaptureBytes, spot: DragSpot) -> DragPayloa
             Ok(preview) => payload = payload.with_preview(preview),
             Err(error) => {
                 tracing::warn!(%error, "drag: card-matched preview could not be built");
+            }
+        }
+    }
+    payload
+}
+
+/// The payload a recording drag offers.
+///
+/// Kept separate from [`DragHost::begin_media`] so the one property that
+/// matters can be asserted without a window: the promised file is an MP4 and
+/// **no image flavour is advertised at all**.
+fn media_payload(media: &Path, spot: DragSpot, poster_png: Option<&[u8]>) -> DragPayload {
+    let stem = media
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Scrozz recording")
+        .to_owned();
+    // The recording is already a durable owned artifact. Offer that path
+    // directly; reading it into a Vec and writing a second copy here would block
+    // the UI in proportion to the recording's duration.
+    let mut payload = DragPayload::existing_file(media, DragFormat::Mp4);
+    if let Some(poster) = poster_png {
+        match preview_for_card(poster, spot) {
+            Ok(preview) => payload = payload.with_preview(preview),
+            Err(error) => {
+                tracing::warn!(%error, "drag: recording poster preview could not be built");
             }
         }
     }
@@ -428,6 +503,69 @@ mod tests {
         FrameEncoder::new()
             .encode_rgba(&image, scrozz_core::ColorSpace::Srgb, ImageFormat::Png)
             .expect("encode fixture")
+    }
+
+    #[test]
+    fn a_recording_drag_promises_an_mp4_and_advertises_no_image() {
+        let poster = png(210, 150);
+        let payload = media_payload(
+            Path::new("/tmp/Scrozz Recording 2026-08-29.mp4"),
+            spot(),
+            Some(&poster),
+        );
+
+        assert_eq!(payload.file().format(), DragFormat::Mp4);
+        assert_eq!(
+            payload.existing_file_path(),
+            Some(Path::new("/tmp/Scrozz Recording 2026-08-29.mp4")),
+            "durable video should be offered in place rather than copied through memory"
+        );
+        assert!(
+            payload.file().file_name().ends_with(".mp4"),
+            "{}",
+            payload.file().file_name()
+        );
+        assert!(
+            payload.image().is_none(),
+            "a video must never be advertised as clipboard image data: dropping \
+             into an image-preferring target would publish a corrupt PNG"
+        );
+        assert!(
+            payload.preview().is_some(),
+            "the poster still follows the pointer during the gesture"
+        );
+
+        // The poster is the drag thumbnail only; it is never the promised file.
+        let promised = payload.file().produce();
+        assert!(
+            promised.is_err(),
+            "a missing durable file must fail at drop time rather than silently \
+             producing the poster instead"
+        );
+    }
+
+    #[test]
+    fn a_recording_drag_references_its_durable_file_without_consuming_it() {
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-drag-media-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("scratch");
+        let media = root.join("Scrozz Recording.mp4");
+        std::fs::write(&media, b"durable-video-bytes").expect("media");
+
+        let payload = media_payload(&media, spot(), None);
+        assert_eq!(payload.existing_file_path(), Some(media.as_path()));
+        assert_eq!(
+            payload.file().produce().expect("durable bytes"),
+            b"durable-video-bytes"
+        );
+        assert!(
+            media.is_file(),
+            "producing the drag bytes must not consume the durable file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn spot() -> DragSpot {

@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use scrozz_core::Error as CoreError;
-use scrozz_export::{Destination, FileExporter, NameTemplate, NamingContext};
+use scrozz_export::{Destination, FileExporter, NamePolicy, NameTemplate, NamingContext};
 
 use crate::fault::{CliError, CliResult};
 use crate::{after_capture::AfterCaptureSettings, shortcuts::Shortcuts};
@@ -81,6 +81,77 @@ fn export_to_directory(
     })
 }
 
+/// A fresh, unused absolute path for a recording about to start.
+///
+/// **Durable by construction.** The file lives in the user's configured capture
+/// folder, not in a temporary directory, because the finished video outlives
+/// both the recorder's own scratch space and the card that shows it. Nothing
+/// downstream — card dismiss, history deletion, temp sweeping — may remove it.
+///
+/// **The file is deliberately not created here.** Every recording engine opens
+/// its destination with `create_new` and refuses a path that already exists —
+/// macOS, Media Foundation and the Linux muxer all do, and that refusal is what
+/// stops a recording silently overwriting something. Reserving the name by
+/// touching the file would therefore make every default-destination recording
+/// fail, and would leave an empty `.mp4` behind on every cancelled selection.
+/// The engine's own atomic create is the winner of any race; this only has to
+/// pick a name that is free right now.
+///
+/// # Errors
+///
+/// Returns a settings error when the persisted document is unreadable, and a
+/// storage error when the folder cannot be made or no free name exists.
+pub fn default_recording_path() -> CliResult<PathBuf> {
+    let (persisted, _) = crate::settings::stored_settings()?;
+    reserve_recording_path(&directory_from(&persisted)?, &NamingContext::now())
+}
+
+fn reserve_recording_path(directory: &Path, context: &NamingContext) -> CliResult<PathBuf> {
+    std::fs::create_dir_all(directory).map_err(|error| {
+        CliError::Core(CoreError::Storage(format!(
+            "could not make the recording folder {}: {error}",
+            directory.display()
+        )))
+    })?;
+    // Canonicalised now rather than after the recording, because history stores
+    // the path and requires a canonical one, and the directory is the only part
+    // that exists yet.
+    let directory = std::fs::canonicalize(directory).map_err(|error| {
+        CliError::Core(CoreError::Storage(format!(
+            "could not resolve the recording folder {}: {error}",
+            directory.display()
+        )))
+    })?;
+    let policy = NamePolicy::default();
+    let template = NameTemplate::parse("Scrozz {date} at {time}")?;
+    let stem = policy.sanitise(&template.render(context, &policy));
+    for attempt in 0..MAX_RECORDING_NAME_ATTEMPTS {
+        let name = if attempt == 0 {
+            format!("{stem}.mp4")
+        } else {
+            format!("{stem} ({attempt}).mp4")
+        };
+        let candidate = directory.join(name);
+        match candidate.try_exists() {
+            Ok(false) => return Ok(candidate),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(CliError::Core(CoreError::Storage(format!(
+                    "could not check the recording destination {}: {error}",
+                    candidate.display()
+                ))));
+            }
+        }
+    }
+    Err(CliError::Core(CoreError::Storage(format!(
+        "no free recording name was available in {} after {MAX_RECORDING_NAME_ATTEMPTS} attempts",
+        directory.display()
+    ))))
+}
+
+/// How many numbered suffixes a reservation tries before giving up.
+const MAX_RECORDING_NAME_ATTEMPTS: u32 = 1_000;
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -89,12 +160,23 @@ mod tests {
 
     use super::*;
 
+    /// A directory no other test in this process can be handed.
+    ///
+    /// The nonce alone is not enough: `SystemTime` is coarser than a nanosecond
+    /// on some platforms, and these tests run in parallel, so two of them can
+    /// read the same instant and then delete each other's scratch directory.
+    /// The sequence makes the answer unique by construction.
     fn scratch() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("scrozz-output-{}-{nonce}", std::process::id()))
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "scrozz-output-{}-{nonce}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -115,6 +197,37 @@ mod tests {
         assert_ne!(first, second, "colliding saves need distinct paths");
         assert_eq!(std::fs::read(first).unwrap(), first_bytes);
         assert_eq!(std::fs::read(second).unwrap(), second_bytes);
+
+        std::fs::remove_dir_all(directory).expect("clean scratch directory");
+    }
+
+    #[test]
+    fn a_recording_destination_is_free_and_is_never_created_in_advance() {
+        let directory = scratch();
+        let context = NamingContext {
+            timestamp: Some(Timestamp::new(2026, 8, 29, 9, 15, 0)),
+            ..NamingContext::default()
+        };
+
+        let first = reserve_recording_path(&directory, &context).expect("first destination");
+        assert!(first.is_absolute());
+        assert_eq!(first.extension().and_then(|e| e.to_str()), Some("mp4"));
+        assert!(
+            !first.exists(),
+            "every recording engine opens its destination with create_new and \
+             refuses a path that already exists, so nothing may be written here yet"
+        );
+
+        // Nothing was created, so the same second legitimately yields the same
+        // name again; the engine's own atomic create resolves any real race.
+        let again = reserve_recording_path(&directory, &context).expect("second destination");
+        assert_eq!(first, again);
+
+        // Once a file really is there, the next name steps around it.
+        std::fs::write(&first, b"recorded").expect("finished recording");
+        let next = reserve_recording_path(&directory, &context).expect("third destination");
+        assert_ne!(next, first);
+        assert!(!next.exists());
 
         std::fs::remove_dir_all(directory).expect("clean scratch directory");
     }

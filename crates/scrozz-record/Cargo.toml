@@ -8,26 +8,85 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Native Linux media libraries are deliberately opt-in. Their build scripts use
+# pkg-config, so a macOS-hosted Linux cross-check remains link-free.
+linux-native = [
+    "dep:ffmpeg-sys-next",
+    "dep:futures-util",
+    "dep:pipewire",
+    "dep:tokio",
+]
+# The only software video encoder Scrozz permits. Hardware H.264 remains the
+# default, and this sizeable fallback stays independently optional.
+rav1e-fallback = ["dep:rav1e"]
+
 [dependencies]
 scrozz-core.workspace = true
+scrozz-export.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-capture.workspace = true
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
 objc2.workspace = true
-objc2-foundation.workspace = true
-objc2-av-foundation.workspace = true
-objc2-core-media.workspace = true
-objc2-screen-capture-kit.workspace = true
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL"] }
+objc2-av-foundation = { workspace = true, features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVAudioMix", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVPlayer", "AVPlayerItem", "AVVideoComposition", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media", "objc2-core-video", "objc2-media-toolbox"] }
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-core-media = { workspace = true, features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "CMTimeRange", "objc2-core-audio-types", "objc2-core-video"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn"] }
+objc2-media-toolbox.workspace = true
+objc2-screen-capture-kit = { workspace = true, features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "libc", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 dispatch2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit.workspace = true
+objc2-foundation = { workspace = true, features = ["NSDate", "NSRunLoop"] }
+
+[dev-dependencies]
+image.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+x11rb.workspace = true
+ffmpeg-sys-next = { version = "9.0.0", default-features = false, features = ["avcodec"], optional = true }
+futures-util = { workspace = true, optional = true }
+pipewire = { version = "0.10.1", features = ["v0_3_44"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
-    "Media_Transcoding",
-    "Media_MediaProperties",
-    "Win32_Media_MediaFoundation",
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [lints]

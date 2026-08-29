@@ -90,21 +90,23 @@ pub mod overlay_app;
 pub mod paint;
 pub mod permission;
 pub mod pinned;
+mod recording_controls;
 pub mod select;
 pub mod settings;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
+pub mod video_editor;
 
-pub use card::{CardAction, CardChrome, CardContent, CardResponse};
+pub use card::{CardAction, CardChrome, CardContent, CardMedia, CardResponse};
 pub use history::{
     DateFilter, HistoryAction, HistoryEntry, HistoryFilters, HistoryPage, HistoryThumbnail,
     HistoryViewModel,
 };
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
-    CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
-    OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+    CaptureMedia, CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry,
+    OverlayHandle, OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
 };
 pub use select::{
     AxisDirection, DisplayLayout, DragModifiers, FrozenDesktop, FrozenDisplayFrame, FrozenPixel,
@@ -112,3 +114,9 @@ pub use select::{
     SelectionAnnouncement, SelectionDecision, SelectionScene, SelectionState, SelectionUi,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
+pub use video_editor::{
+    TranscodeView, VIDEO_EDITOR_WINDOW_TITLE, VideoEditor, VideoEditorAction, VideoEditorControls,
+    VideoEditorLayout, VideoEditorModel, VideoEditorResponse, VideoEditorSnapshot, VideoPreview,
+    show_window as show_video_editor_window, viewport_builder as video_editor_viewport_builder,
+    viewport_id as video_editor_viewport_id,
+};

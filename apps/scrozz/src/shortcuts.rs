@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_ships_unbound_because_it_does_nothing_yet() {
+    fn recording_ships_unbound_so_no_system_chord_is_taken_by_default() {
         let shortcuts = Shortcuts::default();
         assert_eq!(shortcuts.get(ShortcutAction::ToggleRecording), None);
         assert!(shortcuts.is_default(ShortcutAction::ToggleRecording));

@@ -297,6 +297,16 @@ pub enum Job {
         /// Session-local identity used by the editor output pipeline.
         card: CardId,
     },
+    /// Resolve a stored recording's durable media so the video editor can open.
+    ///
+    /// Separate from [`Job::OpenHistoryEditor`] because the two open different
+    /// editors over different documents: a recording has no raster the
+    /// annotation editor could accept, and reading its media metadata is a
+    /// store read that must not happen on the UI thread.
+    OpenHistoryRecording {
+        /// Durable capture whose video is wanted.
+        capture: CaptureId,
+    },
     /// Copy a stored document.
     CopyHistory(CaptureId),
     /// Save a stored document.
@@ -424,6 +434,15 @@ pub enum Outcome {
     Ready(Box<ReadyCapture>),
     /// A stored capture was rebuilt as a live card.
     Restored(Box<Card>),
+    /// A stored recording's durable media was resolved for the video editor.
+    HistoryRecording {
+        /// Durable capture identity.
+        capture: CaptureId,
+        /// Absolute path to the media file, checked to exist.
+        path: std::path::PathBuf,
+        /// Active duration in seconds, as history recorded it.
+        duration_secs: f64,
+    },
     /// A card's capture was decoded and the editor can open on it.
     Opened {
         /// Which card.
@@ -1309,6 +1328,7 @@ impl Worker {
                 Job::OpenHistoryEditor { capture, card } => {
                     self.open_history_editor(capture, card);
                 }
+                Job::OpenHistoryRecording { capture } => self.open_history_recording(capture),
                 Job::CopyHistory(capture) => self.copy_history(capture),
                 Job::SaveHistory(capture) => self.save_history(capture),
                 Job::PrepareHistoryDrag(capture) => self.prepare_history_drag(capture),
@@ -1563,6 +1583,7 @@ impl Worker {
         Ok(ReadyCapture {
             card: Card {
                 id: card,
+                media: scrozz_ui::card::CardMedia::Image,
                 capture_id,
                 kind,
                 provenance: document.source.provenance,
@@ -1944,6 +1965,7 @@ impl Worker {
             let preview = thumbnail.as_ref().and_then(preview_png).map(Arc::new);
             let built = Card {
                 id: card,
+                media: scrozz_ui::card::CardMedia::Image,
                 capture_id: Some(capture.clone()),
                 kind,
                 provenance: rendered.record.provenance,
@@ -1988,6 +2010,51 @@ impl Worker {
             Err(error) => {
                 self.history_failed(HistoryOperation::Restore, Some(capture), error);
             }
+        }
+    }
+
+    /// Reads one stored recording's durable media path and hands it back.
+    ///
+    /// The file is checked here rather than assumed: a history row survives its
+    /// media being moved or deleted by the user — history never owned those
+    /// bytes — and the honest answer in that case is a named failure, not an
+    /// editor over a file that is not there.
+    fn open_history_recording(&mut self, capture: CaptureId) {
+        let record = self
+            .history_store()
+            .and_then(|store| store.record(&capture).map_err(CliError::Core))
+            .and_then(|record| record.ok_or_else(|| history_not_found(&capture)));
+        let resolved = record.and_then(|record| {
+            let video = record.video.ok_or_else(|| {
+                CliError::Core(CoreError::InvalidRequest(format!(
+                    "capture {:?} is not a recording",
+                    capture.0
+                )))
+            })?;
+            let path = video.path;
+            if !path.is_file() {
+                return Err(CliError::Core(CoreError::Storage(format!(
+                    "the recording at {} is no longer on disk",
+                    path.display()
+                ))));
+            }
+            Ok((path, video.duration_secs))
+        });
+        match resolved {
+            Ok((path, duration_secs)) => {
+                self.emit(Outcome::HistoryRecording {
+                    capture: capture.clone(),
+                    path,
+                    duration_secs,
+                });
+                self.history_done(
+                    HistoryOperation::OpenEditor,
+                    Some(capture),
+                    None,
+                    "opened in the video editor".to_owned(),
+                );
+            }
+            Err(error) => self.history_failed(HistoryOperation::OpenEditor, Some(capture), error),
         }
     }
 
@@ -2631,6 +2698,33 @@ fn history_entry(
     store: &mut SqliteStore,
     record: CaptureRecord,
 ) -> CliResult<Option<HistoryEntry>> {
+    // A recording has no editable document and never will: history holds a
+    // reference to a durable media file, not pixels. Reading one is not a
+    // failure and must not drop the row — the whole point of a video history
+    // entry is that it is still there to open, reveal and delete after the
+    // poster, the size and even the file itself have gone.
+    if let Some(video) = &record.video {
+        let missing = !video.path.is_file();
+        let (width, height, scale) = record_geometry(&record);
+        return Ok(Some(HistoryEntry {
+            id: record.id,
+            created_at: record.created_at,
+            media_kind: record.media_kind,
+            pinned: record.pinned,
+            app_name: record.app_name,
+            window_title: record.window_title,
+            width,
+            height,
+            scale,
+            image_present: !missing,
+            content_error: missing
+                .then(|| format!("This recording is no longer at {}.", video.path.display())),
+            annotation_count: record.annotation_count,
+            ocr_text: record.ocr_text,
+            thumbnail: None,
+        }));
+    }
+
     let loaded = store.document(&record.id);
     let (image_present, thumbnail, content_error) = match loaded {
         Ok(None) => return Ok(None),
@@ -2706,15 +2800,9 @@ fn record_geometry(record: &CaptureRecord) -> (u32, u32, f64) {
             frame.scale.get(),
         );
     }
-    let size = record.video.as_ref().and_then(|video| video.get("size"));
-    let width = size
-        .and_then(|size| size.get("width"))
-        .and_then(serde_json::Value::as_f64)
-        .map_or(0, dimension);
-    let height = size
-        .and_then(|size| size.get("height"))
-        .and_then(serde_json::Value::as_f64)
-        .map_or(0, dimension);
+    let size = record.video.as_ref().and_then(|video| video.size);
+    let width = size.map_or(0, |size| dimension(size.width));
+    let height = size.map_or(0, |size| dimension(size.height));
     (width, height, 1.0)
 }
 
@@ -3532,6 +3620,90 @@ mod tests {
         assert_eq!(request, Some(7));
         assert_eq!(operation, HistoryOperation::Query);
         assert!(error.to_string().contains("unavailable"), "{error}");
+    }
+
+    #[test]
+    fn a_stored_recording_stays_in_history_after_its_media_is_gone() {
+        let (dir, mut worker, _receiver) = worker_with_store("worker-recording-row");
+        let media = dir.path().join("Scrozz Recording.mp4");
+        std::fs::write(&media, b"durable-video").expect("durable media");
+        let canonical = std::fs::canonicalize(&media).expect("canonical media");
+
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert_recording(
+                scrozz_store::NewRecording::new(scrozz_store::VideoMetadata {
+                    path: canonical.clone(),
+                    duration_secs: 12.5,
+                    engine: "test".to_owned(),
+                    completion: scrozz_store::VideoCompletion::Complete,
+                    size: Some(scrozz_core::PhysicalSize::new(1920.0, 1080.0)),
+                    frames: Some(375),
+                    audio_channels: Some(2),
+                    file_size_bytes: Some(4_096),
+                    codec: Some("h264".to_owned()),
+                    quality: Some("balanced".to_owned()),
+                    resolution: Some("native".to_owned()),
+                })
+                .from_app("Scrozz")
+                .titled("Screen recording")
+                .taken_at(scrozz_store::Timestamp(3_000)),
+            )
+            .expect("insert recording");
+
+        // The full native summary must survive the sidecar round trip: history
+        // is the only place a finished recording's encoder settings still exist
+        // once the process ends, so a reduced type would lose them for good.
+        let store = worker.store.as_mut().expect("store");
+        let stored = store
+            .record(&id)
+            .expect("read")
+            .expect("record exists")
+            .video
+            .expect("a recording row carries typed video metadata");
+        assert_eq!(stored.path, canonical);
+        assert!((stored.duration_secs - 12.5).abs() < f64::EPSILON);
+        assert_eq!(stored.frames, Some(375));
+        assert_eq!(stored.audio_channels, Some(2));
+        assert_eq!(stored.file_size_bytes, Some(4_096));
+        assert_eq!(stored.codec.as_deref(), Some("h264"));
+        assert_eq!(stored.quality.as_deref(), Some("balanced"));
+        assert_eq!(stored.resolution.as_deref(), Some("native"));
+
+        let store = worker.store.as_mut().expect("store");
+        let record = store.record(&id).expect("read").expect("record exists");
+        let entry = history_entry(store, record)
+            .expect("history entry")
+            .expect("a recording is a history row, not a dropped one");
+        assert_eq!(entry.media_kind, scrozz_store::MediaKind::Video);
+        assert_eq!((entry.width, entry.height), (1920, 1080));
+        assert!(entry.image_present, "the media file is still on disk");
+        assert!(entry.content_error.is_none());
+        assert!(
+            entry.thumbnail.is_none(),
+            "a recording has no editable raster to render a history preview from"
+        );
+
+        // Delete the media the way a user would. History never owned it, so the
+        // row must survive and say what happened rather than disappearing.
+        std::fs::remove_file(&canonical).expect("user removed the recording");
+        let store = worker.store.as_mut().expect("store");
+        let record = store.record(&id).expect("read").expect("record survives");
+        let orphaned = history_entry(store, record)
+            .expect("history entry")
+            .expect("a recording row outlives its media");
+        assert!(!orphaned.image_present);
+        assert!(
+            orphaned
+                .content_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no longer at")),
+            "{:?}",
+            orphaned.content_error
+        );
+        assert_eq!((orphaned.width, orphaned.height), (1920, 1080));
     }
 
     #[test]

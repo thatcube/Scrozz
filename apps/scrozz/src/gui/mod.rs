@@ -69,6 +69,7 @@ pub mod overlay;
 pub mod panel;
 pub mod permission;
 pub mod pipeline;
+pub mod recording;
 pub mod selection;
 pub mod server;
 

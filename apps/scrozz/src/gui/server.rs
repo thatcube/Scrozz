@@ -46,7 +46,7 @@ use crate::{
     gui::card::SurfaceWaker,
     gui::selection::CaptureSelector,
     ipc::{self, DIRECT_AFTER_CAPTURE_POLICY, Response, StreamKind},
-    report::{error_envelope, success_envelope},
+    report::{Report, error_envelope, success_envelope},
 };
 
 #[cfg(unix)]
@@ -137,6 +137,59 @@ impl Request {
             run_with_selector(&self.argv, self.cwd.as_deref(), Some(selector));
         self.reply(&response);
         command
+    }
+
+    /// Answers with a result produced somewhere other than this request.
+    ///
+    /// `record --stop` cannot be answered by *running* `record --stop`: the
+    /// answer is whatever the recording that is now finalising eventually
+    /// produced, which arrives on another thread some time later. So the
+    /// request is parked, and this is how it is finally answered — with the
+    /// same envelope, stream choice and exit code a local run would have used,
+    /// because the caller must not be able to tell the difference.
+    pub fn answer(self, result: &CliResult<Report>) {
+        use clap::Parser as _;
+
+        let mut with_argv0 = Vec::with_capacity(self.argv.len() + 1);
+        with_argv0.push("scrozz".to_owned());
+        with_argv0.extend_from_slice(&self.argv);
+        let parsed = Cli::try_parse_from(with_argv0).ok();
+        let slug = parsed
+            .as_ref()
+            .and_then(|cli| cli.command.as_ref())
+            .map_or_else(|| Command::Gui.slug(), Command::slug);
+        let json_requested = parsed.as_ref().is_some_and(|cli| cli.global.json);
+        let quiet = parsed.as_ref().is_some_and(|cli| cli.global.quiet);
+
+        let response = match result {
+            Ok(report) => {
+                if let Some(bytes) = report.raw.clone() {
+                    Response {
+                        code: 0,
+                        stream: StreamKind::Binary,
+                        payload: bytes,
+                    }
+                } else if json_requested {
+                    json(
+                        0,
+                        success_envelope(&slug, report.data.clone()).to_compact_string(),
+                    )
+                } else if quiet {
+                    text(0, String::new())
+                } else {
+                    text(0, report.human.trim_end().to_owned())
+                }
+            }
+            Err(error) => {
+                let code = error.exit().code();
+                if json_requested {
+                    json(code, error_envelope(&slug, error).to_compact_string())
+                } else {
+                    text(code, error.to_string())
+                }
+            }
+        };
+        self.reply(&response);
     }
 
     #[cfg(unix)]

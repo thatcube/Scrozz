@@ -321,6 +321,24 @@ impl AfterCaptureSettings {
         self.sets[media.index()].set(action, enabled);
     }
 
+    /// The recording half of this matrix, as the recorder's own settings type.
+    ///
+    /// Only the two cells this build can honour cross the boundary, and each
+    /// crosses independently: the overlay and the editor are separate switches
+    /// and both may be on. Read immediately before a recording starts so a
+    /// settings change mid-session applies to the next recording and not the
+    /// one already running.
+    #[must_use]
+    pub const fn recording_policy(&self) -> scrozz_record::AfterCaptureSettings {
+        scrozz_record::AfterCaptureSettings {
+            recent_captures_overlay: self.is_enabled(
+                MediaKind::Recording,
+                AfterCaptureAction::ShowRecentCapturesOverlay,
+            ),
+            open_editor: self.is_enabled(MediaKind::Recording, AfterCaptureAction::OpenEditor),
+        }
+    }
+
     /// Resolves a dotted schema key into its media/action pair.
     #[must_use]
     pub fn resolve_key(key: &str) -> Option<(MediaKind, AfterCaptureAction)> {
@@ -619,20 +637,39 @@ pub const fn current_availability(
     media: MediaKind,
     action: AfterCaptureAction,
 ) -> ActionAvailability {
-    if matches!(media, MediaKind::Recording) {
-        return ActionAvailability::unavailable(
-            "Screen recording is not implemented in this build, so recording actions cannot run yet.",
-        );
-    }
-    match action {
-        AfterCaptureAction::ShowRecentCapturesOverlay
-        | AfterCaptureAction::CopyToClipboard
-        | AfterCaptureAction::SaveAutomatically
-        | AfterCaptureAction::OpenEditor => ActionAvailability::AVAILABLE,
-        AfterCaptureAction::UploadAndCopyLink => ActionAvailability::unavailable(
+    match (media, action) {
+        // Recording is wired end to end for exactly two actions: the completed
+        // video enters the Recent Captures Overlay as an ordinary card, and the
+        // video editor opens over the same durable file. The rest are named as
+        // the specific missing capability rather than as "recording".
+        (
+            MediaKind::Recording,
+            AfterCaptureAction::ShowRecentCapturesOverlay | AfterCaptureAction::OpenEditor,
+        ) => ActionAvailability::AVAILABLE,
+        (MediaKind::Recording, AfterCaptureAction::CopyToClipboard) => {
+            ActionAvailability::unavailable(
+                "Copying a recording needs a platform file-reference clipboard flavour, which is not implemented in this build.",
+            )
+        }
+        (MediaKind::Recording, AfterCaptureAction::SaveAutomatically) => {
+            ActionAvailability::unavailable(
+                "A recording is already written to its destination when it finalizes, so a second automatic export is not implemented in this build.",
+            )
+        }
+        (MediaKind::Recording, AfterCaptureAction::PinToScreen) => ActionAvailability::unavailable(
+            "Pin to Screen holds a still image and does not apply to a recording.",
+        ),
+        (_, AfterCaptureAction::UploadAndCopyLink) => ActionAvailability::unavailable(
             "No cloud upload provider is implemented or configured in this build.",
         ),
-        AfterCaptureAction::PinToScreen => {
+        (
+            MediaKind::Screenshot,
+            AfterCaptureAction::ShowRecentCapturesOverlay
+            | AfterCaptureAction::CopyToClipboard
+            | AfterCaptureAction::SaveAutomatically
+            | AfterCaptureAction::OpenEditor,
+        ) => ActionAvailability::AVAILABLE,
+        (MediaKind::Screenshot, AfterCaptureAction::PinToScreen) => {
             ActionAvailability::unavailable("Pin to Screen is not implemented in this build.")
         }
     }
@@ -1676,15 +1713,101 @@ mod tests {
             );
             assert_eq!(screenshot.available, screenshot.reason.is_none());
 
+            // Recording is wired end to end for exactly the two cells the
+            // product contract names; every other cell must still say why not.
             let recording = current_availability(MediaKind::Recording, action);
-            assert!(!recording.available);
+            assert_eq!(
+                recording.available,
+                matches!(
+                    action,
+                    AfterCaptureAction::ShowRecentCapturesOverlay | AfterCaptureAction::OpenEditor
+                ),
+                "{action:?} disagrees with the wired recording contract"
+            );
+            assert_eq!(recording.available, recording.reason.is_none());
             assert!(
-                recording
-                    .reason
-                    .is_some_and(|reason| !reason.trim().is_empty()),
+                recording.available
+                    || recording
+                        .reason
+                        .is_some_and(|reason| !reason.trim().is_empty()),
                 "{action:?} has a mystery unavailable recording cell"
             );
         }
+    }
+
+    #[test]
+    fn the_two_wired_recording_cells_default_on_and_off_independently() {
+        let fresh = AfterCaptureSettings::fresh();
+        assert!(
+            fresh.is_enabled(
+                MediaKind::Recording,
+                AfterCaptureAction::ShowRecentCapturesOverlay
+            ),
+            "record.show-recent-captures-overlay ships enabled"
+        );
+        assert!(
+            !fresh.is_enabled(MediaKind::Recording, AfterCaptureAction::OpenEditor),
+            "record.open-editor ships disabled"
+        );
+
+        let policy = fresh.recording_policy();
+        assert!(policy.recent_captures_overlay);
+        assert!(!policy.open_editor);
+
+        // The two cells are independent in both directions, and both may run.
+        let mut both = fresh.clone();
+        both.set(MediaKind::Recording, AfterCaptureAction::OpenEditor, true);
+        let both_policy = both.recording_policy();
+        assert!(both_policy.recent_captures_overlay && both_policy.open_editor);
+        assert!(
+            both.is_enabled(
+                MediaKind::Screenshot,
+                AfterCaptureAction::ShowRecentCapturesOverlay
+            ),
+            "changing a recording cell must not touch the screenshot column"
+        );
+
+        let mut editor_only = both;
+        editor_only.set(
+            MediaKind::Recording,
+            AfterCaptureAction::ShowRecentCapturesOverlay,
+            false,
+        );
+        let editor_policy = editor_only.recording_policy();
+        assert!(!editor_policy.recent_captures_overlay && editor_policy.open_editor);
+
+        let mut neither = editor_only;
+        neither.set(MediaKind::Recording, AfterCaptureAction::OpenEditor, false);
+        let none_policy = neither.recording_policy();
+        assert!(!none_policy.recent_captures_overlay && !none_policy.open_editor);
+    }
+
+    #[test]
+    fn recording_keys_are_the_v2_matrix_keys_and_no_second_schema() {
+        assert_eq!(
+            AfterCaptureAction::ShowRecentCapturesOverlay.setting_key(MediaKind::Recording),
+            "record.show-recent-captures-overlay"
+        );
+        assert_eq!(
+            AfterCaptureAction::OpenEditor.setting_key(MediaKind::Recording),
+            "record.open-editor"
+        );
+        assert_eq!(
+            AfterCaptureSettings::resolve_key("record.show-recent-captures-overlay"),
+            Some((
+                MediaKind::Recording,
+                AfterCaptureAction::ShowRecentCapturesOverlay
+            ))
+        );
+        assert_eq!(
+            AfterCaptureSettings::resolve_key("record.open-editor"),
+            Some((MediaKind::Recording, AfterCaptureAction::OpenEditor))
+        );
+
+        let mut settings = AfterCaptureSettings::fresh();
+        assert!(settings.set_key("record.open-editor", true));
+        assert_eq!(settings.value_for_key("record.open-editor"), Some(true));
+        assert_eq!(settings.document_version, SETTINGS_VERSION);
     }
 
     #[test]

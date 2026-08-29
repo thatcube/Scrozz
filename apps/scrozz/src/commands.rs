@@ -29,6 +29,7 @@ use scrozz_core::{
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, to_straight_rgba8};
 use scrozz_ocr::Ocr as _;
+use scrozz_record::{RecordingMachine, RecordingPhase, RecordingRequest, RecordingSettings};
 use scrozz_store::{
     CaptureId, CaptureRecord, DocumentState, History as _, ImageState, Page, SearchQuery,
     SqliteStore, Store, Timestamp,
@@ -76,7 +77,7 @@ pub fn dispatch_with_selector(
 fn dispatch_inner(command: &Command, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
     match command {
         Command::Capture(args) => capture(args, selector),
-        Command::Record(args) => record(args),
+        Command::Record(args) => record(args, selector),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
         Command::Ocr(args) => ocr(args),
@@ -673,7 +674,32 @@ fn beautification_json(beautification: &Beautification) -> Json {
 // record
 // ---------------------------------------------------------------------------
 
-fn record(args: &RecordArgs) -> CliResult<Report> {
+/// A resolved recording request, ready for either the CLI owner or the GUI
+/// machine.
+///
+/// Both front ends build one of these and neither builds a
+/// [`RecordingRequest`] itself, so the destination, encoder policy and reported
+/// plan cannot drift apart between them.
+pub(crate) struct PreparedRecording {
+    pub(crate) request: RecordingRequest,
+    pub(crate) destination: std::path::PathBuf,
+    plan: Json,
+}
+
+impl PreparedRecording {
+    pub(crate) fn started_report(&self) -> Report {
+        Report::new(
+            Json::obj([
+                ("state", Json::str("recording")),
+                ("path", path_json(&self.destination)),
+                ("plan", self.plan.clone()),
+            ]),
+            format!("Recording to {}.", self.destination.display()),
+        )
+    }
+}
+
+fn record(args: &RecordArgs, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
     if args.stop {
         // Reaching here means no instance was running, because a running one
         // would have handled it. There is no session in this process to stop.
@@ -684,40 +710,536 @@ fn record(args: &RecordArgs) -> CliResult<Report> {
         )));
     }
 
-    let target = args.target.resolve()?;
-    let plan = Json::obj([
-        ("target", target_json(&target)),
-        ("fps", Json::Int(args.fps.into())),
-        ("microphone", Json::Bool(args.microphone)),
-        ("system_audio", Json::Bool(args.system_audio)),
-        ("cursor", Json::Bool(args.cursor)),
-        ("output", Json::opt(args.output.as_deref(), path_json)),
-    ]);
+    let requested = recording_target_spec(args)?;
+    let plan = recording_plan(args, &requested);
 
     if args.dry_run {
         return Ok(Report::new(
             Json::obj([("dry_run", Json::Bool(true)), ("plan", plan)]),
             format!(
                 "Would record {} at {} fps.",
-                describe_target(&target),
+                describe_target(&requested),
                 args.fps
             ),
         ));
     }
 
-    let request = scrozz_record::RecordingRequest {
-        target: capture_target(&target)?,
-        microphone: args.microphone,
-        system_audio: args.system_audio,
-        fps: args.fps,
-        show_cursor: args.cursor,
-    };
-    let _session = platform::start_recording(&request)?;
+    let target = resolve_recording_capture_target(&requested, selector)?;
+    let plan = recording_plan_for_target(args, &target);
+    run_owned_recording(prepare_recording(args, target, plan)?)
+}
 
-    Err(CliError::not_implemented(
-        "recording the screen",
-        "scrozz-record",
+/// Runs a recording this process owns, until another `scrozz record --stop`
+/// arrives on the instance socket.
+///
+/// A recording has a beginning and an end, and the end has to come from
+/// somewhere. With no application running, the only channel that exists is the
+/// instance endpoint — which is free precisely because nothing is running. So
+/// the recording owns it for its lifetime and answers exactly one command.
+fn run_owned_recording(prepared: PreparedRecording) -> CliResult<Report> {
+    if !cfg!(unix) {
+        // Without a listener there is no channel a later `record --stop` could
+        // arrive on, and a recording that cannot be stopped is worse than one
+        // that never starts. Said plainly rather than started and abandoned.
+        return Err(CliError::Core(CoreError::Unsupported {
+            what: "starting a recording from the command line on this platform".to_owned(),
+            why: "this build has no instance listener, so `record --stop` could never reach \
+                  the recording; run the Scrozz application and record from there"
+                .to_owned(),
+        }));
+    }
+    let mut settings = RecordingSettings::shipped();
+    let (persisted, _) = settings::stored_settings()?;
+    settings.after_capture = persisted.recording_policy();
+
+    let mut machine = RecordingMachine::native(settings).map_err(CliError::Core)?;
+    let server = crate::gui::server::Server::bind()?;
+    let fallback_target = prepared.request.target.clone();
+    machine
+        .begin_request(prepared.request)
+        .map_err(CliError::Core)?;
+
+    // Everything past this point must reach `stop_reply`, whether it succeeded
+    // or not. A `?` here would drop an unanswered request, close its socket,
+    // and leave the terminal that asked to stop the recording staring at an
+    // empty response instead of the reason it could not be finalised.
+    let mut tick = std::time::Instant::now();
+    let mut stop_reply = None;
+    let outcome = loop {
+        if let Some(request) = server.poll()
+            && let Some(reply) = owned_recording_stop(request)
+        {
+            stop_reply = Some(reply);
+            break finalise_owned_recording(&mut machine);
+        }
+        let now = std::time::Instant::now();
+        if let Err(error) = machine.tick(now.saturating_duration_since(tick)) {
+            break Err(CliError::Core(error));
+        }
+        tick = now;
+        for event in machine.drain_events().collect::<Vec<_>>() {
+            if let scrozz_record::MachineEvent::Warning(message) = event {
+                tracing::warn!("recording warning: {message}");
+            }
+        }
+        if matches!(
+            machine.phase(),
+            RecordingPhase::Finished | RecordingPhase::Failed
+        ) {
+            break finalise_owned_recording(&mut machine);
+        }
+        std::thread::sleep(OWNED_RECORDING_POLL);
+    };
+    drop(server);
+
+    let report = outcome.and_then(|output| match output {
+        Some(recording) => finish_recording_report(recording, Some(&fallback_target)),
+        None => Err(machine.failure().map_or_else(
+            || {
+                CliError::Core(CoreError::Platform(
+                    "the recording ended without producing output".to_owned(),
+                ))
+            },
+            |failure| CliError::Core((*failure.error).clone()),
+        )),
+    });
+    if let Some(reply) = stop_reply {
+        reply.answer(&report);
+    }
+    report
+}
+
+/// Stops and drains an owned recording, returning whatever survived.
+fn finalise_owned_recording(
+    machine: &mut RecordingMachine,
+) -> CliResult<Option<scrozz_record::Recording>> {
+    if machine.is_active() {
+        machine.stop().map_err(CliError::Core)?;
+    }
+    if machine.requires_finalisation() {
+        let session = machine.begin_finalising().map_err(CliError::Core)?;
+        let result = session.stop();
+        machine
+            .complete_finalising(result)
+            .map_err(CliError::Core)?;
+    }
+    Ok(machine.output().cloned())
+}
+
+/// How often an owned CLI recording checks the socket and advances its clock.
+const OWNED_RECORDING_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn owned_recording_stop(
+    request: crate::gui::server::Request,
+) -> Option<crate::gui::server::Request> {
+    use clap::Parser as _;
+
+    let mut argv = Vec::with_capacity(request.argv.len() + 1);
+    argv.push("scrozz".to_owned());
+    argv.extend(request.argv.iter().cloned());
+    let stops = crate::cli::Cli::try_parse_from(argv)
+        .ok()
+        .and_then(|cli| cli.command)
+        .is_some_and(|command| matches!(command, Command::Record(args) if args.stop));
+    if stops {
+        return Some(request);
+    }
+    // Anything else reaching an owned recording is served normally, so a
+    // concurrent `scrozz list displays` is not silently dropped.
+    request.serve();
+    None
+}
+
+pub(crate) fn prepare_recording_args(args: &RecordArgs) -> CliResult<PreparedRecording> {
+    let target = recording_target_spec(args)?;
+    let concrete = capture_target(&target)?;
+    let plan = recording_plan_for_target(args, &concrete);
+    prepare_recording(args, concrete, plan)
+}
+
+pub(crate) fn prepare_recording_args_for_target(
+    args: &RecordArgs,
+    target: CaptureTarget,
+) -> CliResult<PreparedRecording> {
+    let requested = recording_target_spec(args)?;
+    if !matches!(requested, TargetSpec::Interactive(_)) {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "a caller-supplied recording target is only valid for an interactive request"
+                .to_owned(),
+        )));
+    }
+    let plan = recording_plan_for_target(args, &target);
+    prepare_recording(args, target, plan)
+}
+
+fn prepare_recording(
+    args: &RecordArgs,
+    target: CaptureTarget,
+    plan: Json,
+) -> CliResult<PreparedRecording> {
+    let destination = match &args.output {
+        Some(path) => absolute_recording_path(path.clone())?,
+        None => crate::output::default_recording_path()?,
+    };
+    let mut request = RecordingRequest::new(target);
+    request.destination = Some(destination.clone());
+    request.microphone = args.microphone;
+    request.system_audio = args.system_audio;
+    request.fps = args.fps;
+    request.show_cursor = args.cursor;
+    request.validate().map_err(CliError::Core)?;
+    Ok(PreparedRecording {
+        request,
+        destination,
+        plan,
+    })
+}
+
+/// The target a `record` invocation means, defaulting to the active display.
+///
+/// A bare `scrozz record` has to record *something*, and the display the
+/// pointer is on is the only defensible guess. It is stated here rather than
+/// inside the GUI so both front ends agree about what "no target" means.
+pub(crate) fn recording_target_spec(args: &RecordArgs) -> CliResult<TargetSpec> {
+    if args.target.is_unspecified() {
+        Ok(TargetSpec::Display(DisplaySelector::Active))
+    } else {
+        Ok(args.target.resolve()?)
+    }
+}
+
+fn recording_plan(args: &RecordArgs, target: &TargetSpec) -> Json {
+    recording_plan_with_target(args, target_json(target))
+}
+
+fn recording_plan_for_target(args: &RecordArgs, target: &CaptureTarget) -> Json {
+    recording_plan_with_target(args, capture_target_json(target))
+}
+
+fn recording_plan_with_target(args: &RecordArgs, target: Json) -> Json {
+    Json::obj([
+        ("target", target),
+        ("fps", Json::Int(args.fps.into())),
+        ("microphone", Json::Bool(args.microphone)),
+        ("system_audio", Json::Bool(args.system_audio)),
+        ("cursor", Json::Bool(args.cursor)),
+        ("output", Json::opt(args.output.as_deref(), path_json)),
+    ])
+}
+
+/// Chooses a recording target on screen, remembering the region when asked.
+pub(crate) fn select_recording_target_with_memory(
+    mode: InteractiveMode,
+    selector: Option<&dyn CaptureSelector>,
+    remember_region: bool,
+) -> CliResult<CaptureTarget> {
+    let options = recording_selection_options(mode, remember_region)?;
+    let mut lifecycle = SelectorLifecycle::new(selector);
+    let outcome = if let Some(selector) = selector {
+        let capabilities = selector.capabilities();
+        if !capabilities.supports(options.mode) {
+            return Err(CliError::Core(CoreError::Unsupported {
+                what: format!("interactive {} recording selection", interactive_slug(mode)),
+                why: format!(
+                    "the {} selector does not support {} mode",
+                    selector.name(),
+                    options.mode.label()
+                ),
+            }));
+        }
+        selector.select(&capabilities.honour(&options))?
+    } else {
+        crate::gui::select_once(&options, CursorMode::Hidden, false)?.0
+    };
+    lifecycle.finish();
+    if remember_region && outcome.mode == scrozz_core::SelectionMode::Region {
+        match platform::capture_backend() {
+            Ok(backend) => remember_selection(&outcome, backend.as_ref()),
+            Err(error) => {
+                tracing::warn!(
+                    "recording target was selected but could not be remembered: {error}"
+                );
+            }
+        }
+    }
+    Ok(outcome.target)
+}
+
+fn recording_selection_options(
+    mode: InteractiveMode,
+    remember_region: bool,
+) -> CliResult<SelectionOptions> {
+    let mut options = SelectionOptions::for_mode(mode.initial_mode());
+    options.hud = mode.shows_hud();
+    if !remember_region || !matches!(mode, InteractiveMode::Region | InteractiveMode::AllInOne) {
+        return Ok(options);
+    }
+    let Some(remembered) =
+        crate::selection_store::RememberedRegionStore::default_location()?.load()?
+    else {
+        return Ok(options);
+    };
+    let displays = platform::target_enumerator()?.displays()?;
+    options.remembered_display = remembered.display_for(&displays);
+    options.remembered = Some(remembered.rect);
+    Ok(options)
+}
+
+fn resolve_recording_capture_target(
+    target: &TargetSpec,
+    selector: Option<&dyn CaptureSelector>,
+) -> CliResult<CaptureTarget> {
+    match target {
+        TargetSpec::Interactive(mode) => select_recording_target_with_memory(*mode, selector, true),
+        concrete => capture_target(concrete),
+    }
+}
+
+fn absolute_recording_path(path: std::path::PathBuf) -> CliResult<std::path::PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()
+        .map_err(|error| {
+            CliError::Core(CoreError::Platform(format!(
+                "could not resolve the recording destination: {error}"
+            )))
+        })?
+        .join(path))
+}
+
+/// A finished recording's history identity and its report.
+pub(crate) struct FinishedRecording {
+    /// The typed history row, when one could be written.
+    pub(crate) history_id: Option<CaptureId>,
+    /// The report, or the failure the recording itself represents.
+    pub(crate) report: CliResult<Report>,
+}
+
+/// Persists a finished recording and reports it.
+///
+/// History failure is recorded in the report rather than replacing it: the
+/// video exists on disk either way, and telling the user their recording failed
+/// because an index row could not be written would be a lie.
+pub(crate) fn finish_recording(
+    recording: &scrozz_record::Recording,
+    fallback_target: Option<&CaptureTarget>,
+) -> FinishedRecording {
+    if let Err(error) = recording.require_native() {
+        return FinishedRecording {
+            history_id: None,
+            report: Err(CliError::Core(error)),
+        };
+    }
+    let (history_id, history_error) = match persist_recording(recording, fallback_target) {
+        Ok(id) => (Some(id), None),
+        Err(error) => {
+            tracing::warn!("recording was saved but could not enter history: {error}");
+            (None, Some(error.to_string()))
+        }
+    };
+    let report = recording_report(recording, history_id.as_ref(), history_error.as_deref());
+    FinishedRecording { history_id, report }
+}
+
+/// The report half of [`finish_recording`], for callers with no card to make.
+pub(crate) fn finish_recording_report(
+    recording: scrozz_record::Recording,
+    fallback_target: Option<&CaptureTarget>,
+) -> CliResult<Report> {
+    finish_recording(&recording, fallback_target).report
+}
+
+/// Adds a finished recording to history as a typed video row.
+///
+/// The durable media file is referenced, never copied and never owned by
+/// history: deleting the row removes the sidecar, the index entry and any
+/// poster, and leaves the video exactly where the user can still find it.
+pub(crate) fn persist_recording(
+    recording: &scrozz_record::Recording,
+    fallback_target: Option<&CaptureTarget>,
+) -> CliResult<CaptureId> {
+    recording.require_native().map_err(CliError::Core)?;
+    let (engine, native_target) = match &recording.provenance {
+        scrozz_record::RecordingProvenance::Native { engine, target } => {
+            (engine.clone(), target.as_ref())
+        }
+        scrozz_record::RecordingProvenance::Synthetic { .. } => {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "synthetic recording output never enters history".to_owned(),
+            )));
+        }
+    };
+    let target = native_target.or(fallback_target).cloned().ok_or_else(|| {
+        CliError::Core(CoreError::Storage(
+            "native recording did not report its capture target".to_owned(),
+        ))
+    })?;
+    let path = std::fs::canonicalize(&recording.path).map_err(|error| {
+        CliError::Core(CoreError::Storage(format!(
+            "could not resolve the finished recording {}: {error}",
+            recording.path.display()
+        )))
+    })?;
+    // Every native summary field the recorder reported is carried across.
+    // History is the only place a finished recording's encoder settings survive
+    // once the process ends, so dropping any of them here would make them
+    // unrecoverable rather than merely unshown.
+    let video = scrozz_store::VideoMetadata {
+        path,
+        duration_secs: recording.duration_secs,
+        engine,
+        completion: video_completion(&recording.completion),
+        size: recording.metadata.size,
+        frames: recording.metadata.frames,
+        audio_channels: recording.metadata.audio_channels,
+        file_size_bytes: recording.metadata.file_size_bytes,
+        // Slugs, because the recorder owns these vocabularies and history only
+        // has to record faithfully what was used, not re-model it.
+        codec: recording
+            .metadata
+            .video_codec
+            .map(|codec| codec.slug().to_owned()),
+        quality: recording
+            .metadata
+            .quality
+            .map(|quality| quality.slug().to_owned()),
+        resolution: recording
+            .metadata
+            .resolution
+            .map(scrozz_record::RecordingResolution::slug),
+    };
+    let mut store = platform::store()?;
+    Ok(store.insert_recording(
+        scrozz_store::NewRecording::new(video)
+            .with_provenance(provenance_for_target(&target))
+            .with_target(target),
+    )?)
+}
+
+fn video_completion(
+    completion: &scrozz_record::RecordingCompletion,
+) -> scrozz_store::VideoCompletion {
+    match completion {
+        scrozz_record::RecordingCompletion::Complete => scrozz_store::VideoCompletion::Complete,
+        scrozz_record::RecordingCompletion::Partial {
+            salvageability,
+            reason,
+        } => scrozz_store::VideoCompletion::Partial {
+            salvageability: match salvageability {
+                scrozz_record::Salvageability::InitialisationOnly => {
+                    scrozz_store::VideoSalvageability::InitialisationOnly
+                }
+                scrozz_record::Salvageability::Playable => {
+                    scrozz_store::VideoSalvageability::Playable
+                }
+            },
+            reason: reason.clone(),
+        },
+    }
+}
+
+const fn provenance_for_target(target: &CaptureTarget) -> Provenance {
+    match target {
+        CaptureTarget::Display(_) => Provenance::Display,
+        CaptureTarget::Window(_) => Provenance::Window,
+        CaptureTarget::Region(_) => Provenance::Region,
+        CaptureTarget::AllDisplays => Provenance::AllDisplays,
+    }
+}
+
+fn recording_report(
+    recording: &scrozz_record::Recording,
+    history_id: Option<&CaptureId>,
+    history_error: Option<&str>,
+) -> CliResult<Report> {
+    let (completion, salvageability, reason) = match &recording.completion {
+        scrozz_record::RecordingCompletion::Complete => ("complete", "playable", None),
+        scrozz_record::RecordingCompletion::Partial {
+            salvageability,
+            reason,
+        } => (
+            "partial",
+            match salvageability {
+                scrozz_record::Salvageability::InitialisationOnly => "initialisation-only",
+                scrozz_record::Salvageability::Playable => "playable",
+            },
+            Some(reason.as_str()),
+        ),
+    };
+    let (engine, target) = match &recording.provenance {
+        scrozz_record::RecordingProvenance::Native { engine, target } => {
+            (engine.as_str(), target.as_ref())
+        }
+        scrozz_record::RecordingProvenance::Synthetic { generator } => {
+            return Err(CliError::Core(CoreError::InvalidRequest(format!(
+                "synthetic recording output from {generator} is not a real capture"
+            ))));
+        }
+    };
+    let data = Json::obj([
+        ("state", Json::str("stopped")),
+        ("media_kind", Json::str("video")),
+        ("history_id", Json::opt(history_id, |id| Json::str(&id.0))),
+        ("history_error", Json::opt(history_error, Json::str)),
+        ("path", path_json(&recording.path)),
+        ("duration_secs", Json::Float(recording.duration_secs)),
+        ("completion", Json::str(completion)),
+        ("salvageability", Json::str(salvageability)),
+        ("playable", Json::Bool(recording.is_playable())),
+        ("reason", Json::opt(reason, Json::str)),
+        ("engine", Json::str(engine)),
+        ("target", Json::opt(target, capture_target_json)),
+        (
+            "width",
+            Json::opt(recording.metadata.size, |size| Json::Float(size.width)),
+        ),
+        (
+            "height",
+            Json::opt(recording.metadata.size, |size| Json::Float(size.height)),
+        ),
+        (
+            "audio_channels",
+            Json::opt(recording.metadata.audio_channels, |channels| {
+                Json::Int(i64::from(channels))
+            }),
+        ),
+    ]);
+    if let Some(reason) = reason {
+        // Retained partial output is still a failed recording: the path is in
+        // the message so the user can go and look at what survived.
+        return Err(CliError::Core(CoreError::Platform(format!(
+            "recording did not finish cleanly and a {salvageability} partial was retained at {}: {reason}",
+            recording.path.display()
+        ))));
+    }
+    Ok(Report::new(
+        data,
+        format!(
+            "Recorded {:.2} seconds to {}.",
+            recording.duration_secs,
+            recording.path.display()
+        ),
     ))
+}
+
+fn capture_target_json(target: &CaptureTarget) -> Json {
+    match target {
+        CaptureTarget::Region(rect) => Json::obj([
+            ("kind", Json::str("region")),
+            ("x", Json::Float(rect.origin.x)),
+            ("y", Json::Float(rect.origin.y)),
+            ("width", Json::Float(rect.size.width)),
+            ("height", Json::Float(rect.size.height)),
+        ]),
+        CaptureTarget::Window(id) => {
+            Json::obj([("kind", Json::str("window")), ("id", Json::str(&id.0))])
+        }
+        CaptureTarget::Display(id) => {
+            Json::obj([("kind", Json::str("display")), ("id", Json::str(&id.0))])
+        }
+        CaptureTarget::AllDisplays => Json::obj([("kind", Json::str("all-displays"))]),
+    }
 }
 
 // ---------------------------------------------------------------------------

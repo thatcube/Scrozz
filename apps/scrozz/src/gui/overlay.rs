@@ -24,7 +24,9 @@ use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
 use scrozz_store::CaptureId;
-use scrozz_ui::{CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX};
+use scrozz_ui::{
+    CaptureMedia, CaptureRequest, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
+};
 
 use crate::gui::{
     card::{Card, CardEvent, CardId, CardSurface, PinnedCapture, SurfaceWaker, Thumbnail},
@@ -291,6 +293,14 @@ impl OverlayCards {
                         out.push(CardEvent::Save(ours));
                     }
                 }
+                OverlayEvent::EditRequested { id } => {
+                    // Both editors are reached through `Open`; the coordinator
+                    // already knows which media the card holds and therefore
+                    // which editor the request means.
+                    if let Some(ours) = self.mapped.get(&id.0).copied() {
+                        out.push(CardEvent::Open(ours));
+                    }
+                }
                 OverlayEvent::AnnotateRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         out.push(CardEvent::Open(ours));
@@ -386,12 +396,31 @@ fn request_for_card(card: &Card) -> CaptureRequest {
         // that happened should be visible even if thumbnailing failed.
         None => CaptureRequest::new(name, provenance, card.source_px()),
     }
-    .with_source_scale(card.scale);
+    .with_source_scale(card.scale)
+    .with_media(capture_media(card.media));
     request.source_px = card.source_px();
     if let Some(capture) = &card.capture_id {
         request = request.with_pin_id(capture.0.clone());
     }
     request
+}
+
+/// Carries the card's media kind across the overlay seam.
+///
+/// The two enums are deliberately separate types: `scrozz-ui` must not depend
+/// on the app's card module, and the app must not be able to hand the overlay a
+/// video without saying so.
+const fn capture_media(media: scrozz_ui::card::CardMedia) -> CaptureMedia {
+    match media {
+        scrozz_ui::card::CardMedia::Image => CaptureMedia::Image,
+        scrozz_ui::card::CardMedia::Video {
+            duration,
+            has_audio,
+        } => CaptureMedia::Video {
+            duration,
+            has_audio,
+        },
+    }
 }
 
 /// Reading a [`crate::gui::Thumbnail`] as a frame the UI can scale.

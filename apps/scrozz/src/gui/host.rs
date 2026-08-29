@@ -49,6 +49,14 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 /// Headless polling cadence when there is no native event loop to wake.
 const IDLE: Duration = Duration::from_millis(16);
 const IDLE_FALLBACK_WAKE: Duration = Duration::from_millis(250);
+/// Native preview playback and queued child-viewport input must advance at UI
+/// cadence even while the shared transparent root is parked.
+const VIDEO_EDITOR_TICK: Duration = Duration::from_millis(16);
+/// How often an in-flight recording wakes the loop that advances its clock.
+///
+/// Fast enough that a stop feels immediate and a finished recording's card
+/// appears at once; slow enough that an idle menu-bar app is still idle.
+const RECORDING_TICK: Duration = Duration::from_millis(50);
 const WORK_AREA_REFRESH: Duration = Duration::from_millis(250);
 
 type SharedGeometry = Arc<Mutex<OverlayGeometry>>;
@@ -363,6 +371,8 @@ impl Host for Windowed {
                     permission: scrozz_ui::permission::PermissionWindow::default(),
                     permission_resume_armed: false,
                     editor: scrozz_ui::editor::EditorWindow::new(),
+                    video_editor: VideoEditorWindow::default(),
+                    video_editor_actions: Arc::new(Mutex::new(Vec::new())),
                     editing: None,
                     color_picker: scrozz_shell::SystemColorPicker::default(),
                     color_picker_generation: None,
@@ -568,6 +578,11 @@ struct Driver {
     editor: scrozz_ui::editor::EditorWindow,
     /// The editor's document, and the card it came from.
     editing: Option<Editing>,
+    /// The ordinary opaque recording-editor window.
+    video_editor: VideoEditorWindow,
+    /// Actions emitted by the deferred video viewport and drained by the next
+    /// root logic pass.
+    video_editor_actions: Arc<Mutex<Vec<scrozz_ui::VideoEditorAction>>>,
     color_picker: scrozz_shell::SystemColorPicker,
     /// Editor generation that opened the modeless system colour panel.
     color_picker_generation: Option<u64>,
@@ -918,6 +933,8 @@ impl Driver {
             .is_visible();
         let auxiliary_open = self.settings.is_open()
             || self.editor.is_open()
+            || self.app.video_editor_is_open()
+            || self.video_editor.is_open()
             || self.app.permission_prompt().is_some()
             || history_open;
         let mode = root_surface_mode(
@@ -1172,7 +1189,139 @@ const fn root_surface_mode(
     }
 }
 
+/// The ordinary recording-editor viewport, and its native activation state.
+///
+/// Kept beside the deferred pin viewports rather than inside `scrozz-ui` for
+/// one reason: making the window genuinely *ordinary* — key, main, opaque,
+/// mouse-accepting, normal level — is an AppKit call, and `scrozz-ui` forbids
+/// unsafe code and does not depend on `scrozz-shell`. The window is created
+/// here so the activation that follows it can be, too.
+#[derive(Default)]
+struct VideoEditorWindow {
+    open: bool,
+    /// Activation is retried until AppKit reports the window exists, because
+    /// eframe creates a deferred viewport a frame or more after it is asked to.
+    activation_pending: bool,
+    activation_reported: bool,
+}
+
+impl VideoEditorWindow {
+    const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn open(&mut self) {
+        if !self.open {
+            self.open = true;
+            self.activation_pending = true;
+            self.activation_reported = false;
+        }
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.activation_pending = false;
+    }
+}
+
 impl Driver {
+    /// Draws the recording editor in its own opaque, focus-taking window.
+    ///
+    /// A deferred viewport, like history and unlike the annotation editor: the
+    /// editor's preview worker publishes frames from another thread, and an
+    /// immediate viewport would tie its repaint rate to the root overlay's.
+    /// The root parks itself while this is open — see
+    /// [`Driver::sync_root_visibility`] — so the transparent, click-through
+    /// capture surface can never sit over a window the user is typing into.
+    fn show_video_editor(&mut self, ctx: &egui::Context) {
+        let actions: Vec<_> = self
+            .video_editor_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for action in actions {
+            self.app.handle_video_editor_action(action);
+        }
+
+        let snapshot = self.app.video_editor_snapshot();
+        if snapshot.is_some() {
+            self.video_editor.open();
+        } else {
+            self.video_editor.close();
+            return;
+        }
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+
+        let viewport = scrozz_ui::video_editor_viewport_id();
+        let theme = scrozz_ui::Theme::for_appearance(match ctx.theme() {
+            egui::Theme::Dark => scrozz_ui::Appearance::Dark,
+            egui::Theme::Light => scrozz_ui::Appearance::Light,
+        });
+        let root_context = ctx.clone();
+        let collected = Arc::clone(&self.video_editor_actions);
+
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(
+            viewport,
+            scrozz_ui::video_editor_viewport_builder()
+                .with_active(true)
+                .with_visible(true),
+            move |ui, _class| {
+                let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+                let response = scrozz_ui::show_video_editor_window(ui, &snapshot, &theme);
+                let mut queued = collected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if close_requested {
+                    queued.push(scrozz_ui::VideoEditorAction::Close);
+                } else {
+                    queued.extend(response.actions);
+                }
+                if !queued.is_empty() {
+                    root_context.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            },
+        );
+        self.activate_video_editor();
+    }
+
+    /// Makes the recording editor a genuinely ordinary key window.
+    ///
+    /// Retried rather than assumed: eframe creates the deferred viewport some
+    /// frames after it is requested, and a failure to find it yet is ordinary
+    /// latency, not an error worth telling anyone about.
+    fn activate_video_editor(&mut self) {
+        if !self.video_editor.activation_pending {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match scrozz_shell::macos::editor::activate(scrozz_ui::VIDEO_EDITOR_WINDOW_TITLE) {
+                Ok(Some(diagnostics)) => {
+                    self.video_editor.activation_pending = false;
+                    tracing::debug!(?diagnostics, "recording editor became an ordinary window");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.video_editor.activation_pending = false;
+                    if !self.video_editor.activation_reported {
+                        self.video_editor.activation_reported = true;
+                        tracing::warn!(%error, "recording editor could not be foregrounded");
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Windows and Linux get an ordinary decorated viewport from eframe
+            // with no extra activation call; there is nothing honest to add.
+            self.video_editor.activation_pending = false;
+        }
+    }
+
     fn show_history(&self, ctx: &egui::Context) {
         let history = self.app.history();
         let (visible, focus) = {
@@ -1397,6 +1546,17 @@ impl eframe::App for Driver {
         if let Some(remaining) = self.app.remaining_deadline() {
             ctx.request_repaint_after(remaining);
         }
+        // A recording is the one thing that keeps working while nothing is on
+        // screen: its clock, its warnings and its finalisation all advance from
+        // `App::tick`. The idle fallback alone would leave a stop request
+        // waiting a quarter of a second, and a finished recording that long
+        // without its card.
+        if self.app.recording_is_busy() {
+            ctx.request_repaint_after(RECORDING_TICK);
+        }
+        if self.app.video_editor_is_open() || self.video_editor.is_open() {
+            ctx.request_repaint_after(VIDEO_EDITOR_TICK);
+        }
         if matches!(
             self.root_mode,
             RootSurfaceMode::Hidden | RootSurfaceMode::Parked
@@ -1424,6 +1584,7 @@ impl eframe::App for Driver {
 
         self.show_settings(ui.ctx());
         self.show_editor(ui.ctx());
+        self.show_video_editor(ui.ctx());
         self.show_history(ui.ctx());
         self.service_history_drag(ui.ctx());
 
@@ -2112,9 +2273,79 @@ mod tests {
 
         assert!(visibility.contains("self.settings.is_open()"));
         assert!(visibility.contains("self.editor.is_open()"));
+        assert!(visibility.contains("self.app.video_editor_is_open()"));
+        assert!(visibility.contains("self.video_editor.is_open()"));
         assert!(visibility.contains("self.app.permission_prompt().is_some()"));
         assert!(visibility.contains(".is_visible()"));
         assert!(visibility.contains("self.sync_card_visibility(ctx)"));
+    }
+
+    #[test]
+    fn the_video_editor_is_an_ordinary_window_the_root_parks_behind() {
+        // Three properties, and each has its own way of going wrong:
+        //
+        // 1. The viewport is opaque and not click-through, or the editor is a
+        //    transparent hole the user types straight through.
+        // 2. The root parks while it is open, or the click-through capture
+        //    surface sits over a window being typed into.
+        // 3. It is exactly 1180x820 and a normal window level, not a panel.
+        let builder = scrozz_ui::video_editor_viewport_builder();
+        assert_eq!(builder.transparent, Some(false));
+        assert_eq!(builder.mouse_passthrough, Some(false));
+        assert_eq!(builder.decorations, Some(true));
+        assert_eq!(builder.window_level, Some(egui::WindowLevel::Normal));
+        assert_eq!(builder.inner_size, Some(egui::vec2(1180.0, 820.0)));
+
+        assert_eq!(
+            root_surface_mode(false, true, false, true),
+            RootSurfaceMode::Parked,
+            "an open video editor parks the shared root rather than hiding it"
+        );
+
+        let source = include_str!("host.rs");
+        let show = source
+            .split("fn show_video_editor")
+            .nth(1)
+            .and_then(|body| body.split_once("fn activate_video_editor"))
+            .map(|(body, _)| body)
+            .expect("video editor viewport pass");
+        assert!(
+            show.contains("show_viewport_deferred"),
+            "the editor is a deferred viewport so its preview worker drives its own repaints"
+        );
+        assert!(
+            show.contains("handle_video_editor_action"),
+            "every action the editor raised must reach the coordinator"
+        );
+        assert!(
+            show.contains("request_repaint_of(egui::ViewportId::ROOT)"),
+            "child input must wake the root pass that owns the editor coordinator"
+        );
+        assert!(
+            show.contains("VideoEditorAction::Close"),
+            "a native close request must close the editor rather than be swallowed"
+        );
+    }
+
+    #[test]
+    fn the_video_editor_window_only_arms_activation_on_a_real_open() {
+        let mut window = VideoEditorWindow::default();
+        assert!(!window.is_open());
+        assert!(!window.activation_pending);
+
+        window.open();
+        assert!(window.is_open() && window.activation_pending);
+
+        // Re-entering the same open editor must not re-steal the foreground on
+        // every frame; only a fresh open arms activation again.
+        window.activation_pending = false;
+        window.open();
+        assert!(!window.activation_pending);
+
+        window.close();
+        assert!(!window.is_open() && !window.activation_pending);
+        window.open();
+        assert!(window.activation_pending, "reopening arms activation once");
     }
 
     #[test]
@@ -2130,6 +2361,12 @@ mod tests {
 
         assert!(logic.contains("IDLE_FALLBACK_WAKE"));
         assert!(IDLE_FALLBACK_WAKE >= Duration::from_millis(100));
+
+        // A recording advances from the same tick, so a hidden root must wake
+        // faster while one is in flight than the ordinary idle fallback.
+        assert!(logic.contains("recording_is_busy()"));
+        assert!(logic.contains("RECORDING_TICK"));
+        assert!(RECORDING_TICK < IDLE_FALLBACK_WAKE);
     }
 
     #[test]

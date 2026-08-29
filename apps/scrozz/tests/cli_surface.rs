@@ -744,3 +744,58 @@ fn a_command_that_needs_the_running_app_says_so_rather_than_hanging() {
     assert_ne!(code(&out), 101, "{}", stderr(&out));
     assert!(!out.stderr.is_empty(), "it failed without explaining why");
 }
+
+#[test]
+fn a_dry_run_recording_resolves_its_whole_plan_without_recording() {
+    // The default target is the active display, not an interactive picker: a
+    // bare `scrozz record` has to start recording something, and opening a
+    // selector from a script is the wrong answer.
+    let settings = isolated_settings_path();
+    let out = Command::new(env!("CARGO_BIN_EXE_scrozz"))
+        .args([
+            "--json",
+            "record",
+            "--dry-run",
+            "--all-displays",
+            "--fps",
+            "60",
+        ])
+        .env_remove("SCROZZ_SIMULATE_ERROR")
+        .env("SCROZZ_SETTINGS_FILE", &settings)
+        .env("SCROZZ_IPC_SOCKET", "/nonexistent/scrozz-test/absent.sock")
+        .output()
+        .expect("the binary should run");
+    clean_settings(&settings);
+
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(body.contains("\"dry_run\":true"), "{body}");
+    assert!(body.contains("\"fps\":60"), "{body}");
+    assert!(body.contains("all-displays"), "{body}");
+    assert!(
+        !body.contains("not implemented"),
+        "a dry run must resolve the whole plan: {body}"
+    );
+}
+
+#[test]
+fn recording_never_reports_itself_as_unimplemented() {
+    // The one regression this guards: `record` used to resolve everything and
+    // then answer `NotImplemented`, which is exit code 69 and reads to a script
+    // as "this build cannot record at all".
+    let settings = isolated_settings_path();
+    let out = Command::new(env!("CARGO_BIN_EXE_scrozz"))
+        .args(["record", "--dry-run"])
+        .env_remove("SCROZZ_SIMULATE_ERROR")
+        .env("SCROZZ_SETTINGS_FILE", &settings)
+        .env("SCROZZ_IPC_SOCKET", "/nonexistent/scrozz-test/absent.sock")
+        .output()
+        .expect("the binary should run");
+    clean_settings(&settings);
+
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(
+        !said.contains("scrozz-record"),
+        "recording must not name itself as an unfinished provider: {said}"
+    );
+}

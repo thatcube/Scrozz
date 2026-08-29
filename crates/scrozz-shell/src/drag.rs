@@ -11,10 +11,12 @@
 //! # The one property that matters: nothing is produced until a drag starts
 //!
 //! A capture is **never** written to disk because it exists. The payload here
-//! carries a [`ByteSource`] — a closure — and not a `Vec<u8>` and never a
-//! `PathBuf`, so a pile of twenty cards costs twenty PNGs in memory and zero
-//! files. Encoding happens at most once, at the moment a drag begins, for the
-//! one card the user actually dragged.
+//! carries a [`ByteSource`] — a closure — and not a `Vec<u8>`, so a pile of
+//! twenty screenshot cards costs twenty PNGs in memory and zero files. Encoding
+//! happens at most once, at the moment a drag begins, for the one card the user
+//! actually dragged. Durable media such as a completed recording is the one
+//! exception: its payload may reference the existing owned file directly rather
+//! than copying hundreds of megabytes through memory into a second artifact.
 //!
 //! # Why the drag itself hands over a real file
 //!
@@ -430,6 +432,7 @@ pub fn preview_hotspot(
 #[derive(Clone)]
 pub struct DragPayload {
     file: PromisedFile,
+    existing_file: Option<std::path::PathBuf>,
     image: Option<ByteSource>,
     preview: Option<DragPreview>,
 }
@@ -438,6 +441,7 @@ impl fmt::Debug for DragPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DragPayload")
             .field("file", &self.file)
+            .field("existing_file", &self.existing_file)
             .field("image", &self.image.is_some())
             .field("preview", &self.preview)
             .finish()
@@ -450,6 +454,7 @@ impl DragPayload {
     pub const fn new(file: PromisedFile) -> Self {
         Self {
             file,
+            existing_file: None,
             image: None,
             preview: None,
         }
@@ -465,7 +470,39 @@ impl DragPayload {
         let file = PromisedFile::new(stem, DragFormat::Png, Arc::clone(&png));
         Self {
             file,
+            existing_file: None,
             image: Some(png),
+            preview: None,
+        }
+    }
+
+    /// A drag backed by a durable file that already exists on disk.
+    ///
+    /// Native backends offer this path directly instead of reading the whole
+    /// file into memory and writing an equally large temporary copy. The byte
+    /// producer remains available for promise-oriented callers and tests, but
+    /// the eager macOS and Windows paths do not invoke it.
+    #[must_use]
+    pub fn existing_file(path: impl Into<std::path::PathBuf>, format: DragFormat) -> Self {
+        let path = path.into();
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(FALLBACK_STEM)
+            .to_owned();
+        let source_path = path.clone();
+        let bytes = byte_source(move || {
+            std::fs::read(&source_path).map_err(|error| {
+                Error::Storage(format!(
+                    "could not read the durable drag file {}: {error}",
+                    source_path.display()
+                ))
+            })
+        });
+        Self {
+            file: PromisedFile::new(&stem, format, bytes),
+            existing_file: Some(path),
+            image: None,
             preview: None,
         }
     }
@@ -493,6 +530,13 @@ impl DragPayload {
     #[must_use]
     pub const fn file(&self) -> &PromisedFile {
         &self.file
+    }
+
+    /// The durable source path, when this payload does not need a temporary
+    /// artifact.
+    #[must_use]
+    pub fn existing_file_path(&self) -> Option<&std::path::Path> {
+        self.existing_file.as_deref()
     }
 
     /// The clipboard image producer, if one was offered.
@@ -539,11 +583,20 @@ impl DragPayload {
     ///
     /// Whatever the image [`ByteSource`] reported, when it has to be asked.
     pub fn image_png(&self, file_bytes: &Arc<Vec<u8>>) -> Result<Option<Arc<Vec<u8>>>> {
+        self.prepared_image_png(Some(file_bytes))
+    }
+
+    pub(crate) fn prepared_image_png(
+        &self,
+        file_bytes: Option<&Arc<Vec<u8>>>,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
         let Some(source) = &self.image else {
             return Ok(None);
         };
 
-        if self.image_is_file() {
+        if self.image_is_file()
+            && let Some(file_bytes) = file_bytes
+        {
             return Ok(Some(Arc::clone(file_bytes)));
         }
 
@@ -586,6 +639,75 @@ impl DragPayload {
         let artifact = DragArtifact::materialise(root, &self.file.file_name(), &bytes)?;
         Ok((artifact, bytes))
     }
+
+    pub(crate) fn prepare_file(&self, root: &std::path::Path) -> Result<PreparedDragFile> {
+        if let Some(path) = &self.existing_file {
+            let path = interoperable_drag_path(path);
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                Error::Storage(format!(
+                    "could not inspect durable drag file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(Error::InvalidRequest(format!(
+                    "durable drag source is not a file: {}",
+                    path.display()
+                )));
+            }
+            return Ok(PreparedDragFile {
+                path,
+                bytes: None,
+                artifact: None,
+            });
+        }
+
+        let (artifact, bytes) = self.materialise(root)?;
+        Ok(PreparedDragFile {
+            path: artifact.path().to_path_buf(),
+            bytes: Some(Arc::new(bytes)),
+            artifact: Some(artifact),
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn interoperable_drag_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut compatible = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => {
+            std::path::PathBuf::from(format!("{}:\\", char::from(drive)))
+        }
+        Prefix::VerbatimUNC(server, share) => {
+            let mut compatible = std::path::PathBuf::from(r"\\");
+            compatible.push(server);
+            compatible.push(share);
+            compatible
+        }
+        _ => return path.to_path_buf(),
+    };
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            compatible.push(component.as_os_str());
+        }
+    }
+    compatible
+}
+
+#[cfg(not(target_os = "windows"))]
+fn interoperable_drag_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+pub(crate) struct PreparedDragFile {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) bytes: Option<Arc<Vec<u8>>>,
+    pub(crate) artifact: Option<DragArtifact>,
 }
 
 // ---------------------------------------------------------------------------

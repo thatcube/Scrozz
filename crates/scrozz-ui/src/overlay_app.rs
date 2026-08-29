@@ -70,7 +70,7 @@ use scrozz_core::{
     PinState, PinnedSurface, PixelFormat, Provenance, ScaleFactor,
 };
 
-use crate::card::{self, CardAction, CardContent};
+use crate::card::{self, CardAction, CardContent, CardMedia};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
@@ -424,6 +424,46 @@ impl PinSupport {
 // The public seam
 // ---------------------------------------------------------------------------
 
+/// What kind of finished media a request carries.
+///
+/// Deliberately a value rather than a flag: a recording card needs its duration
+/// and whether it has audio, and the overlay must never have to go and ask for
+/// them while painting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum CaptureMedia {
+    /// A still image capture.
+    #[default]
+    Image,
+    /// A finalized recording whose durable file is owned outside the overlay.
+    Video {
+        /// Native container duration.
+        duration: std::time::Duration,
+        /// Whether the durable source carries audio.
+        has_audio: bool,
+    },
+}
+
+impl CaptureMedia {
+    const fn card_media(self) -> CardMedia {
+        match self {
+            Self::Image => CardMedia::Image,
+            Self::Video {
+                duration,
+                has_audio,
+            } => CardMedia::Video {
+                duration,
+                has_audio,
+            },
+        }
+    }
+
+    /// Whether this request presents playable video.
+    #[must_use]
+    pub const fn is_video(self) -> bool {
+        matches!(self, Self::Video { .. })
+    }
+}
+
 /// A capture handed to the overlay.
 #[derive(Clone, Debug)]
 pub struct CaptureRequest {
@@ -437,6 +477,8 @@ pub struct CaptureRequest {
     pub source_px: (u32, u32),
     /// Source pixels per logical point.
     pub source_scale: f64,
+    /// Whether this card is a still or a recording.
+    pub media: CaptureMedia,
     /// A pre-scaled thumbnail. `None` shows a holding fill until one arrives.
     pub thumbnail: Option<egui::ColorImage>,
     /// Explicit content failure for a durable pin whose state remains recoverable.
@@ -453,6 +495,7 @@ impl CaptureRequest {
             provenance,
             source_px,
             source_scale: 1.0,
+            media: CaptureMedia::Image,
             thumbnail: None,
             content_error: None,
         }
@@ -477,6 +520,7 @@ impl CaptureRequest {
             provenance,
             source_px,
             source_scale: frame.scale.get(),
+            media: CaptureMedia::Image,
             thumbnail: Some(thumbnail),
             content_error: None,
         })
@@ -504,6 +548,13 @@ impl CaptureRequest {
         } else {
             1.0
         };
+        self
+    }
+
+    /// Present this request as a recording rather than a still.
+    #[must_use]
+    pub const fn with_media(mut self, media: CaptureMedia) -> Self {
+        self.media = media;
         self
     }
 
@@ -561,6 +612,15 @@ pub enum OverlayEvent {
     },
     /// Open this capture in the annotation editor.
     AnnotateRequested {
+        /// The card.
+        id: CardId,
+    },
+    /// Open this recording in the video editor.
+    ///
+    /// Distinct from [`OverlayEvent::AnnotateRequested`] because the two open
+    /// different editors over different documents; collapsing them would make a
+    /// video silently open an annotation surface it has no raster for.
+    EditRequested {
         /// The card.
         id: CardId,
     },
@@ -657,8 +717,11 @@ enum Command {
     Collapse,
     Expand,
     ToggleDock,
+    // Boxed: a restore carries a complete capture request, which is an order
+    // of magnitude larger than every other command, and the queue holds one
+    // enum-sized slot per entry.
     RestorePin {
-        request: CaptureRequest,
+        request: Box<CaptureRequest>,
         state: PinState,
     },
     RefreshPinTexture {
@@ -808,7 +871,10 @@ impl OverlayHandle {
 
     /// Restore a persisted pin into its own native child viewport.
     pub fn restore_pin(&self, request: CaptureRequest, state: PinState) {
-        self.command(Command::RestorePin { request, state });
+        self.command(Command::RestorePin {
+            request: Box::new(request),
+            state,
+        });
     }
 
     /// Replace a live pin's pixels without touching its newer UI-owned state.
@@ -1259,6 +1325,7 @@ struct Entry {
     source_px: (u32, u32),
     pin_id: Option<PinId>,
     source_scale: f64,
+    media: CaptureMedia,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
     pin_notice: Option<String>,
@@ -1576,6 +1643,7 @@ impl OverlayApp {
                     source_px: request.source_px,
                     pin_id: request.pin_id,
                     source_scale: request.source_scale,
+                    media: request.media,
                     texture: None,
                     pending: thumb,
                     pin_notice: request.content_error,
@@ -1623,9 +1691,7 @@ impl OverlayApp {
                 Command::Collapse => self.stack.collapse(m),
                 Command::Expand => self.stack.expand(m),
                 Command::ToggleDock => self.stack.toggle_dock(m),
-                Command::RestorePin { request, state } => {
-                    self.restore_pin(request, state);
-                }
+                Command::RestorePin { request, state } => self.restore_pin(*request, state),
                 Command::RefreshPinTexture { pin, image } => {
                     if let Some(entry) = self.pins.get_mut(&pin) {
                         entry.pending = downscale(&image, PIN_TEXTURE_PX);
@@ -2069,6 +2135,21 @@ impl OverlayApp {
 
     fn handle_action(&mut self, id: CardId, action: CardAction, m: &Motion) {
         if action == CardAction::Pin {
+            // The card never draws Pin for a recording, and a caller that
+            // reaches here anyway is told why rather than opening a native
+            // window over a video it cannot show.
+            if self
+                .content
+                .get(&id)
+                .is_some_and(|entry| entry.media.is_video())
+            {
+                self.emit(OverlayEvent::PinUnavailable {
+                    card: id,
+                    reason: "Pin to Screen holds a still image and does not apply to a recording."
+                        .to_owned(),
+                });
+                return;
+            }
             self.begin_pin(id, m);
             return;
         }
@@ -2076,6 +2157,7 @@ impl OverlayApp {
             CardAction::Copy => (Some(OverlayEvent::CopyRequested { id }), true),
             CardAction::Save => (Some(OverlayEvent::SaveRequested { id }), true),
             CardAction::Annotate => (Some(OverlayEvent::AnnotateRequested { id }), false),
+            CardAction::Edit => (Some(OverlayEvent::EditRequested { id }), false),
             CardAction::Upload => (Some(OverlayEvent::UploadRequested { id }), false),
             CardAction::Pin => unreachable!("pin actions return above"),
             CardAction::Close => (None, true),
@@ -2302,7 +2384,8 @@ impl eframe::App for OverlayApp {
             let Some(entry) = self.content.get(&f.id) else {
                 continue;
             };
-            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance);
+            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance)
+                .with_media(entry.media.card_media());
             if let Some(tex) = &entry.texture {
                 content.texture = Some(tex.id());
             }

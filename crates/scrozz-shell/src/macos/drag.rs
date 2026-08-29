@@ -87,7 +87,7 @@ use scrozz_core::{Error, Result};
 use crate::drag::artifact::artifact_root;
 use crate::drag::{
     DragCapability, DragOperation, DragOrigin, DragOutcome, DragPayload, DragPreview, DragSession,
-    DragSource, card_rect_in_view, check_origin, preview_hotspot,
+    DragSource, PreparedDragFile, card_rect_in_view, check_origin, preview_hotspot,
 };
 use crate::overlay::AppKitRect;
 
@@ -573,10 +573,14 @@ impl DragSource for MacDragSource {
         let flipped = view.isFlipped();
         let card = card_rect_in_view(logical_card, bounds.size.height, flipped);
 
-        // The one encode this whole feature costs, and the only write. If it
-        // fails, nothing native has been touched yet.
-        let (artifact, bytes) = payload.materialise(&artifact_root())?;
-        let file_bytes = std::sync::Arc::new(bytes);
+        // Screenshots are encoded and materialised once. Durable recordings are
+        // referenced in place, avoiding a full-file read and duplicate write on
+        // the UI thread.
+        let PreparedDragFile {
+            path,
+            bytes,
+            artifact,
+        } = payload.prepare_file(&artifact_root())?;
 
         // Image flavours come from the image producer, never from the file
         // bytes. For a screenshot the two are the same `Arc` and this costs
@@ -584,13 +588,16 @@ impl DragSource for MacDragSource {
         // the difference between "no PNG flavour" and "a PNG flavour that is
         // not a PNG".
         let png = payload
-            .image_png(&file_bytes)?
+            .prepared_image_png(bytes.as_ref())?
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
 
         let session = DragSession::new();
-        // Attached before anything can fail, so every exit path from here has an
-        // owner that will delete the file.
-        session.attach_artifact(artifact);
+        if let Some(artifact) = artifact {
+            // Attached before anything can fail, so every exit path from here
+            // owns the temporary screenshot file. Durable media has no
+            // disposable artifact to attach.
+            session.attach_artifact(artifact);
+        }
 
         let provider = ScrozzImageProvider::new(std::sync::Arc::clone(&png));
         hold_provider(&provider);
@@ -599,9 +606,6 @@ impl DragSource for MacDragSource {
         LIVE.with(|live| live.borrow_mut().push(source.clone()));
 
         let started = (|| -> Result<()> {
-            let path = session
-                .artifact_path()
-                .ok_or_else(|| Error::Platform("the drag file went missing".to_owned()))?;
             let item = capture_item(&path, &png, &provider)?;
 
             let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*item);
@@ -634,7 +638,7 @@ impl DragSource for MacDragSource {
 
         tracing::info!(
             file = %payload.file().file_name(),
-            bytes = file_bytes.len(),
+            bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len()),
             image = !png.is_empty(),
             "drag: session began"
         );

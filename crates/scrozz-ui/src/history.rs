@@ -342,7 +342,11 @@ impl HistoryViewModel {
                 .entries
                 .iter()
                 .find(|entry| entry.id == *id)
-                .is_some_and(|entry| entry.image_present && entry.content_error.is_none());
+                .is_some_and(|entry| {
+                    !entry.media_kind.is_motion()
+                        && entry.image_present
+                        && entry.content_error.is_none()
+                });
             if can_drag && self.drag_ready.as_ref() != Some(id) {
                 self.drag_loading = Some(id.clone());
                 self.actions
@@ -567,6 +571,20 @@ impl HistoryViewModel {
     #[must_use]
     pub fn has_pending_actions(&self) -> bool {
         !self.actions.is_empty()
+    }
+
+    /// The media kind of one loaded entry, when the current page holds it.
+    ///
+    /// The dispatcher needs this to send an action to the right editor without
+    /// a synchronous store read on the UI thread. `None` means "not on this
+    /// page", which the caller must treat as "ask the worker", never as
+    /// "screenshot".
+    #[must_use]
+    pub fn media_kind_of(&self, id: &CaptureId) -> Option<MediaKind> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == *id)
+            .map(|entry| entry.media_kind)
     }
 
     fn reload_from_start(&mut self) {
@@ -1100,10 +1118,18 @@ impl HistoryViewModel {
             facts.push("searchable text".to_owned());
         }
         if !entry.image_present {
-            facts.push("source image evicted".to_owned());
+            facts.push(if entry.media_kind.is_motion() {
+                "media file unavailable".to_owned()
+            } else {
+                "source image evicted".to_owned()
+            });
         }
         if entry.content_error.is_some() {
-            facts.push("saved edits unavailable in this build".to_owned());
+            facts.push(if entry.media_kind.is_motion() {
+                "media metadata unavailable in this build".to_owned()
+            } else {
+                "saved edits unavailable in this build".to_owned()
+            });
         }
         if !facts.is_empty() {
             ui.add_space(Space::SM);
@@ -1124,52 +1150,56 @@ impl HistoryViewModel {
 
         ui.add_space(Space::LG);
         let enabled = entry.image_present && entry.content_error.is_none();
+        let motion = entry.media_kind.is_motion();
         if ui
             .add_enabled(
                 enabled,
-                egui::Button::new("Open editor").min_size(vec2(ui.available_width(), 36.0)),
+                egui::Button::new(if motion { "Open media" } else { "Open editor" })
+                    .min_size(vec2(ui.available_width(), 36.0)),
             )
             .clicked()
         {
             self.actions
                 .push_back(HistoryAction::OpenEditor(entry.id.clone()));
         }
-        ui.horizontal(|ui| {
+        if !motion {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Restore"))
+                    .clicked()
+                {
+                    self.actions
+                        .push_back(HistoryAction::Restore(entry.id.clone()));
+                }
+                if ui.add_enabled(enabled, egui::Button::new("Copy")).clicked() {
+                    self.actions
+                        .push_back(HistoryAction::Copy(entry.id.clone()));
+                }
+                if ui.add_enabled(enabled, egui::Button::new("Save")).clicked() {
+                    self.actions
+                        .push_back(HistoryAction::Save(entry.id.clone()));
+                }
+            });
+            ui.label(
+                RichText::new(if drag_ready {
+                    "Drag the preview into another app"
+                } else if self.drag_loading.as_ref() == Some(&entry.id) {
+                    "Preparing drag..."
+                } else {
+                    "Drag unavailable"
+                })
+                .font(theme.font(Text::Caption))
+                .color(theme.palette.text_faint),
+            );
             if ui
-                .add_enabled(enabled, egui::Button::new("Restore"))
+                .button(if entry.pinned { "Unpin" } else { "Pin" })
                 .clicked()
             {
-                self.actions
-                    .push_back(HistoryAction::Restore(entry.id.clone()));
+                self.actions.push_back(HistoryAction::SetPinned {
+                    id: entry.id.clone(),
+                    pinned: !entry.pinned,
+                });
             }
-            if ui.add_enabled(enabled, egui::Button::new("Copy")).clicked() {
-                self.actions
-                    .push_back(HistoryAction::Copy(entry.id.clone()));
-            }
-            if ui.add_enabled(enabled, egui::Button::new("Save")).clicked() {
-                self.actions
-                    .push_back(HistoryAction::Save(entry.id.clone()));
-            }
-        });
-        ui.label(
-            RichText::new(if drag_ready {
-                "Drag the preview into another app"
-            } else if self.drag_loading.as_ref() == Some(&entry.id) {
-                "Preparing drag..."
-            } else {
-                "Drag unavailable"
-            })
-            .font(theme.font(Text::Caption))
-            .color(theme.palette.text_faint),
-        );
-        if ui
-            .button(if entry.pinned { "Unpin" } else { "Pin" })
-            .clicked()
-        {
-            self.actions.push_back(HistoryAction::SetPinned {
-                id: entry.id.clone(),
-                pinned: !entry.pinned,
-            });
         }
 
         ui.add_space(Space::XL);
@@ -1579,6 +1609,25 @@ mod tests {
         model.drag_prepared(&id);
         assert_eq!(model.drag_ready.as_ref(), Some(&id));
         assert!(model.drag_loading.is_none());
+    }
+
+    #[test]
+    fn selecting_video_does_not_request_a_still_image_drag() {
+        let page = fixture_page(crate::harness::Scenario::HistoryGrid, 7, NOW);
+        let video = page
+            .entries
+            .iter()
+            .find(|entry| entry.media_kind == MediaKind::Video)
+            .expect("video fixture")
+            .id
+            .clone();
+        let mut model = HistoryViewModel::loaded(NOW, page);
+
+        model.select(&video);
+
+        assert!(model.drain_actions().is_empty());
+        assert!(model.drag_loading.is_none());
+        assert!(model.drag_ready.is_none());
     }
 
     #[test]

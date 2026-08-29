@@ -52,11 +52,11 @@ pub mod test_support;
 pub use layout::StoreLayout;
 pub use model::{
     CaptureRecord, FrameHeader, ImageState, MediaKind, Page, RetentionReport, RetentionWindow,
-    SearchQuery, Timestamp,
+    SearchQuery, Timestamp, VideoCompletion, VideoMetadata, VideoSalvageability,
 };
 pub use record::StoredRecord;
 pub use sqlite_store::{
-    DocumentState, EvictedDocument, History, NewCapture, RecoveryReport, SqliteStore,
+    DocumentState, EvictedDocument, History, NewCapture, NewRecording, RecoveryReport, SqliteStore,
 };
 
 use scrozz_core::Result;

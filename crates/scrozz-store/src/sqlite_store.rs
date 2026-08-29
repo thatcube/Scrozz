@@ -14,7 +14,7 @@ use crate::{
     layout::{PendingIndexUpdate, StoreLayout},
     model::{
         CaptureRecord, FrameHeader, ImageState, MediaKind, Page, ProvenanceRepr, RetentionReport,
-        SearchQuery, TargetRepr, Timestamp,
+        SearchQuery, TargetRepr, Timestamp, VideoMetadata,
     },
     record::StoredRecord,
     schema,
@@ -110,6 +110,108 @@ impl<'a> NewCapture<'a> {
     }
 }
 
+/// A video recording on its way into history.
+///
+/// Unlike [`NewCapture`], which owns a document with inline pixels, a recording
+/// refers to an **externally-owned durable media file** that history never
+/// deletes. The path must be absolute, canonical, non-empty, and point to an
+/// existing regular file at insert time.
+#[derive(Debug, Clone)]
+pub struct NewRecording {
+    /// Typed metadata for the video file.
+    pub video: VideoMetadata,
+    /// When the recording was finalised. Defaults to now.
+    pub created_at: Timestamp,
+    /// Owning application, if known.
+    pub app_name: Option<String>,
+    /// Stable application identifier (e.g. bundle ID).
+    pub app_identifier: Option<String>,
+    /// Window title, if known.
+    pub window_title: Option<String>,
+    /// Whether the captured window included its native shadow.
+    pub window_shadow: Option<bool>,
+    /// How the capture was produced.
+    pub provenance: scrozz_core::Provenance,
+    /// What it was aimed at.
+    pub target: scrozz_core::CaptureTarget,
+    /// Whether to pin it immediately.
+    pub pinned: bool,
+}
+
+impl NewRecording {
+    /// A recording with the given video metadata, taken now.
+    #[must_use]
+    pub fn new(video: VideoMetadata) -> Self {
+        Self {
+            video,
+            created_at: Timestamp::now(),
+            app_name: None,
+            app_identifier: None,
+            window_title: None,
+            window_shadow: None,
+            provenance: scrozz_core::Provenance::Region,
+            target: scrozz_core::CaptureTarget::AllDisplays,
+            pinned: false,
+        }
+    }
+
+    /// Records the owning application.
+    #[must_use]
+    pub fn from_app(mut self, app: impl Into<String>) -> Self {
+        self.app_name = Some(app.into());
+        self
+    }
+
+    /// Records the stable application identifier.
+    #[must_use]
+    pub fn with_app_identifier(mut self, id: impl Into<String>) -> Self {
+        self.app_identifier = Some(id.into());
+        self
+    }
+
+    /// Records the window title.
+    #[must_use]
+    pub fn titled(mut self, title: impl Into<String>) -> Self {
+        self.window_title = Some(title.into());
+        self
+    }
+
+    /// Records whether the window shadow was included.
+    #[must_use]
+    pub const fn with_window_shadow(mut self, shadow: bool) -> Self {
+        self.window_shadow = Some(shadow);
+        self
+    }
+
+    /// Sets provenance.
+    #[must_use]
+    pub const fn with_provenance(mut self, provenance: scrozz_core::Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    /// Sets target.
+    #[must_use]
+    pub fn with_target(mut self, target: scrozz_core::CaptureTarget) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Overrides the capture time.
+    #[must_use]
+    pub const fn taken_at(mut self, at: Timestamp) -> Self {
+        self.created_at = at;
+        self
+    }
+
+    /// Pins the recording on arrival.
+    #[must_use]
+    pub const fn pinned(mut self) -> Self {
+        self.pinned = true;
+        self
+    }
+}
+
 /// A document read back out of history.
 ///
 /// Two variants because decision D23 gives documents and images different
@@ -196,6 +298,19 @@ pub trait History: Store {
     /// Returns [`Error::InvalidRequest`] if the frame's geometry does not match
     /// its buffer, or [`Error::Storage`] if the write fails.
     fn insert(&mut self, capture: NewCapture<'_>) -> Result<CaptureId>;
+
+    /// Adds a video recording to history, returning its new identifier.
+    ///
+    /// The `video.path` must be absolute, canonical, non-empty, and point to an
+    /// existing regular file. History never deletes this file — only its own
+    /// sidecar, index row, and poster blob (if any) are removed on deletion or
+    /// eviction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] if the video path fails validation, or
+    /// [`Error::Storage`] if the write fails.
+    fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId>;
 
     /// Everything known about one capture, without its pixels.
     ///
@@ -940,6 +1055,71 @@ impl History for SqliteStore {
             return Ok(id);
         }
         if let Err(error) = tx.commit().map_err(store_err("cannot commit insert")) {
+            self.recover_partial_index_update(error)?;
+            return Ok(id);
+        }
+        finish_committed_index_marker(&self.layout, Some(&marker));
+
+        Ok(id)
+    }
+
+    fn insert_recording(&mut self, recording: NewRecording) -> Result<CaptureId> {
+        recording.video.validate_path()?;
+
+        let id = capture_id_at(recording.created_at.0);
+        let now = Timestamp::now();
+
+        let mut record = StoredRecord::from_parts(
+            &id,
+            recording.created_at,
+            now,
+            MediaKind::Video,
+            recording.pinned,
+            recording.app_name,
+            recording.window_title,
+            recording.provenance,
+            &recording.target,
+            // No still-frame geometry for native video rows.
+            FrameHeader {
+                size: scrozz_core::PhysicalSize::new(0.0, 0.0),
+                stride: 0,
+                format: scrozz_core::PixelFormat::Rgba8,
+                color_space: scrozz_core::ColorSpace::Srgb,
+                scale: scrozz_core::ScaleFactor::IDENTITY,
+            },
+            None, // no content-addressed image blob
+            0,
+            None,
+            &scrozz_annotate::DocumentData::default(),
+        )?;
+        // Patch the typed fields that from_parts doesn't cover.
+        record.frame = None;
+        record.video = Some(serde_json::to_value(recording.video).map_err(|error| {
+            Error::Storage(format!("cannot serialise recording metadata: {error}"))
+        })?);
+        record.app_identifier = recording.app_identifier;
+        record.window_shadow = recording.window_shadow;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_err("cannot begin recording insert"))?;
+        let marker = self.layout.begin_index_update(&id)?;
+        if let Err(error) = self.layout.write_record(&record) {
+            drop(tx);
+            finish_unused_index_marker(&self.layout, Some(&marker));
+            return Err(error);
+        }
+
+        if let Err(error) = upsert_record(&tx, &record) {
+            drop(tx);
+            self.recover_partial_index_update(error)?;
+            return Ok(id);
+        }
+        if let Err(error) = tx
+            .commit()
+            .map_err(store_err("cannot commit recording insert"))
+        {
             self.recover_partial_index_update(error)?;
             return Ok(id);
         }
@@ -1818,12 +1998,18 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
     let frame: Option<FrameHeader> = serde_json::from_str(&frame_json)
         .map_err(|e| Error::Storage(format!("cannot read frame for {id}: {e}")))?;
-    let video = video_json
-        .map(|json| {
-            serde_json::from_str(&json)
-                .map_err(|e| Error::Storage(format!("cannot read video metadata for {id}: {e}")))
-        })
-        .transpose()?;
+    let video: Option<crate::model::VideoMetadata> =
+        video_json.and_then(|json| match serde_json::from_str(&json) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                tracing::debug!(
+                    capture = %id,
+                    %error,
+                    "video metadata is newer or malformed; keeping the history row"
+                );
+                None
+            }
+        });
     let screen_pin = pin_json
         .map(|json| {
             serde_json::from_str(&json)

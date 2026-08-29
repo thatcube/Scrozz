@@ -13,6 +13,7 @@ scrozz-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 image.workspace = true
+gif.workspace = true
 arboard.workspace = true
 
 [lints]
