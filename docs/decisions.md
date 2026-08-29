@@ -959,22 +959,26 @@ recorded here rather than in the crate because each one is *visible to the user*
 so changing it later would change behaviour people had come to rely on.
 
 1. **Redaction is destructive, and destroys what is beneath it in z-order.**
-   Blur, pixelate and solid burn into the pixels during the render pass. A
-   redaction placed above an arrow destroys that arrow's pixels too; annotations
-   placed *after* it still draw on top. This is the only correct reading — a
-   redaction that quietly spared some content beneath it would be a privacy
-   failure wearing the appearance of one.
+   Scrozz exposes one privacy tool, **Redact** (`P`), not separate Blur and
+   Pixelate choices. Every intensity replaces pixels in place with an opaque,
+   deterministic randomized mosaic; Low is still irreversible, while higher
+   intensity monotonically increases block granularity, global mixing, and
+   quantization. A redaction placed above an arrow destroys that arrow's pixels
+   too; annotations placed *after* it still draw on top. This is the only correct
+   reading — a redaction that quietly spared some content beneath it would be a
+   privacy failure wearing the appearance of one.
 
-   The implementation goes further in one respect worth keeping: **blur samples
-   clamp-to-edge from the whole image**, not from the region in isolation. A
-   region blurred in isolation darkens at its edges, which visibly advertises
-   exactly where the redaction is and how big the hidden content was.
+   Old sidecars may still contain Blur, Pixelate, or Solid annotations. Those
+   legacy discriminators remain deserializable and retain their exact renderer,
+   including blur's clamp-to-edge sampling, but they are compatibility model
+   variants rather than user-facing tool choices. If decorative blur returns, it
+   belongs under Effects and is not a privacy control.
 
 2. **Counters renumber by creation order, never by z-order.** Raising a numbered
    step marker must not resequence the steps. The number is the user's meaning;
    z-order is presentation, and presentation must not rewrite meaning.
 
-3. **A solid redaction falls back to opaque black if its style would render it
+3. **A legacy solid redaction falls back to opaque black if its style would render it
    invisible.** A see-through redaction is the worst possible outcome, so the
    failure mode is deliberately biased toward hiding too much.
 

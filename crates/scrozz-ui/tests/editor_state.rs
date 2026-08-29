@@ -102,6 +102,13 @@ fn accelerators_are_case_insensitive() {
 }
 
 #[test]
+fn redact_owns_p_and_legacy_privacy_shortcuts_are_not_exposed() {
+    assert_eq!(Tool::from_accelerator('p'), Some(Tool::Redact));
+    assert_eq!(Tool::from_accelerator('b'), None);
+    assert_eq!(Tool::from_accelerator('x'), None);
+}
+
+#[test]
 fn an_unbound_key_picks_no_tool() {
     assert_eq!(Tool::from_accelerator('!'), None);
 }
@@ -531,7 +538,7 @@ fn a_new_shape_takes_the_current_style() {
 
 #[test]
 fn highlight_and_redaction_ignore_the_palette() {
-    for tool in [Tool::Highlight, Tool::Pixelate, Tool::Blur] {
+    for tool in [Tool::Highlight, Tool::Redact] {
         let mut state = state();
         state.set_stroke_color(Color::rgb(255, 0, 0));
         state.set_tool(tool);
@@ -547,21 +554,127 @@ fn highlight_and_redaction_ignore_the_palette() {
 }
 
 #[test]
-fn the_two_redaction_tools_pick_different_styles() {
-    let mut pixelate = state();
-    pixelate.set_tool(Tool::Pixelate);
-    drag(&mut pixelate, at(20.0, 20.0), at(120.0, 100.0));
+fn the_one_redact_tool_creates_a_secure_mosaic() {
+    let mut state = state();
+    state.set_tool(Tool::Redact);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 100.0));
 
-    let mut blur = state();
-    blur.set_tool(Tool::Blur);
-    drag(&mut blur, at(20.0, 20.0), at(120.0, 100.0));
+    let object = &state.document().annotations()[0];
+    assert!(matches!(
+        object.annotation,
+        Annotation::Redact {
+            style: RedactStyle::Pixelate,
+            ..
+        }
+    ));
+    assert_eq!(
+        object.style.effective_redact_intensity(),
+        Some(scrozz_annotate::REDACT_INTENSITY_DEFAULT)
+    );
+}
 
-    let style_of = |state: &EditorState| match state.document().annotations()[0].annotation {
-        Annotation::Redact { style, .. } => style,
-        _ => panic!("a redaction tool drew something else"),
-    };
-    assert_eq!(style_of(&pixelate), RedactStyle::Pixelate);
-    assert_eq!(style_of(&blur), RedactStyle::Blur);
+#[test]
+fn redact_intensity_is_bounded_inherited_and_selected_edits_coalesce() {
+    let mut state = state();
+    state.set_tool(Tool::Redact);
+    state.set_redact_intensity(0.2);
+    drag(&mut state, at(20.0, 20.0), at(120.0, 100.0));
+    let id = state.selection().expect("new redaction selected");
+    assert_eq!(
+        state
+            .document()
+            .get(id)
+            .unwrap()
+            .style
+            .effective_redact_intensity(),
+        Some(0.2)
+    );
+    let depth = state.undo_depth();
+
+    state.set_redact_intensity(0.5);
+    state.set_redact_intensity(0.9);
+    assert_eq!(state.undo_depth(), depth + 1);
+    assert_eq!(
+        state
+            .document()
+            .get(id)
+            .unwrap()
+            .style
+            .effective_redact_intensity(),
+        Some(0.9)
+    );
+
+    let revision = state.revision();
+    state.set_redact_intensity(0.9);
+    assert_eq!(
+        state.revision(),
+        revision,
+        "an unchanged slider value edited content"
+    );
+
+    state.command(Command::Undo).expect("undo intensity");
+    assert_eq!(
+        state
+            .document()
+            .get(id)
+            .unwrap()
+            .style
+            .effective_redact_intensity(),
+        Some(0.2)
+    );
+
+    state.set_redact_intensity(f32::NAN);
+    assert_eq!(
+        state.redact_intensity(),
+        scrozz_annotate::REDACT_INTENSITY_DEFAULT
+    );
+    state.set_redact_intensity(99.0);
+    assert_eq!(state.redact_intensity(), 1.0);
+
+    state.set_tool(Tool::Rectangle);
+    drag(&mut state, at(160.0, 20.0), at(220.0, 80.0));
+    assert_eq!(
+        state.document().annotations()[1]
+            .style
+            .effective_redact_intensity(),
+        None,
+        "secure-render metadata leaked onto an ordinary shape"
+    );
+}
+
+#[test]
+fn changing_a_legacy_redaction_intensity_migrates_only_that_object_to_secure_rendering() {
+    let mut document = Document::new(capture());
+    let id = document.add(
+        Annotation::Redact {
+            area: LogicalRect::new(at(20.0, 20.0), LogicalSize::new(100.0, 80.0)),
+            style: RedactStyle::Blur,
+        },
+        Style::redaction(),
+    );
+    let mut state = EditorState::new(document);
+    state.select(Some(id));
+    assert_eq!(
+        state
+            .document()
+            .get(id)
+            .unwrap()
+            .style
+            .effective_redact_intensity(),
+        None
+    );
+
+    state.set_redact_intensity(0.75);
+
+    let object = state.document().get(id).unwrap();
+    assert!(matches!(
+        object.annotation,
+        Annotation::Redact {
+            style: RedactStyle::Blur,
+            ..
+        }
+    ));
+    assert_eq!(object.style.effective_redact_intensity(), Some(0.75));
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,7 +1451,7 @@ fn recoloring_a_highlight_preserves_its_translucency() {
 #[test]
 fn restyling_a_redaction_does_not_recolour_it() {
     let mut state = state();
-    state.set_tool(Tool::Pixelate);
+    state.set_tool(Tool::Redact);
     drag(&mut state, at(40.0, 40.0), at(160.0, 140.0));
     let before = state.document().annotations()[0].style;
 

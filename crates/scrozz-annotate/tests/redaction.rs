@@ -231,6 +231,238 @@ fn pixelate_blocks_are_genuinely_uniform() {
 }
 
 #[test]
+fn every_secure_intensity_destroys_original_high_frequency_detail() {
+    for step in 0..=100 {
+        let intensity = step as f32 / 100.0;
+        let mut doc = checkered(96, 96);
+        doc.add(
+            Annotation::Redact {
+                area: rect(8.0, 8.0, 80.0, 80.0),
+                style: RedactStyle::Pixelate,
+            },
+            Style::secure_redaction(intensity),
+        );
+        let out = SkiaRenderer::new().render(&doc).unwrap();
+        for pixel in interior(&out, 8, 8, 88, 88) {
+            assert!(
+                (8..=247).contains(&pixel[0])
+                    && (8..=247).contains(&pixel[1])
+                    && (8..=247).contains(&pixel[2]),
+                "intensity {intensity} preserved a source extreme: {pixel:?}"
+            );
+            assert_eq!(pixel[3], 255, "secure Redact must never use alpha");
+        }
+    }
+}
+
+#[test]
+fn secure_intensity_monotonically_increases_mosaic_granularity() {
+    let mut previous = usize::MAX;
+    for intensity in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let mut doc = checkered(160, 160);
+        doc.add(
+            Annotation::Redact {
+                area: rect(0.0, 0.0, 160.0, 160.0),
+                style: RedactStyle::Pixelate,
+            },
+            Style::secure_redaction(intensity),
+        );
+        let out = SkiaRenderer::new().render(&doc).unwrap();
+        let distinct = interior(&out, 0, 0, 160, 160)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(
+            distinct <= previous,
+            "intensity {intensity} increased recoverable block detail: {previous} -> {distinct}"
+        );
+        previous = distinct;
+    }
+}
+
+#[test]
+fn secure_redact_is_seeded_deterministic_and_ignores_opacity() {
+    let secure = Style::secure_redaction(0.68).with_opacity(0.0);
+    let annotation = Annotation::Redact {
+        area: rect(10.0, 10.0, 80.0, 80.0),
+        style: RedactStyle::Pixelate,
+    };
+    let mut first = checkered(100, 100);
+    first.add(annotation.clone(), secure);
+    let renderer = SkiaRenderer::new();
+    let once = renderer.render(&first).unwrap();
+    let twice = renderer.render(&first).unwrap();
+    assert_eq!(once.data, twice.data);
+    assert!(
+        interior(&once, 10, 10, 90, 90)
+            .iter()
+            .all(|pixel| pixel[0] != 0 && pixel[0] != 255),
+        "zero opacity bypassed secure Redact"
+    );
+
+    let mut second = checkered(100, 100);
+    second.add(
+        Annotation::Line {
+            from: scrozz_core::LogicalPoint::new(0.0, 0.0),
+            to: scrozz_core::LogicalPoint::new(1.0, 1.0),
+        },
+        Style::stroked().with_opacity(0.0),
+    );
+    second.add(annotation, secure);
+    assert_ne!(once.data, renderer.render(&second).unwrap().data);
+}
+
+#[test]
+fn secure_redact_does_not_encode_premultiplied_alpha_patterns_into_colour() {
+    let render = |invert: bool| {
+        let mut frame = flat(48, 48, [120, 80, 40, 255]);
+        for y in 0..48usize {
+            for x in 0..48usize {
+                let alpha = if ((x + y) % 2 == 0) ^ invert { 64 } else { 192 };
+                frame.data[(y * 48 + x) * 4 + 3] = alpha;
+            }
+        }
+        let mut doc = Document::new(capture_with(frame, Provenance::Region));
+        doc.add(
+            Annotation::Redact {
+                area: rect(0.0, 0.0, 48.0, 48.0),
+                style: RedactStyle::Pixelate,
+            },
+            Style::secure_redaction(0.5),
+        );
+        SkiaRenderer::new().render(&doc).unwrap()
+    };
+
+    assert_eq!(
+        render(false).data,
+        render(true).data,
+        "inverting only the source alpha pattern changed secure mosaic colours"
+    );
+}
+
+#[test]
+fn secure_redact_remains_destructive_through_crop_and_scale() {
+    let mut doc = checkered(120, 120);
+    doc.add(
+        Annotation::Redact {
+            area: rect(10.0, 10.0, 100.0, 100.0),
+            style: RedactStyle::Pixelate,
+        },
+        Style::secure_redaction(0.0),
+    );
+    doc.set_crop(Some(rect(20.0, 20.0, 80.0, 80.0))).unwrap();
+    for scale in [0.5, 1.0, 2.0] {
+        let out = SkiaRenderer::new()
+            .render_at(&doc, ScaleFactor::new(scale))
+            .unwrap();
+        for pixel in out.data.as_chunks::<4>().0 {
+            assert!(
+                pixel[0] != 0 && pixel[0] != 255,
+                "scale {scale} recovered checkerboard detail: {pixel:?}"
+            );
+            assert_eq!(pixel[3], 255);
+        }
+    }
+}
+
+#[test]
+fn malformed_secure_intensity_is_clamped_to_a_safe_render() {
+    for intensity in [f32::NAN, -10.0, 10.0] {
+        let mut doc = checkered(40, 40);
+        let mut style = Style::redaction();
+        style.redact_intensity = Some(intensity);
+        doc.add(
+            Annotation::Redact {
+                area: rect(0.0, 0.0, 40.0, 40.0),
+                style: RedactStyle::Pixelate,
+            },
+            style,
+        );
+        let out = SkiaRenderer::new().render(&doc).unwrap();
+        assert!(
+            out.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[0] != 0 && pixel[0] != 255 && pixel[3] == 255)
+        );
+    }
+}
+
+#[test]
+fn secure_redact_is_safe_at_tiny_edges_and_in_wide_gamut_spaces() {
+    for size in 1..=7 {
+        let mut doc = checkered(size, size);
+        doc.add(
+            Annotation::Redact {
+                area: rect(-4.0, -4.0, f64::from(size + 8), f64::from(size + 8)),
+                style: RedactStyle::Pixelate,
+            },
+            Style::secure_redaction(0.4),
+        );
+        let out = SkiaRenderer::new().render(&doc).unwrap();
+        assert!(
+            out.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[0] != 0 && pixel[0] != 255 && pixel[3] == 255)
+        );
+    }
+
+    for space in [ColorSpace::DisplayP3, ColorSpace::Rec2020] {
+        let mut doc = checkered(80, 80);
+        doc.source.frame.color_space = space;
+        doc.add(
+            Annotation::Redact {
+                area: rect(0.0, 0.0, 80.0, 80.0),
+                style: RedactStyle::Pixelate,
+            },
+            Style::secure_redaction(0.68),
+        );
+        let out = SkiaRenderer::new().render(&doc).unwrap();
+        assert_eq!(out.color_space, space);
+        assert!(
+            out.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[0] != 0 && pixel[0] != 255 && pixel[3] == 255)
+        );
+    }
+}
+
+#[test]
+fn secure_redact_obeys_annotation_z_order_in_both_directions() {
+    let mut doc = Document::new(capture_with(
+        flat(80, 80, [255, 255, 255, 255]),
+        Provenance::Region,
+    ));
+    doc.add(
+        Annotation::Rectangle(rect(10.0, 10.0, 60.0, 60.0)),
+        Style::stroked()
+            .with_stroke(Color::TRANSPARENT)
+            .with_fill(Some(Color::rgb(255, 0, 0))),
+    );
+    doc.add(
+        Annotation::Redact {
+            area: rect(10.0, 10.0, 60.0, 60.0),
+            style: RedactStyle::Pixelate,
+        },
+        Style::secure_redaction(0.68),
+    );
+    doc.add(
+        Annotation::Rectangle(rect(25.0, 25.0, 20.0, 20.0)),
+        Style::stroked()
+            .with_stroke(Color::TRANSPARENT)
+            .with_fill(Some(Color::rgb(0, 255, 0))),
+    );
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_ne!(pixel(&out, 15, 15), [255, 0, 0, 255]);
+    assert!(near(pixel(&out, 35, 35), [0, 255, 0, 255], 2));
+}
+
+#[test]
 fn a_redaction_destroys_annotations_drawn_beneath_it() {
     // Redaction is applied in z-order, so it erases whatever is under it —
     // including an annotation that itself leaked something.

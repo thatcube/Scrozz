@@ -436,7 +436,7 @@ fn a_redaction_destroys_the_pixels_it_covers() {
     let plain = editor().render().expect("render");
 
     let mut editor = editor();
-    editor.state_mut().set_tool(Tool::Pixelate);
+    editor.state_mut().set_tool(Tool::Redact);
     editor
         .state_mut()
         .pointer_pressed(LogicalPoint::new(60.0, 60.0));
@@ -464,7 +464,7 @@ fn a_redaction_leaves_the_rest_of_the_image_alone() {
     let plain = editor().render().expect("render");
 
     let mut editor = editor();
-    editor.state_mut().set_tool(Tool::Blur);
+    editor.state_mut().set_tool(Tool::Redact);
     editor
         .state_mut()
         .pointer_pressed(LogicalPoint::new(20.0, 20.0));

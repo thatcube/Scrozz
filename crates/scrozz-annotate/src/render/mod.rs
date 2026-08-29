@@ -262,7 +262,10 @@ fn draw_object(
     into: ColorTransform,
 ) -> Result<()> {
     let opacity = object.style.effective_opacity();
-    if opacity <= 0.0 {
+    let secure_redaction = matches!(object.annotation, Annotation::Redact { .. })
+        .then(|| object.style.effective_redact_intensity())
+        .flatten();
+    if opacity <= 0.0 && secure_redaction.is_none() {
         return Ok(());
     }
     let width = xf.length(object.style.effective_stroke_width());
@@ -349,22 +352,26 @@ fn draw_object(
             ) else {
                 return Ok(());
             };
-            match style {
-                RedactStyle::Blur => redact::blur(canvas, region)?,
-                RedactStyle::Pixelate => redact::pixelate(canvas, region),
-                RedactStyle::Solid => {
-                    // A solid redaction writes its pixels directly rather than
-                    // going through a `Paint`, so it has to be moved into the
-                    // working space by hand — otherwise a custom redaction
-                    // colour is the one annotation colour that comes out wrong
-                    // on a wide-gamut capture.
-                    let color = object
-                        .style
-                        .fill
-                        .or(Some(object.style.stroke))
-                        .filter(|c| !c.is_invisible())
-                        .unwrap_or(Color::BLACK);
-                    redact::solid(canvas, region, shapes::working(color, into));
+            if let Some(intensity) = secure_redaction {
+                redact::secure_mosaic(canvas, region, intensity, object.id.0);
+            } else {
+                match style {
+                    RedactStyle::Blur => redact::blur(canvas, region)?,
+                    RedactStyle::Pixelate => redact::pixelate(canvas, region),
+                    RedactStyle::Solid => {
+                        // A solid redaction writes its pixels directly rather than
+                        // going through a `Paint`, so it has to be moved into the
+                        // working space by hand — otherwise a custom redaction
+                        // colour is the one annotation colour that comes out wrong
+                        // on a wide-gamut capture.
+                        let color = object
+                            .style
+                            .fill
+                            .or(Some(object.style.stroke))
+                            .filter(|c| !c.is_invisible())
+                            .unwrap_or(Color::BLACK);
+                        redact::solid(canvas, region, shapes::working(color, into));
+                    }
                 }
             }
         }

@@ -76,4 +76,6 @@ pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject,
 pub use document::{AnnotationMut, Background, Beautification, Document, DocumentData};
 pub use history::History;
 pub use render::{Renderer, SkiaRenderer};
-pub use style::{ArrowStyle, Color, Style};
+pub use style::{
+    ArrowStyle, Color, REDACT_INTENSITY_DEFAULT, REDACT_INTENSITY_MAX, REDACT_INTENSITY_MIN, Style,
+};

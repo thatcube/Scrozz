@@ -22,8 +22,8 @@
 //! exactly one step.
 
 use scrozz_annotate::{
-    Annotation, AnnotationId, AnnotationKind, ArrowStyle, Color, Document, History, RedactStyle,
-    Style, geom,
+    Annotation, AnnotationId, AnnotationKind, ArrowStyle, Color, Document, History,
+    REDACT_INTENSITY_DEFAULT, RedactStyle, Style, geom,
 };
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Result};
 use std::ops::Range;
@@ -96,10 +96,8 @@ pub enum Tool {
     Text,
     /// Draw a highlighter band.
     Highlight,
-    /// Draw a blur redaction.
-    Blur,
-    /// Draw a pixelate redaction.
-    Pixelate,
+    /// Draw an irreversible secure mosaic redaction.
+    Redact,
     /// Place the next numbered step marker.
     Counter,
     /// Drag out a crop.
@@ -108,7 +106,7 @@ pub enum Tool {
 
 impl Tool {
     /// Every tool, in palette order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::Select,
         Self::Arrow,
         Self::Line,
@@ -117,8 +115,7 @@ impl Tool {
         Self::Pen,
         Self::Text,
         Self::Highlight,
-        Self::Blur,
-        Self::Pixelate,
+        Self::Redact,
         Self::Counter,
         Self::Crop,
     ];
@@ -135,8 +132,7 @@ impl Tool {
             Self::Pen => "Pen",
             Self::Text => "Text",
             Self::Highlight => "Highlight",
-            Self::Blur => "Blur",
-            Self::Pixelate => "Pixelate",
+            Self::Redact => "Redact",
             Self::Counter => "Step number",
             Self::Crop => "Crop",
         }
@@ -154,11 +150,10 @@ impl Tool {
             Self::Line => 'l',
             Self::Rectangle => 'r',
             Self::Ellipse => 'o',
-            Self::Pen => 'p',
+            Self::Pen => 'd',
             Self::Text => 't',
             Self::Highlight => 'h',
-            Self::Blur => 'b',
-            Self::Pixelate => 'x',
+            Self::Redact => 'p',
             Self::Counter => 'n',
             Self::Crop => 'c',
         }
@@ -176,7 +171,7 @@ impl Tool {
     pub const fn is_rect_drag(self) -> bool {
         matches!(
             self,
-            Self::Rectangle | Self::Ellipse | Self::Highlight | Self::Blur | Self::Pixelate
+            Self::Rectangle | Self::Ellipse | Self::Highlight | Self::Redact
         )
     }
 
@@ -201,7 +196,7 @@ impl Tool {
             Self::Pen => AnnotationKind::Freehand,
             Self::Text => AnnotationKind::Text,
             Self::Highlight => AnnotationKind::Highlight,
-            Self::Blur | Self::Pixelate => AnnotationKind::Redact,
+            Self::Redact => AnnotationKind::Redact,
             Self::Counter => AnnotationKind::Counter,
         })
     }
@@ -838,6 +833,38 @@ impl EditorState {
         self.set_style(self.style.with_arrow_bend(bend.clamp(-0.75, 0.75)));
     }
 
+    /// Secure-redaction intensity currently in hand.
+    #[must_use]
+    pub fn redact_intensity(&self) -> f32 {
+        self.style
+            .effective_redact_intensity()
+            .unwrap_or(REDACT_INTENSITY_DEFAULT)
+    }
+
+    /// Sets secure intensity for the selection and future redactions.
+    pub fn set_redact_intensity(&mut self, intensity: f32) {
+        let intensity = Style::secure_redaction(intensity)
+            .effective_redact_intensity()
+            .unwrap_or(REDACT_INTENSITY_DEFAULT);
+        self.style.redact_intensity = Some(intensity);
+        let changed = self.selection.is_some_and(|id| {
+            let Some(mut object) = self.document.get_mut(id) else {
+                return false;
+            };
+            if !matches!(object.annotation(), Annotation::Redact { .. })
+                || object.style().effective_redact_intensity() == Some(intensity)
+            {
+                return false;
+            }
+            object.style().redact_intensity = Some(intensity);
+            true
+        });
+        if changed {
+            self.commit_coalesced("redact-intensity");
+            self.touch();
+        }
+    }
+
     /// The selected annotation, if any.
     #[must_use]
     pub const fn selection(&self) -> Option<AnnotationId> {
@@ -850,6 +877,14 @@ impl EditorState {
         self.selection
             .and_then(|id| self.document.get(id))
             .is_some_and(|object| matches!(object.annotation, Annotation::Arrow { .. }))
+    }
+
+    /// Whether the current selection is any legacy or secure redaction.
+    #[must_use]
+    pub fn selection_is_redaction(&self) -> bool {
+        self.selection
+            .and_then(|id| self.document.get(id))
+            .is_some_and(|object| matches!(object.annotation, Annotation::Redact { .. }))
     }
 
     /// The selection's bounding box, if there is a selection.
@@ -2372,11 +2407,7 @@ impl EditorState {
             Tool::Rectangle => Annotation::Rectangle(LogicalRect::from_corners(origin, point)),
             Tool::Ellipse => Annotation::Ellipse(LogicalRect::from_corners(origin, point)),
             Tool::Highlight => Annotation::Highlight(LogicalRect::from_corners(origin, point)),
-            Tool::Blur => Annotation::Redact {
-                area: LogicalRect::from_corners(origin, point),
-                style: RedactStyle::Blur,
-            },
-            Tool::Pixelate => Annotation::Redact {
+            Tool::Redact => Annotation::Redact {
                 area: LogicalRect::from_corners(origin, point),
                 style: RedactStyle::Pixelate,
             },
@@ -2408,8 +2439,12 @@ impl EditorState {
     fn style_for_new(&self) -> Style {
         match self.tool {
             Tool::Highlight => Style::highlighter(),
-            Tool::Blur | Tool::Pixelate => Style::redaction(),
-            _ => self.style,
+            Tool::Redact => Style::secure_redaction(self.redact_intensity()),
+            _ => {
+                let mut style = self.style;
+                style.redact_intensity = None;
+                style
+            }
         }
     }
 

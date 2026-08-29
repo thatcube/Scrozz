@@ -5,12 +5,14 @@
 
 mod common;
 
-use common::{document, every_annotation, rect, region_capture, window_capture};
+use common::{
+    capture_with, checkerboard, document, every_annotation, rect, region_capture, window_capture,
+};
 use scrozz_annotate::{
     Annotation, ArrowStyle, Background, Beautification, Color, Document, DocumentData, RedactStyle,
-    Style,
+    Renderer, SkiaRenderer, Style,
 };
-use scrozz_core::LogicalPoint;
+use scrozz_core::{LogicalPoint, Provenance};
 
 #[test]
 fn round_trip_preserves_every_annotation_exactly() {
@@ -109,6 +111,7 @@ fn version_two_styles_migrate_to_bold_straight_arrows() {
         .expect("style object");
     style.remove("arrow_style");
     style.remove("arrow_bend");
+    style.remove("redact_intensity");
 
     let restored = Document::from_data(
         region_capture(120, 90),
@@ -118,6 +121,99 @@ fn version_two_styles_migrate_to_bold_straight_arrows() {
     let style = restored.annotations()[0].style;
     assert_eq!(style.arrow_style, ArrowStyle::Bold);
     assert_eq!(style.arrow_bend, 0.0);
+}
+
+#[test]
+fn secure_redaction_intensity_round_trips_exactly() {
+    let mut doc = document(120, 90);
+    let id = doc.add(
+        Annotation::Redact {
+            area: rect(10.0, 10.0, 80.0, 50.0),
+            style: RedactStyle::Pixelate,
+        },
+        Style::secure_redaction(0.73),
+    );
+    let expected = SkiaRenderer.render(&doc).unwrap();
+    let json = serde_json::to_string(&doc.data()).unwrap();
+    let restored = Document::from_data(
+        region_capture(120, 90),
+        serde_json::from_str(&json).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored.get(id).unwrap().style.effective_redact_intensity(),
+        Some(0.73)
+    );
+    assert_eq!(restored.data().version, DocumentData::VERSION);
+    assert_eq!(SkiaRenderer.render(&restored).unwrap().data, expected.data);
+}
+
+#[test]
+fn version_three_redactions_keep_their_exact_legacy_rendering() {
+    let source = capture_with(checkerboard(120, 90, 2), Provenance::Region);
+    let mut original = Document::new(source.clone());
+    for (index, style) in [RedactStyle::Blur, RedactStyle::Pixelate, RedactStyle::Solid]
+        .into_iter()
+        .enumerate()
+    {
+        original.add(
+            Annotation::Redact {
+                area: rect(5.0 + index as f64 * 38.0, 10.0, 34.0, 60.0),
+                style,
+            },
+            Style::redaction(),
+        );
+    }
+    let expected = SkiaRenderer.render(&original).unwrap();
+    let mut value = serde_json::to_value(original.data()).unwrap();
+    value["version"] = serde_json::json!(3);
+    for annotation in value["annotations"].as_array_mut().unwrap() {
+        annotation["style"]
+            .as_object_mut()
+            .unwrap()
+            .remove("redact_intensity");
+    }
+    let restored = Document::from_data(source, serde_json::from_value(value).unwrap()).unwrap();
+    assert!(
+        restored
+            .annotations()
+            .iter()
+            .all(|object| object.style.effective_redact_intensity().is_none())
+    );
+    assert_eq!(SkiaRenderer.render(&restored).unwrap().data, expected.data);
+}
+
+#[test]
+fn persisted_out_of_range_redaction_intensity_is_safely_clamped_on_use() {
+    let mut doc = document(40, 40);
+    doc.add(
+        Annotation::Redact {
+            area: rect(0.0, 0.0, 40.0, 40.0),
+            style: RedactStyle::Pixelate,
+        },
+        Style::secure_redaction(0.5),
+    );
+    for (stored, expected) in [(-20.0, 0.0), (20.0, 1.0)] {
+        let mut value = serde_json::to_value(doc.data()).unwrap();
+        value["annotations"][0]["style"]["redact_intensity"] = serde_json::json!(stored);
+        let data: DocumentData = serde_json::from_value(value).unwrap();
+        let restored = Document::from_data(region_capture(40, 40), data).unwrap();
+        assert_eq!(
+            restored.data().annotations[0].style.redact_intensity,
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn secure_redaction_marker_is_removed_from_non_redaction_objects_on_load() {
+    let mut doc = document(40, 40);
+    doc.add(
+        Annotation::Rectangle(rect(2.0, 2.0, 20.0, 20.0)),
+        Style::stroked().with_redact_intensity(0.9),
+    );
+    let restored = Document::from_data(region_capture(40, 40), doc.data()).unwrap();
+    assert_eq!(restored.data().annotations[0].style.redact_intensity, None);
 }
 
 #[test]

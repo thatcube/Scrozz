@@ -76,14 +76,18 @@ pub enum Annotation {
 }
 
 /// How a redaction obscures its region.
+///
+/// These variants are retained for sidecar compatibility. New user-facing
+/// Redact annotations carry a secure intensity in [`Style`] and use the secure
+/// mosaic renderer regardless of this legacy discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactStyle {
-    /// Gaussian blur.
+    /// Legacy Gaussian blur.
     Blur,
-    /// Mosaic.
+    /// Legacy fixed mosaic.
     Pixelate,
-    /// Solid fill.
+    /// Legacy solid fill.
     Solid,
 }
 

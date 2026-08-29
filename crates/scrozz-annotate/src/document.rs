@@ -112,7 +112,7 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 3;
+    pub const VERSION: u32 = 4;
 }
 
 impl Default for DocumentData {
@@ -168,8 +168,9 @@ impl Document {
     /// version, or if it carries beautification for a capture that forbids it —
     /// a document that was hand-edited or that changed provenance must not be
     /// silently accepted and then quietly rendered wrong.
-    pub fn from_data(source: Capture, data: DocumentData) -> Result<Self> {
+    pub fn from_data(source: Capture, mut data: DocumentData) -> Result<Self> {
         Self::validate_data(&source, &data)?;
+        normalize_redaction_styles(&mut data.annotations);
         let crop = normalize_crop(capture_bounds(&source), data.crop)?;
         let highest = data
             .annotations
@@ -209,8 +210,9 @@ impl Document {
     /// # Errors
     ///
     /// The same conditions as [`Self::from_data`].
-    pub fn restore(&mut self, data: DocumentData) -> Result<()> {
+    pub fn restore(&mut self, mut data: DocumentData) -> Result<()> {
         Self::validate_data(&self.source, &data)?;
+        normalize_redaction_styles(&mut data.annotations);
         let crop = normalize_crop(self.logical_bounds(), data.crop)?;
         let highest = data
             .annotations
@@ -569,6 +571,7 @@ fn normalize_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<Opti
             "crop rectangle must be finite".to_owned(),
         ));
     }
+
     let left = area.origin.x.max(bounds.origin.x);
     let top = area.origin.y.max(bounds.origin.y);
     let right = geom::max_x(&area).min(geom::max_x(&bounds));
@@ -582,6 +585,16 @@ fn normalize_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<Opti
     // A crop that covers everything is no crop: storing it would make `crop()`
     // report a crop the user cannot see and cannot clear.
     Ok((clamped != bounds).then_some(clamped))
+}
+
+fn normalize_redaction_styles(objects: &mut [AnnotationObject]) {
+    for object in objects {
+        if matches!(object.annotation, Annotation::Redact { .. }) {
+            object.style.redact_intensity = object.style.effective_redact_intensity();
+        } else {
+            object.style.redact_intensity = None;
+        }
+    }
 }
 
 /// A borrowed, invariant-preserving handle to one annotation.

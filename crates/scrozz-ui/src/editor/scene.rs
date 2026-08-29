@@ -80,6 +80,23 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
         state.set_crop_width(state.document().logical_size().width * 0.68);
         return;
     }
+    if fixture.scenario == crate::harness::Scenario::EditorRedact {
+        state.set_tool(super::Tool::Redact);
+        state.set_redact_intensity(0.78);
+        state.pointer_pressed(LogicalPoint::new(
+            state.document().logical_size().width * 0.32,
+            state.document().logical_size().height * 0.42,
+        ));
+        state.pointer_dragged(
+            LogicalPoint::new(
+                state.document().logical_size().width * 0.72,
+                state.document().logical_size().height * 0.58,
+            ),
+            false,
+        );
+        state.pointer_released();
+        return;
+    }
     state.set_tool(super::Tool::Arrow);
     // Keep Arrow in hand while selecting the sample arrow, so the golden proves
     // the tool can edit an existing arrow and paints endpoint chrome only.
@@ -139,17 +156,10 @@ fn sample_document(fixture: &Fixture, seed: u64) -> Document {
     );
     document.add(
         Annotation::Redact {
-            area: rect(w * 0.34, h * 0.08, w * 0.17, h * 0.13),
+            area: rect(w * 0.40, h * 0.08, w * 0.24, h * 0.13),
             style: RedactStyle::Pixelate,
         },
-        Style::redaction(),
-    );
-    document.add(
-        Annotation::Redact {
-            area: rect(w * 0.53, h * 0.08, w * 0.17, h * 0.13),
-            style: RedactStyle::Blur,
-        },
-        Style::redaction(),
+        Style::secure_redaction(scrozz_annotate::REDACT_INTENSITY_DEFAULT),
     );
     document.add(
         Annotation::Counter {

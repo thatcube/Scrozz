@@ -283,6 +283,8 @@ pub enum Scenario {
     DockScrubbing,
     /// The editor's dedicated crop mode with full chrome and controls.
     EditorCrop,
+    /// The single secure Redact tool with its intensity control.
+    EditorRedact,
 }
 
 impl Scenario {
@@ -311,6 +313,7 @@ impl Scenario {
             Self::SelectorMixedDpi,
             Self::DockScrubbing,
             Self::EditorCrop,
+            Self::EditorRedact,
         ]
     }
 
@@ -342,6 +345,7 @@ impl Scenario {
             Self::SelectorMixedDpi => "selector-mixed-dpi",
             Self::DockScrubbing => "dock-scrubbing",
             Self::EditorCrop => "editor-crop",
+            Self::EditorRedact => "editor-redact",
         }
     }
 
@@ -850,6 +854,16 @@ impl Fixture {
                     true,
                     "Crop with precision",
                     "The complete source stays visible behind a rule-of-thirds crop with direct edge handles, dimensions, aspect presets, snap, Cancel, and Crop actions.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorRedact => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Redact irreversibly",
+                    "One privacy tool with continuous Low-to-High intensity. Every level writes an opaque randomized mosaic through the export renderer.",
                     instants::REST,
                     None,
                 ),
@@ -2094,6 +2108,7 @@ impl SceneRegistry {
             Scenario::EditorColorPopover,
             Scenario::EditorArrowStyles,
             Scenario::EditorCrop,
+            Scenario::EditorRedact,
         ] {
             me.register(scenario, Box::new(crate::editor::EditorScene));
         }
@@ -3909,6 +3924,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorColorPopover,
         Scenario::EditorArrowStyles,
         Scenario::EditorCrop,
+        Scenario::EditorRedact,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),
