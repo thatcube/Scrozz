@@ -130,6 +130,7 @@ SCROZZ_RECORD_WINDOW_SMOKE=1 tools/run-macos-recording-smoke.sh window-disappear
 tools/run-macos-recording-smoke.sh microphone-package # build/sign only; no prompt
 SCROZZ_RECORD_MIC_SMOKE=1 tools/run-macos-recording-smoke.sh microphone
 SCROZZ_PLAYBACK_SMOKE=1 tools/run-macos-playback-smoke.sh # plays a quiet A/V fixture
+cargo run -p scrozz-record --example macos_export_smoke -- source.mp4 output.mp4
 ```
 
 ### From the command line

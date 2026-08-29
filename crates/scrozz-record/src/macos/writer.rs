@@ -848,7 +848,7 @@ fn destination(requested: Option<&Path>) -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("scrozz-recording-{nonce}.mp4")))
 }
 
-fn sidecar_paths(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn sidecar_paths(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let Some(file_name) = path.file_name() else {
         return Ok(Vec::new());
     };
@@ -869,7 +869,10 @@ fn sidecar_paths(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn best_retained_output(path: &Path, sidecars: &[PathBuf]) -> Option<(PathBuf, Salvageability)> {
+pub(crate) fn best_retained_output(
+    path: &Path,
+    sidecars: &[PathBuf],
+) -> Option<(PathBuf, Salvageability)> {
     let classify = |candidate: &Path| match mp4_salvageability(candidate) {
         Ok(value) => value,
         Err(failure) => {
@@ -970,7 +973,7 @@ fn cleanup_working_directory(directory: &Path) {
     }
 }
 
-fn preserve_before_cancellation(path: &Path) -> std::io::Result<Option<PathBuf>> {
+pub(crate) fn preserve_before_cancellation(path: &Path) -> std::io::Result<Option<PathBuf>> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => return Ok(None),
@@ -1058,6 +1061,73 @@ fn mp4_salvageability(path: &Path) -> std::io::Result<Option<Salvageability>> {
 }
 
 fn avfoundation_reports_playable_video(path: &Path) -> bool {
+    if path.extension().is_some_and(|extension| extension == "mp4") {
+        return avfoundation_reports_playable_mp4(path);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for _ in 0..100 {
+        let sequence = RECOVERY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let probe = parent.join(format!(
+            ".scrozz-avfoundation-probe-{}-{sequence}.mp4",
+            std::process::id()
+        ));
+        match std::fs::hard_link(path, &probe) {
+            Ok(()) => {
+                let playable = avfoundation_reports_playable_mp4(&probe);
+                remove_file_warn(&probe);
+                return playable;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(hard_link_error) => {
+                let mut source = match std::fs::File::open(path) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "could not open AVAssetWriter recovery for probing");
+                        return false;
+                    }
+                };
+                let mut destination = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&probe)
+                {
+                    Ok(destination) => destination,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %hard_link_error,
+                            %error,
+                            "could not copy an MP4-named AVAssetWriter recovery probe"
+                        );
+                        return false;
+                    }
+                };
+                if let Err(error) = std::io::copy(&mut source, &mut destination)
+                    .and_then(|_| destination.sync_all())
+                {
+                    remove_file_warn(&probe);
+                    tracing::warn!(
+                        path = %path.display(),
+                        %hard_link_error,
+                        %error,
+                        "could not finish an MP4-named AVAssetWriter recovery probe"
+                    );
+                    return false;
+                }
+                let playable = avfoundation_reports_playable_mp4(&probe);
+                remove_file_warn(&probe);
+                return playable;
+            }
+        }
+    }
+    false
+}
+
+fn avfoundation_reports_playable_mp4(path: &Path) -> bool {
     let Some(url) = NSURL::from_file_path(path) else {
         return false;
     };

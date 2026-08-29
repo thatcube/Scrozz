@@ -107,7 +107,7 @@ pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
     CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
     OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe, RecordingPresentation,
-    RecordingSurfaceAction, VideoEditorSnapshot,
+    RecordingSurfaceAction,
 };
 pub use recording_hud::{
     RecordingHud, RecordingHudAction, RecordingHudControls, RecordingHudModel,
@@ -124,6 +124,8 @@ pub use select::{
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
 pub use video_editor::{
-    TranscodeView, VideoEditor, VideoEditorAction, VideoEditorControls, VideoEditorModel,
-    VideoEditorResponse, VideoPreview,
+    TranscodeView, VIDEO_EDITOR_WINDOW_TITLE, VideoEditor, VideoEditorAction, VideoEditorControls,
+    VideoEditorModel, VideoEditorResponse, VideoEditorSnapshot, VideoPreview,
+    show_window as show_video_editor_window, viewport_builder as video_editor_viewport_builder,
+    viewport_id as video_editor_viewport_id,
 };

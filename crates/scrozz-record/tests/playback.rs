@@ -29,6 +29,10 @@ mod macos {
     use scrozz_record::{
         Recording,
         edit::{ChannelBehavior, EditPlan, TrimRange, VideoDocument},
+        handoff::{
+            FinalizedMediaHandoff, FinalizedMediaKind, FinalizedMediaOwnership,
+            FinalizedVideoAction, POSTER_MAX_EDGE,
+        },
         media::{DecodedMediaSample, NativeMediaSource},
         settings::ResolutionCap,
         transcode::{NativeTranscoder, TranscodeEvent, Transcoder as _},
@@ -150,6 +154,35 @@ mod macos {
             }
         }
         assert!((23..=25).contains(&video_frames));
+    }
+
+    #[test]
+    fn completed_video_handoff_is_durable_bounded_and_editor_ready() {
+        let handoff = FinalizedMediaHandoff::from_completed(&recording(fixture_path())).unwrap();
+        assert_eq!(handoff.path, fs::canonicalize(fixture_path()).unwrap());
+        assert_eq!(
+            handoff.ownership,
+            FinalizedMediaOwnership::ApplicationRetained
+        );
+        assert_eq!(handoff.media_kind, FinalizedMediaKind::Video);
+        assert_eq!(handoff.open_action, FinalizedVideoAction::OpenEditor);
+        assert_eq!(handoff.dimensions, (96, 54));
+        assert!(handoff.file_size_bytes > 0);
+        assert!(handoff.audio_present);
+        assert!(handoff.poster.width.max(handoff.poster.height) <= POSTER_MAX_EDGE);
+        assert_eq!(
+            handoff.poster.bytes.len(),
+            handoff.poster.stride * handoff.poster.height as usize
+        );
+        assert_eq!(handoff.drag_path(), handoff.path);
+
+        let silent =
+            Recording::native(silent_fixture_path(), 1.0, "deterministic silent fixture").unwrap();
+        assert!(
+            !FinalizedMediaHandoff::from_completed(&silent)
+                .unwrap()
+                .audio_present
+        );
     }
 
     #[test]

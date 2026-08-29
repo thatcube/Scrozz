@@ -328,6 +328,16 @@ fn video_editor_actions_and_enabled_state_are_headless() {
     assert!(initial.controls.mono_enabled);
     assert!(initial.controls.export_enabled);
 
+    let closed = click(&context, initial.close_response.rect.center(), draw);
+    assert!(closed.actions.contains(&VideoEditorAction::Close));
+
+    let sought = click(&context, initial.seek_forward_response.rect.center(), draw);
+    assert!(
+        sought
+            .actions
+            .contains(&VideoEditorAction::Seek(Duration::from_secs(5)))
+    );
+
     let playing = click(&context, initial.transport_response.rect.center(), draw);
     assert!(playing.actions.contains(&VideoEditorAction::Play));
 
@@ -381,6 +391,50 @@ fn video_editor_actions_and_enabled_state_are_headless() {
         "cancel click at {cancel_point:?} emitted {:?} from {:?}",
         cancelled.actions,
         cancel.rect
+    );
+}
+
+#[test]
+fn video_editor_sets_trim_boundaries_to_the_playhead() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let mut document = document(2);
+    document.seek(Duration::from_secs(5)).unwrap();
+    let plan = EditPlan::video(&document).unwrap();
+    let draw = |ui: &mut egui::Ui| {
+        VideoEditor::new(
+            VideoEditorModel {
+                document: &document,
+                plan,
+                preview: VideoPreview::default(),
+                transcode: TranscodeView::Idle,
+            },
+            &theme,
+        )
+        .show(ui)
+    };
+    let initial = run_ui(&context, Vec::new(), draw);
+    let set_in = click(&context, initial.set_in_response.rect.center(), draw);
+    let mut expected_in = plan;
+    expected_in.trim.start = Duration::from_secs(5);
+    assert!(
+        set_in
+            .actions
+            .contains(&VideoEditorAction::PlanChanged(expected_in))
+    );
+
+    let context = new_context();
+    let initial = run_ui(&context, Vec::new(), draw);
+    let set_out = click(&context, initial.set_out_response.rect.center(), draw);
+    let mut expected_out = plan;
+    expected_out.trim.end = Duration::from_secs(5);
+    assert!(
+        set_out
+            .actions
+            .contains(&VideoEditorAction::PlanChanged(expected_out)),
+        "set-out emitted {:?} from {:?}",
+        set_out.actions,
+        initial.set_out_response.rect
     );
 }
 

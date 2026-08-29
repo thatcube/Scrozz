@@ -35,6 +35,8 @@ pub(super) const BACKEND_NAME: &str = "macOS AVFoundation";
 pub(super) const AVAILABLE: bool = true;
 pub(super) const UNAVAILABLE_REASON: Option<&str> = None;
 const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
+const FRAME_RATE_PROBE_SAMPLES: usize = 600;
+const FRAME_RATE_PROBE_SPAN: Duration = Duration::from_secs(10);
 
 pub(super) fn inspect(path: &Path, file_size_bytes: u64) -> Result<SourceInspection> {
     let asset = open_asset(path);
@@ -68,19 +70,20 @@ pub(super) fn inspect(path: &Path, file_size_bytes: u64) -> Result<SourceInspect
     let width = finite_dimension(width, "width")?;
     let height = finite_dimension(height, "height")?;
 
-    let mut fps = f64::from(unsafe { video.nominalFrameRate() });
-    if !fps.is_finite() || fps <= 0.0 {
+    let mut declared_fps = f64::from(unsafe { video.nominalFrameRate() });
+    if !declared_fps.is_finite() || declared_fps <= 0.0 {
         let frame_duration = unsafe { video.minFrameDuration() };
-        fps = duration_from_time(frame_duration)
+        declared_fps = duration_from_time(frame_duration)
             .filter(|duration| !duration.is_zero())
             .map_or(0.0, |duration| 1.0 / duration.as_secs_f64());
     }
-    if !fps.is_finite() || fps <= 0.0 {
+    if !declared_fps.is_finite() || declared_fps <= 0.0 {
         return Err(Error::Codec(format!(
             "AVFoundation could not determine the video frame rate for {}",
             path.display()
         )));
     }
+    let fps = probe_video_frame_rate(&asset, video, declared_fps);
 
     let audio_tracks = tracks(&asset, unsafe { AVMediaTypeAudio }, "audio")?;
     let audio_channels = if audio_tracks.count() == 0 {
@@ -101,6 +104,86 @@ pub(super) fn inspect(path: &Path, file_size_bytes: u64) -> Result<SourceInspect
         file_size_bytes,
         backend: BACKEND_NAME.to_owned(),
     })
+}
+
+fn probe_video_frame_rate(asset: &AVAsset, track: &AVAssetTrack, declared_fps: f64) -> f64 {
+    let reader = match unsafe { AVAssetReader::assetReaderWithAsset_error(asset) } {
+        Ok(reader) => reader,
+        Err(failure) => {
+            tracing::warn!(
+                error = %error::describe(&failure, "probing video frame rate"),
+                declared_fps,
+                "using declared frame rate because the bounded probe could not open"
+            );
+            return declared_fps;
+        }
+    };
+    let output = unsafe {
+        AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(track, None)
+    };
+    unsafe {
+        output.setAlwaysCopiesSampleData(false);
+        if !reader.canAddOutput(&output) {
+            tracing::warn!(
+                declared_fps,
+                "using declared frame rate because AVAssetReader refused the bounded probe"
+            );
+            return declared_fps;
+        }
+        reader.addOutput(&output);
+        if !reader.startReading() {
+            tracing::warn!(
+                error = %reader_failure(&reader, "starting video frame-rate probe"),
+                declared_fps,
+                "using declared frame rate because the bounded probe could not start"
+            );
+            return declared_fps;
+        }
+    }
+
+    let mut timestamps = Vec::with_capacity(FRAME_RATE_PROBE_SAMPLES);
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    while timestamps.len() < FRAME_RATE_PROBE_SAMPLES {
+        let Some(sample) = (unsafe { output.copyNextSampleBuffer() }) else {
+            break;
+        };
+        let Some(timestamp) = seconds_from_time(unsafe { sample.presentation_time_stamp() }) else {
+            continue;
+        };
+        minimum = minimum.min(timestamp);
+        maximum = maximum.max(timestamp);
+        timestamps.push(timestamp);
+        if maximum - minimum >= FRAME_RATE_PROBE_SPAN.as_secs_f64() {
+            break;
+        }
+    }
+    if unsafe { reader.status() } == AVAssetReaderStatus::Failed {
+        tracing::warn!(
+            error = %reader_failure(&reader, "reading video frame-rate samples"),
+            samples = timestamps.len(),
+            declared_fps,
+            "bounded frame-rate probe reached a damaged tail; keeping usable samples"
+        );
+    }
+    unsafe {
+        reader.cancelReading();
+    }
+
+    measured_frame_rate(&mut timestamps, declared_fps)
+}
+
+fn measured_frame_rate(timestamps: &mut Vec<f64>, declared_fps: f64) -> f64 {
+    timestamps.retain(|timestamp| timestamp.is_finite());
+    timestamps.sort_by(f64::total_cmp);
+    timestamps.dedup_by(|first, second| (*first - *second).abs() < f64::EPSILON);
+    timestamps
+        .first()
+        .zip(timestamps.last())
+        .filter(|(first, last)| timestamps.len() >= 3 && *last - *first >= 0.1)
+        .map(|(first, last)| (timestamps.len() - 1) as f64 / (*last - *first))
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .unwrap_or(declared_fps)
 }
 
 pub(super) struct Decoder {
@@ -482,9 +565,21 @@ fn duration_from_time(time: CMTime) -> Option<Duration> {
     {
         return None;
     }
+
     let nanos =
         i128::from(value).checked_mul(i128::from(NANOSECONDS_PER_SECOND))? / i128::from(timescale);
     u64::try_from(nanos).ok().map(Duration::from_nanos)
+}
+
+fn seconds_from_time(time: CMTime) -> Option<f64> {
+    if !time.flags.contains(CMTimeFlags::Valid)
+        || time.flags.intersects(CMTimeFlags::ImpliedValueFlagsMask)
+        || time.timescale <= 0
+    {
+        return None;
+    }
+    let seconds = time.value as f64 / f64::from(time.timescale);
+    seconds.is_finite().then_some(seconds)
 }
 
 fn time_from_duration(duration: Duration) -> CMTime {
@@ -522,5 +617,25 @@ impl Drop for PixelBufferLock<'_> {
         unsafe {
             let _ = CVPixelBufferUnlockBaseAddress(self.buffer, self.flags);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::measured_frame_rate;
+
+    #[test]
+    fn measured_rate_wins_over_a_timebase_style_nominal_rate() {
+        let mut timestamps: Vec<_> = (0..=300).map(|index| f64::from(index) / 30.0).collect();
+        timestamps.swap(1, 2);
+        timestamps.swap(3, 5);
+        let measured = measured_frame_rate(&mut timestamps, 120.0);
+        assert!((measured - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn short_or_invalid_probes_keep_the_declared_rate() {
+        assert_eq!(measured_frame_rate(&mut vec![0.0, 0.03], 60.0), 60.0);
+        assert_eq!(measured_frame_rate(&mut vec![1.0; 10], 24.0), 24.0);
     }
 }

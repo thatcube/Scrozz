@@ -4,9 +4,11 @@ use objc2::Message;
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264, AVVideoCodecTypeHEVC,
+    AVVideoColorPrimaries_ITU_R_709_2, AVVideoColorPrimariesKey, AVVideoColorPropertiesKey,
     AVVideoCompressionPropertiesKey, AVVideoEncoderSpecificationKey,
     AVVideoExpectedSourceFrameRateKey, AVVideoHeightKey, AVVideoMaxKeyFrameIntervalDurationKey,
-    AVVideoWidthKey,
+    AVVideoTransferFunction_ITU_R_709_2, AVVideoTransferFunctionKey, AVVideoWidthKey,
+    AVVideoYCbCrMatrix_ITU_R_709_2, AVVideoYCbCrMatrixKey,
 };
 use objc2_foundation::{NSMutableDictionary, NSNumber, NSString};
 use scrozz_core::{Error, Result};
@@ -34,16 +36,48 @@ pub(crate) fn video(
 pub(crate) fn transcode_video(
     width: u32,
     height: u32,
-    fps: u32,
+    bitrate_fps: u32,
+    encoder_rate_hint: u32,
     quality: Quality,
 ) -> Result<objc2::rc::Retained<SettingsDictionary>> {
-    video_settings(
+    let settings = video_settings(
         VideoCodec::H264,
         width,
         height,
-        quality.target_bitrate(width, height, fps),
-        fps,
-    )
+        quality.target_bitrate(width, height, bitrate_fps),
+        encoder_rate_hint,
+    )?;
+    let color = rec709_color_properties()?;
+    let color_key = unsafe { required(AVVideoColorPropertiesKey, "AVVideoColorPropertiesKey") }?;
+    settings.insert(color_key, any(&*color));
+    Ok(settings)
+}
+
+fn rec709_color_properties() -> Result<objc2::rc::Retained<SettingsDictionary>> {
+    let properties = SettingsDictionary::new();
+    for (key, value, key_name, value_name) in [
+        (
+            unsafe { AVVideoColorPrimariesKey },
+            unsafe { AVVideoColorPrimaries_ITU_R_709_2 },
+            "AVVideoColorPrimariesKey",
+            "AVVideoColorPrimaries_ITU_R_709_2",
+        ),
+        (
+            unsafe { AVVideoTransferFunctionKey },
+            unsafe { AVVideoTransferFunction_ITU_R_709_2 },
+            "AVVideoTransferFunctionKey",
+            "AVVideoTransferFunction_ITU_R_709_2",
+        ),
+        (
+            unsafe { AVVideoYCbCrMatrixKey },
+            unsafe { AVVideoYCbCrMatrix_ITU_R_709_2 },
+            "AVVideoYCbCrMatrixKey",
+            "AVVideoYCbCrMatrix_ITU_R_709_2",
+        ),
+    ] {
+        properties.insert(required(key, key_name)?, any(required(value, value_name)?));
+    }
+    Ok(properties)
 }
 
 fn video_settings(

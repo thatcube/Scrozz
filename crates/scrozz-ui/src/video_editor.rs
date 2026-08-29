@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use egui::{
-    Align2, ComboBox, Image, ProgressBar, Response, RichText, Sense, Slider, Stroke, StrokeKind,
-    Ui, load::SizedTexture, vec2,
+    Align2, CentralPanel, ComboBox, Frame, Image, ProgressBar, Response, RichText, ScrollArea,
+    Sense, Slider, Stroke, StrokeKind, TextureHandle, Ui, ViewportBuilder, WindowLevel,
+    load::SizedTexture, vec2,
 };
 use scrozz_record::{
     edit::{ChannelBehavior, EditOutput, EditPlan, PlaybackState, VideoDocument},
@@ -21,6 +22,171 @@ use crate::{
     },
     theme::{Radius, Space, Text, Theme, corner},
 };
+
+/// Stable native title used for activation and AppKit diagnostics.
+pub const VIDEO_EDITOR_WINDOW_TITLE: &str = "Scrozz Video Editor";
+
+/// Stable identity of the ordinary recording-editor viewport.
+#[must_use]
+pub fn viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("scrozz-recording-video-editor")
+}
+
+/// Opaque, focus-taking, movable recording-editor window properties.
+#[must_use]
+pub fn viewport_builder() -> ViewportBuilder {
+    ViewportBuilder::default()
+        .with_title(VIDEO_EDITOR_WINDOW_TITLE)
+        .with_inner_size([900.0, 900.0])
+        .with_min_inner_size([680.0, 620.0])
+        .with_clamp_size_to_monitor_size(true)
+        .with_resizable(true)
+        .with_decorations(true)
+        .with_transparent(false)
+        .with_mouse_passthrough(false)
+        .with_has_shadow(true)
+        .with_taskbar(true)
+        .with_active(false)
+        .with_visible(false)
+        .with_window_level(WindowLevel::Normal)
+}
+
+/// Editor state retained by the application and cloned into its native viewport.
+#[derive(Debug, Clone)]
+pub struct VideoEditorSnapshot {
+    /// Native source plus deterministic playback cursor.
+    pub document: VideoDocument,
+    /// Current non-destructive edit plan.
+    pub plan: EditPlan,
+    /// Decoded preview frame and native media-clock state.
+    pub playback: PlaybackSnapshot,
+    /// Current native export state, or `None` before the first export.
+    pub transcode_status: Option<TranscodeStatus>,
+    /// Last normalized export progress.
+    pub transcode_progress: f32,
+    /// Complete exported artifact.
+    pub transcode_output: Option<TranscodeOutput>,
+    /// Explicit export failure, including any retained partial.
+    pub transcode_failure: Option<TranscodeFailure>,
+}
+
+#[derive(Clone)]
+struct EditorTexture {
+    stream_id: u64,
+    sequence: u64,
+    handle: TextureHandle,
+}
+
+/// Draws one editor pass over an opaque system-theme canvas.
+///
+/// The returned panel response spans the entire viewport, so even blank
+/// background areas are real hit-testable window content rather than holes in a
+/// transparent overlay.
+#[must_use]
+pub fn show_window(
+    ui: &mut Ui,
+    snapshot: &VideoEditorSnapshot,
+    theme: &Theme,
+) -> VideoEditorResponse {
+    install_window_style(ui, theme);
+    let preview_texture = editor_texture(ui.ctx(), &snapshot.playback);
+    let transcode = snapshot
+        .transcode_status
+        .map_or(TranscodeView::Idle, |status| {
+            TranscodeView::from_status(
+                status,
+                snapshot.transcode_progress,
+                snapshot.transcode_output.as_ref(),
+                snapshot.transcode_failure.as_ref(),
+            )
+        });
+    CentralPanel::default()
+        .frame(
+            Frame::new()
+                .fill(theme.palette.canvas())
+                .inner_margin(Space::XL),
+        )
+        .show(ui, |ui| {
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        VideoEditor::new(
+                            VideoEditorModel {
+                                document: &snapshot.document,
+                                plan: snapshot.plan,
+                                preview: VideoPreview::from_snapshot(
+                                    &snapshot.playback,
+                                    preview_texture,
+                                ),
+                                transcode,
+                            },
+                            theme,
+                        )
+                        .show(ui)
+                    })
+                    .inner
+                })
+                .inner
+        })
+        .inner
+}
+
+fn install_window_style(ui: &mut Ui, theme: &Theme) {
+    ui.set_style(window_style(ui.style(), theme));
+}
+
+fn window_style(base: &egui::Style, theme: &Theme) -> egui::Style {
+    let mut style = base.clone();
+    style.visuals.dark_mode = theme.palette.is_dark();
+    style.visuals.override_text_color = Some(theme.palette.text);
+    style.visuals.panel_fill = theme.palette.canvas();
+    style.visuals.window_fill = theme.palette.canvas();
+    style.visuals.selection.bg_fill = theme.palette.accent.linear_multiply(0.55);
+    style.visuals.selection.stroke = Stroke::new(1.0, theme.palette.on_accent);
+    style.visuals.text_cursor.blink = false;
+    style.animation_time = 0.0;
+    style.spacing.item_spacing = vec2(Space::SM, Space::SM);
+    style.spacing.button_padding = vec2(Space::MD, Space::SM);
+    style.text_styles = crate::theme::text_styles(theme);
+    style
+}
+
+fn editor_texture(ctx: &egui::Context, playback: &PlaybackSnapshot) -> Option<SizedTexture> {
+    let preview = playback.frame.as_ref()?;
+    let id = egui::Id::new("scrozz-recording-editor-texture");
+    let mut state = ctx.data_mut(|data| data.get_temp::<EditorTexture>(id));
+    let replace = state.as_ref().is_none_or(|state| {
+        state.stream_id != playback.stream_id || state.sequence != preview.sequence
+    });
+    if replace {
+        let frame = &preview.frame.image;
+        let width = usize::try_from(frame.width).ok()?;
+        let height = usize::try_from(frame.height).ok()?;
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.data);
+        if let Some(state) = &mut state {
+            state.handle.set(image, egui::TextureOptions::LINEAR);
+            state.stream_id = playback.stream_id;
+            state.sequence = preview.sequence;
+        } else {
+            state = Some(EditorTexture {
+                stream_id: playback.stream_id,
+                sequence: preview.sequence,
+                handle: ctx.load_texture(
+                    "scrozz.recording.editor.preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ),
+            });
+        }
+        if let Some(state) = &state {
+            ctx.data_mut(|data| data.insert_temp(id, state.clone()));
+        }
+    }
+    state
+        .as_ref()
+        .map(|state| SizedTexture::from_handle(&state.handle))
+}
 
 /// Read-only transcoder state supplied by the caller.
 #[derive(Debug, Clone, Copy)]
@@ -190,10 +356,20 @@ pub struct VideoEditorResponse {
     pub controls: VideoEditorControls,
     /// Response for the full editor panel.
     pub response: Response,
+    /// Done/close control.
+    pub close_response: Response,
     /// Play/pause control.
     pub transport_response: Response,
     /// Seek control.
     pub seek_response: Response,
+    /// Seek five seconds backward.
+    pub seek_backward_response: Response,
+    /// Seek five seconds forward.
+    pub seek_forward_response: Response,
+    /// Set trim-in to the current playhead.
+    pub set_in_response: Response,
+    /// Set trim-out to the current playhead.
+    pub set_out_response: Response,
     /// Export control.
     pub export_response: Response,
     /// Cancel-export control, present only while exporting.
@@ -234,7 +410,12 @@ impl<'a> VideoEditor<'a> {
         }
 
         let mut transport_response = None;
+        let mut close_response = None;
         let mut seek_response = None;
+        let mut seek_backward_response = None;
+        let mut seek_forward_response = None;
+        let mut set_in_response = None;
+        let mut set_out_response = None;
         let mut export_response = None;
         let mut cancel_export_response = None;
         let mut reveal_response = None;
@@ -260,9 +441,11 @@ impl<'a> VideoEditor<'a> {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if button(ui, self.theme, "Done", false, !running).clicked() {
+                    let close = button(ui, self.theme, "Done", false, !running);
+                    if close.clicked() {
                         actions.push(VideoEditorAction::Close);
                     }
+                    close_response = Some(close);
                     ui.label(
                         RichText::new(format!(
                             "{} / {}",
@@ -304,6 +487,40 @@ impl<'a> VideoEditor<'a> {
                 }
                 transport_response = Some(transport);
 
+                let backward = button(
+                    ui,
+                    self.theme,
+                    "−5s",
+                    false,
+                    !running && document.position() > plan.trim.start,
+                );
+                if backward.clicked() {
+                    actions.push(VideoEditorAction::Seek(
+                        document
+                            .position()
+                            .saturating_sub(Duration::from_secs(5))
+                            .max(plan.trim.start),
+                    ));
+                }
+                seek_backward_response = Some(backward);
+
+                let forward = button(
+                    ui,
+                    self.theme,
+                    "+5s",
+                    false,
+                    !running && document.position() < plan.trim.end,
+                );
+                if forward.clicked() {
+                    actions.push(VideoEditorAction::Seek(
+                        document
+                            .position()
+                            .saturating_add(Duration::from_secs(5))
+                            .min(plan.trim.end),
+                    ));
+                }
+                seek_forward_response = Some(forward);
+
                 let mut position = document.position().as_secs_f64();
                 let seek = ui.add_enabled(
                     !running,
@@ -324,6 +541,7 @@ impl<'a> VideoEditor<'a> {
                 ui.add_enabled_ui(!running && playback_available, |ui| {
                     ComboBox::from_id_salt("video-editor-rate")
                         .selected_text(format!("{}×", format_rate(self.model.preview.rate)))
+                        .popup_style(ui.style().as_ref().clone().into())
                         .show_ui(ui, |ui| {
                             for rate in [0.5_f32, 1.0, 1.5, 2.0] {
                                 if ui
@@ -366,6 +584,20 @@ impl<'a> VideoEditor<'a> {
                     plan.trim.start = value;
                     plan_changed = true;
                 }
+                let set_in = button(
+                    ui,
+                    self.theme,
+                    "Set in",
+                    false,
+                    !running
+                        && document.position() < plan.trim.end
+                        && document.position() != plan.trim.start,
+                );
+                if set_in.clicked() {
+                    plan.trim.start = document.position();
+                    plan_changed = true;
+                }
+                set_in_response = Some(set_in);
             });
             ui.horizontal(|ui| {
                 ui.label(
@@ -389,6 +621,20 @@ impl<'a> VideoEditor<'a> {
                     plan.trim.end = value;
                     plan_changed = true;
                 }
+                let set_out = button(
+                    ui,
+                    self.theme,
+                    "Set out",
+                    false,
+                    !running
+                        && document.position() > plan.trim.start
+                        && document.position() != plan.trim.end,
+                );
+                if set_out.clicked() {
+                    plan.trim.end = document.position();
+                    plan_changed = true;
+                }
+                set_out_response = Some(set_out);
             });
 
             ui.add_space(Space::SM);
@@ -405,6 +651,7 @@ impl<'a> VideoEditor<'a> {
                 columns[0].add_enabled_ui(!running, |ui| {
                     ComboBox::from_id_salt("video-editor-quality")
                         .selected_text(quality_label(plan.quality))
+                        .popup_style(ui.style().as_ref().clone().into())
                         .show_ui(ui, |ui| {
                             for quality in Quality::ALL {
                                 if ui
@@ -429,6 +676,7 @@ impl<'a> VideoEditor<'a> {
                 columns[1].add_enabled_ui(!running, |ui| {
                     ComboBox::from_id_salt("video-editor-resolution")
                         .selected_text(resolution_label(plan.resolution))
+                        .popup_style(ui.style().as_ref().clone().into())
                         .show_ui(ui, |ui| {
                             for resolution in ResolutionCap::ALL {
                                 if ui
@@ -605,8 +853,15 @@ impl<'a> VideoEditor<'a> {
             actions,
             controls,
             response: inner.response,
+            close_response: close_response.expect("the editor always draws close"),
             transport_response: transport_response.expect("the editor always draws transport"),
             seek_response: seek_response.expect("the editor always draws seek"),
+            seek_backward_response: seek_backward_response
+                .expect("the editor always draws backward seek"),
+            seek_forward_response: seek_forward_response
+                .expect("the editor always draws forward seek"),
+            set_in_response: set_in_response.expect("the editor always draws set-in"),
+            set_out_response: set_out_response.expect("the editor always draws set-out"),
             export_response: export_response.expect("the editor always draws export"),
             cancel_export_response,
             reveal_response,
@@ -977,4 +1232,43 @@ fn fixture_preview_image() -> egui::ColorImage {
         }
     }
     egui::ColorImage::new([WIDTH, HEIGHT], pixels)
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn editor_viewport_is_an_opaque_interactive_normal_window() {
+        let viewport = viewport_builder();
+        assert_eq!(viewport.title.as_deref(), Some(VIDEO_EDITOR_WINDOW_TITLE));
+        assert_eq!(viewport.decorations, Some(true));
+        assert_eq!(viewport.resizable, Some(true));
+        assert_eq!(viewport.transparent, Some(false));
+        assert_eq!(viewport.mouse_passthrough, Some(false));
+        assert_eq!(viewport.has_shadow, Some(true));
+        assert_eq!(viewport.taskbar, Some(true));
+        assert_eq!(viewport.active, Some(false));
+        assert_eq!(viewport.visible, Some(false));
+        assert_eq!(viewport.window_level, Some(WindowLevel::Normal));
+        assert_eq!(viewport.clamp_size_to_monitor_size, Some(true));
+        assert_ne!(viewport_id(), egui::ViewportId::ROOT);
+    }
+
+    #[test]
+    fn both_editor_appearances_have_opaque_canvases() {
+        assert_eq!(Theme::dark().palette.canvas().a(), 255);
+        assert_eq!(Theme::light().palette.canvas().a(), 255);
+        let base = egui::Style::default();
+        let light = window_style(&base, &Theme::light());
+        let dark = window_style(&base, &Theme::dark());
+        assert!(!light.visuals.dark_mode);
+        assert!(dark.visuals.dark_mode);
+        assert_eq!(light.visuals.panel_fill.a(), 255);
+        assert_eq!(dark.visuals.panel_fill.a(), 255);
+        assert_eq!(
+            base.visuals.panel_fill,
+            egui::Style::default().visuals.panel_fill
+        );
+    }
 }

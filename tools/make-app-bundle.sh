@@ -18,6 +18,7 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 APP="${1:-/Applications/Scrozz.app}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/scrozz-rel}"
 BUILD_NUMBER="${SCROZZ_BUILD_NUMBER:-$(date +%s)}"
+SIGN_IDENTITY="${SCROZZ_CODESIGN_IDENTITY:--}"
 
 echo "==> building release binary"
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
@@ -95,11 +96,15 @@ if [[ "${SCROZZ_INCLUDE_LEGACY_ICON:-0}" == "1" ]]; then
     "$APP/Contents/Info.plist"
 fi
 
-echo "==> signing (ad-hoc, stable identifier)"
-# An ad-hoc signature is enough for TCC to keep the grant across rebuilds, as
-# long as the identifier does not change. Without --identifier every rebuild
-# looks like a different app and macOS asks again.
-codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  echo "==> signing (ad-hoc, stable identifier)"
+else
+  echo "==> signing ($SIGN_IDENTITY)"
+fi
+# An ad-hoc signature is enough for local use, while an installed Apple
+# Development identity keeps one stable designated requirement for hands-on
+# builds. Without --identifier every rebuild looks like a different app.
+codesign --force --sign "$SIGN_IDENTITY" --identifier com.thatcube.Scrozz "$APP"
 
 echo
 echo "built: $APP"

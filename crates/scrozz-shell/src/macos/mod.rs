@@ -15,6 +15,7 @@
 
 pub mod display;
 pub mod drag;
+pub mod editor;
 pub mod overlay;
 pub mod permissions;
 

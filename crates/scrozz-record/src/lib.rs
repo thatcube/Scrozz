@@ -28,6 +28,7 @@ mod encoder;
 pub mod engine;
 mod format;
 mod h264;
+pub mod handoff;
 #[cfg(target_os = "linux")]
 mod linux;
 pub mod machine;

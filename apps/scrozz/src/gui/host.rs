@@ -17,10 +17,14 @@ use scrozz_core::{
     Capture, CaptureRequest, CursorMode, Error as CoreError, RegionSelector, SelectionHost,
     SelectionOptions, SelectionOutcome,
 };
+#[cfg(target_os = "macos")]
+use scrozz_ui::VIDEO_EDITOR_WINDOW_TITLE;
 use scrozz_ui::{
-    HistoryWindowAction, OverlayHandle, Theme, history_viewport_builder, history_viewport_id,
+    HistoryWindowAction, OverlayHandle, RecordingSurfaceAction, Theme, VideoEditorAction,
+    history_viewport_builder, history_viewport_id,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
-    show_history_window,
+    show_history_window, show_video_editor_window, video_editor_viewport_builder,
+    video_editor_viewport_id,
 };
 
 use crate::{
@@ -260,6 +264,12 @@ impl Host for Windowed {
                     announced: false,
                     stopped: false,
                     history_actions: Arc::new(Mutex::new(Vec::new())),
+                    editor_actions: Arc::new(Mutex::new(Vec::new())),
+                    editor_was_open: false,
+                    editor_focus_pending: false,
+                    editor_focus_delay: 0,
+                    editor_focus_error_reported: false,
+                    editor_hidden_for_selection: false,
                 }))
             }),
         )
@@ -426,6 +436,12 @@ struct Driver {
     announced: bool,
     stopped: bool,
     history_actions: Arc<Mutex<Vec<HistoryWindowAction>>>,
+    editor_actions: Arc<Mutex<Vec<VideoEditorAction>>>,
+    editor_was_open: bool,
+    editor_focus_pending: bool,
+    editor_focus_delay: u8,
+    editor_focus_error_reported: bool,
+    editor_hidden_for_selection: bool,
 }
 
 impl Driver {
@@ -491,6 +507,116 @@ impl Driver {
             ui.ctx().request_repaint_after(IDLE);
         });
     }
+
+    fn show_video_editor(&mut self, ctx: &egui::Context) {
+        let Some(snapshot) = self.app.video_editor_snapshot() else {
+            if self.editor_was_open {
+                ctx.send_viewport_cmd_to(video_editor_viewport_id(), egui::ViewportCommand::Close);
+                if !self.selection.owns_surface() {
+                    ctx.send_viewport_cmd_to(
+                        egui::ViewportId::ROOT,
+                        egui::ViewportCommand::Visible(true),
+                    );
+                }
+            }
+            self.editor_was_open = false;
+            self.editor_focus_pending = false;
+            self.editor_focus_delay = 0;
+            self.editor_focus_error_reported = false;
+            self.editor_hidden_for_selection = false;
+            return;
+        };
+
+        if !self.editor_was_open {
+            self.editor_focus_pending = true;
+            self.editor_focus_delay = 1;
+            self.editor_focus_error_reported = false;
+        }
+        if self.editor_hidden_for_selection && !self.selection.owns_surface() {
+            self.editor_hidden_for_selection = false;
+            self.editor_focus_pending = true;
+            self.editor_focus_delay = 1;
+            self.editor_focus_error_reported = false;
+        }
+        self.editor_was_open = true;
+
+        let actions = Arc::clone(&self.editor_actions);
+        let viewport = video_editor_viewport_id();
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(
+            viewport,
+            video_editor_viewport_builder(),
+            move |ui, _class| {
+                let theme = if ui.ctx().system_theme().unwrap_or_else(|| ui.ctx().theme())
+                    == egui::Theme::Dark
+                {
+                    Theme::dark()
+                } else {
+                    Theme::light()
+                };
+                let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+                let response = show_video_editor_window(ui, &snapshot, &theme);
+                let mut emitted = response.actions;
+                if close_requested {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if !emitted
+                        .iter()
+                        .any(|action| matches!(action, VideoEditorAction::Close))
+                    {
+                        emitted.push(VideoEditorAction::Close);
+                    }
+                }
+                actions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(emitted);
+                ui.ctx().request_repaint_after(IDLE);
+            },
+        );
+
+        if self.selection.owns_surface() {
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Visible(false));
+            self.editor_hidden_for_selection = true;
+            self.editor_focus_pending = true;
+            self.editor_focus_delay = 1;
+            return;
+        }
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Visible(false),
+        );
+        if self.editor_focus_pending {
+            if self.editor_focus_delay > 0 {
+                self.editor_focus_delay -= 1;
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            match activate_video_editor_window() {
+                Ok(true) => {
+                    self.editor_focus_pending = false;
+                }
+                Ok(false) => {}
+                Err(error) if !self.editor_focus_error_reported => {
+                    self.editor_focus_error_reported = true;
+                    tracing::error!(%error, "recording editor window activation failed");
+                }
+                Err(_) => {}
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Focus);
+                self.editor_focus_pending = false;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_video_editor_window() -> scrozz_core::Result<bool> {
+    scrozz_shell::macos::editor::activate(VIDEO_EDITOR_WINDOW_TITLE)
+        .map(|diagnostics| diagnostics.is_some())
 }
 
 impl eframe::App for Driver {
@@ -549,6 +675,16 @@ impl eframe::App for Driver {
         for action in history_actions {
             self.app.handle_history_window_action(action);
         }
+        let mut pending_editor_actions = self
+            .editor_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let editor_actions = std::mem::take(&mut *pending_editor_actions);
+        drop(pending_editor_actions);
+        for action in editor_actions {
+            self.app
+                .handle_recording_surface_action(RecordingSurfaceAction::Editor(action));
+        }
         for action in self.handle.drain_recording_actions() {
             self.app.handle_recording_surface_action(action);
         }
@@ -574,7 +710,12 @@ impl eframe::App for Driver {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if !self.stopped {
-            self.handle.set_recording(self.app.recording_presentation());
+            if self.app.video_editor_snapshot().is_some() {
+                self.handle.set_recording(None);
+            } else {
+                self.handle.set_recording(self.app.recording_presentation());
+            }
+            self.show_video_editor(ctx);
             self.show_history(ctx);
         }
 

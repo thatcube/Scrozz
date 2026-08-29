@@ -95,6 +95,10 @@ mod platform {
             Duration::ZERO
         }
 
+        pub(super) const fn aborted(&self) -> bool {
+            false
+        }
+
         pub(super) fn finish(&mut self, _requested_end: Duration) -> Result<u64> {
             unreachable!("an unavailable native writer cannot be constructed")
         }
@@ -808,11 +812,18 @@ impl StagedOutput {
             });
         }
         let durability = sync_parent_directory(&self.final_path);
-        self.cleanup_directory();
-        durability.map_err(|error| PublishFailure {
-            error,
-            retained_path: self.final_path.clone(),
-        })
+        let cleanup = self.cleanup_directory();
+        match (durability, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(PublishFailure {
+                error,
+                retained_path: self.final_path.clone(),
+            }),
+            (Err(durability), Err(cleanup)) => Err(PublishFailure {
+                error: combine_errors(durability, cleanup),
+                retained_path: self.final_path.clone(),
+            }),
+        }
     }
 
     fn retain(&mut self) {
@@ -839,23 +850,15 @@ impl StagedOutput {
         self.lock.take();
     }
 
-    fn cleanup_directory(&mut self) {
+    fn cleanup_directory(&mut self) -> Result<()> {
         self.release_lock();
-        for path in [&self.lock_path, &self.staging_path] {
-            if let Err(error) = std::fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::error!(path = %path.display(), %error, "could not clean transcode staging file");
-            }
-        }
-        if let Err(error) = std::fs::remove_dir(&self.directory)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::error!(
-                path = %self.directory.display(),
-                %error,
-                "could not remove empty transcode staging directory"
-            );
+        match std::fs::remove_dir_all(&self.directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Storage(format!(
+                "could not remove transcode staging directory {}: {error}",
+                self.directory.display()
+            ))),
         }
     }
 }
@@ -874,8 +877,10 @@ impl Drop for PreparingDirectory {
 
 impl Drop for StagedOutput {
     fn drop(&mut self) {
-        if !self.retained {
-            self.cleanup_directory();
+        if !self.retained
+            && let Err(error) = self.cleanup_directory()
+        {
+            tracing::error!(%error, "could not clean transcode staging directory on drop");
         }
     }
 }
@@ -924,10 +929,27 @@ fn cleanup_abandoned_transcodes(parent: &Path) -> Result<()> {
             continue;
         }
         let directory = entry.path();
+        let preparing = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PREPARING_DIRECTORY_PREFIX);
         let lock_path = directory.join("owner.lock");
         let mut lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(lock) => lock,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if preparing {
+                    continue;
+                }
+                if let Err(error) = std::fs::remove_dir(&directory)
+                    && !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    )
+                {
+                    return Err(Error::Io(error));
+                }
+                continue;
+            }
             Err(error) => return Err(Error::Io(error)),
         };
         match lock.try_lock() {
@@ -938,21 +960,13 @@ fn cleanup_abandoned_transcodes(parent: &Path) -> Result<()> {
                     continue;
                 }
                 drop(lock);
-                for name in ["output.mp4", "output.gif", "owner.lock"] {
-                    let path = directory.join(name);
-                    if let Err(error) = std::fs::remove_file(&path)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        return Err(Error::Io(error));
-                    }
-                }
-                if let Err(error) = std::fs::remove_dir(&directory)
-                    && !matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                    )
+                if let Err(error) = std::fs::remove_dir_all(&directory)
+                    && error.kind() != std::io::ErrorKind::NotFound
                 {
-                    return Err(Error::Io(error));
+                    return Err(Error::Storage(format!(
+                        "could not remove abandoned transcode staging directory {}: {error}",
+                        directory.display()
+                    )));
                 }
             }
             Err(std::fs::TryLockError::WouldBlock) => {}
@@ -1404,6 +1418,10 @@ fn finish_failed_video(
     output_path: &Path,
 ) -> WorkerTerminal {
     let duration = writer.media_end();
+    if writer.aborted() {
+        discard_video_writer(writer);
+        return failed_after_cleanup(error, output_path);
+    }
     let error = if writer.video_frames() == 0 {
         discard_video_writer(writer);
         error
@@ -1668,7 +1686,20 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 }
 
 fn combine_errors(primary: Error, secondary: Error) -> Error {
-    Error::Codec(format!("{primary}; additionally, {secondary}"))
+    let primary = error_detail(&primary);
+    let secondary = error_detail(&secondary);
+    Error::Codec(format!("{primary}; cleanup also failed: {secondary}"))
+}
+
+fn error_detail(error: &Error) -> String {
+    match error {
+        Error::Codec(message)
+        | Error::Storage(message)
+        | Error::Platform(message)
+        | Error::InvalidRequest(message)
+        | Error::TargetGone(message) => message.clone(),
+        _ => error.to_string(),
+    }
 }
 
 fn failed(error: Error, partial: Option<TranscodeOutput>) -> WorkerTerminal {
@@ -2238,6 +2269,121 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn successful_publish_removes_every_cleanup_owned_staging_file() {
+        let directory = TestDirectory::new("staged-cleanup");
+        let final_path = directory.path.join("edited.mp4");
+        let mut staged = StagedOutput::new(&final_path, EditOutput::Video).unwrap();
+        let staging_directory = staged.directory.clone();
+        std::fs::write(staged.path(), b"encoded").unwrap();
+        std::fs::write(staging_directory.join(".native-sidecar"), b"temporary").unwrap();
+        let output = TranscodeOutput::native(staged.path(), 7, NativeTranscoder::name()).unwrap();
+
+        let WorkerTerminal::Finished(output) = staged.resolve(WorkerTerminal::Finished(output))
+        else {
+            panic!("publication should succeed");
+        };
+        assert_eq!(output.path, final_path);
+        assert!(!staging_directory.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn abandoned_cleanup_removes_empty_staging_directories_without_lock_files() {
+        let directory = TestDirectory::new("empty-staging-cleanup");
+        let orphan = directory
+            .path
+            .join(format!("{STAGING_DIRECTORY_PREFIX}orphan"));
+        std::fs::create_dir(&orphan).unwrap();
+        cleanup_abandoned_transcodes(&directory.path).unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cleanup_does_not_race_a_lockless_preparing_directory() {
+        let directory = TestDirectory::new("preparing-race");
+        let preparing = directory
+            .path
+            .join(format!("{PREPARING_DIRECTORY_PREFIX}in-flight"));
+        std::fs::create_dir(&preparing).unwrap();
+        cleanup_abandoned_transcodes(&directory.path).unwrap();
+        assert!(preparing.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn abandoned_cleanup_removes_owned_asset_writer_sidecars() {
+        let directory = TestDirectory::new("sidecar-staging-cleanup");
+        let final_path = directory.path.join("edited.mp4");
+        let mut staged = StagedOutput::new(&final_path, EditOutput::Video).unwrap();
+        let staging_directory = staged.directory.clone();
+        std::fs::write(staging_directory.join("output.mp4.sb-recovery"), b"sidecar").unwrap();
+        staged.release_lock();
+        std::mem::forget(staged);
+
+        cleanup_abandoned_transcodes(&directory.path).unwrap();
+        assert!(!staging_directory.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn playable_asset_writer_sidecar_is_promoted_before_cleanup() {
+        let directory = TestDirectory::new("sidecar-promotion");
+        let output_path = directory.path.join("output.mp4");
+        std::fs::write(&output_path, b"broken primary").unwrap();
+        let sidecar_source = directory.path.join("sidecar-source.mp4");
+        write_native_silent_fixture(&sidecar_source, (96, 64), 10, 5);
+        let sidecar = directory.path.join("output.mp4.sb-playable");
+        std::fs::rename(&sidecar_source, &sidecar).unwrap();
+
+        assert!(platform::restore_playable_writer_output(&output_path, &[]).unwrap());
+        assert!(!sidecar.exists());
+        NativeMediaSource::open(
+            Recording::native_partial(
+                &output_path,
+                0.5,
+                NativeTranscoder::name(),
+                "promoted sidecar",
+            )
+            .unwrap(),
+        )
+        .expect("promoted sidecar remains playable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preserved_recovery_survives_a_later_sidecar_scan_error() {
+        let directory = TestDirectory::new("preserved-scan-error");
+        let output_path = directory.path.join("output.mp4");
+        std::fs::write(&output_path, b"broken primary").unwrap();
+        let recovery_source = directory.path.join("recovery-source.mp4");
+        write_native_silent_fixture(&recovery_source, (96, 64), 10, 5);
+        let recovery = directory.path.join(".output.mp4.scrozz-recovery-test");
+        std::fs::rename(&recovery_source, &recovery).unwrap();
+
+        assert!(
+            platform::restore_playable_writer_output_after_scan(
+                &output_path,
+                std::slice::from_ref(&recovery),
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            )
+            .unwrap()
+        );
+        assert!(!recovery.exists());
+        NativeMediaSource::open(
+            Recording::native_partial(
+                &output_path,
+                0.5,
+                NativeTranscoder::name(),
+                "promoted preserved recovery",
+            )
+            .unwrap(),
+        )
+        .expect("preserved recovery is promoted despite scan failure");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_artifact_is_inspected_and_decoded_from_real_media() {
         let directory = TestDirectory::new("inspect");
         let recording = write_native_fixture(&directory.path.join("source.mp4"));
@@ -2311,6 +2457,11 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&video_path).unwrap().len(),
             video_output.bytes_written
+        );
+        let video_bytes = std::fs::read(&video_path).unwrap();
+        assert!(
+            !video_bytes.windows(4).any(|bytes| bytes == b"moof"),
+            "completed editor exports must not use live-recording fragments"
         );
         let edited = NativeMediaSource::open(
             Recording::native(&video_path, 1.0, "native test output").unwrap(),
@@ -2498,6 +2649,130 @@ mod tests {
             .unwrap(),
         )
         .expect("retained video partial decodes");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_frame_append_failure_aborts_and_removes_unusable_output() {
+        let directory = TestDirectory::new("video-append-failure");
+        let output_path = directory.path.join("must-be-removed.mp4");
+        let cancelled = AtomicBool::new(false);
+        let mut writer =
+            platform::VideoWriter::new(&output_path, (96, 64), 30.0, crate::Quality::Low, 0)
+                .unwrap();
+        let error = writer
+            .append_video(
+                &DecodedVideoFrame {
+                    timestamp: Duration::ZERO,
+                    duration: Duration::from_millis(33),
+                    image: RgbaImage {
+                        width: 94,
+                        height: 64,
+                        data: vec![0; 94 * 64 * 4],
+                    },
+                },
+                Duration::ZERO,
+                &cancelled,
+            )
+            .expect_err("mismatched frame must abort");
+        assert!(writer.aborted());
+
+        let WorkerTerminal::Failed(failure) = finish_failed_video(error, writer, &output_path)
+        else {
+            panic!("expected structured append failure");
+        };
+        assert!(failure.partial.is_none());
+        assert!(!output_path.exists());
+        let message = failure.error.to_string();
+        assert!(message.contains("94x64"));
+        assert!(!message.contains("codec error: codec error"));
+        assert!(!message.contains("additionally"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancellation_during_append_preserves_prior_video_frames() {
+        let directory = TestDirectory::new("video-append-cancel");
+        let output_path = directory.path.join("cancelled.mp4");
+        let cancelled = AtomicBool::new(false);
+        let mut writer =
+            platform::VideoWriter::new(&output_path, (96, 64), 30.0, crate::Quality::Low, 0)
+                .unwrap();
+        let frame = |timestamp| DecodedVideoFrame {
+            timestamp,
+            duration: Duration::from_millis(33),
+            image: RgbaImage {
+                width: 96,
+                height: 64,
+                data: vec![127; 96 * 64 * 4],
+            },
+        };
+        writer
+            .append_video(&frame(Duration::ZERO), Duration::ZERO, &cancelled)
+            .unwrap();
+        cancelled.store(true, Ordering::Release);
+        let error = writer
+            .append_video(
+                &frame(Duration::from_millis(33)),
+                Duration::ZERO,
+                &cancelled,
+            )
+            .expect_err("cancelled append must stop");
+        assert!(error.is_cancellation());
+        assert!(!writer.aborted());
+
+        let WorkerTerminal::Cancelled(Some(partial)) = finish_cancelled_video(writer, &output_path)
+        else {
+            panic!("prior video frame should be retained after cancellation");
+        };
+        assert!(partial.is_partial());
+        assert!(output_path.exists());
+        NativeMediaSource::open(
+            Recording::native_partial(
+                &output_path,
+                0.033,
+                NativeTranscoder::name(),
+                "cancelled by test",
+            )
+            .unwrap(),
+        )
+        .expect("cancelled output remains playable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_finalize_failure_removes_an_unplayable_output() {
+        let directory = TestDirectory::new("video-finalize-failure");
+        let output_path = directory.path.join("must-be-removed.mp4");
+        std::fs::write(&output_path, b"incomplete AVAssetWriter output").unwrap();
+        let duration = Duration::from_millis(33);
+        let error =
+            Error::Codec("finalizing video export: injected AVAssetWriter failure".to_owned());
+        let WorkerTerminal::Failed(failure) =
+            terminal_failure(error, &output_path, ArtifactKind::Video, duration)
+        else {
+            panic!("expected structured finalize failure");
+        };
+        assert!(failure.partial.is_none());
+        assert!(!output_path.exists());
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("finalizing video export")
+        );
+    }
+
+    #[test]
+    fn combined_errors_have_one_classification_and_name_cleanup() {
+        let combined = combine_errors(
+            Error::Codec("primary encoder failure".to_owned()),
+            Error::Storage("could not remove output".to_owned()),
+        );
+        assert_eq!(
+            combined.to_string(),
+            "codec error: primary encoder failure; cleanup also failed: could not remove output"
+        );
     }
 
     #[cfg(target_os = "macos")]

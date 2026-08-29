@@ -12,7 +12,7 @@ mod plan;
 pub(crate) mod settings;
 mod stream;
 mod timeline;
-mod writer;
+pub(crate) mod writer;
 
 use scrozz_core::Result;
 

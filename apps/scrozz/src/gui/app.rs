@@ -37,6 +37,7 @@ use scrozz_record::{
     MachineEvent, MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
     RecordingSettings,
     edit::{EditOutput, EditPlan, VideoDocument},
+    handoff::FinalizedMediaHandoff,
     playback::{NativePlayback, sync_document},
     transcode::{
         NativeTranscoder, TranscodeEvent, TranscodeFailure, TranscodeJob, TranscodeOutput,
@@ -71,6 +72,7 @@ use crate::{
 
 struct FinalisedRecording {
     result: scrozz_core::Result<Recording>,
+    handoff: scrozz_core::Result<Option<FinalizedMediaHandoff>>,
 }
 
 #[derive(Clone)]
@@ -286,6 +288,7 @@ pub struct App {
     recording_selection: Option<PendingRecordingSelection>,
     pending_recording_start: Option<ArmedRecordingStart>,
     recording_editor: Option<ActiveVideoEditor>,
+    finalized_media_handoff: Option<FinalizedMediaHandoff>,
     history_window: Option<HistoryWindowSnapshot>,
     tick_sequence: u64,
 }
@@ -434,6 +437,7 @@ impl App {
             recording_selection: None,
             pending_recording_start: None,
             recording_editor: None,
+            finalized_media_handoff: None,
             history_window: None,
             tick_sequence: 0,
         };
@@ -745,6 +749,14 @@ impl App {
     }
 
     fn begin_recording(&mut self) {
+        if self
+            .recording_editor
+            .as_ref()
+            .is_some_and(|editor| editor.transcode_job.is_some())
+        {
+            self.note("cancel the active export before starting another recording");
+            return;
+        }
         if let Err(error) = (self.recording_permission)() {
             self.present_recording_error(error);
             return;
@@ -776,6 +788,7 @@ impl App {
             }
         }
 
+        self.recording_editor = None;
         self.recording_preflight = None;
         self.recording_tick = Instant::now();
         self.recording_completion = None;
@@ -1223,7 +1236,13 @@ impl App {
                     "the native recording finaliser panicked".into(),
                 ))
             });
-            let _ = send.send(FinalisedRecording { result });
+            let handoff = match result.as_ref() {
+                Ok(output) if !output.is_partial() => {
+                    FinalizedMediaHandoff::from_completed(output).map(Some)
+                }
+                Ok(_) | Err(_) => Ok(None),
+            };
+            let _ = send.send(FinalisedRecording { result, handoff });
         });
         self.drain_recording_events();
         self.refresh_recording_tray();
@@ -1253,6 +1272,13 @@ impl App {
     }
 
     fn apply_finalised_recording(&mut self, message: FinalisedRecording) {
+        match message.handoff {
+            Ok(Some(handoff)) => self.finalized_media_handoff = Some(handoff),
+            Ok(None) => {}
+            Err(error) => self.note(format!(
+                "recording was saved but its aggregate media handoff failed: {error}"
+            )),
+        }
         let completed = self
             .recording
             .as_mut()
@@ -1560,6 +1586,9 @@ impl App {
     /// Recording state rendered by the shared overlay.
     #[must_use]
     pub fn recording_presentation(&self) -> Option<RecordingPresentation> {
+        if self.recording_editor.is_some() {
+            return None;
+        }
         if let Some(hud) = &self.recording_preflight {
             let suppress_all_overlays = cfg!(any(target_os = "linux", target_os = "windows"))
                 && self.recording.as_ref().is_some_and(|machine| {
@@ -1575,7 +1604,6 @@ impl App {
                 countdown: RecordingSettings::shipped().countdown,
                 countdown_remaining: Duration::ZERO,
                 suppress_all_overlays,
-                editor: None,
             });
         }
         let machine = self.recording.as_ref()?;
@@ -1596,19 +1624,37 @@ impl App {
             countdown: machine.settings().countdown,
             countdown_remaining: machine.countdown_remaining(),
             suppress_all_overlays,
-            editor: self
-                .recording_editor
-                .as_ref()
-                .map(|editor| VideoEditorSnapshot {
-                    document: editor.document.clone(),
-                    plan: editor.plan,
-                    playback: editor.playback.snapshot().clone(),
-                    transcode_status: editor.transcode_status,
-                    transcode_progress: editor.transcode_progress,
-                    transcode_output: editor.transcode_output.clone(),
-                    transcode_failure: editor.transcode_failure.clone(),
-                }),
         })
+    }
+
+    /// Recording editor state rendered in its ordinary native viewport.
+    #[must_use]
+    pub fn video_editor_snapshot(&self) -> Option<VideoEditorSnapshot> {
+        self.recording_editor
+            .as_ref()
+            .map(|editor| VideoEditorSnapshot {
+                document: editor.document.clone(),
+                plan: editor.plan,
+                playback: editor.playback.snapshot().clone(),
+                transcode_status: editor.transcode_status,
+                transcode_progress: editor.transcode_progress,
+                transcode_output: editor.transcode_output.clone(),
+                transcode_failure: editor.transcode_failure.clone(),
+            })
+    }
+
+    /// Completed video waiting to enter the modern aggregate capture pipeline.
+    ///
+    /// Starting another recording does not clear it; the aggregate owner must
+    /// take it explicitly before a later completion replaces the slot.
+    #[must_use]
+    pub const fn finalized_media_handoff(&self) -> Option<&FinalizedMediaHandoff> {
+        self.finalized_media_handoff.as_ref()
+    }
+
+    /// Transfers the completed video to the aggregate capture owner.
+    pub fn take_finalized_media_handoff(&mut self) -> Option<FinalizedMediaHandoff> {
+        self.finalized_media_handoff.take()
     }
 
     /// Applies one semantic action raised by the shared recording surface.
@@ -1710,6 +1756,15 @@ impl App {
             {
                 self.note(format!("could not close the recording editor: {error}"));
             }
+            return;
+        }
+        if self
+            .recording_editor
+            .as_ref()
+            .is_some_and(|editor| editor.transcode_job.is_some())
+            && !video_editor_action_allowed_during_export(&action)
+        {
+            self.note("wait for the active export or cancel it before changing the editor");
             return;
         }
         let Some(editor) = self.recording_editor.as_mut() else {
@@ -1869,6 +1924,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.settle_video_export_before_shutdown();
         self.finalise_recording_before_shutdown();
         if let Some(editor) = &mut self.recording_editor
             && let Err(error) = editor.playback.shutdown()
@@ -1885,6 +1941,33 @@ impl App {
             forwarder.stop();
         }
         self.pipeline.stop();
+    }
+
+    fn settle_video_export_before_shutdown(&mut self) {
+        let cancellation = self
+            .recording_editor
+            .as_mut()
+            .and_then(|editor| editor.transcode_job.as_mut())
+            .map(|job| job.cancel());
+        if let Some(Err(error)) = cancellation {
+            self.note(format!(
+                "video export cancellation was already settling during shutdown: {error}"
+            ));
+        }
+        while self
+            .recording_editor
+            .as_ref()
+            .is_some_and(|editor| editor.transcode_job.is_some())
+        {
+            self.advance_video_export();
+            if self
+                .recording_editor
+                .as_ref()
+                .is_some_and(|editor| editor.transcode_job.is_some())
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     fn finalise_recording_before_shutdown(&mut self) {
@@ -1940,6 +2023,15 @@ impl App {
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
+}
+
+fn video_editor_action_allowed_during_export(action: &VideoEditorAction) -> bool {
+    matches!(
+        action,
+        VideoEditorAction::CancelExport
+            | VideoEditorAction::RevealOutput
+            | VideoEditorAction::RevealPartialOutput
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -2160,6 +2252,39 @@ mod tests {
         let (mut app, _) = app();
         assert_eq!(app.perform(Action::Quit), Tick::Stop);
         assert!(app.notes().iter().any(|n| n == "quit"));
+    }
+
+    #[test]
+    fn active_export_accepts_only_settling_or_reveal_actions() {
+        let document = VideoDocument::open_fixture(
+            scrozz_record::Recording::synthetic("fixture.mp4", 1.0, "test").unwrap(),
+            scrozz_record::edit::SourceMetadata {
+                width: 96,
+                height: 64,
+                fps: 30.0,
+                audio_channels: 0,
+            },
+        )
+        .unwrap();
+        let plan = EditPlan::video(&document).unwrap();
+        for action in [
+            VideoEditorAction::Play,
+            VideoEditorAction::Pause,
+            VideoEditorAction::Seek(Duration::ZERO),
+            VideoEditorAction::SetRate(2.0),
+            VideoEditorAction::PlanChanged(plan),
+            VideoEditorAction::Export(plan),
+            VideoEditorAction::Close,
+        ] {
+            assert!(!video_editor_action_allowed_during_export(&action));
+        }
+        for action in [
+            VideoEditorAction::CancelExport,
+            VideoEditorAction::RevealOutput,
+            VideoEditorAction::RevealPartialOutput,
+        ] {
+            assert!(video_editor_action_allowed_during_export(&action));
+        }
     }
 
     #[test]
