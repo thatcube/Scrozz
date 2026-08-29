@@ -11,12 +11,16 @@
 
 pub mod drag;
 pub mod hotkey;
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod overlay;
 pub mod permissions;
 pub mod pin;
 pub mod tray;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use drag::{
     ByteSource, DragCapability, DragFormat, DragOperation, DragOrigin, DragOutcome, DragPayload,
@@ -34,7 +38,7 @@ pub use overlay::{
 pub use permissions::SystemPermissions;
 pub use tray::{Tray, TrayAction, TrayEntry};
 
-use scrozz_core::{LogicalRect, Result};
+use scrozz_core::{LogicalRect, Result, ScaleFactor};
 
 /// A floating, chrome-less window that lives over the desktop.
 ///
@@ -71,6 +75,16 @@ pub trait OverlayWindow {
     /// Returns [`scrozz_core::Error::Unsupported`] where the compositor forbids
     /// client positioning.
     fn set_frame(&mut self, frame: LogicalRect) -> Result<()>;
+
+    /// Sets geometry using the destination display's authoritative scale.
+    ///
+    /// Backends whose native coordinate system is already logical can keep the
+    /// default. Physical-coordinate backends override this rather than infer DPI
+    /// from a window a manager may already have resized.
+    fn set_frame_with_scale(&mut self, frame: LogicalRect, scale: ScaleFactor) -> Result<()> {
+        let _ = scale;
+        self.set_frame(frame)
+    }
 
     /// Sets whether clicks pass through to whatever is beneath.
     ///

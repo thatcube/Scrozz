@@ -24,7 +24,12 @@
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -40,7 +45,7 @@ use crate::{
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind},
-        card::{CardEvent, CardSurface},
+        card::{CardEvent, CardId, CardSurface, PinGeneration, SurfaceWaker},
         pipeline::{Job, Outcome, Pipeline},
         server::Server,
     },
@@ -184,6 +189,52 @@ pub enum Tick {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinIntent {
+    generation: PinGeneration,
+    visible: bool,
+}
+
+struct InputWakeMonitor {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl InputWakeMonitor {
+    fn start(waker: Option<SurfaceWaker>) -> std::io::Result<Option<Self>> {
+        let Some(waker) = waker else {
+            return Ok(None);
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("scrozz-input-wake".into())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    let pending = scrozz_shell::tray::events_pending()
+                        || scrozz_shell::hotkey::events_pending();
+                    if pending {
+                        waker();
+                    }
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            })?;
+        Ok(Some(Self {
+            stop,
+            worker: Some(worker),
+        }))
+    }
+}
+
+impl Drop for InputWakeMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// The running application.
 pub struct App {
     config: Config,
@@ -193,7 +244,8 @@ pub struct App {
     hotkeys: GlobalHotkeys,
     server: Option<Server>,
     pin_lock_escapes: Vec<LockEscape>,
-    terminally_unpinned: HashSet<CaptureId>,
+    pin_intents: HashMap<CaptureId, PinIntent>,
+    input_wake_monitor: Option<InputWakeMonitor>,
     suppress_locked_restores: bool,
     started: Instant,
     captures: u64,
@@ -211,14 +263,24 @@ impl App {
     /// refuses, are *recorded* and the app runs on — per D8 a missing capability
     /// is explained, not fatal.
     pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
-        let pipeline = Pipeline::start()?;
+        let waker = surface.waker();
+        let pipeline = Pipeline::start_with_waker(waker.clone())?;
         let mut notes = Vec::new();
+        let input_wake_monitor = match InputWakeMonitor::start(waker.clone()) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                notes.push(format!(
+                    "native input wake monitor unavailable; menu and hotkey events may wait for another window event: {error}"
+                ));
+                None
+            }
+        };
 
         let server = if config.ipc {
             // The one failure worth stopping for: another instance is live,
             // and a second menu-bar item is exactly what single-instance exists
             // to prevent.
-            let server = Server::bind()?;
+            let server = Server::bind_with_waker(waker)?;
             notes.push(format!("listening at {}", server.path().display()));
             Some(server)
         } else {
@@ -283,7 +345,8 @@ impl App {
             hotkeys,
             server,
             pin_lock_escapes,
-            terminally_unpinned: HashSet::new(),
+            pin_intents: HashMap::new(),
+            input_wake_monitor,
             suppress_locked_restores: false,
             started: Instant::now(),
             captures: 0,
@@ -330,6 +393,12 @@ impl App {
         self.config
             .deadline
             .is_some_and(|limit| self.started.elapsed() >= limit)
+    }
+
+    pub(crate) fn remaining_deadline(&self) -> Option<Duration> {
+        self.config
+            .deadline
+            .map(|limit| limit.saturating_sub(self.started.elapsed()))
     }
 
     fn drain_tray(&mut self) -> Tick {
@@ -388,9 +457,9 @@ impl App {
             let command = request.serve_with(|command| {
                 if let Some(id) = forwarded_unpin(command) {
                     let capture = CaptureId(id.to_owned());
-                    self.terminally_unpinned.insert(capture.clone());
+                    let generation = self.set_pin_intent(capture.clone(), false);
                     self.surface.discard_pin(&capture);
-                    self.pipeline.terminal_unpin(capture)?;
+                    self.pipeline.terminal_unpin(capture, generation)?;
                     self.note(format!("pinned capture {id} closed after forwarded unpin"));
                 }
                 if forwarded_unlock_pins(command) {
@@ -439,40 +508,88 @@ impl App {
                     self.note(format!("{card} refused: {error}"));
                 }
                 Outcome::PinReady(mut pin) => {
-                    if self.terminally_unpinned.contains(&pin.id) {
+                    if !self.accept_pin_restore(&pin.id) {
                         continue;
                     }
                     if self.suppress_locked_restores {
                         pin.state.locked = false;
                     }
                     let capture = pin.id.0.clone();
+                    let content_error = pin.content_error.clone();
                     if let Err(err) = self.surface.restore_pin(*pin) {
                         self.note(format!(
                             "pinned capture {capture} could not be shown: {err}"
                         ));
                     } else {
-                        self.note(format!("pinned capture {capture} restored"));
+                        if let Some(error) = content_error {
+                            self.note(format!(
+                                "pinned capture {capture} restored with unavailable pixels: {error}"
+                            ));
+                        } else {
+                            self.note(format!("pinned capture {capture} restored"));
+                        }
                     }
                 }
-                Outcome::PinTextureReady { capture, texture } => {
-                    if self.terminally_unpinned.contains(&capture) {
+                Outcome::PinCreated {
+                    card,
+                    capture,
+                    generation,
+                    texture,
+                    warning,
+                } => {
+                    if !self.pin_is_current(&capture, generation, true) {
                         continue;
                     }
-                    if let Err(err) = self.surface.refresh_pin_texture(&capture, texture) {
+                    if let Err(err) = self.surface.commit_pin(&capture, texture) {
+                        let close_generation = self.set_pin_intent(capture.clone(), false);
+                        self.surface.fail_pin(&capture, err.to_string());
+                        self.pipeline.post(Job::SetPin {
+                            capture: capture.clone(),
+                            generation: close_generation,
+                            state: None,
+                        });
                         self.note(format!(
-                            "pinned capture {} texture could not be refreshed: {err}",
+                            "pinned capture {} could not finish its card handoff: {err}",
+                            capture.0
+                        ));
+                    } else {
+                        self.pipeline.post(Job::Release(card));
+                    }
+                    if let Some(warning) = warning {
+                        self.note(format!(
+                            "pinned capture {} kept its bounded preview because full pixels could not be loaded: {warning}",
                             capture.0
                         ));
                     }
                 }
-                Outcome::PinCreationFailed { capture, error } => {
-                    self.surface.discard_pin(&capture);
+                Outcome::PinCreationFailed {
+                    capture,
+                    generation,
+                    error,
+                } => {
+                    if !self.pin_is_current(&capture, generation, true) {
+                        continue;
+                    }
+                    let rollback_generation = self.set_pin_intent(capture.clone(), false);
+                    self.surface.fail_pin(&capture, error.to_string());
+                    self.pipeline.post(Job::SetPin {
+                        capture: capture.clone(),
+                        generation: rollback_generation,
+                        state: None,
+                    });
                     self.note(format!(
-                        "pinned capture {} was closed because it could not be persisted: {error}",
+                        "pinned capture {} returned to its source card because it could not be persisted: {error}",
                         capture.0
                     ));
                 }
-                Outcome::PinPersistenceFailed { capture, error } => {
+                Outcome::PinPersistenceFailed {
+                    capture,
+                    generation,
+                    error,
+                } => {
+                    if !self.pin_generation_is_current(&capture, generation) {
+                        continue;
+                    }
                     self.note(format!(
                         "pinned capture {} could not be persisted: {error}",
                         capture.0
@@ -504,30 +621,30 @@ impl App {
                     self.note(format!("{id} dismissed"));
                 }
                 CardEvent::Pin(id, capture, state) => {
-                    if self.terminally_unpinned.contains(&capture) {
-                        self.pipeline.post(Job::Release(id));
-                        continue;
-                    }
+                    let generation = self.set_pin_intent(capture.clone(), true);
                     self.pipeline.post(Job::PinCard {
                         card: id,
                         capture,
+                        generation,
                         state,
                     });
                     self.note(format!("{id} pinned"));
                 }
                 CardEvent::PinChanged(capture, state) => {
-                    if self.terminally_unpinned.contains(&capture) {
+                    let Some(generation) = self.active_pin_generation(&capture) else {
                         continue;
-                    }
+                    };
                     self.pipeline.post(Job::SetPin {
                         capture,
+                        generation,
                         state: Some(state),
                     });
                 }
                 CardEvent::Unpin(capture) => {
-                    self.terminally_unpinned.insert(capture.clone());
+                    let generation = self.set_pin_intent(capture.clone(), false);
                     self.pipeline.post(Job::SetPin {
                         capture: capture.clone(),
+                        generation,
                         state: None,
                     });
                     self.note(format!("pinned capture {} closed", capture.0));
@@ -611,10 +728,80 @@ impl App {
         }
     }
 
+    /// Accept a region/window selector's completed pixels into the live card stack.
+    ///
+    /// The selector remains platform-owned; from this point onward the capture
+    /// follows the same persistence, bounded-texture, and Pin to Screen path as
+    /// a display hotkey capture.
+    pub fn accept_capture(
+        &mut self,
+        kind: CaptureKind,
+        capture: scrozz_core::Capture,
+    ) -> CliResult<CardId> {
+        self.pipeline.accept_capture(kind, capture)
+    }
+
     fn unlock_all_pins(&mut self) -> CliResult<u64> {
         self.suppress_locked_restores = true;
         self.surface.unlock_pins();
         self.pipeline.unlock_pins()
+    }
+
+    fn set_pin_intent(&mut self, capture: CaptureId, visible: bool) -> PinGeneration {
+        let generation = self
+            .pin_intents
+            .get(&capture)
+            .map_or(PinGeneration(1), |intent| {
+                PinGeneration(intent.generation.0.saturating_add(1))
+            });
+        self.pin_intents.insert(
+            capture,
+            PinIntent {
+                generation,
+                visible,
+            },
+        );
+        generation
+    }
+
+    fn accept_pin_restore(&mut self, capture: &CaptureId) -> bool {
+        match self.pin_intents.get(capture) {
+            Some(intent) => intent.visible,
+            None => {
+                self.pin_intents.insert(
+                    capture.clone(),
+                    PinIntent {
+                        generation: PinGeneration(1),
+                        visible: true,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    fn active_pin_generation(&self, capture: &CaptureId) -> Option<PinGeneration> {
+        self.pin_intents
+            .get(capture)
+            .filter(|intent| intent.visible)
+            .map(|intent| intent.generation)
+    }
+
+    fn pin_is_current(
+        &self,
+        capture: &CaptureId,
+        generation: PinGeneration,
+        visible: bool,
+    ) -> bool {
+        self.pin_intents
+            .get(capture)
+            .is_some_and(|intent| intent.generation == generation && intent.visible == visible)
+    }
+
+    fn pin_generation_is_current(&self, capture: &CaptureId, generation: PinGeneration) -> bool {
+        self.pin_intents
+            .get(capture)
+            .is_some_and(|intent| intent.generation == generation)
     }
 
     fn note(&mut self, what: impl Into<String>) {
@@ -672,6 +859,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.input_wake_monitor = None;
         self.drain_cards();
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
@@ -803,6 +991,33 @@ mod tests {
             .expect("command");
         assert!(forwarded_unlock_pins(&unlock));
         assert_eq!(forwarded_unpin(&unlock), None);
+    }
+
+    #[test]
+    fn pin_settlements_require_the_current_identity_generation() {
+        let (mut app, _) = app();
+        let capture = CaptureId("same-capture".into());
+
+        let first = app.set_pin_intent(capture.clone(), true);
+        let closed = app.set_pin_intent(capture.clone(), false);
+        let repinned = app.set_pin_intent(capture.clone(), true);
+
+        assert!(first < closed && closed < repinned);
+        assert!(!app.pin_is_current(&capture, first, true));
+        assert!(!app.pin_is_current(&capture, closed, false));
+        assert!(app.pin_is_current(&capture, repinned, true));
+    }
+
+    #[test]
+    fn a_restore_queued_before_unpin_cannot_resurrect_the_pin() {
+        let (mut app, _) = app();
+        let capture = CaptureId("restore-race".into());
+
+        app.set_pin_intent(capture.clone(), false);
+        assert!(!app.accept_pin_restore(&capture));
+
+        app.set_pin_intent(capture.clone(), true);
+        assert!(app.accept_pin_restore(&capture));
     }
 
     #[test]

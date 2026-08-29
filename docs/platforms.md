@@ -182,6 +182,29 @@ case, not an edge case.
 
 ---
 
+## Pinned-window contracts and limits
+
+Pin geometry always comes from a native monitor enumerator. If that query fails,
+Pin to Screen is disabled with the platform error; the app never substitutes a
+made-up `1440x875 @ 1x` desktop. A pin viewport is also bounded to a 4096-pixel
+edge and 8,388,608 physical pixels after applying the destination monitor's
+scale. Moving from a 1x to a 4x display can therefore reduce the logical pin size
+before the next backing surface is allocated.
+
+| Session | Non-activation and stacking | Placement, desktops, and lock limits |
+|---|---|---|
+| macOS | Each child viewport is adopted as the same non-activating `NSPanel` used by the capture stack. Adoption is runtime-checked; a failed conversion is shown inside that pin rather than reported as success. | Native global geometry, opacity, click-through, all Spaces, and fullscreen auxiliary behavior are applied. |
+| Windows | The process-owned HWND is verified by PID plus exact title, then receives `WS_EX_NOACTIVATE`, `WS_EX_TOOLWINDOW`, `WS_EX_LAYERED`, `HWND_TOPMOST`, and a `WM_MOUSEACTIVATE -> MA_NOACTIVATE` subclass. Ambiguous lookup fails closed. | Negative virtual-desktop coordinates work. Explicit placement is disabled on mixed-DPI desktops until the Win32 topology model has one coherent global logical mapping. Windows exposes no supported API to place an ordinary app window on every virtual desktop, so pins stay on their current desktop. A no-activate pin does not promise keyboard nudges while another app owns focus. |
+| X11 | Scrozz requests a managed Dock window, ICCCM `input = false`, removes `WM_TAKE_FOCUS`, and asks for Above, Sticky, SkipTaskbar, and SkipPager. These are window-manager policy hints, not a portable focus guarantee, so the UI says so and lock remains disabled. | The shared X11 coordinate space and detected server scale are used. A WM may ignore placement, stacking, stickiness, or focus hints. Override-redirect is deliberately not used for movable pins because it breaks WM move/resize behavior. |
+| Wayland | An ordinary `xdg_toplevel` cannot promise non-activation or an always-on-top layer. Scrozz does not infer layer-shell availability from a compositor name and does not claim support until it has actually bound the advertised protocol. | `xdg-shell` has no global positioning. wlroots/KWin compositors may offer layer-shell; GNOME/Mutter does not. Until a native adapter exists, compositor window rules are the honest workaround. XWayland is an explicit crispness/fractional-scaling trade-off, never an automatic fallback. |
+
+Static pins do not drive a repaint clock. Capture completion, IPC, menu/hotkey
+input, viewport interaction, animation, geometry settlement, and explicit
+content changes wake the event loop. Native pin properties are delta-applied, so
+an unrelated wake produces no repeated window mutation.
+
+---
+
 ## Known asymmetry, stated honestly
 
 macOS is where interactive verification happens today, so macOS code will be

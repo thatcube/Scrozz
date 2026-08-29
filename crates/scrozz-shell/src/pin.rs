@@ -21,8 +21,6 @@ pub enum PinBackend {
     WindowsToolWindow,
     /// Window-manager-managed X11 dock viewport.
     X11ManagedDock,
-    /// Layer-shell surface on KWin or wlroots. The adapter is not implemented.
-    WaylandLayerShell,
     /// Ordinary xdg-toplevel where compositor positioning is unavailable.
     WaylandOrdinaryWindow,
     /// No display server.
@@ -116,14 +114,12 @@ impl PinCapabilities {
     fn windows() -> Self {
         Self {
             backend: PinBackend::WindowsToolWindow,
-            pin_window: Support::Emulated {
-                via: "eframe child viewport",
-            },
+            pin_window: Support::Yes,
             positioning: Support::Yes,
             always_on_top: Support::Yes,
-            click_through: lock_adapter_missing(),
-            native_opacity: native_adapter_missing(),
-            non_activating: native_adapter_missing(),
+            click_through: Support::Yes,
+            native_opacity: Support::Yes,
+            non_activating: Support::Yes,
         }
     }
 
@@ -141,57 +137,19 @@ impl PinCapabilities {
         }
     }
 
-    fn wayland(compositor: Compositor) -> Self {
-        let layer_shell = matches!(
-            compositor,
-            Compositor::Sway
-                | Compositor::Hyprland
-                | Compositor::River
-                | Compositor::Niri
-                | Compositor::Wayfire
-                | Compositor::Kde
-        );
-        if layer_shell {
-            return Self {
-                backend: PinBackend::WaylandLayerShell,
-                pin_window: Support::Emulated {
-                    via: "ordinary eframe Wayland viewport; layer-shell adapter pending",
-                },
-                positioning: Support::No {
-                    why: "Scrozz's layer-shell adapter is not implemented",
-                    remedy: "use compositor window rules until the layer-shell adapter is implemented",
-                },
-                always_on_top: Support::No {
-                    why: "an ordinary xdg-toplevel cannot request a layer-shell level",
-                    remedy: "use compositor window rules until the layer-shell adapter is implemented",
-                },
-                click_through: Support::No {
-                    why: "Scrozz has no Wayland focus-release adapter, so a pointer-transparent pin could still hold keyboard focus",
-                    remedy: "keep the pin unlocked",
-                },
-                native_opacity: Support::No {
-                    why: "native layer-shell opacity is not implemented",
-                    remedy: "use the composited image-opacity fallback",
-                },
-                non_activating: Support::No {
-                    why: "native layer-shell keyboard interactivity is not implemented",
-                    remedy: "keep the pin unlocked or opt into XWayland",
-                },
-            };
-        }
-
+    fn wayland(_compositor: Compositor) -> Self {
         Self {
             backend: PinBackend::WaylandOrdinaryWindow,
             pin_window: Support::Emulated {
                 via: "ordinary compositor-positioned xdg-toplevel",
             },
             positioning: Support::No {
-                why: "the Wayland xdg-shell protocol does not permit client positioning",
-                remedy: "move the window with compositor controls or run Scrozz in an X11 session",
+                why: "xdg-shell has no client positioning, and Scrozz does not bind a discovered layer-shell protocol",
+                remedy: "use compositor window rules; XWayland is an explicit fidelity trade-off, not an automatic fallback",
             },
             always_on_top: Support::No {
-                why: "ordinary xdg-toplevel windows cannot request an always-on-top layer",
-                remedy: "use a compositor window rule or run Scrozz in an X11 session",
+                why: "ordinary xdg-toplevel windows cannot request an always-on-top layer; GNOME exposes no layer-shell protocol",
+                remedy: "use a compositor window rule on compositors that provide one",
             },
             click_through: Support::No {
                 why: "Scrozz has no Wayland focus-release adapter, so a pointer-transparent pin could still hold keyboard focus",
@@ -202,8 +160,8 @@ impl PinCapabilities {
                 remedy: "use the composited image-opacity fallback",
             },
             non_activating: Support::No {
-                why: "ordinary xdg-toplevel windows follow compositor activation policy",
-                remedy: "use a compositor window rule",
+                why: "ordinary xdg-toplevel windows follow compositor activation policy; compositor names do not prove protocol availability",
+                remedy: "use a compositor window rule; a future adapter must discover and bind layer-shell before claiming support",
             },
         }
     }
@@ -261,8 +219,8 @@ mod tests {
         let windows =
             PinCapabilities::for_session(&session(DisplayServer::Windows, Compositor::Other));
         assert_eq!(windows.backend, PinBackend::WindowsToolWindow);
-        assert!(!windows.non_activating.available());
-        assert!(!windows.click_through.available());
+        assert_eq!(windows.non_activating, Support::Yes);
+        assert_eq!(windows.click_through, Support::Yes);
 
         let x11 = PinCapabilities::for_session(&session(DisplayServer::X11, Compositor::Other));
         assert_eq!(x11.backend, PinBackend::X11ManagedDock);
@@ -280,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_shell_sessions_admit_the_missing_adapter() {
+    fn compositor_names_never_fabricate_layer_shell_protocol_support() {
         for compositor in [
             Compositor::Sway,
             Compositor::Hyprland,
@@ -290,9 +248,10 @@ mod tests {
             Compositor::Kde,
         ] {
             let caps = PinCapabilities::for_session(&session(DisplayServer::Wayland, compositor));
-            assert_eq!(caps.backend, PinBackend::WaylandLayerShell);
+            assert_eq!(caps.backend, PinBackend::WaylandOrdinaryWindow);
             assert!(!caps.positioning.available());
             assert!(!caps.click_through.available());
+            assert!(!caps.non_activating.available());
         }
     }
 

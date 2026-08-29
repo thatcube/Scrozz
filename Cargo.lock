@@ -3314,6 +3314,7 @@ dependencies = [
  "tracing",
  "tray-icon",
  "windows",
+ "x11rb 0.14.0",
 ]
 
 [[package]]

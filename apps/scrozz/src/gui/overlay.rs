@@ -22,15 +22,14 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
+use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
 use scrozz_store::CaptureId;
 use scrozz_ui::{
     CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
 };
 
-use crate::gui::{
-    action::CaptureKind,
-    card::{Card, CardEvent, CardId, CardSurface, PinnedCapture, Thumbnail},
+use crate::gui::card::{
+    Card, CardEvent, CardId, CardSurface, PinnedCapture, SurfaceWaker, Thumbnail,
 };
 
 /// A [`CardSurface`] backed by a running `scrozz-ui` overlay.
@@ -121,6 +120,9 @@ impl CardSurface for OverlayCards {
         }
         .with_pin_id(pin.id.0.clone())
         .with_source_scale(pin.scale);
+        if let Some(error) = pin.content_error {
+            request = request.with_content_error(error);
+        }
         request.source_px = (pin.source_width, pin.source_height);
         self.handle.restore_pin(request, pin.state);
         Ok(())
@@ -137,6 +139,26 @@ impl CardSurface for OverlayCards {
         );
         self.handle.refresh_pin_texture(capture.0.clone(), image);
         Ok(())
+    }
+
+    fn commit_pin(
+        &mut self,
+        capture: &CaptureId,
+        texture: Option<Thumbnail>,
+    ) -> scrozz_core::Result<()> {
+        if let Some(texture) = texture {
+            self.refresh_pin_texture(capture, texture)?;
+        }
+        self.handle.commit_pin(capture.0.clone());
+        if let Some(card) = self.pinned.remove(&capture.0) {
+            self.forget(card);
+        }
+        Ok(())
+    }
+
+    fn fail_pin(&mut self, capture: &CaptureId, reason: String) {
+        self.handle.fail_pin(capture.0.clone(), reason);
+        self.pinned.remove(&capture.0);
     }
 
     fn discard_pin(&mut self, capture: &CaptureId) {
@@ -226,7 +248,6 @@ impl CardSurface for OverlayCards {
                 OverlayEvent::PinRequested { id, pin, state } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         self.pinned.insert(pin.0.clone(), ours);
-                        self.forget(ours);
                         out.push(CardEvent::Pin(ours, CaptureId(pin.0), state));
                     }
                 }
@@ -266,6 +287,11 @@ impl CardSurface for OverlayCards {
         self.mapped.len() + self.pending.len()
     }
 
+    fn waker(&self) -> Option<SurfaceWaker> {
+        let handle = self.handle.clone();
+        Some(std::sync::Arc::new(move || handle.wake()))
+    }
+
     fn describe(&self) -> String {
         if self.handle.is_attached() {
             let panel = self
@@ -285,7 +311,7 @@ impl CardSurface for OverlayCards {
 /// region capture must never gain a synthetic one, so this is not cosmetic.
 fn request_for_card(card: &Card) -> CaptureRequest {
     let name = card.file_name();
-    let provenance = provenance_of(card.kind);
+    let provenance = card.provenance;
 
     // The pixels handed to the overlay are the thumbnail, not the capture.
     // Preserve the capture's full dimensions separately: pin geometry is based
@@ -310,14 +336,6 @@ fn request_for_card(card: &Card) -> CaptureRequest {
         request = request.with_pin_id(capture.0.clone());
     }
     request
-}
-
-const fn provenance_of(kind: CaptureKind) -> Provenance {
-    match kind {
-        CaptureKind::Region => Provenance::Region,
-        CaptureKind::Window => Provenance::Window,
-        CaptureKind::Fullscreen => Provenance::Display,
-    }
 }
 
 /// Reading a [`crate::gui::Thumbnail`] as a frame the UI can scale.
@@ -347,7 +365,9 @@ impl Thumb for crate::gui::card::Thumbnail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::action::CaptureKind;
     use crate::gui::card::Thumbnail;
+    use scrozz_core::Provenance;
 
     fn card(id: u64) -> Card {
         Card::placeholder(CardId(id), CaptureKind::Fullscreen)
@@ -407,9 +427,11 @@ mod tests {
     fn each_capture_kind_keeps_its_own_chrome() {
         // D9: a region capture that gained a window shadow would be a lie about
         // what was captured.
-        assert_eq!(provenance_of(CaptureKind::Region), Provenance::Region);
-        assert_eq!(provenance_of(CaptureKind::Window), Provenance::Window);
-        assert_eq!(provenance_of(CaptureKind::Fullscreen), Provenance::Display);
+        assert_eq!(card(1).provenance, Provenance::Display);
+        let mut window = card(2);
+        window.kind = CaptureKind::Window;
+        window.provenance = Provenance::Window;
+        assert_eq!(request_for_card(&window).provenance, Provenance::Window);
     }
 
     #[test]

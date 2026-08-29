@@ -62,9 +62,8 @@ use std::time::Duration;
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{
-    Display, DisplayId, DisplaySet, Frame as CaptureFrame, LockEscape, LogicalPoint, LogicalRect,
-    LogicalSize, PinChromePolicy, PinId, PinState, PinnedSurface, PixelFormat, Provenance,
-    ScaleFactor,
+    DisplayId, DisplaySet, Frame as CaptureFrame, LockEscape, LogicalSize, PinChromePolicy, PinId,
+    PinState, PinnedSurface, PixelFormat, Provenance, ScaleFactor,
 };
 
 use crate::card::{self, CardAction, CardContent};
@@ -84,6 +83,8 @@ pub const RESAMPLE_SECS: f32 = 0.35;
 /// A 6-card stack of full-resolution 5K captures is well over a gigabyte of
 /// texture. Cards are 232 pt wide, so 512 px is already generous at 2×.
 pub const THUMBNAIL_PX: u32 = 512;
+/// Longest edge accepted for a pinned-capture GPU texture.
+pub const PIN_TEXTURE_PX: u32 = 2_048;
 
 /// Native window drags can report a new frame on every repaint. Persist only
 /// after movement settles so one gesture produces one durable update.
@@ -286,9 +287,11 @@ impl Default for OverlayOptions {
             probe: None,
             panel: None,
             thumbnail_px: THUMBNAIL_PX,
-            displays: fallback_displays(geometry),
+            displays: DisplaySet::new(Vec::new()),
             active_display: None,
-            pin_support: PinSupport::portable(),
+            pin_support: PinSupport::unavailable(
+                "native display metrics and pin-window capabilities were not supplied",
+            ),
             pin_lock_escapes: Vec::new(),
             pin_topology_probe: None,
         }
@@ -328,6 +331,8 @@ pub struct PinSupport {
     pub click_through: bool,
     /// Whether clicks avoid activating the application.
     pub non_activating: bool,
+    /// Whether this session has a native child-window adoption adapter.
+    pub native_adoption: bool,
     /// Whether the native child should advertise a managed X11 dock type.
     pub x11_managed_dock: bool,
     /// Human-readable capability detail for feedback and diagnostics.
@@ -335,6 +340,22 @@ pub struct PinSupport {
 }
 
 impl PinSupport {
+    /// Explicitly unavailable pin host used by safe defaults.
+    #[must_use]
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            windows: false,
+            positioning: false,
+            always_on_top: false,
+            native_opacity: false,
+            click_through: false,
+            non_activating: false,
+            native_adoption: false,
+            x11_managed_dock: false,
+            detail: detail.into(),
+        }
+    }
+
     /// Portable egui/winit behavior used by tests and non-specialized hosts.
     #[must_use]
     pub fn portable() -> Self {
@@ -345,30 +366,16 @@ impl PinSupport {
             native_opacity: false,
             click_through: true,
             non_activating: false,
+            native_adoption: false,
             x11_managed_dock: false,
             detail: "portable child viewport; native adoption not reported".into(),
         }
     }
 
     fn limitation_notice(&self) -> Option<String> {
-        (!self.positioning || !self.always_on_top).then(|| self.detail.clone())
+        (!self.positioning || !self.always_on_top || !self.non_activating)
+            .then(|| self.detail.clone())
     }
-}
-
-fn fallback_displays(geometry: OverlayGeometry) -> DisplaySet {
-    let rect = geometry.work_area;
-    let logical = LogicalRect::new(
-        LogicalPoint::new(f64::from(rect.min.x), f64::from(rect.min.y)),
-        LogicalSize::new(f64::from(rect.width()), f64::from(rect.height())),
-    );
-    DisplaySet::new(vec![Display {
-        id: DisplayId("overlay-work-area".into()),
-        name: "Overlay work area".into(),
-        bounds: logical,
-        work_area: logical,
-        scale: ScaleFactor::IDENTITY,
-        is_primary: true,
-    }])
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +397,8 @@ pub struct CaptureRequest {
     pub source_scale: f64,
     /// A pre-scaled thumbnail. `None` shows a holding fill until one arrives.
     pub thumbnail: Option<egui::ColorImage>,
+    /// Explicit content failure for a durable pin whose state remains recoverable.
+    pub content_error: Option<String>,
 }
 
 impl CaptureRequest {
@@ -403,6 +412,7 @@ impl CaptureRequest {
             source_px,
             source_scale: 1.0,
             thumbnail: None,
+            content_error: None,
         }
     }
 
@@ -426,13 +436,14 @@ impl CaptureRequest {
             source_px,
             source_scale: frame.scale.get(),
             thumbnail: Some(thumbnail),
+            content_error: None,
         })
     }
 
     /// Attach a thumbnail.
     #[must_use]
     pub fn with_thumbnail(mut self, image: egui::ColorImage) -> Self {
-        self.thumbnail = Some(image);
+        self.thumbnail = downscale(&image, PIN_TEXTURE_PX);
         self
     }
 
@@ -451,6 +462,13 @@ impl CaptureRequest {
         } else {
             1.0
         };
+        self
+    }
+
+    /// Mark this request as a recoverable pin whose source pixels are unavailable.
+    #[must_use]
+    pub fn with_content_error(mut self, error: impl Into<String>) -> Self {
+        self.content_error = Some(error.into());
         self
     }
 }
@@ -582,6 +600,15 @@ enum Command {
         pin: PinId,
         image: egui::ColorImage,
     },
+    CommitPin(PinId),
+    FailPin {
+        pin: PinId,
+        reason: String,
+    },
+    NativePinFailure {
+        pin: PinId,
+        reason: String,
+    },
     DiscardPin(PinId),
     ClosePin(PinId),
     UnlockPins,
@@ -591,10 +618,16 @@ enum Command {
 /// Native state the host must apply to one child viewport.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativePinRequest {
+    /// Stable pin identity for native failure feedback.
+    pub pin: PinId,
     /// Exact unique title used to discover the native child window.
     pub title: String,
     /// Durable state to apply.
     pub state: PinState,
+    /// Whether native code may set global geometry in this session.
+    pub positioning: bool,
+    /// Authoritative destination-display pixels per logical point.
+    pub display_scale: ScaleFactor,
     /// Whether this pin may carry a native shadow.
     pub shadow: bool,
 }
@@ -679,6 +712,27 @@ impl OverlayHandle {
         self.command(Command::RefreshPinTexture {
             pin: pin.into(),
             image,
+        });
+    }
+
+    /// Commit a provisional pin after durable persistence succeeds.
+    pub fn commit_pin(&self, id: impl Into<PinId>) {
+        self.command(Command::CommitPin(id.into()));
+    }
+
+    /// Roll a provisional pin back to its source card and explain why.
+    pub fn fail_pin(&self, id: impl Into<PinId>, reason: impl Into<String>) {
+        self.command(Command::FailPin {
+            pin: id.into(),
+            reason: reason.into(),
+        });
+    }
+
+    /// Surface a platform adapter failure inside the affected pin.
+    pub fn native_pin_failure(&self, id: impl Into<PinId>, reason: impl Into<String>) {
+        self.command(Command::NativePinFailure {
+            pin: id.into(),
+            reason: reason.into(),
         });
     }
 
@@ -843,7 +897,12 @@ pub fn color_image(frame: &CaptureFrame) -> Option<egui::ColorImage> {
         return None;
     }
     let (w, h) = (frame.width() as usize, frame.height() as usize);
-    if w == 0 || h == 0 {
+    if w == 0
+        || h == 0
+        || w > PIN_TEXTURE_PX as usize
+        || h > PIN_TEXTURE_PX as usize
+        || w.checked_mul(h)? > (PIN_TEXTURE_PX as usize).checked_pow(2)?
+    {
         return None;
     }
     let bpp = frame.format.bytes_per_pixel();
@@ -853,7 +912,7 @@ pub fn color_image(frame: &CaptureFrame) -> Option<egui::ColorImage> {
         PixelFormat::Bgra8 | PixelFormat::BgraPremultiplied8
     );
 
-    let mut pixels = Vec::with_capacity(w * h);
+    let mut pixels = Vec::with_capacity(w.checked_mul(h)?);
     for y in 0..h {
         let row = &frame.data[y * frame.stride..y * frame.stride + w * bpp];
         for px in row.chunks_exact(bpp) {
@@ -878,17 +937,98 @@ pub fn color_image(frame: &CaptureFrame) -> Option<egui::ColorImage> {
 /// size is a field of aliasing artefacts and reads as a broken thumbnail.
 #[must_use]
 pub fn thumbnail(frame: &CaptureFrame, max_edge: u32) -> Option<egui::ColorImage> {
-    let full = color_image(frame)?;
-    Some(downscale(&full, max_edge))
+    if !frame.is_well_formed() || max_edge == 0 || max_edge > PIN_TEXTURE_PX {
+        return None;
+    }
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let max = max_edge as usize;
+    let longest = w.max(h);
+    let scaled = |value: usize| {
+        value
+            .checked_mul(max)
+            .and_then(|value| value.checked_add(longest / 2))
+            .map(|value| (value / longest).max(1))
+    };
+    let (nw, nh) = if longest <= max {
+        (w, h)
+    } else {
+        (scaled(w)?, scaled(h)?)
+    };
+    let output_len = nw.checked_mul(nh)?;
+    if output_len > (PIN_TEXTURE_PX as usize).checked_pow(2)? {
+        return None;
+    }
+
+    let bpp = frame.format.bytes_per_pixel();
+    let premultiplied = frame.format.is_premultiplied();
+    let swap = matches!(
+        frame.format,
+        PixelFormat::Bgra8 | PixelFormat::BgraPremultiplied8
+    );
+    let mut output = Vec::with_capacity(output_len);
+    for y in 0..nh {
+        let y0 = y.checked_mul(h)? / nh;
+        let y1 = (y + 1).checked_mul(h)?.div_ceil(nh).min(h).max(y0 + 1);
+        for x in 0..nw {
+            let x0 = x.checked_mul(w)? / nw;
+            let x1 = (x + 1).checked_mul(w)?.div_ceil(nw).min(w).max(x0 + 1);
+            let mut sums = [0u128; 4];
+            let mut count = 0u128;
+            for sy in y0..y1 {
+                let row_start = sy.checked_mul(frame.stride)?;
+                for sx in x0..x1 {
+                    let start = row_start.checked_add(sx.checked_mul(bpp)?)?;
+                    let px = frame.data.get(start..start.checked_add(bpp)?)?;
+                    let channels = if swap {
+                        [px[2], px[1], px[0], px[3]]
+                    } else {
+                        [px[0], px[1], px[2], px[3]]
+                    };
+                    for (sum, channel) in sums.iter_mut().zip(channels) {
+                        *sum += u128::from(channel);
+                    }
+                    count += 1;
+                }
+            }
+            let channels = sums.map(|sum| u8::try_from(sum / count).unwrap_or(u8::MAX));
+            output.push(if premultiplied {
+                egui::Color32::from_rgba_premultiplied(
+                    channels[0],
+                    channels[1],
+                    channels[2],
+                    channels[3],
+                )
+            } else {
+                egui::Color32::from_rgba_unmultiplied(
+                    channels[0],
+                    channels[1],
+                    channels[2],
+                    channels[3],
+                )
+            });
+        }
+    }
+    Some(egui::ColorImage::new([nw, nh], output))
 }
 
 /// Box-filter an image down so its longest edge is at most `max_edge`.
 #[must_use]
-pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> egui::ColorImage {
+pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> Option<egui::ColorImage> {
     let (w, h) = (image.size[0], image.size[1]);
-    let max = max_edge.max(1) as usize;
-    if w == 0 || h == 0 || (w <= max && h <= max) {
-        return image.clone();
+    if w == 0
+        || h == 0
+        || max_edge == 0
+        || max_edge > PIN_TEXTURE_PX
+        || image.pixels.len() != w.checked_mul(h)?
+    {
+        return None;
+    }
+    let max = max_edge as usize;
+    if w <= max && h <= max {
+        return Some(image.clone());
     }
     let scale = max as f32 / w.max(h) as f32;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -897,7 +1037,7 @@ pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> egui::ColorImage {
         ((h as f32 * scale).round() as usize).max(1),
     );
 
-    let mut out = Vec::with_capacity(nw * nh);
+    let mut out = Vec::with_capacity(nw.checked_mul(nh)?);
     for y in 0..nh {
         let y0 = y * h / nh;
         let y1 = (((y + 1) * h).div_ceil(nh)).min(h).max(y0 + 1);
@@ -927,7 +1067,7 @@ pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> egui::ColorImage {
             ));
         }
     }
-    egui::ColorImage::new([nw, nh], out)
+    Some(egui::ColorImage::new([nw, nh], out))
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +1082,7 @@ struct Entry {
     source_scale: f64,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
+    pin_notice: Option<String>,
 }
 
 struct PinnedEntry {
@@ -949,6 +1090,7 @@ struct PinnedEntry {
     surface: PinnedSurface,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
+    content_error: Option<String>,
     positioning_notice: Option<String>,
     native_frame_changed_at: Option<f64>,
 }
@@ -964,6 +1106,7 @@ impl PinnedEntry {
             surface,
             texture: None,
             pending: request.thumbnail,
+            content_error: request.content_error,
             positioning_notice: limitation_notice,
             native_frame_changed_at: None,
         }
@@ -975,6 +1118,7 @@ pub struct OverlayApp {
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
     pins: HashMap<PinId, PinnedEntry>,
+    pending_pin_cards: HashMap<PinId, CardId>,
     pinned_cards: HashSet<CardId>,
     handle: OverlayHandle,
     theme: Theme,
@@ -1042,6 +1186,7 @@ impl OverlayApp {
             stack: CaptureStack::for_work_area(options.geometry.local()),
             content: HashMap::new(),
             pins: HashMap::new(),
+            pending_pin_cards: HashMap::new(),
             pinned_cards: HashSet::new(),
             handle,
             theme,
@@ -1177,6 +1322,7 @@ impl OverlayApp {
         if let Ok(mut q) = self.handle.shared.outbox.lock() {
             q.push(event);
         }
+        self.handle.wake();
     }
 
     fn take_inbox(&self) -> Vec<CaptureRequest> {
@@ -1202,7 +1348,7 @@ impl OverlayApp {
             let id = self.stack.push(m);
             let thumb = request
                 .thumbnail
-                .map(|image| downscale(&image, self.thumbnail_px));
+                .and_then(|image| downscale(&image, self.thumbnail_px));
             self.content.insert(
                 id,
                 Entry {
@@ -1213,6 +1359,7 @@ impl OverlayApp {
                     source_scale: request.source_scale,
                     texture: None,
                     pending: thumb,
+                    pin_notice: request.content_error,
                 },
             );
             self.emit(OverlayEvent::Pushed { id });
@@ -1248,7 +1395,18 @@ impl OverlayApp {
                 }
                 Command::RefreshPinTexture { pin, image } => {
                     if let Some(entry) = self.pins.get_mut(&pin) {
-                        entry.pending = Some(image);
+                        entry.pending = downscale(&image, PIN_TEXTURE_PX);
+                        entry.content_error = entry
+                            .pending
+                            .is_none()
+                            .then(|| "The refreshed pin texture exceeded safe GPU limits.".into());
+                    }
+                }
+                Command::CommitPin(id) => self.commit_pin(&id, m),
+                Command::FailPin { pin, reason } => self.fail_pin(ctx, &pin, reason),
+                Command::NativePinFailure { pin, reason } => {
+                    if let Some(entry) = self.pins.get_mut(&pin) {
+                        entry.positioning_notice = Some(reason);
                     }
                 }
                 Command::DiscardPin(id) => self.discard_pin(ctx, &id),
@@ -1308,26 +1466,49 @@ impl OverlayApp {
         }
     }
 
-    fn begin_pin(&mut self, card: CardId, m: &Motion) {
+    fn begin_pin(&mut self, card: CardId, _m: &Motion) {
         self.refresh_pin_topology();
         if !self.pin_support.windows {
-            self.emit(OverlayEvent::PinUnavailable {
-                card,
-                reason: self.pin_support.detail.clone(),
-            });
+            self.reject_pin(card, self.pin_support.detail.clone());
             return;
         }
         let Some(source) = self.content.get(&card) else {
             return;
         };
-        let Some(pin) = source.pin_id.clone() else {
-            self.emit(OverlayEvent::PinUnavailable {
+        if source.texture.is_none() && source.pending.is_none() {
+            self.reject_pin(
                 card,
-                reason: "this capture is not in durable history, so it cannot restore as a pin"
-                    .into(),
-            });
+                "Capture pixels are unavailable, so Pin to Screen kept the source card.",
+            );
+            return;
+        }
+        let Some(pin) = source.pin_id.clone() else {
+            self.reject_pin(
+                card,
+                "This capture is not in durable history, so it cannot restore as a pin.",
+            );
             return;
         };
+        if source.source_px.0 == 0
+            || source.source_px.1 == 0
+            || !source.source_scale.is_finite()
+            || source.source_scale <= 0.0
+        {
+            self.reject_pin(
+                card,
+                "Pin to Screen rejected invalid source dimensions before creating a window.",
+            );
+            return;
+        }
+        let name = source.name.clone();
+        let provenance = source.provenance;
+        let source_px = source.source_px;
+        let source_scale = source.source_scale;
+        let texture = source.texture.clone();
+        let pending = source.pending.clone();
+        if let Some(source) = self.content.get_mut(&card) {
+            source.pin_notice = None;
+        }
         let Some(display) = self
             .active_display
             .as_ref()
@@ -1335,46 +1516,56 @@ impl OverlayApp {
             .or_else(|| self.displays.displays().iter().find(|d| d.is_primary))
             .or_else(|| self.displays.displays().first())
         else {
-            self.emit(OverlayEvent::PinUnavailable {
+            self.reject_pin(
                 card,
-                reason: "no connected display is available for pin placement".into(),
-            });
+                "Native display metrics are unavailable, so Pin to Screen was not opened.",
+            );
             return;
         };
-        let scale = if source.source_scale.is_finite() && source.source_scale > 0.0 {
-            source.source_scale
-        } else {
-            1.0
-        };
         let natural = LogicalSize::new(
-            f64::from(source.source_px.0.max(1)) / scale,
-            f64::from(source.source_px.1.max(1)) / scale,
+            f64::from(source_px.0) / source_scale,
+            f64::from(source_px.1) / source_scale,
         );
-        let policy = chrome_policy(source.provenance);
-        let surface = PinnedSurface::on_display(
+        let policy = chrome_policy(provenance);
+        let surface = match PinnedSurface::on_display(
             pin.clone(),
             natural,
             display,
             policy,
             self.pin_lock_escapes.clone(),
-        );
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                let reason = format!("Pin to Screen rejected unsafe source dimensions: {error}");
+                self.reject_pin(card, reason);
+                return;
+            }
+        };
         let state = surface.state().clone();
         let entry = PinnedEntry {
-            name: source.name.clone(),
+            name,
             surface,
-            texture: source.texture.clone(),
-            pending: source.pending.clone(),
+            texture,
+            pending,
+            content_error: None,
             positioning_notice: self.pin_support.limitation_notice(),
             native_frame_changed_at: None,
         };
         self.pins.insert(pin.clone(), entry);
-        self.pinned_cards.insert(card);
+        self.pending_pin_cards.insert(pin.clone(), card);
         self.emit(OverlayEvent::PinRequested {
             id: card,
             pin,
             state,
         });
-        let _ = self.stack.dismiss(card, m);
+    }
+
+    fn reject_pin(&mut self, card: CardId, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(source) = self.content.get_mut(&card) {
+            source.pin_notice = Some(reason.clone());
+        }
+        self.emit(OverlayEvent::PinUnavailable { card, reason });
     }
 
     fn restore_pin(&mut self, request: CaptureRequest, state: PinState) {
@@ -1391,13 +1582,26 @@ impl OverlayApp {
         };
         let requested_locked = state.locked;
         let policy = chrome_policy(request.provenance);
-        let Some(mut surface) = PinnedSurface::restore(
+        let scale = request.source_scale;
+        let natural = LogicalSize::new(
+            f64::from(request.source_px.0) / scale,
+            f64::from(request.source_px.1) / scale,
+        );
+        let restored = PinnedSurface::restore_with_natural_size(
             id.clone(),
+            natural,
             state,
             policy,
             self.pin_lock_escapes.clone(),
             &self.displays,
-        ) else {
+        );
+        let Some(mut surface) = (match restored {
+            Ok(surface) => surface,
+            Err(error) => {
+                tracing::warn!(pin = %id, "persisted pin dimensions were rejected: {error}");
+                return;
+            }
+        }) else {
             tracing::warn!(pin = %id, "persisted pin was not restored because no display exists");
             return;
         };
@@ -1423,10 +1627,30 @@ impl OverlayApp {
             return;
         }
         ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
+        self.pending_pin_cards.remove(id);
         self.emit(OverlayEvent::PinClosed { pin: id.clone() });
     }
 
+    fn commit_pin(&mut self, id: &PinId, m: &Motion) {
+        let Some(card) = self.pending_pin_cards.remove(id) else {
+            return;
+        };
+        self.pinned_cards.insert(card);
+        let _ = self.stack.dismiss(card, m);
+    }
+
+    fn fail_pin(&mut self, ctx: &egui::Context, id: &PinId, reason: String) {
+        let card = self.pending_pin_cards.remove(id);
+        self.discard_pin(ctx, id);
+        if let Some(card) = card
+            && let Some(source) = self.content.get_mut(&card)
+        {
+            source.pin_notice = Some(reason);
+        }
+    }
+
     fn discard_pin(&mut self, ctx: &egui::Context, id: &PinId) {
+        self.pending_pin_cards.remove(id);
         if self.pins.remove(id).is_some() {
             ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
         }
@@ -1490,6 +1714,7 @@ impl OverlayApp {
                         pinned::PinFrame {
                             name: &entry.name,
                             texture: entry.texture.as_ref().map(egui::TextureHandle::id),
+                            content_error: entry.content_error.as_deref(),
                             surface: &mut entry.surface,
                             displays,
                             positioning,
@@ -1530,10 +1755,20 @@ impl OverlayApp {
             }
             if result.close {
                 closed.push(id.clone());
-            } else {
+            } else if self.pin_support.native_adoption {
+                let display_scale = entry
+                    .surface
+                    .state()
+                    .display
+                    .as_ref()
+                    .and_then(|display| displays.get(display))
+                    .map_or(ScaleFactor::IDENTITY, |display| display.scale);
                 native.push(NativePinRequest {
+                    pin: id.clone(),
                     title,
                     state: entry.surface.state().clone(),
+                    positioning,
+                    display_scale,
                     shadow: entry.surface.state().chrome.shadow,
                 });
             }
@@ -1726,6 +1961,7 @@ fn draw_pin_notice(ui: &egui::Ui, text: &str, theme: &Theme) {
     if rect.width() <= 0.0 {
         return;
     }
+
     ui.painter()
         .rect_filled(rect, corner(Radius::BUTTON), theme.palette.card_fill_raised);
     ui.painter().text(
@@ -1741,6 +1977,33 @@ fn draw_pin_notice(ui: &egui::Ui, text: &str, theme: &Theme) {
         egui::Sense::hover(),
     )
     .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+}
+
+fn draw_card_notice(ui: &mut egui::Ui, card: Rect, text: &str, theme: &Theme) {
+    let rect = Rect::from_min_size(
+        card.min + Vec2::splat(8.0),
+        Vec2::new(
+            (card.width() - 16.0).max(0.0),
+            52.0_f32.min((card.height() - 16.0).max(0.0)),
+        ),
+    );
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    ui.painter()
+        .rect_filled(rect, corner(Radius::BUTTON), theme.palette.card_fill_raised);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(6.0)), |ui| {
+        ui.centered_and_justified(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(11.0)
+                        .color(theme.palette.text),
+                )
+                .wrap(),
+            );
+        });
+    });
 }
 
 impl eframe::App for OverlayApp {
@@ -1783,6 +2046,9 @@ impl eframe::App for OverlayApp {
                 content.texture = Some(tex.id());
             }
             let response = card::draw_card(ui, &surface, f, &content);
+            if let Some(notice) = entry.pin_notice.as_deref() {
+                draw_card_notice(ui, f.rect, notice, &self.theme);
+            }
             hits.push(response.hit);
 
             if response.body.hovered() {
@@ -1938,7 +2204,7 @@ mod tests {
     #[test]
     fn downscale_caps_the_longest_edge() {
         let big = egui::ColorImage::new([400, 200], vec![egui::Color32::RED; 400 * 200]);
-        let small = downscale(&big, 100);
+        let small = downscale(&big, 100).expect("bounded image");
         assert_eq!(small.size, [100, 50]);
         assert!(small.pixels.iter().all(|p| *p == egui::Color32::RED));
     }
@@ -1946,7 +2212,26 @@ mod tests {
     #[test]
     fn downscale_leaves_small_images_alone() {
         let small = egui::ColorImage::new([32, 16], vec![egui::Color32::BLUE; 32 * 16]);
-        assert_eq!(downscale(&small, 512).size, [32, 16]);
+        assert_eq!(
+            downscale(&small, 512).expect("bounded image").size,
+            [32, 16]
+        );
+    }
+
+    #[test]
+    fn texture_helpers_reject_oversized_or_malformed_inputs_before_upload() {
+        let oversized = egui::ColorImage::new(
+            [PIN_TEXTURE_PX as usize + 1, 1],
+            vec![egui::Color32::BLACK; PIN_TEXTURE_PX as usize + 1],
+        );
+        assert!(downscale(&oversized, PIN_TEXTURE_PX + 1).is_none());
+
+        let malformed = egui::ColorImage {
+            size: [2, 2],
+            pixels: vec![egui::Color32::BLACK; 3],
+            source_size: egui::Vec2::new(2.0, 2.0),
+        };
+        assert!(downscale(&malformed, 2).is_none());
     }
 
     #[test]
@@ -1992,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn positioning_or_stacking_gaps_are_visible_immediately() {
+    fn positioning_stacking_or_activation_gaps_are_visible_immediately() {
         let mut support = PinSupport::portable();
         support.positioning = false;
         support.always_on_top = false;
@@ -2004,6 +2289,8 @@ mod tests {
 
         support.positioning = true;
         support.always_on_top = true;
+        assert!(support.limitation_notice().is_some());
+        support.non_activating = true;
         assert!(support.limitation_notice().is_none());
     }
 }

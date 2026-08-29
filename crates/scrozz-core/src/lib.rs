@@ -40,8 +40,8 @@ pub use geometry::{
     PhysicalSize, Point, Rect, ScaleFactor, Size,
 };
 pub use pin::{
-    Direction as PinDirection, DisplaySet, LockEscape, LockEscapeRequired, MAX_OPACITY,
-    MIN_OPACITY, NudgeStep, Opacity, PinBorder, PinChrome, PinChromePolicy, PinId, PinScale,
-    PinState, PinnedSurface,
+    Direction as PinDirection, DisplaySet, InvalidPinSize, LockEscape, LockEscapeRequired,
+    MAX_OPACITY, MAX_PIN_PHYSICAL_EDGE, MAX_PIN_PHYSICAL_PIXELS, MIN_OPACITY, NudgeStep, Opacity,
+    PinBorder, PinChrome, PinChromePolicy, PinId, PinScale, PinState, PinnedSurface,
 };
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};
