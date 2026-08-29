@@ -78,10 +78,10 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
 | Capture history | 🟡 | 🟡 | 🟡 | Persistence, retention, restore/delete/filter UI and editable annotation documents are implemented; aggregate hands-on validation is in progress |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
-| Annotation editor | 🟡 | 🟡 | 🟡 | Full editor UI, history, crop, zoom, arrows, text, secure Redact and revision-safe copy/save/drag are implemented; final aggregate and platform validation remain |
+| Annotation editor | 🟡 | 🟡 | 🟡 | Full editor UI, history, crop, zoom, Smart Frame, arrows, text, secure Redact and revision-safe copy/save/drag are implemented; final aggregate and platform validation remain |
 | Screen recording | 🟠 | 🟠 | 🟠 | Native recording engines and editor playback exist; macOS editor/export corrections and Windows/Linux runtime closure remain active |
 | Scrolling capture | 🟠 | 🟠 | 🟠 | Acquisition, alignment and stitching are under active integration; native app coverage and Wayland constraints remain |
-| Beautification | 🟡 | 🟡 | 🟡 | Background, padding and destination-aware export work exists on a reviewed feature branch and awaits aggregate validation |
+| Beautification | 🟡 | 🟡 | 🟡 | Smart Frame, automatic backgrounds, exact output sizes, custom presets and revision-safe export are integrated; hands-on aggregate validation remains |
 | BYO sharing | 🟠 | 🟠 | 🟠 | S3-compatible upload core exists; provider settings, credential-vault integration, history metadata and release packaging are active work |
 
 **What 🟡 rests on, precisely.** Three automated layers, described in full in

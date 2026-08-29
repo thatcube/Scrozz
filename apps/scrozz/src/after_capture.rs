@@ -13,6 +13,7 @@ use std::{
 };
 
 use fs2::FileExt as _;
+use scrozz_annotate::SmartFramePreset;
 use scrozz_core::{Error, Frame, Result};
 use serde_json::{Map, Value};
 
@@ -20,6 +21,7 @@ const SETTINGS_VERSION: u32 = 2;
 const APP_DIR: &str = "Scrozz";
 const FILE_NAME: &str = "settings.json";
 const LOCK_FILE_NAME: &str = ".settings.lock";
+const MAX_SMART_FRAME_PRESETS: usize = 128;
 /// Overrides the settings file path for portable installs and isolated tests.
 pub const SETTINGS_FILE_ENV: &str = "SCROZZ_SETTINGS_FILE";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -264,6 +266,7 @@ pub struct AfterCaptureSettings {
     sets: [ActionSet; 2],
     values: BTreeMap<String, String>,
     unknown_values: BTreeMap<String, Value>,
+    smart_frame_presets: Vec<SmartFramePreset>,
     document_version: u32,
     unknown_root: BTreeMap<String, Value>,
     unknown_after_capture: BTreeMap<String, Value>,
@@ -283,6 +286,7 @@ impl AfterCaptureSettings {
             sets: [ActionSet::fresh_screenshot(), ActionSet::overlay_only()],
             values: BTreeMap::new(),
             unknown_values: BTreeMap::new(),
+            smart_frame_presets: Vec::new(),
             document_version: SETTINGS_VERSION,
             unknown_root: BTreeMap::new(),
             unknown_after_capture: BTreeMap::new(),
@@ -299,6 +303,7 @@ impl AfterCaptureSettings {
             sets: [ActionSet::fresh_screenshot(), ActionSet::overlay_only()],
             values: BTreeMap::new(),
             unknown_values: BTreeMap::new(),
+            smart_frame_presets: Vec::new(),
             document_version: SETTINGS_VERSION,
             unknown_root: BTreeMap::new(),
             unknown_after_capture: BTreeMap::new(),
@@ -356,6 +361,70 @@ impl AfterCaptureSettings {
     /// Stores a non-action setting value.
     pub fn set_value(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.values.insert(key.into(), value.into());
+    }
+
+    /// User-created Smart Frame presets in stable display order.
+    #[must_use]
+    pub fn smart_frame_presets(&self) -> &[SmartFramePreset] {
+        &self.smart_frame_presets
+    }
+
+    /// Adds or replaces one validated Smart Frame preset.
+    pub fn upsert_smart_frame_preset(&mut self, preset: SmartFramePreset) -> Result<()> {
+        preset.validate()?;
+        if let Some(existing) = self
+            .smart_frame_presets
+            .iter_mut()
+            .find(|existing| existing.id == preset.id)
+        {
+            *existing = preset;
+        } else {
+            if self.smart_frame_presets.len() >= MAX_SMART_FRAME_PRESETS {
+                return Err(Error::Storage(format!(
+                    "settings already contain the limit of {MAX_SMART_FRAME_PRESETS} Smart Frame presets"
+                )));
+            }
+            self.smart_frame_presets.push(preset);
+        }
+        self.smart_frame_presets
+            .sort_by_key(|preset| preset.name.to_lowercase());
+        self.validate_smart_frame_presets()
+    }
+
+    /// Removes one custom Smart Frame preset.
+    pub fn delete_smart_frame_preset(&mut self, id: &str) -> Result<()> {
+        let before = self.smart_frame_presets.len();
+        self.smart_frame_presets.retain(|preset| preset.id != id);
+        if self.smart_frame_presets.len() == before {
+            return Err(Error::InvalidRequest(format!(
+                "Smart Frame preset {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_smart_frame_presets(&self) -> Result<()> {
+        if self.smart_frame_presets.len() > MAX_SMART_FRAME_PRESETS {
+            return Err(Error::Storage(format!(
+                "settings contain {} Smart Frame presets; the limit is {MAX_SMART_FRAME_PRESETS}",
+                self.smart_frame_presets.len()
+            )));
+        }
+        for preset in &self.smart_frame_presets {
+            preset.validate()?;
+        }
+        let mut ids: Vec<&str> = self
+            .smart_frame_presets
+            .iter()
+            .map(|preset| preset.id.as_str())
+            .collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::Storage(
+                "Smart Frame preset identifiers must be unique".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn from_json(text: &str) -> Result<(Self, u32)> {
@@ -423,6 +492,13 @@ impl AfterCaptureSettings {
                 }
             }
         }
+        if let Some(value) = root.remove("smart_frame_presets") {
+            settings.smart_frame_presets = serde_json::from_value(value).map_err(|error| {
+                Error::Storage(format!(
+                    "the Smart Frame preset library is unreadable: {error}"
+                ))
+            })?;
+        }
         if version < SETTINGS_VERSION {
             for media in [MediaKind::Screenshot, MediaKind::Recording] {
                 for action in AfterCaptureAction::UI_ORDER {
@@ -441,10 +517,12 @@ impl AfterCaptureSettings {
 
         settings.document_version = version.max(SETTINGS_VERSION);
         settings.unknown_root = root.into_iter().collect();
+        settings.validate_smart_frame_presets()?;
         Ok((settings, version))
     }
 
     fn to_json(&self) -> Result<String> {
+        self.validate_smart_frame_presets()?;
         let mut root: Map<String, Value> = self
             .unknown_root
             .iter()
@@ -480,6 +558,14 @@ impl AfterCaptureSettings {
                     )
                     .collect(),
             ),
+        );
+        root.insert(
+            "smart_frame_presets".to_owned(),
+            serde_json::to_value(&self.smart_frame_presets).map_err(|error| {
+                Error::Storage(format!(
+                    "could not encode the Smart Frame preset library: {error}"
+                ))
+            })?,
         );
         root.insert("after_capture".to_owned(), Value::Object(after_capture));
         serde_json::to_string_pretty(&Value::Object(root))
@@ -1242,6 +1328,127 @@ mod tests {
 
         let restarted = store.load(InstallProfile::Existing).unwrap();
         assert!(!restarted.is_enabled(MediaKind::Screenshot, AfterCaptureAction::CopyToClipboard));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smart_frame_presets_round_trip_with_unknown_fields() {
+        let root = scratch("smart-frame-presets");
+        let path = root.join("settings.json");
+        let store = AfterCaptureStore::new(&path);
+        let mut preset = SmartFramePreset::new(
+            "quiet-frame",
+            "Quiet Frame",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        preset
+            .extensions
+            .insert("future-preset-field".to_owned(), serde_json::json!(true));
+
+        let updated = store
+            .update(InstallProfile::Fresh, |settings| {
+                settings.upsert_smart_frame_preset(preset)?;
+                settings.set_value("after-capture.apply-smart-frame", "true");
+                settings
+                    .unknown_root
+                    .insert("future-root".to_owned(), serde_json::json!({"kept": true}));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(updated.smart_frame_presets().len(), 1);
+
+        let restarted = store.load(InstallProfile::Fresh).unwrap();
+        assert_eq!(restarted.smart_frame_presets()[0].name, "Quiet Frame");
+        assert_eq!(
+            restarted.smart_frame_presets()[0]
+                .extensions
+                .get("future-preset-field"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            restarted
+                .unknown_root
+                .get("future-root")
+                .and_then(|value| value.get("kept"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            restarted.value("after-capture.apply-smart-frame"),
+            Some("true")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smart_frame_presets_load_without_a_values_object() {
+        let root = scratch("smart-frame-presets-without-values");
+        let path = root.join("settings.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "version": 2,
+  "smart_frame_presets": [
+    {
+      "version": 1,
+      "id": "quiet-frame",
+      "name": "Quiet Frame",
+      "settings": {}
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let store = AfterCaptureStore::new(&path);
+        let settings = store.load(InstallProfile::Fresh).unwrap();
+        assert_eq!(settings.smart_frame_presets()[0].id, "quiet-frame");
+        store.save(&settings).unwrap();
+        assert_eq!(
+            store
+                .load(InstallProfile::Fresh)
+                .unwrap()
+                .smart_frame_presets()[0]
+                .id,
+            "quiet-frame"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smart_frame_preset_upsert_and_delete_are_atomic() {
+        let root = scratch("smart-frame-preset-mutations");
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let first = SmartFramePreset::new(
+            "team-note",
+            "Team Note",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        let mut replacement = first.clone();
+        replacement.name = "Team Note Updated".to_owned();
+
+        store
+            .update(InstallProfile::Fresh, |settings| {
+                settings.upsert_smart_frame_preset(first)
+            })
+            .unwrap();
+        let updated = store
+            .update(InstallProfile::Fresh, |settings| {
+                settings.upsert_smart_frame_preset(replacement)
+            })
+            .unwrap();
+        assert_eq!(updated.smart_frame_presets().len(), 1);
+        assert_eq!(updated.smart_frame_presets()[0].name, "Team Note Updated");
+
+        let empty = store
+            .update(InstallProfile::Fresh, |settings| {
+                settings.delete_smart_frame_preset("team-note")
+            })
+            .unwrap();
+        assert!(empty.smart_frame_presets().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

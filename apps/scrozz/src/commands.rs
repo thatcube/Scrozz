@@ -19,12 +19,15 @@
 
 use std::path::Path;
 
-use scrozz_annotate::{Renderer as _, SkiaRenderer};
+use scrozz_annotate::{
+    AnalysisCancellation, AutomaticBackground, Background, BackgroundImage, Beautification,
+    BeautificationPreset, Document, Renderer as _, SkiaRenderer, analyze_smart_frame,
+};
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Provenance,
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
     SelectionOptions, SelectionOutcome,
 };
-use scrozz_export::{Encoder, FrameEncoder, ImageFormat};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat, to_straight_rgba8};
 use scrozz_ocr::Ocr as _;
 use scrozz_store::{
     CaptureId, CaptureRecord, DocumentState, History as _, ImageState, Page, SearchQuery,
@@ -34,8 +37,9 @@ use scrozz_store::{
 use crate::{
     after_capture::{AfterCaptureSettings, current_availability},
     cli::{
-        CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand, HotkeyCommand,
-        InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
+        BeautifyBackground, CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand,
+        HotkeyCommand, InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink,
+        TargetSpec,
     },
     fault::{CliError, CliResult},
     gui::selection::CaptureSelector,
@@ -86,11 +90,48 @@ fn dispatch_inner(command: &Command, selector: Option<&dyn CaptureSelector>) -> 
 // capture
 // ---------------------------------------------------------------------------
 
+/// The pixels a capture ultimately reports, however it got there.
+///
+/// Most captures never touch the annotation pipeline: `&capture.frame` is
+/// returned untouched, exactly as before beautification existed, so the
+/// overwhelming common case pays no rendering cost. Only a beautified capture
+/// builds a [`Document`] and renders it, and the two paths must still produce
+/// one `&Frame` the rest of `capture` can treat uniformly.
+enum CapturedFrame {
+    /// No beautification was requested; the source capture is reported as-is.
+    Direct(Capture),
+    /// Beautification ran; `rendered` is the framed output.
+    ///
+    /// `provenance` is captured separately because building the [`Document`]
+    /// consumes the source [`Capture`] it came from.
+    Rendered {
+        provenance: Provenance,
+        rendered: Frame,
+    },
+}
+
+impl CapturedFrame {
+    fn frame(&self) -> &Frame {
+        match self {
+            Self::Direct(capture) => &capture.frame,
+            Self::Rendered { rendered, .. } => rendered,
+        }
+    }
+
+    fn provenance(&self) -> Provenance {
+        match self {
+            Self::Direct(capture) => capture.provenance,
+            Self::Rendered { provenance, .. } => *provenance,
+        }
+    }
+}
+
 fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
     args.validate()?;
     let requested_target = args.target.resolve()?;
     let sinks = args.sinks();
     let selection = args.selection_options(None)?;
+    let beautification = resolve_beautification(args)?;
 
     let plan = Json::obj([
         ("target", target_json(&requested_target)),
@@ -106,6 +147,11 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
         ("format", Json::str(args.format().slug())),
         ("quality", Json::opt(args.quality, |q| Json::Int(q.into()))),
         ("delay_secs", Json::opt(args.delay, Json::Float)),
+        (
+            "beautification",
+            Json::opt(beautification.as_ref(), beautification_json),
+        ),
+        ("smart_frame", Json::Bool(args.smart_frame)),
         ("sinks", Json::arr(sinks.iter().map(sink_json))),
     ]);
 
@@ -188,7 +234,28 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
     if let Some(outcome) = selection_outcome.as_ref() {
         remember_selection(outcome, backend.as_ref());
     }
-    let frame = &capture.frame;
+    let frame_source = if args.requests_beautification() {
+        let provenance = capture.provenance;
+        let mut document = Document::new(capture);
+        if args.smart_frame {
+            let unframed = SkiaRenderer::new().render(&document)?;
+            let mut smart =
+                analyze_smart_frame(&unframed, provenance, &AnalysisCancellation::default())?
+                    .beautification;
+            apply_beautification_overrides(args, &mut smart)?;
+            document.set_beautification(Some(smart))?;
+        } else {
+            document.set_beautification(beautification)?;
+        }
+        let rendered = SkiaRenderer::new().render(&document)?;
+        CapturedFrame::Rendered {
+            provenance,
+            rendered,
+        }
+    } else {
+        CapturedFrame::Direct(capture)
+    };
+    let frame = frame_source.frame();
 
     let bytes = FrameEncoder::new()
         .encode(frame, args.format().to_export())
@@ -237,7 +304,10 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
         ("height", Json::Int(i64::from(frame.height()))),
         ("scale", Json::Float(frame.scale.get())),
         ("bytes", Json::Int(bytes.len() as i64)),
-        ("provenance", Json::str(format!("{:?}", capture.provenance))),
+        (
+            "provenance",
+            Json::str(format!("{:?}", frame_source.provenance())),
+        ),
         (
             "written",
             Json::arr(written.iter().map(|w| Json::str(w.as_str()))),
@@ -455,6 +525,148 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
             "scrozz-ui (the selection overlay)",
         )),
     }
+}
+
+/// Resolves the beautification a plan would apply, for both `--dry-run`
+/// reporting and the real capture path.
+///
+/// Returns `None` when nothing was requested, so a plain capture keeps
+/// costing nothing beyond the encoder it always paid for. `--smart-frame`
+/// still gets a value here — the automatic-background placeholder a dry run
+/// shows — even though a real capture replaces it with the analysed result,
+/// because a dry run has no pixels yet to analyse.
+fn resolve_beautification(args: &CaptureArgs) -> CliResult<Option<Beautification>> {
+    if !args.requests_beautification() {
+        return Ok(None);
+    }
+
+    let mut beautification = if args.smart_frame {
+        Beautification {
+            auto_balance: true,
+            background: Background::Automatic(AutomaticBackground::default()),
+            ..Beautification::default()
+        }
+    } else {
+        Beautification::preset(
+            args.beautify
+                .map_or(BeautificationPreset::Clean, |preset| preset.to_model()),
+        )
+    };
+    apply_beautification_overrides(args, &mut beautification)?;
+    Ok(Some(beautification))
+}
+
+/// Applies every beautification override the CLI accepted onto a starting
+/// point, be it a named preset or a Smart Frame analysis.
+fn apply_beautification_overrides(
+    args: &CaptureArgs,
+    beautification: &mut Beautification,
+) -> CliResult<()> {
+    if let Some(background) = &args.background {
+        beautification.background = match background {
+            BeautifyBackground::Transparent => Background::Transparent,
+            BeautifyBackground::Solid(color) => Background::Solid(*color),
+            BeautifyBackground::BuiltIn(background) => Background::BuiltIn(*background),
+            BeautifyBackground::Image(path) => {
+                let frame = scrozz_export::decode_file(path)?;
+                let image = to_straight_rgba8(&frame)?;
+                Background::Image(BackgroundImage::new(
+                    image.width,
+                    image.height,
+                    image.data,
+                    frame.color_space,
+                )?)
+            }
+        };
+    }
+    if let Some(padding) = args.padding {
+        beautification.padding = padding;
+    }
+    // `--frame-aspect` and `--size` both describe the output canvas and are
+    // mutually exclusive on the CLI (`clap`'s `conflicts_with`), but the model
+    // still needs whichever one was set to override the other, since a preset
+    // or Smart Frame analysis may already have populated both fields.
+    if let Some(aspect) = args.frame_aspect {
+        beautification.aspect = aspect.to_model();
+        beautification.output_size = None;
+    }
+    if let Some(size) = args.size {
+        beautification.output_size = Some(size.to_model());
+        beautification.aspect = scrozz_annotate::AspectPreset::Original;
+    }
+    if let Some(alignment) = args.alignment {
+        beautification.alignment = alignment.to_model();
+    }
+    if args.auto_balance {
+        beautification.auto_balance = true;
+    }
+    if let Some(radius) = args.corner_radius {
+        beautification.corner_radius = radius;
+    }
+    if let Some(shadow) = args.shadow {
+        beautification.shadow = shadow;
+    }
+    if let Some(border) = args.border {
+        beautification.border_width = border;
+    }
+    beautification.validate()?;
+    Ok(())
+}
+
+/// Renders a [`Beautification`] into the plan's JSON, in the same shape
+/// whether it came from a preset, explicit overrides, or Smart Frame analysis.
+fn beautification_json(beautification: &Beautification) -> Json {
+    Json::obj([
+        ("padding", Json::Float(beautification.padding)),
+        (
+            "aspect",
+            Json::str(format!("{:?}", beautification.aspect).to_lowercase()),
+        ),
+        (
+            "output_size",
+            Json::opt(beautification.output_size, |size| {
+                Json::obj([
+                    ("width", Json::Int(i64::from(size.width))),
+                    ("height", Json::Int(i64::from(size.height))),
+                ])
+            }),
+        ),
+        (
+            "alignment",
+            Json::str(format!("{:?}", beautification.alignment).to_lowercase()),
+        ),
+        ("auto_balance", Json::Bool(beautification.auto_balance)),
+        ("corner_radius", Json::Float(beautification.corner_radius)),
+        ("shadow", Json::Float(beautification.shadow)),
+        ("border", Json::Float(beautification.border_width)),
+        (
+            "background",
+            Json::str(match &beautification.background {
+                Background::Transparent => "transparent".to_owned(),
+                Background::Solid(color) => {
+                    format!(
+                        "#{:02x}{:02x}{:02x}{:02x}",
+                        color.r, color.g, color.b, color.a
+                    )
+                }
+                Background::Gradient { .. } => "gradient".to_owned(),
+                Background::BuiltIn(background) => format!("{background:?}").to_lowercase(),
+                Background::Automatic(background) => format!(
+                    "automatic:v{}:#{:02x}{:02x}{:02x}-#{:02x}{:02x}{:02x}",
+                    background.algorithm_version,
+                    background.start.r,
+                    background.start.g,
+                    background.start.b,
+                    background.end.r,
+                    background.end.g,
+                    background.end.b
+                ),
+                Background::Image(image) => {
+                    format!("image:{}x{}", image.width(), image.height())
+                }
+            }),
+        ),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,6 +1715,82 @@ mod tests {
         assert!(rendered.contains(r#""kind":"interactive""#), "{rendered}");
         assert!(rendered.contains(r#""mode":"region""#), "{rendered}");
         assert!(rendered.contains(r#""interactive":true"#), "{rendered}");
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_resolved_beautification_plan() {
+        let rendered = json_of(&[
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,300,200",
+            "--beautify",
+            "social",
+            "--background",
+            "#11223380",
+            "--frame-aspect",
+            "wide",
+            "--alignment",
+            "bottom-right",
+            "--border",
+            "2",
+            "--dry-run",
+        ]);
+        assert!(rendered.contains(r#""auto_balance":true"#), "{rendered}");
+        assert!(rendered.contains(r#""aspect":"wide""#), "{rendered}");
+        assert!(
+            rendered.contains(r#""alignment":"bottomright""#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r##""background":"#11223380""##),
+            "{rendered}"
+        );
+        assert!(rendered.contains(r#""border":2.0"#), "{rendered}");
+    }
+
+    #[test]
+    fn a_dry_run_without_beautification_reports_no_beautification_plan() {
+        let rendered = json_of(&["scrozz", "capture", "--region", "0,0,300,200", "--dry-run"]);
+        assert!(rendered.contains(r#""beautification":null"#), "{rendered}");
+        assert!(rendered.contains(r#""smart_frame":false"#), "{rendered}");
+    }
+
+    #[test]
+    fn a_dry_run_reports_an_exact_output_size_and_clears_the_aspect() {
+        let rendered = json_of(&[
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,300,200",
+            "--beautify",
+            "clean",
+            "--size",
+            "640x480",
+            "--dry-run",
+        ]);
+        assert!(
+            rendered.contains(r#""output_size":{"width":640,"height":480}"#),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_reports_smart_frame_opt_in_with_an_automatic_background() {
+        let rendered = json_of(&[
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,300,200",
+            "--smart-frame",
+            "--dry-run",
+        ]);
+        assert!(rendered.contains(r#""smart_frame":true"#), "{rendered}");
+        assert!(rendered.contains(r#""auto_balance":true"#), "{rendered}");
+        assert!(
+            rendered.contains(r#""background":"automatic:"#),
+            "{rendered}"
+        );
     }
 
     #[test]

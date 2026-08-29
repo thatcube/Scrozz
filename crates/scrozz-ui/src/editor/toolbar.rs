@@ -77,8 +77,8 @@ const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
 
 /// The width of the right-hand action group, at its widest.
 ///
-/// Four right-aligned document actions.
-const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR);
+/// Five right-aligned document actions.
+const ACTIONS_W: f32 = 5.0f32.mul_add(BUTTON, 4.0 * Space::HAIR);
 
 /// The width the whole toolbar needs to sit on a single row.
 ///
@@ -557,6 +557,11 @@ pub fn draw(
         (Icon::Copy, "Copy", Action::Intent(Box::new(Intent::Copy))),
         (Icon::ArrowForwardUp, "Redo", Action::Redo),
         (Icon::ArrowBackUp, "Undo", Action::Undo),
+        (
+            Icon::LayoutGrid,
+            "Smart Frame",
+            Action::Intent(Box::new(Intent::ToggleSmartFrame)),
+        ),
     ] {
         let rect = Rect::from_center_size(pos2(rx + BUTTON / 2.0, cy), vec2(BUTTON, BUTTON));
         let enabled = match action {
@@ -564,8 +569,12 @@ pub fn draw(
             Action::Redo => state.can_redo(),
             Action::Intent(_) => true,
         };
+        let selected = matches!(
+            &action,
+            Action::Intent(intent) if **intent == Intent::ToggleSmartFrame
+        ) && state.has_smart_frame_draft();
         let flags = if enabled {
-            ControlState::new()
+            ControlState::new().selected(selected)
         } else {
             ControlState::disabled()
         };

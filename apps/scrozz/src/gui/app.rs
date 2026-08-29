@@ -34,7 +34,9 @@ use std::{
 };
 
 use clap::Parser as _;
-use scrozz_annotate::Document;
+use scrozz_annotate::{
+    AnalysisCancellation, Document, DocumentData, SmartFrameAnalysis, SmartFramePreset,
+};
 use scrozz_core::{Error as CoreError, LockEscape, SelectionCapabilities};
 use scrozz_shell::{
     Accelerator, Capability, DragPayload, GlobalHotkeys, HotkeyEvent, KeyState, Permissions,
@@ -540,6 +542,7 @@ pub struct App {
     sound_warning_shown: bool,
     settings_requested: bool,
     editor_requests: VecDeque<EditorRequest>,
+    smart_frame_results: VecDeque<SmartFrameResult>,
     /// Captures retained only because their editor is open, not by the overlay.
     editor_only_cards: HashSet<CardId>,
     /// The one editor revision currently being prepared on the worker.
@@ -578,6 +581,21 @@ pub struct EditorRequest {
     pub generation: u64,
     /// The complete editable document.
     pub document: Document,
+    /// User-created Smart Frame presets available to this editor.
+    pub smart_frame_presets: Vec<SmartFramePreset>,
+}
+
+/// One asynchronous Smart Frame result awaiting delivery to its editor.
+#[derive(Debug)]
+pub struct SmartFrameResult {
+    /// The card whose source was analysed.
+    pub card: CardId,
+    /// The editor lifetime that requested the analysis.
+    pub generation: u64,
+    /// The editor revision the result belongs to.
+    pub revision: u64,
+    /// Resolved framing or an actionable failure.
+    pub result: std::result::Result<SmartFrameAnalysis, String>,
 }
 
 /// The live editor state available during one host pass.
@@ -880,6 +898,7 @@ impl App {
             sound_warning_shown: false,
             settings_requested: false,
             editor_requests: VecDeque::new(),
+            smart_frame_results: VecDeque::new(),
             editor_only_cards: HashSet::new(),
             editor_render_pending: None,
             editor_render_failed: None,
@@ -1378,6 +1397,11 @@ impl App {
                         card,
                         generation,
                         document: *document,
+                        smart_frame_presets: self
+                            .config
+                            .after_capture
+                            .smart_frame_presets()
+                            .to_vec(),
                     });
                 }
                 Outcome::Prepared {
@@ -1408,6 +1432,19 @@ impl App {
                         "{card} editor {generation} revision {revision} could not be prepared for \
                          drag: {error}"
                     ));
+                }
+                Outcome::SmartFrameAnalyzed {
+                    card,
+                    generation,
+                    revision,
+                    result,
+                } => {
+                    self.smart_frame_results.push_back(SmartFrameResult {
+                        card,
+                        generation,
+                        revision,
+                        result: *result,
+                    });
                 }
                 Outcome::Refused { card, error } => {
                     self.note(format!("{card} refused: {error}"));
@@ -2578,9 +2615,30 @@ impl App {
                 unavailable_reason: availability.reason.map(str::to_owned),
             }
         };
-        AfterCaptureAction::UI_ORDER
-            .into_iter()
-            .map(|action| AfterCaptureRow {
+        let mut rows = vec![AfterCaptureRow {
+            screenshot_id: crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY.to_owned(),
+            recording_id: None,
+            label: "Apply Smart Frame".to_owned(),
+            description:
+                "Create one adaptive presentation revision before any screenshot action runs."
+                    .to_owned(),
+            screenshot: AfterCaptureCell {
+                enabled: self
+                    .config
+                    .after_capture
+                    .value(crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
+                    .is_some_and(|value| value == "true"),
+                available: true,
+                unavailable_reason: None,
+            },
+            recording: AfterCaptureCell {
+                enabled: false,
+                available: false,
+                unavailable_reason: Some("Smart Frame applies only to screenshots.".to_owned()),
+            },
+        }];
+        rows.extend(AfterCaptureAction::UI_ORDER.into_iter().map(|action| {
+            AfterCaptureRow {
                 screenshot_id: action.setting_key(MediaKind::Screenshot),
                 recording_id: action
                     .is_contract_available(MediaKind::Recording)
@@ -2589,8 +2647,9 @@ impl App {
                 description: action.description().to_owned(),
                 screenshot: cell(MediaKind::Screenshot, action),
                 recording: cell(MediaKind::Recording, action),
-            })
-            .collect()
+            }
+        }));
+        rows
     }
 
     /// Persists accepted After Capture edits before putting them in force.
@@ -2599,7 +2658,19 @@ impl App {
             return;
         }
         let mut changes = Vec::new();
+        let mut apply_smart_frame = None;
         for edit in edits {
+            if edit.id == crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY {
+                if edit.media != AfterCaptureMedia::Screenshot {
+                    self.note(format!(
+                        "{} was not changed because it arrived from the wrong settings column",
+                        edit.id
+                    ));
+                    continue;
+                }
+                apply_smart_frame = Some(edit.enabled);
+                continue;
+            }
             let Some((media, action)) = AfterCaptureSettings::resolve_key(&edit.id) else {
                 self.note(format!(
                     "unknown After Capture setting {:?} was ignored",
@@ -2631,7 +2702,7 @@ impl App {
             }
             changes.push((media, action, edit.enabled));
         }
-        if changes.is_empty() {
+        if changes.is_empty() && apply_smart_frame.is_none() {
             return;
         }
         let Some(store) = self.config.after_capture_store.clone() else {
@@ -2643,6 +2714,12 @@ impl App {
         match store.update(store.inferred_profile(), |latest| {
             for &(media, action, enabled) in &changes {
                 latest.set(media, action, enabled);
+            }
+            if let Some(enabled) = apply_smart_frame {
+                latest.set_value(
+                    crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY,
+                    enabled.to_string(),
+                );
             }
             Ok(())
         }) {
@@ -2838,6 +2915,84 @@ impl App {
     /// Takes a pending request to open the annotation editor.
     pub fn take_editor_request(&mut self) -> Option<EditorRequest> {
         self.editor_requests.pop_front()
+    }
+
+    /// Takes one completed Smart Frame analysis for delivery by the viewport host.
+    pub fn take_smart_frame_result(&mut self) -> Option<SmartFrameResult> {
+        self.smart_frame_results.pop_front()
+    }
+
+    /// The durable Smart Frame preset library currently in force.
+    #[must_use]
+    pub fn smart_frame_presets(&self) -> &[SmartFramePreset] {
+        self.config.after_capture.smart_frame_presets()
+    }
+
+    /// Queues analysis of one immutable editor revision.
+    pub fn analyze_smart_frame(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        revision: u64,
+        data: DocumentData,
+        cancellation: AnalysisCancellation,
+    ) {
+        if !self.pipeline.post(Job::AnalyzeSmartFrame {
+            card,
+            generation,
+            revision,
+            data: Box::new(data),
+            cancellation,
+        }) {
+            self.smart_frame_results.push_back(SmartFrameResult {
+                card,
+                generation,
+                revision,
+                result: Err("the Smart Frame worker is no longer available".to_owned()),
+            });
+        }
+    }
+
+    /// Persists one custom Smart Frame preset and updates the live policy snapshot.
+    pub fn upsert_smart_frame_preset(
+        &mut self,
+        preset: SmartFramePreset,
+    ) -> CliResult<Vec<SmartFramePreset>> {
+        let store = self.config.after_capture_store.clone().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "no configuration directory is available for Smart Frame presets".to_owned(),
+            ))
+        })?;
+        let updated = store
+            .update(store.inferred_profile(), |settings| {
+                settings.upsert_smart_frame_preset(preset)
+            })
+            .map_err(CliError::Core)?;
+        let presets = updated.smart_frame_presets().to_vec();
+        self.config.after_capture = updated;
+        self.note("Smart Frame preset saved");
+        Ok(presets)
+    }
+
+    /// Removes one custom Smart Frame preset and updates the live policy snapshot.
+    pub fn delete_smart_frame_preset(
+        &mut self,
+        preset_id: &str,
+    ) -> CliResult<Vec<SmartFramePreset>> {
+        let store = self.config.after_capture_store.clone().ok_or_else(|| {
+            CliError::Core(CoreError::Storage(
+                "no configuration directory is available for Smart Frame presets".to_owned(),
+            ))
+        })?;
+        let updated = store
+            .update(store.inferred_profile(), |settings| {
+                settings.delete_smart_frame_preset(preset_id)
+            })
+            .map_err(CliError::Core)?;
+        let presets = updated.smart_frame_presets().to_vec();
+        self.config.after_capture = updated;
+        self.note("Smart Frame preset deleted");
+        Ok(presets)
     }
 
     /// Releases an artifact that was retained only for its editor window.
@@ -3191,7 +3346,7 @@ mod tests {
     fn after_capture_rows_expose_real_capabilities_not_inert_controls() {
         let (app, _) = app();
         let rows = app.after_capture_rows();
-        assert_eq!(rows.len(), AfterCaptureAction::UI_ORDER.len());
+        assert_eq!(rows.len(), AfterCaptureAction::UI_ORDER.len() + 1);
         assert!(
             rows.iter().all(|row| !row.label.contains("Quick Access")),
             "{rows:?}"
@@ -3212,6 +3367,14 @@ mod tests {
         assert!(!pin.screenshot.available);
         assert!(pin.recording_id.is_none());
         assert!(pin.recording.unavailable_reason.is_some());
+
+        let smart_frame = rows
+            .iter()
+            .find(|row| row.screenshot_id == crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
+            .expect("Smart Frame row");
+        assert!(!smart_frame.screenshot.enabled);
+        assert!(smart_frame.screenshot.available);
+        assert!(smart_frame.recording_id.is_none());
     }
 
     #[test]
@@ -3247,6 +3410,80 @@ mod tests {
             .load(crate::after_capture::InstallProfile::Fresh)
             .unwrap();
         assert!(restarted.is_enabled(MediaKind::Screenshot, AfterCaptureAction::SaveAutomatically));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn after_capture_smart_frame_is_opt_in_and_persists() {
+        let root =
+            std::env::temp_dir().join(format!("scrozz-app-smart-frame-{}", std::process::id()));
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let surface = Recording::new();
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        config.after_capture_store = Some(store.clone());
+        let mut app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+            false,
+        )
+        .expect("sealed app");
+
+        app.edit_after_capture(&[AfterCaptureEdit {
+            id: crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY.to_owned(),
+            media: AfterCaptureMedia::Screenshot,
+            enabled: true,
+        }]);
+        assert!(crate::settings::smart_frame_after_capture(&app.config.after_capture).unwrap());
+        drop(app);
+
+        let restarted = store.load(InstallProfile::Fresh).unwrap();
+        assert!(crate::settings::smart_frame_after_capture(&restarted).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smart_frame_presets_persist_without_replacing_other_settings() {
+        let root =
+            std::env::temp_dir().join(format!("scrozz-app-smart-presets-{}", std::process::id()));
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        config.after_capture.set_value("capture.format", "webp");
+        store.save(&config.after_capture).unwrap();
+        config.after_capture_store = Some(store.clone());
+        let surface = Recording::new();
+        let mut app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+            false,
+        )
+        .expect("sealed app");
+        let preset = SmartFramePreset::new(
+            "notes",
+            "Notes",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+
+        let presets = app.upsert_smart_frame_preset(preset).unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(app.smart_frame_presets()[0].name, "Notes");
+        let restarted = store.load(InstallProfile::Fresh).unwrap();
+        assert_eq!(restarted.value("capture.format"), Some("webp"));
+        assert_eq!(restarted.smart_frame_presets()[0].id, "notes");
+
+        let presets = app.delete_smart_frame_preset("notes").unwrap();
+        assert!(presets.is_empty());
+        assert!(
+            store
+                .load(InstallProfile::Fresh)
+                .unwrap()
+                .smart_frame_presets()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3344,11 +3581,13 @@ mod tests {
             card: CardId(1),
             generation: 1,
             document: scrozz_annotate::Document::new(capture.clone()),
+            smart_frame_presets: Vec::new(),
         });
         app.editor_requests.push_back(EditorRequest {
             card: CardId(2),
             generation: 2,
             document: scrozz_annotate::Document::new(capture),
+            smart_frame_presets: Vec::new(),
         });
 
         assert_eq!(app.take_editor_request().unwrap().card, CardId(1));

@@ -1515,7 +1515,16 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
         available: false,
         unavailable_reason: Some(reason.to_owned()),
     };
-    [
+    let mut rows = vec![AfterCaptureRow {
+        screenshot_id: "after-capture.apply-smart-frame".to_owned(),
+        recording_id: None,
+        label: "Apply Smart Frame".to_owned(),
+        description: "Create one adaptive presentation revision before any screenshot action runs."
+            .to_owned(),
+        screenshot: available(false),
+        recording: unavailable(false, "Smart Frame applies only to screenshots."),
+    }];
+    rows.extend([
         (
             "show-recent-captures-overlay",
             "Show Recent Captures Overlay",
@@ -1587,7 +1596,8 @@ fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
             }
         },
     )
-    .collect()
+    .collect::<Vec<_>>());
+    rows
 }
 
 #[cfg(test)]
@@ -1927,7 +1937,7 @@ mod tests {
             rows.iter().all(|row| !row.label.contains("Quick Access")),
             "{rows:?}"
         );
-        assert_eq!(rows[0].label, "Show Recent Captures Overlay");
+        assert_eq!(rows[0].label, "Apply Smart Frame");
         for row in &rows {
             for cell in [&row.screenshot, &row.recording] {
                 assert!(

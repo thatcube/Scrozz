@@ -540,6 +540,73 @@ fn a_dry_run_reports_the_plan_and_captures_nothing() {
 }
 
 #[test]
+fn a_dry_run_reports_the_resolved_beautification_plan() {
+    let out = scrozz([
+        "--json",
+        "capture",
+        "--region",
+        "0,0,300,200",
+        "--beautify",
+        "social",
+        "--background",
+        "#11223380",
+        "--frame-aspect",
+        "wide",
+        "--alignment",
+        "bottom-right",
+        "--border",
+        "2",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    // Beautification requires no `--format`, so the plan still reports the
+    // ordinary default format; only the beautification fields are new.
+    assert!(has_field(&text, "format", r#""png""#), "{text}");
+    assert!(has_field(&text, "auto_balance", "true"), "{text}");
+    assert!(has_field(&text, "aspect", r#""wide""#), "{text}");
+    assert!(has_field(&text, "alignment", r#""bottomright""#), "{text}");
+    assert!(has_field(&text, "background", r##""#11223380""##), "{text}");
+}
+
+#[test]
+fn d9_refuses_window_beautification_before_touching_a_backend() {
+    let out = scrozz([
+        "capture",
+        "--window",
+        "Safari",
+        "--beautify",
+        "clean",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 7, "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("window"), "{text}");
+    assert!(text.contains("D9"), "{text}");
+}
+
+#[test]
+fn explicit_smart_frame_dry_run_is_allowed_for_a_window_outer_canvas() {
+    // The reviewed D9 carve-out: an explicit `--smart-frame` may still add an
+    // outer canvas to a window capture, unlike `--beautify` above, because it
+    // adds no inset/corner/shadow/border that would touch native pixels.
+    let out = scrozz([
+        "--json",
+        "capture",
+        "--window",
+        "Safari",
+        "--smart-frame",
+        "--no-ipc",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(has_field(&text, "smart_frame", "true"), "{text}");
+}
+
+#[test]
 fn all_in_one_selector_controls_survive_the_real_cli_boundary() {
     let out = scrozz([
         "--json",

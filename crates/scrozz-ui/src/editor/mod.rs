@@ -303,7 +303,18 @@ impl EditorUi {
             bar,
             inspector_was_open,
         ) {
-            self.pending = Some(action);
+            if action == Intent::ToggleSmartFrame {
+                if self.state.has_smart_frame_draft() {
+                    self.show_smart_frame = true;
+                } else if self.show_smart_frame {
+                    self.show_smart_frame = false;
+                } else {
+                    self.show_smart_frame = true;
+                    self.pending = Some(self.state.begin_smart_frame());
+                }
+            } else {
+                self.pending = Some(action);
+            }
         }
         // Smart Frame right panel.
         if let Some(panel_rect) = sf_panel

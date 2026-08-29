@@ -591,6 +591,8 @@ pub enum Intent {
     Save,
     /// Open the platform's custom colour picker.
     CustomColor,
+    /// Toggle the Smart Frame side panel.
+    ToggleSmartFrame,
     /// Request asynchronous Smart Frame analysis.
     ///
     /// The host schedules [`analyze_smart_frame`](scrozz_annotate::analyze_smart_frame)
@@ -626,7 +628,8 @@ impl PartialEq for Intent {
             | (Self::Close, Self::Close)
             | (Self::Copy, Self::Copy)
             | (Self::Save, Self::Save)
-            | (Self::CustomColor, Self::CustomColor) => true,
+            | (Self::CustomColor, Self::CustomColor)
+            | (Self::ToggleSmartFrame, Self::ToggleSmartFrame) => true,
             (
                 Self::AnalyzeSmartFrame { revision: a, .. },
                 Self::AnalyzeSmartFrame { revision: b, .. },

@@ -675,6 +675,7 @@ impl Driver {
 
         match intent {
             Intent::None => {}
+            Intent::ToggleSmartFrame => {}
             Intent::Close => self.editor.close(),
             Intent::Copy | Intent::Save => match editor.render() {
                 Ok(rendered) => {
@@ -699,6 +700,40 @@ impl Driver {
                         editor.open_custom_color_fallback();
                     }
                 }
+            }
+            Intent::AnalyzeSmartFrame {
+                revision,
+                data,
+                cancellation,
+            } => self
+                .app
+                .analyze_smart_frame(card, generation, revision, *data, cancellation),
+            Intent::UpsertPreset(preset) => match self.app.upsert_smart_frame_preset(*preset) {
+                Ok(presets) => editor.state_mut().set_custom_presets(presets),
+                Err(error) => {
+                    editor
+                        .state_mut()
+                        .set_custom_presets(self.app.smart_frame_presets().to_vec());
+                    tracing::warn!(%error, "Smart Frame preset could not be saved");
+                }
+            },
+            Intent::DeletePreset(preset_id) => {
+                match self.app.delete_smart_frame_preset(&preset_id) {
+                    Ok(presets) => editor.state_mut().set_custom_presets(presets),
+                    Err(error) => {
+                        editor
+                            .state_mut()
+                            .set_custom_presets(self.app.smart_frame_presets().to_vec());
+                        tracing::warn!(%error, "Smart Frame preset could not be deleted");
+                    }
+                }
+            }
+            Intent::RequestSensitiveReview { revision, data } => {
+                let _ = data;
+                editor.deliver_sensitive_review(scrozz_annotate::SensitiveRegionReview {
+                    revision,
+                    ..Default::default()
+                });
             }
         }
 
@@ -1315,12 +1350,25 @@ impl eframe::App for Driver {
             let title = format!("{}", request.card);
             let mut editor = scrozz_ui::editor::EditorUi::new(request.document);
             editor.set_custom_swatches(self.custom_swatches.clone());
+            editor
+                .state_mut()
+                .set_custom_presets(request.smart_frame_presets);
             self.editing = Some(Editing {
                 card: request.card,
                 generation: request.generation,
                 editor,
             });
             let _ = self.editor.open(title);
+        }
+        while let Some(result) = self.app.take_smart_frame_result() {
+            let Some(editing) = self.editing.as_mut() else {
+                continue;
+            };
+            if editing.card == result.card && editing.generation == result.generation {
+                editing
+                    .editor
+                    .deliver_analysis(result.revision, result.result);
+            }
         }
         self.sync_root_visibility(ctx);
         if !self.stopped && tick == Tick::Stop {

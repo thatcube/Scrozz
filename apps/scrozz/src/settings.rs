@@ -24,6 +24,9 @@ use crate::{
 use scrozz_shell::ScreenshotSound;
 use std::path::PathBuf;
 
+/// Persisted opt-in transform resolved before screenshot consumers run.
+pub const APPLY_SMART_FRAME_AFTER_CAPTURE_KEY: &str = "after-capture.apply-smart-frame";
+
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -288,6 +291,12 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "false",
         description: "Pin screenshots in a floating always-above window.",
+    },
+    Setting {
+        key: APPLY_SMART_FRAME_AFTER_CAPTURE_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Apply an adaptive Smart Frame before any enabled screenshot action runs.",
     },
     Setting {
         key: "capture.window-shadow",
@@ -591,6 +600,22 @@ pub fn retention_policy(
     })
 }
 
+/// Whether GUI screenshots should receive Smart Frame before any consumer runs.
+pub fn smart_frame_after_capture(persisted: &AfterCaptureSettings) -> CliResult<bool> {
+    let shortcuts = Shortcuts::default();
+    let value = resolve(
+        lookup(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)?,
+        &shortcuts,
+        persisted,
+    )
+    .0;
+    value.parse::<bool>().map_err(|_| {
+        CliError::usage(format!(
+            "{APPLY_SMART_FRAME_AFTER_CAPTURE_KEY} must be `true` or `false`"
+        ))
+    })
+}
+
 fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSound> {
     match selected {
         "8-bit" => Ok(ScreenshotSound::EightBit),
@@ -747,6 +772,16 @@ mod tests {
     #[test]
     fn frozen_selection_defaults_off() {
         assert_eq!(lookup("capture.freeze-screen").unwrap().default, "false");
+    }
+
+    #[test]
+    fn after_capture_smart_frame_defaults_off() {
+        let persisted = AfterCaptureSettings::fresh();
+        assert_eq!(
+            lookup(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY).unwrap().default,
+            "false"
+        );
+        assert!(!smart_frame_after_capture(&persisted).unwrap());
     }
 
     #[test]
