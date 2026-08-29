@@ -274,14 +274,6 @@ fn install_forgivingly(
     }
 }
 
-fn rejection_summary(rejections: &[Rejection]) -> String {
-    rejections
-        .iter()
-        .map(|rejection| rejection.reason.as_str())
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 /// Whether the host should keep going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -291,14 +283,11 @@ pub enum Tick {
     Stop,
 }
 
-const SHORTCUT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
+const ASSIGNMENT_EVENT_GUARD: Duration = Duration::from_millis(150);
 
-struct PendingShortcutVerification {
-    action: ShortcutAction,
+struct AssignmentEventGuard {
     accelerator: Accelerator,
-    candidate: Shortcuts,
-    previous: Shortcuts,
-    deadline: Instant,
+    expires: Instant,
 }
 
 /// The running application.
@@ -319,7 +308,7 @@ pub struct App {
     shortcuts: Shortcuts,
     shortcut_store: Option<ShortcutStore>,
     rejected: Vec<(ShortcutAction, String)>,
-    pending_shortcut: Option<PendingShortcutVerification>,
+    assignment_guard: Option<AssignmentEventGuard>,
     session: Session,
     selection_capabilities: SelectionCapabilities,
     capture_backend_ready: bool,
@@ -430,7 +419,7 @@ impl App {
             shortcuts,
             shortcut_store,
             rejected: Vec::new(),
-            pending_shortcut: None,
+            assignment_guard: None,
             session,
             selection_capabilities,
             capture_backend_ready,
@@ -459,7 +448,6 @@ impl App {
             return Tick::Stop;
         }
         self.drain_hotkeys();
-        self.expire_shortcut_verification();
         if self.drain_server() == Tick::Stop {
             return Tick::Stop;
         }
@@ -500,78 +488,35 @@ impl App {
         }
 
         for event in pending {
-            self.handle_hotkey_event(event);
+            if let Some(action) = self.action_for_hotkey_event(event) {
+                self.perform(action);
+            }
         }
     }
 
-    fn handle_hotkey_event(&mut self, event: HotkeyEvent) {
+    fn action_for_hotkey_event(&mut self, event: HotkeyEvent) -> Option<Action> {
+        if self.assignment_guard.as_ref().is_some_and(|guard| {
+            guard.accelerator == event.accelerator && Instant::now() <= guard.expires
+        }) {
+            if event.state == KeyState::Released {
+                self.assignment_guard = None;
+            }
+            return None;
+        }
+        self.assignment_guard
+            .take_if(|guard| Instant::now() > guard.expires);
+
         // Both edges arrive. Acting on the release as well would take two
         // captures per press.
         if event.state != KeyState::Pressed {
-            return;
-        }
-        if self.pending_shortcut.as_ref().is_some_and(|pending| {
-            pending.accelerator == event.accelerator && pending.action.id() == event.action
-        }) {
-            let pending = self
-                .pending_shortcut
-                .take()
-                .expect("the verification was just matched");
-            self.commit_shortcuts(pending.candidate);
-            self.rejected.clear();
-            self.note(format!(
-                "{} verified and saved for {}",
-                event.accelerator, event.action
-            ));
-            return;
+            return None;
         }
 
-        let id = event.action;
-        {
-            if let Some(action) = Action::from_id(&id) {
-                self.perform(action);
-            } else {
-                tracing::warn!(action = %id, "a hotkey fired for an action this build does not know");
-            }
+        let action = Action::from_id(&event.action);
+        if action.is_none() {
+            tracing::warn!(action = %event.action, "a hotkey fired for an action this build does not know");
         }
-    }
-
-    fn expire_shortcut_verification(&mut self) {
-        let Some(pending) = self
-            .pending_shortcut
-            .take_if(|pending| Instant::now() >= pending.deadline)
-        else {
-            return;
-        };
-        let action = pending.action;
-        let symbols = pending.accelerator.symbols();
-        match self.register_shortcuts(&pending.previous) {
-            Ok(()) => {
-                self.refresh_tray_shortcuts();
-                self.rejected = vec![(
-                    action,
-                    format!(
-                        "Scrozz did not receive {symbols} during verification. macOS may still be \
-                         handling it; check the current Keyboard Shortcuts settings or choose \
-                         another combination."
-                    ),
-                )];
-                self.note(format!(
-                    "{symbols} verification timed out; restored previous shortcuts"
-                ));
-            }
-            Err(rejections) => {
-                self.pending_shortcut = Some(pending);
-                self.rejected = vec![(
-                    action,
-                    format!(
-                        "{symbols} was not verified, and the previous shortcuts could not be \
-                         restored yet: {}",
-                        rejection_summary(&rejections)
-                    ),
-                )];
-            }
-        }
+        action
     }
 
     fn drain_server(&mut self) -> Tick {
@@ -762,15 +707,11 @@ impl App {
     /// The editable shortcut table, as the settings pane needs to see it.
     #[must_use]
     pub fn shortcut_rows(&self) -> Vec<ShortcutRow> {
-        let shown = self
-            .pending_shortcut
-            .as_ref()
-            .map_or(&self.shortcuts, |pending| &pending.candidate);
-        let problems = shown.problems();
+        let problems = self.shortcuts.problems();
         ShortcutAction::ALL
             .into_iter()
             .map(|action| {
-                let accelerator = shown.get(action).unwrap_or_default();
+                let accelerator = self.shortcuts.get(action).unwrap_or_default();
                 // A stored value that will not parse is shown back verbatim,
                 // because "that is not a combination" is only useful next to what
                 // the user actually typed.
@@ -780,18 +721,6 @@ impl App {
                     .iter()
                     .find(|(offender, _)| *offender == action)
                     .map(|(_, why)| why.to_string())
-                    .or_else(|| {
-                        self.pending_shortcut
-                            .as_ref()
-                            .filter(|pending| pending.action == action)
-                            .map(|pending| {
-                                format!(
-                                    "Press {} now to verify that macOS delivers it to Scrozz. \
-                                     The previous shortcut stays saved until verification succeeds.",
-                                    pending.accelerator.symbols()
-                                )
-                            })
-                    })
                     .or_else(|| {
                         self.rejected
                             .iter()
@@ -803,9 +732,17 @@ impl App {
                     label: action.label().to_owned(),
                     accelerator: accelerator.to_owned(),
                     symbols,
-                    is_default: shown.is_default(action),
+                    is_default: self.shortcuts.is_default(action),
                     usable: self.shortcut_is_usable(action),
                     problem,
+                    advisory: (cfg!(target_os = "macos")
+                        && Accelerator::parse(accelerator)
+                            .is_ok_and(|parsed| parsed.system_owner().is_some()))
+                    .then_some(
+                        "May conflict with a macOS shortcut. If it does not fire, review System \
+                         Settings › Keyboard › Keyboard Shortcuts."
+                            .to_owned(),
+                    ),
                 }
             })
             .collect()
@@ -821,24 +758,9 @@ impl App {
         if edits.is_empty() {
             return;
         }
-        if let Some(pending) = self.pending_shortcut.take() {
-            if let Err(rejections) = self.register_shortcuts(&pending.previous) {
-                let action = pending.action;
-                self.pending_shortcut = Some(pending);
-                self.rejected = vec![(
-                    action,
-                    format!(
-                        "The pending shortcut could not be cancelled safely: {}",
-                        rejection_summary(&rejections)
-                    ),
-                )];
-                return;
-            }
-            self.refresh_tray_shortcuts();
-        }
-
         let mut candidate = self.shortcuts.clone();
         let mut touched = Vec::new();
+        let mut recorded = None;
         for edit in edits {
             match edit {
                 ShortcutEdit::ResetAll => {
@@ -851,6 +773,9 @@ impl App {
                     };
                     candidate.set(action, Some(accelerator));
                     touched.push(action);
+                    recorded = candidate
+                        .get(action)
+                        .and_then(|raw| Accelerator::parse(raw).ok());
                 }
                 ShortcutEdit::Clear { id } => {
                     let Some(action) = ShortcutAction::from_id(id) else {
@@ -901,31 +826,12 @@ impl App {
 
         match self.register_shortcuts(&candidate) {
             Ok(()) => {
-                let verification = touched.iter().find_map(|action| {
-                    let accelerator = candidate
-                        .get(*action)
-                        .and_then(|raw| Accelerator::parse(raw).ok())?;
-                    (cfg!(target_os = "macos") && accelerator.system_owner().is_some())
-                        .then_some((*action, accelerator))
+                self.assignment_guard = recorded.map(|accelerator| AssignmentEventGuard {
+                    accelerator,
+                    expires: Instant::now() + ASSIGNMENT_EVENT_GUARD,
                 });
-                if let Some((action, accelerator)) = verification {
-                    self.pending_shortcut = Some(PendingShortcutVerification {
-                        action,
-                        accelerator,
-                        candidate,
-                        previous: self.shortcuts.clone(),
-                        deadline: Instant::now() + SHORTCUT_VERIFICATION_TIMEOUT,
-                    });
-                    self.rejected.clear();
-                    self.refresh_tray_shortcuts();
-                    self.note(format!(
-                        "{} registered provisionally; waiting for live delivery",
-                        accelerator.symbols()
-                    ));
-                } else {
-                    self.commit_shortcuts(candidate);
-                    self.rejected.clear();
-                }
+                self.commit_shortcuts(candidate);
+                self.rejected.clear();
             }
             Err(rejections) => {
                 self.rejected = rejections
@@ -1151,6 +1057,8 @@ mod tests {
         app.shortcuts = shortcuts.clone();
         app.config.shortcuts = shortcuts;
         app.shortcut_store = None;
+        app.selection_capabilities = SelectionCapabilities::CLIENT_OVERLAY;
+        app.capture_backend_ready = true;
         app
     }
 
@@ -1198,7 +1106,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn start_known_default_verification(app: &mut App) -> Accelerator {
+    fn assign_known_default(app: &mut App) -> Accelerator {
         let accelerator = Accelerator::parse("Cmd+Shift+4").expect("known default parses");
         app.edit_shortcuts(&[ShortcutEdit::Set {
             id: ShortcutAction::CaptureRegion.id().to_owned(),
@@ -1209,130 +1117,154 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn disabled_system_default_can_commit_after_live_delivery() {
+    fn disabled_system_default_saves_immediately_with_advisory() {
         let mut app = app_with_shortcuts(Shortcuts::default());
-        let (directory, store) = shortcut_store("verified-default");
+        let (directory, store) = shortcut_store("known-default");
         app.shortcut_store = Some(store.clone());
-        let previous = app
-            .shortcuts
-            .get(ShortcutAction::CaptureRegion)
-            .map(str::to_owned);
-        let accelerator = start_known_default_verification(&mut app);
+        let accelerator = assign_known_default(&mut app);
 
-        assert!(app.pending_shortcut.is_some());
-        assert_eq!(
-            app.shortcuts.get(ShortcutAction::CaptureRegion),
-            previous.as_deref(),
-            "the saved configuration stays unchanged until delivery is observed"
-        );
-        let provisional = app
-            .shortcut_rows()
-            .into_iter()
-            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
-            .expect("region is listed");
-        assert_eq!(provisional.accelerator, accelerator.to_string());
-        assert!(
-            provisional
-                .problem
-                .is_some_and(|message| message.contains("verify"))
-        );
-
-        app.handle_hotkey_event(HotkeyEvent {
-            action: ShortcutAction::CaptureRegion.id().to_owned(),
-            accelerator,
-            state: KeyState::Pressed,
-        });
-
-        assert!(app.pending_shortcut.is_none());
         assert_eq!(
             app.shortcuts.get(ShortcutAction::CaptureRegion),
             Some(accelerator.to_string().as_str())
         );
-        let committed = app
-            .shortcut_rows()
-            .into_iter()
-            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
-            .expect("region is listed");
-        assert_eq!(committed.accelerator, accelerator.to_string());
-        assert_eq!(committed.symbols, accelerator.symbols());
-        assert!(committed.problem.is_none());
         assert_eq!(
             store.load().get(ShortcutAction::CaptureRegion),
             Some(accelerator.to_string().as_str()),
-            "only observed delivery is persisted"
+            "successful native registration saves immediately"
         );
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn successful_registration_without_delivery_restores_the_previous_binding() {
-        let mut app = app_with_shortcuts(Shortcuts::default());
-        let (directory, store) = shortcut_store("unverified-default");
-        store
-            .save(&app.shortcuts)
-            .expect("save the previously working shortcuts");
-        app.shortcut_store = Some(store.clone());
-        let previous = app
-            .shortcuts
-            .get(ShortcutAction::CaptureRegion)
-            .expect("region ships bound")
-            .to_owned();
-        start_known_default_verification(&mut app);
-        app.pending_shortcut
-            .as_mut()
-            .expect("known default awaits verification")
-            .deadline = Instant::now();
-
-        app.expire_shortcut_verification();
-
-        assert!(app.pending_shortcut.is_none());
         assert_eq!(
-            app.shortcuts.get(ShortcutAction::CaptureRegion),
-            Some(previous.as_str())
+            app.hotkeys.action_for(&accelerator),
+            Some(ShortcutAction::CaptureRegion.id()),
+            "the live registration and tray source update immediately"
+        );
+        assert_eq!(
+            app.config.bindings,
+            bindings_from(&app.shortcuts),
+            "the configured and displayed shortcut table updates immediately"
         );
         let row = app
             .shortcut_rows()
             .into_iter()
             .find(|row| row.id == ShortcutAction::CaptureRegion.id())
             .expect("region is listed");
-        let message = row.problem.expect("timeout is explained");
-        assert!(message.contains("did not receive"));
+        assert_eq!(row.accelerator, accelerator.to_string());
+        assert_eq!(row.symbols, accelerator.symbols());
+        assert!(row.problem.is_none());
         assert!(
-            !message.contains("already used by"),
-            "delivery failure cannot identify an owner: {message}"
-        );
-        assert_eq!(
-            store.load().get(ShortcutAction::CaptureRegion),
-            Some(previous.as_str()),
-            "an unobserved registration must not replace the saved binding"
+            row.advisory
+                .is_some_and(|message| message.contains("May conflict"))
         );
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_new_edit_cancels_provisional_verification_before_rebinding() {
+    fn free_chord_has_no_system_advisory() {
         let mut app = app_with_shortcuts(Shortcuts::default());
-        start_known_default_verification(&mut app);
-        assert!(app.pending_shortcut.is_some());
-
         app.edit_shortcuts(&[ShortcutEdit::Set {
             id: ShortcutAction::CaptureRegion.id().to_owned(),
             accelerator: "Cmd+Shift+F13".to_owned(),
         }]);
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is listed");
+        assert!(row.advisory.is_none());
+    }
 
-        assert!(app.pending_shortcut.is_none());
-        assert_eq!(
-            app.shortcuts.get(ShortcutAction::CaptureRegion),
-            Some("Shift+Cmd+F13")
-        );
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn known_default_dispatch_never_reopens_or_refocuses_settings() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        assert_eq!(app.perform(Action::OpenSettings), Tick::Continue);
         assert!(
-            app.shortcut_rows()
-                .into_iter()
-                .find(|row| row.id == ShortcutAction::CaptureRegion.id())
-                .is_some_and(|row| row.problem.is_none())
+            app.take_settings_request(),
+            "the host has opened the visible Settings window"
         );
+        let accelerator = assign_known_default(&mut app);
+        let event = |state| HotkeyEvent {
+            action: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator,
+            state,
+        };
+
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Released)),
+            None,
+            "the recorder's assignment release clears its guard"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                app.action_for_hotkey_event(event(KeyState::Pressed)),
+                Some(Action::Capture(CaptureKind::Region)),
+                "each press routes exactly one capture action"
+            );
+            assert_eq!(app.action_for_hotkey_event(event(KeyState::Released)), None);
+            assert!(
+                !app.take_settings_request(),
+                "capture hotkeys must not reopen or foreground Settings"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_event_is_suppressed_but_later_presses_route_only_the_assigned_action() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let accelerator = Accelerator::parse("Cmd+Shift+F13").expect("free chord parses");
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: accelerator.to_string(),
+        }]);
+
+        let event = |state| HotkeyEvent {
+            action: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator,
+            state,
+        };
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Pressed)),
+            None,
+            "the assignment key-down cannot invoke its new action"
+        );
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Released)),
+            None,
+            "the assignment release clears the narrow guard"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                app.action_for_hotkey_event(event(KeyState::Pressed)),
+                Some(Action::Capture(CaptureKind::Region))
+            );
+            assert_eq!(app.action_for_hotkey_event(event(KeyState::Released)), None);
+            assert!(!app.take_settings_request());
+        }
+        assert!(!app.settings_requested);
+    }
+
+    #[test]
+    fn assignment_guard_expires_without_swallowing_a_later_press() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let accelerator = Accelerator::parse("Cmd+Shift+F13").expect("free chord parses");
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: accelerator.to_string(),
+        }]);
+        app.assignment_guard
+            .as_mut()
+            .expect("a recorded assignment gets a narrow guard")
+            .expires = Instant::now();
+
+        assert_eq!(
+            app.action_for_hotkey_event(HotkeyEvent {
+                action: ShortcutAction::CaptureRegion.id().to_owned(),
+                accelerator,
+                state: KeyState::Pressed,
+            }),
+            Some(Action::Capture(CaptureKind::Region))
+        );
+        assert!(!app.take_settings_request());
     }
 
     #[test]

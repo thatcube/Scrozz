@@ -39,6 +39,8 @@ pub struct ShortcutRow {
     pub usable: bool,
     /// Why this row is not in force, if it is not.
     pub problem: Option<String>,
+    /// Nonblocking guidance for a binding that may overlap an OS default.
+    pub advisory: Option<String>,
 }
 
 /// A change the user asked for, for the host to validate and apply.
@@ -391,6 +393,7 @@ pub fn preview_shortcuts(platform: SettingsPlatform) -> Vec<ShortcutRow> {
         is_default: true,
         usable,
         problem: None,
+        advisory: None,
     })
     .collect()
 }
@@ -880,6 +883,13 @@ fn draw_shortcut_row(
                         .font(theme.font(Text::Caption))
                         .color(problem_ink(palette.appearance)),
                 );
+            } else if let Some(advisory) = &row.advisory {
+                ui.add_space(Space::XS);
+                ui.label(
+                    RichText::new(advisory)
+                        .font(theme.font(Text::Caption))
+                        .color(palette.text_muted),
+                );
             }
         });
 }
@@ -1141,6 +1151,20 @@ mod tests {
 
         assert_eq!(window.open(), OpenDisposition::Reused);
         assert!(std::mem::take(&mut window.focus_requested));
+    }
+
+    #[test]
+    fn shortcut_state_changes_never_request_window_focus() {
+        let mut window = SettingsWindow::default();
+        window.open();
+        assert!(std::mem::take(&mut window.focus_requested));
+
+        window.recording = Some("capture.region".to_owned());
+        window.recording = None;
+        assert!(
+            !window.focus_requested,
+            "only an explicit Settings action may foreground the viewport"
+        );
     }
 
     #[test]
