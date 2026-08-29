@@ -20,8 +20,8 @@
 use std::path::Path;
 
 use scrozz_annotate::{
-    Background, BackgroundImage, Beautification, BeautificationPreset, Document, Renderer,
-    SkiaRenderer,
+    AnalysisCancellation, AutomaticBackground, Background, BackgroundImage, Beautification,
+    BeautificationPreset, Document, Renderer, SkiaRenderer, analyze_smart_frame,
 };
 use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame};
 use scrozz_export::{
@@ -88,6 +88,7 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
             "beautification",
             Json::opt(beautification.as_ref(), beautification_json),
         ),
+        ("smart_frame", Json::Bool(args.smart_frame)),
         ("sinks", Json::arr(sinks.iter().map(sink_json))),
     ]);
 
@@ -119,7 +120,19 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
     let capture = backend.capture(&request)?;
     let provenance = capture.provenance;
     let mut document = Document::new(capture);
-    document.set_beautification(beautification)?;
+    if args.smart_frame {
+        let unframed = SkiaRenderer::new().render(&document)?;
+        let mut smart = analyze_smart_frame(
+            &unframed,
+            document.source.provenance,
+            &AnalysisCancellation::default(),
+        )?
+        .beautification;
+        apply_beautification_overrides(args, &mut smart)?;
+        document.set_beautification(Some(smart))?;
+    } else {
+        document.set_beautification(beautification)?;
+    }
     let frame = SkiaRenderer::new().render(&document)?;
     // Keep the report contract destination-independent: `bytes` is the size of
     // one canonical encoded image, not a sum over however many sinks received it.
@@ -186,10 +199,26 @@ fn resolve_beautification(args: &CaptureArgs) -> CliResult<Option<Beautification
         return Ok(None);
     }
 
-    let mut beautification = Beautification::preset(
-        args.beautify
-            .map_or(BeautificationPreset::Clean, |preset| preset.to_model()),
-    );
+    let mut beautification = if args.smart_frame {
+        Beautification {
+            auto_balance: true,
+            background: Background::Automatic(AutomaticBackground::default()),
+            ..Beautification::default()
+        }
+    } else {
+        Beautification::preset(
+            args.beautify
+                .map_or(BeautificationPreset::Clean, |preset| preset.to_model()),
+        )
+    };
+    apply_beautification_overrides(args, &mut beautification)?;
+    Ok(Some(beautification))
+}
+
+fn apply_beautification_overrides(
+    args: &CaptureArgs,
+    beautification: &mut Beautification,
+) -> CliResult<()> {
     if let Some(background) = &args.background {
         beautification.background = match background {
             BeautifyBackground::Transparent => Background::Transparent,
@@ -212,6 +241,11 @@ fn resolve_beautification(args: &CaptureArgs) -> CliResult<Option<Beautification
     }
     if let Some(aspect) = args.aspect {
         beautification.aspect = aspect.to_model();
+        beautification.output_size = None;
+    }
+    if let Some(size) = args.size {
+        beautification.output_size = Some(size.to_model());
+        beautification.aspect = scrozz_annotate::AspectPreset::Original;
     }
     if let Some(alignment) = args.alignment {
         beautification.alignment = alignment.to_model();
@@ -229,7 +263,7 @@ fn resolve_beautification(args: &CaptureArgs) -> CliResult<Option<Beautification
         beautification.border_width = border;
     }
     beautification.validate()?;
-    Ok(Some(beautification))
+    Ok(())
 }
 
 fn beautification_json(beautification: &Beautification) -> Json {
@@ -238,6 +272,15 @@ fn beautification_json(beautification: &Beautification) -> Json {
         (
             "aspect",
             Json::str(format!("{:?}", beautification.aspect).to_lowercase()),
+        ),
+        (
+            "output_size",
+            Json::opt(beautification.output_size, |size| {
+                Json::obj([
+                    ("width", Json::Int(i64::from(size.width))),
+                    ("height", Json::Int(i64::from(size.height))),
+                ])
+            }),
         ),
         (
             "alignment",
@@ -259,6 +302,16 @@ fn beautification_json(beautification: &Beautification) -> Json {
                 }
                 Background::Gradient { .. } => "gradient".to_owned(),
                 Background::BuiltIn(background) => format!("{background:?}").to_lowercase(),
+                Background::Automatic(background) => format!(
+                    "automatic:v{}:#{:02x}{:02x}{:02x}-#{:02x}{:02x}{:02x}",
+                    background.algorithm_version,
+                    background.start.r,
+                    background.start.g,
+                    background.start.b,
+                    background.end.r,
+                    background.end.g,
+                    background.end.b
+                ),
                 Background::Image(image) => {
                     format!("image:{}x{}", image.width(), image.height())
                 }
@@ -626,27 +679,38 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 // ---------------------------------------------------------------------------
 
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
+    let store = settings::SettingsStore::open_default()?;
     match command {
-        SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json())]),
-            settings::all_human(),
-        )),
+        SettingsCommand::Get { key: None } => {
+            let values = store.load()?;
+            Ok(Report::new(
+                Json::obj([("settings", settings::all_json_for(&values))]),
+                settings::all_human_for(&values),
+            ))
+        }
 
         SettingsCommand::Get { key: Some(key) } => {
             let setting = settings::lookup(key)?;
-            Ok(Report::new(setting.to_json(), setting.default.to_string()))
+            let values = store.load()?;
+            let value = values.value(setting);
+            let source = if values.is_overridden(setting.key) {
+                "user"
+            } else {
+                "default"
+            };
+            Ok(Report::new(
+                setting.to_json_value(value, source),
+                value.to_owned(),
+            ))
         }
 
         SettingsCommand::Set { key, value } => {
-            // Validate first and completely. A rejected value must be rejected
-            // for the right reason: "that is not a format" is useful, "settings
-            // are not implemented" is not, and the user needs to hear the first
-            // one even while the second is true.
             let setting = settings::lookup(key)?;
             setting.validate(value)?;
-            Err(CliError::not_implemented(
-                format!("saving {key}"),
-                "scrozz-store (settings persistence)",
+            let values = store.set(key, value)?;
+            Ok(Report::new(
+                setting.to_json_value(values.value(setting), "user"),
+                format!("{key} = {value}"),
             ))
         }
     }
@@ -892,6 +956,28 @@ mod tests {
     }
 
     #[test]
+    fn smart_frame_is_explicit_in_the_cli_plan() {
+        let rendered = json_of(&[
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,320,180",
+            "--smart-frame",
+            "--dry-run",
+        ]);
+        assert!(rendered.contains(r#""smart_frame":true"#), "{rendered}");
+        assert!(rendered.contains(r#""auto_balance":true"#), "{rendered}");
+        assert!(rendered.contains("automatic:v1"), "{rendered}");
+    }
+
+    #[test]
+    fn direct_cli_capture_does_not_read_ambient_after_capture_policy() {
+        let rendered = json_of(&["scrozz", "capture", "--region", "0,0,320,180", "--dry-run"]);
+        assert!(rendered.contains(r#""smart_frame":false"#), "{rendered}");
+        assert!(rendered.contains(r#""beautification":null"#), "{rendered}");
+    }
+
+    #[test]
     fn with_no_destination_the_capture_folder_is_used() {
         let rendered = json_of(&["scrozz", "capture", "--dry-run"]);
         assert!(
@@ -1079,10 +1165,15 @@ mod tests {
     }
 
     #[test]
-    fn a_good_value_reports_the_missing_persistence() {
-        let err = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap_err();
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("capture.format"), "{err}");
+    fn a_good_value_is_persisted_and_read_back() {
+        let store = settings::SettingsStore::open_default().unwrap();
+        let _ = std::fs::remove_file(store.path());
+        let report = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap();
+        assert_eq!(report.human, "capture.format = webp");
+        let read = run(&["scrozz", "settings", "get", "capture.format"]).unwrap();
+        assert_eq!(read.human, "webp");
+        assert!(read.data.to_compact_string().contains(r#""source":"user""#));
+        std::fs::remove_file(store.path()).unwrap();
     }
 
     // -- hotkey ------------------------------------------------------------

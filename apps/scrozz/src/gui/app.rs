@@ -28,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use scrozz_annotate::SmartFramePreset;
 use scrozz_export::Destination;
 use scrozz_shell::{
     Accelerator, Capability, GlobalHotkeys, Hotkey, HotkeyManager, KeyState, Permissions,
@@ -47,6 +48,7 @@ use crate::{
     },
     json::Json,
     report::Report,
+    settings::{AfterCapturePolicy, UserSettings},
 };
 
 /// What a hotkey is bound to unless the environment says otherwise.
@@ -96,6 +98,10 @@ pub struct Config {
     pub deadline: Option<Duration>,
     /// Whether to capture once at startup.
     pub capture_on_start: Option<CaptureKind>,
+    /// GUI-only transform and consumer ordering.
+    pub after_capture: AfterCapturePolicy,
+    /// User-created Smart Frame presets.
+    pub smart_frame_presets: Vec<SmartFramePreset>,
 }
 
 impl Default for Config {
@@ -109,6 +115,8 @@ impl Default for Config {
             ipc: true,
             deadline: None,
             capture_on_start: None,
+            after_capture: AfterCapturePolicy::default(),
+            smart_frame_presets: Vec::new(),
         }
     }
 }
@@ -147,6 +155,14 @@ impl Config {
         config
     }
 
+    /// Applies durable user preferences after environment-only launch options.
+    #[must_use]
+    pub fn with_user_settings(mut self, settings: &UserSettings) -> Self {
+        self.after_capture = settings.after_capture_policy();
+        self.smart_frame_presets = settings.smart_frame_presets.clone();
+        self
+    }
+
     /// A configuration that touches nothing outside this process.
     ///
     /// No menu-bar item, no keyboard registration, no socket. What tests use,
@@ -159,6 +175,8 @@ impl Config {
             ipc: false,
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
+            after_capture: AfterCapturePolicy::default(),
+            smart_frame_presets: Vec::new(),
         }
     }
 }
@@ -221,7 +239,7 @@ impl App {
     /// refuses, are *recorded* and the app runs on — per D8 a missing capability
     /// is explained, not fatal.
     pub fn new(config: Config, surface: Box<dyn CardSurface>) -> CliResult<Self> {
-        let pipeline = Pipeline::start()?;
+        let pipeline = Pipeline::start_with_policy(config.after_capture.clone())?;
         let mut notes = Vec::new();
 
         let server = if config.ipc {
@@ -389,6 +407,34 @@ impl App {
             // a recording returns as soon as it has started.
             if let Some(command) = request.serve() {
                 self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+                if matches!(
+                    command,
+                    crate::cli::Command::Settings(crate::cli::SettingsArgs {
+                        command: crate::cli::SettingsCommand::Set { .. }
+                    })
+                ) {
+                    match crate::settings::SettingsStore::open_default()
+                        .and_then(|store| store.load())
+                    {
+                        Ok(settings) => {
+                            self.config.after_capture = settings.after_capture_policy();
+                            self.config.smart_frame_presets = settings.smart_frame_presets;
+                            if !self.pipeline.post(Job::ConfigureAfterCapture(
+                                self.config.after_capture.clone(),
+                            )) {
+                                self.note(
+                                    "settings were saved, but the capture worker could not reload \
+                                     After Capture policy",
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            self.note(format!(
+                                "settings were saved but could not be reloaded: {error}"
+                            ));
+                        }
+                    }
+                }
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
                     // again". There is nothing to show yet, so it is a no-op
@@ -408,13 +454,35 @@ impl App {
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
-                Outcome::Ready(card) => {
+                Outcome::Ready(ready) => {
                     self.captures += 1;
+                    let card = ready.card;
                     let summary = card.summary();
-                    if let Err(err) = self.surface.present(*card) {
-                        self.note(format!("a card could not be shown: {err}"));
+                    let card_id = card.id;
+                    for consumer in ready.consumers {
+                        match consumer.result {
+                            Ok(detail) => self.note(format!("{card_id} {detail}")),
+                            Err(error) => self.note(format!(
+                                "{card_id} {} failed without blocking other actions: {error}",
+                                consumer.consumer
+                            )),
+                        }
+                    }
+                    if ready.show_overlay {
+                        if let Err(err) = self.surface.present(*card) {
+                            self.note(format!("a card could not be shown: {err}"));
+                        } else {
+                            self.note(summary);
+                        }
                     } else {
-                        self.note(summary);
+                        self.note(format!("{summary} (Quick Access disabled)"));
+                    }
+                    if ready.open_editor
+                        && self.pending_editors.insert(card_id)
+                        && !self.pipeline.post(Job::Open(card_id))
+                    {
+                        self.pending_editors.remove(&card_id);
+                        self.note(format!("{card_id} could not queue the editor restore"));
                     }
                 }
                 Outcome::EditorReady {
@@ -440,10 +508,10 @@ impl App {
                         }
                         Ok(document) => {
                             self.editors.insert(card, capture);
-                            if let Err(error) = self
-                                .surface
-                                .open_editor(EditorRequest::new(card.0, title, document))
-                            {
+                            if let Err(error) = self.surface.open_editor(
+                                EditorRequest::new(card.0, title, document)
+                                    .with_presets(self.config.smart_frame_presets.clone()),
+                            ) {
                                 self.editors.remove(&card);
                                 self.note(format!("{card} could not open the editor: {error}"));
                             } else {
@@ -526,6 +594,14 @@ impl App {
                         .editor_persist_status(card, EditorStatus::Failed(error.clone()));
                     self.note(format!("{card} could not save changes: {error}"));
                 }
+                Outcome::SmartFrameAnalyzed {
+                    card,
+                    revision,
+                    result,
+                } => {
+                    self.surface
+                        .editor_smart_frame_analyzed(card, revision, *result);
+                }
                 Outcome::Failed { card, error } => {
                     self.note(format!("{card} failed: {error}"));
                 }
@@ -552,10 +628,14 @@ impl App {
         for event in pending {
             match event {
                 CardEvent::Copy(id) => {
-                    self.pipeline.post(Job::Copy(id));
+                    self.route_card_delivery(id, Destination::Clipboard, Job::Copy(id));
                 }
                 CardEvent::Save(id) => {
-                    self.pipeline.post(Job::Save(id));
+                    self.route_card_delivery(
+                        id,
+                        Destination::Folder(crate::output::default_directory()),
+                        Job::Save(id),
+                    );
                 }
                 CardEvent::Open(id) => {
                     if self.editors.contains_key(&id) {
@@ -566,6 +646,7 @@ impl App {
                         self.note(format!("{id} could not queue the editor restore"));
                     }
                 }
+
                 CardEvent::Dismiss(id) => {
                     self.surface.dismiss(id);
                     // The bytes are only worth holding while a card can still
@@ -581,6 +662,31 @@ impl App {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
             }
+        }
+    }
+
+    fn route_card_delivery(
+        &mut self,
+        card: crate::gui::card::CardId,
+        destination: Destination,
+        fallback: Job,
+    ) {
+        let pending = self
+            .pending_persists
+            .get(&card)
+            .map(|pending| pending.data.clone());
+        let capture = self.editors.get(&card).cloned();
+        let job = match (pending, capture) {
+            (Some(data), Some(capture)) => Job::Export {
+                card,
+                capture,
+                destination,
+                data,
+            },
+            _ => fallback,
+        };
+        if !self.pipeline.post(job) {
+            self.note(format!("{card} could not queue delivery"));
         }
     }
 
@@ -638,6 +744,87 @@ impl App {
                         self.surface
                             .editor_export_status(card, EditorStatus::Failed(error.to_owned()));
                         self.note(format!("{card} could not export: {error}"));
+                    }
+                }
+                EditorEvent::AnalyzeSmartFrame {
+                    id,
+                    revision,
+                    data,
+                    cancellation,
+                } => {
+                    let card = crate::gui::card::CardId(id);
+                    let Some(capture) = self.editors.get(&card).cloned() else {
+                        self.surface.editor_smart_frame_analyzed(
+                            card,
+                            revision,
+                            Err("the capture history identity is no longer available".to_owned()),
+                        );
+                        continue;
+                    };
+                    if !self.pipeline.post(Job::AnalyzeSmartFrame {
+                        card,
+                        capture,
+                        revision,
+                        data,
+                        cancellation,
+                    }) {
+                        self.surface.editor_smart_frame_analyzed(
+                            card,
+                            revision,
+                            Err("the Smart Frame worker is no longer available".to_owned()),
+                        );
+                    }
+                }
+                EditorEvent::UpsertPreset { id, preset } => {
+                    let card = crate::gui::card::CardId(id);
+                    let result = crate::settings::SettingsStore::open_default()
+                        .and_then(|store| store.upsert_preset(preset));
+                    match result {
+                        Ok(settings) => {
+                            self.config.smart_frame_presets = settings.smart_frame_presets.clone();
+                            let open: Vec<_> = self.editors.keys().copied().collect();
+                            for editor in open {
+                                self.surface.editor_presets_updated(
+                                    editor,
+                                    settings.smart_frame_presets.clone(),
+                                    EditorStatus::Complete(if editor == card {
+                                        "Saved custom Smart Frame preset".to_owned()
+                                    } else {
+                                        "Smart Frame presets updated".to_owned()
+                                    }),
+                                );
+                            }
+                        }
+                        Err(error) => self.surface.editor_status(
+                            card,
+                            EditorStatus::Failed(format!("Could not save preset: {error}")),
+                        ),
+                    }
+                }
+                EditorEvent::DeletePreset { id, preset_id } => {
+                    let card = crate::gui::card::CardId(id);
+                    let result = crate::settings::SettingsStore::open_default()
+                        .and_then(|store| store.delete_preset(&preset_id));
+                    match result {
+                        Ok(settings) => {
+                            self.config.smart_frame_presets = settings.smart_frame_presets.clone();
+                            let open: Vec<_> = self.editors.keys().copied().collect();
+                            for editor in open {
+                                self.surface.editor_presets_updated(
+                                    editor,
+                                    settings.smart_frame_presets.clone(),
+                                    EditorStatus::Complete(if editor == card {
+                                        "Deleted custom Smart Frame preset".to_owned()
+                                    } else {
+                                        "Smart Frame presets updated".to_owned()
+                                    }),
+                                );
+                            }
+                        }
+                        Err(error) => self.surface.editor_status(
+                            card,
+                            EditorStatus::Failed(format!("Could not delete preset: {error}")),
+                        ),
                     }
                 }
                 EditorEvent::Closed { id } => {

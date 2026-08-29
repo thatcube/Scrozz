@@ -101,7 +101,8 @@ use crate::{cli::Cli, fault::CliResult, report::Report};
 pub fn run(cli: &Cli) -> CliResult<Report> {
     crate::platform::become_accessory_app()?;
 
-    let config = Config::from_cli(cli);
+    let settings = crate::settings::SettingsStore::open_default()?.load()?;
+    let config = Config::from_cli(cli).with_user_settings(&settings);
 
     // Handed to the host because a windowed run cannot always return to `main`
     // to have its report printed — see `host::Driver::logic`.

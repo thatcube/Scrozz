@@ -78,6 +78,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Capture history | 🟠 | 🟠 | 🟠 | Local SQLite persistence and retention exist in `scrozz-store`; the `history` commands are not wired up yet |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟠 | 🟠 | 🟠 | The document model and renderer exist; the editing interface does not |
+| Smart Frame | 🟡 | 🟡 | 🟡 | Non-destructive adaptive framing, exact sizes, presets, and deterministic UI goldens; live desktop review remains |
 | Screen recording | ⬜ | ⬜ | ⬜ | Contracts only. Hardware encoders only, for licence reasons |
 | Scrolling capture | ⬜ | ⬜ | ⬜ | No clean implementation exists on any platform; deliberately deferred |
 
@@ -131,8 +132,10 @@ cargo run -p scrozz -- list displays
 cargo run -p scrozz -- list windows
 cargo run -p scrozz -- capture --display primary -o shot.png
 cargo run -p scrozz -- capture --region 0,0,1200,800 --json
+cargo run -p scrozz -- capture --region 0,0,1200,800 --smart-frame --size 1080x1350
 cargo run -p scrozz -- ocr shot.png
 cargo run -p scrozz -- settings get
+cargo run -p scrozz -- settings set after-capture.apply-smart-frame true
 cargo run -p scrozz -- --help
 ```
 

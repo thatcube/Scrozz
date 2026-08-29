@@ -37,6 +37,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let settings = std::env::temp_dir().join(format!(
+        "scrozz-cli-surface-settings-{}.json",
+        std::process::id()
+    ));
     Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(args)
         // Otherwise the developer's own RUST_LOG decides whether the assertions
@@ -44,6 +48,7 @@ where
         .env_remove("RUST_LOG")
         .env_remove("SCROZZ_SIMULATE_ERROR")
         .env_remove("SCROZZ_UNSTABLE_BACKENDS")
+        .env("SCROZZ_SETTINGS_PATH", settings)
         .output()
         .expect("the binary should run")
 }
@@ -54,10 +59,15 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let settings = std::env::temp_dir().join(format!(
+        "scrozz-cli-surface-settings-{}.json",
+        std::process::id()
+    ));
     Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(args)
         .env_remove("RUST_LOG")
         .env_remove("SCROZZ_UNSTABLE_BACKENDS")
+        .env("SCROZZ_SETTINGS_PATH", settings)
         .env("SCROZZ_SIMULATE_ERROR", kind)
         .output()
         .expect("the binary should run")

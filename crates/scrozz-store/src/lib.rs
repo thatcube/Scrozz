@@ -49,7 +49,7 @@ pub mod sqlite_store;
 #[doc(hidden)]
 pub mod test_support;
 
-pub use layout::StoreLayout;
+pub use layout::{StoreLayout, atomic_write};
 pub use model::{
     CaptureRecord, FrameHeader, ImageState, Page, RetentionReport, SearchQuery, Timestamp,
 };

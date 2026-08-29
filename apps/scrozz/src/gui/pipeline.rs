@@ -24,13 +24,19 @@
 
 use std::{
     collections::HashMap,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
+    },
     thread::JoinHandle,
     time::SystemTime,
 };
 
-use scrozz_annotate::{Document, DocumentData, Renderer, SkiaRenderer};
-use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_annotate::{
+    AnalysisCancellation, Document, DocumentData, Renderer, SkiaRenderer, SmartFrameAnalysis,
+    analyze_smart_frame,
+};
+use scrozz_core::{CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
 use scrozz_export::{Destination, Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
@@ -41,7 +47,71 @@ use crate::{
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
     },
     platform,
+    settings::AfterCapturePolicy,
 };
+
+const MAX_ANALYSIS_CACHE_ENTRIES: usize = 32;
+
+/// One isolated After Capture consumer result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerResult {
+    /// Stable consumer name.
+    pub consumer: &'static str,
+    /// Success detail or actionable failure.
+    pub result: std::result::Result<String, String>,
+}
+
+/// Stable After Capture execution order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterCaptureConsumer {
+    /// System clipboard.
+    Copy,
+    /// Configured/default folder.
+    Save,
+    /// Configured upload provider.
+    Upload,
+    /// Quick Access overlay.
+    Overlay,
+    /// Editable document viewport.
+    OpenEditor,
+    /// Floating pinned image.
+    Pin,
+}
+
+impl AfterCaptureConsumer {
+    const ORDERED: [Self; 6] = [
+        Self::Copy,
+        Self::Save,
+        Self::Upload,
+        Self::Overlay,
+        Self::OpenEditor,
+        Self::Pin,
+    ];
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Save => "save",
+            Self::Upload => "upload",
+            Self::Overlay => "overlay",
+            Self::OpenEditor => "open-editor",
+            Self::Pin => "pin",
+        }
+    }
+}
+
+/// Capture plus the main-thread work selected by After Capture settings.
+#[derive(Debug)]
+pub struct ReadyCapture {
+    /// Card containing the exact derived revision preview.
+    pub card: Box<Card>,
+    /// Whether to show Quick Access.
+    pub show_overlay: bool,
+    /// Whether to open the editable document.
+    pub open_editor: bool,
+    /// Results from worker-owned consumers.
+    pub consumers: Vec<ConsumerResult>,
+}
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
@@ -82,6 +152,21 @@ pub enum Job {
         /// Compact snapshot of current edits.
         data: DocumentData,
     },
+    /// Analyse one immutable editor revision without blocking capture work.
+    AnalyzeSmartFrame {
+        /// Which editor requested analysis.
+        card: CardId,
+        /// Stable history identity used to restore source pixels.
+        capture: CaptureId,
+        /// Revision echoed back for stale-result rejection.
+        revision: u64,
+        /// Current annotations, with framing removed.
+        data: DocumentData,
+        /// Cooperative cancellation handle.
+        cancellation: AnalysisCancellation,
+    },
+    /// Replace the GUI-only After Capture policy after a live settings update.
+    ConfigureAfterCapture(AfterCapturePolicy),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Finish, so the thread can be joined.
@@ -92,7 +177,7 @@ pub enum Job {
 #[derive(Debug)]
 pub enum Outcome {
     /// A capture succeeded and is ready to show.
-    Ready(Box<Card>),
+    Ready(ReadyCapture),
     /// A persisted document is ready for an ordinary editor viewport.
     EditorReady {
         /// Which card requested it.
@@ -141,6 +226,15 @@ pub enum Outcome {
         /// Why.
         error: CliError,
     },
+    /// Smart Frame analysis completed or failed.
+    SmartFrameAnalyzed {
+        /// Which editor requested it.
+        card: CardId,
+        /// Revision the result belongs to.
+        revision: u64,
+        /// Fully resolved settings or an actionable failure.
+        result: Box<std::result::Result<SmartFrameAnalysis, String>>,
+    },
     /// A capture failed. The main thread says why and shows nothing.
     Failed {
         /// Which card was expected.
@@ -182,12 +276,17 @@ impl Pipeline {
     /// reports and continues past, because a capture the user can see and copy
     /// is worth more than a capture refused because history was unavailable.
     pub fn start() -> CliResult<Self> {
+        Self::start_with_policy(AfterCapturePolicy::default())
+    }
+
+    /// Starts the worker with a persisted GUI-only After Capture policy.
+    pub fn start_with_policy(after_capture: AfterCapturePolicy) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx).run(&job_rx))
+            .spawn(move || Worker::new(outcome_tx, after_capture).run(&job_rx))
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -248,10 +347,19 @@ struct Worker {
     outcomes: Sender<Outcome>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
+    after_capture: AfterCapturePolicy,
+    analysis_cache: Arc<Mutex<HashMap<AnalysisCacheKey, SmartFrameAnalysis>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AnalysisCacheKey {
+    capture: String,
+    document_fingerprint: u64,
+    algorithm_version: u16,
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>) -> Self {
+    fn new(outcomes: Sender<Outcome>, after_capture: AfterCapturePolicy) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -272,6 +380,8 @@ impl Worker {
             outcomes,
             store,
             cache: HashMap::new(),
+            after_capture,
+            analysis_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -294,6 +404,14 @@ impl Worker {
                     destination,
                     data,
                 } => self.export(card, &capture, destination, data),
+                Job::AnalyzeSmartFrame {
+                    card,
+                    capture,
+                    revision,
+                    data,
+                    cancellation,
+                } => self.analyze_smart_frame(card, &capture, revision, data, cancellation),
+                Job::ConfigureAfterCapture(policy) => self.after_capture = policy,
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
@@ -306,7 +424,7 @@ impl Worker {
     fn capture(&mut self, kind: CaptureKind, card: CardId) {
         match self.take(kind, card) {
             Ok(built) => {
-                let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
+                let _ = self.outcomes.send(Outcome::Ready(built));
             }
             Err(error) => {
                 tracing::warn!(%card, "capture failed: {error}");
@@ -315,7 +433,7 @@ impl Worker {
         }
     }
 
-    fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
+    fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<ReadyCapture> {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
@@ -343,22 +461,60 @@ impl Worker {
         };
 
         let capture = backend.capture(&request)?;
-        let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
-        let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
-        let capture_id = self.remember(&capture);
+        let mut document = Document::new(capture);
+        let frame = Self::prepare_after_capture_revision(&mut document, &self.after_capture)?;
+        let bytes = FrameEncoder::new().encode(&frame, ImageFormat::Png)?;
+        let thumbnail = Thumbnail::from_frame(&frame, THUMBNAIL_MAX_EDGE).ok();
+        let capture_id = self.remember(&document);
+        let mut written = Vec::new();
+        let consumers =
+            Self::dispatch_after_capture(&self.after_capture, &frame, |consumer, frame| {
+                match consumer {
+                    AfterCaptureConsumer::Copy => SystemClipboard::new()
+                        .write_image_reporting(frame)
+                        .map(|_| "copied to the clipboard".to_owned())
+                        .map_err(|error| error.to_string()),
+                    AfterCaptureConsumer::Save => crate::output::export_frame_auto(
+                        frame,
+                        &Destination::Folder(crate::output::default_directory()),
+                    )
+                    .and_then(|outcome| {
+                        outcome.path.ok_or_else(|| {
+                            CliError::Core(CoreError::Storage(
+                                "the folder exporter returned no path".to_owned(),
+                            ))
+                        })
+                    })
+                    .map(|path| {
+                        let displayed = path.display().to_string();
+                        written.push(displayed.clone());
+                        format!("saved to {displayed}")
+                    })
+                    .map_err(|error| error.to_string()),
+                    AfterCaptureConsumer::Upload => {
+                        Err("no upload provider is configured".to_owned())
+                    }
+                    AfterCaptureConsumer::Overlay => {
+                        Ok("queued the shared revision for Quick Access".to_owned())
+                    }
+                    AfterCaptureConsumer::OpenEditor => {
+                        Ok("queued the shared revision for the editor".to_owned())
+                    }
+                    AfterCaptureConsumer::Pin => {
+                        Err("pinning is not available in this build".to_owned())
+                    }
+                }
+            });
 
         let built = Card {
             id: card,
             capture_id: capture_id.clone(),
             kind,
-            source_width: capture.frame.width(),
-            source_height: capture.frame.height(),
-            scale: capture.frame.scale.get(),
+            source_width: frame.width(),
+            source_height: frame.height(),
+            scale: frame.scale.get(),
             thumbnail,
-            // History persistence is internal and does not count as an export.
-            // A visible file is created only when the user presses Save; writing
-            // one here made Save create a duplicate a few seconds later.
-            written: Vec::new(),
+            written,
             taken_at: SystemTime::now(),
         };
         self.cache.insert(
@@ -370,14 +526,18 @@ impl Worker {
             },
         );
 
-        Ok(built)
+        Ok(ReadyCapture {
+            card: Box::new(built),
+            show_overlay: self.after_capture.overlay,
+            open_editor: self.after_capture.open_editor,
+            consumers,
+        })
     }
 
     /// Persists a capture, or explains in the log why it was not.
-    fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
+    fn remember(&mut self, document: &Document) -> Option<CaptureId> {
         let store = self.store.as_mut()?;
-        let document = Document::new(capture.clone());
-        match store.insert(NewCapture::new(&document)) {
+        match store.insert(NewCapture::new(document)) {
             Ok(id) => Some(id),
             Err(err) => {
                 tracing::warn!("could not add the capture to history: {err}");
@@ -390,22 +550,44 @@ impl Worker {
         // The round trip through PNG is deliberate — see the module docs — and
         // is also what will make "copy" work for a card whose capture arrived
         // over IPC, where the worker never held a `Frame` at all.
-        let result = self
-            .cached(card, "copy")
-            .and_then(|cached| Ok(scrozz_export::decode(&cached.bytes)?))
-            .and_then(|frame| {
-                SystemClipboard::new().write_image_reporting(&frame)?;
-                Ok("copied to the clipboard".to_owned())
-            });
+        let result = self.current_frame(card, "copy").and_then(|frame| {
+            SystemClipboard::new().write_image_reporting(&frame)?;
+            Ok("copied to the clipboard".to_owned())
+        });
         self.answer(card, result);
     }
 
     fn save(&mut self, card: CardId) {
-        let result = self.cached(card, "save").and_then(|cached| {
-            let path = crate::output::export_default(&cached.bytes)?;
+        let result = self.current_frame(card, "save").and_then(|frame| {
+            let outcome = crate::output::export_frame_auto(
+                &frame,
+                &Destination::Folder(crate::output::default_directory()),
+            )?;
+            let path = outcome.path.ok_or_else(|| {
+                CliError::Core(CoreError::Storage(
+                    "the folder exporter returned no path".to_owned(),
+                ))
+            })?;
             Ok(format!("saved to {}", path.display()))
         });
         self.answer(card, result);
+    }
+
+    fn current_frame(&mut self, card: CardId, verb: &str) -> CliResult<scrozz_core::Frame> {
+        let capture_id = self.cached(card, verb)?.capture_id.clone();
+        if let (Some(store), Some(capture_id)) = (self.store.as_mut(), capture_id) {
+            let state = store.document(&capture_id)?.ok_or_else(|| {
+                CliError::Core(CoreError::Storage(format!(
+                    "capture {} is no longer in history",
+                    capture_id.0
+                )))
+            })?;
+            if let Some(document) = state.complete() {
+                return Ok(SkiaRenderer.render(&document)?);
+            }
+        }
+        let bytes = self.cached(card, verb)?.bytes.clone();
+        Ok(scrozz_export::decode(&bytes)?)
     }
 
     fn open(&mut self, card: CardId) {
@@ -420,6 +602,47 @@ impl Worker {
             Err(error) => Outcome::EditorRefused { card, error },
         };
         let _ = self.outcomes.send(message);
+    }
+
+    fn prepare_after_capture_revision(
+        document: &mut Document,
+        policy: &AfterCapturePolicy,
+    ) -> CliResult<scrozz_core::Frame> {
+        if policy.apply_smart_frame {
+            let current = SkiaRenderer.render(document)?;
+            let analysis = analyze_smart_frame(
+                &current,
+                document.source.provenance,
+                &AnalysisCancellation::default(),
+            )?;
+            document.set_beautification(Some(analysis.beautification))?;
+        }
+        Ok(SkiaRenderer.render(document)?)
+    }
+
+    fn dispatch_after_capture(
+        policy: &AfterCapturePolicy,
+        frame: &scrozz_core::Frame,
+        mut deliver: impl FnMut(
+            AfterCaptureConsumer,
+            &scrozz_core::Frame,
+        ) -> std::result::Result<String, String>,
+    ) -> Vec<ConsumerResult> {
+        AfterCaptureConsumer::ORDERED
+            .into_iter()
+            .filter(|consumer| match consumer {
+                AfterCaptureConsumer::Copy => policy.copy,
+                AfterCaptureConsumer::Save => policy.save,
+                AfterCaptureConsumer::Upload => policy.upload,
+                AfterCaptureConsumer::Overlay => policy.overlay,
+                AfterCaptureConsumer::OpenEditor => policy.open_editor,
+                AfterCaptureConsumer::Pin => policy.pin,
+            })
+            .map(|consumer| ConsumerResult {
+                consumer: consumer.slug(),
+                result: deliver(consumer, frame),
+            })
+            .collect()
     }
 
     fn open_document(&mut self, card: CardId) -> CliResult<(CaptureId, String, Document)> {
@@ -538,10 +761,99 @@ impl Worker {
         Ok(Document::from_data(document.source, data)?)
     }
 
+    fn analyze_smart_frame(
+        &mut self,
+        card: CardId,
+        capture: &CaptureId,
+        revision: u64,
+        data: DocumentData,
+        cancellation: AnalysisCancellation,
+    ) {
+        let fingerprint = match Self::document_fingerprint(&data) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                let _ = self.outcomes.send(Outcome::SmartFrameAnalyzed {
+                    card,
+                    revision,
+                    result: Box::new(Err(error.to_string())),
+                });
+                return;
+            }
+        };
+        let key = AnalysisCacheKey {
+            capture: capture.0.clone(),
+            document_fingerprint: fingerprint,
+            algorithm_version: scrozz_annotate::smart_frame::SMART_FRAME_ALGORITHM_VERSION,
+        };
+        if let Some(cached) = self
+            .analysis_cache
+            .lock()
+            .expect("analysis cache mutex poisoned")
+            .get(&key)
+            .cloned()
+        {
+            let _ = self.outcomes.send(Outcome::SmartFrameAnalyzed {
+                card,
+                revision,
+                result: Box::new(Ok(cached)),
+            });
+            return;
+        }
+
+        let document = self.document_for_export(capture, data);
+        let outcomes = self.outcomes.clone();
+        let cache = Arc::clone(&self.analysis_cache);
+        let spawn = std::thread::Builder::new()
+            .name(format!("scrozz-smart-frame-{}", card.0))
+            .spawn(move || {
+                let result = document
+                    .and_then(|document| {
+                        let provenance = document.source.provenance;
+                        let frame = SkiaRenderer.render(&document)?;
+                        Ok(analyze_smart_frame(&frame, provenance, &cancellation)?)
+                    })
+                    .map_err(|error| error.to_string());
+                if let Ok(analysis) = &result
+                    && !cancellation.is_cancelled()
+                {
+                    let mut cache = cache.lock().expect("analysis cache mutex poisoned");
+                    if cache.len() >= MAX_ANALYSIS_CACHE_ENTRIES {
+                        cache.clear();
+                    }
+                    cache.insert(key, analysis.clone());
+                }
+                let _ = outcomes.send(Outcome::SmartFrameAnalyzed {
+                    card,
+                    revision,
+                    result: Box::new(result),
+                });
+            });
+        if let Err(error) = spawn {
+            let _ = self.outcomes.send(Outcome::SmartFrameAnalyzed {
+                card,
+                revision,
+                result: Box::new(Err(format!(
+                    "could not start Smart Frame analysis: {error}"
+                ))),
+            });
+        }
+    }
+
     fn cached(&self, card: CardId, verb: &str) -> CliResult<&Cached> {
         self.cache
             .get(&card)
             .ok_or_else(|| CliError::usage(format!("{card} has no capture to {verb}")))
+    }
+
+    fn document_fingerprint(data: &DocumentData) -> CliResult<u64> {
+        let bytes = serde_json::to_vec(data).map_err(|error| {
+            CliError::Core(CoreError::Storage(format!(
+                "cannot fingerprint the Smart Frame revision: {error}"
+            )))
+        })?;
+        Ok(bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        }))
     }
 
     fn answer(&self, card: CardId, result: CliResult<String>) {
@@ -558,13 +870,15 @@ mod editor_tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use scrozz_annotate::{Background, Beautification, BeautificationPreset};
+    use scrozz_annotate::{
+        Annotation, Background, Beautification, BeautificationPreset, RedactStyle, Style,
+    };
     use scrozz_core::{
-        ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, Provenance,
-        ScaleFactor,
+        Capture, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
+        Provenance, ScaleFactor,
     };
 
     use super::*;
@@ -627,6 +941,8 @@ mod editor_tests {
                 outcomes: outcome_tx,
                 store: Some(store),
                 cache,
+                after_capture: AfterCapturePolicy::default(),
+                analysis_cache: Arc::new(Mutex::new(HashMap::new())),
             },
             outcome_rx,
             capture_id,
@@ -725,15 +1041,195 @@ mod editor_tests {
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
             bytes.windows(b"iCCP".len()).any(|window| window == b"iCCP"),
-            "the sRGB working space should carry an ICC profile chunk"
+            "the preserved source colour space should carry an ICC profile chunk"
         );
         assert_eq!(
             scrozz_export::decode(&bytes)
                 .expect("decode exported image")
                 .color_space,
-            ColorSpace::Srgb
+            ColorSpace::DisplayP3
         );
         fs::remove_dir_all(root).expect("remove export folder");
+    }
+
+    #[test]
+    fn after_capture_smart_frame_derives_one_revision_without_touching_source() {
+        let mut document = Document::new(capture());
+        let source = document.source.frame.data.clone();
+        let policy = AfterCapturePolicy {
+            apply_smart_frame: true,
+            ..AfterCapturePolicy::default()
+        };
+
+        let derived = Worker::prepare_after_capture_revision(&mut document, &policy).unwrap();
+
+        assert!(document.beautification().is_some());
+        assert!(document.beautification().unwrap().auto_balance);
+        assert_eq!(document.source.frame.data, source);
+        assert!(derived.width() > document.source.frame.width());
+    }
+
+    #[test]
+    fn after_capture_consumers_are_ordered_isolated_and_share_one_frame() {
+        let frame = capture().frame;
+        let policy = AfterCapturePolicy {
+            apply_smart_frame: true,
+            copy: true,
+            save: true,
+            upload: true,
+            overlay: true,
+            open_editor: true,
+            pin: true,
+        };
+        let mut seen = Vec::new();
+        let expected_address = std::ptr::from_ref(&frame);
+
+        let results = Worker::dispatch_after_capture(&policy, &frame, |consumer, delivered| {
+            assert_eq!(std::ptr::from_ref(delivered), expected_address);
+            seen.push(consumer);
+            if consumer == AfterCaptureConsumer::Upload {
+                Err("provider rejected upload".to_owned())
+            } else {
+                Ok(format!("{} ok", consumer.slug()))
+            }
+        });
+
+        assert_eq!(seen, AfterCaptureConsumer::ORDERED);
+        assert_eq!(results.len(), AfterCaptureConsumer::ORDERED.len());
+        assert!(results[2].result.is_err());
+        assert!(
+            results[3..].iter().all(|result| result.result.is_ok()),
+            "an upload failure must not block later consumers"
+        );
+    }
+
+    #[test]
+    fn disabled_after_capture_policy_is_a_byte_stable_noop() {
+        let mut document = Document::new(capture());
+        let source = document.source.frame.data.clone();
+        let output =
+            Worker::prepare_after_capture_revision(&mut document, &AfterCapturePolicy::default())
+                .unwrap();
+
+        assert!(document.beautification().is_none());
+        assert_eq!(document.source.frame.data, source);
+        assert_eq!(output.data, source);
+    }
+
+    #[test]
+    fn card_delivery_uses_the_same_persisted_redacted_revision_as_editor_export() {
+        let (mut worker, outcomes, capture_id, root) = stored_worker("revision-parity");
+        let mut edited = Document::new(capture());
+        edited.add(
+            Annotation::Redact {
+                area: LogicalRect::new(LogicalPoint::new(4.0, 4.0), LogicalSize::new(20.0, 16.0)),
+                style: RedactStyle::Solid,
+            },
+            Style::redaction(),
+        );
+        edited
+            .set_beautification(Some(Beautification::preset(BeautificationPreset::Social)))
+            .unwrap();
+        let data = edited.data();
+        worker.persist(CardId(7), 1, &capture_id, &data);
+        let _ = outcomes.recv().unwrap();
+
+        let delivered = worker.current_frame(CardId(7), "copy").unwrap();
+        let expected = SkiaRenderer.render(&edited).unwrap();
+        assert_eq!(delivered.data, expected.data);
+        assert_eq!(delivered.color_space, expected.color_space);
+        fs::remove_dir_all(root).expect("remove scratch store");
+    }
+
+    #[test]
+    fn analysis_cache_key_tracks_the_document_revision() {
+        let first = Document::new(capture()).data();
+        let mut second = first.clone();
+        second.next_id = second.next_id.saturating_add(1);
+        assert_ne!(
+            Worker::document_fingerprint(&first).unwrap(),
+            Worker::document_fingerprint(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn asynchronous_analysis_returns_only_the_requested_revision_and_reuses_cache() {
+        let (mut worker, outcomes, capture_id, root) = stored_worker("analysis");
+        let data = Document::new(capture()).data();
+        worker.analyze_smart_frame(
+            CardId(7),
+            &capture_id,
+            41,
+            data.clone(),
+            AnalysisCancellation::default(),
+        );
+        let first = outcomes
+            .recv_timeout(Duration::from_secs(2))
+            .expect("analysis result");
+        let Outcome::SmartFrameAnalyzed {
+            card,
+            revision,
+            result,
+        } = first
+        else {
+            panic!("Smart Frame analysis outcome");
+        };
+        assert_eq!(card, CardId(7));
+        assert_eq!(revision, 41);
+        assert!(result.is_ok());
+
+        worker.analyze_smart_frame(
+            CardId(7),
+            &capture_id,
+            42,
+            data,
+            AnalysisCancellation::default(),
+        );
+        let cached = outcomes
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cached analysis result");
+        assert!(matches!(
+            cached,
+            Outcome::SmartFrameAnalyzed {
+                revision: 42,
+                result,
+                ..
+            } if result.is_ok()
+        ));
+        fs::remove_dir_all(root).expect("remove scratch store");
+    }
+
+    #[test]
+    fn cancelled_async_analysis_returns_cancellation_without_caching() {
+        let (mut worker, outcomes, capture_id, root) = stored_worker("cancel-analysis");
+        let cancellation = AnalysisCancellation::default();
+        cancellation.cancel();
+        worker.analyze_smart_frame(
+            CardId(7),
+            &capture_id,
+            99,
+            Document::new(capture()).data(),
+            cancellation,
+        );
+        let outcome = outcomes
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled analysis result");
+        assert!(matches!(
+            outcome,
+            Outcome::SmartFrameAnalyzed {
+                revision: 99,
+                result,
+                ..
+            } if matches!(result.as_ref(), Err(error) if error.contains("cancelled"))
+        ));
+        assert!(
+            worker
+                .analysis_cache
+                .lock()
+                .expect("analysis cache")
+                .is_empty()
+        );
+        fs::remove_dir_all(root).expect("remove scratch store");
     }
 }
 

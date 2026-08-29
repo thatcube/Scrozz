@@ -259,6 +259,12 @@ pub enum Scenario {
     DockCollapsed,
     /// The annotation toolbar open over a capture (D14).
     EditorAnnotating,
+    /// Editor before Smart Frame is activated.
+    SmartFrameUntouched,
+    /// Immediate one-click Smart Frame result with progressive controls closed.
+    SmartFrameOneClick,
+    /// Smart Frame draft with the complete advanced inspector visible.
+    SmartFrameExpanded,
 }
 
 impl Scenario {
@@ -275,6 +281,9 @@ impl Scenario {
             Self::DockCollapsing,
             Self::DockCollapsed,
             Self::EditorAnnotating,
+            Self::SmartFrameUntouched,
+            Self::SmartFrameOneClick,
+            Self::SmartFrameExpanded,
         ]
     }
 
@@ -294,6 +303,9 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::SmartFrameUntouched => "smart-frame-untouched",
+            Self::SmartFrameOneClick => "smart-frame-one-click",
+            Self::SmartFrameExpanded => "smart-frame-expanded",
         }
     }
 
@@ -747,9 +759,44 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::SmartFrameUntouched => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Start with one clear action",
+                    "The untouched editor makes Smart Frame the dominant action and keeps advanced controls out of the common path.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SmartFrameOneClick => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Balanced in one click",
+                    "Smart Frame immediately produces an editable result with Auto Balance on, while Apply and Cancel remain explicit.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::SmartFrameExpanded => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Refine every framing choice",
+                    "The advanced inspector exposes padding, inset, balance, finish, background, alignment and output size without crowding the default state.",
+                    instants::REST,
+                    None,
+                ),
             };
 
-        let size_pt = if annotating { (900.0, 620.0) } else { size_pt };
+        let size_pt = match scenario {
+            Scenario::SmartFrameUntouched | Scenario::SmartFrameOneClick => (1180.0, 760.0),
+            Scenario::SmartFrameExpanded => (1180.0, 1300.0),
+            _ if annotating => (900.0, 620.0),
+            _ => size_pt,
+        };
 
         Self {
             scenario,
@@ -1874,6 +1921,18 @@ impl SceneRegistry {
         me.register(
             Scenario::EditorAnnotating,
             Box::new(crate::editor::EditorPreviewScene::new()),
+        );
+        me.register(
+            Scenario::SmartFrameUntouched,
+            Box::new(crate::editor::EditorPreviewScene::untouched()),
+        );
+        me.register(
+            Scenario::SmartFrameOneClick,
+            Box::new(crate::editor::EditorPreviewScene::one_click()),
+        );
+        me.register(
+            Scenario::SmartFrameExpanded,
+            Box::new(crate::editor::EditorPreviewScene::expanded()),
         );
         // WIRING POINT — as each surface lands, override its placeholder here:
         //
@@ -3661,6 +3720,9 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::SmartFrameUntouched,
+        Scenario::SmartFrameOneClick,
+        Scenario::SmartFrameExpanded,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),
@@ -3668,6 +3730,21 @@ pub fn golden_plan() -> Vec<GoldenCase> {
             expectation: format!(
                 "{} in the light theme: text contrast and card elevation must \
                  both survive the inversion",
+                scenario.slug()
+            ),
+        });
+    }
+
+    for scenario in [
+        Scenario::SmartFrameUntouched,
+        Scenario::SmartFrameOneClick,
+        Scenario::SmartFrameExpanded,
+    ] {
+        cases.push(GoldenCase {
+            name: format!("{}--compact", scenario.slug()),
+            spec: RenderSpec::golden(scenario, VirtualClock::ZERO).with_size_pt((760.0, 560.0)),
+            expectation: format!(
+                "{} in a compact editor: primary actions and labels remain visible without a dense default panel",
                 scenario.slug()
             ),
         });

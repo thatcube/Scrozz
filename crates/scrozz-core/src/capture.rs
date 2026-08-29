@@ -62,7 +62,10 @@ pub enum Provenance {
 }
 
 impl Provenance {
-    /// Whether synthetic corners, shadows and backgrounds are forbidden.
+    /// Whether the captured subject itself must remain pixel-exact.
+    ///
+    /// An outer presentation canvas is permitted; cropping, rounding, bordering,
+    /// or re-shadowing these pixels is not.
     #[must_use]
     pub const fn forbids_compositing(self) -> bool {
         matches!(self, Self::Window)

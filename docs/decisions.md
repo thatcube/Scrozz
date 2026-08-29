@@ -189,11 +189,13 @@ flawless. Capso's unclean radii come from doing post-processing that should not
 happen.
 
 **Therefore, for Scrozz:** window captures are sacred. Take what the OS gives and
-composite nothing. Where a platform does *not* give correct corners and alpha
+never crop, round, border, re-shadow, or paint over those pixels. Smart Frame may
+place the byte-stable captured rectangle on a larger presentation canvas, because
+that changes the canvas rather than the window. Where a platform does *not* give correct corners and alpha
 (Windows, Linux), reconstructing them is a **fidelity gap to be closed**, held to
 the acceptance criteria above and to golden-image tests — never an invitation to
-apply an adjustable radius. Radius, shadow and inset controls apply only to
-non-window captures.
+apply an adjustable radius. Radius, shadow, border and inset controls apply only
+to non-window captures.
 
 **Corollary — the concentric radius rule.** Wherever a rounded shape nests inside
 another, `inner_radius = outer_radius − padding`. Violating it makes corners look

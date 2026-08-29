@@ -19,7 +19,9 @@ pub use destination::{ExportOutcome, FileExporter, S3Object, S3Uploader, Unimple
 pub use encode::{ColorConversion, EncodeOptions, FrameEncoder, PngEffort};
 pub use icc::profile_for;
 pub use naming::{FilenameRules, NamePolicy, NameTemplate, NamingContext, Timestamp};
-pub use pixels::{RgbaImage, convert_to_srgb, to_straight_rgba8};
+pub use pixels::{
+    RgbaImage, convert_color_space, convert_srgb_color, convert_to_srgb, to_straight_rgba8,
+};
 pub use selection::{
     ContentKind, DestinationCapabilities, DestinationColorSpace, DestinationKind,
     DestinationProfile, ExportSelection, select_export,

@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use scrozz_annotate::{SmartFrameAnalysis, SmartFramePreset};
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
 use scrozz_ui::{
     CaptureRequest, DismissReason, OverlayEvent, OverlayHandle,
@@ -253,6 +254,28 @@ impl CardSurface for OverlayCards {
     fn editor_persist_status(&mut self, id: CardId, status: EditorStatus) {
         if let Some(editor) = &self.editor {
             editor.persist_status(id.0, status);
+        }
+    }
+
+    fn editor_smart_frame_analyzed(
+        &mut self,
+        id: CardId,
+        revision: u64,
+        result: std::result::Result<SmartFrameAnalysis, String>,
+    ) {
+        if let Some(editor) = &self.editor {
+            editor.smart_frame_analyzed(id.0, revision, result);
+        }
+    }
+
+    fn editor_presets_updated(
+        &mut self,
+        id: CardId,
+        presets: Vec<SmartFramePreset>,
+        status: EditorStatus,
+    ) {
+        if let Some(editor) = &self.editor {
+            editor.presets_updated(id.0, presets, status);
         }
     }
 

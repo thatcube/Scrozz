@@ -1,17 +1,4 @@
-//! The settings schema.
-//!
-//! # Why the schema lives here and not in the store
-//!
-//! Nothing persists settings yet. That could mean `scrozz settings` waits for a
-//! store, but it should not: the *schema* is the interesting part and the part
-//! everything else depends on. A key's name, type and default are what the GUI
-//! renders, what `--json` reports, and what a user's dotfiles refer to. Getting
-//! them wrong is expensive to undo; getting them right costs nothing today.
-//!
-//! So `settings get` works now, reporting defaults and saying so, and
-//! `settings set` validates fully before reporting that persistence is missing.
-//! A typo in a key or a value is caught immediately rather than being written
-//! somewhere and silently ignored later.
+//! The settings schema and small, forward-compatible preferences file.
 //!
 //! # Naming
 //!
@@ -19,11 +6,296 @@
 //! the hotkey commands already use, and it survives being a TOML table, a JSON
 //! object path and a command-line argument without being quoted.
 
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use scrozz_annotate::SmartFramePreset;
+use scrozz_core::{Error as CoreError, Result as CoreResult};
+use scrozz_store::atomic_write;
+use serde::{Deserialize, Serialize};
+
 use crate::{
     fault::{CliError, CliResult},
     hotkey_config::Accelerator,
     json::Json,
 };
+
+const SETTINGS_FILE: &str = "settings.json";
+const SETTINGS_VERSION: u32 = 1;
+const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+const MAX_SMART_FRAME_PRESETS: usize = 128;
+pub const SETTINGS_PATH_ENV: &str = "SCROZZ_SETTINGS_PATH";
+
+/// Ordered consumers for the GUI's After Capture workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AfterCapturePolicy {
+    /// Resolve one Smart Frame revision before any consumer runs.
+    pub apply_smart_frame: bool,
+    /// Copy the derived revision.
+    pub copy: bool,
+    /// Save the derived revision.
+    pub save: bool,
+    /// Upload the derived revision when an upload provider exists.
+    pub upload: bool,
+    /// Show the derived revision in the Quick Access overlay.
+    pub overlay: bool,
+    /// Open the derived editable document.
+    pub open_editor: bool,
+    /// Pin the derived revision.
+    pub pin: bool,
+}
+
+impl Default for AfterCapturePolicy {
+    fn default() -> Self {
+        Self {
+            apply_smart_frame: false,
+            copy: false,
+            save: false,
+            upload: false,
+            overlay: true,
+            open_editor: false,
+            pin: false,
+        }
+    }
+}
+
+/// All durable user preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserSettings {
+    /// File format version.
+    pub version: u32,
+    /// Scalar settings keyed by their public dotted names.
+    pub values: BTreeMap<String, String>,
+    /// User-created Smart Frame presets. These never contain capture pixels.
+    pub smart_frame_presets: Vec<SmartFramePreset>,
+    /// Unknown top-level fields survive read-modify-write cycles.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_VERSION,
+            values: BTreeMap::new(),
+            smart_frame_presets: Vec::new(),
+            extensions: BTreeMap::new(),
+        }
+    }
+}
+
+impl UserSettings {
+    /// Current or default value of one known setting.
+    #[must_use]
+    pub fn value(&self, setting: &Setting) -> &str {
+        self.values
+            .get(setting.key)
+            .map_or(setting.default, String::as_str)
+    }
+
+    /// Whether a value came from durable user settings.
+    #[must_use]
+    pub fn is_overridden(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
+    /// Typed After Capture policy.
+    #[must_use]
+    pub fn after_capture_policy(&self) -> AfterCapturePolicy {
+        let enabled = |key: &str, fallback: bool| {
+            self.values
+                .get(key)
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(fallback)
+        };
+        let defaults = AfterCapturePolicy::default();
+        AfterCapturePolicy {
+            apply_smart_frame: enabled(
+                "after-capture.apply-smart-frame",
+                defaults.apply_smart_frame,
+            ),
+            copy: enabled("after-capture.copy", defaults.copy)
+                || enabled("capture.copy-to-clipboard", false),
+            save: enabled("after-capture.save", defaults.save),
+            upload: enabled("after-capture.upload", defaults.upload),
+            overlay: enabled("after-capture.overlay", defaults.overlay),
+            open_editor: enabled("after-capture.open-editor", defaults.open_editor),
+            pin: enabled("after-capture.pin", defaults.pin),
+        }
+    }
+
+    fn validate(&self) -> CoreResult<()> {
+        if self.smart_frame_presets.len() > MAX_SMART_FRAME_PRESETS {
+            return Err(CoreError::Storage(format!(
+                "settings contain {} Smart Frame presets; the limit is {MAX_SMART_FRAME_PRESETS}",
+                self.smart_frame_presets.len()
+            )));
+        }
+        for (key, value) in &self.values {
+            if let Ok(setting) = lookup(key) {
+                setting
+                    .validate(value)
+                    .map_err(|error| CoreError::Storage(error.to_string()))?;
+            }
+        }
+        for preset in &self.smart_frame_presets {
+            preset.validate()?;
+        }
+        let mut ids: Vec<&str> = self
+            .smart_frame_presets
+            .iter()
+            .map(|preset| preset.id.as_str())
+            .collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CoreError::Storage(
+                "Smart Frame preset identifiers must be unique".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Atomic reader/writer for the preferences file.
+#[derive(Debug, Clone)]
+pub struct SettingsStore {
+    path: PathBuf,
+}
+
+impl SettingsStore {
+    /// Default per-user settings location.
+    pub fn open_default() -> CoreResult<Self> {
+        if let Some(path) = std::env::var_os(SETTINGS_PATH_ENV) {
+            return Ok(Self::at(path));
+        }
+        #[cfg(test)]
+        {
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("unnamed");
+            let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+            });
+            Ok(Self::at(std::env::temp_dir().join(format!(
+                "scrozz-test-settings-{}-{hash}.json",
+                std::process::id()
+            ))))
+        }
+        #[cfg(not(test))]
+        {
+            let root = dirs::config_dir().ok_or_else(|| {
+                CoreError::Storage("no platform configuration directory is available".to_owned())
+            })?;
+            Ok(Self::at(root.join("Scrozz").join(SETTINGS_FILE)))
+        }
+    }
+
+    /// Explicit path, primarily for tests.
+    #[must_use]
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Reads and validates settings, returning defaults when no file exists.
+    pub fn load(&self) -> CoreResult<UserSettings> {
+        match fs::metadata(&self.path) {
+            Ok(metadata) if metadata.len() > MAX_SETTINGS_BYTES => {
+                return Err(CoreError::Storage(format!(
+                    "settings file is {} bytes; the limit is {MAX_SETTINGS_BYTES}",
+                    metadata.len()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(UserSettings::default());
+            }
+            Err(error) => return Err(CoreError::Io(error)),
+        }
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        let settings: UserSettings = serde_json::from_slice(&bytes)
+            .map_err(|error| CoreError::Storage(format!("cannot decode settings: {error}")))?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// Persists one scalar setting without dropping unknown fields or presets.
+    pub fn set(&self, key: &str, value: &str) -> CliResult<UserSettings> {
+        let setting = lookup(key)?;
+        setting.validate(value)?;
+        let mut settings = self.load()?;
+        settings.values.insert(key.to_owned(), value.to_owned());
+        self.save(&settings)?;
+        Ok(settings)
+    }
+
+    /// Adds or replaces one custom preset.
+    pub fn upsert_preset(&self, preset: SmartFramePreset) -> CoreResult<UserSettings> {
+        preset.validate()?;
+        let mut settings = self.load()?;
+        if let Some(existing) = settings
+            .smart_frame_presets
+            .iter_mut()
+            .find(|existing| existing.id == preset.id)
+        {
+            *existing = preset;
+        } else {
+            settings.smart_frame_presets.push(preset);
+        }
+        settings
+            .smart_frame_presets
+            .sort_by_key(|preset| preset.name.to_lowercase());
+        self.save(&settings)?;
+        Ok(settings)
+    }
+
+    /// Removes one custom preset.
+    pub fn delete_preset(&self, id: &str) -> CoreResult<UserSettings> {
+        let mut settings = self.load()?;
+        let before = settings.smart_frame_presets.len();
+        settings
+            .smart_frame_presets
+            .retain(|preset| preset.id != id);
+        if settings.smart_frame_presets.len() == before {
+            return Err(CoreError::InvalidRequest(format!(
+                "Smart Frame preset {id:?} does not exist"
+            )));
+        }
+        self.save(&settings)?;
+        Ok(settings)
+    }
+
+    /// Writes a complete validated settings file atomically.
+    pub fn save(&self, settings: &UserSettings) -> CoreResult<()> {
+        settings.validate()?;
+        let mut current = settings.clone();
+        current.version = current.version.max(SETTINGS_VERSION);
+        let bytes = serde_json::to_vec_pretty(&current)
+            .map_err(|error| CoreError::Storage(format!("cannot encode settings: {error}")))?;
+        if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(CoreError::Storage(format!(
+                "settings file would be {} bytes; the limit is {MAX_SETTINGS_BYTES}",
+                bytes.len()
+            )));
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&self.path, &bytes)
+    }
+
+    /// Storage path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,15 +349,18 @@ impl Setting {
     /// The JSON representation, including the current (always default) value.
     #[must_use]
     pub fn to_json(self) -> Json {
+        self.to_json_value(self.default, "default")
+    }
+
+    /// JSON representation with a resolved value and provenance.
+    #[must_use]
+    pub fn to_json_value(self, value: &str, source: &str) -> Json {
         let mut fields = vec![
             ("key", Json::str(self.key)),
             ("type", Json::str(self.kind.slug())),
-            ("value", Json::str(self.default)),
+            ("value", Json::str(value)),
             ("default", Json::str(self.default)),
-            // Honest about where the value came from. When persistence lands
-            // this becomes "user" for anything overridden, and a script that
-            // already reads it keeps working.
-            ("source", Json::str("default")),
+            ("source", Json::str(source)),
             ("description", Json::str(self.description)),
         ];
         if let Kind::Choice(options) = self.kind {
@@ -198,6 +473,48 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "true",
         description: "Include the window's drop shadow in window captures.",
+    },
+    Setting {
+        key: "after-capture.apply-smart-frame",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Create one Smart Frame revision before enabled After Capture actions.",
+    },
+    Setting {
+        key: "after-capture.copy",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Copy the shared After Capture revision.",
+    },
+    Setting {
+        key: "after-capture.save",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Save the shared After Capture revision.",
+    },
+    Setting {
+        key: "after-capture.upload",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Upload the shared After Capture revision when a provider is configured.",
+    },
+    Setting {
+        key: "after-capture.overlay",
+        kind: Kind::Bool,
+        default: "true",
+        description: "Show the shared After Capture revision in Quick Access.",
+    },
+    Setting {
+        key: "after-capture.open-editor",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Open the shared After Capture revision in the editor.",
+    },
+    Setting {
+        key: "after-capture.pin",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Pin the shared After Capture revision.",
     },
     Setting {
         key: "record.fps",
@@ -330,9 +647,63 @@ pub fn all_human() -> String {
         .join("\n")
 }
 
+/// Every setting resolved against durable preferences.
+#[must_use]
+pub fn all_json_for(settings: &UserSettings) -> Json {
+    Json::arr(SETTINGS.iter().copied().map(|setting| {
+        setting.to_json_value(
+            settings.value(&setting),
+            if settings.is_overridden(setting.key) {
+                "user"
+            } else {
+                "default"
+            },
+        )
+    }))
+}
+
+/// Human-readable settings resolved against durable preferences.
+#[must_use]
+pub fn all_human_for(settings: &UserSettings) -> String {
+    let width = SETTINGS
+        .iter()
+        .map(|setting| setting.key.len())
+        .max()
+        .unwrap_or(0);
+    SETTINGS
+        .iter()
+        .map(|setting| {
+            format!(
+                "{:width$}  {}",
+                setting.key,
+                settings.value(setting),
+                width = width
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use scrozz_annotate::{SmartFramePreset, SmartFramePresetSettings};
+
     use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "scrozz-settings-{label}-{}-{nonce}",
+                std::process::id()
+            ))
+            .join("settings.json")
+    }
 
     #[test]
     fn every_key_is_unique() {
@@ -415,6 +786,100 @@ mod tests {
             setting.default.parse::<u64>().unwrap(),
             scrozz_store::RetentionPolicy::default().max_image_bytes
         );
+    }
+
+    #[test]
+    fn smart_frame_after_capture_is_opt_in_and_overlay_stays_on() {
+        let policy = UserSettings::default().after_capture_policy();
+        assert!(!policy.apply_smart_frame);
+        assert!(policy.overlay);
+        assert!(!policy.copy);
+        assert!(!policy.save);
+    }
+
+    #[test]
+    fn settings_and_presets_persist_atomically_with_unknown_fields() {
+        let path = scratch("round-trip");
+        let root = path.parent().unwrap().to_path_buf();
+        let store = SettingsStore::at(&path);
+        let mut settings = UserSettings::default();
+        settings
+            .extensions
+            .insert("future_root".to_owned(), serde_json::json!({"kept": true}));
+        settings
+            .values
+            .insert("future.setting".to_owned(), "future-value".to_owned());
+        settings.smart_frame_presets.push(
+            SmartFramePreset::new(
+                "quiet-frame",
+                "Quiet Frame",
+                SmartFramePresetSettings::default(),
+            )
+            .unwrap(),
+        );
+        store.save(&settings).unwrap();
+        let updated = store
+            .set("after-capture.apply-smart-frame", "true")
+            .unwrap();
+
+        assert!(updated.after_capture_policy().apply_smart_frame);
+        assert_eq!(updated.extensions["future_root"]["kept"], true);
+        assert_eq!(updated.values["future.setting"], "future-value");
+        assert_eq!(updated.smart_frame_presets[0].name, "Quiet Frame");
+        assert!(path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preset_update_and_delete_are_cross_capture_storage_operations() {
+        let path = scratch("presets");
+        let root = path.parent().unwrap().to_path_buf();
+        let store = SettingsStore::at(&path);
+        let preset = SmartFramePreset::new(
+            "team-note",
+            "Team Note",
+            SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        store.upsert_preset(preset.clone()).unwrap();
+        let mut renamed = preset;
+        renamed.name = "Team Note Updated".to_owned();
+        let settings = store.upsert_preset(renamed).unwrap();
+        assert_eq!(settings.smart_frame_presets.len(), 1);
+        assert_eq!(settings.smart_frame_presets[0].name, "Team Note Updated");
+
+        let settings = store.delete_preset("team-note").unwrap();
+        assert!(settings.smart_frame_presets.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_settings_keep_unknown_fields_when_a_known_value_changes() {
+        let path = scratch("forward-compatible");
+        let root = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            br#"{
+                "version": 9,
+                "values": {"future.setting": "kept"},
+                "smart_frame_presets": [],
+                "future_section": {"token": 17}
+            }"#,
+        )
+        .unwrap();
+        let store = SettingsStore::at(&path);
+        let settings = store
+            .set("after-capture.apply-smart-frame", "true")
+            .unwrap();
+        assert_eq!(settings.version, 9);
+        assert_eq!(settings.values["future.setting"], "kept");
+        assert_eq!(settings.extensions["future_section"]["token"], 17);
+
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.version, 9);
+        assert_eq!(reloaded.extensions["future_section"]["token"], 17);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

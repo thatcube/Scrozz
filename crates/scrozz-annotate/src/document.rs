@@ -1,6 +1,6 @@
 //! The document: a capture plus every edit ever made to it.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use scrozz_core::{
@@ -14,6 +14,7 @@ use serde::{
 
 use crate::{
     annotation::{Annotation, AnnotationId, AnnotationObject},
+    smart_frame::{SMART_FRAME_ALGORITHM_VERSION, SmartFrameMetadata},
     style::{Color, Style},
 };
 
@@ -22,6 +23,7 @@ use crate::{
 /// Forty million pixels admits an 8K canvas while refusing dimensions
 /// large enough to make Rust's infallible allocator abort the process.
 pub(crate) const MAX_RASTER_PIXELS: u64 = 40_000_000;
+pub(crate) const MAX_RASTER_EDGE: u32 = 16_384;
 const MAX_BACKGROUND_PIXELS: u64 = 16_777_216;
 const MAX_BACKGROUND_BYTES: u64 = MAX_BACKGROUND_PIXELS * 4;
 const MAX_ENCODED_BACKGROUND_BYTES: u64 = MAX_BACKGROUND_BYTES + 1024 * 1024;
@@ -273,7 +275,12 @@ fn validate_background_area(width: u32, height: u32) -> Result<u64> {
         .ok_or_else(|| {
             Error::InvalidRequest(format!("background image {width}x{height} is too large"))
         })?;
-    if width == 0 || height == 0 || pixel_count > MAX_BACKGROUND_PIXELS {
+    if width == 0
+        || height == 0
+        || width > MAX_RASTER_EDGE
+        || height > MAX_RASTER_EDGE
+        || pixel_count > MAX_BACKGROUND_PIXELS
+    {
         return Err(Error::InvalidRequest(format!(
             "background image {width}x{height} has {pixel_count} pixels; the limit is \
              {MAX_BACKGROUND_PIXELS}"
@@ -300,8 +307,142 @@ pub enum Background {
     },
     /// A procedural background bundled with Scrozz.
     BuiltIn(BuiltInBackground),
+    /// A capture-derived, fully resolved two-stop field.
+    Automatic(AutomaticBackground),
     /// A custom image, cropped to cover the canvas.
     Image(BackgroundImage),
+}
+
+/// Resolved automatic background inputs and output colours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutomaticBackground {
+    /// Algorithm that chose these colours.
+    pub algorithm_version: u16,
+    /// First field colour, stored in sRGB authoring space.
+    pub start: Color,
+    /// Second field colour, stored in sRGB authoring space.
+    pub end: Color,
+    /// Average outer-edge colour used for separation checks.
+    pub edge_reference: Color,
+    /// Colour space of the source samples before analysis.
+    pub source_color_space: ColorSpace,
+    /// Lowest contrast ratio between either stop and `edge_reference`, ×100.
+    pub minimum_contrast_x100: u16,
+    /// Unknown fields survive read-modify-write cycles.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for AutomaticBackground {
+    fn default() -> Self {
+        Self::fallback(ColorSpace::Unknown)
+    }
+}
+
+impl AutomaticBackground {
+    /// Stable neutral used before analysis completes or when colour is unknown.
+    #[must_use]
+    pub fn fallback(source_color_space: ColorSpace) -> Self {
+        Self {
+            algorithm_version: SMART_FRAME_ALGORITHM_VERSION,
+            start: Color::rgb(34, 40, 55),
+            end: Color::rgb(62, 74, 103),
+            edge_reference: Color::rgb(128, 128, 128),
+            source_color_space,
+            minimum_contrast_x100: 300,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// Mean luminance of the two resolved stops.
+    #[must_use]
+    pub fn average_luminance(&self) -> f32 {
+        (self.start.luminance() + self.end.luminance()) / 2.0
+    }
+}
+
+/// Non-destructive inset in source logical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceInsets {
+    /// Left edge.
+    pub left: f64,
+    /// Top edge.
+    pub top: f64,
+    /// Right edge.
+    pub right: f64,
+    /// Bottom edge.
+    pub bottom: f64,
+}
+
+impl SourceInsets {
+    /// Equal inset on every edge.
+    #[must_use]
+    pub const fn uniform(value: f64) -> Self {
+        Self {
+            left: value,
+            top: value,
+            right: value,
+            bottom: value,
+        }
+    }
+
+    /// Whether no source pixels are excluded.
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        [self.left, self.top, self.right, self.bottom]
+            .into_iter()
+            .all(|value| value <= 0.0)
+    }
+}
+
+/// Exact presentation-canvas dimensions in output pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExactOutputSize {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl ExactOutputSize {
+    /// Creates exact output dimensions.
+    #[must_use]
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    /// Width divided by height.
+    #[must_use]
+    pub fn ratio(self) -> f64 {
+        f64::from(self.width) / f64::from(self.height.max(1))
+    }
+}
+
+/// Optional text placed on the presentation canvas, never over source pixels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Watermark {
+    /// Text to draw.
+    pub text: String,
+    /// sRGB text colour.
+    pub color: Color,
+    /// Logical cap height.
+    pub font_size: f64,
+    /// Logical distance from the canvas edge.
+    pub margin: f64,
+}
+
+impl Default for Watermark {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            color: Color::rgba(255, 255, 255, 180),
+            font_size: 12.0,
+            margin: 12.0,
+        }
+    }
 }
 
 /// Where the capture sits when an aspect preset creates extra canvas.
@@ -401,17 +542,17 @@ pub enum BeautificationPreset {
 
 /// Padding, background and framing applied around a capture.
 ///
-/// Per decision D9 this is refused outright for window captures: the OS already
-/// supplied the window's true shape and shadow, and synthesising them again
-/// yields a subtly, unmistakably wrong image. [`Document::may_beautify`] is the
-/// enforcement point, [`Document::set_beautification`] is the gate, and the
-/// renderer refuses a second time so a document assembled by any other route
-/// still cannot slip through.
+/// Per decision D9 a window capture may use only the outer-canvas fields. The OS
+/// supplied the subject's true shape and shadow, so inset, synthetic corners,
+/// border, and shadow are rejected by [`Document::set_beautification`] and by
+/// the renderer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Beautification {
     /// Padding around the image, in logical points.
     pub padding: f64,
+    /// Non-destructive source-space trim.
+    pub inset: SourceInsets,
     /// Corner radius applied to the image.
     pub corner_radius: f64,
     /// Drop shadow depth.
@@ -424,24 +565,38 @@ pub struct Beautification {
     pub auto_balance: bool,
     /// Output aspect ratio.
     pub aspect: AspectPreset,
+    /// Exact output dimensions, which take precedence over `aspect`.
+    pub output_size: Option<ExactOutputSize>,
     /// Border width drawn inside the rounded capture edge, in logical points.
     pub border_width: f64,
     /// Border colour.
     pub border_color: Color,
+    /// Optional user-authored watermark. Off by default.
+    pub watermark: Option<Watermark>,
+    /// Resolved Smart Frame analysis for stable rendering across upgrades.
+    pub smart_frame: Option<SmartFrameMetadata>,
+    /// Unknown fields survive read-modify-write cycles.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Beautification {
     fn default() -> Self {
         Self {
             padding: 0.0,
+            inset: SourceInsets::uniform(0.0),
             corner_radius: 0.0,
             shadow: 0.0,
             background: Background::Transparent,
             alignment: Alignment::Center,
             auto_balance: false,
             aspect: AspectPreset::Original,
+            output_size: None,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            watermark: None,
+            smart_frame: None,
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -458,14 +613,19 @@ impl Beautification {
     pub fn padded(padding: f64, background: Background) -> Self {
         Self {
             padding,
+            inset: SourceInsets::uniform(0.0),
             corner_radius: 0.0,
             shadow: 0.0,
             background,
             alignment: Alignment::Center,
             auto_balance: false,
             aspect: AspectPreset::Original,
+            output_size: None,
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
+            watermark: None,
+            smart_frame: None,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -475,47 +635,67 @@ impl Beautification {
         match preset {
             BeautificationPreset::Clean => Self {
                 padding: 40.0,
+                inset: SourceInsets::uniform(0.0),
                 corner_radius: 16.0,
                 shadow: 18.0,
                 background: Background::BuiltIn(BuiltInBackground::Mist),
                 alignment: Alignment::Center,
-                auto_balance: false,
+                auto_balance: true,
                 aspect: AspectPreset::Original,
+                output_size: None,
                 border_width: 1.0,
                 border_color: Color::rgba(255, 255, 255, 90),
+                watermark: None,
+                smart_frame: None,
+                extensions: BTreeMap::new(),
             },
             BeautificationPreset::Social => Self {
                 padding: 64.0,
+                inset: SourceInsets::uniform(0.0),
                 corner_radius: 20.0,
                 shadow: 24.0,
                 background: Background::BuiltIn(BuiltInBackground::Iris),
                 alignment: Alignment::Center,
                 auto_balance: true,
                 aspect: AspectPreset::Square,
+                output_size: None,
                 border_width: 1.0,
                 border_color: Color::rgba(255, 255, 255, 110),
+                watermark: None,
+                smart_frame: None,
+                extensions: BTreeMap::new(),
             },
             BeautificationPreset::Story => Self {
                 padding: 72.0,
+                inset: SourceInsets::uniform(0.0),
                 corner_radius: 24.0,
                 shadow: 28.0,
                 background: Background::BuiltIn(BuiltInBackground::Midnight),
                 alignment: Alignment::Center,
                 auto_balance: true,
                 aspect: AspectPreset::Story,
+                output_size: None,
                 border_width: 1.0,
                 border_color: Color::rgba(255, 255, 255, 90),
+                watermark: None,
+                smart_frame: None,
+                extensions: BTreeMap::new(),
             },
             BeautificationPreset::Editorial => Self {
                 padding: 56.0,
+                inset: SourceInsets::uniform(0.0),
                 corner_radius: 10.0,
                 shadow: 14.0,
                 background: Background::BuiltIn(BuiltInBackground::Sand),
                 alignment: Alignment::Center,
-                auto_balance: false,
+                auto_balance: true,
                 aspect: AspectPreset::Portrait,
+                output_size: None,
                 border_width: 1.0,
                 border_color: Color::rgba(65, 53, 43, 65),
+                watermark: None,
+                smart_frame: None,
+                extensions: BTreeMap::new(),
             },
         }
     }
@@ -538,7 +718,13 @@ impl Beautification {
             && self.shadow <= 0.0
             && self.background == Background::Transparent
             && self.aspect == AspectPreset::Original
+            && self.output_size.is_none()
             && self.border_width <= 0.0
+            && self.inset.is_zero()
+            && self
+                .watermark
+                .as_ref()
+                .is_none_or(|watermark| watermark.text.is_empty())
     }
 
     /// Validates values before they can reach allocation or rasterisation.
@@ -550,6 +736,10 @@ impl Beautification {
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("padding", self.padding),
+            ("left inset", self.inset.left),
+            ("top inset", self.inset.top),
+            ("right inset", self.inset.right),
+            ("bottom inset", self.inset.bottom),
             ("corner radius", self.corner_radius),
             ("shadow", self.shadow),
             ("border width", self.border_width),
@@ -564,7 +754,50 @@ impl Beautification {
         if let Background::Image(image) = &self.background {
             image.validate()?;
         }
+        if let Some(size) = self.output_size {
+            let pixels = u64::from(size.width)
+                .checked_mul(u64::from(size.height))
+                .ok_or_else(|| Error::InvalidRequest("exact output area overflowed".to_owned()))?;
+            if size.width == 0
+                || size.height == 0
+                || size.width > MAX_RASTER_EDGE
+                || size.height > MAX_RASTER_EDGE
+                || pixels > MAX_RASTER_PIXELS
+            {
+                return Err(Error::InvalidRequest(format!(
+                    "exact output {}x{} has {pixels} pixels; the limit is {MAX_RASTER_PIXELS}",
+                    size.width, size.height
+                )));
+            }
+        }
+        if let Some(watermark) = &self.watermark {
+            if watermark.text.chars().count() > 160 {
+                return Err(Error::InvalidRequest(
+                    "watermark text cannot exceed 160 characters".to_owned(),
+                ));
+            }
+            for (name, value) in [
+                ("watermark size", watermark.font_size),
+                ("watermark margin", watermark.margin),
+            ] {
+                if !value.is_finite() || !(0.0..=Self::MAX_MEASUREMENT).contains(&value) {
+                    return Err(Error::InvalidRequest(format!(
+                        "{name} must be between 0 and {}, got {value}",
+                        Self::MAX_MEASUREMENT
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Whether this framing leaves every source pixel untouched.
+    #[must_use]
+    pub fn preserves_subject_pixels(&self) -> bool {
+        self.inset.is_zero()
+            && self.corner_radius <= 0.0
+            && self.shadow <= 0.0
+            && self.border_width <= 0.0
     }
 
     /// Logical output size before rasterisation.
@@ -572,8 +805,10 @@ impl Beautification {
     /// Aspect presets only add canvas; they never crop or scale the capture.
     #[must_use]
     pub fn output_size(&self, content: LogicalSize) -> LogicalSize {
-        let base_width = content.width + self.padding * 2.0;
-        let base_height = content.height + self.padding * 2.0;
+        let content_width = (content.width - self.inset.left - self.inset.right).max(1.0);
+        let content_height = (content.height - self.inset.top - self.inset.bottom).max(1.0);
+        let base_width = content_width + self.padding * 2.0;
+        let base_height = content_height + self.padding * 2.0;
         let Some(ratio) = self.aspect.ratio() else {
             return LogicalSize::new(base_width, base_height);
         };
@@ -605,11 +840,14 @@ pub struct DocumentData {
     /// Persisted so a reopened document cannot reissue an id that an undo stack
     /// or a selection still refers to.
     pub next_id: u64,
+    /// Unknown fields survive read-modify-write cycles.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 }
 
 impl Default for DocumentData {
@@ -619,6 +857,7 @@ impl Default for DocumentData {
             annotations: Vec::new(),
             beautification: None,
             next_id: 1,
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -640,6 +879,7 @@ pub struct Document {
     objects: Vec<AnnotationObject>,
     beautification: Option<Beautification>,
     next_id: u64,
+    extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl Document {
@@ -651,6 +891,7 @@ impl Document {
             objects: Vec::new(),
             beautification: None,
             next_id: 1,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -659,9 +900,7 @@ impl Document {
     /// # Errors
     ///
     /// Returns [`Error::InvalidRequest`] if the data is from a newer format
-    /// version, or if it carries beautification for a capture that forbids it —
-    /// a document that was hand-edited or that changed provenance must not be
-    /// silently accepted and then quietly rendered wrong.
+    /// version, malformed framing, or window framing that violates D9.
     pub fn from_data(source: Capture, data: DocumentData) -> Result<Self> {
         if data.version > DocumentData::VERSION {
             return Err(Error::InvalidRequest(format!(
@@ -670,13 +909,9 @@ impl Document {
                 DocumentData::VERSION
             )));
         }
-        if data.beautification.is_some() && source.provenance.forbids_compositing() {
-            return Err(Error::InvalidRequest(
-                "beautification is not permitted for window captures (decision D9)".to_owned(),
-            ));
-        }
         if let Some(beautification) = &data.beautification {
             beautification.validate()?;
+            Self::validate_provenance(beautification, &source)?;
         }
         let highest = data
             .annotations
@@ -689,6 +924,7 @@ impl Document {
             objects: data.annotations,
             beautification: data.beautification,
             next_id: data.next_id.max(highest).max(1),
+            extensions: data.extensions,
         };
         document.renumber_counters();
         Ok(document)
@@ -702,6 +938,7 @@ impl Document {
             annotations: self.objects.clone(),
             beautification: self.beautification.clone(),
             next_id: self.next_id,
+            extensions: self.extensions.clone(),
         }
     }
 
@@ -740,7 +977,17 @@ impl Document {
     pub fn output_logical_size(&self) -> LogicalSize {
         self.beautification.as_ref().map_or_else(
             || self.logical_size(),
-            |beautification| beautification.output_size(self.logical_size()),
+            |beautification| {
+                beautification.output_size.map_or_else(
+                    || beautification.output_size(self.logical_size()),
+                    |size| {
+                        LogicalSize::new(
+                            f64::from(size.width) / self.source.frame.scale.get(),
+                            f64::from(size.height) / self.source.frame.scale.get(),
+                        )
+                    },
+                )
+            },
         )
     }
 
@@ -915,10 +1162,16 @@ impl Document {
 
     /// Whether framing may be applied at all.
     ///
-    /// False for window captures. The UI disables the controls entirely rather
-    /// than letting them be set and quietly ignored.
+    /// Window captures may receive an outer canvas, but their source pixels are
+    /// immutable under D9.
     #[must_use]
     pub fn may_beautify(&self) -> bool {
+        true
+    }
+
+    /// Whether inset, synthetic corners, shadow, or border may touch the subject.
+    #[must_use]
+    pub fn may_style_subject(&self) -> bool {
         !self.source.provenance.forbids_compositing()
     }
 
@@ -932,21 +1185,47 @@ impl Document {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidRequest`] when framing is requested for a window
-    /// capture. Per decision D9 the OS output *is* the truth for a window, and
-    /// compositing padding, corners or a shadow onto it produces a subtly wrong
-    /// image. Refusing here, rather than accepting and ignoring, is what stops a
-    /// caller believing the setting took effect.
+    /// Returns [`Error::InvalidRequest`] when framing would crop, round, border,
+    /// or re-shadow a window capture. An outer canvas remains permitted.
     pub fn set_beautification(&mut self, beautification: Option<Beautification>) -> Result<()> {
-        if beautification.is_some() && !self.may_beautify() {
-            return Err(Error::InvalidRequest(
-                "beautification is not permitted for window captures (decision D9)".to_owned(),
-            ));
-        }
         if let Some(beautification) = &beautification {
             beautification.validate()?;
+            Self::validate_provenance(beautification, &self.source)?;
         }
         self.beautification = beautification;
+        Ok(())
+    }
+
+    fn validate_provenance(beautification: &Beautification, source: &Capture) -> Result<()> {
+        if source.provenance.forbids_compositing() && !beautification.preserves_subject_pixels() {
+            return Err(Error::InvalidRequest(
+                "window Smart Frame may add only an outer canvas; inset, corners, shadow, and border \
+                 are disabled to preserve native pixels (decision D9)"
+                    .to_owned(),
+            ));
+        }
+        if source.provenance.forbids_compositing()
+            && let Some(size) = beautification.output_size
+        {
+            let padding = (beautification.padding * source.frame.scale.get()).ceil() as u32;
+            let minimum_width = source
+                .frame
+                .width()
+                .saturating_add(padding.saturating_mul(2));
+            let minimum_height = source
+                .frame
+                .height()
+                .saturating_add(padding.saturating_mul(2));
+            if size.width < minimum_width || size.height < minimum_height {
+                return Err(Error::InvalidRequest(format!(
+                    "exact output {}x{} is too small for the native {}x{} window plus padding",
+                    size.width,
+                    size.height,
+                    source.frame.width(),
+                    source.frame.height()
+                )));
+            }
+        }
         Ok(())
     }
 

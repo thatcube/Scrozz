@@ -28,6 +28,7 @@ use std::{
     time::SystemTime,
 };
 
+use scrozz_annotate::{SmartFrameAnalysis, SmartFramePreset};
 use scrozz_core::Frame;
 use scrozz_store::CaptureId;
 use scrozz_ui::editor::{EditorEvent, EditorRequest, EditorStatus};
@@ -374,6 +375,24 @@ pub trait CardSurface {
     /// Delivers autosave feedback without replacing export feedback.
     fn editor_persist_status(&mut self, id: CardId, status: EditorStatus) {
         self.editor_status(id, status);
+    }
+
+    /// Delivers an asynchronous Smart Frame result.
+    fn editor_smart_frame_analyzed(
+        &mut self,
+        _id: CardId,
+        _revision: u64,
+        _result: std::result::Result<SmartFrameAnalysis, String>,
+    ) {
+    }
+
+    /// Replaces the custom-preset list after durable storage changes.
+    fn editor_presets_updated(
+        &mut self,
+        _id: CardId,
+        _presets: Vec<SmartFramePreset>,
+        _status: EditorStatus,
+    ) {
     }
 
     /// Takes one pending editor interaction, if there is one. Never blocks.

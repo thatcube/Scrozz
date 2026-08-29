@@ -5,20 +5,23 @@
 //! composited into that canvas once.
 //!
 //! Decision D9 is enforced by [`crate::Document`] and again by the renderer that
-//! calls this module: window captures already contain the compositor's real
-//! corners and shadow, so no synthetic framing may reach this code for them.
+//! calls this module: a window may be translated onto an outer canvas, but its
+//! native pixels cannot be cropped, rounded, bordered, or re-shadowed.
 
-use scrozz_core::{ColorSpace, Error, LogicalSize, Result};
-use scrozz_export::{RgbaImage, convert_to_srgb};
+use scrozz_core::{ColorSpace, Error, LogicalPoint, LogicalSize, Result};
+use scrozz_export::{RgbaImage, convert_color_space, convert_srgb_color};
 use tiny_skia::{
-    BlendMode, FillRule, GradientStop, LinearGradient, Paint, Pattern, Pixmap, PixmapPaint, Point,
-    PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
+    BlendMode, FillRule, GradientStop, IntRect, LinearGradient, Paint, Pattern, Pixmap,
+    PixmapPaint, Point, PremultipliedColorU8, Rect, SpreadMode, Stroke, Transform,
 };
 
 use crate::{
-    document::{Background, BackgroundImage, Beautification, BuiltInBackground, MAX_RASTER_PIXELS},
-    render::shapes,
-    style::Color,
+    document::{
+        Background, BackgroundImage, Beautification, BuiltInBackground, ExactOutputSize,
+        MAX_RASTER_EDGE, MAX_RASTER_PIXELS,
+    },
+    render::shapes::{self, Scaled},
+    style::{Color, Style},
 };
 
 /// How far the shadow falls below the capture, relative to blur depth.
@@ -36,8 +39,19 @@ pub struct ResolvedLayout {
     pub width: u32,
     /// Output height in physical pixels.
     pub height: u32,
+    /// Source rectangle sampled from the rendered current revision.
+    pub source: IntRect,
     /// Capture bounds inside the output.
     pub content: Rect,
+}
+
+pub(crate) struct ApplyOptions {
+    pub scale: f64,
+    pub source_scale: f64,
+    pub target_color_space: ColorSpace,
+    pub preserve_source_pixels: bool,
+    pub retained_source_bytes: u64,
+    pub target_width: Option<u32>,
 }
 
 /// Frames `content` according to `beautification`.
@@ -50,16 +64,33 @@ pub struct ResolvedLayout {
 /// Returns [`Error::InvalidRequest`] for malformed settings, a malformed custom
 /// background, or a canvas too large to allocate.
 pub fn apply(content: &Pixmap, beautification: &Beautification, scale: f64) -> Result<Pixmap> {
-    apply_with_retained_bytes(content, beautification, scale, 0, None)
+    apply_with_retained_bytes(
+        content,
+        beautification,
+        ApplyOptions {
+            scale,
+            source_scale: scale,
+            target_color_space: ColorSpace::Srgb,
+            preserve_source_pixels: false,
+            retained_source_bytes: 0,
+            target_width: None,
+        },
+    )
 }
 
 pub(crate) fn apply_with_retained_bytes(
     content: &Pixmap,
     beautification: &Beautification,
-    scale: f64,
-    retained_source_bytes: u64,
-    target_width: Option<u32>,
+    options: ApplyOptions,
 ) -> Result<Pixmap> {
+    let ApplyOptions {
+        scale,
+        source_scale,
+        target_color_space,
+        preserve_source_pixels,
+        retained_source_bytes,
+        target_width,
+    } = options;
     beautification.validate()?;
     if !scale.is_finite() || scale <= 0.0 {
         return Err(Error::InvalidRequest(format!(
@@ -67,7 +98,14 @@ pub(crate) fn apply_with_retained_bytes(
         )));
     }
 
-    let layout = resolve_layout_with_width(content, beautification, scale, target_width)?;
+    let layout = resolve_layout_with_width(
+        content,
+        beautification,
+        scale,
+        source_scale,
+        target_width,
+        preserve_source_pixels,
+    )?;
     preflight_working_set(content, beautification, layout, retained_source_bytes)?;
     if beautification.is_noop() {
         return Ok(content.clone());
@@ -79,7 +117,7 @@ pub(crate) fn apply_with_retained_bytes(
         ))
     })?;
 
-    paint_background(&mut canvas, &beautification.background)?;
+    paint_background(&mut canvas, &beautification.background, target_color_space)?;
 
     let radius = (beautification.corner_radius * scale) as f32;
     let radius = radius.min(layout.content.width().min(layout.content.height()) / 2.0);
@@ -87,7 +125,14 @@ pub(crate) fn apply_with_retained_bytes(
     if shadow > 0.0 {
         draw_shadow(&mut canvas, layout.content, radius, shadow)?;
     }
-    draw_content(&mut canvas, content, layout.content, radius);
+    draw_content(
+        &mut canvas,
+        content,
+        layout.source,
+        layout.content,
+        radius,
+        preserve_source_pixels,
+    );
 
     let border = (beautification.border_width * scale) as f32;
     if border > 0.0 && !beautification.border_color.is_invisible() {
@@ -96,8 +141,21 @@ pub(crate) fn apply_with_retained_bytes(
             layout.content,
             radius,
             border,
-            beautification.border_color,
+            converted_color(beautification.border_color, target_color_space)?,
         );
+    }
+    if let Some(watermark) = beautification
+        .watermark
+        .as_ref()
+        .filter(|watermark| !watermark.text.trim().is_empty())
+    {
+        draw_watermark(
+            &mut canvas,
+            layout.content,
+            watermark,
+            scale,
+            target_color_space,
+        )?;
     }
     Ok(canvas)
 }
@@ -116,14 +174,16 @@ pub fn resolve_layout(
     beautification: &Beautification,
     scale: f64,
 ) -> Result<ResolvedLayout> {
-    resolve_layout_with_width(content, beautification, scale, None)
+    resolve_layout_with_width(content, beautification, scale, scale, None, false)
 }
 
 fn resolve_layout_with_width(
     content: &Pixmap,
     beautification: &Beautification,
     scale: f64,
+    source_scale: f64,
     target_width: Option<u32>,
+    preserve_source_pixels: bool,
 ) -> Result<ResolvedLayout> {
     beautification.validate()?;
     if !scale.is_finite() || scale <= 0.0 {
@@ -132,13 +192,29 @@ fn resolve_layout_with_width(
         )));
     }
 
+    if !source_scale.is_finite() || source_scale <= 0.0 {
+        return Err(Error::InvalidRequest(format!(
+            "source scale must be finite and positive, got {source_scale}"
+        )));
+    }
+    let source = inset_source_rect(content, beautification, scale)?;
     let logical_content = LogicalSize::new(
         f64::from(content.width()) / scale,
         f64::from(content.height()) / scale,
     );
     let output = beautification.output_size(logical_content);
-    let width = target_width.unwrap_or(checked_dimension(output.width * scale, "width")?);
-    let height = checked_dimension(output.height * scale, "height")?;
+    let (width, height) = match beautification.output_size {
+        Some(exact) => exact_canvas(exact, scale, source_scale, target_width)?,
+        None => {
+            let width = target_width.unwrap_or(checked_dimension(output.width * scale, "width")?);
+            let height = if target_width.is_some() {
+                checked_dimension(f64::from(width) / (output.width / output.height), "height")?
+            } else {
+                checked_dimension(output.height * scale, "height")?
+            };
+            (width, height)
+        }
+    };
     let pixel_count = u64::from(width)
         .checked_mul(u64::from(height))
         .ok_or_else(|| Error::InvalidRequest("beautified canvas area overflowed".to_owned()))?;
@@ -148,26 +224,43 @@ fn resolve_layout_with_width(
              {MAX_RASTER_PIXELS}"
         )));
     }
-    let available_x = f64::from(width.saturating_sub(content.width()));
-    let available_y = f64::from(height.saturating_sub(content.height()));
     let padding = beautification.padding * scale;
+    let max_content_width = (f64::from(width) - padding * 2.0).max(1.0);
+    let max_content_height = (f64::from(height) - padding * 2.0).max(1.0);
+    let fit = if beautification.output_size.is_some() {
+        (max_content_width / f64::from(source.width()))
+            .min(max_content_height / f64::from(source.height()))
+            .min(1.0)
+    } else {
+        1.0
+    };
+    if preserve_source_pixels && target_width.is_none() && fit < 1.0 {
+        return Err(Error::InvalidRequest(
+            "exact output is too small to preserve native window pixels with the requested padding"
+                .to_owned(),
+        ));
+    }
+    let content_width = f64::from(source.width()) * fit;
+    let content_height = f64::from(source.height()) * fit;
+    let available_x = (f64::from(width) - content_width).max(0.0);
+    let available_y = (f64::from(height) - content_height).max(0.0);
 
     let (x, y) = if beautification.auto_balance {
-        let focus = visual_centroid(content);
+        let focus = resolved_focus(content, source, beautification);
         (
             balanced_position(
                 f64::from(width),
-                f64::from(content.width()),
+                content_width,
                 available_x,
                 padding,
-                focus.0,
+                focus.0 * fit,
             ),
             balanced_position(
                 f64::from(height),
-                f64::from(content.height()),
+                content_height,
                 available_y,
                 padding,
-                focus.1,
+                focus.1 * fit,
             ),
         )
     } else {
@@ -177,23 +270,105 @@ fn resolve_layout_with_width(
         )
     };
 
+    let (x, y) = if preserve_source_pixels {
+        (x.round(), y.round())
+    } else {
+        (x, y)
+    };
     let content = Rect::from_xywh(
         x as f32,
         y as f32,
-        content.width() as f32,
-        content.height() as f32,
+        content_width as f32,
+        content_height as f32,
     )
     .ok_or_else(|| Error::InvalidRequest("resolved content rectangle is empty".to_owned()))?;
 
     Ok(ResolvedLayout {
         width,
         height,
+        source,
         content,
     })
 }
 
+fn exact_canvas(
+    exact: ExactOutputSize,
+    scale: f64,
+    source_scale: f64,
+    target_width: Option<u32>,
+) -> Result<(u32, u32)> {
+    if let Some(width) = target_width {
+        return Ok((
+            width,
+            checked_dimension(f64::from(width) / exact.ratio(), "height")?,
+        ));
+    }
+    let ratio = scale / source_scale;
+    Ok((
+        checked_dimension(f64::from(exact.width) * ratio, "width")?,
+        checked_dimension(f64::from(exact.height) * ratio, "height")?,
+    ))
+}
+
+fn inset_source_rect(
+    content: &Pixmap,
+    beautification: &Beautification,
+    scale: f64,
+) -> Result<IntRect> {
+    let inset = beautification.inset;
+    let left = checked_inset(inset.left * scale, content.width(), "left")?;
+    let top = checked_inset(inset.top * scale, content.height(), "top")?;
+    let right = checked_inset(inset.right * scale, content.width(), "right")?;
+    let bottom = checked_inset(inset.bottom * scale, content.height(), "bottom")?;
+    let width = content
+        .width()
+        .checked_sub(left)
+        .and_then(|value| value.checked_sub(right))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            Error::InvalidRequest("horizontal inset removes the entire source".into())
+        })?;
+    let height = content
+        .height()
+        .checked_sub(top)
+        .and_then(|value| value.checked_sub(bottom))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::InvalidRequest("vertical inset removes the entire source".into()))?;
+    IntRect::from_xywh(left as i32, top as i32, width, height)
+        .ok_or_else(|| Error::InvalidRequest("source inset is not renderable".into()))
+}
+
+fn checked_inset(value: f64, extent: u32, edge: &str) -> Result<u32> {
+    if !value.is_finite() || value < 0.0 || value > f64::from(extent) {
+        return Err(Error::InvalidRequest(format!(
+            "{edge} source inset {value} exceeds the {extent}px source"
+        )));
+    }
+    Ok(value.round() as u32)
+}
+
+fn resolved_focus(
+    content: &Pixmap,
+    source: IntRect,
+    beautification: &Beautification,
+) -> (f64, f64) {
+    if let Some(metadata) = &beautification.smart_frame
+        && metadata.focus.confidence >= 20
+    {
+        return (
+            metadata.focus.x_in(f64::from(source.width())),
+            metadata.focus.y_in(f64::from(source.height())),
+        );
+    }
+    let focus = visual_centroid(content);
+    (
+        (focus.0 - f64::from(source.x())).clamp(0.0, f64::from(source.width())),
+        (focus.1 - f64::from(source.y())).clamp(0.0, f64::from(source.height())),
+    )
+}
+
 fn checked_dimension(value: f64, name: &str) -> Result<u32> {
-    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(MAX_RASTER_EDGE) {
         return Err(Error::InvalidRequest(format!(
             "beautified canvas {name} {value} is not renderable"
         )));
@@ -360,20 +535,42 @@ fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((u32::from(r) * 54 + u32::from(g) * 183 + u32::from(b) * 19) / 256) as u8
 }
 
-fn paint_background(canvas: &mut Pixmap, background: &Background) -> Result<()> {
+fn paint_background(
+    canvas: &mut Pixmap,
+    background: &Background,
+    target_color_space: ColorSpace,
+) -> Result<()> {
     match background {
         Background::Transparent => {}
         Background::Solid(color) => {
-            canvas.fill(sk_color(*color));
+            canvas.fill(sk_color(converted_color(*color, target_color_space)?));
         }
         Background::Gradient { start, end } => {
-            paint_gradient(canvas, *start, *end, false);
+            paint_gradient(
+                canvas,
+                converted_color(*start, target_color_space)?,
+                converted_color(*end, target_color_space)?,
+                false,
+            );
         }
         Background::BuiltIn(background) => {
             let (start, end, diagonal) = built_in_colors(*background);
-            paint_gradient(canvas, start, end, diagonal);
+            paint_gradient(
+                canvas,
+                converted_color(start, target_color_space)?,
+                converted_color(end, target_color_space)?,
+                diagonal,
+            );
         }
-        Background::Image(image) => paint_image_background(canvas, image)?,
+        Background::Automatic(background) => {
+            paint_gradient(
+                canvas,
+                converted_color(background.start, target_color_space)?,
+                converted_color(background.end, target_color_space)?,
+                true,
+            );
+        }
+        Background::Image(image) => paint_image_background(canvas, image, target_color_space)?,
     }
     Ok(())
 }
@@ -419,19 +616,23 @@ fn paint_gradient(canvas: &mut Pixmap, start: Color, end: Color, diagonal: bool)
     canvas.fill_rect(rect, &paint, Transform::identity(), None);
 }
 
-fn paint_image_background(canvas: &mut Pixmap, image: &BackgroundImage) -> Result<()> {
+fn paint_image_background(
+    canvas: &mut Pixmap,
+    image: &BackgroundImage,
+    target_color_space: ColorSpace,
+) -> Result<()> {
     image.validate()?;
     let converted;
-    let pixels = if matches!(
-        image.color_space(),
-        ColorSpace::DisplayP3 | ColorSpace::Rec2020
-    ) {
+    let pixels = if image.color_space() != target_color_space
+        && image.color_space() != ColorSpace::Unknown
+        && target_color_space != ColorSpace::Unknown
+    {
         let source = RgbaImage {
             width: image.width(),
             height: image.height(),
             data: image.pixels().to_vec(),
         };
-        converted = convert_to_srgb(&source, image.color_space())?;
+        converted = convert_color_space(&source, image.color_space(), target_color_space)?;
         converted.data.as_slice()
     } else {
         image.pixels()
@@ -641,17 +842,66 @@ fn averaged_pixel(sum: [u64; 4], divisor: u64) -> PremultipliedColorU8 {
 }
 
 /// Draws the source clipped to an antialiased rounded rectangle.
-fn draw_content(canvas: &mut Pixmap, content: &Pixmap, image_rect: Rect, radius: f32) {
+fn draw_content(
+    canvas: &mut Pixmap,
+    content: &Pixmap,
+    source_rect: IntRect,
+    image_rect: Rect,
+    radius: f32,
+    preserve_source_pixels: bool,
+) {
+    let exact_copy = (image_rect.width() - source_rect.width() as f32).abs() < f32::EPSILON
+        && (image_rect.height() - source_rect.height() as f32).abs() < f32::EPSILON
+        && image_rect.left().fract().abs() < f32::EPSILON
+        && image_rect.top().fract().abs() < f32::EPSILON
+        && radius <= 0.0;
+    if exact_copy {
+        copy_source_rect(
+            canvas,
+            content,
+            source_rect,
+            image_rect.left() as u32,
+            image_rect.top() as u32,
+            preserve_source_pixels,
+        );
+        return;
+    }
+
+    let scale_x = image_rect.width() / source_rect.width() as f32;
+    let scale_y = image_rect.height() / source_rect.height() as f32;
+    let translate_x = image_rect.left() - source_rect.x() as f32 * scale_x;
+    let translate_y = image_rect.top() - source_rect.y() as f32 * scale_y;
+    let full_source = source_rect.x() == 0
+        && source_rect.y() == 0
+        && source_rect.width() == content.width()
+        && source_rect.height() == content.height();
+    let transform = if full_source
+        && (scale_x - 1.0).abs() < f32::EPSILON
+        && (scale_y - 1.0).abs() < f32::EPSILON
+    {
+        Transform::from_translate(image_rect.left(), image_rect.top())
+    } else {
+        Transform::from_row(scale_x, 0.0, 0.0, scale_y, translate_x, translate_y)
+    };
     let shader = Pattern::new(
         content.as_ref(),
         SpreadMode::Pad,
-        tiny_skia::FilterQuality::Nearest,
+        if (scale_x - 1.0).abs() < f32::EPSILON && (scale_y - 1.0).abs() < f32::EPSILON {
+            tiny_skia::FilterQuality::Nearest
+        } else {
+            tiny_skia::FilterQuality::Bilinear
+        },
         1.0,
-        Transform::from_translate(image_rect.left(), image_rect.top()),
+        transform,
     );
     let paint = Paint {
         shader,
-        anti_alias: true,
+        anti_alias: radius > 0.0,
+        blend_mode: if preserve_source_pixels {
+            BlendMode::Source
+        } else {
+            BlendMode::SourceOver
+        },
         ..Paint::default()
     };
     let Some(path) = shapes::rounded_rect(image_rect, radius) else {
@@ -664,6 +914,98 @@ fn draw_content(canvas: &mut Pixmap, content: &Pixmap, image_rect: Rect, radius:
         Transform::identity(),
         None,
     );
+}
+
+fn copy_source_rect(
+    canvas: &mut Pixmap,
+    source: &Pixmap,
+    source_rect: IntRect,
+    destination_x: u32,
+    destination_y: u32,
+    replace: bool,
+) {
+    let canvas_width = canvas.width() as usize;
+    let source_width = source.width() as usize;
+    for row in 0..source_rect.height() as usize {
+        for column in 0..source_rect.width() as usize {
+            let source_index =
+                (source_rect.y() as usize + row) * source_width + source_rect.x() as usize + column;
+            let destination_index =
+                (destination_y as usize + row) * canvas_width + destination_x as usize + column;
+            let Some(source_pixel) = source.pixels().get(source_index).copied() else {
+                continue;
+            };
+            let Some(destination) = canvas.pixels_mut().get_mut(destination_index) else {
+                continue;
+            };
+            if replace || source_pixel.alpha() == 255 {
+                *destination = source_pixel;
+            } else if source_pixel.alpha() > 0 {
+                *destination = source_over(source_pixel, *destination);
+            }
+        }
+    }
+}
+
+fn source_over(
+    source: PremultipliedColorU8,
+    destination: PremultipliedColorU8,
+) -> PremultipliedColorU8 {
+    let inverse = 255_u32.saturating_sub(u32::from(source.alpha()));
+    let blend = |source: u8, destination: u8| {
+        (u32::from(source) + (u32::from(destination) * inverse + 127) / 255).min(255) as u8
+    };
+    let alpha = blend(source.alpha(), destination.alpha());
+    PremultipliedColorU8::from_rgba(
+        blend(source.red(), destination.red()).min(alpha),
+        blend(source.green(), destination.green()).min(alpha),
+        blend(source.blue(), destination.blue()).min(alpha),
+        alpha,
+    )
+    .unwrap_or_else(transparent)
+}
+
+fn draw_watermark(
+    canvas: &mut Pixmap,
+    content: Rect,
+    watermark: &crate::Watermark,
+    scale: f64,
+    target_color_space: ColorSpace,
+) -> Result<()> {
+    let size = crate::font::measure(&watermark.text, watermark.font_size);
+    let width = (size.width * scale) as f32;
+    let height = (size.height * scale) as f32;
+    let margin = (watermark.margin * scale) as f32;
+    let at_x = (canvas.width() as f32 - width - margin).max(margin);
+    let below_y = content.bottom() + margin;
+    let above_y = content.top() - margin - height;
+    let at_y = if below_y + height <= canvas.height() as f32 {
+        below_y
+    } else if above_y >= 0.0 {
+        above_y
+    } else {
+        return Ok(());
+    };
+    let style = Style::default()
+        .with_stroke(converted_color(watermark.color, target_color_space)?)
+        .with_font_size(watermark.font_size)
+        .with_stroke_width((watermark.font_size * 0.12).max(1.0));
+    let Some(path) = shapes::text(
+        &watermark.text,
+        LogicalPoint::new(at_x as f64 / scale, at_y as f64 / scale),
+        &style,
+        Scaled::new(scale),
+    ) else {
+        return Ok(());
+    };
+    let paint = shapes::paint(style.stroke, 1.0, BlendMode::SourceOver);
+    shapes::stroke_path(
+        canvas,
+        &path,
+        &paint,
+        (watermark.font_size * scale * 0.12).max(1.0) as f32,
+    );
+    Ok(())
 }
 
 fn draw_border(canvas: &mut Pixmap, image_rect: Rect, radius: f32, width: f32, color: Color) {
@@ -695,6 +1037,11 @@ fn draw_border(canvas: &mut Pixmap, image_rect: Rect, radius: f32, width: f32, c
 
 fn sk_color(color: Color) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba8(color.r, color.g, color.b, color.a)
+}
+
+fn converted_color(color: Color, target: ColorSpace) -> Result<Color> {
+    let [r, g, b, a] = convert_srgb_color([color.r, color.g, color.b, color.a], target)?;
+    Ok(Color::rgba(r, g, b, a))
 }
 
 fn premultiply(r: u8, g: u8, b: u8, a: u8) -> PremultipliedColorU8 {

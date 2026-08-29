@@ -25,7 +25,9 @@
 use std::{path::PathBuf, str::FromStr};
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use scrozz_annotate::{Alignment, AspectPreset, BeautificationPreset, BuiltInBackground, Color};
+use scrozz_annotate::{
+    Alignment, AspectPreset, BeautificationPreset, BuiltInBackground, Color, ExactOutputSize,
+};
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
 
 use crate::fault::{CliError, CliResult};
@@ -521,6 +523,47 @@ impl BeautifyAspect {
     }
 }
 
+/// Exact output canvas dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeautifySize {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl BeautifySize {
+    /// Converts to the shared model.
+    #[must_use]
+    pub const fn to_model(self) -> ExactOutputSize {
+        ExactOutputSize::new(self.width, self.height)
+    }
+}
+
+impl FromStr for BeautifySize {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (width, height) = raw
+            .trim()
+            .split_once(['x', 'X', '\u{d7}'])
+            .ok_or_else(|| format!("expected WIDTHxHEIGHT, got {raw:?}"))?;
+        let width = width
+            .parse::<u32>()
+            .map_err(|_| format!("output width is not a positive integer: {width:?}"))?;
+        let height = height
+            .parse::<u32>()
+            .map_err(|_| format!("output height is not a positive integer: {height:?}"))?;
+        let size = Self { width, height };
+        let beauty = scrozz_annotate::Beautification {
+            output_size: Some(size.to_model()),
+            ..scrozz_annotate::Beautification::default()
+        };
+        beauty.validate().map_err(|error| error.to_string())?;
+        Ok(size)
+    }
+}
+
 /// Placement within an aspect-expanded canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BeautifyAlignment {
@@ -690,6 +733,10 @@ pub struct CaptureArgs {
     #[arg(long, value_enum, value_name = "PRESET")]
     pub beautify: Option<BeautifyPreset>,
 
+    /// Analyse this capture and create an adaptive Smart Frame.
+    #[arg(long, conflicts_with = "beautify")]
+    pub smart_frame: bool,
+
     /// Override the beautification background.
     ///
     /// Accepts a built-in name, `transparent`, `#RRGGBB[AA]`, or `image:PATH`.
@@ -703,6 +750,10 @@ pub struct CaptureArgs {
     /// Output aspect ratio.
     #[arg(long, value_enum, value_name = "ASPECT")]
     pub aspect: Option<BeautifyAspect>,
+
+    /// Exact presentation-canvas dimensions, such as 1080x1350.
+    #[arg(long, value_name = "WIDTHxHEIGHT", conflicts_with = "aspect")]
+    pub size: Option<BeautifySize>,
 
     /// Capture placement within aspect-expanded canvas.
     #[arg(long, value_enum, value_name = "POSITION")]
@@ -772,9 +823,11 @@ impl CaptureArgs {
     #[must_use]
     pub fn requests_beautification(&self) -> bool {
         self.beautify.is_some()
+            || self.smart_frame
             || self.background.is_some()
             || self.padding.is_some()
             || self.aspect.is_some()
+            || self.size.is_some()
             || self.alignment.is_some()
             || self.auto_balance
             || self.corner_radius.is_some()
@@ -824,9 +877,16 @@ impl CaptureArgs {
                 target,
                 TargetSpec::Window(_) | TargetSpec::Interactive(InteractiveMode::Window)
             )
+            && (!self.smart_frame
+                || self.beautify.is_some()
+                || self.corner_radius.is_some_and(|value| value > 0.0)
+                || self.shadow.is_some_and(|value| value > 0.0)
+                || self.border.is_some_and(|value| value > 0.0))
         {
             return Err(CliError::Core(scrozz_core::Error::InvalidRequest(
-                "beautification is not permitted for window captures (decision D9)".to_owned(),
+                "window Smart Frame may add only an outer canvas; inset, corners, shadow, and \
+                 border are disabled to preserve native pixels (decision D9)"
+                    .to_owned(),
             )));
         }
         Ok(())
@@ -1711,6 +1771,85 @@ mod tests {
             assert!(err.to_string().contains("window"), "{err}");
             assert!(err.to_string().contains("D9"), "{err}");
         }
+    }
+
+    #[test]
+    fn explicit_smart_frame_is_allowed_for_window_outer_canvas() {
+        for argv in [
+            vec!["scrozz", "capture", "--window", "Safari", "--smart-frame"],
+            vec![
+                "scrozz",
+                "capture",
+                "--interactive",
+                "window",
+                "--smart-frame",
+                "--padding",
+                "40",
+            ],
+        ] {
+            let Some(Command::Capture(args)) = parse(&argv).command else {
+                panic!("expected capture")
+            };
+            assert!(args.smart_frame);
+            assert!(args.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn exact_output_size_parses_and_conflicts_with_ratio() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,100,80",
+            "--smart-frame",
+            "--size",
+            "1080x1350",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert_eq!(
+            args.size.map(BeautifySize::to_model),
+            Some(ExactOutputSize::new(1080, 1350))
+        );
+        assert!(args.validate().is_ok());
+        reject(&[
+            "scrozz",
+            "capture",
+            "--smart-frame",
+            "--size",
+            "1080x1080",
+            "--aspect",
+            "square",
+        ]);
+        reject(&["scrozz", "capture", "--smart-frame", "--size", "0x10"]);
+        reject(&[
+            "scrozz",
+            "capture",
+            "--smart-frame",
+            "--size",
+            "50000x50000",
+        ]);
+    }
+
+    #[test]
+    fn window_smart_frame_rejects_subject_modifiers() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--window",
+            "Safari",
+            "--smart-frame",
+            "--shadow",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
     }
 
     #[test]

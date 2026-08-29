@@ -16,8 +16,10 @@ use egui::{
     TextureOptions, Vec2, ViewportBuilder, ViewportId, pos2, vec2,
 };
 use scrozz_annotate::{
-    Alignment, AspectPreset, Background, BackgroundImage, Beautification, BeautificationPreset,
-    BuiltInBackground, Document, DocumentData, SkiaRenderer,
+    Alignment, AnalysisCancellation, AspectPreset, AutomaticBackground, Background,
+    BackgroundImage, Beautification, BeautificationPreset, BuiltInBackground, Document,
+    DocumentData, ExactOutputSize, SensitiveRegionReview, SkiaRenderer, SmartFrameAnalysis,
+    SmartFramePreset, SmartFramePresetSettings, SourceInsets, Watermark, provisional_smart_frame,
 };
 use scrozz_core::{ColorSpace, Error, Result};
 use scrozz_export::{convert_to_srgb, to_straight_rgba8};
@@ -55,6 +57,31 @@ pub enum EditorEvent {
         /// Compact edit snapshot; the worker restores immutable source pixels.
         data: DocumentData,
     },
+    /// Analyse one immutable current revision off the UI thread.
+    AnalyzeSmartFrame {
+        /// Stable card/editor identifier.
+        id: u64,
+        /// Editor revision used to reject stale results.
+        revision: u64,
+        /// Current annotations with framing removed.
+        data: DocumentData,
+        /// Cooperative cancellation handle.
+        cancellation: AnalysisCancellation,
+    },
+    /// Add or replace a pixel-free custom preset.
+    UpsertPreset {
+        /// Stable card/editor identifier.
+        id: u64,
+        /// Validated preset.
+        preset: SmartFramePreset,
+    },
+    /// Remove a custom preset.
+    DeletePreset {
+        /// Stable card/editor identifier.
+        id: u64,
+        /// Preset identifier.
+        preset_id: String,
+    },
     /// The viewport closed.
     Closed {
         /// Stable card/editor identifier.
@@ -71,6 +98,8 @@ pub struct EditorRequest {
     pub title: String,
     /// Capture plus its restored edits.
     pub document: Document,
+    /// Cross-capture custom presets.
+    pub custom_presets: Vec<SmartFramePreset>,
 }
 
 impl EditorRequest {
@@ -81,7 +110,15 @@ impl EditorRequest {
             id,
             title: title.into(),
             document,
+            custom_presets: Vec::new(),
         }
+    }
+
+    /// Supplies persisted custom presets.
+    #[must_use]
+    pub fn with_presets(mut self, presets: Vec<SmartFramePreset>) -> Self {
+        self.custom_presets = presets;
+        self
     }
 }
 
@@ -106,6 +143,20 @@ enum EditorCommand {
     PersistStatus {
         id: u64,
         status: EditorStatus,
+    },
+    SmartFrameAnalyzed {
+        id: u64,
+        revision: u64,
+        result: Box<std::result::Result<SmartFrameAnalysis, String>>,
+    },
+    PresetsUpdated {
+        id: u64,
+        presets: Vec<SmartFramePreset>,
+        status: EditorStatus,
+    },
+    SensitiveReview {
+        id: u64,
+        review: SensitiveRegionReview,
     },
 }
 
@@ -195,6 +246,59 @@ impl EditorHandle {
         }
     }
 
+    /// Delivers an asynchronous Smart Frame analysis.
+    pub fn smart_frame_analyzed(
+        &self,
+        id: u64,
+        revision: u64,
+        result: std::result::Result<SmartFrameAnalysis, String>,
+    ) {
+        let context = {
+            let mut shared = self.shared.lock().expect("editor mutex poisoned");
+            shared
+                .commands
+                .push_back(EditorCommand::SmartFrameAnalyzed {
+                    id,
+                    revision,
+                    result: Box::new(result),
+                });
+            shared.context.clone()
+        };
+        if let Some(context) = context {
+            context.request_repaint();
+        }
+    }
+
+    /// Replaces the custom-preset list after a durable mutation.
+    pub fn presets_updated(&self, id: u64, presets: Vec<SmartFramePreset>, status: EditorStatus) {
+        let context = {
+            let mut shared = self.shared.lock().expect("editor mutex poisoned");
+            shared.commands.push_back(EditorCommand::PresetsUpdated {
+                id,
+                presets,
+                status,
+            });
+            shared.context.clone()
+        };
+        if let Some(context) = context {
+            context.request_repaint();
+        }
+    }
+
+    /// Supplies reviewed-but-unconfirmed sensitive-region suggestions.
+    pub fn sensitive_review(&self, id: u64, review: SensitiveRegionReview) {
+        let context = {
+            let mut shared = self.shared.lock().expect("editor mutex poisoned");
+            shared
+                .commands
+                .push_back(EditorCommand::SensitiveReview { id, review });
+            shared.context.clone()
+        };
+        if let Some(context) = context {
+            context.request_repaint();
+        }
+    }
+
     /// Returns all editor work currently waiting for the application.
     #[must_use]
     pub fn drain_events(&self) -> Vec<EditorEvent> {
@@ -269,6 +373,7 @@ impl EditorWorkspace {
                 self.handle.emit(event);
             }
             if close {
+                panel.cancel_smart_frame();
                 if let Some(event) = panel.flush_persist() {
                     self.handle.emit(event);
                 }
@@ -340,9 +445,52 @@ impl EditorWorkspace {
                         }
                     }
                 }
+                EditorCommand::SmartFrameAnalyzed {
+                    id,
+                    revision,
+                    result,
+                } => {
+                    if let Some(panel) = self.panels.get_mut(&id) {
+                        panel.finish_smart_frame_analysis(revision, *result);
+                    }
+                }
+                EditorCommand::PresetsUpdated {
+                    id,
+                    presets,
+                    status,
+                } => {
+                    if let Some(panel) = self.panels.get_mut(&id) {
+                        panel.custom_presets = presets;
+                        panel.status = status;
+                    }
+                }
+                EditorCommand::SensitiveReview { id, review } => {
+                    if let Some(panel) = self.panels.get_mut(&id)
+                        && review.revision == panel.revision
+                    {
+                        panel.sensitive_review = Some(review);
+                    }
+                }
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct SmartFrameDraft {
+    before: Option<Beautification>,
+    analysis_revision: u64,
+    cancellation: AnalysisCancellation,
+    analysis_pending: bool,
+    edited_after_request: bool,
+    inset_explanation: String,
+    analysis_scope: AnalysisScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisScope {
+    All,
+    AutomaticOnly,
 }
 
 struct EditorPanel {
@@ -359,14 +507,31 @@ struct EditorPanel {
     persist_error: Option<String>,
     persist_pending: bool,
     changed_at: f64,
+    revision: u64,
+    next_analysis_generation: u64,
+    smart_frame: Option<SmartFrameDraft>,
+    undo: Vec<Option<Beautification>>,
+    redo: Vec<Option<Beautification>>,
+    advanced_open: bool,
+    custom_presets: Vec<SmartFramePreset>,
+    selected_preset: Option<String>,
+    preset_name: String,
+    sensitive_review: Option<SensitiveRegionReview>,
+    confirm_revert: bool,
 }
 
 impl EditorPanel {
     fn new(request: EditorRequest) -> Self {
+        let EditorRequest {
+            id,
+            title,
+            document,
+            custom_presets,
+        } = request;
         Self {
-            id: request.id,
-            title: request.title,
-            document: request.document,
+            id,
+            title,
+            document,
             preview: None,
             preview_size: [1, 1],
             preview_dirty: true,
@@ -377,6 +542,17 @@ impl EditorPanel {
             persist_error: None,
             persist_pending: false,
             changed_at: 0.0,
+            revision: 0,
+            next_analysis_generation: 1,
+            smart_frame: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            advanced_open: false,
+            custom_presets,
+            selected_preset: None,
+            preset_name: String::new(),
+            sensitive_review: None,
+            confirm_revert: false,
         }
     }
 
@@ -421,7 +597,7 @@ impl EditorPanel {
                     .inner_margin(Margin::same(20)),
             )
             .show(root, |ui| {
-                self.controls(ui, theme);
+                events.extend(self.controls(ui, theme));
             });
 
         egui::CentralPanel::default()
@@ -440,10 +616,11 @@ impl EditorPanel {
     }
 
     fn header(&self, ui: &mut egui::Ui, theme: &Theme) {
+        let show_metadata = ui.available_width() >= 920.0;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("FRAMING BENCH")
+                    RichText::new("SMART FRAME STUDIO")
                         .font(FontId::monospace(10.0))
                         .color(theme.palette.accent)
                         .strong(),
@@ -456,21 +633,23 @@ impl EditorPanel {
                         .strong(),
                 );
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let source = &self.document.source.frame;
-                chip(
-                    ui,
-                    &format!(
-                        "{} x {}  /  {}x",
-                        source.width(),
-                        source.height(),
-                        trim_scale(source.scale.get())
-                    ),
-                    theme,
-                );
-                ui.add_space(8.0);
-                chip(ui, "SOURCE UNTOUCHED", theme);
-            });
+            if show_metadata {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let source = &self.document.source.frame;
+                    chip(
+                        ui,
+                        &format!(
+                            "{} x {}  /  {}x",
+                            source.width(),
+                            source.height(),
+                            trim_scale(source.scale.get())
+                        ),
+                        theme,
+                    );
+                    ui.add_space(8.0);
+                    chip(ui, "SOURCE UNTOUCHED", theme);
+                });
+            }
         });
     }
 
@@ -521,72 +700,761 @@ impl EditorPanel {
         );
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        if !self.document.may_beautify() {
-            d9_refusal(ui, theme);
-            return;
-        }
-
-        let mut config = self.document.beautification().cloned().unwrap_or_default();
-        let before = config.clone();
-
+    fn controls(&mut self, ui: &mut egui::Ui, theme: &Theme) -> Vec<EditorEvent> {
+        let mut events = Vec::new();
+        let compact = ui.available_height() < 520.0;
         ScrollArea::vertical()
             .id_salt(("beautify.scroll", self.id))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                section_label(ui, "STARTING POINT", theme);
-                preset_row(ui, &mut config, theme);
-                section_rule(ui, theme);
+                if self.smart_frame.is_none() {
+                    smart_frame_intro(ui, theme);
+                    ui.add_space(12.0);
+                    let existing = self.document.beautification().cloned();
+                    let label = if existing.is_some() {
+                        "Edit Smart Frame"
+                    } else {
+                        "Smart Frame"
+                    };
+                    if smart_frame_button(ui, label, theme).clicked() {
+                        if let Some(existing) = existing {
+                            self.begin_with(existing);
+                        } else {
+                            events.push(self.begin_smart_frame());
+                        }
+                    }
+                    ui.add_space(14.0);
+                    section_label(ui, "STARTING POINTS", theme);
+                    self.starting_points(ui, theme);
+                    if !compact {
+                        self.preset_library(ui, theme, &mut events, false);
+                    }
+                    if self.document.beautification().is_some() {
+                        section_rule(ui, theme);
+                        if self.confirm_revert {
+                            EguiFrame::new()
+                                .fill(danger(theme).gamma_multiply(0.09))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Remove applied framing?")
+                                            .color(theme.palette.text)
+                                            .strong(),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .button(
+                                                RichText::new("Revert")
+                                                    .color(danger(theme))
+                                                    .strong(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.revert_framing(ui.input(|input| input.time));
+                                            self.confirm_revert = false;
+                                        }
+                                        if ui.button("Keep framing").clicked() {
+                                            self.confirm_revert = false;
+                                        }
+                                    });
+                                });
+                        } else if ui
+                            .button(RichText::new("Revert framing").color(danger(theme)))
+                            .clicked()
+                        {
+                            self.confirm_revert = true;
+                        }
+                    }
+                    return;
+                }
 
-                section_label(ui, "BACKGROUND", theme);
-                background_controls(ui, &mut config, theme, &mut self.status);
+                self.draft_header(ui, theme, &mut events);
                 section_rule(ui, theme);
+                section_label(ui, "STARTING POINTS", theme);
+                self.starting_points(ui, theme);
+                if !compact {
+                    self.preset_library(ui, theme, &mut events, true);
+                    section_rule(ui, theme);
+                }
 
-                section_label(ui, "CANVAS", theme);
-                measure_slider(ui, "Padding", &mut config.padding, 0.0..=220.0);
-                ui.add_space(8.0);
-                aspect_row(ui, &mut config.aspect);
-                ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                    ui.checkbox(&mut self.advanced_open, "Advanced controls");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new("Placement")
-                                .color(theme.palette.text)
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new("Anchor the capture in extra canvas")
-                                .small()
+                            RichText::new("SOURCE SAFE")
+                                .font(FontId::monospace(9.0))
                                 .color(theme.palette.text_muted),
                         );
                     });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        alignment_matrix(ui, &mut config.alignment, theme);
-                    });
                 });
-                ui.add_space(10.0);
-                ui.checkbox(&mut config.auto_balance, "Visually balance the subject")
-                    .on_hover_text(
-                        "Offsets the capture using deterministic visual salience, while retaining \
-                         at least 35% of the requested padding.",
-                    );
-                section_rule(ui, theme);
-
-                section_label(ui, "FINISH", theme);
-                measure_slider(ui, "Corners", &mut config.corner_radius, 0.0..=80.0);
-                measure_slider(ui, "Shadow", &mut config.shadow, 0.0..=80.0);
-                measure_slider(ui, "Border", &mut config.border_width, 0.0..=12.0);
-                if config.border_width > 0.0 {
-                    color_control(ui, "Border colour", &mut config.border_color);
+                if self.advanced_open {
+                    self.advanced_controls(ui, theme, &mut events);
                 }
-                ui.add_space(12.0);
+                if !compact {
+                    section_rule(ui, theme);
+                    self.sensitive_suggestions(ui, theme);
+                }
             });
+        events
+    }
 
+    fn begin_smart_frame(&mut self) -> EditorEvent {
+        let before = self.document.beautification().cloned();
+        let generation = self.next_analysis_generation;
+        self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
+        let cancellation = AnalysisCancellation::default();
+        let provisional = provisional_smart_frame(
+            self.document.logical_size(),
+            self.document.source.frame.scale.get(),
+            self.document.source.provenance,
+            self.document.source.frame.color_space,
+        );
+        self.document
+            .set_beautification(Some(provisional))
+            .expect("the provisional recipe is provenance-safe");
+        self.smart_frame = Some(SmartFrameDraft {
+            before,
+            analysis_revision: generation,
+            cancellation: cancellation.clone(),
+            analysis_pending: true,
+            edited_after_request: false,
+            inset_explanation: "Analysing this revision...".to_owned(),
+            analysis_scope: AnalysisScope::All,
+        });
+        self.preview_dirty = true;
+        self.advanced_open = false;
+        self.confirm_revert = false;
+        self.status =
+            EditorStatus::Complete("Smart Frame draft - review before applying".to_owned());
+        let mut data = self.document.data();
+        data.beautification = None;
+        EditorEvent::AnalyzeSmartFrame {
+            id: self.id,
+            revision: generation,
+            data,
+            cancellation,
+        }
+    }
+
+    fn begin_with(&mut self, mut config: Beautification) {
+        let before = self.smart_frame.as_ref().map_or_else(
+            || self.document.beautification().cloned(),
+            |draft| draft.before.clone(),
+        );
+        self.cancel_analysis();
+        self.confirm_revert = false;
+        if !self.document.may_style_subject() {
+            config.inset = SourceInsets::default();
+            config.corner_radius = 0.0;
+            config.shadow = 0.0;
+            config.border_width = 0.0;
+        }
+        match self.document.set_beautification(Some(config)) {
+            Ok(()) => {
+                self.smart_frame = Some(SmartFrameDraft {
+                    before,
+                    analysis_revision: 0,
+                    cancellation: AnalysisCancellation::default(),
+                    analysis_pending: false,
+                    edited_after_request: true,
+                    inset_explanation: "Preset values are editable until Apply".to_owned(),
+                    analysis_scope: AnalysisScope::All,
+                });
+                self.preview_dirty = true;
+                self.status =
+                    EditorStatus::Complete("Smart Frame draft - review before applying".to_owned());
+            }
+            Err(error) => self.status = EditorStatus::Failed(error.to_string()),
+        }
+    }
+
+    fn restart_analysis(&mut self) -> Option<EditorEvent> {
+        let before = self.smart_frame.as_ref()?.before.clone();
+        self.cancel_analysis();
+        let generation = self.next_analysis_generation;
+        self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
+        let cancellation = AnalysisCancellation::default();
+        let provisional = provisional_smart_frame(
+            self.document.logical_size(),
+            self.document.source.frame.scale.get(),
+            self.document.source.provenance,
+            self.document.source.frame.color_space,
+        );
+        self.document
+            .set_beautification(Some(provisional))
+            .expect("the provisional recipe is provenance-safe");
+        self.smart_frame = Some(SmartFrameDraft {
+            before,
+            analysis_revision: generation,
+            cancellation: cancellation.clone(),
+            analysis_pending: true,
+            edited_after_request: false,
+            inset_explanation: "Analysing this revision...".to_owned(),
+            analysis_scope: AnalysisScope::All,
+        });
+        self.preview_dirty = true;
+        let mut data = self.document.data();
+        data.beautification = None;
+        Some(EditorEvent::AnalyzeSmartFrame {
+            id: self.id,
+            revision: generation,
+            data,
+            cancellation,
+        })
+    }
+
+    fn finish_smart_frame_analysis(
+        &mut self,
+        revision: u64,
+        result: std::result::Result<SmartFrameAnalysis, String>,
+    ) {
+        let Some(draft) = self.smart_frame.as_mut() else {
+            return;
+        };
+        if draft.analysis_revision != revision
+            || draft.edited_after_request
+            || draft.cancellation.is_cancelled()
+        {
+            return;
+        }
+        draft.analysis_pending = false;
+        match result {
+            Ok(analysis) => {
+                draft.inset_explanation = analysis.inset_explanation;
+                let beautification = match draft.analysis_scope {
+                    AnalysisScope::All => analysis.beautification,
+                    AnalysisScope::AutomaticOnly => {
+                        let mut current =
+                            self.document.beautification().cloned().unwrap_or_default();
+                        current.background = analysis.beautification.background;
+                        current.smart_frame = analysis.beautification.smart_frame;
+                        current
+                    }
+                };
+                match self.document.set_beautification(Some(beautification)) {
+                    Ok(()) => {
+                        self.preview_dirty = true;
+                        self.status =
+                            EditorStatus::Complete("Smart Frame is ready to review".to_owned());
+                    }
+                    Err(error) => self.status = EditorStatus::Failed(error.to_string()),
+                }
+            }
+            Err(error) if error.to_lowercase().contains("cancel") => {}
+            Err(error) => {
+                draft.inset_explanation =
+                    "Inset left at zero because analysis did not complete".to_owned();
+                self.status = EditorStatus::Failed(error);
+            }
+        }
+    }
+
+    fn cancel_analysis(&mut self) {
+        if let Some(draft) = &self.smart_frame {
+            draft.cancellation.cancel();
+        }
+    }
+
+    fn request_automatic_background_analysis(&mut self) -> Option<EditorEvent> {
+        let draft = self.smart_frame.as_mut()?;
+        draft.cancellation.cancel();
+        let generation = self.next_analysis_generation;
+        self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
+        let cancellation = AnalysisCancellation::default();
+        draft.analysis_revision = generation;
+        draft.cancellation = cancellation.clone();
+        draft.analysis_pending = true;
+        draft.edited_after_request = false;
+        draft.analysis_scope = AnalysisScope::AutomaticOnly;
+        draft.inset_explanation = "Resolving a capture-aware background...".to_owned();
+        let mut data = self.document.data();
+        data.beautification = None;
+        Some(EditorEvent::AnalyzeSmartFrame {
+            id: self.id,
+            revision: generation,
+            data,
+            cancellation,
+        })
+    }
+
+    fn mark_draft_edited(&mut self) {
+        if let Some(draft) = &mut self.smart_frame {
+            draft.cancellation.cancel();
+            draft.analysis_pending = false;
+            draft.edited_after_request = true;
+        }
+        self.preview_dirty = true;
+    }
+
+    fn apply_smart_frame(&mut self, now: f64) {
+        let Some(draft) = self.smart_frame.take() else {
+            return;
+        };
+        draft.cancellation.cancel();
+        let after = self.document.beautification().cloned();
+        if after != draft.before {
+            self.undo.push(draft.before);
+            self.redo.clear();
+            self.revision = self.revision.saturating_add(1);
+            self.changed(now);
+        } else {
+            self.status = EditorStatus::Complete("No framing changes to apply".to_owned());
+        }
+    }
+
+    fn cancel_smart_frame(&mut self) {
+        let Some(draft) = self.smart_frame.take() else {
+            return;
+        };
+        draft.cancellation.cancel();
+        if self.document.set_beautification(draft.before).is_ok() {
+            self.preview_dirty = true;
+            self.status = EditorStatus::Complete("Smart Frame draft cancelled".to_owned());
+        }
+    }
+
+    fn revert_framing(&mut self, now: f64) {
+        self.cancel_smart_frame();
+        let before = self.document.beautification().cloned();
+        if before.is_some() && self.document.set_beautification(None).is_ok() {
+            self.undo.push(before);
+            self.redo.clear();
+            self.revision = self.revision.saturating_add(1);
+            self.changed(now);
+        }
+    }
+
+    fn undo_framing(&mut self, now: f64) {
+        self.cancel_smart_frame();
+        let Some(previous) = self.undo.pop() else {
+            return;
+        };
+        let current = self.document.beautification().cloned();
+        if self.document.set_beautification(previous).is_ok() {
+            self.redo.push(current);
+            self.revision = self.revision.saturating_add(1);
+            self.changed(now);
+        }
+    }
+
+    fn redo_framing(&mut self, now: f64) {
+        self.cancel_smart_frame();
+        let Some(next) = self.redo.pop() else {
+            return;
+        };
+        let current = self.document.beautification().cloned();
+        if self.document.set_beautification(next).is_ok() {
+            self.undo.push(current);
+            self.revision = self.revision.saturating_add(1);
+            self.changed(now);
+        }
+    }
+
+    fn draft_header(&mut self, ui: &mut egui::Ui, theme: &Theme, events: &mut Vec<EditorEvent>) {
+        let Some(draft) = &self.smart_frame else {
+            return;
+        };
+        let analysis_pending = draft.analysis_pending;
+        let inset_explanation = draft.inset_explanation.clone();
+        EguiFrame::new()
+            .fill(theme.palette.accent.gamma_multiply(0.10))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(14))
+            .stroke(Stroke::new(1.0, theme.palette.accent.gamma_multiply(0.55)))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("SMART FRAME DRAFT")
+                        .font(FontId::monospace(10.0))
+                        .color(theme.palette.accent)
+                        .strong(),
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(if analysis_pending {
+                        "Balancing this revision..."
+                    } else {
+                        "Ready to refine"
+                    })
+                    .color(theme.palette.text)
+                    .strong(),
+                );
+                ui.label(
+                    RichText::new(inset_explanation)
+                        .small()
+                        .color(theme.palette.text_muted),
+                );
+                if !analysis_pending
+                    && ui.small_button("Refresh automatic choices").clicked()
+                    && let Some(event) = self.restart_analysis()
+                {
+                    events.push(event);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [112.0, 34.0],
+                            egui::Button::new(
+                                RichText::new("Apply")
+                                    .strong()
+                                    .color(theme.palette.on_accent),
+                            )
+                            .fill(theme.palette.accent)
+                            .corner_radius(CornerRadius::same(8)),
+                        )
+                        .clicked()
+                    {
+                        self.apply_smart_frame(ui.input(|input| input.time));
+                    }
+                    if ui
+                        .add_sized([92.0, 34.0], egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        self.cancel_smart_frame();
+                    }
+                });
+            });
+    }
+
+    fn starting_points(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.horizontal_wrapped(|ui| {
+                for (label, preset) in [
+                    ("Clean", BeautificationPreset::Clean),
+                    ("Social", BeautificationPreset::Social),
+                    ("Story", BeautificationPreset::Story),
+                    ("Editorial", BeautificationPreset::Editorial),
+                ] {
+                    let candidate = Beautification::preset(preset);
+                    let selected = self.document.beautification() == Some(&candidate);
+                    if pill_button(ui, label, selected, theme).clicked() {
+                        self.begin_with(candidate);
+                    }
+                }
+            });
+        });
+    }
+
+    fn preset_library(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        events: &mut Vec<EditorEvent>,
+        allow_save: bool,
+    ) {
+        ui.add_space(12.0);
+        if self.custom_presets.is_empty() && !allow_save {
+            return;
+        }
+        ui.label(
+            RichText::new("Your presets")
+                .color(theme.palette.text)
+                .strong(),
+        );
+        if self.custom_presets.is_empty() {
+            ui.label(
+                RichText::new("Save the current draft to reuse it on another capture.")
+                    .small()
+                    .color(theme.palette.text_muted),
+            );
+        } else {
+            let selected_name = self
+                .selected_preset
+                .as_deref()
+                .and_then(|id| self.custom_presets.iter().find(|preset| preset.id == id))
+                .map_or("Choose a custom preset", |preset| preset.name.as_str());
+            let presets = self.custom_presets.clone();
+            egui::ComboBox::from_id_salt(("editor.custom-preset", self.id))
+                .selected_text(selected_name)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for preset in presets {
+                        if ui
+                            .selectable_label(
+                                self.selected_preset.as_deref() == Some(preset.id.as_str()),
+                                &preset.name,
+                            )
+                            .clicked()
+                        {
+                            self.selected_preset = Some(preset.id.clone());
+                            self.preset_name = preset.name.clone();
+                            let automatic = matches!(
+                                preset.settings.background,
+                                scrozz_annotate::PresetBackground::Automatic
+                            );
+                            self.begin_with(preset.settings.to_beautification());
+                            if automatic
+                                && let Some(event) = self.request_automatic_background_analysis()
+                            {
+                                events.push(event);
+                            }
+                        }
+                    }
+                });
+        }
+        if !allow_save {
+            return;
+        }
+        ui.add_space(7.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.preset_name)
+                .hint_text("Preset name")
+                .desired_width(ui.available_width()),
+        );
+        let updates_selected = self
+            .selected_preset
+            .as_deref()
+            .and_then(|id| self.custom_presets.iter().find(|preset| preset.id == id))
+            .is_some_and(|preset| preset.name == self.preset_name.trim());
+        let save_label = if updates_selected {
+            "Update preset"
+        } else {
+            "Save new preset"
+        };
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.preset_name.trim().is_empty(),
+                    egui::Button::new(save_label),
+                )
+                .clicked()
+            {
+                match self.build_preset(false) {
+                    Ok(preset) => {
+                        self.upsert_local_preset(preset.clone());
+                        events.push(EditorEvent::UpsertPreset {
+                            id: self.id,
+                            preset,
+                        });
+                    }
+                    Err(error) => self.status = EditorStatus::Failed(error.to_string()),
+                }
+            }
+            if self.selected_preset.is_some() && ui.small_button("Duplicate").clicked() {
+                match self.build_preset(true) {
+                    Ok(preset) => {
+                        self.upsert_local_preset(preset.clone());
+                        events.push(EditorEvent::UpsertPreset {
+                            id: self.id,
+                            preset,
+                        });
+                    }
+                    Err(error) => self.status = EditorStatus::Failed(error.to_string()),
+                }
+            }
+            if let Some(id) = self.selected_preset.clone()
+                && ui.small_button("Delete").clicked()
+            {
+                self.custom_presets.retain(|preset| preset.id != id);
+                self.selected_preset = None;
+                events.push(EditorEvent::DeletePreset {
+                    id: self.id,
+                    preset_id: id,
+                });
+            }
+        });
+    }
+
+    fn build_preset(&mut self, duplicate: bool) -> Result<SmartFramePreset> {
+        let name = if duplicate {
+            format!("{} copy", self.preset_name.trim())
+        } else {
+            self.preset_name.trim().to_owned()
+        };
+        let beauty = self
+            .document
+            .beautification()
+            .ok_or_else(|| Error::InvalidRequest("start a Smart Frame draft first".to_owned()))?;
+        let mut settings = SmartFramePresetSettings::from_beautification(beauty)?;
+        let selected = self
+            .selected_preset
+            .as_deref()
+            .and_then(|id| self.custom_presets.iter().find(|preset| preset.id == id));
+        if let Some(selected) = selected {
+            settings.extensions = selected.settings.extensions.clone();
+        }
+        let existing_id = (!duplicate)
+            .then(|| {
+                selected
+                    .filter(|preset| preset.name == name)
+                    .map(|preset| preset.id.clone())
+            })
+            .flatten();
+        let id = existing_id.unwrap_or_else(|| unique_preset_id(&name, &self.custom_presets));
+        let mut preset = SmartFramePreset::new(id, name, settings)?;
+        if let Some(selected) = selected {
+            preset.extensions = selected.extensions.clone();
+        }
+        Ok(preset)
+    }
+
+    fn upsert_local_preset(&mut self, preset: SmartFramePreset) {
+        self.selected_preset = Some(preset.id.clone());
+        if let Some(existing) = self
+            .custom_presets
+            .iter_mut()
+            .find(|existing| existing.id == preset.id)
+        {
+            *existing = preset;
+        } else {
+            self.custom_presets.push(preset);
+        }
+        self.custom_presets
+            .sort_by_key(|preset| preset.name.to_lowercase());
+        self.status = EditorStatus::Complete("Saved custom Smart Frame preset".to_owned());
+    }
+
+    fn advanced_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        events: &mut Vec<EditorEvent>,
+    ) {
+        let mut config = self.document.beautification().cloned().unwrap_or_default();
+        let before = config.clone();
+        section_rule(ui, theme);
+        section_label(ui, "BACKGROUND", theme);
+        background_controls(
+            ui,
+            &mut config,
+            theme,
+            &mut self.status,
+            self.document.source.frame.color_space,
+        );
+        section_rule(ui, theme);
+        section_label(ui, "CANVAS", theme);
+        measure_slider(ui, "Padding", &mut config.padding, 0.0..=220.0);
+        let mut uniform_inset = config
+            .inset
+            .left
+            .max(config.inset.top)
+            .max(config.inset.right)
+            .max(config.inset.bottom);
+        let inset_response = measure_slider(ui, "Inset", &mut uniform_inset, 0.0..=160.0);
+        if inset_response.changed() {
+            config.inset = SourceInsets::uniform(uniform_inset);
+        }
+        if let Some(metadata) = &config.smart_frame {
+            ui.label(
+                RichText::new(metadata.inset_decision.explanation())
+                    .small()
+                    .color(theme.palette.text_muted),
+            );
+        }
+        ui.add_space(8.0);
+        output_size_row(ui, &mut config, &mut self.status);
+        ui.add_space(8.0);
+        aspect_row(ui, &mut config.aspect);
+        if config.aspect != AspectPreset::Original {
+            config.output_size = None;
+        }
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Alignment")
+                        .color(theme.palette.text)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(if config.auto_balance {
+                        "Auto Balance positions the subject"
+                    } else {
+                        "Choose an anchor in the extra canvas"
+                    })
+                    .small()
+                    .color(theme.palette.text_muted),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                alignment_matrix(ui, &mut config.alignment, theme);
+            });
+        });
+        ui.add_space(10.0);
+        ui.checkbox(&mut config.auto_balance, "Auto Balance")
+            .on_hover_text(
+                "Uses the stored visual focus for stable placement and retains a safe edge inset.",
+            );
+        section_rule(ui, theme);
+        section_label(ui, "SUBJECT", theme);
+        ui.add_enabled_ui(self.document.may_style_subject(), |ui| {
+            measure_slider(ui, "Corners", &mut config.corner_radius, 0.0..=80.0);
+            measure_slider(ui, "Shadow", &mut config.shadow, 0.0..=80.0);
+            measure_slider(ui, "Border", &mut config.border_width, 0.0..=12.0);
+            if config.border_width > 0.0 {
+                color_control(ui, "Border colour", &mut config.border_color);
+            }
+        });
+        if !self.document.may_style_subject() {
+            d9_outer_canvas_note(ui, theme);
+            config.inset = SourceInsets::default();
+            config.corner_radius = 0.0;
+            config.shadow = 0.0;
+            config.border_width = 0.0;
+        }
+        section_rule(ui, theme);
+        section_label(ui, "WATERMARK", theme);
+        let mut enabled = config.watermark.is_some();
+        if ui.checkbox(&mut enabled, "Show watermark").changed() {
+            config.watermark = enabled.then(Watermark::default);
+        }
+        if let Some(watermark) = &mut config.watermark {
+            ui.add(
+                egui::TextEdit::singleline(&mut watermark.text)
+                    .hint_text("Your text")
+                    .desired_width(ui.available_width()),
+            );
+            measure_slider(ui, "Text size", &mut watermark.font_size, 8.0..=36.0);
+            color_control(ui, "Text colour", &mut watermark.color);
+        }
+
+        let automatic_selected = !matches!(before.background, Background::Automatic(_))
+            && matches!(config.background, Background::Automatic(_));
         if beautification_changed(&before, &config) {
-            let beautification = (config != Beautification::default()).then_some(config);
-            match self.document.set_beautification(beautification) {
-                Ok(()) => self.changed(ui.input(|input| input.time)),
+            match self.document.set_beautification(Some(config)) {
+                Ok(()) => {
+                    self.mark_draft_edited();
+                    if automatic_selected
+                        && let Some(event) = self.request_automatic_background_analysis()
+                    {
+                        events.push(event);
+                    }
+                }
                 Err(error) => self.status = EditorStatus::Failed(error.to_string()),
+            }
+        }
+    }
+
+    fn sensitive_suggestions(&self, ui: &mut egui::Ui, theme: &Theme) {
+        section_label(ui, "PRIVACY REVIEW", theme);
+        match &self.sensitive_review {
+            Some(review) if !review.suggestions.is_empty() => {
+                ui.label(
+                    RichText::new(format!(
+                        "{} suggestion{} awaiting review",
+                        review.suggestions.len(),
+                        if review.suggestions.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ))
+                    .color(theme.palette.text),
+                );
+                ui.label(
+                    RichText::new("Smart Frame never redacts suggested regions automatically.")
+                        .small()
+                        .color(theme.palette.text_muted),
+                );
+            }
+            _ => {
+                ui.label(
+                    RichText::new("No reviewed sensitive-region suggestions")
+                        .small()
+                        .color(theme.palette.text_muted),
+                );
             }
         }
     }
@@ -595,8 +1463,22 @@ impl EditorPanel {
         let mut events = Vec::new();
         ui.horizontal(|ui| {
             self.status_label(ui, theme);
+            ui.add_space(10.0);
+            if ui
+                .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo framing"))
+                .clicked()
+            {
+                self.undo_framing(ui.input(|input| input.time));
+            }
+            if ui
+                .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
+                .clicked()
+            {
+                self.redo_framing(ui.input(|input| input.time));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let copy = action_button(ui, "Copy image", true, !self.export_pending, theme);
+                let destinations_enabled = !self.export_pending && self.smart_frame.is_none();
+                let copy = action_button(ui, "Copy image", true, destinations_enabled, theme);
                 if copy.clicked() {
                     if let Some(event) = self.flush_persist() {
                         events.push(event);
@@ -612,7 +1494,7 @@ impl EditorPanel {
                 }
                 ui.add_space(8.0);
                 let save =
-                    action_button(ui, "Save to Pictures", false, !self.export_pending, theme);
+                    action_button(ui, "Save to Pictures", false, destinations_enabled, theme);
                 if save.clicked() {
                     if let Some(event) = self.flush_persist() {
                         events.push(event);
@@ -711,6 +1593,85 @@ impl EditorPanel {
     }
 }
 
+fn smart_frame_intro(ui: &mut egui::Ui, theme: &Theme) {
+    EguiFrame::new()
+        .fill(theme.palette.card_fill)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(14))
+        .stroke(Stroke::new(1.0, theme.palette.hairline))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("SMART FRAME")
+                    .font(FontId::monospace(10.0))
+                    .color(theme.palette.accent)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Balanced framing in one action")
+                    .size(17.0)
+                    .color(theme.palette.text)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Adapts spacing, finish, and a capture-aware background. Auto Balance starts on.",
+                )
+                .small()
+                .color(theme.palette.text_muted),
+            );
+        });
+}
+
+fn smart_frame_button(ui: &mut egui::Ui, label: &str, theme: &Theme) -> Response {
+    ui.add_sized(
+        [ui.available_width(), 44.0],
+        egui::Button::new(
+            RichText::new(label)
+                .size(14.0)
+                .color(theme.palette.on_accent)
+                .strong(),
+        )
+        .fill(theme.palette.accent)
+        .stroke(Stroke::new(1.0, theme.palette.accent))
+        .corner_radius(CornerRadius::same(10)),
+    )
+}
+
+fn unique_preset_id(name: &str, presets: &[SmartFramePreset]) -> String {
+    let base = name
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let base = if base.is_empty() {
+        "smart-frame".to_owned()
+    } else {
+        base
+    };
+    if presets.iter().all(|preset| preset.id != base) {
+        return base;
+    }
+    for suffix in 2..=10_000 {
+        let candidate = format!("{base}-{suffix}");
+        if presets.iter().all(|preset| preset.id != candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", presets.len().saturating_add(2))
+}
+
 fn section_label(ui: &mut egui::Ui, label: &str, theme: &Theme) {
     ui.label(
         RichText::new(label)
@@ -770,7 +1731,21 @@ fn background_controls(
     config: &mut Beautification,
     theme: &Theme,
     status: &mut EditorStatus,
+    source_color_space: ColorSpace,
 ) {
+    if pill_button(
+        ui,
+        "Automatic",
+        matches!(config.background, Background::Automatic(_)),
+        theme,
+    )
+    .on_hover_text("Uses a resolved, contrast-checked palette from this capture.")
+    .clicked()
+    {
+        config.background =
+            Background::Automatic(AutomaticBackground::fallback(source_color_space));
+    }
+    ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         for background in [
             BuiltInBackground::Mist,
@@ -1019,6 +1994,90 @@ fn aspect_row(ui: &mut egui::Ui, aspect: &mut AspectPreset) {
         });
 }
 
+fn output_size_row(ui: &mut egui::Ui, config: &mut Beautification, status: &mut EditorStatus) {
+    const PRESETS: &[(&str, Option<ExactOutputSize>)] = &[
+        ("Flexible canvas", None),
+        (
+            "Square post - 1080 x 1080 (social)",
+            Some(ExactOutputSize::new(1080, 1080)),
+        ),
+        (
+            "Portrait post - 1080 x 1350 (social)",
+            Some(ExactOutputSize::new(1080, 1350)),
+        ),
+        (
+            "Vertical story - 1080 x 1920 (social)",
+            Some(ExactOutputSize::new(1080, 1920)),
+        ),
+        (
+            "Video thumbnail - 1280 x 720",
+            Some(ExactOutputSize::new(1280, 720)),
+        ),
+        (
+            "Wide header - 1500 x 500",
+            Some(ExactOutputSize::new(1500, 500)),
+        ),
+    ];
+    let selected = PRESETS
+        .iter()
+        .find(|(_, size)| *size == config.output_size)
+        .map_or_else(
+            || {
+                config.output_size.map_or_else(
+                    || "Flexible canvas".to_owned(),
+                    |size| format!("Custom - {} x {}", size.width, size.height),
+                )
+            },
+            |(label, _)| (*label).to_owned(),
+        );
+    egui::ComboBox::from_id_salt(("editor.output-size", ui.id()))
+        .selected_text(selected)
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            for (label, size) in PRESETS {
+                if ui
+                    .selectable_label(config.output_size == *size, *label)
+                    .clicked()
+                {
+                    config.output_size = *size;
+                    if size.is_some() {
+                        config.aspect = AspectPreset::Original;
+                    }
+                }
+            }
+        });
+    let mut custom = config
+        .output_size
+        .unwrap_or(ExactOutputSize::new(1080, 1080));
+    ui.horizontal(|ui| {
+        ui.label("Custom");
+        let width = ui.add(
+            egui::DragValue::new(&mut custom.width)
+                .range(1..=16_384)
+                .suffix(" px"),
+        );
+        ui.label("x");
+        let height = ui.add(
+            egui::DragValue::new(&mut custom.height)
+                .range(1..=16_384)
+                .suffix(" px"),
+        );
+        if width.changed() || height.changed() {
+            let candidate = Some(custom);
+            let mut checked = config.clone();
+            checked.output_size = candidate;
+            checked.aspect = AspectPreset::Original;
+            match checked.validate() {
+                Ok(()) => {
+                    config.output_size = candidate;
+                    config.aspect = AspectPreset::Original;
+                }
+                Err(error) => *status = EditorStatus::Failed(error.to_string()),
+            }
+        }
+    });
+}
+
 fn aspect_label(aspect: AspectPreset) -> &'static str {
     match aspect {
         AspectPreset::Original => "Original canvas",
@@ -1083,7 +2142,7 @@ fn measure_slider(
     label: &str,
     value: &mut f64,
     range: std::ops::RangeInclusive<f64>,
-) {
+) -> Response {
     ui.horizontal(|ui| {
         ui.label(label);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1092,9 +2151,11 @@ fn measure_slider(
                     .suffix(" pt")
                     .fixed_decimals(0)
                     .show_value(true),
-            );
-        });
-    });
+            )
+        })
+        .inner
+    })
+    .inner
 }
 
 fn color_control(ui: &mut egui::Ui, label: &str, color: &mut scrozz_annotate::Color) {
@@ -1144,7 +2205,7 @@ fn action_button(
     .inner
 }
 
-fn d9_refusal(ui: &mut egui::Ui, theme: &Theme) {
+fn d9_outer_canvas_note(ui: &mut egui::Ui, theme: &Theme) {
     ui.add_space(8.0);
     EguiFrame::new()
         .fill(danger(theme).gamma_multiply(0.10))
@@ -1153,32 +2214,26 @@ fn d9_refusal(ui: &mut egui::Ui, theme: &Theme) {
         .stroke(Stroke::new(1.0, danger(theme).gamma_multiply(0.7)))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("WINDOW SHAPE LOCKED")
+                RichText::new("NATIVE WINDOW PRESERVED")
                     .font(FontId::monospace(10.0))
                     .color(danger(theme))
                     .strong(),
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new("Beautification is unavailable for window captures.")
+                RichText::new("Only the outer presentation canvas changes.")
                     .color(theme.palette.text)
                     .strong(),
             );
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "The operating system already supplied the window's true corners and shadow. \
-                     Adding another frame would make the capture subtly wrong (decision D9).",
+                    "Inset, corners, shadow, and border stay disabled so the captured window remains \
+                     byte-stable. Background, padding, placement, and output size remain available.",
                 )
                 .color(theme.palette.text_muted),
             );
         });
-    ui.add_space(16.0);
-    ui.label(
-        RichText::new("The source stays unchanged and remains available for export.")
-            .small()
-            .color(theme.palette.text_muted),
-    );
 }
 
 fn danger(theme: &Theme) -> Color32 {
@@ -1203,17 +2258,65 @@ pub struct EditorPreviewScene {
 }
 
 impl EditorPreviewScene {
-    /// Builds the annotated editor fixture.
+    /// Builds the legacy editor fixture with the advanced inspector visible.
     #[must_use]
     pub fn new() -> Self {
+        Self::expanded()
+    }
+
+    /// Editor before Smart Frame is activated.
+    #[must_use]
+    pub fn untouched() -> Self {
+        Self::with_state(EditorPreviewState::Untouched)
+    }
+
+    /// One-click result with progressive controls closed.
+    #[must_use]
+    pub fn one_click() -> Self {
+        Self::with_state(EditorPreviewState::OneClick)
+    }
+
+    /// Smart Frame draft with the complete advanced inspector.
+    #[must_use]
+    pub fn expanded() -> Self {
+        Self::with_state(EditorPreviewState::Expanded)
+    }
+
+    fn with_state(state: EditorPreviewState) -> Self {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            1,
+            "Launch notes - region capture",
+            editor_fixture_document(),
+        ));
+        if state != EditorPreviewState::Untouched {
+            let EditorEvent::AnalyzeSmartFrame {
+                revision,
+                cancellation,
+                ..
+            } = panel.begin_smart_frame()
+            else {
+                unreachable!("Smart Frame always requests analysis");
+            };
+            let result = scrozz_annotate::analyze_smart_frame(
+                &panel.document.source.frame,
+                panel.document.source.provenance,
+                &cancellation,
+            )
+            .map_err(|error| error.to_string());
+            panel.finish_smart_frame_analysis(revision, result);
+            panel.advanced_open = state == EditorPreviewState::Expanded;
+        }
         Self {
-            panel: Mutex::new(EditorPanel::new(EditorRequest::new(
-                1,
-                "Launch notes - region capture",
-                editor_fixture_document(),
-            ))),
+            panel: Mutex::new(panel),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorPreviewState {
+    Untouched,
+    OneClick,
+    Expanded,
 }
 
 impl Default for EditorPreviewScene {
@@ -1298,11 +2401,7 @@ fn editor_fixture_document() -> Document {
             LogicalSize::new(f64::from(WIDTH) / 2.0, f64::from(HEIGHT) / 2.0),
         )),
     };
-    let mut document = Document::new(source);
-    document
-        .set_beautification(Some(Beautification::preset(BeautificationPreset::Social)))
-        .expect("region fixture may be beautified");
-    document
+    Document::new(source)
 }
 
 #[cfg(test)]
@@ -1348,14 +2447,23 @@ mod tests {
     }
 
     #[test]
-    fn window_document_reports_d9_instead_of_becoming_beautifiable() {
-        let document = document(Provenance::Window);
-        assert!(!document.may_beautify());
+    fn window_document_allows_only_an_outer_presentation_canvas() {
+        let mut document = document(Provenance::Window);
+        assert!(document.may_beautify());
+        assert!(!document.may_style_subject());
         assert!(
             document
                 .clone()
                 .set_beautification(Some(Beautification::preset(BeautificationPreset::Clean)))
                 .is_err()
+        );
+        assert!(
+            document
+                .set_beautification(Some(Beautification::padded(
+                    32.0,
+                    Background::Automatic(AutomaticBackground::default())
+                )))
+                .is_ok()
         );
     }
 
@@ -1463,5 +2571,169 @@ mod tests {
             &panel.status,
             EditorStatus::Failed(message) if message == "export failed"
         ));
+    }
+
+    #[test]
+    fn smart_frame_starts_as_an_immediate_default_on_draft() {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            3,
+            "Capture",
+            document(Provenance::Region),
+        ));
+        let before = panel.document.data();
+
+        let EditorEvent::AnalyzeSmartFrame {
+            revision,
+            data,
+            cancellation,
+            ..
+        } = panel.begin_smart_frame()
+        else {
+            panic!("analysis event");
+        };
+
+        assert_eq!(revision, 1);
+        assert!(!cancellation.is_cancelled());
+        assert!(
+            data.beautification.is_none(),
+            "analysis receives no old frame"
+        );
+        let draft = panel.document.beautification().expect("visible draft");
+        assert!(draft.auto_balance, "Smart Frame's main value starts on");
+        assert!(matches!(draft.background, Background::Automatic(_)));
+        assert_eq!(panel.revision, 0, "opening a draft is revision-neutral");
+
+        panel.cancel_smart_frame();
+        assert_eq!(panel.document.data(), before);
+        assert_eq!(panel.revision, 0);
+        assert!(panel.flush_persist().is_none());
+    }
+
+    #[test]
+    fn apply_is_one_undoable_revision_and_cancel_restores_exactly() {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            4,
+            "Capture",
+            document(Provenance::Region),
+        ));
+        let before = panel.document.data();
+        panel.begin_with(Beautification::preset(BeautificationPreset::Social));
+        panel.apply_smart_frame(1.0);
+
+        assert_eq!(panel.revision, 1);
+        assert_eq!(panel.undo.len(), 1);
+        assert!(panel.persist_pending);
+        assert!(panel.document.beautification().is_some());
+
+        panel.undo_framing(2.0);
+        assert_eq!(panel.document.data().beautification, before.beautification);
+        assert_eq!(panel.revision, 2);
+        panel.redo_framing(3.0);
+        assert_eq!(
+            panel.document.beautification(),
+            Some(&Beautification::preset(BeautificationPreset::Social))
+        );
+    }
+
+    #[test]
+    fn a_stale_analysis_never_replaces_a_newer_draft() {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            5,
+            "Capture",
+            document(Provenance::Region),
+        ));
+        let EditorEvent::AnalyzeSmartFrame {
+            revision: stale, ..
+        } = panel.begin_smart_frame()
+        else {
+            panic!("analysis event");
+        };
+        panel.cancel_smart_frame();
+        let EditorEvent::AnalyzeSmartFrame {
+            revision: current, ..
+        } = panel.begin_smart_frame()
+        else {
+            panic!("analysis event");
+        };
+        assert_ne!(stale, current);
+        let expected = panel.document.beautification().cloned();
+        panel.finish_smart_frame_analysis(
+            stale,
+            Ok(SmartFrameAnalysis {
+                beautification: Beautification::preset(BeautificationPreset::Story),
+                inset_explanation: "stale".to_owned(),
+            }),
+        );
+        assert_eq!(panel.document.beautification(), expected.as_ref());
+    }
+
+    #[test]
+    fn a_manual_preset_choice_cancels_the_in_flight_analysis() {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            8,
+            "Capture",
+            document(Provenance::Region),
+        ));
+        let EditorEvent::AnalyzeSmartFrame {
+            revision,
+            cancellation,
+            ..
+        } = panel.begin_smart_frame()
+        else {
+            panic!("analysis event");
+        };
+        panel.begin_with(Beautification::preset(BeautificationPreset::Editorial));
+        assert!(cancellation.is_cancelled());
+
+        panel.finish_smart_frame_analysis(
+            revision,
+            Ok(SmartFrameAnalysis {
+                beautification: Beautification::preset(BeautificationPreset::Story),
+                inset_explanation: "stale".to_owned(),
+            }),
+        );
+        assert_eq!(
+            panel.document.beautification(),
+            Some(&Beautification::preset(BeautificationPreset::Editorial))
+        );
+    }
+
+    #[test]
+    fn window_smart_frame_preserves_the_subject_controls() {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            6,
+            "Window",
+            document(Provenance::Window),
+        ));
+        let _ = panel.begin_smart_frame();
+        let beauty = panel.document.beautification().expect("outer frame");
+        assert!(beauty.padding > 0.0);
+        assert!(beauty.preserves_subject_pixels());
+        assert!(panel.document.may_beautify());
+        assert!(!panel.document.may_style_subject());
+    }
+
+    #[test]
+    fn renaming_a_selected_preset_saves_a_new_preset_instead_of_overwriting() {
+        let mut panel = EditorPanel::new(EditorRequest::new(
+            7,
+            "Capture",
+            document(Provenance::Region),
+        ));
+        panel.begin_with(Beautification::preset(BeautificationPreset::Clean));
+        let original = SmartFramePreset::new(
+            "quiet",
+            "Quiet",
+            SmartFramePresetSettings::from_beautification(panel.document.beautification().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        panel.custom_presets.push(original);
+        panel.selected_preset = Some("quiet".to_owned());
+        panel.preset_name = "Quiet for docs".to_owned();
+
+        let renamed = panel.build_preset(false).unwrap();
+        assert_ne!(renamed.id, "quiet");
+        assert_eq!(renamed.name, "Quiet for docs");
     }
 }

@@ -7,7 +7,8 @@ use common::{
 };
 use scrozz_annotate::{
     Alignment, Annotation, AspectPreset, Background, BackgroundImage, Beautification,
-    BeautificationPreset, Color, Document, Renderer, SkiaRenderer, Style,
+    BeautificationPreset, Color, Document, ExactOutputSize, Renderer, SkiaRenderer, SourceInsets,
+    Style, Watermark,
 };
 use scrozz_core::{ColorSpace, Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
 
@@ -286,15 +287,14 @@ fn a_highlight_leaves_dark_text_readable() {
 }
 
 #[test]
-fn beautification_is_refused_by_the_renderer_for_window_captures() {
-    // Decision D9, enforced a second time. `set_beautification` already refuses,
-    // so reaching this state needs a hand-built sidecar — which is exactly the
-    // route a future importer or a corrupted file would take.
+fn renderer_refuses_window_framing_that_changes_subject_pixels() {
     let data = scrozz_annotate::DocumentData {
-        beautification: Some(Beautification::padded(
-            40.0,
-            Background::Solid(Color::WHITE),
-        )),
+        beautification: Some(Beautification {
+            padding: 40.0,
+            shadow: 4.0,
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }),
         ..Default::default()
     };
 
@@ -304,8 +304,35 @@ fn beautification_is_refused_by_the_renderer_for_window_captures() {
 
     let err = SkiaRenderer::new()
         .render(&doc)
-        .expect_err("a window capture must never be re-framed");
+        .expect_err("a window capture must never be re-shadowed");
     assert!(format!("{err}").to_lowercase().contains("window"), "{err}");
+}
+
+#[test]
+fn window_outer_canvas_preserves_native_pixels_byte_for_byte() {
+    let mut frame = flat(3, 2, [0, 0, 0, 0]);
+    frame.format = PixelFormat::RgbaPremultiplied8;
+    frame.color_space = ColorSpace::DisplayP3;
+    frame.stride = 3 * 4;
+    frame.data = vec![
+        20, 10, 5, 40, 80, 20, 10, 90, 120, 30, 15, 140, 160, 40, 20, 180, 200, 50, 25, 220, 240,
+        60, 30, 255,
+    ];
+    let original = frame.data.clone();
+    let mut doc = Document::new(capture_with(frame, Provenance::Window));
+    doc.set_beautification(Some(Beautification::padded(
+        2.0,
+        Background::Solid(Color::WHITE),
+    )))
+    .unwrap();
+
+    let out = SkiaRenderer.render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (7, 6));
+    for y in 0..2usize {
+        let start = ((y + 2) * 7 + 2) * 4;
+        assert_eq!(&out.data[start..start + 12], &original[y * 12..y * 12 + 12]);
+    }
+    assert_eq!(out.color_space, doc.source.frame.color_space);
 }
 
 #[test]
@@ -593,7 +620,7 @@ fn transparent_background_preserves_alpha_around_rounded_content() {
 }
 
 #[test]
-fn beautification_uses_an_srgb_working_space_without_mutating_the_source() {
+fn beautification_preserves_the_source_profile_without_mutating_the_source() {
     let mut frame = flat(40, 30, [180, 40, 210, 255]);
     frame.color_space = ColorSpace::DisplayP3;
     let mut doc = Document::new(capture_with(frame, Provenance::Region));
@@ -604,9 +631,103 @@ fn beautification_uses_an_srgb_working_space_without_mutating_the_source() {
     .unwrap();
 
     let out = SkiaRenderer::new().render(&doc).unwrap();
-    assert_eq!(out.color_space, ColorSpace::Srgb);
+    assert_eq!(out.color_space, ColorSpace::DisplayP3);
     assert_eq!(doc.source.frame.color_space, ColorSpace::DisplayP3);
     assert_eq!(doc.source.frame.data, source_before);
+}
+
+#[test]
+fn source_space_inset_is_non_destructive_and_scales_with_rendering() {
+    let mut frame = flat(20, 16, [255, 255, 255, 255]);
+    for y in 3..13usize {
+        for x in 4..16usize {
+            let index = y * frame.stride + x * 4;
+            frame.data[index..index + 4].copy_from_slice(&[20, 30, 40, 255]);
+        }
+    }
+    let original = frame.data.clone();
+    let mut doc = Document::new(capture_with(frame, Provenance::Region));
+    doc.set_beautification(Some(Beautification {
+        inset: SourceInsets {
+            left: 4.0,
+            top: 3.0,
+            right: 4.0,
+            bottom: 3.0,
+        },
+        background: Background::Transparent,
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer.render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (12, 10));
+    let first_difference = pixels(&out)
+        .into_iter()
+        .enumerate()
+        .find(|(_, pixel)| !near(*pixel, [20, 30, 40, 255], 1));
+    assert!(
+        first_difference.is_none(),
+        "cropped output differs at {first_difference:?}"
+    );
+    assert_eq!(doc.source.frame.data, original);
+
+    let two = SkiaRenderer.render_at(&doc, ScaleFactor::new(2.0)).unwrap();
+    assert_eq!((two.width(), two.height()), (24, 20));
+}
+
+#[test]
+fn exact_output_size_is_exact_and_preserves_capture_aspect() {
+    let mut doc = document(1600, 900);
+    doc.set_beautification(Some(Beautification {
+        padding: 40.0,
+        output_size: Some(ExactOutputSize::new(1080, 1080)),
+        background: Background::Solid(Color::WHITE),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer.render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (1080, 1080));
+    let preview = SkiaRenderer.render_to_width(&doc, 540).unwrap();
+    assert_eq!((preview.width(), preview.height()), (540, 540));
+}
+
+#[test]
+fn a_window_exact_canvas_that_would_scale_native_pixels_is_refused() {
+    let mut doc = Document::new(window_capture(800, 600));
+    let error = doc
+        .set_beautification(Some(Beautification {
+            padding: 20.0,
+            output_size: Some(ExactOutputSize::new(640, 480)),
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }))
+        .expect_err("D9 forbids shrinking native window pixels");
+    assert!(error.to_string().contains("too small"), "{error}");
+}
+
+#[test]
+fn watermark_is_optional_and_stays_outside_the_subject() {
+    let mut doc = document(120, 60);
+    let source = SkiaRenderer.render(&doc).unwrap();
+    doc.set_beautification(Some(Beautification {
+        padding: 30.0,
+        background: Background::Solid(Color::rgb(28, 32, 44)),
+        watermark: Some(Watermark {
+            text: "Scrozz".to_owned(),
+            ..Watermark::default()
+        }),
+        ..Beautification::default()
+    }))
+    .unwrap();
+    let output = SkiaRenderer.render(&doc).unwrap();
+
+    assert_ne!(output.data, source.data);
+    assert_eq!(
+        pixel(&output, 30, 30),
+        pixel(&source, 0, 0),
+        "watermark must not paint over source pixels"
+    );
 }
 
 #[test]
@@ -627,13 +748,13 @@ fn a_noop_beautification_preserves_the_source_profile() {
 fn an_oversized_total_canvas_is_refused_before_allocation() {
     let content = scrozz_annotate::render::raster::to_pixmap(&flat(1, 1, [0, 0, 0, 255])).unwrap();
     let beauty = Beautification {
-        padding: 10_000.0,
+        padding: 4_000.0,
         background: Background::Solid(Color::WHITE),
         ..Beautification::default()
     };
 
     let error = scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0)
-        .expect_err("a 20,001-square canvas exceeds the raster budget");
+        .expect_err("an 8,001-square canvas exceeds the raster budget");
     assert!(
         error.to_string().contains("pixels"),
         "the refusal should name the actual limit: {error}"
@@ -644,12 +765,25 @@ fn an_oversized_total_canvas_is_refused_before_allocation() {
 fn an_oversized_scaled_render_is_refused_before_output_allocation() {
     let doc = Document::new(capture_with(flat(1, 1, [0, 0, 0, 255]), Provenance::Region));
     let error = SkiaRenderer::new()
-        .render_to_width(&doc, 100_000)
-        .expect_err("a ten-billion-pixel output must be refused");
+        .render_to_width(&doc, 7_000)
+        .expect_err("a 49-million-pixel output must be refused");
     assert!(
         error.to_string().contains("pixels"),
         "the refusal should name the raster limit: {error}"
     );
+}
+
+#[test]
+fn malformed_inset_is_refused_before_sampling_or_allocation() {
+    let content =
+        scrozz_annotate::render::raster::to_pixmap(&flat(20, 20, [0, 0, 0, 255])).unwrap();
+    let beauty = Beautification {
+        inset: SourceInsets::uniform(11.0),
+        ..Beautification::default()
+    };
+    let error = scrozz_annotate::render::beautify::resolve_layout(&content, &beauty, 1.0)
+        .expect_err("22 points of inset cannot fit a 20-pixel source");
+    assert!(error.to_string().contains("entire source"), "{error}");
 }
 
 #[test]
@@ -679,7 +813,7 @@ fn comprehensive_beautification_has_a_stable_golden_fingerprint() {
     assert_eq!((out.width(), out.height()), (107, 107));
     assert_eq!(
         fnv1a64(&out.data),
-        11_378_392_604_669_186_597,
+        135_859_388_595_944_742,
         "update only for an intentional visual change"
     );
 }

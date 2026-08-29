@@ -7,8 +7,9 @@ mod common;
 
 use common::{document, every_annotation, rect, region_capture, window_capture};
 use scrozz_annotate::{
-    Alignment, Annotation, AspectPreset, Background, BackgroundImage, Beautification, Color,
-    Document, DocumentData, RedactStyle, Style,
+    Alignment, Annotation, AspectPreset, AutomaticBackground, Background, BackgroundImage,
+    Beautification, Color, Document, DocumentData, ExactOutputSize, RedactStyle, SourceInsets,
+    Style, Watermark,
 };
 use scrozz_core::{ColorSpace, LogicalPoint};
 
@@ -139,6 +140,7 @@ fn round_trip_preserves_beautification() {
         aspect: AspectPreset::Portrait,
         border_width: 2.5,
         border_color: Color::rgba(255, 255, 255, 170),
+        ..Beautification::default()
     }))
     .expect("region captures may be beautified");
 
@@ -219,7 +221,7 @@ fn legacy_raw_background_pixels_migrate_to_compact_png_storage() {
     let data: DocumentData = serde_json::from_str(json).unwrap();
     let restored = Document::from_data(region_capture(1, 1), data).unwrap();
     let migrated = serde_json::to_string(&restored.data()).unwrap();
-    assert!(migrated.contains("\"version\":2"));
+    assert!(migrated.contains("\"version\":3"));
     assert!(migrated.contains("\"pixels_png\":"));
     assert!(!migrated.contains("\"pixels\":["));
 }
@@ -263,7 +265,7 @@ fn legacy_beautification_without_new_fields_uses_safe_defaults() {
 fn expanded_beautification_writes_a_new_document_version() {
     assert_eq!(
         DocumentData::VERSION,
-        2,
+        3,
         "older builds must reject sidecars containing the expanded framing model"
     );
 }
@@ -313,9 +315,7 @@ fn a_sidecar_from_the_future_is_refused_rather_than_misread() {
 }
 
 #[test]
-fn a_window_sidecar_carrying_beautification_is_refused() {
-    // Decision D9. A document can arrive from disk, so refusing only at the
-    // setter would leave a route in.
+fn a_window_sidecar_may_add_an_outer_canvas_but_not_touch_subject_pixels() {
     let data = DocumentData {
         beautification: Some(Beautification::padded(
             40.0,
@@ -324,32 +324,94 @@ fn a_window_sidecar_carrying_beautification_is_refused() {
         ..DocumentData::default()
     };
 
-    assert!(Document::from_data(window_capture(50, 50), data.clone()).is_err());
+    assert!(Document::from_data(window_capture(50, 50), data.clone()).is_ok());
     assert!(Document::from_data(region_capture(50, 50), data).is_ok());
+
+    let data = DocumentData {
+        beautification: Some(Beautification {
+            padding: 40.0,
+            corner_radius: 1.0,
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }),
+        ..DocumentData::default()
+    };
+    assert!(Document::from_data(window_capture(50, 50), data).is_err());
 }
 
 #[test]
-fn beautification_is_refused_for_window_captures() {
+fn window_beautification_enforces_outer_canvas_only() {
     let mut doc = Document::new(window_capture(100, 100));
-    assert!(!doc.may_beautify());
+    assert!(doc.may_beautify());
+    assert!(!doc.may_style_subject());
 
+    doc.set_beautification(Some(Beautification::padded(
+        32.0,
+        Background::Solid(Color::WHITE),
+    )))
+    .expect("D9 permits an outer presentation canvas");
     let err = doc
-        .set_beautification(Some(Beautification::padded(
-            32.0,
-            Background::Solid(Color::WHITE),
-        )))
-        .expect_err("D9 forbids compositing onto a window capture");
+        .set_beautification(Some(Beautification {
+            padding: 32.0,
+            shadow: 1.0,
+            background: Background::Solid(Color::WHITE),
+            ..Beautification::default()
+        }))
+        .expect_err("D9 forbids re-shadowing a window capture");
     assert!(
         format!("{err}").to_lowercase().contains("window"),
         "the refusal should say why: {err}"
     );
     assert!(
-        doc.beautification().is_none(),
+        doc.beautification().is_some(),
         "the refusal must not half-apply"
     );
 
     // Clearing is always allowed, even for a window.
     assert!(doc.set_beautification(None).is_ok());
+}
+
+#[test]
+fn expanded_smart_frame_fields_and_unknown_values_round_trip() {
+    let mut doc = document(800, 600);
+    let mut automatic = AutomaticBackground::fallback(ColorSpace::DisplayP3);
+    automatic
+        .extensions
+        .insert("future_palette".to_owned(), serde_json::json!("kept"));
+    let mut beauty = Beautification {
+        padding: 44.0,
+        inset: SourceInsets {
+            left: 2.0,
+            top: 3.0,
+            right: 4.0,
+            bottom: 5.0,
+        },
+        background: Background::Automatic(automatic),
+        output_size: Some(ExactOutputSize::new(1080, 1350)),
+        watermark: Some(Watermark {
+            text: "Scrozz".to_owned(),
+            ..Watermark::default()
+        }),
+        ..Beautification::default()
+    };
+    beauty
+        .extensions
+        .insert("future_control".to_owned(), serde_json::json!({"value": 7}));
+    doc.set_beautification(Some(beauty)).unwrap();
+    let mut data = doc.data();
+    data.extensions
+        .insert("future_document".to_owned(), serde_json::json!(true));
+
+    let restored: DocumentData =
+        serde_json::from_str(&serde_json::to_string(&data).unwrap()).unwrap();
+    assert_eq!(restored.extensions["future_document"], true);
+    let beauty = restored.beautification.unwrap();
+    assert_eq!(beauty.output_size, Some(ExactOutputSize::new(1080, 1350)));
+    assert_eq!(beauty.extensions["future_control"]["value"], 7);
+    let Background::Automatic(automatic) = beauty.background else {
+        panic!("automatic background");
+    };
+    assert_eq!(automatic.extensions["future_palette"], "kept");
 }
 
 #[test]

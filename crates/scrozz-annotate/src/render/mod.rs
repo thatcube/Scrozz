@@ -5,13 +5,13 @@ pub mod raster;
 pub mod redact;
 pub mod shapes;
 
-use scrozz_core::{ColorSpace, Error, Frame, PixelFormat, Result, ScaleFactor};
-use scrozz_export::{RgbaImage, convert_to_srgb, to_straight_rgba8};
+use scrozz_core::{ColorSpace, Error, Frame, Result, ScaleFactor};
+use scrozz_export::convert_srgb_color;
 use tiny_skia::{BlendMode, Pixmap, Transform};
 
 use crate::{
     annotation::{Annotation, AnnotationObject, RedactStyle},
-    document::{Beautification, Document, MAX_RASTER_PIXELS},
+    document::{Beautification, Document, MAX_RASTER_EDGE, MAX_RASTER_PIXELS},
     style::Color,
 };
 
@@ -52,8 +52,8 @@ impl SkiaRenderer {
     /// # Errors
     ///
     /// Returns [`Error::InvalidRequest`] if the source frame is malformed, if
-    /// the output would be zero-sized or unallocatable, or if the document
-    /// carries beautification for a window capture — see decision D9.
+    /// the output would be zero-sized or unallocatable, or if window framing
+    /// would change native subject pixels — see decision D9.
     pub fn render_at(&self, document: &Document, scale: ScaleFactor) -> Result<Frame> {
         self.render_at_with_width(document, scale, None)
     }
@@ -64,28 +64,23 @@ impl SkiaRenderer {
         scale: ScaleFactor,
         target_width: Option<u32>,
     ) -> Result<Frame> {
-        // D9, second gate. `Document::set_beautification` refuses this too, but
-        // a document can also arrive from persistence or from a future editing
-        // path, and shipping a re-shadowed window capture must be impossible
-        // rather than merely unlikely.
-        if document.beautification().is_some() && !document.may_beautify() {
+        // D9, second gate. An outer canvas is allowed, but native window pixels
+        // may never be cropped, rounded, bordered, or re-shadowed.
+        if document.source.provenance.forbids_compositing()
+            && document
+                .beautification()
+                .is_some_and(|beautification| !beautification.preserves_subject_pixels())
+        {
             return Err(Error::InvalidRequest(
-                "beautification is not permitted for window captures (decision D9)".to_owned(),
+                "window Smart Frame may add only an outer canvas; native pixels must remain \
+                 untouched (decision D9)"
+                    .to_owned(),
             ));
         }
 
-        let edited = !document.annotations().is_empty()
-            || document
-                .beautification()
-                .is_some_and(|beautification| !beautification.is_noop());
         let logical = document.logical_size();
         let width = checked_render_dimension(logical.width * scale.get(), "width")?;
         let height = checked_render_dimension(logical.height * scale.get(), "height")?;
-        let converts_source = edited
-            && matches!(
-                document.source.frame.color_space,
-                ColorSpace::DisplayP3 | ColorSpace::Rec2020
-            );
         let retained_background_bytes = match document.beautification() {
             Some(beautification) => {
                 beautification.validate()?;
@@ -97,17 +92,11 @@ impl SkiaRenderer {
             &document.source.frame,
             width,
             height,
-            converts_source,
+            false,
             retained_background_bytes,
         )?;
 
-        let converted_source = if converts_source {
-            Some(frame_to_srgb(&document.source.frame)?)
-        } else {
-            None
-        };
-        let source_frame = converted_source.as_ref().unwrap_or(&document.source.frame);
-        let source = raster::to_pixmap(source_frame)?;
+        let source = raster::to_pixmap(&document.source.frame)?;
 
         let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
             Error::InvalidRequest(format!("output size {width}x{height} is not renderable"))
@@ -116,10 +105,9 @@ impl SkiaRenderer {
 
         let xf = Scaled::new(scale.get());
         for object in document.annotations() {
-            draw_object(&mut canvas, object, xf);
+            draw_object(&mut canvas, object, xf, document.source.frame.color_space)?;
         }
         drop(source);
-        drop(converted_source);
 
         let retained_source_bytes =
             u64::try_from(document.source.frame.data.len()).map_err(|_| {
@@ -130,9 +118,14 @@ impl SkiaRenderer {
                 beautify::apply_with_retained_bytes(
                     &canvas,
                     beautification,
-                    scale.get(),
-                    retained_source_bytes,
-                    target_width,
+                    beautify::ApplyOptions {
+                        scale: scale.get(),
+                        source_scale: document.source.frame.scale.get(),
+                        target_color_space: document.source.frame.color_space,
+                        preserve_source_pixels: document.source.provenance.forbids_compositing(),
+                        retained_source_bytes,
+                        target_width,
+                    },
                 )?
             }
             Some(_) | None => canvas,
@@ -146,20 +139,17 @@ impl SkiaRenderer {
             )));
         }
 
-        let color_space = if !edited {
-            document.source.frame.color_space
-        } else if document.source.frame.color_space == ColorSpace::Unknown
+        let color_space = if document.source.frame.color_space == ColorSpace::Unknown
             || document.beautification().is_some_and(|beautification| {
                 matches!(
                     &beautification.background,
                     crate::Background::Image(image)
                         if image.color_space() == ColorSpace::Unknown
                 )
-            })
-        {
+            }) {
             ColorSpace::Unknown
         } else {
-            ColorSpace::Srgb
+            document.source.frame.color_space
         };
 
         Ok(raster::from_pixmap(canvas, color_space, scale))
@@ -199,7 +189,7 @@ impl Renderer for SkiaRenderer {
 }
 
 fn checked_render_dimension(value: f64, name: &str) -> Result<u32> {
-    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(MAX_RASTER_EDGE) {
         return Err(Error::InvalidRequest(format!(
             "rendered {name} {value} is not addressable"
         )));
@@ -264,23 +254,6 @@ fn retained_background_bytes(beautification: &Beautification) -> Result<u64> {
         .ok_or_else(|| Error::InvalidRequest("background working set overflowed".to_owned()))
 }
 
-fn frame_to_srgb(frame: &Frame) -> Result<Frame> {
-    let source = to_straight_rgba8(frame)?;
-    let RgbaImage {
-        width,
-        height,
-        data,
-    } = convert_to_srgb(&source, frame.color_space)?;
-    Ok(Frame {
-        data,
-        size: scrozz_core::PhysicalSize::new(f64::from(width), f64::from(height)),
-        stride: width as usize * PixelFormat::Rgba8.bytes_per_pixel(),
-        format: PixelFormat::Rgba8,
-        color_space: ColorSpace::Srgb,
-        scale: frame.scale,
-    })
-}
-
 /// Draws the source image scaled to fill the canvas.
 fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
     let sx = f64::from(canvas.width()) / f64::from(source.width());
@@ -310,46 +283,63 @@ fn draw_source(canvas: &mut Pixmap, source: &Pixmap) {
 /// Redactions are handled in z-order like everything else, and destroy whatever
 /// has been composited beneath them — including earlier annotations. That is the
 /// stricter reading and the safer one: a redaction always erases what it covers.
-fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
+fn draw_object(
+    canvas: &mut Pixmap,
+    object: &AnnotationObject,
+    xf: Scaled,
+    color_space: ColorSpace,
+) -> Result<()> {
     let opacity = object.style.effective_opacity();
     if opacity <= 0.0 {
-        return;
+        return Ok(());
     }
     let width = xf.length(object.style.effective_stroke_width());
 
     match &object.annotation {
         Annotation::Arrow { from, to } => {
             let Some((shaft, head)) = shapes::arrow(object, *from, *to, xf) else {
-                return;
+                return Ok(());
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(
+                converted_color(object.style.stroke, color_space)?,
+                opacity,
+                BlendMode::SourceOver,
+            );
             shapes::stroke_path(canvas, &shaft, &paint, width);
             shapes::fill_path(canvas, &head, &paint);
         }
         Annotation::Rectangle(rect) => {
             let Some(path) = shapes::rectangle(rect, xf) else {
-                return;
+                return Ok(());
             };
-            fill_then_stroke(canvas, &path, object, opacity, width);
+            fill_then_stroke(canvas, &path, object, opacity, width, color_space)?;
         }
         Annotation::Ellipse(rect) => {
             let Some(path) = shapes::ellipse(rect, xf) else {
-                return;
+                return Ok(());
             };
-            fill_then_stroke(canvas, &path, object, opacity, width);
+            fill_then_stroke(canvas, &path, object, opacity, width, color_space)?;
         }
         Annotation::Freehand(points) => {
             let Some(path) = shapes::freehand(points, xf) else {
-                return;
+                return Ok(());
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(
+                converted_color(object.style.stroke, color_space)?,
+                opacity,
+                BlendMode::SourceOver,
+            );
             shapes::stroke_path(canvas, &path, &paint, width);
         }
         Annotation::Text { at, content } => {
             let Some(path) = shapes::text(content, *at, &object.style, xf) else {
-                return;
+                return Ok(());
             };
-            let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+            let paint = shapes::paint(
+                converted_color(object.style.stroke, color_space)?,
+                opacity,
+                BlendMode::SourceOver,
+            );
             // Type weight is a fraction of cap height, not the shape stroke
             // width: an 18pt label drawn with a 12pt shape stroke is a blob.
             let weight = xf
@@ -359,27 +349,35 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
         }
         Annotation::Counter { at, index } => {
             let Some((disc, label)) = shapes::counter(object, *at, *index, xf) else {
-                return;
+                return Ok(());
             };
-            let fill = object.style.fill.unwrap_or(object.style.stroke);
+            let authored_fill = object.style.fill.unwrap_or(object.style.stroke);
+            let fill = converted_color(authored_fill, color_space)?;
             let disc_paint = shapes::paint(fill, opacity, BlendMode::SourceOver);
             shapes::fill_path(canvas, &disc, &disc_paint);
             if let Some(label) = label {
                 // Pick black or white against the disc so the numeral stays
                 // legible whatever colour the user chose.
-                let ink = shapes::paint(fill.contrasting(), opacity, BlendMode::SourceOver);
+                let ink = shapes::paint(
+                    converted_color(authored_fill.contrasting(), color_space)?,
+                    opacity,
+                    BlendMode::SourceOver,
+                );
                 let weight = xf.length(object.counter_radius() * 0.2).max(1.0);
                 shapes::stroke_path(canvas, &label, &ink, weight);
             }
         }
         Annotation::Highlight(rect) => {
             let Some(path) = shapes::highlight(rect, xf) else {
-                return;
+                return Ok(());
             };
             // Multiply, not source-over: a highlighter darkens what is under it
             // and leaves dark text readable, where a translucent overlay would
             // wash it out towards the highlight colour.
-            let color = object.style.fill.unwrap_or(object.style.stroke);
+            let color = converted_color(
+                object.style.fill.unwrap_or(object.style.stroke),
+                color_space,
+            )?;
             let paint = shapes::paint(color, opacity, BlendMode::Multiply);
             shapes::fill_path(canvas, &path, &paint);
         }
@@ -391,7 +389,7 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
                 xf.length(crate::geom::max_x(area)),
                 xf.length(crate::geom::max_y(area)),
             ) else {
-                return;
+                return Ok(());
             };
             match style {
                 RedactStyle::Blur => redact::blur(canvas, region),
@@ -403,11 +401,12 @@ fn draw_object(canvas: &mut Pixmap, object: &AnnotationObject, xf: Scaled) {
                         .or(Some(object.style.stroke))
                         .filter(|c| !c.is_invisible())
                         .unwrap_or(Color::BLACK);
-                    redact::solid(canvas, region, color);
+                    redact::solid(canvas, region, converted_color(color, color_space)?);
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn fill_then_stroke(
@@ -416,13 +415,28 @@ fn fill_then_stroke(
     object: &AnnotationObject,
     opacity: f32,
     width: f32,
-) {
+    color_space: ColorSpace,
+) -> Result<()> {
     if let Some(fill) = object.style.fill.filter(|c| !c.is_invisible()) {
-        let paint = shapes::paint(fill, opacity, BlendMode::SourceOver);
+        let paint = shapes::paint(
+            converted_color(fill, color_space)?,
+            opacity,
+            BlendMode::SourceOver,
+        );
         shapes::fill_path(canvas, path, &paint);
     }
     if !object.style.stroke.is_invisible() && object.style.stroke_width > 0.0 {
-        let paint = shapes::paint(object.style.stroke, opacity, BlendMode::SourceOver);
+        let paint = shapes::paint(
+            converted_color(object.style.stroke, color_space)?,
+            opacity,
+            BlendMode::SourceOver,
+        );
         shapes::stroke_path(canvas, path, &paint, width);
     }
+    Ok(())
+}
+
+fn converted_color(color: Color, target: ColorSpace) -> Result<Color> {
+    let [r, g, b, a] = convert_srgb_color([color.r, color.g, color.b, color.a], target)?;
+    Ok(Color::rgba(r, g, b, a))
 }
