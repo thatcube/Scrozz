@@ -143,6 +143,22 @@ expected to honor the public protection flag; a picker that deliberately offers
 protected utility chrome may still show its compact bounds but cannot capture
 its contents.
 
+An empty/parked/selector root never transitions directly to visible card mode.
+The host first orders it out, applies the authoritative card geometry for the
+owning display, and waits for two consecutive native viewport observations to
+match position, logical size, and native pixels-per-point. Only then does it
+install non-click-through card input/tracking and order the root in. Eframe may
+paint the incoming card while the native root is still ordered out; either way,
+the first on-screen frame comes from the final framebuffer rather than the
+parked 1×1/1× bootstrap. Card-count changes, display moves/scale changes, and
+returns from selection use the same hidden arming barrier; every empty-to-first
+cycle starts a new barrier. Platforms that do not expose window geometry
+(Wayland) use two hidden event-loop turns, and start at final card geometry
+rather than macOS's 1×1 parked frame. Overlay contexts lock egui zoom to 1× and
+disable keyboard zoom: their geometry already uses native OS points, so a second
+application-level scale would desynchronize viewport commands, hit testing, and
+the readiness barrier.
+
 Window selection has a stricter invocation boundary than the other modes. The
 selector takes a fresh native target snapshot before it sends any event that can
 raise, resize, show or create a Scrozz picker surface. That snapshot is consumed

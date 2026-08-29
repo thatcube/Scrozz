@@ -56,6 +56,17 @@ pub struct BehaviorController {
     cursor_log: Rc<RefCell<Vec<OverlayCursor>>>,
     #[cfg(test)]
     visibility_log: Rc<RefCell<Vec<bool>>>,
+    #[cfg(test)]
+    action_log: Rc<RefCell<Vec<RecordedNativeAction>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RecordedNativeAction {
+    Frame(LogicalRect),
+    Behavior(OverlayBehavior),
+    Cursor(OverlayCursor),
+    Visible(bool),
 }
 
 impl BehaviorController {
@@ -74,6 +85,11 @@ impl BehaviorController {
 
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
+
+        #[cfg(test)]
+        self.action_log
+            .borrow_mut()
+            .push(RecordedNativeAction::Frame(frame));
     }
 
     /// Applies a card or selection behavior when a native adapter is retained.
@@ -93,7 +109,12 @@ impl BehaviorController {
         }
 
         #[cfg(test)]
-        self.behavior_log.borrow_mut().push(*behavior);
+        {
+            self.behavior_log.borrow_mut().push(*behavior);
+            self.action_log
+                .borrow_mut()
+                .push(RecordedNativeAction::Behavior(*behavior));
+        }
 
         if behavior.click_through {
             self.set_cursor(OverlayCursor::Arrow);
@@ -128,7 +149,12 @@ impl BehaviorController {
         }
 
         #[cfg(test)]
-        self.cursor_log.borrow_mut().push(cursor);
+        {
+            self.cursor_log.borrow_mut().push(cursor);
+            self.action_log
+                .borrow_mut()
+                .push(RecordedNativeAction::Cursor(cursor));
+        }
 
         #[cfg(all(not(target_os = "macos"), not(test)))]
         let _ = cursor;
@@ -148,7 +174,12 @@ impl BehaviorController {
         }
 
         #[cfg(test)]
-        self.visibility_log.borrow_mut().push(visible);
+        {
+            self.visibility_log.borrow_mut().push(visible);
+            self.action_log
+                .borrow_mut()
+                .push(RecordedNativeAction::Visible(visible));
+        }
 
         #[cfg(all(not(target_os = "macos"), not(test)))]
         let _ = visible;
@@ -188,6 +219,11 @@ impl BehaviorController {
     #[cfg(test)]
     pub(crate) fn recorded_visibility(&self) -> Vec<bool> {
         self.visibility_log.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_actions(&self) -> Vec<RecordedNativeAction> {
+        self.action_log.borrow().clone()
     }
 }
 
