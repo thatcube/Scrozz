@@ -443,6 +443,18 @@ struct InputWakeMonitor {
 
 impl InputWakeMonitor {
     fn start(waker: Option<SurfaceWaker>) -> std::io::Result<Option<Self>> {
+        Self::start_with_probe(
+            waker,
+            || scrozz_shell::tray::events_pending() || scrozz_shell::hotkey::events_pending(),
+            Duration::from_millis(8),
+        )
+    }
+
+    fn start_with_probe(
+        waker: Option<SurfaceWaker>,
+        pending: impl Fn() -> bool + Send + 'static,
+        interval: Duration,
+    ) -> std::io::Result<Option<Self>> {
         let Some(waker) = waker else {
             return Ok(None);
         };
@@ -452,12 +464,10 @@ impl InputWakeMonitor {
             .name("scrozz-input-wake".into())
             .spawn(move || {
                 while !worker_stop.load(Ordering::Acquire) {
-                    let pending = scrozz_shell::tray::events_pending()
-                        || scrozz_shell::hotkey::events_pending();
-                    if pending {
+                    if pending() {
                         waker();
                     }
-                    std::thread::sleep(Duration::from_millis(8));
+                    std::thread::sleep(interval);
                 }
             })?;
         Ok(Some(Self {
@@ -2783,6 +2793,33 @@ mod tests {
         app.selection_capabilities = SelectionCapabilities::CLIENT_OVERLAY;
         app.capture_backend_ready = true;
         app
+    }
+
+    #[test]
+    fn pending_native_input_wakes_an_idle_window_host() {
+        let pending = Arc::new(AtomicBool::new(true));
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let pending_probe = Arc::clone(&pending);
+        let monitor = InputWakeMonitor::start_with_probe(
+            Some(waker),
+            move || pending_probe.load(Ordering::Acquire),
+            Duration::from_millis(1),
+        )
+        .expect("wake monitor starts")
+        .expect("a waker creates a monitor");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while wakes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pending.store(false, Ordering::Release);
+        drop(monitor);
+
+        assert!(wakes.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 
 /// Headless polling cadence when there is no native event loop to wake.
 const IDLE: Duration = Duration::from_millis(16);
+const IDLE_FALLBACK_WAKE: Duration = Duration::from_millis(250);
 const WORK_AREA_REFRESH: Duration = Duration::from_millis(250);
 
 type SharedGeometry = Arc<Mutex<OverlayGeometry>>;
@@ -999,6 +1000,16 @@ impl eframe::App for Driver {
         if let Some(remaining) = self.app.remaining_deadline() {
             ctx.request_repaint_after(remaining);
         }
+        if matches!(
+            self.root_mode,
+            RootSurfaceMode::Hidden | RootSurfaceMode::Parked
+        ) {
+            // Tray, hotkey, pipeline, and IPC producers all request an immediate
+            // repaint through the overlay handle. This slow wake is the
+            // fail-safe: a platform event source must never leave a hidden
+            // menu-bar app permanently asleep.
+            ctx.request_repaint_after(IDLE_FALLBACK_WAKE);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -1613,6 +1624,21 @@ mod tests {
         assert!(visibility.contains("self.editor.is_open()"));
         assert!(visibility.contains("self.app.permission_prompt().is_some()"));
         assert!(visibility.contains("OverlayBehavior::capture_card()"));
+    }
+
+    #[test]
+    fn hidden_root_retains_a_bounded_event_loop_fallback() {
+        let source = include_str!("host.rs");
+        let logic = source
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .and_then(|driver| driver.split("fn logic(&mut self, ctx:").nth(1))
+            .and_then(|body| body.split_once("fn ui(&mut self, ui:"))
+            .map(|(body, _)| body)
+            .expect("Driver logic pass");
+
+        assert!(logic.contains("IDLE_FALLBACK_WAKE"));
+        assert!(IDLE_FALLBACK_WAKE >= Duration::from_millis(100));
     }
 
     #[test]
