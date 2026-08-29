@@ -44,6 +44,8 @@ const PIXELATE_FRACTION: f32 = 1.0 / 8.0;
 
 /// Never mosaic in blocks smaller than this many pixels.
 const MIN_BLOCK: u32 = 4;
+const SECURE_MIN_BLOCK: u32 = 6;
+const SECURE_MAX_BLOCK: u32 = 64;
 
 /// Clips a region to the pixmap, returning `None` if nothing is left.
 #[must_use]
@@ -123,6 +125,72 @@ pub fn pixelate(pixmap: &mut Pixmap, region: IntRect) {
             }
             bx = block_right;
         }
+        by = block_bottom;
+    }
+}
+
+/// Irreversibly replaces a region with a deterministic randomized mosaic.
+///
+/// Unlike the legacy visual Pixelate variant, this combines every block with
+/// the region mean, quantizes channels, and adds seed-derived noise before
+/// writing opaque replacement pixels. Even the lowest valid intensity therefore
+/// destroys local detail rather than storing a reversible overlay or a faithful
+/// downsample. Higher intensity monotonically grows blocks and increases the
+/// global mixing/quantization.
+pub fn secure_mosaic(pixmap: &mut Pixmap, region: IntRect, intensity: f32, seed: u64) {
+    let intensity = if intensity.is_finite() {
+        intensity.clamp(0.0, 1.0)
+    } else {
+        crate::REDACT_INTENSITY_DEFAULT
+    };
+    let block = secure_block(region, intensity);
+    let width = pixmap.width() as usize;
+    let (left, top) = (region.left(), region.top());
+    let (right, bottom) = (region.right(), region.bottom());
+    let global = average_region(pixmap, region);
+    let global_mix = 0.55 + intensity * 0.35;
+    let quantization = 32 + (intensity * 48.0).round() as i32;
+    let noise = 5 + (intensity * 13.0).round() as i32;
+
+    let mut block_y = 0u64;
+    let mut by = top;
+    while by < bottom {
+        let block_bottom = (by + block as i32).min(bottom);
+        let mut block_x = 0u64;
+        let mut bx = left;
+        while bx < right {
+            let block_right = (bx + block as i32).min(right);
+            let local = average_rect(pixmap, bx, by, block_right, block_bottom);
+            let channel = |index: usize| {
+                let mixed = f32::from(local[index])
+                    .mul_add(1.0 - global_mix, f32::from(global[index]) * global_mix)
+                    .round() as i32;
+                let quantized = ((mixed + quantization / 2) / quantization) * quantization;
+                let hash = mix_seed(
+                    seed ^ block_x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ block_y.wrapping_mul(0xD1B5_4A32_D192_ED03)
+                        ^ (index as u64).wrapping_mul(0x94D0_49BB_1331_11EB),
+                );
+                let span = noise * 2 + 1;
+                let mut offset = (hash % span as u64) as i32 - noise;
+                if offset == 0 {
+                    offset = if hash & 1 == 0 { 1 } else { -1 };
+                }
+                (quantized + offset).clamp(8, 247) as u8
+            };
+            let flat = PremultipliedColorU8::from_rgba(channel(0), channel(1), channel(2), 255)
+                .expect("opaque channels are valid premultiplied colours");
+            let pixels = pixmap.pixels_mut();
+            for y in by..block_bottom {
+                let row = y as usize * width;
+                for x in bx..block_right {
+                    pixels[row + x as usize] = flat;
+                }
+            }
+            block_x += 1;
+            bx = block_right;
+        }
+        block_y += 1;
         by = block_bottom;
     }
 }
@@ -271,6 +339,73 @@ pub fn blur_sigma(region: IntRect) -> f32 {
 pub fn pixelate_block(region: IntRect) -> u32 {
     let shorter = region.width().min(region.height()) as f32;
     ((shorter * PIXELATE_FRACTION).round() as u32).max(MIN_BLOCK)
+}
+
+/// Secure-mosaic block size for `intensity`.
+#[must_use]
+pub fn secure_block(region: IntRect, intensity: f32) -> u32 {
+    let intensity = if intensity.is_finite() {
+        intensity.clamp(0.0, 1.0)
+    } else {
+        crate::REDACT_INTENSITY_DEFAULT
+    };
+    let shorter = region.width().min(region.height()).max(1) as f32;
+    (shorter * (0.10 + intensity * 0.20))
+        .round()
+        .clamp(SECURE_MIN_BLOCK as f32, SECURE_MAX_BLOCK as f32) as u32
+}
+
+fn average_region(pixmap: &Pixmap, region: IntRect) -> [u8; 4] {
+    average_rect(
+        pixmap,
+        region.left(),
+        region.top(),
+        region.right(),
+        region.bottom(),
+    )
+}
+
+fn average_rect(pixmap: &Pixmap, left: i32, top: i32, right: i32, bottom: i32) -> [u8; 4] {
+    let width = pixmap.width() as usize;
+    let mut sum = [0u64; 4];
+    let mut count = 0u64;
+    for y in top..bottom {
+        let row = y as usize * width;
+        for x in left..right {
+            add_straight_pixel(&mut sum, pixmap.pixels()[row + x as usize]);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        [0, 0, 0, 255]
+    } else {
+        let mut average = averaged(sum, count);
+        average[3] = 255;
+        average
+    }
+}
+
+fn add_straight_pixel(sum: &mut [u64; 4], pixel: PremultipliedColorU8) {
+    let alpha = pixel.alpha();
+    let straight = |channel: u8| {
+        if alpha == 0 {
+            128
+        } else {
+            ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+        }
+    };
+    sum[0] += u64::from(straight(pixel.red()));
+    sum[1] += u64::from(straight(pixel.green()));
+    sum[2] += u64::from(straight(pixel.blue()));
+    sum[3] += 255;
+}
+
+fn mix_seed(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn add_pixel(sum: &mut [u64; 4], pixel: PremultipliedColorU8) {

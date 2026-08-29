@@ -114,6 +114,13 @@ pub enum ArrowStyle {
     Double,
 }
 
+/// Lowest persisted secure-redaction intensity.
+pub const REDACT_INTENSITY_MIN: f32 = 0.0;
+/// Highest persisted secure-redaction intensity.
+pub const REDACT_INTENSITY_MAX: f32 = 1.0;
+/// Secure medium-high default for new redactions.
+pub const REDACT_INTENSITY_DEFAULT: f32 = 0.68;
+
 /// How one annotation is drawn.
 ///
 /// All measurements are logical points, matching the coordinates annotations
@@ -138,6 +145,12 @@ pub struct Style {
     /// Signed curve amount relative to arrow length, clamped on use.
     #[serde(default)]
     pub arrow_bend: f64,
+    /// Secure mosaic intensity for new redactions.
+    ///
+    /// `None` marks legacy Blur, Pixelate, and Solid annotations, which keep
+    /// their original renderer for compatibility.
+    #[serde(default)]
+    pub redact_intensity: Option<f32>,
 }
 
 impl Style {
@@ -169,6 +182,12 @@ impl Style {
             stroke_width: 0.0,
             ..Self::default()
         }
+    }
+
+    /// The opaque destructive mosaic used by the user-facing Redact tool.
+    #[must_use]
+    pub fn secure_redaction(intensity: f32) -> Self {
+        Self::redaction().with_redact_intensity(intensity)
     }
 
     /// This style with a different stroke colour.
@@ -220,6 +239,13 @@ impl Style {
         self
     }
 
+    /// This style with a secure redaction intensity.
+    #[must_use]
+    pub fn with_redact_intensity(mut self, intensity: f32) -> Self {
+        self.redact_intensity = Some(clamp_redact_intensity(intensity));
+        self
+    }
+
     /// Stroke width clamped away from zero and non-finite values.
     #[must_use]
     pub fn effective_stroke_width(&self) -> f64 {
@@ -259,6 +285,12 @@ impl Style {
             0.0
         }
     }
+
+    /// Validated secure intensity, or `None` for a legacy redaction.
+    #[must_use]
+    pub fn effective_redact_intensity(&self) -> Option<f32> {
+        self.redact_intensity.map(clamp_redact_intensity)
+    }
 }
 
 impl Default for Style {
@@ -271,6 +303,15 @@ impl Default for Style {
             font_size: 18.0,
             arrow_style: ArrowStyle::Bold,
             arrow_bend: 0.0,
+            redact_intensity: None,
         }
+    }
+}
+
+fn clamp_redact_intensity(intensity: f32) -> f32 {
+    if intensity.is_finite() {
+        intensity.clamp(REDACT_INTENSITY_MIN, REDACT_INTENSITY_MAX)
+    } else {
+        REDACT_INTENSITY_DEFAULT
     }
 }

@@ -295,6 +295,8 @@ pub enum Scenario {
     HistoryEmpty,
     /// The editor's dedicated crop mode with full chrome and controls.
     EditorCrop,
+    /// The single secure Redact tool with its intensity control.
+    EditorRedact,
 }
 
 impl Scenario {
@@ -329,6 +331,7 @@ impl Scenario {
             Self::HistoryDetail,
             Self::HistoryEmpty,
             Self::EditorCrop,
+            Self::EditorRedact,
         ]
     }
 
@@ -366,6 +369,7 @@ impl Scenario {
             Self::HistoryDetail => "history-detail",
             Self::HistoryEmpty => "history-empty",
             Self::EditorCrop => "editor-crop",
+            Self::EditorRedact => "editor-redact",
         }
     }
 
@@ -724,6 +728,7 @@ impl Fixture {
             Scenario::HistoryDetail => 10,
             Scenario::HistoryEmpty => 11,
             Scenario::EditorCrop => 20,
+            Scenario::EditorRedact => 21,
             _ => scenario as u64,
         };
         let seed = DEFAULT_SEED ^ seed_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -894,6 +899,16 @@ impl Fixture {
                     true,
                     "Crop with precision",
                     "The complete source stays visible behind a rule-of-thirds crop with direct edge handles, dimensions, aspect presets, snap, Cancel, and Crop actions.",
+                    instants::REST,
+                    None,
+                ),
+                Scenario::EditorRedact => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Redact irreversibly",
+                    "One privacy tool with continuous Low-to-High intensity. Every level writes an opaque randomized mosaic through the export renderer.",
                     instants::REST,
                     None,
                 ),
@@ -2191,6 +2206,7 @@ impl SceneRegistry {
             Scenario::EditorColorPopover,
             Scenario::EditorArrowStyles,
             Scenario::EditorCrop,
+            Scenario::EditorRedact,
         ] {
             me.register(scenario, Box::new(crate::editor::EditorScene));
         }
@@ -4149,6 +4165,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::SettingsAfterCapture,
         Scenario::EditorArrowStyles,
         Scenario::EditorCrop,
+        Scenario::EditorRedact,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

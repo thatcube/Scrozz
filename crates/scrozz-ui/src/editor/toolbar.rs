@@ -60,6 +60,7 @@ const POPOVER_MAX_HEIGHT: f32 = 560.0;
 
 /// The stroke-width slider's length, in points.
 const STROKE: f32 = 104.0;
+const REDACT_INTENSITY: f32 = 212.0;
 
 /// The width the tool palette occupies, including its trailing gap.
 const TOOLS_W: f32 = Tool::ALL.len() as f32 * (BUTTON + Space::HAIR);
@@ -326,8 +327,7 @@ pub const fn tool_icon(tool: Tool) -> Icon {
         Tool::Pen => Icon::Pencil,
         Tool::Text => Icon::LetterT,
         Tool::Highlight => Icon::Highlight,
-        Tool::Blur => Icon::Droplet,
-        Tool::Pixelate => Icon::GridDots,
+        Tool::Redact => Icon::GridDots,
         Tool::Counter => Icon::ListNumbers,
         Tool::Crop => Icon::Crop,
     }
@@ -395,68 +395,121 @@ pub fn draw(
         x += Space::SM + Space::XS;
     }
 
-    // Colour. One stable-width control; the palette lives in a foreground
-    // popup so opening it cannot move any toolbar or canvas geometry.
-    let color_rect = Rect::from_center_size(
-        pos2(x + COLOR_CONTROL / 2.0, cy),
-        vec2(COLOR_CONTROL, BUTTON),
-    );
-    let color_button = color_control(
-        ui,
-        surface,
-        color_rect,
-        egui::Id::new(COLOR_CONTROL_ID),
-        state.stroke_color(),
-        color_popover.open,
-    );
-    if color_button.clicked() && (!input_blocked || color_popover.open) {
-        if color_popover.open {
-            color_popover.close();
-        } else {
-            color_popover.open();
+    let redact_context = state.tool() == Tool::Redact || state.selection_is_redaction();
+    if redact_context {
+        color_popover.close();
+        arrow_popover.close();
+        let mut intensity = (state.redact_intensity() * 100.0).round();
+        let label_width = 58.0;
+        ui.painter().text(
+            pos2(x, cy - 4.0),
+            egui::Align2::LEFT_CENTER,
+            "Intensity",
+            Text::Label.font(),
+            palette.text,
+        );
+        let rect = Rect::from_min_size(
+            pos2(x + label_width, cy - 16.0),
+            vec2(REDACT_INTENSITY - label_width, 25.0),
+        );
+        let response = ui.put(
+            rect,
+            egui::Slider::new(&mut intensity, 0.0..=100.0)
+                .suffix("%")
+                .step_by(1.0),
+        );
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Slider,
+                true,
+                format!("Intensity: {intensity:.0}%. Low 0%, Medium 50%, High 100%"),
+            )
+        });
+        if response.changed() && !input_blocked {
+            state.set_redact_intensity(intensity / 100.0);
         }
-    }
-    let custom = draw_color_popover(ui, surface, state, color_popover, &color_button);
-    if custom {
-        return Some(Intent::CustomColor);
-    }
-    x += COLOR_CONTROL;
+        for (fraction, align, label) in [
+            (0.0, egui::Align2::LEFT_CENTER, "Low"),
+            (0.5, egui::Align2::CENTER_CENTER, "Medium"),
+            (1.0, egui::Align2::RIGHT_CENTER, "High"),
+        ] {
+            ui.painter().text(
+                pos2(rect.left() + rect.width() * fraction, cy + 13.0),
+                align,
+                label,
+                Text::Caption.font(),
+                palette.text_muted,
+            );
+        }
+        response.on_hover_text(
+            "Redact intensity: Low 0%, Medium 50%, High 100%. Every level is irreversible.",
+        );
+        x += REDACT_INTENSITY + Space::XS;
+    } else {
+        // Colour. One stable-width control; the palette lives in a foreground
+        // popup so opening it cannot move any toolbar or canvas geometry.
+        let color_rect = Rect::from_center_size(
+            pos2(x + COLOR_CONTROL / 2.0, cy),
+            vec2(COLOR_CONTROL, BUTTON),
+        );
+        let color_button = color_control(
+            ui,
+            surface,
+            color_rect,
+            egui::Id::new(COLOR_CONTROL_ID),
+            state.stroke_color(),
+            color_popover.open,
+        );
+        if color_button.clicked() && (!input_blocked || color_popover.open) {
+            if color_popover.open {
+                color_popover.close();
+            } else {
+                color_popover.open();
+            }
+        }
+        let custom = draw_color_popover(ui, surface, state, color_popover, &color_button);
+        if custom {
+            return Some(Intent::CustomColor);
+        }
+        x += COLOR_CONTROL;
 
-    x += Space::XS;
-    divider_v(ui.painter(), x, row_top(cy), row_bottom(cy), palette);
-    x += Space::SM + Space::XS;
+        x += Space::XS;
+        divider_v(ui.painter(), x, row_top(cy), row_bottom(cy), palette);
+        x += Space::SM + Space::XS;
 
-    // Stroke width.
-    let width_rect = Rect::from_center_size(pos2(x + STROKE / 2.0, cy), vec2(STROKE, BUTTON - 4.0));
-    let fraction = width_fraction(state.stroke_width());
-    let response = stroke_width(
-        ui,
-        surface,
-        width_rect,
-        ui.id().with("editor-stroke"),
-        fraction,
-        state.stroke_width(),
-    );
-    if !input_blocked
-        && (response.dragged() || response.clicked())
-        && let Some(pos) = response.interact_pointer_pos()
-    {
-        let inner_l = width_rect.left() + Space::MD;
-        let inner_r = width_rect.right() - Space::MD;
-        let f = ((pos.x - inner_l) / (inner_r - inner_l)).clamp(0.0, 1.0);
-        state.set_stroke_width(width_for_fraction(f));
+        // Stroke width.
+        let width_rect =
+            Rect::from_center_size(pos2(x + STROKE / 2.0, cy), vec2(STROKE, BUTTON - 4.0));
+        let fraction = width_fraction(state.stroke_width());
+        let response = stroke_width(
+            ui,
+            surface,
+            width_rect,
+            ui.id().with("editor-stroke"),
+            fraction,
+            state.stroke_width(),
+        );
+        if !input_blocked
+            && (response.dragged() || response.clicked())
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let inner_l = width_rect.left() + Space::MD;
+            let inner_r = width_rect.right() - Space::MD;
+            let f = ((pos.x - inner_l) / (inner_r - inner_l)).clamp(0.0, 1.0);
+            state.set_stroke_width(width_for_fraction(f));
+        }
+        if !input_blocked
+            && let Some(width) = stroke_keyboard_width(ui, &response, state.stroke_width())
+        {
+            state.set_stroke_width(width);
+        }
+        response.on_hover_text(format!(
+            "{} · {:.0} pt",
+            thickness_name(state.stroke_width()),
+            state.stroke_width()
+        ));
+        x += STROKE + Space::XS;
     }
-    if !input_blocked
-        && let Some(width) = stroke_keyboard_width(ui, &response, state.stroke_width())
-    {
-        state.set_stroke_width(width);
-    }
-    response.on_hover_text(format!(
-        "{} · {:.0} pt",
-        thickness_name(state.stroke_width()),
-        state.stroke_width()
-    ));
-    x += STROKE + Space::XS;
 
     let arrow_context = state.tool() == Tool::Arrow || state.selection_is_arrow();
     if arrow_context {

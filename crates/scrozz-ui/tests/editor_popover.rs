@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used)]
 
-use egui::accesskit::{Action, ActionRequest, Node, NodeId, Toggled, TreeId};
+use egui::accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Toggled, TreeId};
 use egui::{
     Context, Event, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput, Rect, TouchPhase,
     pos2, vec2,
@@ -110,6 +110,15 @@ fn access_action(tree: TreeId, node: NodeId, action: Action) -> Event {
         target_tree: tree,
         target_node: node,
         data: None,
+    })
+}
+
+fn set_numeric(tree: TreeId, node: NodeId, value: f64) -> Event {
+    Event::AccessKitActionRequest(ActionRequest {
+        action: Action::SetValue,
+        target_tree: tree,
+        target_node: node,
+        data: Some(ActionData::NumericValue(value)),
     })
 }
 
@@ -428,6 +437,49 @@ fn crop_panel_exposes_dimensions_aspect_snap_cancel_apply_and_revert() {
     editor.state_mut().set_tool(Tool::Crop);
     let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
     let _ = access_node(&output, |label| label == "Revert to Original");
+}
+
+#[test]
+fn redact_is_the_only_privacy_tool_and_intensity_is_accessible_and_view_only_until_changed() {
+    let mut driver = Driver::new(true, 1.0);
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Redact);
+    let revision = editor.state().revision();
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let update = output.platform_output.accesskit_update.as_ref().unwrap();
+    let labels: Vec<_> = update
+        .nodes
+        .iter()
+        .filter_map(|(_, node)| node.label())
+        .collect();
+    assert!(labels.contains(&"Redact"));
+    assert!(!labels.contains(&"Blur"));
+    assert!(!labels.contains(&"Pixelate"));
+    assert!(!labels.iter().any(|label| label.starts_with("Colour:")));
+    assert!(!labels.contains(&"Stroke width"));
+
+    let (tree, intensity, node) = access_node(&output, |label| label.starts_with("Intensity"));
+    assert_eq!(node.min_numeric_value(), Some(0.0));
+    assert_eq!(node.max_numeric_value(), Some(100.0));
+    assert_eq!(editor.state().revision(), revision);
+
+    let _ = driver.frame(&mut editor, SIZE, vec![set_numeric(tree, intensity, 20.0)]);
+    assert!((editor.state().redact_intensity() - 0.2).abs() < 0.001);
+    assert_eq!(editor.state().revision(), revision);
+
+    editor
+        .state_mut()
+        .pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    editor
+        .state_mut()
+        .pointer_dragged(LogicalPoint::new(100.0, 80.0), false);
+    editor.state_mut().pointer_released();
+    let depth = editor.state().undo_depth();
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let (tree, intensity, _) = access_node(&output, |label| label.starts_with("Intensity"));
+    let _ = driver.frame(&mut editor, SIZE, vec![set_numeric(tree, intensity, 90.0)]);
+    assert!((editor.state().redact_intensity() - 0.9).abs() < 0.001);
+    assert_eq!(editor.state().undo_depth(), depth + 1);
 }
 
 #[test]

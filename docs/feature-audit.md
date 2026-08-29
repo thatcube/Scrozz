@@ -155,14 +155,14 @@ non-destructive. This is the single largest surface area in the product.
 | ANN-04 | Filled rectangle | T0 | |
 | ANN-05 | Ellipse | T0 | |
 | ANN-06 | Line | T0 | |
-| ANN-07 | Pixelate — **with randomization** (anti-unpixelate) | T1 | Randomization is a real security property, not decoration |
-| ANN-08 | Blur — secure + smooth modes | T1 | "Secure" = irreversible, not a reversible gaussian |
+| ANN-07 | Pixelate — **with randomization** (anti-unpixelate) | T1 | Superseded in current UX by the single secure Redact tool; legacy Pixelate remains render-compatible only |
+| ANN-08 | Blur — secure + smooth modes | T1 | Not exposed as privacy UX. Legacy Blur remains render-compatible; any future decorative blur belongs under Effects |
 | ANN-09 | Spotlight (dim everything else) | T1 | |
 | ANN-10 | Counter (numbered step markers) | T1 | Auto-increment, reorderable |
 | ANN-11 | Pencil / freehand — **auto-smoothing** | T1 | Curve fitting, not raw point dump |
 | ANN-12 | Highlighter | T1 | Multiply blend |
 | ANN-13 | Text tool — **7 predefined styles** | T0 | Text layout + editing is deceptively expensive |
-| ANN-14 | **Redact tool** (shortcut `P`) — separate from blur/pixelate, with a strength slider | **T1** | **Not on the features page; found in the live UI.** Maintainer specifically loves this one. Distinct from blur: redaction must be *irreversible by construction* |
+| ANN-14 | **Redact tool** (shortcut `P`) with an intensity slider | **T1** | **Implemented as the only user-facing privacy tool:** continuous Low/Medium/High intensity, secure medium-high default, opaque randomized mosaic at every level |
 
 ### Editor capabilities
 
@@ -403,7 +403,7 @@ Screenshots: `~/.copilot/scrozz-ui-reference/cleanshot/settings/`
 
 | ID | Feature | Tier | Notes |
 |---|---|---|---|
-| NEW-01 | **Redact tool** (`P`) with strength slider | T1 | Separate tool from blur/pixelate — see ANN-14 |
+| NEW-01 | **Redact tool** (`P`) with intensity slider | T1 | **Implemented:** one-tool secure UX; Blur/Pixelate/Solid are legacy model/render variants only |
 | NEW-02 | **Non-destructive crop** with "Revert to Original" | T1 | **Implemented:** draft changes are view-only until one-step Apply; Cancel is a no-op; Revert is undoable |
 | NEW-03 | Crop: snap to edges (⌘ to disable), rotate, flip, numeric W×H, live image size | T2 | Snap override, numeric source-pixel W×H, dimension swap, and live image size are implemented; rotate/flip remain separate work |
 | NEW-04 | **Canvas auto-expand** — canvas grows so annotations placed outside the image still fit | T2 | Genuinely clever; changes how the document model handles bounds |

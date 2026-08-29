@@ -3423,9 +3423,7 @@ mod tests {
             target: CaptureTarget::Region(bounds),
         };
         let mut editor = EditorUi::new(scrozz_annotate::Document::new(capture));
-        editor
-            .state_mut()
-            .set_tool(scrozz_ui::editor::Tool::Pixelate);
+        editor.state_mut().set_tool(scrozz_ui::editor::Tool::Redact);
         editor
             .state_mut()
             .pointer_pressed(LogicalPoint::new(8.0, 8.0));
@@ -3434,6 +3432,12 @@ mod tests {
             .pointer_dragged(LogicalPoint::new(56.0, 56.0), false);
         editor.state_mut().pointer_released();
         assert!(editor.state().revision() > 0);
+        assert_eq!(
+            editor.document().annotations()[0]
+                .style
+                .effective_redact_intensity(),
+            Some(scrozz_annotate::REDACT_INTENSITY_DEFAULT)
+        );
         editor
     }
 
