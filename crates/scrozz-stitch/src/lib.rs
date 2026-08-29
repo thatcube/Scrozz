@@ -15,10 +15,14 @@ pub mod session;
 pub mod stitch;
 
 pub use align::{
-    AlignError, Alignment, AlignmentConfig, AnalysisBand, align_vertical, align_vertical_in,
+    AlignError, Alignment, AlignmentConfig, AnalysisBand, AnalysisSpan, align_axis, align_axis_in,
+    align_horizontal, align_horizontal_in, align_vertical, align_vertical_in,
 };
-pub use chrome::{ChromeBands, ChromeConfig, conservative_chrome, detect_sticky_chrome};
-pub use luma::{LumaPlane, RowProfile};
+pub use chrome::{
+    ChromeBands, ChromeConfig, SideChromeBands, conservative_chrome, conservative_side_chrome,
+    detect_sticky_chrome, detect_sticky_side_chrome,
+};
+pub use luma::{ColumnProfile, LumaPlane, RowProfile};
 pub use session::{
     AtomicCancellation, BackendFrameSource, CancelAction, CancelSignal, CompletionReason,
     FrameSource, NeverCancel, NoopPacer, Pacer, Progress, ScrollSession, ScrollSessionConfig,
@@ -28,7 +32,7 @@ pub use stitch::{
     PushOutcome, ScrollStitcher, SeamQuality, StitchConfig, StitchSummary, StopReason,
 };
 
-/// Assembles overlapping frames into one tall image.
+/// Assembles overlapping frames into one long image.
 pub trait Stitcher {
     /// Adds a frame to the sequence.
     ///

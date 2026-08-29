@@ -12,12 +12,12 @@
 //!
 //! # MIT-SHM
 //!
-//! The shared-memory path is detected and reported but not used. It needs both
-//! `x11rb`'s `shm` feature and a way to call `shmget`/`shmat` or `memfd_create`
-//! — that is, `libc` or `rustix` — and this crate's manifest grants neither.
-//! `GetImage` is used instead, which is correct everywhere and slower on large
-//! captures. [`X11Backend::shm_available`] records what was found so the report
-//! is honest about which path ran.
+//! The shared-memory path is detected and reported but not used. The manifest
+//! enables `x11rb`'s protocol support, but this backend does not yet own the
+//! allocation, mapping and cleanup lifecycle needed to use a shared segment
+//! safely. `GetImage` is correct everywhere and slower on large captures.
+//! [`X11Backend::shm_available`] records what was found so the report is honest
+//! about which path ran.
 
 pub mod ewmh;
 pub mod layout;
@@ -110,6 +110,24 @@ pub struct X11Backend {
     shm_available: bool,
     image_lsb_first: bool,
     name: String,
+}
+
+#[derive(Debug, Clone)]
+struct MonitorDescription {
+    name: String,
+    bounds: PixelRect,
+    is_primary: bool,
+    backing_outputs: Option<Vec<u32>>,
+}
+
+/// One XWayland display plus the RandR output count needed to prove identity.
+#[derive(Debug, Clone)]
+pub(crate) struct DisplaySnapshot {
+    /// Public display facts exposed to callers.
+    pub display: Display,
+    /// Physical RandR output ids backing the monitor, or `None` when RandR 1.5
+    /// was unavailable and the root-screen fallback was used.
+    pub backing_outputs: Option<Vec<u32>>,
 }
 
 impl std::fmt::Debug for X11Backend {
@@ -213,20 +231,21 @@ impl X11Backend {
         (reply.type_ != 0).then_some((reply.type_, reply.value))
     }
 
-    fn monitors(&self) -> Result<Vec<(String, PixelRect, bool)>> {
+    fn monitors(&self) -> Result<Vec<MonitorDescription>> {
         let screen = self.screen()?;
 
         let Some(randr) = self.randr else {
-            return Ok(vec![(
-                "Screen".to_owned(),
-                PixelRect::new(
+            return Ok(vec![MonitorDescription {
+                name: "Screen".to_owned(),
+                bounds: PixelRect::new(
                     0,
                     0,
                     u32::from(screen.width_in_pixels),
                     u32::from(screen.height_in_pixels),
                 ),
-                true,
-            )]);
+                is_primary: true,
+                backing_outputs: None,
+            }]);
         };
 
         let monitors = randr
@@ -234,16 +253,17 @@ impl X11Backend {
             .map_err(|err| Error::Platform(format!("RandR monitor query failed: {err}")))?;
 
         if monitors.is_empty() {
-            return Ok(vec![(
-                "Screen".to_owned(),
-                PixelRect::new(
+            return Ok(vec![MonitorDescription {
+                name: "Screen".to_owned(),
+                bounds: PixelRect::new(
                     0,
                     0,
                     u32::from(screen.width_in_pixels),
                     u32::from(screen.height_in_pixels),
                 ),
-                true,
-            )]);
+                is_primary: true,
+                backing_outputs: None,
+            }]);
         }
 
         let primary = wire::primary_index(&monitors);
@@ -264,11 +284,12 @@ impl X11Backend {
                     .map(|reply| String::from_utf8_lossy(&reply.name).into_owned())
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| format!("Monitor {}", index + 1));
-                (
+                MonitorDescription {
                     name,
-                    PixelRect::new(monitor.x, monitor.y, monitor.width, monitor.height),
-                    primary == Some(index),
-                )
+                    bounds: PixelRect::new(monitor.x, monitor.y, monitor.width, monitor.height),
+                    is_primary: primary == Some(index),
+                    backing_outputs: Some(monitor.outputs.clone()),
+                }
             })
             .collect())
     }
@@ -298,8 +319,34 @@ impl X11Backend {
             .monitors()?
             .into_iter()
             .enumerate()
-            .map(|(index, (name, rect, primary))| {
-                (DisplayId(display_id(index, &name)), rect, primary)
+            .map(|(index, monitor)| {
+                (
+                    DisplayId(display_id(index, &monitor.name)),
+                    monitor.bounds,
+                    monitor.is_primary,
+                )
+            })
+            .collect())
+    }
+
+    /// Reads displays with the physical-output multiplicity Wayland needs for
+    /// fail-closed portal identity checks.
+    pub(crate) fn display_snapshots(&self) -> Result<Vec<DisplaySnapshot>> {
+        let work_area = self.desktop_work_area();
+        Ok(self
+            .monitors()?
+            .into_iter()
+            .enumerate()
+            .map(|(index, monitor)| DisplaySnapshot {
+                display: layout::to_display(
+                    DisplayId(display_id(index, &monitor.name)),
+                    monitor.name,
+                    monitor.bounds,
+                    layout::work_area_for(monitor.bounds, work_area),
+                    self.scale,
+                    monitor.is_primary,
+                ),
+                backing_outputs: monitor.backing_outputs,
             })
             .collect())
     }
@@ -533,22 +580,10 @@ impl X11Backend {
 
 impl TargetEnumerator for X11Backend {
     fn displays(&self) -> Result<Vec<Display>> {
-        let work_area = self.desktop_work_area();
-
         Ok(self
-            .monitors()?
+            .display_snapshots()?
             .into_iter()
-            .enumerate()
-            .map(|(index, (name, bounds, is_primary))| {
-                layout::to_display(
-                    DisplayId(display_id(index, &name)),
-                    name,
-                    bounds,
-                    layout::work_area_for(bounds, work_area),
-                    self.scale,
-                    is_primary,
-                )
-            })
+            .map(|snapshot| snapshot.display)
             .collect())
     }
 
@@ -630,12 +665,12 @@ impl TargetEnumerator for X11Backend {
 impl CaptureBackend for X11Backend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
         if request.cursor == scrozz_core::CursorMode::Visible {
-            // Compositing the pointer needs XFIXES for the cursor image, which
-            // is another feature-gated extension. Failing here would make the
+            // Compositing the pointer needs an XFIXES cursor-image path that this
+            // backend has not implemented. Failing here would make the
             // whole capture unavailable over an optional decoration, so the
             // capture proceeds and the omission is logged.
             tracing::warn!(
-                "cursor capture needs the XFIXES extension, which is not compiled in; \
+                "cursor capture through XFIXES is not implemented yet; \
                  capturing without the pointer"
             );
         }
@@ -651,7 +686,7 @@ impl CaptureBackend for X11Backend {
                 let rects: Vec<PixelRect> = self
                     .monitors()?
                     .into_iter()
-                    .map(|(_, rect, _)| rect)
+                    .map(|monitor| monitor.bounds)
                     .collect();
                 let region = layout::bounding_box(&rects)
                     .ok_or_else(|| Error::Platform("no displays are connected".into()))?;

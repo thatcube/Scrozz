@@ -24,25 +24,34 @@
 
 use std::{
     collections::HashMap,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Mutex,
+        mpsc::{Receiver, RecvTimeoutError, Sender, channel},
+    },
     thread::JoinHandle,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use scrozz_annotate::Document;
-use scrozz_core::{Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError};
+use scrozz_core::{
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, ScrollAxis,
+};
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, SystemClipboard};
 use scrozz_stitch::{AtomicCancellation, CancelAction, Progress};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 
 use crate::{
+    commands::ScrollingTarget,
     fault::{CliError, CliResult},
     gui::{
         action::CaptureKind,
         card::{Card, CardId, THUMBNAIL_MAX_EDGE, Thumbnail},
+        server::Request,
     },
     platform,
 };
+
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
@@ -55,12 +64,35 @@ pub enum Job {
         /// main thread can correlate the answer with the request.
         card: CardId,
     },
+    /// Take and assemble repeated frames along one explicit axis.
+    Scrolling {
+        /// Direction the stitched image grows.
+        axis: ScrollAxis,
+        /// Identity reserved for the resulting card.
+        card: CardId,
+        /// Window identity selected before the HUD and geometry refreshed when
+        /// the user chose an axis.
+        target: Box<ScrollingTarget>,
+        /// One-way cancellation for queued or in-flight frame acquisition.
+        acquisition_cancellation: scrozz_capture::CaptureCancellation,
+    },
     /// Put a card's capture on the clipboard.
     Copy(CardId),
     /// Write a card's capture to the configured folder.
     Save(CardId),
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
+    /// Commit a completed scrolling capture after the HUD accepts it.
+    Accept(CardId),
+    /// Remove a capture that lost a race with an explicit scrolling abort.
+    Discard {
+        /// Session-local card identity.
+        card: CardId,
+        /// History identity, when persistence completed before the abort.
+        capture: Option<CaptureId>,
+    },
+    /// Execute a command forwarded by another process and answer its socket.
+    Forward(Request),
     /// Finish, so the thread can be joined.
     Stop,
 }
@@ -98,6 +130,8 @@ pub enum Outcome {
         /// Why.
         error: CliError,
     },
+    /// A forwarded command finished and its caller has been answered.
+    Forwarded(Option<crate::cli::Command>),
 }
 
 /// A handle to the capture thread.
@@ -105,8 +139,11 @@ pub struct Pipeline {
     jobs: Sender<Job>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
+    worker_done: Receiver<()>,
+    capture_cancellation: scrozz_capture::CaptureCancellation,
     next_card: u64,
-    cancellation: AtomicCancellation,
+    scrolling_cancellation: AtomicCancellation,
+    active_scrolling_acquisition: Mutex<Option<scrozz_capture::CaptureCancellation>>,
 }
 
 impl Pipeline {
@@ -121,12 +158,23 @@ impl Pipeline {
     pub fn start() -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
-        let cancellation = AtomicCancellation::default();
-        let worker_cancellation = cancellation.clone();
+        let (worker_done_tx, worker_done) = channel();
+        let capture_cancellation = scrozz_capture::CaptureCancellation::new();
+        let scrolling_cancellation = AtomicCancellation::default();
+        let worker_capture_cancellation = capture_cancellation.clone();
+        let worker_scrolling_cancellation = scrolling_cancellation.clone();
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx, worker_cancellation).run(&job_rx))
+            .spawn(move || {
+                Worker::new(
+                    outcome_tx,
+                    worker_capture_cancellation,
+                    worker_scrolling_cancellation,
+                )
+                .run(&job_rx);
+                let _ = worker_done_tx.send(());
+            })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -137,8 +185,11 @@ impl Pipeline {
             jobs,
             outcomes,
             worker: Some(worker),
+            worker_done,
+            capture_cancellation,
             next_card: 1,
-            cancellation,
+            scrolling_cancellation,
+            active_scrolling_acquisition: Mutex::new(None),
         })
     }
 
@@ -151,10 +202,63 @@ impl Pipeline {
 
     /// Posts a job. Returns `false` if the worker has gone.
     pub fn post(&self, job: Job) -> bool {
-        if matches!(&job, Job::Capture { .. }) {
-            self.cancellation.reset();
+        match self.jobs.send(job) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::SendError(Job::Forward(request))) => {
+                // Do not leave the forwarding client blocked on an unexplained
+                // EOF if the worker died between accept and enqueue.
+                let cancellation = scrozz_capture::CaptureCancellation::new();
+                cancellation.cancel();
+                let _ = request.serve_with_cancellation(&cancellation);
+                false
+            }
+            Err(std::sync::mpsc::SendError(_)) => false,
         }
-        self.jobs.send(job).is_ok()
+    }
+
+    /// Posts a scrolling job with a token that Abort can cancel even while the
+    /// job is queued or waiting in native frame acquisition.
+    pub fn post_scrolling(
+        &self,
+        axis: ScrollAxis,
+        card: CardId,
+        target: Box<ScrollingTarget>,
+    ) -> bool {
+        self.scrolling_cancellation.reset();
+        let acquisition_cancellation = scrozz_capture::CaptureCancellation::new();
+        *self
+            .active_scrolling_acquisition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(acquisition_cancellation.clone());
+        let posted = self.post(Job::Scrolling {
+            axis,
+            card,
+            target,
+            acquisition_cancellation: acquisition_cancellation.clone(),
+        });
+        if !posted {
+            acquisition_cancellation.cancel();
+            self.active_scrolling_acquisition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        posted
+    }
+
+    /// Ask the active scrolling session to keep its partial image or abort it.
+    pub fn cancel_scrolling(&self, action: CancelAction) {
+        self.scrolling_cancellation.cancel(action);
+        if action == CancelAction::Abort
+            && let Some(cancellation) = self
+                .active_scrolling_acquisition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+        {
+            cancellation.cancel();
+        }
     }
 
     /// Takes one finished piece of work, if there is one. Never blocks.
@@ -162,27 +266,29 @@ impl Pipeline {
         self.outcomes.try_recv().ok()
     }
 
-    /// Stops the worker and waits for it.
+    /// Cancels interactive acquisition, then stops and joins the worker.
     ///
     /// Called from `Drop`, but exposed so a host can shut down deterministically
-    /// rather than at an unspecified point during teardown.
+    /// rather than at an unspecified point during teardown. Cancelling first
+    /// closes an active Wayland ScreenCast session and dismisses its picker.
     pub fn stop(&mut self) {
-        self.cancellation.cancel(CancelAction::Abort);
+        self.capture_cancellation.cancel();
+        self.cancel_scrolling(CancelAction::Abort);
         let _ = self.jobs.send(Job::Stop);
         if let Some(worker) = self.worker.take() {
-            let deadline = Instant::now() + Duration::from_millis(750);
-            while !worker.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if worker.is_finished() {
-                let _ = worker.join();
-            } else {
-                // Portal permission calls are owned by the OS and cannot be
-                // interrupted synchronously. Dropping the handle detaches this
-                // worker so quitting the menu app never waits on that dialog.
-                tracing::warn!(
-                    "capture worker did not stop promptly; detaching it during shutdown"
-                );
+            match self.worker_done.recv_timeout(WORKER_STOP_TIMEOUT) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    if worker.join().is_err() {
+                        tracing::warn!("capture worker panicked during shutdown");
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        timeout_ms = WORKER_STOP_TIMEOUT.as_millis(),
+                        "capture worker did not stop in time; detaching the in-flight operation"
+                    );
+                    drop(worker);
+                }
             }
         }
     }
@@ -203,11 +309,17 @@ struct Worker {
     outcomes: Sender<Outcome>,
     store: Option<SqliteStore>,
     cache: HashMap<CardId, Cached>,
-    cancellation: AtomicCancellation,
+    pending: HashMap<CardId, Capture>,
+    capture_cancellation: scrozz_capture::CaptureCancellation,
+    scrolling_cancellation: AtomicCancellation,
 }
 
 impl Worker {
-    fn new(outcomes: Sender<Outcome>, cancellation: AtomicCancellation) -> Self {
+    fn new(
+        outcomes: Sender<Outcome>,
+        capture_cancellation: scrozz_capture::CaptureCancellation,
+        scrolling_cancellation: AtomicCancellation,
+    ) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
@@ -228,29 +340,87 @@ impl Worker {
             outcomes,
             store,
             cache: HashMap::new(),
-            cancellation,
+            pending: HashMap::new(),
+            capture_cancellation,
+            scrolling_cancellation,
         }
     }
 
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
+            if self.capture_cancellation.is_cancelled() {
+                match job {
+                    // The caller is blocked waiting for a protocol response. Run
+                    // only the cheap parse/response path, which observes the
+                    // already-cancelled token before dispatching any command.
+                    Job::Forward(request) => self.forward(request),
+                    Job::Stop => break,
+                    Job::Capture { .. }
+                    | Job::Scrolling { .. }
+                    | Job::Copy(_)
+                    | Job::Save(_)
+                    | Job::Release(_)
+                    | Job::Accept(_)
+                    | Job::Discard { .. } => {}
+                }
+                continue;
+            }
+
             match job {
-                Job::Capture { kind, card } => self.capture(kind, card),
+                Job::Capture { kind, card } => self.capture(kind, card, None),
+                Job::Scrolling {
+                    axis,
+                    card,
+                    target,
+                    acquisition_cancellation,
+                } => {
+                    self.capture(
+                        CaptureKind::Scrolling,
+                        card,
+                        Some((axis, *target, acquisition_cancellation)),
+                    );
+                }
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
                 Job::Release(card) => {
                     self.cache.remove(&card);
                 }
+                Job::Accept(card) => self.accept(card),
+                Job::Discard { card, capture } => {
+                    if let Err(error) = self.discard(card, capture.as_ref()) {
+                        let _ = self.outcomes.send(Outcome::Refused { card, error });
+                    }
+                }
+                Job::Forward(request) => self.forward(request),
                 Job::Stop => break,
             }
         }
         tracing::debug!("capture worker stopped");
     }
 
-    fn capture(&mut self, kind: CaptureKind, card: CardId) {
-        match self.take(kind, card) {
+    fn capture(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        scrolling: Option<(
+            ScrollAxis,
+            ScrollingTarget,
+            scrozz_capture::CaptureCancellation,
+        )>,
+    ) {
+        match self.take(kind, card, scrolling) {
             Ok(built) => {
-                let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
+                if kind == CaptureKind::Scrolling
+                    && self.scrolling_cancellation.requested() == Some(CancelAction::Abort)
+                {
+                    let error = self
+                        .discard(built.id, built.capture_id.as_ref())
+                        .err()
+                        .unwrap_or(CliError::Core(CoreError::Cancelled));
+                    let _ = self.outcomes.send(Outcome::Failed { card, error });
+                } else {
+                    let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
+                }
             }
             Err(error) => {
                 tracing::warn!(%card, "capture failed: {error}");
@@ -259,16 +429,43 @@ impl Worker {
         }
     }
 
-    fn take(&mut self, kind: CaptureKind, card: CardId) -> CliResult<Card> {
-        // Through `platform`, not `scrozz_capture` directly, so the
-        // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
+    fn forward(&self, request: Request) {
+        let command = request.serve_with_cancellation(&self.capture_cancellation);
+        let _ = self.outcomes.send(Outcome::Forwarded(command));
+    }
+
+    fn take(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        scrolling: Option<(
+            ScrollAxis,
+            ScrollingTarget,
+            scrozz_capture::CaptureCancellation,
+        )>,
+    ) -> CliResult<Card> {
+        if let Some((_, _, cancellation)) = &scrolling {
+            self.fail_if_aborted(kind)?;
+            if cancellation.is_cancelled() {
+                return Err(CliError::Core(CoreError::Cancelled));
+            }
+        }
+        // Through `platform`, not `scrozz_capture` directly, so test builds stay
+        // isolated from the developer's real screen and backend errors keep the
+        // CLI/GUI fault contract.
         let backend = platform::capture_backend()?;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
-            CaptureKind::Fullscreen | CaptureKind::Scrolling => {
-                CaptureTarget::Display(backend.active_display()?.id)
-            }
+            CaptureKind::Fullscreen => CaptureTarget::Display(backend.active_display()?.id),
+            CaptureKind::Scrolling => scrolling
+                .as_ref()
+                .map(|(_, target, _)| target.capture_target())
+                .ok_or_else(|| {
+                    CliError::Core(CoreError::InvalidRequest(
+                        "a scrolling pipeline job must carry its snapshotted target".to_owned(),
+                    ))
+                })?,
             // Choosing a region or a window is the selection overlay's job, and
             // per D8 a missing capability is explained rather than approximated.
             // Silently capturing the whole display instead would be worse than
@@ -289,21 +486,44 @@ impl Worker {
         };
 
         let capture = if kind == CaptureKind::Scrolling {
+            let (axis, target, acquisition_cancellation) = scrolling.ok_or_else(|| {
+                CliError::Core(CoreError::InvalidRequest(
+                    "a scrolling pipeline job must name its axis and target".to_owned(),
+                ))
+            })?;
             let outcomes = self.outcomes.clone();
-            crate::commands::scrolling_capture_with(
-                backend.as_ref(),
-                request,
-                &mut self.cancellation,
+            crate::commands::scrolling_capture_target_with_cancellation(
+                target,
+                axis,
+                &mut self.scrolling_cancellation,
+                &acquisition_cancellation,
                 move |progress| {
                     let _ = outcomes.send(Outcome::Progress { card, progress });
                 },
             )?
         } else {
-            backend.capture(&request)?
+            platform::capture_with_cancellation(&request, &self.capture_cancellation)?
         };
+        self.fail_if_aborted(kind)?;
         let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
+        self.fail_if_aborted(kind)?;
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
-        let capture_id = self.remember(&capture);
+        self.fail_if_aborted(kind)?;
+        let source_width = capture.frame.width();
+        let source_height = capture.frame.height();
+        let scale = capture.frame.scale.get();
+        let capture_id = if kind == CaptureKind::Scrolling {
+            self.pending.insert(card, capture);
+            None
+        } else {
+            self.remember(capture)
+        };
+        if kind == CaptureKind::Scrolling
+            && self.scrolling_cancellation.requested() == Some(CancelAction::Abort)
+        {
+            self.discard(card, capture_id.as_ref())?;
+            return Err(CliError::Core(CoreError::Cancelled));
+        }
 
         self.cache.insert(card, Cached { bytes });
 
@@ -311,9 +531,9 @@ impl Worker {
             id: card,
             capture_id,
             kind,
-            source_width: capture.frame.width(),
-            source_height: capture.frame.height(),
-            scale: capture.frame.scale.get(),
+            source_width,
+            source_height,
+            scale,
             thumbnail,
             // History persistence is internal and does not count as an export.
             // A visible file is created only when the user presses Save; writing
@@ -324,9 +544,9 @@ impl Worker {
     }
 
     /// Persists a capture, or explains in the log why it was not.
-    fn remember(&mut self, capture: &Capture) -> Option<CaptureId> {
+    fn remember(&mut self, capture: Capture) -> Option<CaptureId> {
         let store = self.store.as_mut()?;
-        let document = Document::new(capture.clone());
+        let document = Document::new(capture);
         match store.insert(NewCapture::new(&document)) {
             Ok(id) => Some(id),
             Err(err) => {
@@ -334,6 +554,30 @@ impl Worker {
                 None
             }
         }
+    }
+
+    fn accept(&mut self, card: CardId) {
+        if let Some(capture) = self.pending.remove(&card) {
+            self.remember(capture);
+        }
+    }
+
+    fn fail_if_aborted(&self, kind: CaptureKind) -> CliResult<()> {
+        if kind == CaptureKind::Scrolling
+            && self.scrolling_cancellation.requested() == Some(CancelAction::Abort)
+        {
+            return Err(CliError::Core(CoreError::Cancelled));
+        }
+        Ok(())
+    }
+
+    fn discard(&mut self, card: CardId, capture: Option<&CaptureId>) -> CliResult<()> {
+        self.pending.remove(&card);
+        self.cache.remove(&card);
+        if let (Some(store), Some(capture)) = (self.store.as_mut(), capture) {
+            store.delete(capture)?;
+        }
+        Ok(())
     }
 
     fn copy(&mut self, card: CardId) {
@@ -397,7 +641,13 @@ mod tests {
         // Drop also stops it, so the second call must be a no-op rather than a
         // join on an already-joined handle.
         let mut pipeline = Pipeline::start().expect("the worker should start");
+        assert!(!pipeline.capture_cancellation.is_cancelled());
         pipeline.stop();
+        assert!(pipeline.capture_cancellation.is_cancelled());
+        assert_eq!(
+            pipeline.scrolling_cancellation.requested(),
+            Some(CancelAction::Abort)
+        );
         pipeline.stop();
     }
 
@@ -431,6 +681,20 @@ mod tests {
         let pipeline = Pipeline::start().expect("the worker should start");
         assert!(pipeline.post(Job::Release(CardId(1))));
         assert!(pipeline.post(Job::Release(CardId(1))));
+    }
+
+    #[test]
+    fn abort_cancels_the_active_scrolling_acquisition_token() {
+        let pipeline = Pipeline::start().expect("the worker should start");
+        let acquisition = scrozz_capture::CaptureCancellation::new();
+        *pipeline
+            .active_scrolling_acquisition
+            .lock()
+            .expect("acquisition slot") = Some(acquisition.clone());
+
+        pipeline.cancel_scrolling(CancelAction::Abort);
+
+        assert!(acquisition.is_cancelled());
     }
 
     /// Waits briefly for the worker, so the test does not depend on scheduling.

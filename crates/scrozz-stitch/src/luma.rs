@@ -133,6 +133,12 @@ impl LumaPlane {
     pub const fn matches_width(&self, other: &Self) -> bool {
         self.width == other.width
     }
+
+    /// Whether two planes have identical pixel geometry.
+    #[must_use]
+    pub const fn matches_dimensions(&self, other: &Self) -> bool {
+        self.width == other.width && self.height == other.height
+    }
 }
 
 /// ITU-R BT.601 luma, in integers so the result is identical on every target.
@@ -171,6 +177,129 @@ pub struct RowProfile {
     height: u32,
     /// `height * buckets` mean values, row-major.
     data: Vec<u16>,
+    /// Exact per-bucket sums used to prove lower bounds before full-pixel work.
+    sums: Vec<u64>,
+}
+
+/// A per-column summary used to search horizontal offsets cheaply.
+///
+/// This is the transpose of [`RowProfile`]: each column is reduced to a small
+/// set of row means, then shortlisted offsets are verified against the original
+/// pixels by the aligner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnProfile {
+    buckets: usize,
+    width: u32,
+    /// `width * buckets` mean values, column-major.
+    data: Vec<u16>,
+    /// Exact per-bucket sums used to prove lower bounds before full-pixel work.
+    sums: Vec<u64>,
+}
+
+impl ColumnProfile {
+    /// Summarises every column of `plane` into `buckets` row means.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buckets` is zero.
+    #[must_use]
+    pub fn new(plane: &LumaPlane, buckets: usize) -> Self {
+        Self::new_in(plane, buckets, 0, plane.height())
+    }
+
+    pub(crate) fn new_in(plane: &LumaPlane, buckets: usize, first_row: u32, end_row: u32) -> Self {
+        assert!(buckets > 0, "a column profile needs at least one bucket");
+        assert!(
+            first_row <= end_row && end_row <= plane.height(),
+            "column-profile rows must be within the luma plane"
+        );
+        let selected_height = end_row - first_row;
+        if selected_height == 0 {
+            return Self {
+                buckets: 1,
+                width: plane.width(),
+                data: vec![0; plane.width() as usize],
+                sums: vec![0; plane.width() as usize],
+            };
+        }
+        let buckets = buckets.min(selected_height as usize).max(1);
+        let height = selected_height as usize;
+        let width = plane.width() as usize;
+        let mut sums = vec![0u64; width * buckets];
+        let mut counts = vec![0u32; buckets];
+
+        // Traverse the luma plane in its native row-major order. Walking one
+        // column at a time turns a 5K frame into millions of cache misses.
+        for selected_y in 0..height {
+            let y = first_row as usize + selected_y;
+            let bucket = (((selected_y + 1) * buckets - 1) / height).min(buckets - 1);
+            counts[bucket] += 1;
+            for (x, &value) in plane.row(y as u32).iter().enumerate() {
+                sums[x * buckets + bucket] += u64::from(value);
+            }
+        }
+
+        let mut data = vec![0u16; width * buckets];
+        for x in 0..width {
+            for bucket in 0..buckets {
+                data[x * buckets + bucket] =
+                    (sums[x * buckets + bucket] / u64::from(counts[bucket])) as u16;
+            }
+        }
+
+        Self {
+            buckets,
+            width: plane.width(),
+            data,
+            sums,
+        }
+    }
+
+    /// Number of row buckets per column.
+    #[must_use]
+    pub const fn buckets(&self) -> usize {
+        self.buckets
+    }
+
+    /// Number of columns.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// One column's summary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x` is outside the profile.
+    #[must_use]
+    pub fn column(&self, x: u32) -> &[u16] {
+        let start = x as usize * self.buckets;
+        &self.data[start..start + self.buckets]
+    }
+
+    /// Mean absolute difference between two columns, scaled to 0–255.
+    #[must_use]
+    pub fn column_distance(&self, x: u32, other: &Self, other_x: u32) -> u32 {
+        let a = self.column(x);
+        let b = other.column(other_x);
+        let sum: u32 = a
+            .iter()
+            .zip(b)
+            .map(|(&p, &q)| u32::from(p.abs_diff(q)))
+            .sum();
+        sum / a.len() as u32
+    }
+
+    pub(crate) fn column_pixel_sad_lower_bound(&self, x: u32, other: &Self, other_x: u32) -> u64 {
+        let start = x as usize * self.buckets;
+        let other_start = other_x as usize * other.buckets;
+        self.sums[start..start + self.buckets]
+            .iter()
+            .zip(&other.sums[other_start..other_start + other.buckets])
+            .map(|(&left, &right)| left.abs_diff(right))
+            .sum()
+    }
 }
 
 impl RowProfile {
@@ -181,21 +310,46 @@ impl RowProfile {
     /// Panics if `buckets` is zero.
     #[must_use]
     pub fn new(plane: &LumaPlane, buckets: usize) -> Self {
+        Self::new_in(plane, buckets, 0, plane.width())
+    }
+
+    pub(crate) fn new_in(
+        plane: &LumaPlane,
+        buckets: usize,
+        first_column: u32,
+        end_column: u32,
+    ) -> Self {
         assert!(buckets > 0, "a row profile needs at least one bucket");
-        let buckets = buckets.min(plane.width() as usize).max(1);
-        let width = plane.width() as usize;
+        assert!(
+            first_column <= end_column && end_column <= plane.width(),
+            "row-profile columns must be within the luma plane"
+        );
+        let selected_width = end_column - first_column;
+        if selected_width == 0 {
+            return Self {
+                buckets: 1,
+                height: plane.height(),
+                data: vec![0; plane.height() as usize],
+                sums: vec![0; plane.height() as usize],
+            };
+        }
+        let buckets = buckets.min(selected_width as usize).max(1);
+        let width = selected_width as usize;
         let mut data = vec![0u16; plane.height() as usize * buckets];
+        let mut sums = vec![0u64; plane.height() as usize * buckets];
 
         for y in 0..plane.height() {
-            let row = plane.row(y);
+            let row = &plane.row(y)[first_column as usize..end_column as usize];
             let out = &mut data[y as usize * buckets..(y as usize + 1) * buckets];
+            let row_sums = &mut sums[y as usize * buckets..(y as usize + 1) * buckets];
             for (b, slot) in out.iter_mut().enumerate() {
                 // Integer bucket bounds, so a width that does not divide evenly
                 // still partitions the row exactly once with no gaps.
                 let start = b * width / buckets;
                 let end = ((b + 1) * width / buckets).max(start + 1).min(width);
-                let sum: u32 = row[start..end].iter().map(|&v| u32::from(v)).sum();
-                *slot = (sum / (end - start) as u32) as u16;
+                let sum: u64 = row[start..end].iter().map(|&v| u64::from(v)).sum();
+                row_sums[b] = sum;
+                *slot = (sum / (end - start) as u64) as u16;
             }
         }
 
@@ -203,6 +357,7 @@ impl RowProfile {
             buckets,
             height: plane.height(),
             data,
+            sums,
         }
     }
 
@@ -236,6 +391,16 @@ impl RowProfile {
             .map(|(&p, &q)| u32::from(p.abs_diff(q)))
             .sum();
         sum / a.len() as u32
+    }
+
+    pub(crate) fn row_pixel_sad_lower_bound(&self, y: u32, other: &Self, other_y: u32) -> u64 {
+        let start = y as usize * self.buckets;
+        let other_start = other_y as usize * other.buckets;
+        self.sums[start..start + self.buckets]
+            .iter()
+            .zip(&other.sums[other_start..other_start + other.buckets])
+            .map(|(&left, &right)| left.abs_diff(right))
+            .sum()
     }
 }
 
@@ -368,5 +533,34 @@ mod tests {
         let plane = LumaPlane::from_raw(4, 2, vec![1, 2, 3, 4, 1, 2, 3, 4]);
         let profile = RowProfile::new(&plane, 4);
         assert_eq!(profile.row_distance(0, &profile, 1), 0);
+    }
+
+    #[test]
+    fn column_buckets_partition_the_column_exactly_once() {
+        let plane = LumaPlane::from_raw(
+            2,
+            5,
+            vec![
+                0, 5, //
+                20, 5, //
+                40, 5, //
+                60, 5, //
+                80, 5,
+            ],
+        );
+        let profile = ColumnProfile::new(&plane, 2);
+        assert_eq!(profile.buckets(), 2);
+        assert_eq!(profile.width(), 2);
+        assert_eq!(profile.column(0), [10, 60]);
+        assert_eq!(profile.column_distance(1, &profile, 1), 0);
+    }
+
+    #[test]
+    fn profiles_tolerate_an_empty_perpendicular_axis() {
+        let no_columns = LumaPlane::from_raw(0, 3, Vec::new());
+        let no_rows = LumaPlane::from_raw(3, 0, Vec::new());
+
+        assert_eq!(RowProfile::new(&no_columns, 4).row(1), [0]);
+        assert_eq!(ColumnProfile::new(&no_rows, 4).column(1), [0]);
     }
 }

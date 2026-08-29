@@ -1,11 +1,17 @@
-//! Detection of fixed headers and footers.
+//! Detection of fixed chrome at the leading and trailing scroll edges.
 //!
-//! Fixed chrome has a stronger definition than "these rows look alike". It must
-//! match at the same screen coordinates and fail to match at the measured scroll
-//! displacement. That second condition is what prevents a blank page margin from
-//! being mistaken for a sticky toolbar.
+//! Fixed chrome has a stronger definition than "these rows or columns look
+//! alike". First its whole edge run must match at the same screen coordinates;
+//! then pixels beyond that run must demonstrate the measured displacement. The
+//! boundary-level proof matters because a solid toolbar can also match itself
+//! when sampled at the displacement.
 
-use crate::{align::AnalysisBand, luma::LumaPlane};
+use scrozz_core::ScrollAxis;
+
+use crate::{
+    align::{AnalysisBand, AnalysisSpan},
+    luma::LumaPlane,
+};
 
 /// Sticky rows excluded from the scrolling content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,16 +33,72 @@ impl ChromeBands {
     }
 }
 
+/// Sticky columns excluded from horizontally scrolling content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SideChromeBands {
+    /// Fixed columns at the left.
+    pub left: u32,
+    /// Fixed columns at the right.
+    pub right: u32,
+}
+
+impl SideChromeBands {
+    /// The moving content between the two fixed side bands.
+    #[must_use]
+    pub fn content_span(self, width: u32) -> AnalysisSpan {
+        AnalysisSpan {
+            start: self.left.min(width),
+            end: width.saturating_sub(self.right).max(self.left.min(width)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AxisChromeBands {
+    pub(crate) leading: u32,
+    pub(crate) trailing: u32,
+}
+
+impl AxisChromeBands {
+    pub(crate) fn content_span(self, extent: u32) -> AnalysisSpan {
+        AnalysisSpan {
+            start: self.leading.min(extent),
+            end: extent
+                .saturating_sub(self.trailing)
+                .max(self.leading.min(extent)),
+        }
+    }
+}
+
+impl From<ChromeBands> for AxisChromeBands {
+    fn from(value: ChromeBands) -> Self {
+        Self {
+            leading: value.top,
+            trailing: value.bottom,
+        }
+    }
+}
+
+impl From<SideChromeBands> for AxisChromeBands {
+    fn from(value: SideChromeBands) -> Self {
+        Self {
+            leading: value.left,
+            trailing: value.right,
+        }
+    }
+}
+
 /// Thresholds for sticky-chrome detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromeConfig {
     /// Same-coordinate mean error still considered a match.
     pub zero_match_max: u32,
-    /// Shifted mean error required to prove the band did not move.
+    /// Same-coordinate error required in moving content that does match when
+    /// shifted by the measured displacement.
     pub shifted_mismatch_min: u32,
     /// Ignore thinner runs; one matching separator line is not chrome.
     pub min_band: u32,
-    /// Maximum combined chrome height as a percentage of the frame.
+    /// Maximum combined chrome extent as a percentage of the scroll axis.
     pub max_height_percent: u32,
 }
 
@@ -59,22 +121,38 @@ pub fn detect_sticky_chrome(
     measured_delta: u32,
     config: &ChromeConfig,
 ) -> ChromeBands {
-    if measured_delta == 0
-        || !previous.matches_width(current)
-        || previous.height() != current.height()
-    {
-        return ChromeBands::default();
+    let bands = detect_sticky_axis_chrome(
+        previous,
+        current,
+        ScrollAxis::Vertical,
+        measured_delta,
+        config,
+    );
+    ChromeBands {
+        top: bands.leading,
+        bottom: bands.trailing,
     }
+}
 
-    let height = previous.height();
-    let cap = (u64::from(height) * u64::from(config.max_height_percent.min(100)) / 100) as u32;
-    if cap < config.min_band {
-        return ChromeBands::default();
+/// Detects fixed left and right bands in one horizontally aligned frame pair.
+#[must_use]
+pub fn detect_sticky_side_chrome(
+    previous: &LumaPlane,
+    current: &LumaPlane,
+    measured_delta: u32,
+    config: &ChromeConfig,
+) -> SideChromeBands {
+    let bands = detect_sticky_axis_chrome(
+        previous,
+        current,
+        ScrollAxis::Horizontal,
+        measured_delta,
+        config,
+    );
+    SideChromeBands {
+        left: bands.leading,
+        right: bands.trailing,
     }
-
-    let top = detect_prefix(previous, current, measured_delta, cap, config);
-    let bottom = detect_suffix(previous, current, measured_delta, cap, config);
-    cap_combined(ChromeBands { top, bottom }, cap)
 }
 
 /// Takes the conservative minimum seen across every adjacent frame pair.
@@ -86,58 +164,271 @@ pub fn conservative_chrome<I>(pairs: I, height: u32, config: &ChromeConfig) -> C
 where
     I: IntoIterator<Item = ChromeBands>,
 {
+    let bands =
+        conservative_axis_chrome(pairs.into_iter().map(AxisChromeBands::from), height, config);
+    ChromeBands {
+        top: bands.leading,
+        bottom: bands.trailing,
+    }
+}
+
+/// Takes the conservative side-band minimum seen across adjacent frame pairs.
+#[must_use]
+pub fn conservative_side_chrome<I>(pairs: I, width: u32, config: &ChromeConfig) -> SideChromeBands
+where
+    I: IntoIterator<Item = SideChromeBands>,
+{
+    let bands =
+        conservative_axis_chrome(pairs.into_iter().map(AxisChromeBands::from), width, config);
+    SideChromeBands {
+        left: bands.leading,
+        right: bands.trailing,
+    }
+}
+
+pub(crate) fn detect_sticky_axis_chrome(
+    previous: &LumaPlane,
+    current: &LumaPlane,
+    axis: ScrollAxis,
+    delta: u32,
+    config: &ChromeConfig,
+) -> AxisChromeBands {
+    let perpendicular_extent = match axis {
+        ScrollAxis::Vertical => previous.width(),
+        ScrollAxis::Horizontal => previous.height(),
+    };
+    detect_sticky_axis_chrome_in(
+        previous,
+        current,
+        axis,
+        delta,
+        AnalysisSpan::full(perpendicular_extent),
+        config,
+    )
+}
+
+pub(crate) fn detect_sticky_axis_chrome_in(
+    previous: &LumaPlane,
+    current: &LumaPlane,
+    axis: ScrollAxis,
+    delta: u32,
+    perpendicular: AnalysisSpan,
+    config: &ChromeConfig,
+) -> AxisChromeBands {
+    if delta == 0 || !previous.matches_dimensions(current) {
+        return AxisChromeBands::default();
+    }
+    let perpendicular_extent = match axis {
+        ScrollAxis::Vertical => previous.width(),
+        ScrollAxis::Horizontal => previous.height(),
+    };
+    if perpendicular.is_empty() || perpendicular.end > perpendicular_extent {
+        return AxisChromeBands::default();
+    }
+
+    let extent = axis_extent(previous, axis);
+    let cap = (u64::from(extent) * u64::from(config.max_height_percent.min(100)) / 100) as u32;
+    if cap < config.min_band {
+        return AxisChromeBands::default();
+    }
+
+    cap_combined(
+        AxisChromeBands {
+            leading: detect_prefix(previous, current, axis, delta, perpendicular, cap, config),
+            trailing: detect_suffix(previous, current, axis, delta, perpendicular, cap, config),
+        },
+        cap,
+        config.min_band,
+    )
+}
+
+pub(crate) fn conservative_axis_chrome<I>(
+    pairs: I,
+    extent: u32,
+    config: &ChromeConfig,
+) -> AxisChromeBands
+where
+    I: IntoIterator<Item = AxisChromeBands>,
+{
     let mut pairs = pairs.into_iter();
     let Some(first) = pairs.next() else {
-        return ChromeBands::default();
+        return AxisChromeBands::default();
     };
-    let mut result = pairs.fold(first, |current, next| ChromeBands {
-        top: current.top.min(next.top),
-        bottom: current.bottom.min(next.bottom),
+    let result = pairs.fold(first, |current, next| AxisChromeBands {
+        leading: current.leading.min(next.leading),
+        trailing: current.trailing.min(next.trailing),
     });
-    let cap = (u64::from(height) * u64::from(config.max_height_percent.min(100)) / 100) as u32;
-    result = cap_combined(result, cap);
-    result
+    let cap = (u64::from(extent) * u64::from(config.max_height_percent.min(100)) / 100) as u32;
+    cap_combined(result, cap, config.min_band)
 }
 
 fn detect_prefix(
     previous: &LumaPlane,
     current: &LumaPlane,
+    axis: ScrollAxis,
     delta: u32,
+    perpendicular: AnalysisSpan,
     cap: u32,
     config: &ChromeConfig,
 ) -> u32 {
-    let max = cap.min(previous.height().saturating_sub(delta));
-    let mut best = 0;
-    for rows in config.min_band..=max {
-        let zero = rectangular_sad(previous, 0, current, 0, rows);
-        let shifted = rectangular_sad(previous, delta, current, 0, rows);
-        if zero <= config.zero_match_max && shifted >= config.shifted_mismatch_min {
-            best = rows;
-        }
+    let extent = axis_extent(previous, axis);
+    let length = (0..cap)
+        .take_while(|&position| {
+            rectangular_sad(
+                previous,
+                position,
+                current,
+                position,
+                1,
+                axis,
+                perpendicular,
+            ) <= config.zero_match_max
+                && shifted_axis_line_sad(previous, current, axis, position, delta, perpendicular)
+                    .is_some_and(|shifted| shifted >= config.shifted_mismatch_min)
+        })
+        .count() as u32;
+    if length >= config.min_band
+        && has_shifted_content_evidence(
+            previous,
+            current,
+            axis,
+            delta,
+            perpendicular,
+            AnalysisSpan {
+                start: length,
+                end: extent,
+            },
+            config,
+        )
+    {
+        length
+    } else {
+        0
     }
-    best
 }
 
 fn detect_suffix(
     previous: &LumaPlane,
     current: &LumaPlane,
+    axis: ScrollAxis,
     delta: u32,
+    perpendicular: AnalysisSpan,
     cap: u32,
     config: &ChromeConfig,
 ) -> u32 {
-    let height = previous.height();
-    let max = cap.min(height.saturating_sub(delta));
-    let mut best = 0;
-    for rows in config.min_band..=max {
-        let start = height - rows;
-        let zero = rectangular_sad(previous, start, current, start, rows);
-        let shifted = rectangular_sad(previous, start, current, start - delta.min(start), rows);
-        if start >= delta && zero <= config.zero_match_max && shifted >= config.shifted_mismatch_min
-        {
-            best = rows;
+    let extent = axis_extent(previous, axis);
+    let length = (0..cap)
+        .take_while(|&offset| {
+            let position = extent - 1 - offset;
+            rectangular_sad(
+                previous,
+                position,
+                current,
+                position,
+                1,
+                axis,
+                perpendicular,
+            ) <= config.zero_match_max
+                && shifted_axis_line_sad(previous, current, axis, position, delta, perpendicular)
+                    .is_some_and(|shifted| shifted >= config.shifted_mismatch_min)
+        })
+        .count() as u32;
+    if length >= config.min_band
+        && has_shifted_content_evidence(
+            previous,
+            current,
+            axis,
+            delta,
+            perpendicular,
+            AnalysisSpan {
+                start: 0,
+                end: extent.saturating_sub(length),
+            },
+            config,
+        )
+    {
+        length
+    } else {
+        0
+    }
+}
+
+fn shifted_axis_line_sad(
+    previous: &LumaPlane,
+    current: &LumaPlane,
+    axis: ScrollAxis,
+    position: u32,
+    delta: u32,
+    perpendicular: AnalysisSpan,
+) -> Option<u32> {
+    let extent = axis_extent(previous, axis);
+    if position.saturating_add(delta) < extent {
+        Some(rectangular_sad(
+            previous,
+            position + delta,
+            current,
+            position,
+            1,
+            axis,
+            perpendicular,
+        ))
+    } else if position >= delta {
+        Some(rectangular_sad(
+            previous,
+            position,
+            current,
+            position - delta,
+            1,
+            axis,
+            perpendicular,
+        ))
+    } else {
+        None
+    }
+}
+
+fn has_shifted_content_evidence(
+    previous: &LumaPlane,
+    current: &LumaPlane,
+    axis: ScrollAxis,
+    delta: u32,
+    perpendicular: AnalysisSpan,
+    content: AnalysisSpan,
+    config: &ChromeConfig,
+) -> bool {
+    let end = content
+        .end
+        .min(axis_extent(previous, axis).saturating_sub(delta));
+    let mut run = 0;
+    for position in content.start..end {
+        let zero = rectangular_sad(
+            previous,
+            position,
+            current,
+            position,
+            1,
+            axis,
+            perpendicular,
+        );
+        let shifted = rectangular_sad(
+            previous,
+            position + delta,
+            current,
+            position,
+            1,
+            axis,
+            perpendicular,
+        );
+        if shifted <= config.zero_match_max && zero >= config.shifted_mismatch_min {
+            run += 1;
+            if run >= config.min_band {
+                return true;
+            }
+        } else {
+            run = 0;
         }
     }
-    best
+    false
 }
 
 fn rectangular_sad(
@@ -145,39 +436,74 @@ fn rectangular_sad(
     first_y: u32,
     second: &LumaPlane,
     second_y: u32,
-    rows: u32,
+    length: u32,
+    axis: ScrollAxis,
+    perpendicular: AnalysisSpan,
 ) -> u32 {
     let mut sum = 0u64;
     let mut count = 0u64;
-    for row in 0..rows {
-        for (&left, &right) in first
-            .row(first_y + row)
-            .iter()
-            .zip(second.row(second_y + row))
-        {
-            sum += u64::from(left.abs_diff(right));
-            count += 1;
+    match axis {
+        ScrollAxis::Vertical => {
+            for row in 0..length {
+                let first = &first.row(first_y + row)
+                    [perpendicular.start as usize..perpendicular.end as usize];
+                let second = &second.row(second_y + row)
+                    [perpendicular.start as usize..perpendicular.end as usize];
+                for (&left, &right) in first.iter().zip(second) {
+                    sum += u64::from(left.abs_diff(right));
+                    count += 1;
+                }
+            }
+        }
+        ScrollAxis::Horizontal => {
+            let first_start = first_y as usize;
+            let second_start = second_y as usize;
+            let length = length as usize;
+            for row in perpendicular.start..perpendicular.end {
+                let first = &first.row(row)[first_start..first_start + length];
+                let second = &second.row(row)[second_start..second_start + length];
+                for (&left, &right) in first.iter().zip(second) {
+                    sum += u64::from(left.abs_diff(right));
+                    count += 1;
+                }
+            }
         }
     }
     (sum / count.max(1)) as u32
 }
 
-fn cap_combined(mut bands: ChromeBands, cap: u32) -> ChromeBands {
-    let excess = bands.top.saturating_add(bands.bottom).saturating_sub(cap);
+fn cap_combined(mut bands: AxisChromeBands, cap: u32, min_band: u32) -> AxisChromeBands {
+    let excess = bands
+        .leading
+        .saturating_add(bands.trailing)
+        .saturating_sub(cap);
     if excess == 0 {
         return bands;
     }
 
-    if bands.top >= bands.bottom {
-        let from_top = excess.min(bands.top);
-        bands.top -= from_top;
-        bands.bottom = bands.bottom.saturating_sub(excess - from_top);
+    if bands.leading >= bands.trailing {
+        let from_leading = excess.min(bands.leading);
+        bands.leading -= from_leading;
+        bands.trailing = bands.trailing.saturating_sub(excess - from_leading);
     } else {
-        let from_bottom = excess.min(bands.bottom);
-        bands.bottom -= from_bottom;
-        bands.top = bands.top.saturating_sub(excess - from_bottom);
+        let from_trailing = excess.min(bands.trailing);
+        bands.trailing -= from_trailing;
+        bands.leading = bands.leading.saturating_sub(excess - from_trailing);
+    }
+    if bands.leading < min_band {
+        bands.leading = 0;
+    }
+    if bands.trailing < min_band {
+        bands.trailing = 0;
     }
     bands
+}
+
+const fn axis_extent(plane: &LumaPlane, axis: ScrollAxis) -> u32 {
+    match axis {
+        ScrollAxis::Vertical => plane.height(),
+        ScrollAxis::Horizontal => plane.width(),
+    }
 }
 
 #[cfg(test)]
@@ -211,11 +537,28 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_band_that_matches_both_offsets_is_not_sticky() {
+    fn a_flat_band_that_also_matches_at_the_measured_delta_is_not_cropped() {
         let first = plane(&[10, 10, 10, 10, 60, 80, 100, 120, 140, 160], 8);
         let second = plane(&[10, 10, 60, 80, 100, 120, 140, 160, 180, 200], 8);
         let chrome = detect_sticky_chrome(&first, &second, 2, &config());
         assert_eq!(chrome.top, 0);
+    }
+
+    #[test]
+    fn moving_rows_cannot_be_diluted_into_a_fixed_header() {
+        let first = plane(&[10, 20, 30, 40, 50, 55, 60, 65, 70, 75], 8);
+        let second = plane(&[10, 20, 30, 40, 60, 65, 70, 75, 80, 85], 8);
+        let chrome = detect_sticky_chrome(
+            &first,
+            &second,
+            2,
+            &ChromeConfig {
+                min_band: 2,
+                max_height_percent: 60,
+                ..ChromeConfig::default()
+            },
+        );
+        assert_eq!(chrome.top, 4);
     }
 
     #[test]
@@ -245,5 +588,16 @@ mod tests {
                 bottom: 10
             }
         );
+    }
+
+    #[test]
+    fn the_combined_cap_does_not_invent_a_subminimum_band() {
+        let config = ChromeConfig {
+            min_band: 4,
+            max_height_percent: 50,
+            ..ChromeConfig::default()
+        };
+        let bands = conservative_chrome([ChromeBands { top: 4, bottom: 4 }], 10, &config);
+        assert_eq!(bands, ChromeBands { top: 0, bottom: 4 });
     }
 }

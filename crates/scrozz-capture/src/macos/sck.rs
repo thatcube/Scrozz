@@ -12,7 +12,7 @@
 //! whose pool can drain before the parked thread wakes.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::{DynBlock, RcBlock};
 use objc2::rc::{Allocated, Retained};
@@ -27,6 +27,7 @@ use objc2_screen_capture_kit::{
 use scrozz_core::{Error, Result};
 
 use super::error;
+use crate::CaptureCancellation;
 
 /// Enumerating what is shareable is a local query; it should be near-instant.
 const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,6 +35,7 @@ const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A capture has to round-trip through the window server and encode an image,
 /// which on a large multi-display setup is not instant.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Checks — and, on first run, requests — Screen Recording permission.
 ///
@@ -65,17 +67,31 @@ pub(crate) fn ensure_permission() -> Result<()> {
 /// list. Off-screen windows are kept, so minimised and hidden windows can still
 /// be listed and reported as not visible.
 pub(crate) fn shareable_content() -> Result<Retained<SCShareableContent>> {
+    shareable_content_with_cancellation(None)
+}
+
+pub(crate) fn shareable_content_with_cancellation(
+    cancellation: Option<&CaptureCancellation>,
+) -> Result<Retained<SCShareableContent>> {
+    if let Some(cancellation) = cancellation {
+        cancellation.check()?;
+    }
     ensure_permission()?;
 
-    blocking("listing shareable content", ENUMERATE_TIMEOUT, |handler| {
-        // SAFETY: the arguments match the selector's `BOOL, BOOL, block`.
-        unsafe {
-            SCShareableContent::
+    blocking(
+        "listing shareable content",
+        ENUMERATE_TIMEOUT,
+        cancellation,
+        |handler| {
+            // SAFETY: the arguments match the selector's `BOOL, BOOL, block`.
+            unsafe {
+                SCShareableContent::
                 getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
                     true, false, handler,
                 );
-        }
-    })
+            }
+        },
+    )
 }
 
 /// Takes a single screenshot through the given filter.
@@ -89,10 +105,14 @@ pub(crate) fn shareable_content() -> Result<Retained<SCShareableContent>> {
 /// the stream. Scrozz's floor is macOS 14, so that path is described rather
 /// than implemented; the class check below turns an older system into a clear
 /// [`Error::Unsupported`] instead of a crash.
-pub(crate) fn capture_image(
+pub(crate) fn capture_image_with_cancellation(
     filter: &SCContentFilter,
     config: &SCStreamConfiguration,
+    cancellation: Option<&CaptureCancellation>,
 ) -> Result<Retained<CGImage>> {
+    if let Some(cancellation) = cancellation {
+        cancellation.check()?;
+    }
     let manager = screenshot_manager()?;
     let selector = sel!(captureImageWithFilter:configuration:completionHandler:);
     if !manager.metaclass().responds_to(selector) {
@@ -103,17 +123,22 @@ pub(crate) fn capture_image(
         ));
     }
 
-    blocking("taking a screenshot", CAPTURE_TIMEOUT, |handler| {
-        // SAFETY: the arguments match the selector's
-        // `SCContentFilter *, SCStreamConfiguration *, block`.
-        unsafe {
-            SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-                filter,
-                config,
-                Some(handler),
-            );
-        }
-    })
+    blocking(
+        "taking a screenshot",
+        CAPTURE_TIMEOUT,
+        cancellation,
+        |handler| {
+            // SAFETY: the arguments match the selector's
+            // `SCContentFilter *, SCStreamConfiguration *, block`.
+            unsafe {
+                SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                    filter,
+                    config,
+                    Some(handler),
+                );
+            }
+        },
+    )
 }
 
 /// Whether `+[SCScreenshotManager captureImageInRect:completionHandler:]` exists.
@@ -134,7 +159,13 @@ pub(crate) fn supports_capture_in_rect() -> bool {
 /// The rectangle is display-agnostic: ScreenCaptureKit resolves which displays
 /// it covers and returns one image. That is exactly what a region selection
 /// dragged across two monitors needs, and what a whole-desktop capture needs.
-pub(crate) fn capture_image_in_rect(rect: CGRect) -> Result<Retained<CGImage>> {
+pub(crate) fn capture_image_in_rect_with_cancellation(
+    rect: CGRect,
+    cancellation: Option<&CaptureCancellation>,
+) -> Result<Retained<CGImage>> {
+    if let Some(cancellation) = cancellation {
+        cancellation.check()?;
+    }
     ensure_permission()?;
 
     let manager = screenshot_manager()?;
@@ -148,12 +179,17 @@ pub(crate) fn capture_image_in_rect(rect: CGRect) -> Result<Retained<CGImage>> {
         ));
     }
 
-    blocking("capturing a rectangle", CAPTURE_TIMEOUT, |handler| {
-        // SAFETY: the arguments match the selector's `CGRect, block`.
-        unsafe {
-            SCScreenshotManager::captureImageInRect_completionHandler(rect, Some(handler));
-        }
-    })
+    blocking(
+        "capturing a rectangle",
+        CAPTURE_TIMEOUT,
+        cancellation,
+        |handler| {
+            // SAFETY: the arguments match the selector's `CGRect, block`.
+            unsafe {
+                SCScreenshotManager::captureImageInRect_completionHandler(rect, Some(handler));
+            }
+        },
+    )
 }
 
 /// Allocates an `SCContentFilter` for one of the `initWith…` families.
@@ -184,6 +220,7 @@ fn screenshot_manager() -> Result<&'static AnyClass> {
 fn blocking<T: Message + 'static>(
     context: &'static str,
     timeout: Duration,
+    cancellation: Option<&CaptureCancellation>,
     dispatch: impl FnOnce(&DynBlock<dyn Fn(*mut T, *mut NSError)>),
 ) -> Result<Retained<T>> {
     let slot = Arc::new(Rendezvous::<T>::new());
@@ -200,7 +237,7 @@ fn blocking<T: Message + 'static>(
 
     dispatch(&handler);
 
-    slot.wait(timeout)
+    slot.wait_with_cancellation(timeout, cancellation)?
         .ok_or_else(|| timed_out(context))?
         .into_result(context)
 }
@@ -278,12 +315,42 @@ impl<T: ?Sized> Rendezvous<T> {
         self.ready.notify_all();
     }
 
+    fn wait_with_cancellation(
+        &self,
+        timeout: Duration,
+        cancellation: Option<&CaptureCancellation>,
+    ) -> Result<Option<Delivery<T>>> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Platform("the ScreenCaptureKit deadline overflowed".into()))?;
+        let mut slot = self.lock();
+        loop {
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
+            if slot.is_some() {
+                return Ok(slot.take());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let wait = if cancellation.is_some() {
+                remaining.min(CANCELLATION_POLL_INTERVAL)
+            } else {
+                remaining
+            };
+            (slot, _) = self
+                .ready
+                .wait_timeout_while(slot, wait, |slot| slot.is_none())
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    #[cfg(test)]
     fn wait(&self, timeout: Duration) -> Option<Delivery<T>> {
-        let (mut slot, _) = self
-            .ready
-            .wait_timeout_while(self.lock(), timeout, |slot| slot.is_none())
-            .unwrap_or_else(PoisonError::into_inner);
-        slot.take()
+        self.wait_with_cancellation(timeout, None)
+            .expect("an uncancelled rendezvous wait cannot fail")
     }
 
     /// A poisoned mutex here means a completion handler panicked. What it
@@ -325,6 +392,19 @@ mod tests {
     fn a_rendezvous_nobody_fulfils_times_out_rather_than_hanging() {
         let slot = Rendezvous::<NSObject>::new();
         assert!(slot.wait(Duration::from_millis(50)).is_none());
+    }
+
+    #[test]
+    fn a_cancelled_rendezvous_returns_without_waiting_for_the_handler() {
+        let slot = Rendezvous::<NSObject>::new();
+        let cancellation = CaptureCancellation::new();
+        cancellation.cancel();
+
+        let error = match slot.wait_with_cancellation(Duration::from_secs(5), Some(&cancellation)) {
+            Err(error) => error,
+            Ok(_) => panic!("the cancelled wait must stop"),
+        };
+        assert!(error.is_cancellation());
     }
 
     #[test]

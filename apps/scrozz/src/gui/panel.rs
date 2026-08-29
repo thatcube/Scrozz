@@ -9,7 +9,7 @@
 //!
 //! # Why it takes a pointer
 //!
-//! [`PanelHook`] is `FnOnce(&eframe::CreationContext<'_>) -> PanelReport`, and
+//! [`PanelHook`] is `FnOnce(&eframe::CreationContext<'_>) -> PanelSetup`, and
 //! the work is split in two: [`hook`] does the pointer extraction, and
 //! [`convert_ns_view`] does the conversion. The split is where the platform
 //! risk is — the conversion can be exercised without a window, so it is the
@@ -29,11 +29,11 @@
 
 use std::ffi::c_void;
 
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(target_os = "macos")]
-use raw_window_handle::RawWindowHandle;
+use scrozz_shell::OverlayWindow;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
-use scrozz_ui::PanelReport;
+use scrozz_ui::{PanelReport, PanelSetup};
 
 /// Converts the window hosting `ns_view` into a non-activating overlay panel.
 ///
@@ -52,35 +52,168 @@ use scrozz_ui::PanelReport;
 /// `eframe` app creator, which is the only caller.
 #[must_use]
 pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
-    if ns_view.is_null() {
-        return PanelReport::unsupported("the window handle carried a null NSView");
-    }
-
-    // The entry point is named differently per platform: macOS adopts a view or
-    // a window, and the stub backends adopt an opaque handle. Both refuse
-    // safely, so the non-macOS arm is a real path rather than a `todo!`.
     #[cfg(target_os = "macos")]
-    // SAFETY: forwarded from this function's own contract — a live `NSView *`
-    // on the main thread.
-    let adopted = unsafe { NativeOverlay::from_ns_view(ns_view) };
+    {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { setup_ns_view(ns_view, true) }.report
+    }
 
     #[cfg(not(target_os = "macos"))]
-    // SAFETY: as above; the stub backends do not dereference the handle.
-    let adopted = unsafe { NativeOverlay::adopt(ns_view) };
+    {
+        if ns_view.is_null() {
+            return PanelReport::unsupported("the window handle carried a null NSView");
+        }
 
-    let mut overlay = match adopted {
+        // The entry point is named differently per platform: macOS adopts a view or
+        // a window, and the stub backends adopt an opaque handle. Both refuse
+        // safely, so the non-macOS arm is a real path rather than a `todo!`.
+        // SAFETY: as above; the stub backends do not dereference the handle.
+        let adopted = unsafe { NativeOverlay::adopt(ns_view) };
+
+        let mut overlay = match adopted {
+            Ok(overlay) => overlay,
+            Err(err) => return PanelReport::unsupported(err.to_string()),
+        };
+
+        match overlay.apply(&OverlayBehavior::capture_card()) {
+            // `non_activating` is the only part of the behaviour D27 depends on.
+            // Everything else — level, collection behaviour — can be applied and
+            // the card still behaves; this cannot.
+            Ok(report) if report.non_activating => PanelReport::converted(report.detail),
+            Ok(report) => PanelReport::unsupported(report.detail),
+            Err(err) => PanelReport::unsupported(err.to_string()),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn setup_ns_view(ns_view: *mut c_void, convert_panel: bool) -> PanelSetup {
+    if ns_view.is_null() {
+        return PanelSetup::unsupported("the window handle carried a null NSView");
+    }
+
+    // SAFETY: forwarded from this function's own contract — a live `NSView *`
+    // on the main thread.
+    let mut overlay = match unsafe { NativeOverlay::from_ns_view(ns_view) } {
         Ok(overlay) => overlay,
-        Err(err) => return PanelReport::unsupported(err.to_string()),
+        Err(err) => return PanelSetup::unsupported(err.to_string()),
+    };
+    let report = if convert_panel {
+        match overlay.apply(&OverlayBehavior::capture_card()) {
+            Ok(report) if report.non_activating => PanelReport::converted(report.detail),
+            Ok(report) => PanelReport::unsupported(report.detail),
+            Err(err) => PanelReport::unsupported(err.to_string()),
+        }
+    } else {
+        PanelReport::unsupported("native panel conversion was disabled by SCROZZ_GUI_PANEL")
     };
 
-    match overlay.apply(&OverlayBehavior::capture_card()) {
-        // `non_activating` is the only part of the behaviour D27 depends on.
-        // Everything else — level, collection behaviour — can be applied and
-        // the card still behaves; this cannot.
-        Ok(report) if report.non_activating => PanelReport::converted(report.detail),
-        Ok(report) => PanelReport::unsupported(report.detail),
-        Err(err) => PanelReport::unsupported(err.to_string()),
-    }
+    PanelSetup::new(report).with_passthrough(Box::new(move |requested| {
+        overlay
+            .set_click_through(requested)
+            .map_err(|err| err.to_string())?;
+        overlay
+            .click_through()
+            .map(|actual| actual == requested)
+            .map_err(|err| err.to_string())
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn setup_windows(hwnd: isize) -> PanelSetup {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        },
+    };
+
+    let hwnd = HWND(hwnd as *mut c_void);
+    PanelSetup::unsupported(
+        "the Windows overlay is not yet converted into a non-activating native panel",
+    )
+    .with_passthrough(Box::new(move |requested| {
+        let mask = (WS_EX_LAYERED | WS_EX_TRANSPARENT).0 as isize;
+        // SAFETY: `hwnd` came from eframe's live `WindowHandle`; this closure is
+        // retained only by that window's app and runs on its UI thread.
+        let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        let requested_style = if requested {
+            current | mask
+        } else {
+            current & !mask
+        };
+        if requested_style != current {
+            // SAFETY: as above. Readback below is the success criterion because
+            // zero is both a valid previous style and the API's failure value.
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, requested_style);
+            }
+        }
+        // SAFETY: as above.
+        let actual = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        Ok((actual & mask == mask) == requested)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn setup_x11(window: u32) -> PanelSetup {
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            shape::{ConnectionExt as _, SK, SO},
+            xproto::{ClipOrdering, ConnectionExt as _, Rectangle},
+        },
+    };
+
+    let (connection, _) = match x11rb::connect(None) {
+        Ok(connection) => connection,
+        Err(err) => {
+            return PanelSetup::unsupported(format!(
+                "the X11 overlay connection could not be opened: {err}"
+            ));
+        }
+    };
+
+    PanelSetup::unsupported(
+        "the X11 overlay is not yet converted into a non-activating native panel",
+    )
+    .with_passthrough(Box::new(move |requested| {
+        let rectangles = if requested {
+            Vec::new()
+        } else {
+            let geometry = connection
+                .get_geometry(window)
+                .map_err(|err| err.to_string())?
+                .reply()
+                .map_err(|err| err.to_string())?;
+            vec![Rectangle {
+                x: 0,
+                y: 0,
+                width: geometry.width,
+                height: geometry.height,
+            }]
+        };
+        connection
+            .shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                ClipOrdering::UNSORTED,
+                window,
+                0,
+                0,
+                &rectangles,
+            )
+            .map_err(|err| err.to_string())?
+            .check()
+            .map_err(|err| err.to_string())?;
+        connection.flush().map_err(|err| err.to_string())?;
+        let actual = connection
+            .shape_get_rectangles(window, SK::INPUT)
+            .map_err(|err| err.to_string())?
+            .reply()
+            .map_err(|err| err.to_string())?;
+        Ok(actual.rectangles.is_empty() == requested)
+    }))
 }
 
 /// The hook `scrozz-ui` runs while the overlay window is being created.
@@ -96,19 +229,25 @@ pub unsafe fn convert_ns_view(ns_view: *mut c_void) -> PanelReport {
 /// pins the arm this reaches for.
 #[must_use]
 pub fn hook() -> scrozz_ui::PanelHook {
-    Box::new(|cc: &eframe::CreationContext<'_>| {
+    hook_with_conversion(true)
+}
+
+/// Builds the native-window hook while optionally leaving the macOS window's
+/// activation class unchanged. Click-through control remains installed either
+/// way because automatic scrolling must not depend on the panel diagnostic.
+#[must_use]
+pub fn hook_with_conversion(convert_panel: bool) -> scrozz_ui::PanelHook {
+    Box::new(move |cc: &eframe::CreationContext<'_>| {
         let handle = match cc.window_handle() {
             Ok(handle) => handle,
             Err(err) => {
-                return PanelReport::unsupported(format!(
-                    "eframe reported no window handle: {err}"
-                ));
+                return PanelSetup::unsupported(format!("eframe reported no window handle: {err}"));
             }
         };
 
         #[cfg(target_os = "macos")]
         let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-            return PanelReport::unsupported(
+            return PanelSetup::unsupported(
                 "the overlay window is not an AppKit window, so it has no NSView to convert",
             );
         };
@@ -116,15 +255,33 @@ pub fn hook() -> scrozz_ui::PanelHook {
         // SAFETY: `handle` borrows the window for this scope, so the view is
         // alive; `OverlayApp::new` runs on the main thread.
         #[cfg(target_os = "macos")]
-        return unsafe { convert_ns_view(appkit.ns_view.as_ptr()) };
+        return unsafe { setup_ns_view(appkit.ns_view.as_ptr(), convert_panel) };
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         {
-            let _ = handle;
-            PanelReport::unsupported(
-                "only the macOS overlay backend is implemented so far, so the \
-                 window keeps its native activation behaviour",
-            )
+            let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+                return PanelSetup::unsupported(
+                    "the overlay window is not a Win32 window, so native passthrough is unavailable",
+                );
+            };
+            return setup_windows(win32.hwnd.get());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            match handle.as_raw() {
+                RawWindowHandle::Xlib(xlib) => u32::try_from(xlib.window).map_or_else(
+                    |_| PanelSetup::unsupported("the X11 window ID does not fit in 32 bits"),
+                    setup_x11,
+                ),
+                RawWindowHandle::Xcb(xcb) => setup_x11(xcb.window.get()),
+                RawWindowHandle::Wayland(_) => PanelSetup::unsupported(
+                    "Wayland automatic scrolling is manual-only, so native passthrough is not required",
+                ),
+                _ => PanelSetup::unsupported(
+                    "the Linux overlay has neither an X11 nor a Wayland window handle",
+                ),
+            }
         }
     })
 }

@@ -14,8 +14,8 @@
 //!
 //! - **macOS** requires the Accessibility grant. Without it `CGEventPost`
 //!   succeeds and does nothing, which is worse than failing.
-//! - **Windows** allows it outright, except into a process running at higher
-//!   integrity, where UIPI drops the event silently.
+//! - **Windows** allows target-addressed wheel messages except into a process
+//!   running at higher integrity, where UIPI rejects the delivery.
 //! - **X11** allows it through XTEST, which is available on essentially every
 //!   server and needs no grant.
 //! - **Wayland** forbids it entirely except through the `RemoteDesktop` portal,
@@ -26,7 +26,10 @@
 //! that cannot do it at all report [`crate::Error::Unsupported`] with the reason
 //! and the alternative, rather than appearing broken.
 
-use crate::geometry::{LogicalPoint, ScaleFactor};
+use crate::{
+    DisplayId, WindowId,
+    geometry::{LogicalPoint, ScaleFactor},
+};
 
 /// The direction content is gathered in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -110,17 +113,28 @@ impl ScrollCapabilities {
 }
 
 /// One scroll nudge to deliver into a foreign window.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScrollGesture {
     /// Which way to move.
     pub axis: ScrollAxis,
     /// Where the wheel event lands, in the global logical desktop.
     ///
-    /// Wheel events are routed by pointer position on every platform, so this is
-    /// not decoration: aimed at the wrong point, the event scrolls whatever is
-    /// under the pointer instead of the region being captured. Callers aim it at
-    /// the centre of the target.
+    /// X11 and macOS route through pointer position, while Windows addresses the
+    /// exact child window at this point. This is therefore not decoration: every
+    /// automatic driver verifies that the selected window still owns it. Callers
+    /// place it at the centre of the selected viewport.
     pub at: LogicalPoint,
+    /// Display whose coordinate space contains [`Self::at`].
+    ///
+    /// Carrying the stable id avoids guessing between overlapping logical
+    /// rectangles on mixed-DPI Windows desktops.
+    pub display: Option<DisplayId>,
+    /// Exact window the caller selected for capture.
+    ///
+    /// Every location-addressed driver binds delivery to this top-level identity.
+    /// Carrying its stable id lets the driver reject recycled handles and prove
+    /// the target at [`Self::at`] still belongs to the selected window.
+    pub window: Option<WindowId>,
     /// How far to scroll, in logical points.
     ///
     /// Positive moves the viewport *down* the document, which is what makes
@@ -137,8 +151,36 @@ impl ScrollGesture {
         Self {
             axis: ScrollAxis::Vertical,
             at,
+            display: None,
+            window: None,
             amount,
         }
+    }
+
+    /// A rightward scroll of `amount` logical points at `at`.
+    #[must_use]
+    pub const fn right(at: LogicalPoint, amount: f64) -> Self {
+        Self {
+            axis: ScrollAxis::Horizontal,
+            at,
+            display: None,
+            window: None,
+            amount,
+        }
+    }
+
+    /// Binds this gesture to the display selected for capture.
+    #[must_use]
+    pub fn on_display(mut self, display: DisplayId) -> Self {
+        self.display = Some(display);
+        self
+    }
+
+    /// Binds this gesture to the exact window selected for capture.
+    #[must_use]
+    pub fn in_window(mut self, window: WindowId) -> Self {
+        self.window = Some(window);
+        self
     }
 
     /// Whether this gesture asks for no movement at all.

@@ -11,10 +11,6 @@
 # every baseline, every freshly rendered image and every diff into one directory
 # that CI uploads as an artifact, and prints where they went.
 #
-# It also has to survive the harness not existing yet. `scrozz-ui::harness` is
-# a `todo!()` at the time of writing, so the honest behaviour is to skip loudly
-# rather than to fail — a job that is red for "not built yet" trains people to
-# ignore red.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -38,46 +34,6 @@ note() {
   fi
 }
 
-# --- Is there anything to run? ---------------------------------------------
-#
-# Two independent signals, because either one alone gives a false answer:
-#   * a test file with no `egui_kittest` in the lock cannot compile;
-#   * `egui_kittest` in the lock with no test file renders nothing.
-have_dep=0
-have_tests=0
-
-if [[ -f Cargo.lock ]] && grep -q '^name = "egui_kittest"$' Cargo.lock; then
-  have_dep=1
-fi
-
-for f in "$CRATE_DIR"/tests/*.rs; do
-  if [[ -f "$f" ]]; then
-    have_tests=1
-    break
-  fi
-done
-
-if [[ "$have_dep" == "0" || "$have_tests" == "0" ]]; then
-  note "### Golden images: skipped"
-  note ""
-  note "The headless screenshot harness (decision D25) is not wired up yet, so"
-  note "there is nothing to diff. This is expected during Phase 0 and is **not**"
-  note "a failure."
-  note ""
-  note "| Precondition | Found |"
-  note "|---|---|"
-  note "| \`egui_kittest\` in \`Cargo.lock\` | $([[ $have_dep == 1 ]] && echo yes || echo '**no**') |"
-  note "| a test file in \`$CRATE_DIR/tests/\` | $([[ $have_tests == 1 ]] && echo yes || echo '**no**') |"
-  note ""
-  note "This job starts enforcing itself the moment both are true — add"
-  note "\`egui_kittest\` as a dev-dependency of \`$CRATE\` and put the tests in"
-  note "\`$CRATE_DIR/tests/\`. Baselines belong in \`$CRATE_DIR/tests/snapshots/\`."
-  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-    echo "::notice title=Golden images skipped::The D25 screenshot harness is not implemented yet; no baselines to diff."
-  fi
-  exit 0
-fi
-
 # --- Run --------------------------------------------------------------------
 #
 # The harness can use this to pick a per-platform baseline directory. Font
@@ -87,13 +43,12 @@ fi
 export SCROZZ_GOLDEN_PLATFORM="${RUNNER_OS:-$(uname -s)}"
 
 if [[ "$UPDATE" == "1" ]]; then
-  # The env var egui_kittest itself reads.
   export UPDATE_SNAPSHOTS=1
   echo "golden: re-recording baselines for $SCROZZ_GOLDEN_PLATFORM"
 fi
 
 echo "golden: running $CRATE tests (platform=$SCROZZ_GOLDEN_PLATFORM)"
-cargo test --package "$CRATE" --tests -- --nocapture
+cargo test --locked --package "$CRATE" --tests -- --nocapture
 status=$?
 
 if [[ "$UPDATE" == "1" ]]; then

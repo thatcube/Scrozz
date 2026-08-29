@@ -12,7 +12,7 @@
 //!
 //! `SCScreenshotManager` is macOS 14 and later, and is used because a still
 //! capture through it is a single call. The pre-14 alternative is spelled out
-//! in [`sck::capture_image`]; on an older system this backend reports
+//! in [`sck::capture_image_with_cancellation`]; on an older system this backend reports
 //! [`scrozz_core::Error::Unsupported`] rather than misbehaving.
 
 mod appkit;
@@ -34,9 +34,13 @@ use scrozz_core::{
     LogicalRect, Provenance, Result, ScaleFactor, TargetEnumerator, Window,
 };
 
+use crate::CaptureCancellation;
+
 /// ScreenCaptureKit-backed still capture.
 #[derive(Debug, Default)]
-pub struct ScreenCaptureKitBackend;
+pub struct ScreenCaptureKitBackend {
+    cancellation: Option<CaptureCancellation>,
+}
 
 impl ScreenCaptureKitBackend {
     /// Creates the backend.
@@ -46,7 +50,13 @@ impl ScreenCaptureKitBackend {
     /// first call that genuinely needs access.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { cancellation: None }
+    }
+
+    pub(crate) fn with_cancellation(cancellation: &CaptureCancellation) -> Self {
+        Self {
+            cancellation: Some(cancellation.clone()),
+        }
     }
 }
 
@@ -68,12 +78,22 @@ impl TargetEnumerator for ScreenCaptureKitBackend {
 
 impl CaptureBackend for ScreenCaptureKitBackend {
     fn capture(&self, request: &CaptureRequest) -> Result<Capture> {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         let (frame, provenance) = match &request.target {
-            CaptureTarget::Display(id) => capture_display(id, request)?,
-            CaptureTarget::Window(id) => capture_window(id, request)?,
-            CaptureTarget::Region(rect) => capture_region(*rect, request)?,
-            CaptureTarget::AllDisplays => capture_all_displays(request)?,
+            CaptureTarget::Display(id) => capture_display(id, request, self.cancellation.as_ref())?,
+            CaptureTarget::Window(id) => capture_window(id, request, self.cancellation.as_ref())?,
+            CaptureTarget::Region(rect) => {
+                capture_region(*rect, request, self.cancellation.as_ref())?
+            }
+            CaptureTarget::AllDisplays => {
+                capture_all_displays(request, self.cancellation.as_ref())?
+            }
         };
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
 
         Ok(Capture {
             frame,
@@ -90,8 +110,9 @@ impl CaptureBackend for ScreenCaptureKitBackend {
 fn capture_display(
     id: &scrozz_core::DisplayId,
     request: &CaptureRequest,
+    cancellation: Option<&CaptureCancellation>,
 ) -> Result<(scrozz_core::Frame, Provenance)> {
-    let content = sck::shareable_content()?;
+    let content = sck::shareable_content_with_cancellation(cancellation)?;
     let target = find_display(&content, id)?;
 
     // SAFETY: `displayID` is a plain property read.
@@ -108,7 +129,7 @@ fn capture_display(
     };
 
     let config = configure(&filter, request, scale, None)?;
-    let image = sck::capture_image(&filter, &config)?;
+    let image = sck::capture_image_with_cancellation(&filter, &config, cancellation)?;
     Ok((image::to_frame(&image, scale)?, Provenance::Display))
 }
 
@@ -139,8 +160,9 @@ fn capture_display(
 fn capture_window(
     id: &scrozz_core::WindowId,
     request: &CaptureRequest,
+    cancellation: Option<&CaptureCancellation>,
 ) -> Result<(scrozz_core::Frame, Provenance)> {
-    let content = sck::shareable_content()?;
+    let content = sck::shareable_content_with_cancellation(cancellation)?;
     let target = window::find(&content, id).ok_or_else(|| {
         Error::TargetGone(format!(
             "window {} is no longer open; it may have been closed since the list was taken",
@@ -159,7 +181,7 @@ fn capture_window(
         unsafe { SCContentFilter::initWithDesktopIndependentWindow(sck::alloc_filter(), &target) };
 
     let config = configure(&filter, request, scale, None)?;
-    let image = sck::capture_image(&filter, &config)?;
+    let image = sck::capture_image_with_cancellation(&filter, &config, cancellation)?;
     Ok((image::to_frame(&image, scale)?, Provenance::Window))
 }
 
@@ -173,6 +195,7 @@ fn capture_window(
 fn capture_region(
     rect: LogicalRect,
     request: &CaptureRequest,
+    cancellation: Option<&CaptureCancellation>,
 ) -> Result<(scrozz_core::Frame, Provenance)> {
     if rect.is_empty() {
         return Err(Error::InvalidRequest(
@@ -184,7 +207,8 @@ fn capture_region(
     let scale = scale_for_rect(rect, &displays);
 
     if sck::supports_capture_in_rect() {
-        let image = sck::capture_image_in_rect(display::to_cg_rect(rect))?;
+        let image =
+            sck::capture_image_in_rect_with_cancellation(display::to_cg_rect(rect), cancellation)?;
         return Ok((image::to_frame(&image, scale)?, Provenance::Region));
     }
 
@@ -195,7 +219,7 @@ fn capture_region(
             Error::InvalidRequest("the requested region is not on any display".to_owned())
         })?;
 
-    let content = sck::shareable_content()?;
+    let content = sck::shareable_content_with_cancellation(cancellation)?;
     let target = find_display(&content, &home.id)?;
 
     // SAFETY: whole-display filter, cropped below by `sourceRect`.
@@ -217,7 +241,7 @@ fn capture_region(
     );
 
     let config = configure(&filter, request, home.scale, Some(local))?;
-    let image = sck::capture_image(&filter, &config)?;
+    let image = sck::capture_image_with_cancellation(&filter, &config, cancellation)?;
     Ok((image::to_frame(&image, home.scale)?, Provenance::Region))
 }
 
@@ -228,7 +252,10 @@ fn capture_region(
 /// resampling each display into a common scale and guessing at the gaps between
 /// non-adjacent monitors — a worse image, produced more slowly. A single
 /// display short-circuits to the ordinary display path.
-fn capture_all_displays(request: &CaptureRequest) -> Result<(scrozz_core::Frame, Provenance)> {
+fn capture_all_displays(
+    request: &CaptureRequest,
+    cancellation: Option<&CaptureCancellation>,
+) -> Result<(scrozz_core::Frame, Provenance)> {
     let displays = display::displays()?;
     match displays.as_slice() {
         [] => Err(Error::Unsupported {
@@ -236,7 +263,7 @@ fn capture_all_displays(request: &CaptureRequest) -> Result<(scrozz_core::Frame,
             why: "no displays are attached".to_owned(),
         }),
         [only] => {
-            let (frame, _) = capture_display(&only.id, request)?;
+            let (frame, _) = capture_display(&only.id, request, cancellation)?;
             Ok((frame, Provenance::AllDisplays))
         }
         many => {
@@ -251,7 +278,10 @@ fn capture_all_displays(request: &CaptureRequest) -> Result<(scrozz_core::Frame,
 
             let union = union_of(many);
             let scale = scale_for_rect(union, many);
-            let image = sck::capture_image_in_rect(display::to_cg_rect(union))?;
+            let image = sck::capture_image_in_rect_with_cancellation(
+                display::to_cg_rect(union),
+                cancellation,
+            )?;
             Ok((image::to_frame(&image, scale)?, Provenance::AllDisplays))
         }
     }

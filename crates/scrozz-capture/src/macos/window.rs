@@ -1,12 +1,14 @@
 //! Enumerating windows.
 //!
-//! ScreenCaptureKit is the source rather than `CGWindowListCopyWindowInfo`,
-//! for one decisive reason: capturing a window needs the `SCWindow` object
-//! itself, so enumerating through anything else would mean looking the window
-//! up a second time and racing with the user closing it in between.
+//! ScreenCaptureKit supplies the capturable window objects. CoreGraphics supplies
+//! the documented window-server ordering; ScreenCaptureKit does not promise that
+//! its array order is front-to-back.
 
+use std::collections::HashMap;
+
+use objc2_core_graphics::{CGWindowListCreate, CGWindowListOption, kCGNullWindowID};
 use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
-use scrozz_core::{Display, DisplayId, LogicalRect, Result, Window, WindowId};
+use scrozz_core::{Display, DisplayId, Error, LogicalRect, Result, Window, WindowId};
 
 /// Windows the user could plausibly pick, in front-to-back order.
 ///
@@ -18,16 +20,48 @@ use scrozz_core::{Display, DisplayId, LogicalRect, Result, Window, WindowId};
 pub(crate) fn windows(content: &SCShareableContent, displays: &[Display]) -> Result<Vec<Window>> {
     // SAFETY: reading properties of the shareable content snapshot.
     let list = unsafe { content.windows() };
-
-    Ok(list
+    let rank: HashMap<u32, usize> = on_screen_window_ids_front_to_back()?
+        .into_iter()
+        .enumerate()
+        .map(|(rank, id)| (id, rank))
+        .collect();
+    let mut windows: Vec<(u32, Window)> = list
         .iter()
         .filter(|window| {
             // SAFETY: `windowLayer` is a plain property read.
             let layer = unsafe { window.windowLayer() };
             layer == 0
         })
-        .map(|window| to_window(&window, displays))
-        .collect())
+        .map(|window| {
+            // SAFETY: `windowID` is a plain property read on this snapshot.
+            let id = unsafe { window.windowID() };
+            (id, to_window(&window, displays))
+        })
+        .collect();
+    windows.sort_by_key(|(id, _)| rank.get(id).copied().unwrap_or(usize::MAX));
+    Ok(windows.into_iter().map(|(_, window)| window).collect())
+}
+
+/// Window-server identities in documented front-to-back order.
+pub(crate) fn on_screen_window_ids_front_to_back() -> Result<Vec<u32>> {
+    let options =
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+    let ids = CGWindowListCreate(options, kCGNullWindowID).ok_or_else(|| {
+        Error::Platform("CGWindowListCreate returned no on-screen window list".into())
+    })?;
+    let mut ordered = Vec::with_capacity(ids.len());
+    for index in 0..ids.len() {
+        let index = isize::try_from(index)
+            .map_err(|_| Error::Platform("the macOS window list is too large".into()))?;
+        // SAFETY: `index` is in bounds and the immutable array stays alive.
+        // CGWindowListCreate stores each CGWindowID directly in the CFArray's
+        // pointer-sized value slot; these are not retained CFNumber objects.
+        let raw = unsafe { ids.value_at_index(index) };
+        if let Ok(id) = u32::try_from(raw.addr()) {
+            ordered.push(id);
+        }
+    }
+    Ok(ordered)
 }
 
 /// Finds a specific window in a content snapshot.

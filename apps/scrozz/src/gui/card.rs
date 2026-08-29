@@ -24,12 +24,16 @@
 //! which a lazily-resolved handle could not promise.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 
 use scrozz_core::Frame;
 use scrozz_store::CaptureId;
+use scrozz_ui::{ScrollHudAction, ScrollHudState};
 
 use crate::gui::action::CaptureKind;
 
@@ -346,6 +350,24 @@ pub trait CardSurface {
     /// caller wins.
     fn poll(&mut self) -> Option<CardEvent>;
 
+    /// Show or update the scrolling-capture HUD.
+    fn show_scroll_hud(&mut self, state: ScrollHudState);
+
+    /// Hide the scrolling-capture HUD.
+    fn hide_scroll_hud(&mut self);
+
+    /// Takes one pending scrolling-HUD decision, if there is one.
+    fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction>;
+
+    /// Force the native surface to pass pointer input through during automatic
+    /// scrolling. Non-window surfaces have nothing to intercept.
+    fn request_scroll_passthrough(&mut self, _requested: bool) {}
+
+    /// Whether a requested native click-through transition has taken effect.
+    fn scroll_passthrough_ready(&self) -> bool {
+        true
+    }
+
     /// How many cards are showing.
     fn len(&self) -> usize;
 
@@ -366,10 +388,28 @@ pub trait CardSurface {
 /// it is what `scrozz gui` runs on a machine with no windowing host, so the
 /// capture path, the store writes and the IPC forwarding can all be exercised
 /// end to end without anything appearing on screen.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Recording {
     log: Arc<Mutex<Vec<Card>>>,
     injected: Arc<Mutex<Vec<CardEvent>>>,
+    scroll_hud: Arc<Mutex<Option<ScrollHudState>>>,
+    scroll_actions: Arc<Mutex<Vec<ScrollHudAction>>>,
+    scroll_passthrough_requested: Arc<AtomicBool>,
+    scroll_passthrough_ready: Arc<AtomicBool>,
+}
+
+impl Default for Recording {
+    fn default() -> Self {
+        Self {
+            log: Arc::default(),
+            injected: Arc::default(),
+            scroll_hud: Arc::default(),
+            scroll_actions: Arc::default(),
+            scroll_passthrough_requested: Arc::default(),
+            // A recording surface has no native window to intercept input.
+            scroll_passthrough_ready: Arc::new(AtomicBool::new(true)),
+        }
+    }
 }
 
 impl Recording {
@@ -403,6 +443,36 @@ impl Recording {
             .push(event);
     }
 
+    /// Queues a scrolling-HUD decision.
+    pub fn inject_scroll_action(&self, action: ScrollHudAction) {
+        self.scroll_actions
+            .lock()
+            .expect("scroll HUD events are poisoned")
+            .push(action);
+    }
+
+    /// The scrolling-HUD state most recently presented.
+    #[must_use]
+    pub fn scrolling_hud(&self) -> Option<ScrollHudState> {
+        self.scroll_hud
+            .lock()
+            .expect("scroll HUD state is poisoned")
+            .clone()
+    }
+
+    /// Controls the native-passthrough acknowledgement exposed to coordinator
+    /// tests.
+    pub fn set_scroll_passthrough_ready(&self, ready: bool) {
+        self.scroll_passthrough_ready
+            .store(ready, Ordering::Release);
+    }
+
+    /// Whether the coordinator most recently requested click-through.
+    #[must_use]
+    pub fn scroll_passthrough_requested(&self) -> bool {
+        self.scroll_passthrough_requested.load(Ordering::Acquire)
+    }
+
     /// A handle sharing this recorder's state.
     #[must_use]
     pub fn handle(&self) -> Self {
@@ -431,6 +501,41 @@ impl CardSurface for Recording {
         } else {
             Some(queue.remove(0))
         }
+    }
+
+    fn show_scroll_hud(&mut self, state: ScrollHudState) {
+        *self
+            .scroll_hud
+            .lock()
+            .expect("scroll HUD state is poisoned") = Some(state);
+    }
+
+    fn hide_scroll_hud(&mut self) {
+        *self
+            .scroll_hud
+            .lock()
+            .expect("scroll HUD state is poisoned") = None;
+    }
+
+    fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
+        let mut queue = self
+            .scroll_actions
+            .lock()
+            .expect("scroll HUD events are poisoned");
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
+    }
+
+    fn request_scroll_passthrough(&mut self, requested: bool) {
+        self.scroll_passthrough_requested
+            .store(requested, Ordering::Release);
+    }
+
+    fn scroll_passthrough_ready(&self) -> bool {
+        self.scroll_passthrough_ready.load(Ordering::Acquire)
     }
 
     fn len(&self) -> usize {

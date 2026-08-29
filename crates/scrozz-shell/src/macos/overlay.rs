@@ -369,6 +369,16 @@ pub struct MacOverlay {
 }
 
 impl MacOverlay {
+    /// Returns whether AppKit currently ignores mouse events for this window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] off the main thread.
+    pub fn click_through(&self) -> Result<bool> {
+        let _mtm = main_thread("reading overlay click-through")?;
+        Ok(self.window.ignoresMouseEvents())
+    }
+
     /// Adopts the window hosting an `NSView`.
     ///
     /// This is the path from `raw-window-handle`: eframe reports

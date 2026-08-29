@@ -352,6 +352,7 @@ impl eframe::App for Driver {
             }
             // Before the window closes, so the menu-bar item never outlives
             // what the user can see.
+            self.overlay.prepare_shutdown(ctx);
             self.app.shut_down();
 
             if self.converted() {
@@ -398,9 +399,8 @@ fn panel_hook() -> Option<scrozz_ui::PanelHook> {
         tracing::warn!(
             "the panel conversion is disabled; capture cards will pull focus when clicked"
         );
-        return None;
     }
-    Some(crate::gui::panel::hook())
+    Some(crate::gui::panel::hook_with_conversion(enabled))
 }
 
 /// Where the overlay window goes.

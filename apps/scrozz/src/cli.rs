@@ -25,7 +25,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, ScrollAxis};
 
 use crate::fault::{CliError, CliResult};
 
@@ -162,6 +162,76 @@ impl Command {
 }
 
 impl Cli {
+    /// Resolves path arguments as the process that forwarded this invocation saw
+    /// them, without changing the GUI process's global working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::Ipc`] when the forwarded directory is relative,
+    /// missing, or no longer a directory.
+    pub(crate) fn resolve_forwarded_paths(
+        &mut self,
+        cwd: Option<&std::path::Path>,
+    ) -> CliResult<()> {
+        let Some(cwd) = cwd else {
+            return Ok(());
+        };
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(CliError::ipc(format!(
+                "the forwarding process supplied an unavailable working directory: {}",
+                cwd.display()
+            )));
+        }
+
+        let resolve = |path: &mut PathBuf| {
+            if path.is_relative() {
+                *path = cwd.join(&*path);
+            }
+        };
+
+        match self.command.as_mut() {
+            Some(Command::Capture(args)) => {
+                if let Some(path) = args.output.as_mut() {
+                    resolve(path);
+                }
+            }
+            Some(Command::Record(args)) => {
+                if let Some(path) = args.output.as_mut() {
+                    resolve(path);
+                }
+            }
+            Some(Command::History(HistoryArgs {
+                command: HistoryCommand::Get { output, .. },
+            })) => {
+                if let Some(path) = output.as_mut() {
+                    resolve(path);
+                }
+            }
+            Some(Command::Ocr(args)) => {
+                if let Some(path) = args.file.as_mut() {
+                    resolve(path);
+                }
+                if let Some(subject) = args.subject.as_mut() {
+                    let path = PathBuf::from(&*subject);
+                    let resolved = cwd.join(&path);
+                    if path.is_relative() && resolved.is_file() {
+                        *subject = resolved.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            Some(
+                Command::List(_)
+                | Command::History(_)
+                | Command::Settings(_)
+                | Command::Hotkey(_)
+                | Command::Gui,
+            )
+            | None => {}
+        }
+
+        Ok(())
+    }
+
     /// Checks the rules that span a global option and a subcommand.
     ///
     /// Per-subcommand rules live on the subcommand's own `validate`; this is only
@@ -253,6 +323,24 @@ pub enum DisplaySelector {
     Id(String),
 }
 
+/// The direction a scrolling capture grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScrollAxisArg {
+    /// Move down and build a tall image.
+    Vertical,
+    /// Move right and build a wide image.
+    Horizontal,
+}
+
+impl From<ScrollAxisArg> for ScrollAxis {
+    fn from(axis: ScrollAxisArg) -> Self {
+        match axis {
+            ScrollAxisArg::Vertical => Self::Vertical,
+            ScrollAxisArg::Horizontal => Self::Horizontal,
+        }
+    }
+}
+
 /// A resolved capture target.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetSpec {
@@ -264,8 +352,14 @@ pub enum TargetSpec {
     Display(DisplaySelector),
     /// Every display.
     AllDisplays,
-    /// Repeated frames from one display, assembled while its content scrolls.
-    Scrolling(DisplaySelector),
+    /// Repeated frames from the frontmost window on one display, assembled while
+    /// its content scrolls. Wayland delegates window selection to its portal.
+    Scrolling {
+        /// Display whose viewport is sampled.
+        display: DisplaySelector,
+        /// Direction the stitched canvas grows.
+        axis: ScrollAxis,
+    },
     /// Chosen on screen.
     Interactive(InteractiveMode),
 }
@@ -473,10 +567,13 @@ pub struct CaptureArgs {
     #[command(flatten)]
     pub target: TargetArgs,
 
-    /// Capture a scrolling page on a display.
+    /// Capture the frontmost scrolling window on a display.
     ///
     /// With no value, uses the display under the pointer. A selector may be an
-    /// id, `primary`, or `active`.
+    /// id, `primary`, or `active`. Focus the target window before capture. On
+    /// Wayland, omit the value (or use `active`) and choose one window in the
+    /// desktop portal; explicit display selectors are rejected rather than
+    /// silently ignored.
     #[arg(
         long,
         value_name = "ID|primary|active",
@@ -485,6 +582,12 @@ pub struct CaptureArgs {
         conflicts_with = "target"
     )]
     pub scrolling: Option<String>,
+
+    /// Direction the scrolling capture should grow.
+    ///
+    /// Defaults to vertical when omitted.
+    #[arg(long, value_enum, value_name = "vertical|horizontal")]
+    pub scroll_axis: Option<ScrollAxisArg>,
 
     /// Composite the pointer into the capture.
     #[arg(long)]
@@ -543,7 +646,12 @@ impl CaptureArgs {
     pub fn target_spec(&self) -> CliResult<TargetSpec> {
         self.scrolling.as_ref().map_or_else(
             || self.target.resolve(),
-            |selector| Ok(TargetSpec::Scrolling(parse_display_selector(selector)?)),
+            |selector| {
+                Ok(TargetSpec::Scrolling {
+                    display: parse_display_selector(selector)?,
+                    axis: self.scroll_axis.unwrap_or(ScrollAxisArg::Vertical).into(),
+                })
+            },
         )
     }
 
@@ -582,6 +690,11 @@ impl CaptureArgs {
     /// Returns [`CliError::Usage`] for a negative or non-finite delay, or for
     /// `--quality` on a format that has no quality setting.
     pub fn validate(&self) -> CliResult<()> {
+        if self.scroll_axis.is_some() && self.scrolling.is_none() {
+            return Err(CliError::usage(
+                "--scroll-axis only applies to --scrolling captures",
+            ));
+        }
         if let Some(delay) = self.delay
             && (!delay.is_finite() || delay < 0.0)
         {
@@ -1246,8 +1359,53 @@ mod tests {
             let Some(Command::Capture(parsed)) = parse(&args).command else {
                 panic!("expected capture")
             };
-            assert_eq!(parsed.target_spec().unwrap(), TargetSpec::Scrolling(want));
+            assert_eq!(
+                parsed.target_spec().unwrap(),
+                TargetSpec::Scrolling {
+                    display: want,
+                    axis: ScrollAxis::Vertical,
+                }
+            );
         }
+    }
+
+    #[test]
+    fn scrolling_axis_can_be_horizontal() {
+        let Some(Command::Capture(parsed)) = parse(&[
+            "scrozz",
+            "capture",
+            "--scrolling=primary",
+            "--scroll-axis",
+            "horizontal",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert_eq!(
+            parsed.target_spec().unwrap(),
+            TargetSpec::Scrolling {
+                display: DisplaySelector::Primary,
+                axis: ScrollAxis::Horizontal,
+            }
+        );
+    }
+
+    #[test]
+    fn scrolling_axis_requires_a_scrolling_capture() {
+        let Some(Command::Capture(args)) = parse(&[
+            "scrozz",
+            "capture",
+            "--display",
+            "primary",
+            "--scroll-axis",
+            "horizontal",
+        ])
+        .command
+        else {
+            panic!("expected capture")
+        };
+        assert!(args.validate().is_err());
     }
 
     #[test]
@@ -1354,6 +1512,54 @@ mod tests {
         let err = cli.validate().unwrap_err();
         assert_eq!(err.exit(), crate::exit::Exit::Usage);
         assert!(err.to_string().contains("--stdout"), "{err}");
+    }
+
+    #[test]
+    fn forwarded_relative_paths_are_resolved_without_changing_process_cwd() {
+        let before = std::env::current_dir().expect("a working directory");
+        let cwd = std::env::temp_dir();
+
+        let mut cli = parse(&["scrozz", "capture", "-o", "shot.png"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture");
+        };
+        assert_eq!(args.output, Some(cwd.join("shot.png")));
+
+        let mut cli = parse(&["scrozz", "record", "-o", "clip.mp4"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::Record(args)) = cli.command else {
+            panic!("expected record");
+        };
+        assert_eq!(args.output, Some(cwd.join("clip.mp4")));
+
+        let mut cli = parse(&["scrozz", "history", "get", "id", "-o", "saved.png"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::History(HistoryArgs {
+            command: HistoryCommand::Get { output, .. },
+        })) = cli.command
+        else {
+            panic!("expected history get");
+        };
+        assert_eq!(output, Some(cwd.join("saved.png")));
+
+        let mut cli = parse(&["scrozz", "ocr", "--file", "source.png"]);
+        cli.resolve_forwarded_paths(Some(&cwd)).unwrap();
+        let Some(Command::Ocr(args)) = cli.command else {
+            panic!("expected OCR");
+        };
+        assert_eq!(args.file, Some(cwd.join("source.png")));
+        assert_eq!(std::env::current_dir().unwrap(), before);
+    }
+
+    #[test]
+    fn an_unavailable_forwarded_directory_is_rejected() {
+        let mut cli = parse(&["scrozz", "capture", "--dry-run"]);
+        let missing = std::env::temp_dir().join(format!(
+            "scrozz-missing-forwarded-cwd-{}",
+            std::process::id()
+        ));
+        assert!(cli.resolve_forwarded_paths(Some(&missing)).is_err());
     }
 
     #[test]

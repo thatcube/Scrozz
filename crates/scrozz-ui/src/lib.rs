@@ -86,6 +86,7 @@ pub mod icons;
 pub mod motion;
 pub mod overlay_app;
 pub mod paint;
+pub mod scrolling;
 pub mod stack;
 pub mod theme;
 pub mod vibrancy;
@@ -93,7 +94,10 @@ pub mod vibrancy;
 pub use card::{CardAction, CardChrome, CardContent, CardResponse};
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use overlay_app::{
-    CaptureRequest, DismissReason, OverlayApp, OverlayEvent, OverlayGeometry, OverlayHandle,
-    OverlayOptions, PanelHook, PanelReport, Passthrough, PointerProbe,
+    CaptureRequest, DismissReason, NativePassthrough, OverlayApp, OverlayEvent, OverlayGeometry,
+    OverlayHandle, OverlayOptions, PanelHook, PanelReport, PanelSetup, Passthrough, PointerProbe,
+};
+pub use scrolling::{
+    ScrollHudAction, ScrollHudResponse, ScrollHudState, ScrollHudStatus, ScrollingHud,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};

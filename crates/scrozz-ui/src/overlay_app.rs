@@ -57,7 +57,10 @@
 //! call — including a timed wake when something is merely waiting.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{Frame as CaptureFrame, PixelFormat, Provenance};
@@ -66,6 +69,7 @@ use crate::card::{self, CardAction, CardContent};
 use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
+use crate::scrolling::{ScrollHudAction, ScrollHudState, ScrollingHud};
 use crate::stack::{CaptureStack, CardId, Intent, dock};
 use crate::theme::{Appearance, Radius, Theme, corner};
 
@@ -157,9 +161,46 @@ impl PanelReport {
 /// `MacOverlay::from_ns_view` / `from_ns_window` on macOS but `adopt` on its
 /// stub platforms, so the hook is written per-target anyway.
 ///
-/// Returning [`PanelReport::unsupported`] is always safe: the overlay still
+/// Applies a click-through transition through the native window API and reads
+/// the state back. Returning `true` certifies that the requested state reached
+/// the native window; a queued viewport command alone is not an acknowledgement.
+pub type NativePassthrough = Box<dyn FnMut(bool) -> Result<bool, String>>;
+
+/// Native resources retained after the panel hook configures the window.
+pub struct PanelSetup {
+    /// Whether native panel conversion succeeded.
+    pub report: PanelReport,
+    /// Optional synchronous native click-through apply-and-readback.
+    pub passthrough: Option<NativePassthrough>,
+}
+
+impl PanelSetup {
+    /// Creates a setup without a native click-through controller.
+    #[must_use]
+    pub fn new(report: PanelReport) -> Self {
+        Self {
+            report,
+            passthrough: None,
+        }
+    }
+
+    /// Attaches a native click-through controller.
+    #[must_use]
+    pub fn with_passthrough(mut self, passthrough: NativePassthrough) -> Self {
+        self.passthrough = Some(passthrough);
+        self
+    }
+
+    /// Creates a setup for a platform or window kind that cannot be converted.
+    #[must_use]
+    pub fn unsupported(detail: impl Into<String>) -> Self {
+        Self::new(PanelReport::unsupported(detail))
+    }
+}
+
+/// Returning [`PanelSetup::unsupported`] is always safe: the overlay still
 /// works, it just takes focus when clicked.
-pub type PanelHook = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> PanelReport>;
+pub type PanelHook = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> PanelSetup>;
 
 /// Reports the pointer position in the overlay window's own logical
 /// coordinates, whether or not the window is currently accepting mouse events.
@@ -405,6 +446,8 @@ pub enum OverlayEvent {
     DockExpanded,
     /// The last card left; the overlay can be hidden.
     Emptied,
+    /// A decision from the scrolling-capture HUD.
+    Scrolling(ScrollHudAction),
 }
 
 /// Something the application asks the overlay to do.
@@ -423,8 +466,11 @@ struct Shared {
     inbox: Mutex<Vec<CaptureRequest>>,
     outbox: Mutex<Vec<OverlayEvent>>,
     commands: Mutex<Vec<Command>>,
+    scroll_hud: Mutex<Option<ScrollHudState>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
+    scroll_passthrough_requested: AtomicBool,
+    passthrough_applied: AtomicBool,
 }
 
 /// The application's grip on a running overlay.
@@ -450,6 +496,37 @@ impl OverlayHandle {
             q.push(request);
         }
         self.wake();
+    }
+
+    /// Show or update the scrolling-capture HUD.
+    pub fn show_scroll_hud(&self, state: ScrollHudState) {
+        if let Ok(mut slot) = self.shared.scroll_hud.lock() {
+            *slot = Some(state);
+        }
+        self.wake();
+    }
+
+    /// Hide the scrolling-capture HUD.
+    pub fn hide_scroll_hud(&self) {
+        if let Ok(mut slot) = self.shared.scroll_hud.lock() {
+            *slot = None;
+        }
+        self.wake();
+    }
+
+    /// Keep the native overlay mouse-transparent while automatic scrolling is
+    /// delivering globally addressed input.
+    pub fn request_scroll_passthrough(&self, requested: bool) {
+        self.shared
+            .scroll_passthrough_requested
+            .store(requested, Ordering::Release);
+        self.wake();
+    }
+
+    /// Whether the overlay has applied mouse transparency to its native window.
+    #[must_use]
+    pub fn scroll_passthrough_ready(&self) -> bool {
+        self.shared.passthrough_applied.load(Ordering::Acquire)
     }
 
     /// Take everything that has happened since the last call.
@@ -732,6 +809,7 @@ pub struct OverlayApp {
     geometry: OverlayGeometry,
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
+    native_passthrough: Option<NativePassthrough>,
     thumbnail_px: u32,
     /// The value most recently sent to the window, so the command is sent on
     /// change rather than every frame.
@@ -763,10 +841,14 @@ impl OverlayApp {
             *slot = Some(ctx.clone());
         }
 
-        let report = options.panel.take().map_or_else(
-            || PanelReport::unsupported("no native panel hook supplied"),
+        let setup = options.panel.take().map_or_else(
+            || PanelSetup::unsupported("no native panel hook supplied"),
             |hook| hook(cc),
         );
+        let PanelSetup {
+            report,
+            passthrough: native_passthrough,
+        } = setup;
         if !report.non_activating {
             tracing::warn!(detail = %report.detail, "overlay window is not non-activating");
         }
@@ -791,6 +873,7 @@ impl OverlayApp {
             geometry: options.geometry,
             passthrough: options.passthrough,
             probe: options.probe,
+            native_passthrough,
             thumbnail_px: options.thumbnail_px.max(1),
             passthrough_now: false,
             last_seen: 0.0,
@@ -827,6 +910,29 @@ impl OverlayApp {
         self.stack.resize(geometry.local(), m);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+    }
+
+    /// Restores pointer input before the host begins a potentially blocking
+    /// shutdown. This applies through the native controller immediately rather
+    /// than waiting for another frame that may never be drawn.
+    pub fn prepare_shutdown(&mut self, ctx: &egui::Context) {
+        self.passthrough = Passthrough::Never;
+        self.handle.request_scroll_passthrough(false);
+        self.passthrough_now = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+
+        let applied = self
+            .handle
+            .shared
+            .passthrough_applied
+            .load(Ordering::Acquire);
+        let acknowledged =
+            apply_native_passthrough(self.native_passthrough.as_mut(), false, applied)
+                .unwrap_or(applied);
+        self.handle
+            .shared
+            .passthrough_applied
+            .store(acknowledged, Ordering::Release);
     }
 
     fn emit(&self, event: OverlayEvent) {
@@ -949,40 +1055,73 @@ impl OverlayApp {
     fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], pointer: Option<Pos2>) {
         let now = ctx.input(|i| i.time);
         let empty = hits.is_empty();
-        let desired = match self.passthrough {
-            Passthrough::Never => false,
-            Passthrough::Always => true,
-            // Nothing to click. Pass everything through unconditionally and do
-            // not re-sample: an empty overlay that blinked its click-through
-            // off once a second would eat a desktop click for no reason, and
-            // an idle overlay has no business scheduling repaints.
-            Passthrough::Auto if empty => true,
-            Passthrough::Auto => {
-                if pointer.is_some() {
-                    self.last_seen = now;
-                    passes_through(pointer, hits)
-                } else if self.probe.is_some() {
-                    // The probe answered "nowhere"; there is genuinely no
-                    // pointer on this display.
-                    true
-                } else if now - self.last_seen > f64::from(RESAMPLE_SECS) {
-                    // Drop click-through for one frame so the pointer becomes
-                    // visible again, then decide properly next frame.
-                    self.last_seen = now;
-                    false
-                } else {
-                    self.passthrough_now
+        let forced = self
+            .handle
+            .shared
+            .scroll_passthrough_requested
+            .load(Ordering::Acquire);
+        let desired = if forced {
+            true
+        } else {
+            match self.passthrough {
+                Passthrough::Never => false,
+                Passthrough::Always => true,
+                // Nothing to click. Pass everything through unconditionally and do
+                // not re-sample: an empty overlay that blinked its click-through
+                // off once a second would eat a desktop click for no reason, and
+                // an idle overlay has no business scheduling repaints.
+                Passthrough::Auto if empty => true,
+                Passthrough::Auto => {
+                    if pointer.is_some() {
+                        self.last_seen = now;
+                        passes_through(pointer, hits)
+                    } else if self.probe.is_some() {
+                        // The probe answered "nowhere"; there is genuinely no
+                        // pointer on this display.
+                        true
+                    } else if now - self.last_seen > f64::from(RESAMPLE_SECS) {
+                        // Drop click-through for one frame so the pointer becomes
+                        // visible again, then decide properly next frame.
+                        self.last_seen = now;
+                        false
+                    } else {
+                        self.passthrough_now
+                    }
                 }
             }
         };
 
-        if self.passthrough == Passthrough::Auto && self.probe.is_none() && desired && !empty {
+        if !forced
+            && self.passthrough == Passthrough::Auto
+            && self.probe.is_none()
+            && desired
+            && !empty
+        {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(RESAMPLE_SECS));
         }
         if desired != self.passthrough_now {
             self.passthrough_now = desired;
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(desired));
         }
+        let applied = self
+            .handle
+            .shared
+            .passthrough_applied
+            .load(Ordering::Acquire);
+        let acknowledged =
+            apply_native_passthrough(self.native_passthrough.as_mut(), desired, applied)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        requested = desired,
+                        error = %err,
+                        "native overlay click-through transition failed"
+                    );
+                    applied
+                });
+        self.handle
+            .shared
+            .passthrough_applied
+            .store(acknowledged, Ordering::Release);
     }
 
     fn handle_action(&mut self, id: CardId, action: CardAction, m: &Motion) {
@@ -1069,12 +1208,27 @@ impl eframe::App for OverlayApp {
         let surface = Surface::new(&self.theme, &self.icons, m);
         let frames = self.stack.frame(&m);
 
-        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 1);
+        let mut hits: Vec<Rect> = Vec::with_capacity(frames.len() + 2);
         let mut hovered = None;
         let mut action = None;
         let mut drag_start = None;
         let mut drag_to = None;
         let mut drag_end = false;
+
+        let scroll_hud = self
+            .handle
+            .shared
+            .scroll_hud
+            .lock()
+            .ok()
+            .and_then(|state| state.clone());
+        if let Some(state) = scroll_hud {
+            let response = ScrollingHud::draw(ui, &self.theme, &state, true);
+            hits.push(response.rect);
+            if let Some(action) = response.action {
+                self.emit(OverlayEvent::Scrolling(action));
+            }
+        }
 
         for f in &frames {
             let Some(entry) = self.content.get(&f.id) else {
@@ -1181,6 +1335,24 @@ pub fn dock_rect(geometry: OverlayGeometry) -> Rect {
     let layout =
         crate::stack::StackLayout::new(geometry.local(), crate::stack::CardMetrics::default());
     dock::rect_for_slot0(layout.slot_rect(0))
+}
+
+fn apply_native_passthrough(
+    controller: Option<&mut NativePassthrough>,
+    desired: bool,
+    applied: bool,
+) -> Result<bool, String> {
+    if desired == applied {
+        return Ok(applied);
+    }
+    let Some(controller) = controller else {
+        return Ok(applied);
+    };
+    if controller(desired)? {
+        Ok(desired)
+    } else {
+        Ok(applied)
+    }
 }
 
 #[cfg(test)]
@@ -1291,5 +1463,37 @@ mod tests {
         assert!(!PanelReport::default().non_activating);
         assert!(!PanelReport::unsupported("none").non_activating);
         assert!(PanelReport::converted("NSPanel").non_activating);
+    }
+
+    #[test]
+    fn scrolling_passthrough_request_is_explicit_and_acknowledged_separately() {
+        let handle = OverlayHandle::new();
+        handle.request_scroll_passthrough(true);
+
+        assert!(
+            handle
+                .shared
+                .scroll_passthrough_requested
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            !handle.scroll_passthrough_ready(),
+            "the request is not an acknowledgement from the native viewport"
+        );
+    }
+
+    #[test]
+    fn native_passthrough_readback_controls_the_acknowledgement() {
+        let mut refused: NativePassthrough = Box::new(|_| Ok(false));
+        assert!(!apply_native_passthrough(Some(&mut refused), true, false).unwrap());
+
+        let mut accepted: NativePassthrough = Box::new(|_| Ok(true));
+        assert!(apply_native_passthrough(Some(&mut accepted), true, false).unwrap());
+        assert!(!apply_native_passthrough(Some(&mut accepted), false, true).unwrap());
+    }
+
+    #[test]
+    fn missing_native_passthrough_never_invents_an_acknowledgement() {
+        assert!(!apply_native_passthrough(None, true, false).unwrap());
     }
 }

@@ -24,7 +24,8 @@ use std::collections::{HashMap, VecDeque};
 
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
 use scrozz_ui::{
-    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, overlay_app::THUMBNAIL_PX,
+    CaptureRequest, DismissReason, OverlayEvent, OverlayHandle, ScrollHudAction, ScrollHudState,
+    overlay_app::THUMBNAIL_PX,
 };
 
 use crate::gui::{
@@ -50,6 +51,8 @@ pub struct OverlayCards {
     /// `drain_events` empties the overlay's outbox in one go, so a batch of
     /// five has to be held somewhere; without this, four would be dropped.
     queued: VecDeque<CardEvent>,
+    /// Scrolling-HUD decisions beyond the one this poll returned.
+    scroll_queued: VecDeque<ScrollHudAction>,
 }
 
 impl OverlayCards {
@@ -62,6 +65,7 @@ impl OverlayCards {
             mapped: HashMap::new(),
             reverse: HashMap::new(),
             queued: VecDeque::new(),
+            scroll_queued: VecDeque::new(),
         }
     }
 
@@ -185,6 +189,9 @@ impl CardSurface for OverlayCards {
                         out.push(CardEvent::Collapse(ours));
                     }
                 }
+                OverlayEvent::Scrolling(action) => {
+                    self.scroll_queued.push_back(action);
+                }
                 // Nothing downstream acts on these yet, and inventing a
                 // translation for them would be worse than leaving the gap
                 // visible.
@@ -208,6 +215,26 @@ impl CardSurface for OverlayCards {
 
     fn len(&self) -> usize {
         self.mapped.len() + self.pending.len()
+    }
+
+    fn show_scroll_hud(&mut self, state: ScrollHudState) {
+        self.handle.show_scroll_hud(state);
+    }
+
+    fn hide_scroll_hud(&mut self) {
+        self.handle.hide_scroll_hud();
+    }
+
+    fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
+        self.scroll_queued.pop_front()
+    }
+
+    fn request_scroll_passthrough(&mut self, requested: bool) {
+        self.handle.request_scroll_passthrough(requested);
+    }
+
+    fn scroll_passthrough_ready(&self) -> bool {
+        !self.handle.is_attached() || self.handle.scroll_passthrough_ready()
     }
 
     fn describe(&self) -> String {
