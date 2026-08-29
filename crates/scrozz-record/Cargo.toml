@@ -33,8 +33,8 @@ rav1e = { version = "0.8.1", default-features = false, features = ["threading"],
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
 objc2.workspace = true
-objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL"] }
-objc2-av-foundation = { workspace = true, features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVAudioMix", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVMediaFormat", "AVPlayer", "AVPlayerItem", "AVVideoComposition", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media", "objc2-core-video", "objc2-media-toolbox"] }
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDate", "NSDictionary", "NSError", "NSObject", "NSRunLoop", "NSString", "NSThread", "NSURL"] }
+objc2-av-foundation = { workspace = true, features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVAudioMix", "AVCaptureAudioDataOutput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureVideoDataOutput", "AVMediaFormat", "AVPlayer", "AVPlayerItem", "AVVideoComposition", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media", "objc2-core-video", "objc2-media-toolbox"] }
 objc2-core-audio-types = "0.3.2"
 objc2-core-foundation.workspace = true
 objc2-core-graphics.workspace = true
@@ -56,6 +56,7 @@ ashpd.workspace = true
 x11rb.workspace = true
 ffmpeg-sys-next = { version = "9.0.0", default-features = false, features = ["avcodec"], optional = true }
 futures-util = { workspace = true, optional = true }
+libc = "0.2"
 pipewire = { version = "0.10.1", features = ["v0_3_44"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
 

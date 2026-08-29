@@ -10,6 +10,8 @@ pub(crate) const SCREEN_REMEDY: &str = "System Settings -> Privacy & Security ->
 
 pub(crate) const MICROPHONE_REMEDY: &str =
     "System Settings -> Privacy & Security -> Microphone: switch Scrozz on";
+pub(crate) const CAMERA_REMEDY: &str =
+    "System Settings -> Privacy & Security -> Camera: switch Scrozz on";
 
 pub(crate) fn screen_permission_denied() -> Error {
     Error::PermissionDenied {
@@ -22,6 +24,13 @@ pub(crate) fn microphone_permission_denied() -> Error {
     Error::PermissionDenied {
         capability: "microphone".to_owned(),
         remedy: MICROPHONE_REMEDY.to_owned(),
+    }
+}
+
+pub(crate) fn camera_permission_denied() -> Error {
+    Error::PermissionDenied {
+        capability: "camera".to_owned(),
+        remedy: CAMERA_REMEDY.to_owned(),
     }
 }
 

@@ -432,7 +432,9 @@ pub struct RecordingPresentation {
     pub countdown: CountdownSettings,
     /// Remaining virtual countdown time.
     pub countdown_remaining: Duration,
-    /// Hide every Scrozz overlay while a backend cannot exclude its windows.
+    /// Hide capture cards and the dock while a backend cannot exclude its
+    /// windows. An active camera still forces either a capture-excluded HUD or a
+    /// minimal privacy badge to remain visible.
     pub suppress_all_overlays: bool,
 }
 
@@ -1113,6 +1115,40 @@ impl OverlayApp {
         }
     }
 
+    fn draw_camera_privacy_indicator(&self, ui: &mut egui::Ui) {
+        let work = ui.max_rect();
+        let rect = Rect::from_min_size(
+            Pos2::new(work.right() - 170.0, work.top() + 24.0),
+            Vec2::new(146.0, 34.0),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                egui::Frame::new()
+                    .fill(self.theme.palette.chip_fill)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        self.theme.palette.recording.linear_multiply(0.8),
+                    ))
+                    .corner_radius(corner(Radius::CHIP))
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        let (dot, _) =
+                            ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                        ui.painter()
+                            .circle_filled(dot.center(), 4.0, self.theme.palette.recording);
+                        ui.label(
+                            egui::RichText::new("CAMERA ACTIVE")
+                                .font(self.theme.font(crate::theme::Text::Label))
+                                .color(self.theme.palette.text),
+                        );
+                    });
+            },
+        );
+    }
+
     /// Draw the dock, and return its hit rectangle plus whether it was clicked.
     fn draw_dock(
         &self,
@@ -1222,8 +1258,20 @@ impl eframe::App for OverlayApp {
         if let Some(rect) = dock_hit {
             hits.push(rect);
         }
-        if let Some(recording) = recording.filter(|_| !suppress_all_overlays) {
+        let camera_indicator_required = recording.as_ref().is_some_and(|presentation| {
+            presentation
+                .hud
+                .camera_status
+                .as_ref()
+                .is_some_and(|status| status.privacy_indicator_visible)
+        });
+        let show_capture_excluded_hud = camera_indicator_required && cfg!(target_os = "windows");
+        if let Some(recording) =
+            recording.filter(|_| !suppress_all_overlays || show_capture_excluded_hud)
+        {
             self.draw_recording(ui, &recording, &mut hits);
+        } else if camera_indicator_required {
+            self.draw_camera_privacy_indicator(ui);
         }
 
         // Gestures, applied after drawing so this frame's responses drive the

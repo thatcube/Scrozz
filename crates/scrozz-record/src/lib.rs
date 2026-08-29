@@ -22,6 +22,7 @@ use std::{
 use scrozz_core::{CaptureTarget, Error, Frame, PhysicalPoint, PhysicalSize, Result};
 
 mod audio;
+pub mod camera;
 mod config;
 pub mod edit;
 mod encoder;
@@ -48,6 +49,11 @@ pub mod transcode;
 #[cfg(target_os = "windows")]
 mod windows;
 
+pub use camera::{
+    CameraDevice, CameraDeviceId, CameraDeviceState, CameraFeed, CameraFrame, CameraOrientation,
+    CameraPermission, CameraPreview, CameraPreviewSession, CameraRecordingMetadata, CameraRequest,
+    CameraRuntimeStatus,
+};
 pub use engine::{
     EngineCapabilities, RecordingEngine, detect_native_engine, validate_capabilities,
 };
@@ -222,6 +228,8 @@ pub struct RecordingRequest {
     pub microphone: bool,
     /// Capture system audio output.
     pub system_audio: bool,
+    /// Optional camera capture and composition.
+    pub camera: Option<CameraRequest>,
     /// Frames per second.
     pub fps: u32,
     /// Draw the pointer into the video.
@@ -243,6 +251,7 @@ impl RecordingRequest {
             destination: None,
             microphone: false,
             system_audio: false,
+            camera: None,
             fps: 30,
             show_cursor: false,
             quality: Quality::default(),
@@ -253,12 +262,16 @@ impl RecordingRequest {
 
     /// Builds the platform request represented by recording settings.
     #[must_use]
-    pub const fn from_settings(target: CaptureTarget, settings: &RecordingSettings) -> Self {
+    pub fn from_settings(target: CaptureTarget, settings: &RecordingSettings) -> Self {
         Self {
             target,
             destination: None,
             microphone: settings.audio.microphone,
             system_audio: settings.audio.system_audio,
+            camera: settings
+                .camera
+                .enabled
+                .then(|| CameraRequest::new(settings.camera)),
             fps: settings.video.fps,
             show_cursor: settings.shows_cursor(),
             quality: settings.video.quality,
@@ -291,6 +304,9 @@ impl RecordingRequest {
             )));
         }
         self.resolution.validate()?;
+        if let Some(camera) = &self.camera {
+            camera.validate()?;
+        }
         if self
             .destination
             .as_ref()
@@ -412,6 +428,8 @@ pub struct RecordingMetadata {
     pub quality: Option<Quality>,
     /// Applied resolution policy.
     pub resolution: Option<RecordingResolution>,
+    /// Camera composition, without device identifiers or frame pixels.
+    pub camera: Option<Box<CameraRecordingMetadata>>,
 }
 
 /// A finished recording.
@@ -763,6 +781,24 @@ pub trait RecordingSession: Send {
         None
     }
 
+    /// Pixel-free camera status for privacy and diagnostics UI.
+    fn camera_status(&self) -> Option<CameraRuntimeStatus> {
+        None
+    }
+
+    /// Latest frame for an explicitly active camera preview.
+    fn camera_preview(&self) -> Option<CameraPreview> {
+        None
+    }
+
+    /// Updates camera composition without interrupting the media timeline.
+    fn update_camera(&mut self, _settings: settings::CameraSettings) -> Result<()> {
+        Err(Error::Unsupported {
+            what: "live camera composition changes".to_owned(),
+            why: "the selected recording engine does not expose camera controls".to_owned(),
+        })
+    }
+
     /// Ends the session and finalises the file.
     ///
     /// Returns `Err` only when no reportable output exists. Every retained
@@ -785,13 +821,17 @@ pub fn start_with_settings(
     request: &RecordingRequest,
     settings: &RecordingSettings,
 ) -> Result<Box<dyn RecordingSession>> {
+    let mut request = request.clone();
+    if request.camera.is_none() && settings.camera.enabled {
+        request.camera = Some(CameraRequest::new(settings.camera));
+    }
     request.validate()?;
     settings.validate()?;
     let Some(engine) = detect_native_engine() else {
         return Err(no_native_engine_error());
     };
-    validate_capabilities(engine.capabilities(), request, Some(settings))?;
-    engine.start(request)
+    validate_capabilities(engine.capabilities(), &request, Some(settings))?;
+    engine.start(&request)
 }
 
 /// Starts native recording with pull-based composited overlays.
@@ -805,6 +845,95 @@ pub fn start_with_overlays(
     };
     validate_capabilities(engine.capabilities(), request, None)?;
     engine.start_with_overlays(request, overlays)
+}
+
+/// Enumerates cameras without starting capture or requesting permission.
+///
+/// # Errors
+///
+/// Returns an explicit unsupported/platform error when the current native
+/// adapter cannot enumerate cameras.
+pub fn camera_devices() -> Result<Vec<CameraDevice>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::camera::devices()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::camera_devices()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::camera_devices()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err(Error::Unsupported {
+            what: "camera device enumeration".to_owned(),
+            why: "this platform camera adapter is not linked in the current build".to_owned(),
+        })
+    }
+}
+
+/// Reads camera permission state without prompting.
+#[must_use]
+pub fn camera_permission() -> CameraPermission {
+    #[cfg(target_os = "macos")]
+    {
+        macos::camera::permission_status()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Desktop Media Foundation reports policy denial only when the selected
+        // device is opened; enumeration itself must never trigger capture.
+        CameraPermission::NotDetermined
+    }
+    #[cfg(all(target_os = "linux", feature = "linux-native"))]
+    {
+        CameraPermission::NotDetermined
+    }
+    #[cfg(all(target_os = "linux", not(feature = "linux-native")))]
+    {
+        CameraPermission::Unsupported
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        CameraPermission::Unsupported
+    }
+}
+
+/// Starts camera-only preview after an explicit user action.
+///
+/// # Errors
+///
+/// Returns permission, device, or native capture errors. Merely constructing
+/// settings or enumerating devices never calls this function.
+pub fn start_camera_preview(request: &CameraRequest) -> Result<Box<dyn CameraPreviewSession>> {
+    request.validate()?;
+    #[cfg(target_os = "macos")]
+    {
+        macos::camera::start_preview(request)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::start_preview(request)
+    }
+    #[cfg(all(target_os = "linux", feature = "linux-native"))]
+    {
+        linux::start_preview(request)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", feature = "linux-native")
+    )))]
+    {
+        Err(Error::Unsupported {
+            what: "camera preview".to_owned(),
+            why: "this build does not include a native camera capture adapter".to_owned(),
+        })
+    }
 }
 
 fn no_native_engine_error() -> Error {
@@ -837,6 +966,24 @@ mod tests {
         let request = RecordingRequest::new(CaptureTarget::AllDisplays);
         assert!(!request.microphone);
         assert!(!request.system_audio);
+        assert!(request.camera.is_none());
+    }
+
+    #[test]
+    fn camera_request_is_explicit_and_validated() {
+        let mut request = RecordingRequest::new(CaptureTarget::AllDisplays);
+        let settings = settings::CameraSettings {
+            enabled: true,
+            ..settings::CameraSettings::default()
+        };
+        request.camera = Some(CameraRequest::new(settings));
+        request.validate().unwrap();
+
+        request.camera.as_mut().unwrap().settings.enabled = false;
+        assert!(matches!(
+            request.validate(),
+            Err(Error::InvalidRequest(message)) if message.contains("camera request")
+        ));
     }
 
     #[test]

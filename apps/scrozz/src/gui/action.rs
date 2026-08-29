@@ -200,8 +200,8 @@ impl Action {
     ) -> bool {
         match self {
             Self::Capture(kind) => kind.is_available(capabilities, session, capture_backend_ready),
-            Self::Quit => true,
-            Self::ToggleRecording | Self::OpenHistory | Self::OpenSettings => false,
+            Self::OpenSettings | Self::Quit => true,
+            Self::ToggleRecording | Self::OpenHistory => false,
         }
     }
 }

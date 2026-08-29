@@ -9,7 +9,7 @@ use std::{collections::VecDeque, fmt, path::PathBuf, sync::Arc, time::Duration};
 use scrozz_core::{CaptureTarget, Error, Result};
 
 use crate::{
-    OverlaySource, Recording, RecordingEngine, RecordingRequest, RecordingSession,
+    CameraDeviceId, OverlaySource, Recording, RecordingEngine, RecordingRequest, RecordingSession,
     RecordingSettings, SessionEvent,
     engine::{EngineCapabilities, detect_native_engine, validate_capabilities},
 };
@@ -87,6 +87,7 @@ pub struct RecordingMachine {
     engine: Box<dyn RecordingEngine>,
     capabilities: EngineCapabilities,
     settings: RecordingSettings,
+    camera_device: Option<CameraDeviceId>,
     phase: RecordingPhase,
     request: Option<RecordingRequest>,
     pending_overlays: Option<Box<dyn OverlaySource>>,
@@ -142,6 +143,7 @@ impl RecordingMachine {
             engine,
             capabilities,
             settings,
+            camera_device: None,
             phase: RecordingPhase::Idle,
             request: None,
             pending_overlays: None,
@@ -265,7 +267,7 @@ impl RecordingMachine {
     ) -> Result<()> {
         self.require_phase(RecordingPhase::Idle, "begin recording")?;
         self.clear_run();
-        let mut request = RecordingRequest::from_settings(target, &self.settings);
+        let mut request = self.request_for_target(target);
         request.destination = Some(destination);
         self.prepare_request(request)
     }
@@ -283,7 +285,7 @@ impl RecordingMachine {
     ) -> Result<()> {
         self.require_phase(RecordingPhase::Idle, "begin recording")?;
         self.clear_run();
-        let mut request = RecordingRequest::from_settings(target, &self.settings);
+        let mut request = self.request_for_target(target);
         request.destination = Some(destination);
         self.pending_overlays = Some(overlays);
         self.prepare_request(request)
@@ -330,16 +332,22 @@ impl RecordingMachine {
     }
 
     fn prepare_target(&mut self, target: CaptureTarget) -> Result<()> {
-        let request = RecordingRequest::from_settings(target, &self.settings);
+        let request = self.request_for_target(target);
         self.prepare_request(request)
+    }
+
+    fn request_for_target(&self, target: CaptureTarget) -> RecordingRequest {
+        let mut request = RecordingRequest::from_settings(target, &self.settings);
+        if let Some(camera) = &mut request.camera {
+            camera.device_id = self.camera_device.clone();
+        }
+        request
     }
 
     fn prepare_request(&mut self, request: RecordingRequest) -> Result<()> {
         request.validate()?;
         validate_capabilities(self.capabilities, &request, Some(&self.settings))?;
-        self.overlays_required = self.settings.clicks.enabled
-            || self.settings.keystrokes.enabled
-            || self.settings.camera.enabled;
+        self.overlays_required = self.settings.clicks.enabled || self.settings.keystrokes.enabled;
         self.stage_request(&request);
 
         let countdown = if self.settings.countdown.enabled {
@@ -786,6 +794,84 @@ impl RecordingMachine {
         &self.settings
     }
 
+    /// Pixel-free native camera status.
+    #[must_use]
+    pub fn camera_status(&self) -> Option<crate::camera::CameraRuntimeStatus> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.camera_status())
+    }
+
+    /// Latest camera preview on the corrected recording clock.
+    #[must_use]
+    pub fn camera_preview(&self) -> Option<crate::camera::CameraPreview> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.camera_preview())
+    }
+
+    /// Changes camera position, size, shape, or presenter mode while recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns a phase, validation, or native-adapter error.
+    pub fn update_camera(&mut self, settings: crate::settings::CameraSettings) -> Result<()> {
+        settings.validate()?;
+        if !matches!(
+            self.phase,
+            RecordingPhase::Recording | RecordingPhase::Paused
+        ) {
+            return Err(Error::InvalidRequest(
+                "camera composition can change only while recording or paused".to_owned(),
+            ));
+        }
+        self.session
+            .as_mut()
+            .ok_or_else(|| {
+                Error::Platform("recording state has no active platform session".to_owned())
+            })?
+            .update_camera(settings)?;
+        self.settings.camera = settings;
+        if let Some(request) = &mut self.request
+            && let Some(camera) = &mut request.camera
+        {
+            camera.settings = settings;
+        }
+        Ok(())
+    }
+
+    /// Replaces the full preference set before target selection begins.
+    pub fn set_settings(&mut self, settings: RecordingSettings) -> Result<()> {
+        settings.validate()?;
+        if !matches!(
+            self.phase,
+            RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed
+        ) {
+            return Err(Error::InvalidRequest(
+                "recording settings cannot change after target selection begins".to_owned(),
+            ));
+        }
+        self.settings = settings;
+        Ok(())
+    }
+
+    /// Selects the stable camera preference used by the next recording.
+    ///
+    /// Native handles remain inside adapters; only the platform's persistent
+    /// device identifier crosses this seam.
+    pub fn set_camera_device(&mut self, device: Option<CameraDeviceId>) -> Result<()> {
+        if !matches!(
+            self.phase,
+            RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed
+        ) {
+            return Err(Error::InvalidRequest(
+                "camera selection cannot change after recording target selection begins".to_owned(),
+            ));
+        }
+        self.camera_device = device;
+        Ok(())
+    }
+
     /// Replaces the after-capture policy before a recording starts.
     ///
     /// # Errors
@@ -1047,6 +1133,33 @@ mod tests {
             Some(std::path::Path::new("durable.mp4"))
         );
         assert_eq!(request.fps, 48);
+    }
+
+    #[test]
+    fn camera_layout_transition_does_not_change_the_recording_clock() {
+        let plan = MockSessionPlan::complete("out.mp4", 2.0).unwrap();
+        let mut settings = settings_without_countdown();
+        settings.camera.enabled = true;
+        let mut machine =
+            RecordingMachine::with_engine(Box::new(MockEngine::fully_capable(plan)), settings)
+                .unwrap();
+        machine.begin(target()).unwrap();
+        machine.tick(Duration::from_secs(1)).unwrap();
+        let before = machine.elapsed();
+        machine
+            .update_camera(crate::settings::CameraSettings {
+                presenter: true,
+                ..settings.camera
+            })
+            .unwrap();
+        assert_eq!(machine.elapsed(), before);
+        machine.tick(Duration::from_secs(1)).unwrap();
+        assert_eq!(machine.elapsed(), Duration::from_secs(2));
+        assert!(
+            machine
+                .camera_status()
+                .is_some_and(|status| status.privacy_indicator_visible)
+        );
     }
 
     #[test]

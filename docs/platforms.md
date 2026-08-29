@@ -58,6 +58,22 @@ contract, but report an explicit unsupported capability until Media Foundation
 source-reader/audio-renderer and linked-libav/desktop-audio adapters exist. They
 never advance a synthetic clock or show source thumbnails as fake playback.
 
+Camera capture follows the same native-adapter rule. macOS uses AVFoundation,
+Windows uses a Media Foundation source reader, and Linux's opt-in native recorder
+uses V4L2 read or mmap streaming I/O. All three feed the same bounded latest-frame
+queue and deterministic PiP/presenter compositor; camera timestamps are mapped
+onto each recorder's pause-free media clock before composition. Device
+enumeration is passive.
+Permission prompts and camera activation happen only after an explicit Preview
+or Record action, and every stop/drop path clears the in-app privacy indicator
+while releasing the native device.
+
+Windows marks the non-activating recording HUD with
+`WDA_EXCLUDEFROMCAPTURE`, so live PiP controls stay visible without entering the
+video. X11 and current Wayland capture paths cannot promise per-window
+exclusion; while recording there, Scrozz suppresses the full HUD and leaves a
+minimal camera-active badge visible. That badge may appear in display captures.
+
 Completed recordings cross into newer aggregate UI through
 `scrozz_record::handoff::FinalizedMediaHandoff`. It carries only durable media
 ownership, the canonical video path, bounded RGBA poster plus explicit colour

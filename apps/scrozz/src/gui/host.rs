@@ -20,11 +20,12 @@ use scrozz_core::{
 #[cfg(target_os = "macos")]
 use scrozz_ui::VIDEO_EDITOR_WINDOW_TITLE;
 use scrozz_ui::{
-    HistoryWindowAction, OverlayHandle, RecordingSurfaceAction, Theme, VideoEditorAction,
+    CameraSettingsAction, HistoryWindowAction, OverlayHandle, RecordingSurfaceAction, Theme,
+    VideoEditorAction, camera_settings_viewport_builder, camera_settings_viewport_id,
     history_viewport_builder, history_viewport_id,
     overlay_app::{OverlayApp, OverlayGeometry, OverlayOptions},
-    show_history_window, show_video_editor_window, video_editor_viewport_builder,
-    video_editor_viewport_id,
+    show_camera_settings_window, show_history_window, show_video_editor_window,
+    video_editor_viewport_builder, video_editor_viewport_id,
 };
 
 use crate::{
@@ -270,6 +271,8 @@ impl Host for Windowed {
                     editor_focus_delay: 0,
                     editor_focus_error_reported: false,
                     editor_hidden_for_selection: false,
+                    camera_settings_actions: Arc::new(Mutex::new(Vec::new())),
+                    camera_settings_was_open: false,
                 }))
             }),
         )
@@ -442,6 +445,8 @@ struct Driver {
     editor_focus_delay: u8,
     editor_focus_error_reported: bool,
     editor_hidden_for_selection: bool,
+    camera_settings_actions: Arc<Mutex<Vec<CameraSettingsAction>>>,
+    camera_settings_was_open: bool,
 }
 
 impl Driver {
@@ -611,6 +616,59 @@ impl Driver {
             }
         }
     }
+
+    fn show_camera_settings(&mut self, ctx: &egui::Context) {
+        let Some(snapshot) = self.app.camera_settings_snapshot() else {
+            if self.camera_settings_was_open {
+                ctx.send_viewport_cmd_to(
+                    camera_settings_viewport_id(),
+                    egui::ViewportCommand::Close,
+                );
+            }
+            self.camera_settings_was_open = false;
+            return;
+        };
+        let first_frame = !self.camera_settings_was_open;
+        self.camera_settings_was_open = true;
+        let actions = Arc::clone(&self.camera_settings_actions);
+        let viewport = camera_settings_viewport_id();
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(
+            viewport,
+            camera_settings_viewport_builder(),
+            move |ui, _class| {
+                let theme = if ui.ctx().system_theme().unwrap_or_else(|| ui.ctx().theme())
+                    == egui::Theme::Dark
+                {
+                    Theme::dark()
+                } else {
+                    Theme::light()
+                };
+                let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+                let response = show_camera_settings_window(ui, &snapshot, &theme);
+                let mut emitted = response.actions;
+                if close_requested {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if !emitted
+                        .iter()
+                        .any(|action| matches!(action, CameraSettingsAction::Close))
+                    {
+                        emitted.push(CameraSettingsAction::Close);
+                    }
+                }
+                actions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(emitted);
+                ui.ctx().request_repaint_after(IDLE);
+            },
+        );
+        if first_frame {
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Focus);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -675,6 +733,15 @@ impl eframe::App for Driver {
         for action in history_actions {
             self.app.handle_history_window_action(action);
         }
+        let mut pending_camera_actions = self
+            .camera_settings_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let camera_actions = std::mem::take(&mut *pending_camera_actions);
+        drop(pending_camera_actions);
+        for action in camera_actions {
+            self.app.handle_camera_settings_action(action);
+        }
         let mut pending_editor_actions = self
             .editor_actions
             .lock()
@@ -717,6 +784,7 @@ impl eframe::App for Driver {
             }
             self.show_video_editor(ctx);
             self.show_history(ctx);
+            self.show_camera_settings(ctx);
         }
 
         // An idle overlay must still be woken, or a hotkey pressed while

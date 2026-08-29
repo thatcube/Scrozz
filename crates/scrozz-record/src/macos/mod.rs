@@ -1,6 +1,7 @@
 //! macOS ScreenCaptureKit recording.
 
 mod audio;
+pub(crate) mod camera;
 mod compositor;
 mod content;
 pub(crate) mod error;
@@ -34,6 +35,7 @@ impl RecordingEngine for MacEngine {
             video: true,
             system_audio: stream::system_audio_available(),
             microphone: true,
+            camera: true,
             pause_resume: true,
             display: true,
             window: true,

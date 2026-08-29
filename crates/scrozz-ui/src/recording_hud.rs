@@ -2,16 +2,23 @@
 
 use std::time::Duration;
 
-use egui::{Color32, Response, RichText, Sense, Stroke, Ui, vec2};
+use egui::{
+    Color32, ComboBox, Image, Response, RichText, Sense, Slider, Stroke, TextureHandle, Ui,
+    load::SizedTexture, vec2,
+};
 use scrozz_record::{
-    Recording,
+    CameraPreview, CameraRuntimeStatus, Recording,
+    camera::render_camera_preview,
     engine::EngineCapabilities,
     machine::{
         ClockDrift, DRIFT_EVENT_THRESHOLD_SECS, MachineFailure, RecordingMachine, RecordingPhase,
     },
+    overlay::move_camera,
+    settings::{CameraSettings, CameraShape, OverlayAnchor},
 };
 
 use crate::{
+    camera_settings::preview_size,
     harness::{RecordingFixture, Scene, SceneCtx},
     recording_controls::{
         body, button, caption, format_duration, heading, install_scene_theme, panel, rule,
@@ -37,6 +44,12 @@ pub struct RecordingHudModel<'a> {
     pub output: Option<&'a Recording>,
     /// Terminal failure and any salvageable output.
     pub failure: Option<&'a MachineFailure>,
+    /// Pixel-free camera health, present only for camera recordings.
+    pub camera_status: Option<&'a CameraRuntimeStatus>,
+    /// Latest camera frame for the explicit live preview.
+    pub camera_preview: Option<&'a CameraPreview>,
+    /// Mutable composition values shown by the HUD.
+    pub camera_settings: Option<CameraSettings>,
 }
 
 /// Owned HUD values suitable for crossing the application/overlay thread seam.
@@ -56,6 +69,12 @@ pub struct RecordingHudSnapshot {
     pub output: Option<Recording>,
     /// Terminal failure and retained partial output.
     pub failure: Option<MachineFailure>,
+    /// Pixel-free live camera health.
+    pub camera_status: Option<CameraRuntimeStatus>,
+    /// Latest live preview frame.
+    pub camera_preview: Option<CameraPreview>,
+    /// Current camera composition values.
+    pub camera_settings: Option<CameraSettings>,
 }
 
 impl RecordingHudSnapshot {
@@ -70,6 +89,11 @@ impl RecordingHudSnapshot {
             drift: machine.latest_drift(),
             output: machine.output().cloned(),
             failure: machine.failure().cloned(),
+            camera_status: machine.camera_status(),
+            camera_preview: machine.camera_preview(),
+            camera_settings: machine
+                .request()
+                .and_then(|request| request.camera.as_ref().map(|camera| camera.settings)),
         }
     }
 
@@ -84,6 +108,9 @@ impl RecordingHudSnapshot {
             drift: self.drift,
             output: self.output.as_ref(),
             failure: self.failure.as_ref(),
+            camera_status: self.camera_status.as_ref(),
+            camera_preview: self.camera_preview.as_ref(),
+            camera_settings: self.camera_settings,
         }
     }
 }
@@ -100,12 +127,17 @@ impl<'a> RecordingHudModel<'a> {
             drift: machine.latest_drift(),
             output: machine.output(),
             failure: machine.failure(),
+            camera_status: None,
+            camera_preview: None,
+            camera_settings: machine
+                .request()
+                .and_then(|request| request.camera.as_ref().map(|camera| camera.settings)),
         }
     }
 }
 
 /// A semantic action requested by the HUD.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecordingHudAction {
     /// Dismiss terminal recording state.
     Dismiss,
@@ -119,6 +151,8 @@ pub enum RecordingHudAction {
     RevealOutput,
     /// Reveal salvageable partial output in the platform file browser.
     RevealPartialOutput,
+    /// Apply a live camera composition change.
+    CameraChanged(CameraSettings),
 }
 
 /// Enabled state for every HUD control.
@@ -132,6 +166,8 @@ pub struct RecordingHudControls {
     pub reveal_output_enabled: bool,
     /// Whether partial output can be revealed.
     pub reveal_partial_enabled: bool,
+    /// Whether live camera composition controls are available.
+    pub camera_enabled: bool,
 }
 
 impl RecordingHudControls {
@@ -150,6 +186,7 @@ impl RecordingHudControls {
                 .failure
                 .and_then(|failure| failure.partial.as_ref())
                 .is_some(),
+            camera_enabled: active && model.camera_status.is_some_and(|camera| camera.active),
         }
     }
 }
@@ -231,6 +268,23 @@ impl<'a> RecordingHud<'a> {
                     "Timing",
                     &format!("Encoder clock {millis:+.0} ms from recording time"),
                 );
+            }
+
+            if let (Some(status), Some(settings)) =
+                (self.model.camera_status, self.model.camera_settings)
+            {
+                ui.add_space(Space::MD);
+                let changed = camera_controls(
+                    ui,
+                    self.theme,
+                    self.model.camera_preview,
+                    status,
+                    settings,
+                    controls.camera_enabled,
+                );
+                if let Some(settings) = changed {
+                    action = Some(RecordingHudAction::CameraChanged(settings));
+                }
             }
 
             if let Some(failure) = self.model.failure {
@@ -350,6 +404,238 @@ impl<'a> RecordingHud<'a> {
     }
 }
 
+fn camera_controls(
+    ui: &mut Ui,
+    theme: &Theme,
+    preview: Option<&CameraPreview>,
+    status: &CameraRuntimeStatus,
+    mut settings: CameraSettings,
+    enabled: bool,
+) -> Option<CameraSettings> {
+    let original = settings;
+    ui.horizontal(|ui| {
+        let (rect, response) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+        ui.painter().circle_filled(
+            rect.center(),
+            4.0,
+            if status.active {
+                theme.palette.success
+            } else {
+                theme.palette.warning
+            },
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Image,
+                true,
+                if status.active {
+                    "Camera active; privacy indicator visible"
+                } else {
+                    "Camera unavailable"
+                },
+            )
+        });
+        crate::recording_controls::section_label(
+            ui,
+            theme,
+            if status.active {
+                "CAMERA ACTIVE"
+            } else {
+                "CAMERA UNAVAILABLE"
+            },
+        );
+        if status.dropped_frames != 0 {
+            caption(ui, theme, format!("{} dropped", status.dropped_frames));
+        }
+    });
+    if let Some(message) = status.warning.as_deref() {
+        caption(ui, theme, message);
+    }
+    if let Some(preview) = preview
+        && let Some(texture) = camera_texture(ui.ctx(), preview)
+    {
+        let size = texture.size;
+        let response = ui.add(
+            Image::from_texture(texture)
+                .fit_to_exact_size(size)
+                .corner_radius(corner(Radius::BUTTON))
+                .sense(Sense::drag()),
+        );
+        response
+            .clone()
+            .on_hover_text("Drag to place camera; preview is mirrored exactly as recorded");
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Image,
+                true,
+                "Live camera preview; drag to place",
+            )
+        });
+        if enabled
+            && response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let local = pointer - response.rect.min;
+            let output = scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(0.0, 0.0),
+                scrozz_core::LogicalSize::new(
+                    f64::from(response.rect.width()),
+                    f64::from(response.rect.height()),
+                ),
+            );
+            if let Ok(moved) = move_camera(
+                output,
+                preview.frame.oriented_aspect(),
+                4.0,
+                8.0,
+                scrozz_core::LogicalPoint::new(f64::from(local.x), f64::from(local.y)),
+                settings,
+            ) {
+                settings = moved;
+            }
+        }
+    }
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut settings.presenter, false, "Picture in picture");
+            ui.selectable_value(&mut settings.presenter, true, "Presenter");
+        });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Position")
+                    .font(theme.font(Text::Label))
+                    .color(theme.palette.text_muted),
+            );
+            let previous = settings.position;
+            ComboBox::from_id_salt("recording-camera-position")
+                .selected_text(camera_anchor_label(settings.position))
+                .show_ui(ui, |ui| {
+                    for anchor in OverlayAnchor::ALL {
+                        ui.selectable_value(
+                            &mut settings.position,
+                            anchor,
+                            camera_anchor_label(anchor),
+                        );
+                    }
+                });
+            if settings.position != previous {
+                settings.placement = None;
+            }
+        });
+        if settings.presenter {
+            caption(
+                ui,
+                theme,
+                "Presenter fills the canvas; PiP shape is preserved.",
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Shape")
+                        .font(theme.font(Text::Label))
+                        .color(theme.palette.text_muted),
+                );
+                ComboBox::from_id_salt("recording-camera-shape")
+                    .selected_text(camera_shape_label(settings.shape))
+                    .show_ui(ui, |ui| {
+                        for shape in CameraShape::ALL {
+                            ui.selectable_value(
+                                &mut settings.shape,
+                                shape,
+                                camera_shape_label(shape),
+                            );
+                        }
+                    });
+            });
+        }
+        ui.add(
+            Slider::new(
+                &mut settings.size,
+                CameraSettings::MIN_SIZE..=CameraSettings::MAX_SIZE,
+            )
+            .text("Camera size")
+            .show_value(false),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut settings.mirror, "Mirror");
+            ui.checkbox(&mut settings.border, "Border");
+            ui.checkbox(&mut settings.shadow, "Shadow");
+            if settings.presenter {
+                ui.checkbox(&mut settings.presenter_screen, "Screen inset");
+            }
+        });
+    });
+    (settings != original).then_some(settings)
+}
+
+fn camera_anchor_label(anchor: OverlayAnchor) -> &'static str {
+    match anchor {
+        OverlayAnchor::TopLeft => "Top left",
+        OverlayAnchor::TopCenter => "Top center",
+        OverlayAnchor::TopRight => "Top right",
+        OverlayAnchor::BottomLeft => "Bottom left",
+        OverlayAnchor::BottomCenter => "Bottom center",
+        OverlayAnchor::BottomRight => "Bottom right",
+    }
+}
+
+fn camera_shape_label(shape: CameraShape) -> &'static str {
+    match shape {
+        CameraShape::Circle => "Circle",
+        CameraShape::Rounded => "Rounded rectangle",
+        CameraShape::Square => "Square",
+        CameraShape::Rectangle => "Rectangle",
+    }
+}
+
+#[derive(Clone)]
+struct CameraTexture {
+    sequence: u64,
+    settings: CameraSettings,
+    handle: TextureHandle,
+}
+
+fn camera_texture(ctx: &egui::Context, preview: &CameraPreview) -> Option<SizedTexture> {
+    let id = egui::Id::new("scrozz-recording-camera-preview");
+    let sequence = preview.status.frames_received;
+    let mut state = ctx.data_mut(|data| data.get_temp::<CameraTexture>(id));
+    if state
+        .as_ref()
+        .is_none_or(|texture| texture.sequence != sequence || texture.settings != preview.settings)
+    {
+        let (width, height) = preview_size(preview, 144, 96);
+        let rendered =
+            render_camera_preview(&preview.frame, width, height, preview.settings).ok()?;
+        let mut rgba = rendered.data;
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+        if let Some(state) = &mut state {
+            state.handle.set(image, egui::TextureOptions::LINEAR);
+            state.sequence = sequence;
+            state.settings = preview.settings;
+        } else {
+            state = Some(CameraTexture {
+                sequence,
+                settings: preview.settings,
+                handle: ctx.load_texture(
+                    "scrozz.recording.camera.preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ),
+            });
+        }
+        if let Some(state) = &state {
+            ctx.data_mut(|data| data.insert_temp(id, state.clone()));
+        }
+    }
+    state
+        .as_ref()
+        .map(|state| SizedTexture::from_handle(&state.handle))
+}
+
 fn status_mark(ui: &mut Ui, theme: &Theme, phase: RecordingPhase) {
     let (rect, response) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::hover());
     let color = match phase {
@@ -430,6 +716,9 @@ impl Scene for RecordingHudScene {
                     drift: fixture.drift,
                     output: fixture.output.as_ref(),
                     failure: fixture.failure.as_ref(),
+                    camera_status: fixture.camera_status.as_ref(),
+                    camera_preview: fixture.camera_preview.as_ref(),
+                    camera_settings: fixture.camera_settings,
                 },
                 &theme,
             )

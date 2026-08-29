@@ -638,13 +638,15 @@ pub enum CameraShape {
     Circle,
     /// A rounded rectangle at the camera's own aspect ratio.
     Rounded,
+    /// A square without rounded corners.
+    Square,
     /// A plain rectangle at the camera's own aspect ratio.
     Rectangle,
 }
 
 impl CameraShape {
     /// Every shape, in a stable order.
-    pub const ALL: [Self; 3] = [Self::Circle, Self::Rounded, Self::Rectangle];
+    pub const ALL: [Self; 4] = [Self::Circle, Self::Rounded, Self::Square, Self::Rectangle];
 
     /// The stable settings slug.
     #[must_use]
@@ -652,6 +654,7 @@ impl CameraShape {
         match self {
             Self::Circle => "circle",
             Self::Rounded => "rounded",
+            Self::Square => "square",
             Self::Rectangle => "rectangle",
         }
     }
@@ -668,7 +671,43 @@ impl CameraShape {
     /// Whether the shape forces a square frame, cropping the camera image.
     #[must_use]
     pub const fn is_square(self) -> bool {
-        matches!(self, Self::Circle)
+        matches!(self, Self::Circle | Self::Square)
+    }
+}
+
+/// Free camera placement within the safe recording area.
+///
+/// `(0, 0)` is the top-left available position and `(1, 1)` is bottom-right.
+/// `None` on [`CameraSettings::placement`] retains the named anchor, which is
+/// easier to configure from a keyboard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraPlacement {
+    /// Horizontal alignment inside the safe area.
+    pub x: f32,
+    /// Vertical alignment inside the safe area.
+    pub y: f32,
+}
+
+impl CameraPlacement {
+    /// Creates a validated normalized placement.
+    pub fn new(x: f32, y: f32) -> Result<Self> {
+        let value = Self { x, y };
+        value.validate()
+    }
+
+    /// Validates both normalized coordinates.
+    pub fn validate(self) -> Result<Self> {
+        if !self.x.is_finite()
+            || !self.y.is_finite()
+            || !(0.0..=1.0).contains(&self.x)
+            || !(0.0..=1.0).contains(&self.y)
+        {
+            return Err(Error::InvalidRequest(format!(
+                "camera placement ({}, {}) must be finite and inside 0..=1",
+                self.x, self.y
+            )));
+        }
+        Ok(self)
     }
 }
 
@@ -679,6 +718,8 @@ pub struct CameraSettings {
     pub enabled: bool,
     /// Which corner the picture sits in.
     pub position: OverlayAnchor,
+    /// Optional free placement established by dragging.
+    pub placement: Option<CameraPlacement>,
     /// The picture's height as a fraction of the recorded region's shorter
     /// edge. A fraction rather than pixels so one setting looks right on a
     /// laptop panel and on a 5K display.
@@ -688,12 +729,18 @@ pub struct CameraSettings {
     /// Presenter mode: the camera fills the frame and the screen is inset, or
     /// dropped entirely (REC-26).
     pub presenter: bool,
+    /// Keep a shared-screen inset in presenter mode.
+    pub presenter_screen: bool,
     /// Mirror the camera image horizontally.
     ///
     /// On by default because an unmirrored self-view reads as wrong to the
     /// person on camera — it is the one place where "what the lens saw" is the
     /// less useful truth.
     pub mirror: bool,
+    /// Draw a high-contrast edge around the camera layer.
+    pub border: bool,
+    /// Draw a restrained shadow behind floating camera/screen layers.
+    pub shadow: bool,
 }
 
 impl CameraSettings {
@@ -717,6 +764,9 @@ impl CameraSettings {
                 Self::MAX_SIZE
             )));
         }
+        if let Some(placement) = self.placement {
+            placement.validate()?;
+        }
         Ok(self)
     }
 }
@@ -726,10 +776,14 @@ impl Default for CameraSettings {
         Self {
             enabled: false,
             position: OverlayAnchor::BottomRight,
+            placement: None,
             size: 0.22,
             shape: CameraShape::Circle,
             presenter: false,
+            presenter_screen: true,
             mirror: true,
+            border: true,
+            shadow: true,
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use scrozz_core::{Error, Result};
+use scrozz_core::{ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, ScaleFactor};
 use windows::{
     Graphics::DirectX::Direct3D11::{IDirect3DDevice, IDirect3DSurface},
     Win32::{
@@ -10,11 +10,12 @@ use windows::{
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
-                D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+                D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-                D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
+                D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV,
+                D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+                D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
                 D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
@@ -226,6 +227,99 @@ impl Device {
         }
         .map_err(|error| Error::Platform(format!("frame texture creation failed: {error}")))?;
         texture.ok_or_else(|| Error::Platform("D3D11 returned no frame texture".into()))
+    }
+
+    /// Copies an encoder-sized GPU frame into bounded packed BGRA storage.
+    pub fn download_bgra(&self, texture: &ID3D11Texture2D) -> Result<Frame> {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&raw mut description) };
+        if description.Width == 0
+            || description.Height == 0
+            || description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        {
+            return Err(Error::Codec(
+                "camera composition requires a non-empty BGRA screen texture".into(),
+            ));
+        }
+        description.Usage = D3D11_USAGE_STAGING;
+        description.BindFlags = 0;
+        description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0.cast_unsigned();
+        description.MiscFlags = 0;
+        let mut staging = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&raw const description, None, Some(&raw mut staging))
+        }
+        .map_err(|error| {
+            Error::Platform(format!(
+                "camera composition staging texture creation failed: {error}"
+            ))
+        })?;
+        let staging =
+            staging.ok_or_else(|| Error::Platform("D3D11 returned no staging texture".into()))?;
+        unsafe { self.context.CopyResource(&staging, texture) };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))
+        }
+        .map_err(|error| Error::Platform(format!("mapping the screen texture failed: {error}")))?;
+        let row_bytes = description.Width as usize * 4;
+        let result = (|| {
+            if mapped.pData.is_null() || mapped.RowPitch < row_bytes as u32 {
+                return Err(Error::Platform(
+                    "mapped screen texture had invalid BGRA storage".into(),
+                ));
+            }
+            let mut data = Vec::with_capacity(row_bytes * description.Height as usize);
+            for row in 0..description.Height as usize {
+                let source = unsafe {
+                    std::slice::from_raw_parts(
+                        mapped
+                            .pData
+                            .cast::<u8>()
+                            .add(row * mapped.RowPitch as usize),
+                        row_bytes,
+                    )
+                };
+                data.extend_from_slice(source);
+            }
+            Ok(Frame {
+                data,
+                size: PhysicalSize::new(
+                    f64::from(description.Width),
+                    f64::from(description.Height),
+                ),
+                stride: row_bytes,
+                format: PixelFormat::Bgra8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            })
+        })();
+        unsafe { self.context.Unmap(&staging, 0) };
+        result
+    }
+
+    /// Uploads a tightly packed BGRA frame for the existing MF encoder.
+    pub fn upload_bgra(&self, frame: &Frame) -> Result<ID3D11Texture2D> {
+        if !frame.is_well_formed() || frame.format != PixelFormat::Bgra8 {
+            return Err(Error::InvalidRequest(
+                "camera-composited Windows frame must be well-formed BGRA".into(),
+            ));
+        }
+        let texture = self.create_texture(frame.width(), frame.height())?;
+        unsafe {
+            self.context.UpdateSubresource(
+                &texture,
+                0,
+                None,
+                frame.data.as_ptr().cast(),
+                u32::try_from(frame.stride)
+                    .map_err(|_| Error::Platform("screen stride exceeds u32".into()))?,
+                0,
+            );
+        }
+        Ok(texture)
     }
 }
 

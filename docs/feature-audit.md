@@ -114,6 +114,13 @@ background / custom image / plain color / transparent, shadow on/off.
 | REC-25 | Camera position / size / shape | T2 | Rendering |
 | REC-26 | Camera fullscreen (presenter) mode | T2 | Rendering |
 
+REC-24–26 share one normalized composition contract: stable device preferences
+never retain native handles, camera queues are bounded, PiP placement is
+safe-area-aware across scale factors, and live PiP/presenter changes do not
+restart the encoder timeline. Platform adapters remain native (AVFoundation,
+Media Foundation, V4L2) and expose permission/device failures rather than
+substituting synthetic frames.
+
 ### Video editor
 
 | ID | Feature | Tier | Notes |

@@ -1,6 +1,7 @@
 //! Windows.Graphics.Capture, WASAPI, and Media Foundation recording.
 
 mod audio;
+mod camera;
 mod com;
 mod device;
 mod encoder;
@@ -32,6 +33,7 @@ impl RecordingEngine for WindowsEngine {
             video: true,
             system_audio: true,
             microphone: true,
+            camera: true,
             pause_resume: true,
             display: true,
             window: true,
@@ -48,4 +50,14 @@ impl RecordingEngine for WindowsEngine {
     fn start(&self, request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
         session::start(request)
     }
+}
+
+pub(crate) fn camera_devices() -> Result<Vec<crate::CameraDevice>> {
+    camera::devices()
+}
+
+pub(crate) fn start_preview(
+    request: &crate::CameraRequest,
+) -> Result<Box<dyn crate::CameraPreviewSession>> {
+    camera::start_preview(request)
 }

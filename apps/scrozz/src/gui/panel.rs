@@ -32,7 +32,7 @@ use std::ffi::c_void;
 use std::{cell::RefCell, rc::Rc};
 
 use raw_window_handle::HasWindowHandle;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use raw_window_handle::RawWindowHandle;
 use scrozz_shell::{NativeOverlay, OverlayBehavior};
 use scrozz_ui::PanelReport;
@@ -228,7 +228,26 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             PanelReport::unsupported(detail)
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+                return PanelReport::unsupported(
+                    "the overlay window is not a Win32 window, so it cannot be excluded from capture",
+                );
+            };
+            match
+                // SAFETY: the creation-context handle borrows this live top-level window.
+                unsafe {
+                    scrozz_shell::windows::overlay::configure(win32.hwnd.get() as *mut c_void)
+                } {
+                Ok(()) => PanelReport::converted(
+                    "the Win32 overlay is non-activating, topmost, and excluded from display capture",
+                ),
+                Err(error) => PanelReport::unsupported(error.to_string()),
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = handle;
             let _ = controller;

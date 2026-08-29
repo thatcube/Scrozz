@@ -2,3 +2,4 @@
 
 pub mod apartment;
 pub mod identity;
+pub mod overlay;

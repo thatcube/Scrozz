@@ -331,7 +331,7 @@ pub struct CameraLayout {
     /// PiP or presenter composition.
     pub mode: CameraLayoutMode,
     /// Rectangle occupied by screen content.
-    pub screen: LogicalRect,
+    pub screen: Option<LogicalRect>,
     /// Rectangle occupied by camera content.
     pub camera: LogicalRect,
     /// Camera source crop behavior.
@@ -361,6 +361,7 @@ pub fn layout_camera(
     if !settings.enabled {
         return Ok(None);
     }
+
     settings.validate()?;
     validate_rect(output, "camera output")?;
     if !source_aspect.is_finite() || source_aspect <= 0.0 {
@@ -384,8 +385,22 @@ pub fn layout_camera(
 
     if settings.presenter {
         let scale = (1.0 - f64::from(settings.size)).clamp(0.5, 0.85);
-        let screen_size = LogicalSize::new(available_width * scale, available_height * scale);
-        let screen = anchored_rect(output, screen_size, margin, settings.position);
+        let bounds = LogicalSize::new(available_width * scale, available_height * scale);
+        let output_aspect = output.size.width / output.size.height;
+        let screen_size = if bounds.width / bounds.height > output_aspect {
+            LogicalSize::new(bounds.height * output_aspect, bounds.height)
+        } else {
+            LogicalSize::new(bounds.width, bounds.width / output_aspect)
+        };
+        let screen = settings.presenter_screen.then(|| {
+            positioned_rect(
+                output,
+                screen_size,
+                margin,
+                settings.position,
+                settings.placement,
+            )
+        });
         return Ok(Some(CameraLayout {
             mode: CameraLayoutMode::Presenter,
             screen,
@@ -411,15 +426,16 @@ pub fn layout_camera(
         .min(1.0);
     width *= fit;
     height *= fit;
-    let camera = anchored_rect(
+    let camera = positioned_rect(
         output,
         LogicalSize::new(width, height),
         margin,
         settings.position,
+        settings.placement,
     );
     Ok(Some(CameraLayout {
         mode: CameraLayoutMode::PictureInPicture,
-        screen: output,
+        screen: Some(output),
         camera,
         crop,
         shape: settings.shape,
@@ -427,17 +443,101 @@ pub fn layout_camera(
     }))
 }
 
-fn anchored_rect(
+/// Updates free camera placement from a pointer position and snaps near anchors.
+///
+/// The returned settings remain resolution-independent: arbitrary placement is
+/// normalized to the safe area, while snapped placement stores only the named
+/// anchor. This is what lets a drag performed on a scaled preview reproduce in
+/// the encoded output.
+pub fn move_camera(
+    output: LogicalRect,
+    source_aspect: f64,
+    margin: f64,
+    snap_distance: f64,
+    pointer: LogicalPoint,
+    mut settings: CameraSettings,
+) -> Result<CameraSettings> {
+    if !pointer.x.is_finite()
+        || !pointer.y.is_finite()
+        || !snap_distance.is_finite()
+        || snap_distance < 0.0
+    {
+        return Err(Error::InvalidRequest(
+            "camera drag coordinates and snap distance must be finite".to_owned(),
+        ));
+    }
+    let layout = layout_camera(output, source_aspect, margin, settings)?
+        .ok_or_else(|| Error::InvalidRequest("cannot move a disabled camera".to_owned()))?;
+    let moving = if settings.presenter {
+        layout.screen.unwrap_or(layout.camera)
+    } else {
+        layout.camera
+    };
+    let available_width = (output.size.width - margin * 2.0 - moving.size.width).max(0.0);
+    let available_height = (output.size.height - margin * 2.0 - moving.size.height).max(0.0);
+    let wanted_x = (pointer.x - moving.size.width * 0.5 - output.origin.x - margin)
+        .clamp(0.0, available_width);
+    let wanted_y = (pointer.y - moving.size.height * 0.5 - output.origin.y - margin)
+        .clamp(0.0, available_height);
+
+    let mut nearest = None;
+    for anchor in crate::settings::OverlayAnchor::ALL {
+        let (unit_x, unit_y) = anchor.unit();
+        let anchor_x = available_width * f64::from(unit_x);
+        let anchor_y = available_height * f64::from(unit_y);
+        let distance = ((wanted_x - anchor_x).powi(2) + (wanted_y - anchor_y).powi(2)).sqrt();
+        if distance <= snap_distance && nearest.is_none_or(|(_, best)| distance < best) {
+            nearest = Some((anchor, distance));
+        }
+    }
+    if let Some((anchor, _)) = nearest {
+        settings.position = anchor;
+        settings.placement = None;
+    } else {
+        settings.placement = Some(crate::settings::CameraPlacement::new(
+            if available_width == 0.0 {
+                0.0
+            } else {
+                (wanted_x / available_width) as f32
+            },
+            if available_height == 0.0 {
+                0.0
+            } else {
+                (wanted_y / available_height) as f32
+            },
+        )?);
+    }
+    Ok(settings)
+}
+
+/// Applies a resize gesture while preserving the validated camera-size range.
+#[must_use]
+pub fn resize_camera(mut settings: CameraSettings, delta_fraction: f32) -> CameraSettings {
+    if delta_fraction.is_finite() {
+        settings.size = (settings.size + delta_fraction)
+            .clamp(CameraSettings::MIN_SIZE, CameraSettings::MAX_SIZE);
+    }
+    settings
+}
+
+fn positioned_rect(
     output: LogicalRect,
     size: LogicalSize,
     margin: f64,
     anchor: crate::settings::OverlayAnchor,
+    placement: Option<crate::settings::CameraPlacement>,
 ) -> LogicalRect {
-    let (unit_x, unit_y) = anchor.unit();
+    let (unit_x, unit_y) = placement.map_or_else(
+        || {
+            let (x, y) = anchor.unit();
+            (f64::from(x), f64::from(y))
+        },
+        |position| (f64::from(position.x), f64::from(position.y)),
+    );
     let available_width = output.size.width - margin * 2.0;
     let available_height = output.size.height - margin * 2.0;
-    let x = output.origin.x + margin + (available_width - size.width) * f64::from(unit_x);
-    let y = output.origin.y + margin + (available_height - size.height) * f64::from(unit_y);
+    let x = output.origin.x + margin + (available_width - size.width) * unit_x;
+    let y = output.origin.y + margin + (available_height - size.height) * unit_y;
     LogicalRect::new(LogicalPoint::new(x, y), size)
 }
 
@@ -659,11 +759,10 @@ mod tests {
         assert_eq!(layout.camera, output());
         assert_eq!(layout.crop, CameraCrop::FillOutput);
         assert_eq!(layout.shape, CameraShape::Rectangle);
-        assert!(layout.screen.size.width < layout.camera.size.width);
-        assert_eq!(
-            layout.screen.origin.x + layout.screen.size.width,
-            1920.0 - 30.0
-        );
+        let screen = layout.screen.unwrap();
+        assert!(screen.size.width < layout.camera.size.width);
+        assert!((screen.size.width / screen.size.height - 16.0 / 9.0).abs() < 1e-9);
+        assert_eq!(screen.origin.x + screen.size.width, 1920.0 - 30.0);
     }
 
     #[test]
@@ -674,5 +773,65 @@ mod tests {
         };
         assert!(layout_camera(output(), f64::NAN, 20.0, settings).is_err());
         assert!(layout_camera(output(), 1.0, 600.0, settings).is_err());
+    }
+
+    #[test]
+    fn drag_snaps_to_safe_area_and_free_placement_scales_across_dpi() {
+        let settings = CameraSettings {
+            enabled: true,
+            shape: CameraShape::Circle,
+            ..CameraSettings::default()
+        };
+        let snapped = move_camera(
+            output(),
+            16.0 / 9.0,
+            24.0,
+            30.0,
+            LogicalPoint::new(1_850.0, 1_010.0),
+            settings,
+        )
+        .unwrap();
+        assert_eq!(snapped.position, OverlayAnchor::BottomRight);
+        assert!(snapped.placement.is_none());
+
+        let free = move_camera(
+            output(),
+            16.0 / 9.0,
+            24.0,
+            4.0,
+            LogicalPoint::new(800.0, 420.0),
+            settings,
+        )
+        .unwrap();
+        let one_x = layout_camera(output(), 16.0 / 9.0, 24.0, free)
+            .unwrap()
+            .unwrap()
+            .camera
+            .origin
+            .x;
+        let doubled = LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            LogicalSize::new(3840.0, 2160.0),
+        );
+        let two_x = layout_camera(doubled, 16.0 / 9.0, 48.0, free)
+            .unwrap()
+            .unwrap()
+            .camera
+            .origin
+            .x;
+        assert!((two_x - one_x * 2.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn resize_clamps_without_disabling_camera() {
+        let settings = CameraSettings {
+            enabled: true,
+            ..CameraSettings::default()
+        };
+        assert_eq!(resize_camera(settings, 10.0).size, CameraSettings::MAX_SIZE);
+        assert_eq!(
+            resize_camera(settings, -10.0).size,
+            CameraSettings::MIN_SIZE
+        );
     }
 }

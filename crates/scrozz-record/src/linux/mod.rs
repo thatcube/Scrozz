@@ -1,5 +1,6 @@
 //! Linux recording orchestration.
 
+mod camera;
 #[cfg(feature = "linux-native")]
 mod source;
 
@@ -25,6 +26,7 @@ impl RecordingEngine for LinuxEngine {
             video: true,
             system_audio: true,
             microphone: true,
+            camera: true,
             pause_resume: true,
             display: true,
             window: true,
@@ -46,6 +48,17 @@ impl RecordingEngine for LinuxEngine {
     }
 }
 
+pub(crate) fn camera_devices() -> scrozz_core::Result<Vec<crate::CameraDevice>> {
+    camera::devices()
+}
+
+#[cfg(feature = "linux-native")]
+pub(crate) fn start_preview(
+    request: &crate::CameraRequest,
+) -> scrozz_core::Result<Box<dyn crate::CameraPreviewSession>> {
+    camera::start_preview(request)
+}
+
 #[cfg(feature = "linux-native")]
 mod native {
     use std::collections::{BTreeMap, VecDeque};
@@ -63,6 +76,7 @@ mod native {
 
     use super::source::{AudioBatch, PipeWireAudio, VideoSource, open_video_source};
     use crate::audio::{AudioBuffer, AudioMixer};
+    use crate::camera::CameraCompositor;
     use crate::config::{RecordingConfig, resolve_dimensions};
     use crate::encoder::aac::{AacEncoder, EncodedAudioPacket};
     use crate::encoder::{self, EncodedVideoPacket, VideoEncoder, VideoEncoderSettings};
@@ -75,9 +89,10 @@ mod native {
     use crate::state::{RecorderCommand, RecorderState, RecordingStateMachine};
     use crate::timeline::RecordingTimeline;
     use crate::{
-        Quality, Recording, RecordingMetadata, RecordingRequest, RecordingResolution,
-        RecordingSession, RecordingState as PublicRecordingState, Salvageability, SessionEvent,
-        VideoCodec,
+        CameraFeed, CameraFrame, CameraRecordingMetadata, CameraRuntimeStatus, Quality, Recording,
+        RecordingMetadata, RecordingRequest, RecordingResolution, RecordingSession,
+        RecordingState as PublicRecordingState, Salvageability, SessionEvent, VideoCodec,
+        settings::CameraSettings,
     };
 
     static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -97,6 +112,7 @@ mod native {
 
     enum WorkerSignal {
         FirstFrame,
+        Warning(String),
         Terminal(Box<Result<Recording>>),
     }
 
@@ -199,6 +215,7 @@ mod native {
         elapsed_nanos: Arc<AtomicU64>,
         state: Arc<AtomicU8>,
         temporary_output: Option<TemporaryOutput>,
+        camera: Option<CameraFeed>,
     }
 
     impl LinuxRecordingSession {
@@ -238,7 +255,7 @@ mod native {
         fn receive_terminal(&mut self) {
             while self.terminal.is_none() {
                 match self.signals.recv() {
-                    Ok(WorkerSignal::FirstFrame) => {}
+                    Ok(WorkerSignal::FirstFrame | WorkerSignal::Warning(_)) => {}
                     Ok(WorkerSignal::Terminal(result)) => self.cache_terminal(*result),
                     Err(_) => self.cache_disconnected_terminal(),
                 }
@@ -311,6 +328,7 @@ mod native {
             }
             match self.signals.try_recv() {
                 Ok(WorkerSignal::FirstFrame) => Some(SessionEvent::FirstFrame),
+                Ok(WorkerSignal::Warning(warning)) => Some(SessionEvent::Warning(warning)),
                 Ok(WorkerSignal::Terminal(result)) => {
                     self.cache_terminal(*result);
                     self.emit_terminal()
@@ -325,6 +343,25 @@ mod native {
 
         fn engine_elapsed_secs(&self) -> Option<f64> {
             Some(self.elapsed_nanos.load(Ordering::Acquire) as f64 / 1_000_000_000.0)
+        }
+
+        fn camera_status(&self) -> Option<CameraRuntimeStatus> {
+            self.camera.as_ref().map(CameraFeed::status)
+        }
+
+        fn camera_preview(&self) -> Option<crate::CameraPreview> {
+            self.camera.as_ref().and_then(|camera| {
+                camera.preview(Duration::from_nanos(
+                    self.elapsed_nanos.load(Ordering::Acquire),
+                ))
+            })
+        }
+
+        fn update_camera(&mut self, settings: CameraSettings) -> Result<()> {
+            self.camera
+                .as_ref()
+                .ok_or_else(|| Error::InvalidRequest("this recording has no active camera".into()))?
+                .update_settings(settings)
         }
 
         fn stop(mut self: Box<Self>) -> Result<Recording> {
@@ -365,6 +402,7 @@ mod native {
 
     pub(super) fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
         let config = RecordingConfig::try_from(request)?;
+        let camera = config.camera.as_ref().map(CameraFeed::new).transpose()?;
         let (control_tx, control_rx) = mpsc::channel();
         let (initialised_tx, initialised_rx) = mpsc::sync_channel(0);
         let (signal_tx, signal_rx) = mpsc::channel();
@@ -372,6 +410,7 @@ mod native {
         let worker_elapsed = Arc::clone(&elapsed_nanos);
         let state = Arc::new(AtomicU8::new(SESSION_RECORDING));
         let worker_state = Arc::clone(&state);
+        let worker_camera = camera.clone();
         let worker = thread::Builder::new()
             .name("scrozz-linux-recording".into())
             .spawn(move || {
@@ -382,6 +421,7 @@ mod native {
                     signal_tx,
                     worker_elapsed,
                     worker_state,
+                    worker_camera,
                 )
             })
             .map_err(Error::Io)?;
@@ -396,6 +436,7 @@ mod native {
                 elapsed_nanos,
                 state,
                 temporary_output,
+                camera,
             })),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -419,8 +460,9 @@ mod native {
         signals: Sender<WorkerSignal>,
         elapsed_nanos: Arc<AtomicU64>,
         session_state: Arc<AtomicU8>,
+        camera_feed: Option<CameraFeed>,
     ) {
-        match Worker::initialize(config) {
+        match Worker::initialize(config, camera_feed) {
             Ok(WorkerStartup::Ready(mut worker)) => {
                 let temporary_output = worker.temporary_output.clone();
                 session_state.store(SESSION_RECORDING, Ordering::Release);
@@ -476,6 +518,9 @@ mod native {
         video_encoder: Box<dyn VideoEncoder>,
         resolved_codec: VideoCodec,
         audio_source: Option<PipeWireAudio>,
+        camera: Option<super::camera::CameraCapture>,
+        camera_feed: Option<CameraFeed>,
+        camera_compositor: CameraCompositor,
         audio_encoder: Option<AacEncoder>,
         audio_watermark: AudioWatermarkMixer,
         audio_cursor: u64,
@@ -667,7 +712,10 @@ mod native {
     }
 
     impl Worker {
-        fn initialize(mut config: RecordingConfig) -> Result<WorkerStartup> {
+        fn initialize(
+            mut config: RecordingConfig,
+            camera_feed: Option<CameraFeed>,
+        ) -> Result<WorkerStartup> {
             let mut source = open_video_source(&config.target, config.show_cursor)?;
             let first_frame = source.next_frame(Duration::from_secs(15))?.ok_or_else(|| {
                 Error::Platform("the capture source delivered no frame within 15 seconds".into())
@@ -687,6 +735,17 @@ mod native {
                 first_frame.height,
                 backing_scale,
             )?;
+            if let Some(camera) = &camera_feed {
+                camera.set_output_size(dimensions.width, dimensions.height)?;
+            }
+            let camera = match (config.camera.clone(), camera_feed.clone()) {
+                (Some(request), Some(feed)) => {
+                    let camera = super::camera::CameraCapture::start(request, feed.clone())?;
+                    feed.activate();
+                    Some(camera)
+                }
+                _ => None,
+            };
             let video_encoder = encoder::open(
                 config.codec,
                 VideoEncoderSettings {
@@ -740,6 +799,7 @@ mod native {
                             codec: resolved_codec,
                             quality: config.quality,
                             resolution: config.resolution,
+                            camera: None,
                             partial: None,
                         },
                         temporary,
@@ -761,6 +821,7 @@ mod native {
                         codec: resolved_codec,
                         quality: config.quality,
                         resolution: config.resolution,
+                        camera: None,
                         partial: None,
                     },
                     temporary,
@@ -792,6 +853,9 @@ mod native {
                 video_encoder,
                 resolved_codec,
                 audio_source,
+                camera,
+                camera_feed,
+                camera_compositor: CameraCompositor::default(),
                 audio_encoder: audio_encoder.take(),
                 audio_watermark,
                 audio_cursor: 0,
@@ -940,6 +1004,13 @@ mod native {
                     failure = Some(error.to_string());
                     break;
                 }
+                if let Some(warning) = self
+                    .camera
+                    .as_ref()
+                    .and_then(super::camera::CameraCapture::try_warning)
+                {
+                    let _ = signals.send(WorkerSignal::Warning(warning));
+                }
                 let Some(captured) = captured else {
                     continue;
                 };
@@ -957,6 +1028,13 @@ mod native {
                         self.last_timeline_frame_end = self
                             .last_timeline_frame_end
                             .max(frame_index.saturating_add(1));
+                        let captured = match self.compose_camera(captured, media_time) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                failure = Some(error.to_string());
+                                break;
+                            }
+                        };
                         match to_nv12(&captured, self.dimensions) {
                             Ok(frame) => {
                                 if let Err(error) = self.encode_video(&frame, frame_index) {
@@ -991,6 +1069,44 @@ mod native {
             self.finalise(duration, user_stopped, failure)
         }
 
+        fn compose_camera(
+            &mut self,
+            captured: PackedFrame,
+            media_time: Duration,
+        ) -> Result<PackedFrame> {
+            let (Some(camera), Some(feed)) = (&self.camera, &self.camera_feed) else {
+                return Ok(captured);
+            };
+            let (latest, superseded) = camera.take_latest_frame();
+            feed.note_drops(superseded);
+            if let Some(frame) = latest {
+                if frame.captured_at.elapsed() <= crate::camera::MAX_CAMERA_FRAME_AGE {
+                    let _ = feed.push(CameraFrame::new(
+                        frame.pixels,
+                        media_time,
+                        frame.orientation,
+                    )?)?;
+                } else {
+                    feed.note_drop();
+                }
+            }
+            let camera_frame = feed.frame_for(media_time);
+            let settings = feed.settings();
+            if camera_frame.is_none() && !settings.presenter {
+                return Ok(captured);
+            }
+            let mut captured = captured.into_bgra()?;
+            self.camera_compositor.compose_optional(
+                &mut captured.data,
+                captured.width,
+                captured.height,
+                captured.stride,
+                camera_frame.as_ref(),
+                settings,
+            )?;
+            Ok(captured)
+        }
+
         fn handle_control(
             &mut self,
             control: Control,
@@ -1009,6 +1125,13 @@ mod native {
                         .and_then(|()| timeline.media_time(now))
                         .map(|elapsed| publish_elapsed(elapsed_nanos, elapsed));
                     if result.is_ok() {
+                        if let Some(camera) = &self.camera {
+                            let discarded = camera.set_paused(true);
+                            if let Some(feed) = &self.camera_feed {
+                                feed.note_drops(discarded);
+                                feed.clear_frames();
+                            }
+                        }
                         self.audio_suspended = true;
                         session_state.store(SESSION_PAUSED, Ordering::Release);
                     }
@@ -1023,6 +1146,13 @@ mod native {
                         .and_then(|()| timeline.media_time(now))
                         .map(|elapsed| publish_elapsed(elapsed_nanos, elapsed));
                     if result.is_ok() {
+                        if let Some(camera) = &self.camera {
+                            let discarded = camera.set_paused(false);
+                            if let Some(feed) = &self.camera_feed {
+                                feed.note_drops(discarded);
+                                feed.clear_frames();
+                            }
+                        }
                         self.audio_suspended = false;
                         self.audio_frame_offset = None;
                         self.audio_watermark.reset();
@@ -1156,6 +1286,17 @@ mod native {
             user_stopped: bool,
             mut failure: Option<String>,
         ) -> Result<Recording> {
+            if let Some(mut camera) = self.camera.take() {
+                camera.stop();
+            }
+            let camera = self.camera_feed.as_ref().map(|feed| {
+                let metadata = Box::new(CameraRecordingMetadata::from_runtime(
+                    feed.settings(),
+                    &feed.status(),
+                ));
+                feed.stop();
+                metadata
+            });
             if !self.audio_suspended {
                 match self.capture_audio(true) {
                     Ok(()) => {}
@@ -1245,6 +1386,7 @@ mod native {
                 codec: self.resolved_codec,
                 quality: self.config.quality,
                 resolution: self.config.resolution,
+                camera,
                 partial,
             })
         }
@@ -1270,6 +1412,7 @@ mod native {
         codec: VideoCodec,
         quality: Quality,
         resolution: RecordingResolution,
+        camera: Option<Box<CameraRecordingMetadata>>,
         partial: Option<(Salvageability, String)>,
     }
 
@@ -1317,6 +1460,7 @@ mod native {
             video_codec: Some(report.codec),
             quality: Some(report.quality),
             resolution: Some(report.resolution),
+            camera: report.camera,
         };
         let mut recording =
             Recording::native(report.path, report.duration_secs, report.engine_name)?;
@@ -1778,6 +1922,7 @@ mod native {
                 codec: VideoCodec::Av1,
                 quality: Quality::High,
                 resolution: RecordingResolution::MaxShortestEdge(720),
+                camera: None,
                 partial: Some((
                     Salvageability::InitialisationOnly,
                     "no complete media fragment".into(),
@@ -1838,6 +1983,7 @@ mod native {
                 codec: VideoCodec::Av1,
                 quality: Quality::Balanced,
                 resolution: RecordingResolution::Native,
+                camera: None,
                 partial: Some((Salvageability::InitialisationOnly, "test partial".into())),
             })
             .unwrap();
@@ -2026,6 +2172,7 @@ mod native {
                 elapsed_nanos,
                 state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
                 temporary_output: None,
+                camera: None,
             };
 
             assert!(matches!(poll_until(&mut session), SessionEvent::FirstFrame));
@@ -2059,6 +2206,7 @@ mod native {
                 elapsed_nanos: Arc::new(AtomicU64::new(0)),
                 state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
                 temporary_output: None,
+                camera: None,
             };
             let SessionEvent::Failed(error) = poll_until(&mut session) else {
                 panic!("expected terminal failure event");
@@ -2089,6 +2237,7 @@ mod native {
                 elapsed_nanos: Arc::new(AtomicU64::new(0)),
                 state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
                 temporary_output: None,
+                camera: None,
             };
             let SessionEvent::Failed(error) = poll_until(&mut session) else {
                 panic!("expected terminal failure event");
@@ -2111,6 +2260,7 @@ mod native {
                 elapsed_nanos: Arc::new(AtomicU64::new(0)),
                 state: Arc::clone(&state),
                 temporary_output: None,
+                camera: None,
             };
             assert_eq!(session.state(), RecordingState::Paused);
             state.store(SESSION_STOPPED, std::sync::atomic::Ordering::Release);
@@ -2145,6 +2295,7 @@ mod native {
                 elapsed_nanos: Arc::new(AtomicU64::new(0)),
                 state: Arc::new(AtomicU8::new(SESSION_RECORDING)),
                 temporary_output: Some(temporary),
+                camera: None,
             });
             assert!(!path.exists());
             assert!(!directory.exists());

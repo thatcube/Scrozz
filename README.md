@@ -121,14 +121,17 @@ Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.
 
 Native recording probes are explicitly opt-in. The window-disappearance probe
-uses a disposable window; the microphone probe builds a signed helper app with
-`NSMicrophoneUsageDescription` and may show privacy prompts. Ordinary tests
-never run either probe:
+uses a disposable window; the microphone and camera probes build a signed helper
+app with the required usage descriptions and may show privacy prompts. Ordinary
+tests never run these probes:
 
 ```bash
 SCROZZ_RECORD_WINDOW_SMOKE=1 tools/run-macos-recording-smoke.sh window-disappearance
 tools/run-macos-recording-smoke.sh microphone-package # build/sign only; no prompt
 SCROZZ_RECORD_MIC_SMOKE=1 tools/run-macos-recording-smoke.sh microphone
+tools/run-macos-recording-smoke.sh camera-package    # build/sign only; no prompt
+SCROZZ_CAMERA_PREVIEW_SMOKE=1 tools/run-macos-recording-smoke.sh camera-preview
+SCROZZ_RECORD_CAMERA_SMOKE=1 tools/run-macos-recording-smoke.sh camera
 SCROZZ_PLAYBACK_SMOKE=1 tools/run-macos-playback-smoke.sh # plays a quiet A/V fixture
 cargo run -p scrozz-record --example macos_export_smoke -- source.mp4 output.mp4
 ```
@@ -142,8 +145,11 @@ hotkeys on compositors that refuse to provide them.
 ```bash
 cargo run -p scrozz -- list displays
 cargo run -p scrozz -- list windows
+cargo run -p scrozz -- list cameras
 cargo run -p scrozz -- capture --display primary -o shot.png
 cargo run -p scrozz -- capture --region 0,0,1200,800 --json
+cargo run -p scrozz -- record --camera --camera-shape circle
+cargo run -p scrozz -- record --camera --presenter
 cargo run -p scrozz -- ocr shot.png
 cargo run -p scrozz -- settings get
 cargo run -p scrozz -- --help
@@ -157,6 +163,12 @@ window" apart from "not implemented" apart from "permission denied".
 Capture from a bare `cargo run` will be refused on macOS until you have built and
 approved the app bundle above, for the permission reason described there. That
 refusal is deliberate and tells you exactly which setting to change.
+
+Camera access is likewise requested only after an explicit **Preview camera** or
+recording action. Scrozz remembers the stable device identifier and composition
+preferences, never a native device handle. The recording HUD keeps an in-app
+privacy indicator visible while the camera is active and releases the device as
+soon as preview or recording stops.
 
 ## Contributing & development
 

@@ -75,6 +75,29 @@ impl PackedFrame {
             PackedPixelFormat::Rgba | PackedPixelFormat::Rgbx => (pixel[0], pixel[1], pixel[2]),
         }
     }
+
+    /// Converts this frame to tightly packed opaque BGRA.
+    pub fn into_bgra(self) -> Result<Self> {
+        self.validate()?;
+        let stride = self.width as usize * 4;
+        if self.format == PackedPixelFormat::Bgra && self.stride == stride {
+            return Ok(self);
+        }
+        let mut data = Vec::with_capacity(stride * self.height as usize);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let (red, green, blue) = self.rgb_at(x, y);
+                data.extend_from_slice(&[blue, green, red, 255]);
+            }
+        }
+        Ok(Self {
+            width: self.width,
+            height: self.height,
+            stride,
+            format: PackedPixelFormat::Bgra,
+            data,
+        })
+    }
 }
 
 /// Encoder-ready NV12 frame.
@@ -359,6 +382,21 @@ mod tests {
         .unwrap();
         assert_eq!(nv12.y, vec![235; 8]);
         assert_eq!(nv12.uv, vec![128; 4]);
+    }
+
+    #[test]
+    fn packed_rgba_and_padding_normalize_to_tight_bgra() {
+        let frame = PackedFrame {
+            width: 1,
+            height: 2,
+            stride: 8,
+            format: PackedPixelFormat::Rgba,
+            data: vec![10, 20, 30, 40, 9, 9, 9, 9, 50, 60, 70, 80, 8, 8, 8, 8],
+        };
+        let converted = frame.into_bgra().unwrap();
+        assert_eq!(converted.stride, 4);
+        assert_eq!(converted.format, PackedPixelFormat::Bgra);
+        assert_eq!(converted.data, [30, 20, 10, 255, 70, 60, 50, 255]);
     }
 
     #[test]

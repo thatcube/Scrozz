@@ -71,14 +71,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use scrozz_core::{CaptureTarget, Error, LogicalPoint, LogicalRect, LogicalSize, Result};
+use scrozz_core::{
+    CaptureTarget, ColorSpace, Error, Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
+    PixelFormat, Result, ScaleFactor,
+};
 use scrozz_record::{
-    Recording,
+    CameraDevice, CameraDeviceId, CameraDeviceState, CameraFrame, CameraOrientation,
+    CameraPermission, CameraPreview, CameraRuntimeStatus, Recording,
     edit::{ChannelBehavior, EditPlan, SourceMetadata, TrimRange, VideoDocument},
     engine::EngineCapabilities,
     machine::{ClockDrift, MachineFailure, RecordingPhase},
     selection::{AspectRatio, LastSelectionMemory, SelectionConstraints, SelectionMode},
-    settings::{CountdownSettings, Quality, ResolutionCap},
+    settings::{CameraSettings, CameraShape, CountdownSettings, Quality, ResolutionCap},
     transcode::{TranscodeFailure, TranscodeOutput},
 };
 
@@ -308,6 +312,12 @@ pub enum Scenario {
     SelectorMixedDpi,
     /// The editor collapsed into its narrow stacked arrangement.
     VideoEditingNarrow,
+    /// Active recording with a live camera PiP preview and controls.
+    RecordingCamera,
+    /// Active recording after switching to presenter mode.
+    RecordingPresenter,
+    /// Camera preferences before any permission prompt or preview.
+    CameraSettings,
 }
 
 impl Scenario {
@@ -340,6 +350,9 @@ impl Scenario {
         Self::SelectorAllInOne,
         Self::SelectorMixedDpi,
         Self::VideoEditingNarrow,
+        Self::RecordingCamera,
+        Self::RecordingPresenter,
+        Self::CameraSettings,
     ];
 
     /// Every scenario, in stable declaration order.
@@ -368,6 +381,9 @@ impl Scenario {
             Self::RecordingSelecting => "recording-selecting",
             Self::RecordingCountdown => "recording-countdown",
             Self::RecordingActive => "recording-active",
+            Self::RecordingCamera => "recording-camera",
+            Self::RecordingPresenter => "recording-presenter",
+            Self::CameraSettings => "camera-settings",
             Self::RecordingPaused => "recording-paused",
             Self::RecordingFailedPartial => "recording-failed-partial",
             Self::VideoEditing => "video-editing",
@@ -571,13 +587,15 @@ pub enum Gesture {
 #[derive(Debug, Clone)]
 pub enum RecordingFixture {
     /// Compact recording status and controls.
-    Hud(RecordingHudFixture),
+    Hud(Box<RecordingHudFixture>),
     /// Focused countdown overlay.
     Countdown(RecordingCountdownFixture),
     /// All-in-One target and region selector.
     Selection(RecordingSelectionFixture),
     /// Video transport, edits, and export state.
-    Editor(VideoEditorFixture),
+    Editor(Box<VideoEditorFixture>),
+    /// Explicit camera device and preview settings.
+    CameraSettings(crate::camera_settings::CameraSettingsSnapshot),
 }
 
 /// Deterministic values shown by the recording HUD.
@@ -597,6 +615,12 @@ pub struct RecordingHudFixture {
     pub output: Option<Recording>,
     /// Failure and any salvageable recording.
     pub failure: Option<MachineFailure>,
+    /// Pixel-free camera status.
+    pub camera_status: Option<CameraRuntimeStatus>,
+    /// Deterministic camera preview.
+    pub camera_preview: Option<CameraPreview>,
+    /// Camera composition controls.
+    pub camera_settings: Option<CameraSettings>,
 }
 
 /// Deterministic countdown values.
@@ -981,6 +1005,39 @@ impl Fixture {
                     None,
                     Some(Self::hud_fixture(RecordingPhase::Recording)),
                 ),
+                Scenario::RecordingCamera => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Camera picture in picture",
+                    "The recording HUD keeps a live privacy indicator, preview, position, shape, size, mirror, border, and shadow controls visible without taking focus.",
+                    instants::REST,
+                    None,
+                    Some(Self::camera_hud_fixture(false)),
+                ),
+                Scenario::RecordingPresenter => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Presenter mode",
+                    "The same live camera controls switch to a camera-primary canvas with an optional shared-screen inset and no recording-clock discontinuity.",
+                    instants::REST,
+                    None,
+                    Some(Self::camera_hud_fixture(true)),
+                ),
+                Scenario::CameraSettings => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Camera settings",
+                    "Camera stays off until Preview or recording is explicitly requested; device state and composition are visible before permission is asked.",
+                    instants::REST,
+                    None,
+                    Some(Self::camera_settings_fixture()),
+                ),
                 Scenario::RecordingPaused => (
                     Vec::new(),
                     Gesture::None,
@@ -1206,7 +1263,7 @@ impl Fixture {
                 recovery_error: None,
             }
         });
-        RecordingFixture::Hud(RecordingHudFixture {
+        RecordingFixture::Hud(Box::new(RecordingHudFixture {
             phase,
             elapsed,
             capabilities: EngineCapabilities::ALL,
@@ -1214,6 +1271,103 @@ impl Fixture {
             drift,
             output: None,
             failure,
+            camera_status: None,
+            camera_preview: None,
+            camera_settings: None,
+        }))
+    }
+
+    fn camera_hud_fixture(presenter: bool) -> RecordingFixture {
+        let settings = CameraSettings {
+            enabled: true,
+            presenter,
+            shape: CameraShape::Circle,
+            ..CameraSettings::default()
+        };
+        let width = 320;
+        let height = 180;
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let red = 36 + (x * 100 / width) as u8;
+                let green = 82 + (y * 90 / height) as u8;
+                pixels.extend_from_slice(&[red, green, 176, 255]);
+            }
+        }
+        let status = CameraRuntimeStatus {
+            active: true,
+            privacy_indicator_visible: true,
+            device_state: CameraDeviceState::Available,
+            frames_received: 127,
+            dropped_frames: 2,
+            queued_frames: 3,
+            warning: None,
+        };
+        let frame = CameraFrame::new(
+            Frame {
+                data: pixels,
+                size: PhysicalSize::new(width as f64, height as f64),
+                stride: width * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            Duration::from_secs(67),
+            CameraOrientation::Upright,
+        )
+        .expect("camera fixture frame is valid");
+        RecordingFixture::Hud(Box::new(RecordingHudFixture {
+            phase: RecordingPhase::Recording,
+            elapsed: Duration::from_secs(67),
+            capabilities: EngineCapabilities::ALL,
+            warning: None,
+            drift: Some(ClockDrift {
+                authoritative_secs: 67.0,
+                engine_secs: 67.0,
+                delta_secs: 0.0,
+            }),
+            output: None,
+            failure: None,
+            camera_status: Some(status.clone()),
+            camera_preview: Some(CameraPreview {
+                frame,
+                settings,
+                status,
+                output_aspect: Some(16.0 / 9.0),
+            }),
+            camera_settings: Some(settings),
+        }))
+    }
+
+    fn camera_settings_fixture() -> RecordingFixture {
+        let settings = CameraSettings {
+            enabled: true,
+            ..CameraSettings::default()
+        };
+        RecordingFixture::CameraSettings(crate::camera_settings::CameraSettingsSnapshot {
+            settings,
+            devices: vec![
+                CameraDevice {
+                    id: CameraDeviceId::new("fixture-camera-default")
+                        .expect("fixture camera id is valid"),
+                    name: "Studio Camera".to_owned(),
+                    state: CameraDeviceState::Available,
+                    is_default: true,
+                },
+                CameraDevice {
+                    id: CameraDeviceId::new("fixture-camera-busy")
+                        .expect("fixture camera id is valid"),
+                    name: "Desk Camera".to_owned(),
+                    state: CameraDeviceState::Busy,
+                    is_default: false,
+                },
+            ],
+            selected_device: None,
+            capture_configuration_locked: false,
+            permission: CameraPermission::NotDetermined,
+            preview: None,
+            preview_status: None,
+            error: None,
         })
     }
 
@@ -1310,11 +1464,11 @@ impl Fixture {
             _ => EditorExportFixture::Idle,
         };
 
-        RecordingFixture::Editor(VideoEditorFixture {
+        RecordingFixture::Editor(Box::new(VideoEditorFixture {
             document,
             plan,
             export,
-        })
+        }))
     }
 
     /// Builds `n` cards deterministically from `seed`.
@@ -2421,11 +2575,17 @@ impl SceneRegistry {
         for scenario in [
             Scenario::RecordingIdle,
             Scenario::RecordingActive,
+            Scenario::RecordingCamera,
+            Scenario::RecordingPresenter,
             Scenario::RecordingPaused,
             Scenario::RecordingFailedPartial,
         ] {
             me.register(scenario, Box::new(crate::recording_hud::RecordingHudScene));
         }
+        me.register(
+            Scenario::CameraSettings,
+            Box::new(crate::camera_settings::CameraSettingsScene),
+        );
         me.register(
             Scenario::RecordingSelecting,
             Box::new(crate::recording_overlay::RecordingOverlayScene),
@@ -4235,6 +4395,9 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::EditorAnnotating,
         Scenario::VideoEditing,
         Scenario::VideoEditingNarrow,
+        Scenario::RecordingCamera,
+        Scenario::RecordingPresenter,
+        Scenario::CameraSettings,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

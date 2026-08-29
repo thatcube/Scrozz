@@ -34,8 +34,8 @@ use std::{
 
 use scrozz_core::{CaptureTarget, Error as CoreError, SelectionMode as CaptureSelectionMode};
 use scrozz_record::{
-    MachineEvent, MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
-    RecordingSettings,
+    CameraPreviewSession, CameraRequest, MachineEvent, MachineFailure, Recording, RecordingMachine,
+    RecordingPhase, RecordingRequest, RecordingSettings,
     edit::{EditOutput, EditPlan, VideoDocument},
     handoff::FinalizedMediaHandoff,
     playback::{NativePlayback, sync_document},
@@ -51,8 +51,9 @@ use scrozz_shell::{
 };
 use scrozz_store::{History as _, Page, Store as _};
 use scrozz_ui::{
-    HistoryWindowAction, HistoryWindowSnapshot, RecordingHudAction, RecordingHudSnapshot,
-    RecordingPresentation, RecordingSurfaceAction, VideoEditorAction, VideoEditorSnapshot,
+    CameraSettingsAction, CameraSettingsSnapshot, HistoryWindowAction, HistoryWindowSnapshot,
+    RecordingHudAction, RecordingHudSnapshot, RecordingPresentation, RecordingSurfaceAction,
+    VideoEditorAction, VideoEditorSnapshot,
 };
 
 use crate::{
@@ -312,6 +313,11 @@ pub struct App {
     recording_editor: Option<ActiveVideoEditor>,
     finalized_media_handoff: Option<FinalizedMediaHandoff>,
     history_window: Option<HistoryWindowSnapshot>,
+    camera_settings_window: Option<CameraSettingsSnapshot>,
+    camera_preview: Option<Box<dyn CameraPreviewSession>>,
+    camera_devices: fn() -> scrozz_core::Result<Vec<scrozz_record::CameraDevice>>,
+    camera_permission_status: fn() -> scrozz_record::CameraPermission,
+    camera_preview_start: fn(&CameraRequest) -> scrozz_core::Result<Box<dyn CameraPreviewSession>>,
     tick_sequence: u64,
 }
 
@@ -335,16 +341,23 @@ impl App {
         let pipeline = Pipeline::start(Arc::clone(&selector))?;
         let mut notes = Vec::new();
         let mut recording_settings = RecordingSettings::shipped();
+        let mut camera_device = None;
         if config.persisted_settings {
-            match settings::load_recording_after_capture() {
-                Ok(after_capture) => recording_settings.after_capture = after_capture,
+            match settings::load_recording_preferences() {
+                Ok(preferences) => {
+                    recording_settings = preferences.settings;
+                    camera_device = preferences.camera_device;
+                }
                 Err(error) => notes.push(format!(
-                    "Could not load after-capture settings; using safe defaults: {error}"
+                    "Could not load recording settings; using safe defaults: {error}"
                 )),
             }
         }
         let recording = match RecordingMachine::native(recording_settings) {
-            Ok(machine) => {
+            Ok(mut machine) => {
+                if let Err(error) = machine.set_camera_device(camera_device) {
+                    notes.push(format!("could not select the preferred camera: {error}"));
+                }
                 notes.push(format!(
                     "recording engine ready with capabilities {:?}",
                     machine.capabilities()
@@ -365,6 +378,7 @@ impl App {
         let action_available = |action: Action| match action {
             Action::ToggleRecording => recording_available,
             Action::OpenHistory => true,
+            Action::OpenSettings => true,
             _ => action.is_available(selection_capabilities, &session, capture_backend_ready),
         };
 
@@ -470,6 +484,11 @@ impl App {
             recording_editor: None,
             finalized_media_handoff: None,
             history_window: None,
+            camera_settings_window: None,
+            camera_preview: None,
+            camera_devices: scrozz_record::camera_devices,
+            camera_permission_status: scrozz_record::camera_permission,
+            camera_preview_start: scrozz_record::start_camera_preview,
             tick_sequence: 0,
         };
 
@@ -501,6 +520,7 @@ impl App {
         }
         self.drain_pipeline();
         self.drain_cards();
+        self.advance_camera_preview();
         self.advance_recording();
 
         Tick::Continue
@@ -699,7 +719,7 @@ impl App {
                 Tick::Continue
             }
             Action::OpenSettings => {
-                self.note("the settings window is not built yet");
+                self.open_camera_settings();
                 Tick::Continue
             }
             Action::Quit => {
@@ -780,6 +800,7 @@ impl App {
     }
 
     fn begin_recording(&mut self) {
+        self.stop_camera_preview();
         if self
             .recording_editor
             .as_ref()
@@ -1035,9 +1056,9 @@ impl App {
             self.reply_recording_waiters();
             return;
         }
-        let after_capture = if self.config.persisted_settings {
-            match settings::load_recording_after_capture() {
-                Ok(settings) => settings,
+        let persisted = if self.config.persisted_settings {
+            match settings::load_recording_preferences() {
+                Ok(settings) => Some(settings),
                 Err(error) => {
                     let error = CliError::Core(error);
                     self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
@@ -1047,17 +1068,25 @@ impl App {
                 }
             }
         } else {
-            self.recording
-                .as_ref()
-                .expect("a pending start requires a recording machine")
-                .settings()
-                .after_capture
+            None
         };
+        let uses_settings = matches!(&pending.start, PendingRecordingStart::Settings { .. });
         let machine = self
             .recording
             .as_mut()
             .expect("a pending start requires a recording machine");
-        if let Err(error) = machine.set_after_capture_settings(after_capture) {
+        let settings_result = if let Some(preferences) = persisted {
+            if uses_settings {
+                machine
+                    .set_settings(preferences.settings)
+                    .and_then(|()| machine.set_camera_device(preferences.camera_device))
+            } else {
+                machine.set_after_capture_settings(preferences.settings.after_capture)
+            }
+        } else {
+            Ok(())
+        };
+        if let Err(error) = settings_result {
             let error = CliError::Core(error);
             self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
             self.present_recording_error(error);
@@ -1645,6 +1674,9 @@ impl App {
                 partial: None,
                 recovery_error: None,
             }),
+            camera_status: None,
+            camera_preview: None,
+            camera_settings: None,
         });
         self.note(format!("recording action failed: {error}"));
     }
@@ -1738,6 +1770,246 @@ impl App {
         self.finalized_media_handoff.take()
     }
 
+    /// Camera settings state rendered in its ordinary native viewport.
+    #[must_use]
+    pub fn camera_settings_snapshot(&self) -> Option<CameraSettingsSnapshot> {
+        self.camera_settings_window.clone().map(|mut snapshot| {
+            snapshot.capture_configuration_locked = self.camera_configuration_locked();
+            snapshot
+        })
+    }
+
+    /// Applies one camera-settings action.
+    pub fn handle_camera_settings_action(&mut self, action: CameraSettingsAction) {
+        match action {
+            CameraSettingsAction::Close => {
+                self.stop_camera_preview();
+                self.camera_settings_window = None;
+                self.note("camera settings closed");
+            }
+            CameraSettingsAction::StartPreview => self.start_camera_preview(),
+            CameraSettingsAction::StopPreview => self.stop_camera_preview(),
+            CameraSettingsAction::DeviceChanged(device) => {
+                if self.camera_configuration_locked() {
+                    if let Some(snapshot) = &mut self.camera_settings_window {
+                        snapshot.error = Some(
+                            "Camera device selection applies after the current recording ends."
+                                .to_owned(),
+                        );
+                    }
+                    return;
+                }
+                if let Some(machine) = &mut self.recording
+                    && let Err(error) = machine.set_camera_device(device.clone())
+                {
+                    if let Some(snapshot) = &mut self.camera_settings_window {
+                        snapshot.error = Some(error.to_string());
+                    }
+                    return;
+                }
+                self.stop_camera_preview();
+                if let Some(snapshot) = &mut self.camera_settings_window {
+                    snapshot.selected_device = device.clone();
+                    snapshot.preview = None;
+                    snapshot.error = None;
+                    if self.config.persisted_settings
+                        && let Err(error) =
+                            settings::persist_camera_preferences(snapshot.settings, device.as_ref())
+                    {
+                        snapshot.error = Some(error.to_string());
+                    }
+                }
+            }
+            CameraSettingsAction::SettingsChanged(camera) => {
+                let phase = self.recording.as_ref().map(RecordingMachine::phase);
+                let current = self
+                    .recording
+                    .as_ref()
+                    .map_or(camera, |machine| machine.settings().camera);
+                let active = matches!(
+                    phase,
+                    Some(RecordingPhase::Recording | RecordingPhase::Paused)
+                );
+                if active && camera.enabled != current.enabled {
+                    if let Some(snapshot) = &mut self.camera_settings_window {
+                        snapshot.error = Some(
+                            "Camera capture cannot be enabled or disabled during a recording."
+                                .to_owned(),
+                        );
+                    }
+                    return;
+                }
+                if self.camera_configuration_locked() && !active {
+                    if let Some(snapshot) = &mut self.camera_settings_window {
+                        snapshot.error = Some(
+                            "Camera settings apply after the current recording setup ends."
+                                .to_owned(),
+                        );
+                    }
+                    return;
+                }
+                let device = self
+                    .camera_settings_window
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.selected_device.clone());
+                let result = if let Some(machine) = &mut self.recording {
+                    if active {
+                        machine.update_camera(camera)
+                    } else {
+                        let mut all = *machine.settings();
+                        all.camera = camera;
+                        machine
+                            .set_settings(all)
+                            .and_then(|()| machine.set_camera_device(device.clone()))
+                    }
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    if let Some(snapshot) = &mut self.camera_settings_window {
+                        snapshot.error = Some(error.to_string());
+                    }
+                    return;
+                }
+                if !camera.enabled {
+                    self.stop_camera_preview();
+                } else if let Some(preview) = &mut self.camera_preview
+                    && let Err(error) = preview.update_settings(camera)
+                    && let Some(snapshot) = &mut self.camera_settings_window
+                {
+                    snapshot.error = Some(error.to_string());
+                }
+                if let Some(snapshot) = &mut self.camera_settings_window {
+                    snapshot.settings = camera;
+                }
+                if self.config.persisted_settings
+                    && let Err(error) =
+                        settings::persist_camera_preferences(camera, device.as_ref())
+                    && let Some(snapshot) = &mut self.camera_settings_window
+                {
+                    snapshot.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn open_camera_settings(&mut self) {
+        if self.camera_settings_window.is_some() {
+            return;
+        }
+        let (settings, selected_device, mut error) = if self.config.persisted_settings {
+            match settings::load_recording_preferences() {
+                Ok(preferences) => (preferences.settings.camera, preferences.camera_device, None),
+                Err(failure) => (
+                    self.recording.as_ref().map_or_else(
+                        || RecordingSettings::shipped().camera,
+                        |m| m.settings().camera,
+                    ),
+                    None,
+                    Some(failure.to_string()),
+                ),
+            }
+        } else {
+            (
+                self.recording.as_ref().map_or_else(
+                    || RecordingSettings::shipped().camera,
+                    |m| m.settings().camera,
+                ),
+                self.recording
+                    .as_ref()
+                    .and_then(RecordingMachine::request)
+                    .and_then(|request| request.camera.as_ref())
+                    .and_then(|camera| camera.device_id.clone()),
+                None,
+            )
+        };
+        let devices = if self.config.persisted_settings {
+            match (self.camera_devices)() {
+                Ok(devices) => devices,
+                Err(failure) => {
+                    error = Some(failure.to_string());
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.camera_settings_window = Some(CameraSettingsSnapshot {
+            settings,
+            devices,
+            selected_device,
+            capture_configuration_locked: self.camera_configuration_locked(),
+            permission: if self.config.persisted_settings {
+                (self.camera_permission_status)()
+            } else {
+                scrozz_record::CameraPermission::Unsupported
+            },
+            preview: None,
+            preview_status: None,
+            error,
+        });
+        self.note("camera settings window opened");
+    }
+
+    fn camera_configuration_locked(&self) -> bool {
+        self.recording.as_ref().is_some_and(|machine| {
+            !matches!(
+                machine.phase(),
+                RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed
+            )
+        })
+    }
+
+    fn start_camera_preview(&mut self) {
+        self.stop_camera_preview();
+        let Some(snapshot) = self.camera_settings_window.as_mut() else {
+            return;
+        };
+        let mut settings = snapshot.settings;
+        settings.enabled = true;
+        let mut request = CameraRequest::new(settings);
+        request.device_id = snapshot.selected_device.clone();
+        match (self.camera_preview_start)(&request) {
+            Ok(preview) => {
+                snapshot.settings = settings;
+                snapshot.permission = (self.camera_permission_status)();
+                snapshot.error = None;
+                snapshot.preview_status = Some(preview.status());
+                self.camera_preview = Some(preview);
+            }
+            Err(error) => {
+                snapshot.permission = (self.camera_permission_status)();
+                snapshot.error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn advance_camera_preview(&mut self) {
+        let Some(preview) = self.camera_preview.as_mut() else {
+            return;
+        };
+        let frame = preview.poll();
+        if let Some(snapshot) = &mut self.camera_settings_window {
+            snapshot.permission = (self.camera_permission_status)();
+            snapshot.preview = frame;
+            let status = preview.status();
+            if let Some(warning) = status.warning.clone() {
+                snapshot.error = Some(warning);
+            }
+            snapshot.preview_status = Some(status);
+        }
+    }
+
+    fn stop_camera_preview(&mut self) {
+        if let Some(preview) = self.camera_preview.take() {
+            preview.stop();
+        }
+        if let Some(snapshot) = &mut self.camera_settings_window {
+            snapshot.preview = None;
+            snapshot.preview_status = None;
+        }
+    }
+
     /// Applies one semantic action raised by the shared recording surface.
     pub fn handle_recording_surface_action(&mut self, action: RecordingSurfaceAction) {
         match action {
@@ -1786,6 +2058,23 @@ impl App {
                 self.finish_recording_action(result, "recording state changed");
             }
             RecordingHudAction::Stop => self.begin_recording_finalisation(None),
+            RecordingHudAction::CameraChanged(settings) => {
+                let result = self.recording.as_mut().ok_or_else(|| {
+                    CoreError::InvalidRequest("no recording session is available".into())
+                });
+                let result = result.and_then(|machine| {
+                    machine.update_camera(settings)?;
+                    if self.config.persisted_settings {
+                        let device = machine
+                            .request()
+                            .and_then(|request| request.camera.as_ref())
+                            .and_then(|camera| camera.device_id.as_ref());
+                        settings::persist_camera_preferences(settings, device)?;
+                    }
+                    Ok(())
+                });
+                self.finish_recording_action(result, "camera composition updated");
+            }
             RecordingHudAction::RevealOutput => {
                 let path = self
                     .recording_editor
@@ -1999,6 +2288,7 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        self.stop_camera_preview();
         self.settle_video_export_before_shutdown();
         self.finalise_recording_before_shutdown();
         self.release_video_editor();
@@ -2269,11 +2559,66 @@ pub fn menu_actions() -> Vec<Action> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
 
     struct InstantRecordingSelector;
+    static CAMERA_PREVIEW_STARTED: AtomicBool = AtomicBool::new(false);
+    static CAMERA_PREVIEW_STOPPED: AtomicBool = AtomicBool::new(false);
+
+    struct MockCameraPreview;
+
+    impl CameraPreviewSession for MockCameraPreview {
+        fn status(&self) -> scrozz_record::CameraRuntimeStatus {
+            scrozz_record::CameraRuntimeStatus {
+                active: true,
+                privacy_indicator_visible: true,
+                device_state: scrozz_record::CameraDeviceState::Available,
+                frames_received: 0,
+                dropped_frames: 0,
+                queued_frames: 0,
+                warning: None,
+            }
+        }
+
+        fn poll(&mut self) -> Option<scrozz_record::CameraPreview> {
+            None
+        }
+
+        fn update_settings(
+            &mut self,
+            _settings: scrozz_record::settings::CameraSettings,
+        ) -> scrozz_core::Result<()> {
+            Ok(())
+        }
+
+        fn stop(self: Box<Self>) {
+            CAMERA_PREVIEW_STOPPED.store(true, Ordering::Release);
+        }
+    }
+
+    fn mock_camera_devices() -> scrozz_core::Result<Vec<scrozz_record::CameraDevice>> {
+        Ok(vec![scrozz_record::CameraDevice {
+            id: scrozz_record::CameraDeviceId::new("test-camera").unwrap(),
+            name: "Test camera".to_owned(),
+            state: scrozz_record::CameraDeviceState::Available,
+            is_default: true,
+        }])
+    }
+
+    fn mock_camera_permission() -> scrozz_record::CameraPermission {
+        scrozz_record::CameraPermission::Authorized
+    }
+
+    fn mock_camera_preview(
+        _request: &CameraRequest,
+    ) -> scrozz_core::Result<Box<dyn CameraPreviewSession>> {
+        CAMERA_PREVIEW_STARTED.store(true, Ordering::Release);
+        Ok(Box::new(MockCameraPreview))
+    }
 
     impl scrozz_core::RegionSelector for InstantRecordingSelector {
         fn name(&self) -> &'static str {
@@ -2324,6 +2669,78 @@ mod tests {
         assert!(
             !app.config.persisted_settings,
             "sealed runs must not touch user settings"
+        );
+    }
+
+    #[test]
+    fn camera_preview_starts_only_after_explicit_action_and_stops_on_close() {
+        CAMERA_PREVIEW_STARTED.store(false, Ordering::Release);
+        CAMERA_PREVIEW_STOPPED.store(false, Ordering::Release);
+        let (mut app, _) = app();
+        app.camera_devices = mock_camera_devices;
+        app.camera_permission_status = mock_camera_permission;
+        app.camera_preview_start = mock_camera_preview;
+
+        assert!(app.camera_preview.is_none());
+        app.perform(Action::OpenSettings);
+        assert!(app.camera_preview.is_none());
+        assert!(!CAMERA_PREVIEW_STARTED.load(Ordering::Acquire));
+
+        let mut camera = app.camera_settings_window.as_ref().unwrap().settings;
+        camera.enabled = true;
+        app.handle_camera_settings_action(CameraSettingsAction::SettingsChanged(camera));
+        app.handle_camera_settings_action(CameraSettingsAction::StartPreview);
+        assert!(CAMERA_PREVIEW_STARTED.load(Ordering::Acquire));
+        assert!(app.camera_preview.is_some());
+
+        app.handle_camera_settings_action(CameraSettingsAction::Close);
+        assert!(CAMERA_PREVIEW_STOPPED.load(Ordering::Acquire));
+        assert!(app.camera_preview.is_none());
+    }
+
+    #[test]
+    fn active_recording_rejects_camera_disable_and_device_switch_without_ui_drift() {
+        let (mut app, _) = app();
+        let mut settings = RecordingSettings::shipped();
+        settings.camera.enabled = true;
+        let plan =
+            scrozz_record::engine::MockSessionPlan::complete("camera-settings-lock.mp4", 1.0)
+                .unwrap();
+        let mut machine = RecordingMachine::with_engine(
+            Box::new(scrozz_record::engine::MockEngine::fully_capable(plan)),
+            settings,
+        )
+        .unwrap();
+        machine
+            .begin_request(RecordingRequest::from_settings(
+                CaptureTarget::Display(scrozz_core::DisplayId("display".to_owned())),
+                &settings,
+            ))
+            .unwrap();
+        app.recording = Some(machine);
+        app.open_camera_settings();
+
+        let original = app.camera_settings_window.as_ref().unwrap().clone();
+        app.handle_camera_settings_action(CameraSettingsAction::DeviceChanged(Some(
+            scrozz_record::CameraDeviceId::new("replacement").unwrap(),
+        )));
+        let after_device = app.camera_settings_window.as_ref().unwrap();
+        assert_eq!(after_device.selected_device, original.selected_device);
+        assert!(after_device.error.is_some());
+
+        let mut disabled = original.settings;
+        disabled.enabled = false;
+        app.handle_camera_settings_action(CameraSettingsAction::SettingsChanged(disabled));
+        let after_disable = app.camera_settings_window.as_ref().unwrap();
+        assert!(after_disable.settings.enabled);
+        assert!(
+            app.recording
+                .as_ref()
+                .unwrap()
+                .request()
+                .unwrap()
+                .camera
+                .is_some()
         );
     }
 

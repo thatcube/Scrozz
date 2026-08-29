@@ -951,6 +951,26 @@ fn prepare_recording(
     request.destination = Some(destination.clone());
     request.microphone = args.microphone;
     request.system_audio = args.system_audio;
+    if let Some(device) = &args.camera {
+        let settings = scrozz_record::settings::CameraSettings {
+            enabled: true,
+            position: scrozz_record::settings::OverlayAnchor::from_slug(&args.camera_position)?,
+            size: f32::from(args.camera_size) / 100.0,
+            shape: scrozz_record::settings::CameraShape::from_slug(&args.camera_shape)?,
+            presenter: args.presenter,
+            presenter_screen: !args.presenter_camera_only,
+            mirror: !args.no_camera_mirror,
+            border: !args.no_camera_border,
+            shadow: !args.no_camera_shadow,
+            ..scrozz_record::settings::CameraSettings::default()
+        };
+        settings.validate()?;
+        let mut camera = scrozz_record::CameraRequest::new(settings);
+        if device != "default" {
+            camera = camera.with_device(scrozz_record::CameraDeviceId::new(device.clone())?);
+        }
+        request.camera = Some(camera);
+    }
     request.fps = args.fps;
     request.show_cursor = args.cursor;
     request.quality = args.quality.to_recording();
@@ -993,6 +1013,22 @@ fn recording_plan_with_target(args: &RecordArgs, target: Json) -> Json {
         ("codec", Json::str(args.codec.slug())),
         ("microphone", Json::Bool(args.microphone)),
         ("system_audio", Json::Bool(args.system_audio)),
+        (
+            "camera",
+            Json::opt(args.camera.as_deref(), |device| {
+                Json::obj([
+                    ("device", Json::str(device)),
+                    ("presenter", Json::Bool(args.presenter)),
+                    ("presenter_screen", Json::Bool(!args.presenter_camera_only)),
+                    ("position", Json::str(&args.camera_position)),
+                    ("size_percent", Json::Int(i64::from(args.camera_size))),
+                    ("shape", Json::str(&args.camera_shape)),
+                    ("mirror", Json::Bool(!args.no_camera_mirror)),
+                    ("border", Json::Bool(!args.no_camera_border)),
+                    ("shadow", Json::Bool(!args.no_camera_shadow)),
+                ])
+            }),
+        ),
         ("cursor", Json::Bool(args.cursor)),
         ("output", Json::opt(args.output.as_deref(), path_json)),
     ])
@@ -1340,6 +1376,18 @@ fn recording_report(
                     Json::str(resolution.slug())
                 }),
             ),
+            (
+                "camera",
+                Json::opt(recording.metadata.camera.as_deref(), |camera| {
+                    Json::obj([
+                        ("presenter", Json::Bool(camera.presenter)),
+                        ("presenter_screen", Json::Bool(camera.presenter_screen)),
+                        ("shape", Json::str(camera.shape.slug())),
+                        ("mirrored", Json::Bool(camera.mirrored)),
+                        ("dropped_frames", Json::Int(camera.dropped_frames as i64)),
+                    ])
+                }),
+            ),
         ]),
         human,
     );
@@ -1384,11 +1432,9 @@ fn capture_target_json(target: &CaptureTarget) -> Json {
 // ---------------------------------------------------------------------------
 
 fn list(what: ListWhat) -> CliResult<Report> {
-    let enumerator = platform::target_enumerator();
-
     match what {
         ListWhat::Displays => {
-            let displays = enumerator?.displays()?;
+            let displays = platform::target_enumerator()?.displays()?;
             let data = Json::arr(displays.iter().map(|d| {
                 Json::obj([
                     ("id", Json::str(d.id.0.as_str())),
@@ -1431,7 +1477,7 @@ fn list(what: ListWhat) -> CliResult<Report> {
                         .to_string(),
                 }));
             }
-            let windows = enumerator?.windows()?;
+            let windows = platform::target_enumerator()?.windows()?;
             let data = Json::arr(windows.iter().map(|w| {
                 Json::obj([
                     ("id", Json::str(w.id.0.as_str())),
@@ -1452,6 +1498,40 @@ fn list(what: ListWhat) -> CliResult<Report> {
                         w.id.0,
                         w.application.as_deref().unwrap_or("—"),
                         w.title.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Report::new(data, human))
+        }
+        ListWhat::Cameras => {
+            let devices = scrozz_record::camera_devices()?;
+            let data = Json::arr(devices.iter().map(|device| {
+                Json::obj([
+                    ("id", Json::str(device.id.as_str())),
+                    ("name", Json::str(&device.name)),
+                    (
+                        "state",
+                        Json::str(match device.state {
+                            scrozz_record::CameraDeviceState::Available => "available",
+                            scrozz_record::CameraDeviceState::Busy => "busy",
+                            scrozz_record::CameraDeviceState::Disconnected => "disconnected",
+                            scrozz_record::CameraDeviceState::PermissionDenied => {
+                                "permission-denied"
+                            }
+                        }),
+                    ),
+                    ("default", Json::Bool(device.is_default)),
+                ])
+            }));
+            let human = devices
+                .iter()
+                .map(|device| {
+                    format!(
+                        "{}  {}{}",
+                        device.id.as_str(),
+                        device.name,
+                        if device.is_default { "  (default)" } else { "" }
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2376,6 +2456,32 @@ mod tests {
         assert!(rendered.contains(r#""fps":60"#), "{rendered}");
         assert!(rendered.contains(r#""microphone":true"#), "{rendered}");
         assert!(rendered.contains(r#""system_audio":false"#), "{rendered}");
+    }
+
+    #[test]
+    fn a_camera_dry_run_reports_composition_without_opening_hardware() {
+        let rendered = json_of(&[
+            "scrozz",
+            "record",
+            "--dry-run",
+            "--camera",
+            "stable-device",
+            "--presenter",
+            "--camera-position",
+            "top-left",
+            "--camera-size",
+            "32",
+            "--camera-shape",
+            "square",
+        ]);
+        assert!(
+            rendered.contains(r#""device":"stable-device""#),
+            "{rendered}"
+        );
+        assert!(rendered.contains(r#""presenter":true"#), "{rendered}");
+        assert!(rendered.contains(r#""position":"top-left""#), "{rendered}");
+        assert!(rendered.contains(r#""size_percent":32"#), "{rendered}");
+        assert!(rendered.contains(r#""shape":"square""#), "{rendered}");
     }
 
     #[test]

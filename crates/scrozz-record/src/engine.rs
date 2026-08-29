@@ -8,8 +8,8 @@ use std::{
 use scrozz_core::{Error, Result};
 
 use crate::{
-    OverlaySource, Recording, RecordingRequest, RecordingSession, RecordingSettings, SessionEvent,
-    VideoCodec,
+    CameraFeed, OverlaySource, Recording, RecordingRequest, RecordingSession, RecordingSettings,
+    SessionEvent, VideoCodec,
 };
 
 /// Declarative features a concrete recording engine can potentially support.
@@ -216,7 +216,7 @@ pub fn validate_capabilities(
         request.microphone || settings.is_some_and(RecordingSettings::needs_microphone);
     let system_audio =
         request.system_audio || settings.is_some_and(|value| value.audio.system_audio);
-    let camera = settings.is_some_and(RecordingSettings::needs_camera);
+    let camera = request.camera.is_some() || settings.is_some_and(RecordingSettings::needs_camera);
     let clicks = settings.is_some_and(|value| value.clicks.enabled);
     let keys = settings.is_some_and(|value| value.keystrokes.enabled);
 
@@ -391,6 +391,10 @@ impl RecordingEngine for MockEngine {
                         .to_owned(),
                 )
             })?;
+        let camera = request.camera.as_ref().map(CameraFeed::new).transpose()?;
+        if let Some(camera) = &camera {
+            camera.activate();
+        }
         Ok(Box::new(MockSession {
             polls: plan.polls.into(),
             stop: plan.stop,
@@ -398,6 +402,7 @@ impl RecordingEngine for MockEngine {
             resume_failure: plan.resume_failure,
             paused: false,
             engine_elapsed_secs: None,
+            camera,
         }))
     }
 
@@ -417,6 +422,7 @@ struct MockSession {
     resume_failure: Option<String>,
     paused: bool,
     engine_elapsed_secs: Option<f64>,
+    camera: Option<CameraFeed>,
 }
 
 impl RecordingSession for MockSession {
@@ -464,7 +470,21 @@ impl RecordingSession for MockSession {
         self.engine_elapsed_secs
     }
 
+    fn camera_status(&self) -> Option<crate::CameraRuntimeStatus> {
+        self.camera.as_ref().map(CameraFeed::status)
+    }
+
+    fn update_camera(&mut self, settings: crate::settings::CameraSettings) -> Result<()> {
+        self.camera
+            .as_ref()
+            .ok_or_else(|| Error::InvalidRequest("this mock session has no camera".into()))?
+            .update_settings(settings)
+    }
+
     fn stop(self: Box<Self>) -> Result<Recording> {
+        if let Some(camera) = &self.camera {
+            camera.stop();
+        }
         match self.stop {
             MockStop::Output(output) => output.into_synthetic("deterministic mock engine"),
             MockStop::NoOutput(error) => Err(error),

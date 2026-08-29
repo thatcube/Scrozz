@@ -20,7 +20,10 @@ use crate::{
 };
 use fs2::FileExt as _;
 use scrozz_core::{Error, Result};
-use scrozz_record::AfterCaptureSettings;
+use scrozz_record::{
+    AfterCaptureSettings, CameraDeviceId, RecordingSettings,
+    settings::{CameraShape, OverlayAnchor},
+};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
@@ -40,12 +43,33 @@ const RECORDING_OVERLAY_KEY: &str = "record.show-recent-captures-overlay";
 const RECORDING_EDITOR_KEY: &str = "record.open-editor";
 const RECORDING_OVERLAY_FIELD: &str = "show-recent-captures-overlay";
 const RECORDING_EDITOR_FIELD: &str = "open-editor";
+const CAMERA_ENABLED_KEY: &str = "record.camera";
+const CAMERA_DEVICE_KEY: &str = "record.camera-device";
+const CAMERA_POSITION_KEY: &str = "record.camera-position";
+const CAMERA_PLACEMENT_X_KEY: &str = "record.camera-placement-x";
+const CAMERA_PLACEMENT_Y_KEY: &str = "record.camera-placement-y";
+const CAMERA_SIZE_KEY: &str = "record.camera-size";
+const CAMERA_SHAPE_KEY: &str = "record.camera-shape";
+const CAMERA_PRESENTER_KEY: &str = "record.camera-presenter";
+const CAMERA_PRESENTER_SCREEN_KEY: &str = "record.camera-presenter-screen";
+const CAMERA_MIRROR_KEY: &str = "record.camera-mirror";
+const CAMERA_BORDER_KEY: &str = "record.camera-border";
+const CAMERA_SHADOW_KEY: &str = "record.camera-shadow";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct LoadedSettings {
     actions: AfterCaptureSettings,
     persisted: bool,
     document: Value,
+}
+
+/// Persisted recording preferences used to construct the next native session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingPreferences {
+    /// Validated recording settings.
+    pub settings: RecordingSettings,
+    /// Stable platform camera id, never a transient native handle.
+    pub camera_device: Option<CameraDeviceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +183,27 @@ impl AfterCaptureStore {
             write_actions(&mut loaded.document, loaded.actions)?;
             self.save_document_unlocked(&loaded.document)?;
             Ok(loaded.actions)
+        })
+    }
+
+    fn update_value(&self, key: &str, value: &str) -> Result<()> {
+        self.update_values(&[(key, value)])
+    }
+
+    fn update_values(&self, changes: &[(&str, &str)]) -> Result<()> {
+        self.with_lock(|| {
+            let mut loaded = self.load_unlocked()?;
+            let values = loaded
+                .document
+                .get_mut("values")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    Error::Storage("settings document has no writable values object".to_owned())
+                })?;
+            for (key, value) in changes {
+                values.insert((*key).to_owned(), Value::String((*value).to_owned()));
+            }
+            self.save_document_unlocked(&loaded.document)
         })
     }
 
@@ -593,6 +638,143 @@ pub fn load_recording_after_capture() -> Result<AfterCaptureSettings> {
         .map(|(value, _)| value)
 }
 
+/// Loads the complete recording preference surface.
+///
+/// Missing camera keys retain shipped defaults so older settings files migrate
+/// without prompting for camera access.
+pub fn load_recording_preferences() -> Result<RecordingPreferences> {
+    let store = AfterCaptureStore::default_location()?;
+    load_recording_preferences_from(&store)
+}
+
+fn load_recording_preferences_from(store: &AfterCaptureStore) -> Result<RecordingPreferences> {
+    store.with_lock(|| {
+        let loaded = store.load_unlocked()?;
+        recording_preferences(&loaded)
+    })
+}
+
+fn recording_preferences(loaded: &LoadedSettings) -> Result<RecordingPreferences> {
+    let mut settings = RecordingSettings::shipped();
+    settings.after_capture = loaded.actions;
+    settings.camera.enabled = document_bool(&loaded.document, CAMERA_ENABLED_KEY, false)?;
+    settings.camera.position = OverlayAnchor::from_slug(&document_string(
+        &loaded.document,
+        CAMERA_POSITION_KEY,
+        settings.camera.position.slug(),
+    )?)?;
+    let placement_x = document_i64(&loaded.document, CAMERA_PLACEMENT_X_KEY, -1)?;
+    let placement_y = document_i64(&loaded.document, CAMERA_PLACEMENT_Y_KEY, -1)?;
+    settings.camera.placement = match (placement_x, placement_y) {
+        (-1, -1) => None,
+        (x @ 0..=1_000, y @ 0..=1_000) => Some(scrozz_record::settings::CameraPlacement::new(
+            x as f32 / 1_000.0,
+            y as f32 / 1_000.0,
+        )?),
+        _ => {
+            return Err(Error::Storage(
+                "persisted camera placement requires both coordinates in 0..=1000 or both -1"
+                    .to_owned(),
+            ));
+        }
+    };
+    settings.camera.size = document_i64(&loaded.document, CAMERA_SIZE_KEY, 22)? as f32 / 100.0;
+    settings.camera.shape = CameraShape::from_slug(&document_string(
+        &loaded.document,
+        CAMERA_SHAPE_KEY,
+        settings.camera.shape.slug(),
+    )?)?;
+    settings.camera.presenter = document_bool(&loaded.document, CAMERA_PRESENTER_KEY, false)?;
+    settings.camera.presenter_screen =
+        document_bool(&loaded.document, CAMERA_PRESENTER_SCREEN_KEY, true)?;
+    settings.camera.mirror = document_bool(&loaded.document, CAMERA_MIRROR_KEY, true)?;
+    settings.camera.border = document_bool(&loaded.document, CAMERA_BORDER_KEY, true)?;
+    settings.camera.shadow = document_bool(&loaded.document, CAMERA_SHADOW_KEY, true)?;
+    settings.validate()?;
+    let camera_device = match document_string(&loaded.document, CAMERA_DEVICE_KEY, "default")? {
+        value if value == "default" => None,
+        value => Some(CameraDeviceId::new(value)?),
+    };
+    Ok(RecordingPreferences {
+        settings,
+        camera_device,
+    })
+}
+
+/// Atomically persists the live camera composition and stable device choice.
+pub fn persist_camera_preferences(
+    settings: scrozz_record::settings::CameraSettings,
+    device: Option<&CameraDeviceId>,
+) -> Result<()> {
+    settings.validate()?;
+    let enabled = settings.enabled.to_string();
+    let device = device.map_or("default", CameraDeviceId::as_str);
+    let position = settings.position.slug();
+    let size = (settings.size * 100.0).round().to_string();
+    let shape = settings.shape.slug();
+    let presenter = settings.presenter.to_string();
+    let presenter_screen = settings.presenter_screen.to_string();
+    let mirror = settings.mirror.to_string();
+    let border = settings.border.to_string();
+    let shadow = settings.shadow.to_string();
+    let placement_x = settings
+        .placement
+        .map_or(-1, |placement| (placement.x * 1_000.0).round() as i64)
+        .to_string();
+    let placement_y = settings
+        .placement
+        .map_or(-1, |placement| (placement.y * 1_000.0).round() as i64)
+        .to_string();
+    AfterCaptureStore::default_location()?.update_values(&[
+        (CAMERA_ENABLED_KEY, &enabled),
+        (CAMERA_DEVICE_KEY, device),
+        (CAMERA_POSITION_KEY, position),
+        (CAMERA_PLACEMENT_X_KEY, &placement_x),
+        (CAMERA_PLACEMENT_Y_KEY, &placement_y),
+        (CAMERA_SIZE_KEY, &size),
+        (CAMERA_SHAPE_KEY, shape),
+        (CAMERA_PRESENTER_KEY, &presenter),
+        (CAMERA_PRESENTER_SCREEN_KEY, &presenter_screen),
+        (CAMERA_MIRROR_KEY, &mirror),
+        (CAMERA_BORDER_KEY, &border),
+        (CAMERA_SHADOW_KEY, &shadow),
+    ])
+}
+
+fn document_value<'a>(document: &'a Value, key: &str) -> Option<&'a str> {
+    document
+        .get("values")
+        .and_then(Value::as_object)
+        .and_then(|values| values.get(key))
+        .and_then(Value::as_str)
+}
+
+fn document_string(document: &Value, key: &str, default: &str) -> Result<String> {
+    Ok(document_value(document, key).unwrap_or(default).to_owned())
+}
+
+fn document_bool(document: &Value, key: &str, default: bool) -> Result<bool> {
+    match document_value(document, key) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(value) => Err(Error::Storage(format!(
+            "persisted setting {key} must be true or false, not {value:?}"
+        ))),
+    }
+}
+
+fn document_i64(document: &Value, key: &str, default: i64) -> Result<i64> {
+    match document_value(document, key) {
+        None => Ok(default),
+        Some(value) => value.parse().map_err(|_| {
+            Error::Storage(format!(
+                "persisted setting {key} must be a whole number, not {value:?}"
+            ))
+        }),
+    }
+}
+
 /// Persists one setting when this narrow store owns it.
 ///
 /// Returns `false` for settings that remain schema-only.
@@ -606,6 +788,11 @@ pub fn persist(setting: &Setting, value: &str) -> CliResult<bool> {
 }
 
 fn persist_to(store: &AfterCaptureStore, setting: &Setting, value: &str) -> CliResult<bool> {
+    if is_camera_setting(setting.key) {
+        setting.validate(value)?;
+        store.update_value(setting.key, value)?;
+        return Ok(true);
+    }
     if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
         return Ok(false);
     }
@@ -620,7 +807,9 @@ fn persist_to(store: &AfterCaptureStore, setting: &Setting, value: &str) -> CliR
 }
 
 fn resolved_value(setting: &Setting) -> CliResult<(String, &'static str)> {
-    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+    if !is_camera_setting(setting.key)
+        && !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY)
+    {
         return Ok((setting.default.to_owned(), "default"));
     }
     let store = AfterCaptureStore::default_location()?;
@@ -631,9 +820,17 @@ fn resolved_value_from(
     store: &AfterCaptureStore,
     setting: &Setting,
 ) -> CliResult<(String, &'static str)> {
+    if is_camera_setting(setting.key) {
+        let loaded = store.with_lock(|| store.load_unlocked())?;
+        return Ok(match document_value(&loaded.document, setting.key) {
+            Some(value) => (value.to_owned(), "user"),
+            None => (setting.default.to_owned(), "default"),
+        });
+    }
     if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
         return Ok((setting.default.to_owned(), "default"));
     }
+
     let (actions, persisted) = store.load()?;
     let value = match setting.key {
         RECORDING_OVERLAY_KEY => actions.recent_captures_overlay,
@@ -644,6 +841,24 @@ fn resolved_value_from(
         value.to_string(),
         if persisted { "user" } else { "default" },
     ))
+}
+
+fn is_camera_setting(key: &str) -> bool {
+    matches!(
+        key,
+        CAMERA_ENABLED_KEY
+            | CAMERA_DEVICE_KEY
+            | CAMERA_POSITION_KEY
+            | CAMERA_PLACEMENT_X_KEY
+            | CAMERA_PLACEMENT_Y_KEY
+            | CAMERA_SIZE_KEY
+            | CAMERA_SHAPE_KEY
+            | CAMERA_PRESENTER_KEY
+            | CAMERA_PRESENTER_SCREEN_KEY
+            | CAMERA_MIRROR_KEY
+            | CAMERA_BORDER_KEY
+            | CAMERA_SHADOW_KEY
+    )
 }
 
 /// One setting as JSON with its current persisted value.
@@ -735,6 +950,91 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "false",
         description: "Record system audio output.",
+    },
+    Setting {
+        key: CAMERA_ENABLED_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Capture a camera and composite it into screen recordings.",
+    },
+    Setting {
+        key: CAMERA_DEVICE_KEY,
+        kind: Kind::Path,
+        default: "default",
+        description: "Stable camera device identifier, or `default`.",
+    },
+    Setting {
+        key: CAMERA_POSITION_KEY,
+        kind: Kind::Choice(&[
+            "top-left",
+            "top-center",
+            "top-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right",
+        ]),
+        default: "bottom-right",
+        description: "Safe-area camera anchor.",
+    },
+    Setting {
+        key: CAMERA_SIZE_KEY,
+        kind: Kind::Int { min: 8, max: 50 },
+        default: "22",
+        description: "Camera height as a percentage of the shorter output edge.",
+    },
+    Setting {
+        key: CAMERA_PLACEMENT_X_KEY,
+        kind: Kind::Int {
+            min: -1,
+            max: 1_000,
+        },
+        default: "-1",
+        description: "Normalized dragged camera x position in thousandths; -1 uses the anchor.",
+    },
+    Setting {
+        key: CAMERA_PLACEMENT_Y_KEY,
+        kind: Kind::Int {
+            min: -1,
+            max: 1_000,
+        },
+        default: "-1",
+        description: "Normalized dragged camera y position in thousandths; -1 uses the anchor.",
+    },
+    Setting {
+        key: CAMERA_SHAPE_KEY,
+        kind: Kind::Choice(&["circle", "rounded", "square", "rectangle"]),
+        default: "circle",
+        description: "Camera mask shape.",
+    },
+    Setting {
+        key: CAMERA_PRESENTER_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Use the camera as the primary presenter canvas.",
+    },
+    Setting {
+        key: CAMERA_PRESENTER_SCREEN_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Show the shared screen as an inset in presenter mode.",
+    },
+    Setting {
+        key: CAMERA_MIRROR_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Mirror camera preview and recorded composition.",
+    },
+    Setting {
+        key: CAMERA_BORDER_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Draw a high-contrast camera border.",
+    },
+    Setting {
+        key: CAMERA_SHADOW_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Draw a restrained camera shadow.",
     },
     Setting {
         key: RECORDING_OVERLAY_KEY,
@@ -917,6 +1217,64 @@ mod tests {
             resolved_value_from(&store, overlay).unwrap(),
             ("false".to_owned(), "user")
         );
+    }
+
+    #[test]
+    fn camera_preferences_round_trip_without_native_handles() {
+        let root = scratch("camera");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join(SETTINGS_FILE));
+        for (key, value) in [
+            (CAMERA_ENABLED_KEY, "true"),
+            (CAMERA_DEVICE_KEY, "stable-camera-id"),
+            (CAMERA_POSITION_KEY, "top-left"),
+            (CAMERA_PLACEMENT_X_KEY, "333"),
+            (CAMERA_PLACEMENT_Y_KEY, "667"),
+            (CAMERA_SIZE_KEY, "34"),
+            (CAMERA_SHAPE_KEY, "square"),
+            (CAMERA_PRESENTER_KEY, "true"),
+            (CAMERA_PRESENTER_SCREEN_KEY, "false"),
+            (CAMERA_MIRROR_KEY, "false"),
+            (CAMERA_BORDER_KEY, "false"),
+            (CAMERA_SHADOW_KEY, "true"),
+        ] {
+            assert!(persist_to(&store, lookup(key).unwrap(), value).unwrap());
+        }
+
+        let preferences = load_recording_preferences_from(&store).unwrap();
+        assert!(preferences.settings.camera.enabled);
+        assert_eq!(
+            preferences
+                .camera_device
+                .as_ref()
+                .map(CameraDeviceId::as_str),
+            Some("stable-camera-id")
+        );
+        assert_eq!(preferences.settings.camera.position, OverlayAnchor::TopLeft);
+        assert_eq!(
+            preferences.settings.camera.placement,
+            Some(
+                scrozz_record::settings::CameraPlacement::new(0.333, 0.667)
+                    .expect("fixture placement")
+            )
+        );
+        assert_eq!(preferences.settings.camera.size, 0.34);
+        assert_eq!(preferences.settings.camera.shape, CameraShape::Square);
+        assert!(preferences.settings.camera.presenter);
+        assert!(!preferences.settings.camera.presenter_screen);
+        assert!(!preferences.settings.camera.mirror);
+        assert!(!preferences.settings.camera.border);
+        assert!(preferences.settings.camera.shadow);
+    }
+
+    #[test]
+    fn missing_camera_preferences_never_enable_capture() {
+        let root = scratch("camera-default");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join(SETTINGS_FILE));
+        let preferences = load_recording_preferences_from(&store).unwrap();
+        assert!(!preferences.settings.camera.enabled);
+        assert!(preferences.camera_device.is_none());
     }
 
     #[test]
