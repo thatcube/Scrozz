@@ -237,8 +237,8 @@ impl Action {
     ) -> bool {
         match self {
             Self::Capture(kind) => kind.is_available(capabilities, session, capture_backend_ready),
-            Self::Quit | Self::OpenSettings | Self::UnlockPins => true,
-            Self::ToggleRecording | Self::OpenHistory => false,
+            Self::Quit | Self::OpenHistory | Self::OpenSettings | Self::UnlockPins => true,
+            Self::ToggleRecording => false,
         }
     }
 
@@ -374,6 +374,16 @@ mod tests {
                 "{action:?} is on the wrong side of the bindable line"
             );
         }
+    }
+
+    #[test]
+    fn capture_history_is_available_from_the_tray_without_a_global_shortcut() {
+        assert!(Action::OpenHistory.is_available(
+            SelectionCapabilities::NONE,
+            &Session::detect(),
+            false,
+        ));
+        assert!(Action::OpenHistory.shortcut().is_none());
     }
 
     #[test]

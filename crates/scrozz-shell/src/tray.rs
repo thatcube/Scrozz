@@ -147,6 +147,7 @@ impl TrayAction {
                 | Self::CaptureFullscreen
                 | Self::CaptureAllDisplays
                 | Self::Quit
+                | Self::OpenHistory
                 | Self::OpenSettings
                 | Self::UnlockPinnedCaptures
         )
@@ -173,8 +174,10 @@ impl TrayAction {
                 session.server,
                 DisplayServer::Wayland | DisplayServer::Headless
             ),
-            Self::Quit | Self::OpenSettings | Self::UnlockPinnedCaptures => true,
-            Self::ToggleRecording | Self::OpenHistory => false,
+            Self::Quit | Self::OpenHistory | Self::OpenSettings | Self::UnlockPinnedCaptures => {
+                true
+            }
+            Self::ToggleRecording => false,
         }
     }
 }
@@ -509,4 +512,16 @@ pub const fn recording_label(recording: bool) -> &'static str {
 fn append(menu: &Menu, item: &dyn IsMenuItem) -> Result<()> {
     menu.append(item)
         .map_err(|err| Error::Platform(format!("could not build the tray menu: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implemented_history_is_enabled_in_every_desktop_session() {
+        assert!(TrayAction::OpenHistory.is_available());
+        assert!(TrayAction::OpenHistory.is_available_for(&Session::detect()));
+        assert!(!TrayAction::ToggleRecording.is_available());
+    }
 }
