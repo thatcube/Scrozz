@@ -288,9 +288,8 @@ impl AnnotationObject {
         let half_stroke = self.style.effective_stroke_width() / 2.0;
         match &self.annotation {
             Annotation::Text { .. } | Annotation::Counter { .. } => self.bounds(),
-            Annotation::Arrow { .. } => {
-                // The head is wider than the shaft, so grow by its half-width.
-                geom::inflate(&self.annotation.bounds(), self.arrow_head_half_width())
+            Annotation::Arrow { from, to } => {
+                crate::arrow::visual_bounds(*from, *to, self.style, self.id.0)
             }
             Annotation::Highlight(_) | Annotation::Redact { .. } => self.annotation.bounds(),
             _ => geom::inflate(&self.annotation.bounds(), half_stroke),
@@ -318,6 +317,15 @@ impl AnnotationObject {
         self.style.effective_stroke_width() * 1.8
     }
 
+    /// Position of the style-specific bend affordance.
+    #[must_use]
+    pub fn arrow_bend_handle(&self) -> Option<LogicalPoint> {
+        let Annotation::Arrow { from, to } = self.annotation else {
+            return None;
+        };
+        Some(crate::arrow::bend_handle(from, to, self.style))
+    }
+
     /// Whether `point` selects this annotation.
     ///
     /// Filled and region-like annotations are hit anywhere inside them; outlined
@@ -330,9 +338,15 @@ impl AnnotationObject {
         }
         let slack = self.style.effective_stroke_width() / 2.0 + Self::HIT_TOLERANCE;
         match &self.annotation {
-            Annotation::Arrow { from, to } | Annotation::Line { from, to } => {
-                geom::distance_to_segment(point, *from, *to) <= slack
-            }
+            Annotation::Arrow { from, to } => crate::arrow::hit(
+                point,
+                *from,
+                *to,
+                self.style,
+                self.id.0,
+                Self::HIT_TOLERANCE,
+            ),
+            Annotation::Line { from, to } => geom::distance_to_segment(point, *from, *to) <= slack,
             Annotation::Rectangle(r) => {
                 if self.style.fill.is_some_and(|f| !f.is_invisible()) {
                     geom::contains(&geom::inflate(r, slack), point)

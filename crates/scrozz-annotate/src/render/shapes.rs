@@ -159,58 +159,27 @@ pub fn fill_path(pixmap: &mut Pixmap, path: &Path, paint: &Paint<'_>) {
     pixmap.fill_path(path, paint, FillRule::Winding, Transform::identity(), None);
 }
 
-/// The shaft and head of an arrow, as two paths.
+/// One continuous filled arrow silhouette.
 ///
-/// The head is a filled triangle whose length and width both scale with stroke
-/// width, so a hairline arrow does not end in a pinpoint and a heavy one does
-/// not end in a blob. The shaft stops short of the head's base rather than
-/// running through it, which would show as a bump on a translucent arrow.
+/// Shaft, shoulder, and head share one outline, so translucent arrows cannot
+/// reveal an overlap and thick arrows cannot develop a bulb, seam, or notch.
 #[must_use]
 pub fn arrow(
     object: &AnnotationObject,
     from: LogicalPoint,
     to: LogicalPoint,
     xf: Scaled,
-) -> Option<(Path, Path)> {
-    let (x0, y0) = xf.point(from);
-    let (x1, y1) = xf.point(to);
-    let (dx, dy) = (x1 - x0, y1 - y0);
-    let length = dx.hypot(dy);
-    if length <= f32::EPSILON {
-        return None;
+) -> Option<Path> {
+    let points = crate::arrow::outline(from, to, object.style, object.id.0)?;
+    let mut path = PathBuilder::new();
+    let (x, y) = xf.point(points[0]);
+    path.move_to(x, y);
+    for point in points.into_iter().skip(1) {
+        let (x, y) = xf.point(point);
+        path.line_to(x, y);
     }
-    let (ux, uy) = (dx / length, dy / length);
-
-    // Never let the head eat the whole arrow: a very short arrow becomes mostly
-    // head, but must still read as an arrow rather than as a stray triangle.
-    let head_length = xf.length(object.arrow_head_length()).min(length * 0.6);
-    let half_width = xf.length(object.arrow_head_half_width());
-
-    let base_x = ux.mul_add(-head_length, x1);
-    let base_y = uy.mul_add(-head_length, y1);
-    let (px, py) = (-uy, ux);
-
-    let mut shaft = PathBuilder::new();
-    shaft.move_to(x0, y0);
-    // Overlap the head's base slightly so no seam shows between them.
-    shaft.line_to(
-        ux.mul_add(head_length * 0.35, base_x),
-        uy.mul_add(head_length * 0.35, base_y),
-    );
-
-    let mut head = PathBuilder::new();
-    head.move_to(x1, y1);
-    head.line_to(
-        px.mul_add(half_width, base_x),
-        py.mul_add(half_width, base_y),
-    );
-    head.line_to(
-        px.mul_add(-half_width, base_x),
-        py.mul_add(-half_width, base_y),
-    );
-    head.close();
-
-    Some((shaft.finish()?, head.finish()?))
+    path.close();
+    path.finish()
 }
 
 /// A straight line path between two points.

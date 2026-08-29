@@ -114,7 +114,7 @@ fn the_stack_grows_upward() {
     let layout = StackLayout::default();
     let area = work_area();
     let mut previous = layout.slot_frame(area, 0);
-    for slot in 1..layout.max_slots {
+    for slot in 1..layout.capacity(area) {
         let current = layout.slot_frame(area, slot);
         assert!(
             current.origin.y < previous.origin.y,
@@ -135,7 +135,7 @@ fn adjacent_slots_are_separated_by_exactly_one_gap() {
     assert_eq!(layout.gap, 8.0);
     assert_eq!(layout.margin, 2.0);
     assert_eq!(layout.left_margin, 40.0);
-    assert_eq!(layout.card, LogicalSize::new(210.0, 150.0));
+    assert_eq!(layout.card, LogicalSize::new(288.0, 180.0));
     let area = work_area();
     let lower = layout.slot_frame(area, 0);
     let upper = layout.slot_frame(area, 1);
@@ -165,26 +165,23 @@ fn a_cards_position_never_moves_upward_as_the_stack_fills() {
 #[test]
 fn capacity_is_derived_from_work_area_height() {
     let layout = StackLayout::default();
-    // 1069 points of work area, 16 of margin either side, 158 per card:
-    // (1037 + 8) / 158 = 6.6 -> 6, which is also the cap.
-    assert_eq!(layout.capacity(work_area()), 6);
+    // n*180 + (n-1)*8 fits five cards in this 1069-point work area.
+    assert_eq!(layout.capacity(work_area()), 5);
 }
 
 #[test]
-fn capacity_clamps_on_a_short_display() {
+fn capacity_adapts_to_a_short_display() {
     let layout = StackLayout::default();
-    // An old 1024x768 display with a Dock leaves room for four cards, not six.
+    // An old 1024x768 display with a Dock leaves room for three preferred cards.
     let short = rect(0.0, 25.0, 1024.0, 660.0);
-    let capacity = layout.capacity(short);
-    assert!(
-        (1..=layout.max_slots).contains(&capacity),
-        "capacity {capacity} outside 1..={}",
-        layout.max_slots
-    );
-    assert!(
-        capacity < layout.max_slots,
-        "a 660pt work area cannot hold six 150pt cards"
-    );
+    assert_eq!(layout.capacity(short), 3);
+}
+
+#[test]
+fn tall_displays_are_not_capped_at_six_recent_captures() {
+    let layout = StackLayout::default();
+    let portrait = rect(0.0, 0.0, 1600.0, 2200.0);
+    assert_eq!(layout.capacity(portrait), 11);
 }
 
 #[test]

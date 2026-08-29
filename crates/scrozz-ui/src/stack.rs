@@ -70,13 +70,6 @@ pub type Millis = u64;
 // Slot geometry
 // ---------------------------------------------------------------------------
 
-/// The most slots the stack will ever offer.
-///
-/// Six is the target on a 16-inch MacBook Pro. Beyond that the pile stops
-/// reading as "recent captures" and starts reading as a file manager, which is
-/// not what this surface is for.
-pub const MAX_SLOTS: usize = 6;
-
 /// The fewest slots a usable stack can have.
 pub const MIN_SLOTS: usize = 1;
 
@@ -105,8 +98,8 @@ pub struct CardMetrics {
 impl Default for CardMetrics {
     fn default() -> Self {
         Self {
-            width: 210.0,
-            height: 150.0,
+            width: Self::PREFERRED_WIDTH,
+            height: Self::PREFERRED_HEIGHT,
             gap: 8.0,
             margin: 2.0,
             left_margin: 40.0,
@@ -116,6 +109,44 @@ impl Default for CardMetrics {
 }
 
 impl CardMetrics {
+    /// Minimum designed card width, in logical points.
+    pub const MIN_WIDTH: f32 = 224.0;
+    /// Minimum designed card height, in logical points.
+    pub const MIN_HEIGHT: f32 = 140.0;
+    /// Preferred 16:10 card width, in logical points.
+    pub const PREFERRED_WIDTH: f32 = 288.0;
+    /// Preferred 16:10 card height, in logical points.
+    pub const PREFERRED_HEIGHT: f32 = 180.0;
+    /// Maximum designed card width, in logical points.
+    pub const MAX_WIDTH: f32 = 320.0;
+    /// Maximum designed card height, in logical points.
+    pub const MAX_HEIGHT: f32 = 200.0;
+
+    /// Preferred metrics adjusted for an OS text/accessibility density.
+    #[must_use]
+    pub fn for_density(scale: f32) -> Self {
+        let scale = if scale.is_finite() { scale } else { 1.0 };
+        let width = (Self::PREFERRED_WIDTH * scale).clamp(Self::MIN_WIDTH, Self::MAX_WIDTH);
+        Self {
+            width,
+            height: width / 1.6,
+            ..Self::default()
+        }
+    }
+
+    fn constrained_to(mut self, work_area: Rect) -> Self {
+        let width_room = (work_area.width() - self.left_margin - self.margin).max(1.0);
+        let height_room = (work_area.height() - self.margin * 2.0).max(1.0);
+        let scale = (width_room / self.width)
+            .min(height_room / self.height)
+            .min(1.0);
+        if scale.is_finite() && scale > 0.0 {
+            self.width *= scale;
+            self.height *= scale;
+        }
+        self
+    }
+
     /// Distance between the tops of adjacent slots.
     #[must_use]
     pub fn pitch(&self) -> f32 {
@@ -128,18 +159,11 @@ impl CardMetrics {
     /// `floor((usable + gap) / pitch)`.
     #[must_use]
     pub fn slots_for_height(&self, usable_height: f32) -> usize {
-        let pitch = self.pitch();
-        if pitch <= 0.0 || !usable_height.is_finite() {
-            return MIN_SLOTS;
-        }
-        let fits = ((usable_height + self.gap) / pitch).floor();
-        if fits < MIN_SLOTS as f32 {
-            MIN_SLOTS
-        } else if fits > MAX_SLOTS as f32 {
-            MAX_SLOTS
-        } else {
-            fits as usize
-        }
+        scrozz_core::layout::vertical_capacity(
+            f64::from(usable_height),
+            f64::from(self.height),
+            f64::from(self.gap),
+        )
     }
 }
 
@@ -150,6 +174,7 @@ impl CardMetrics {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StackLayout {
     work_area: Rect,
+    requested_metrics: CardMetrics,
     metrics: CardMetrics,
     slots: usize,
 }
@@ -158,10 +183,13 @@ impl StackLayout {
     /// Derives a layout — and a slot count — from a work area.
     #[must_use]
     pub fn new(work_area: Rect, metrics: CardMetrics) -> Self {
+        let requested_metrics = metrics;
+        let metrics = metrics.constrained_to(work_area);
         let usable = work_area.height() - 2.0 * metrics.margin;
         let slots = metrics.slots_for_height(usable);
         Self {
             work_area,
+            requested_metrics,
             metrics,
             slots,
         }
@@ -411,17 +439,26 @@ fn lock_direction(travel: Vec2) -> Option<Dir> {
     if travel.length() < DRAG_LOCK_SLOP {
         return None;
     }
+    if travel.y > 0.0 {
+        return Some(if travel.x >= 0.0 {
+            Dir::Right
+        } else {
+            Dir::Left
+        });
+    }
     Some(if travel.x.abs() >= travel.y.abs() {
         if travel.x >= 0.0 {
             Dir::Right
         } else {
             Dir::Left
         }
-    } else if travel.y >= 0.0 {
-        Dir::Down
     } else {
         Dir::Up
     })
+}
+
+fn in_collapse_cone(travel: Vec2) -> bool {
+    travel.y > 0.0 && travel.x.abs() <= travel.y * COLLAPSE_CONE_RATIO
 }
 
 /// The window a release speed is measured over, in seconds.
@@ -437,6 +474,9 @@ pub const DRAG_LOCK_SLOP: f32 = 8.0;
 
 /// Opacity of the stationary source while the native drag ghost is active.
 pub const DRAG_SOURCE_ALPHA: f32 = 0.5;
+
+/// Maximum horizontal drift relative to downward travel that still previews collapse.
+pub const COLLAPSE_CONE_RATIO: f32 = 0.35;
 
 /// Release speed, measured by differencing over [`VELOCITY_WINDOW`].
 #[derive(Debug, Clone, Default)]
@@ -826,6 +866,8 @@ struct ActiveDrag {
     velocity: DragVelocity,
     direction: Option<Dir>,
     pinned_rect: Option<Rect>,
+    collapse_candidate: bool,
+    collapse_progress: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1162,7 @@ impl CaptureStack {
     /// Shrinking retires from the bottom, oldest first, exactly as overflow
     /// does, so the invariant survives a display change.
     pub fn resize(&mut self, work_area: Rect, m: &Motion) {
-        self.layout = StackLayout::new(work_area, self.layout.metrics);
+        self.layout = StackLayout::new(work_area, self.layout.requested_metrics);
         self.dock.set_rect(self.layout.dock_rect());
         while self.cards.len() > self.capacity() {
             self.retire_slot(0, Intent::Dismiss, Dir::Left, Vec2::ZERO, m);
@@ -1162,6 +1204,8 @@ impl CaptureStack {
             velocity,
             direction: None,
             pinned_rect: None,
+            collapse_candidate: false,
+            collapse_progress: 0.0,
         });
         let card = &mut self.cards[slot];
         card.drag = Some(Vec2::ZERO);
@@ -1175,21 +1219,56 @@ impl CaptureStack {
     /// An outward/upward gesture is a native drag source, so the resident card
     /// stays pinned while the OS-owned ghost follows the pointer.
     pub fn drag_to(&mut self, pointer: Pos2, m: &Motion) {
-        let (id, offset, direction, newly_locked) = {
+        let (id, offset, direction, newly_locked, collapse_candidate, collapse_progress) = {
             let Some(drag) = self.drag.as_mut() else {
                 return;
             };
             drag.latest = pointer;
             drag.velocity.push(pointer, m);
             let offset = pointer - drag.origin;
-            let newly_locked = if drag.direction.is_none() {
-                drag.direction = lock_direction(offset);
-                drag.direction
+            let newly_locked = if drag.direction.is_none() && !drag.collapse_candidate {
+                if in_collapse_cone(offset) && offset.length() >= DRAG_LOCK_SLOP {
+                    drag.collapse_candidate = true;
+                    None
+                } else {
+                    drag.direction = lock_direction(offset);
+                    drag.direction
+                }
             } else {
                 None
             };
-            (drag.id, offset, drag.direction, newly_locked)
+            if drag.collapse_candidate {
+                drag.collapse_progress = if in_collapse_cone(offset) {
+                    (offset.y / self.gestures.collapse_dist).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if drag.collapse_progress >= 1.0 {
+                    drag.direction = Some(Dir::Down);
+                }
+            }
+            (
+                drag.id,
+                offset,
+                drag.direction,
+                newly_locked,
+                drag.collapse_candidate,
+                drag.collapse_progress,
+            )
         };
+
+        if collapse_candidate {
+            if m.is_reduced() {
+                self.dock.scrub(0.0);
+            } else if collapse_progress > 0.0 {
+                self.dock.scrub(collapse_progress);
+            } else {
+                self.dock.expand(m);
+            }
+            if collapse_progress >= 1.0 {
+                self.dock.collapse(m);
+            }
+        }
 
         if newly_locked.is_some_and(|direction| direction.intent() == Intent::DragOut)
             && let Some(slot) = self.slot_of(id)
@@ -1209,8 +1288,11 @@ impl CaptureStack {
                     card.ret = None;
                     start_drag_fade(card, DRAG_SOURCE_ALPHA, m, self.timing.drag_source_fade);
                 }
-            } else if direction.is_some() {
+            } else if direction.is_some() && direction != Some(Dir::Down) {
                 card.drag = Some(offset);
+            } else if collapse_candidate {
+                card.drag = Some(Vec2::ZERO);
+                card.lifted = false;
             }
         }
     }
@@ -1287,7 +1369,12 @@ impl CaptureStack {
                 self.spring_back(slot, m, drag.pinned_rect);
                 self.dock.collapse(m);
             }
-            Intent::SpringBack => self.spring_back(slot, m, drag.pinned_rect),
+            Intent::SpringBack => {
+                self.spring_back(slot, m, drag.pinned_rect);
+                if drag.collapse_candidate {
+                    self.dock.expand(m);
+                }
+            }
         }
 
         Some(DragRelease {
@@ -1307,6 +1394,9 @@ impl CaptureStack {
         };
         if let Some(slot) = self.slot_of(drag.id) {
             self.spring_back(slot, m, drag.pinned_rect);
+        }
+        if drag.collapse_candidate {
+            self.dock.expand(m);
         }
     }
 
@@ -1567,12 +1657,21 @@ impl CaptureStack {
             id: card.id,
             slot,
             rect,
-            alpha: entry_alpha * drag_alpha(card, m),
+            alpha: entry_alpha * drag_alpha(card, m) * self.collapse_preview_alpha(),
             reveal: self.timing.reveal_ease.apply(reveal) * flat,
             lift: if card.lifted { 1.0 } else { 0.0 },
             angle,
             state,
         }
+    }
+
+    fn collapse_preview_alpha(&self) -> f32 {
+        let progress = self
+            .drag
+            .as_ref()
+            .filter(|drag| drag.collapse_candidate)
+            .map_or(0.0, |drag| drag.collapse_progress);
+        1.0 - progress * 0.35
     }
 
     fn departing_frame(&self, d: &Departing, m: &Motion) -> CardFrame {

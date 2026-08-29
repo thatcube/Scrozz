@@ -22,7 +22,8 @@
 //! exactly one step.
 
 use scrozz_annotate::{
-    Annotation, AnnotationId, AnnotationKind, Color, Document, History, RedactStyle, Style, geom,
+    Annotation, AnnotationId, AnnotationKind, ArrowStyle, Color, Document, History, RedactStyle,
+    Style, geom,
 };
 use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Result};
 use std::ops::Range;
@@ -343,6 +344,11 @@ enum Drag {
         handle: Handle,
         from: LogicalPoint,
         to: LogicalPoint,
+    },
+    ArrowBend {
+        from: LogicalPoint,
+        to: LogicalPoint,
+        bend: f64,
     },
     Cropping {
         origin: LogicalPoint,
@@ -696,10 +702,46 @@ impl EditorState {
         self.set_style(style);
     }
 
+    /// Arrow shape language currently in hand.
+    #[must_use]
+    pub const fn arrow_style(&self) -> ArrowStyle {
+        self.style.arrow_style
+    }
+
+    /// Sets the arrow shape language for the selection and future arrows.
+    pub fn set_arrow_style(&mut self, arrow_style: ArrowStyle) {
+        let mut style = self.style.with_arrow_style(arrow_style);
+        if arrow_style == ArrowStyle::Curved && style.effective_arrow_bend().abs() < f64::EPSILON {
+            style = style.with_arrow_bend(0.28);
+        } else if arrow_style != ArrowStyle::Curved && self.style.arrow_style != arrow_style {
+            style = style.with_arrow_bend(0.0);
+        }
+        self.set_style(style);
+    }
+
+    /// Signed arrow bend in source-relative units.
+    #[must_use]
+    pub fn arrow_bend(&self) -> f64 {
+        self.style.effective_arrow_bend()
+    }
+
+    /// Sets the bend for the selection and future arrows.
+    pub fn set_arrow_bend(&mut self, bend: f64) {
+        self.set_style(self.style.with_arrow_bend(bend.clamp(-0.75, 0.75)));
+    }
+
     /// The selected annotation, if any.
     #[must_use]
     pub const fn selection(&self) -> Option<AnnotationId> {
         self.selection
+    }
+
+    /// Whether the current selection is an arrow.
+    #[must_use]
+    pub fn selection_is_arrow(&self) -> bool {
+        self.selection
+            .and_then(|id| self.document.get(id))
+            .is_some_and(|object| matches!(object.annotation, Annotation::Arrow { .. }))
     }
 
     /// The selection's bounding box, if there is a selection.
@@ -727,6 +769,14 @@ impl EditorState {
             .into_iter()
             .map(|handle| (handle, handle.position(&bounds)))
             .collect()
+    }
+
+    /// Distinct diamond bend affordance for a selected arrow.
+    #[must_use]
+    pub fn arrow_bend_handle(&self) -> Option<LogicalPoint> {
+        self.selection
+            .and_then(|id| self.document.get(id))
+            .and_then(scrozz_annotate::AnnotationObject::arrow_bend_handle)
     }
 
     /// Selects an annotation, or clears the selection with `None`.
@@ -1189,6 +1239,12 @@ impl EditorState {
         self.drag != Drag::Idle
     }
 
+    /// Whether the distinct arrow bend affordance is being dragged.
+    #[must_use]
+    pub fn is_dragging_arrow_bend(&self) -> bool {
+        matches!(self.drag, Drag::ArrowBend { .. })
+    }
+
     // -----------------------------------------------------------------------
     // Pointer
     // -----------------------------------------------------------------------
@@ -1381,6 +1437,26 @@ impl EditorState {
                 }
                 self.drag = Drag::ArrowEndpoint { handle, from, to };
             }
+            Drag::ArrowBend { from, to, bend } => {
+                let midpoint = LogicalPoint::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+                let dx = to.x - from.x;
+                let dy = to.y - from.y;
+                let length = dx.hypot(dy);
+                if length > f64::EPSILON {
+                    let signed =
+                        ((point.x - midpoint.x) * -dy + (point.y - midpoint.y) * dx) / length;
+                    let next = (signed * 2.0 / length).clamp(-0.75, 0.75);
+                    if let Some(id) = self.selection
+                        && let Some(mut object) = self.document.get_mut(id)
+                        && (object.style().effective_arrow_bend() - next).abs() > f64::EPSILON
+                    {
+                        object.style().arrow_bend = next;
+                        self.style.arrow_bend = next;
+                        changed = true;
+                    }
+                }
+                self.drag = Drag::ArrowBend { from, to, bend };
+            }
             Drag::Cropping { origin, .. } => {
                 self.drag = Drag::Cropping {
                     origin,
@@ -1512,6 +1588,19 @@ impl EditorState {
                     let changed = *current_from != from || *current_to != to;
                     *current_from = from;
                     *current_to = to;
+                    changed
+                } else {
+                    false
+                }
+            }
+            Drag::ArrowBend { bend, .. } => {
+                if let Some(id) = self.selection
+                    && let Some(mut object) = self.document.get_mut(id)
+                {
+                    let changed =
+                        (object.style().effective_arrow_bend() - bend).abs() > f64::EPSILON;
+                    object.style().arrow_bend = bend;
+                    self.style.arrow_bend = bend;
                     changed
                 } else {
                     false
@@ -1725,6 +1814,9 @@ impl EditorState {
             };
             return true;
         }
+        if self.press_arrow_bend(point) {
+            return true;
+        }
 
         let hit = self.document.hit_test_all(point).into_iter().find(|id| {
             self.document
@@ -1768,6 +1860,9 @@ impl EditorState {
                 return;
             }
         }
+        if self.press_arrow_bend(point) {
+            return;
+        }
         match self.document.hit_test(point) {
             Some(id) => {
                 self.selection = Some(id);
@@ -1788,6 +1883,27 @@ impl EditorState {
             }
             None => self.selection = None,
         }
+    }
+
+    fn press_arrow_bend(&mut self, point: LogicalPoint) -> bool {
+        let Some(handle) = self.arrow_bend_handle() else {
+            return false;
+        };
+        if geom::distance(handle, point) > self.handle_tolerance() {
+            return false;
+        }
+        let Some(object) = self.selection.and_then(|id| self.document.get(id)) else {
+            return false;
+        };
+        let Annotation::Arrow { from, to } = object.annotation else {
+            return false;
+        };
+        self.drag = Drag::ArrowBend {
+            from,
+            to,
+            bend: object.style.effective_arrow_bend(),
+        };
+        true
     }
 
     fn place(&mut self, tool: Tool, point: LogicalPoint) {
@@ -1917,6 +2033,9 @@ impl EditorState {
             .is_some_and(|id| self.document.get(id).is_none())
         {
             self.selection = None;
+        }
+        if let Some(object) = self.selection.and_then(|id| self.document.get(id)) {
+            self.style = object.style;
         }
         // Editing follows the annotation. Undoing the click that made a label
         // takes the label out of the document, so editing has to stop — but the

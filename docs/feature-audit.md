@@ -150,7 +150,7 @@ non-destructive. This is the single largest surface area in the product.
 | ID | Tool | Tier | Notes |
 |---|---|---|---|
 | ANN-01 | Crop — with aspect ratio + snap to edges | T0 | |
-| ANN-02 | Arrow — **4 styles including curved** | T0 | Curved arrow needs bezier + control handles |
+| ANN-02 | Arrow — **4 styles including curved** | T0 | **Implemented:** Bold, Curved, Sketch, and Double; four named thickness presets backed by numeric source-unit width; deterministic Sketch seed; hybrid bend affordance |
 | ANN-03 | Rectangle | T0 | |
 | ANN-04 | Filled rectangle | T0 | |
 | ANN-05 | Ellipse | T0 | |
@@ -218,7 +218,7 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 | QA-10 | **Swipe-to-dismiss gesture** | **T1** | Previously mis-tiered T3. Primary dismissal on macOS; needs a non-trackpad equivalent on Windows/Linux |
 | QA-11 | Quick actions | T2 | |
 | QA-12 | Temporarily hide overlays | T2 | |
-| QA-13 | **Capture stack — multiple captures stacked in the corner** | **T0** | **Missing from the first pass entirely.** Card-stack metaphor with per-card actions; changes the overlay's whole data model from one capture to a collection |
+| QA-13 | **Capture stack — multiple captures stacked in the corner** | **T0** | **Implemented:** adaptive 288×180 logical 16:10 cards, cover-fill previews, and work-area-derived capacity with no fixed item-count cap |
 | QA-14 | **Promised-file drag (drag out before saving)** | **T0** | The technical core of QA-03 — see below |
 
 > **QA-14 is the sleeper cost in this section.** Dragging a capture that has never

@@ -41,6 +41,7 @@
 
 mod build_info;
 mod cli;
+mod color_swatches;
 mod commands;
 mod exit;
 mod fault;

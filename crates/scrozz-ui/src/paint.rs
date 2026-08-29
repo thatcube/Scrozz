@@ -817,10 +817,11 @@ pub fn stroke_width(
     rect: Rect,
     id: Id,
     fraction: f32,
+    value: f64,
 ) -> Response {
     let response = ui.interact(rect, id, Sense::click_and_drag());
     let fraction = fraction.clamp(0.0, 1.0);
-    response.widget_info(|| WidgetInfo::slider(true, f64::from(fraction), "Stroke width"));
+    response.widget_info(|| WidgetInfo::slider(true, value, "Stroke width"));
 
     let palette = surface.palette();
     let painter = ui.painter();

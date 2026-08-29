@@ -30,6 +30,7 @@ pub mod color;
 pub mod error;
 pub mod frame;
 pub mod geometry;
+pub mod layout;
 pub mod product_copy;
 pub mod selection;
 pub mod target;

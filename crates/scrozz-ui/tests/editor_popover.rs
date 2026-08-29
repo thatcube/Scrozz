@@ -4,7 +4,7 @@
 
 use egui::accesskit::{Action, ActionRequest, Node, NodeId, Toggled, TreeId};
 use egui::{Context, Event, Key, Modifiers, PointerButton, RawInput, Rect, pos2, vec2};
-use scrozz_annotate::{Annotation, Color, Document};
+use scrozz_annotate::{Annotation, ArrowStyle, Color, Document};
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
@@ -174,7 +174,7 @@ fn disclosure_opens_a_complete_accessible_palette_without_reflowing() {
         "Purple colour",
         "Pink colour",
         "White colour",
-        "Choose custom colour",
+        "Add custom colour",
     ] {
         let _ = access_node(&opened, |label| label == name);
     }
@@ -200,7 +200,7 @@ fn same_colour_is_a_no_op_and_custom_colour_is_forwarded() {
 
     editor.open_color_popover();
     let (_, reopened) = driver.frame(&mut editor, SIZE, Vec::new());
-    let (tree, custom, _) = access_node(&reopened, |label| label == "Choose custom colour");
+    let (tree, custom, _) = access_node(&reopened, |label| label == "Add custom colour");
     let (intent, _) = driver.frame(&mut editor, SIZE, vec![activate(tree, custom)]);
     assert_eq!(intent, Intent::CustomColor);
 }
@@ -420,6 +420,35 @@ fn egui_colours_round_trip_as_straight_alpha() {
 }
 
 #[test]
+fn custom_swatches_are_bounded_mru_and_accessibly_replaceable() {
+    let mut driver = Driver::new(true, 1.0);
+    let mut editor = editor();
+    let colors: Vec<_> = (0..10)
+        .map(|value| Color::rgba(value, value + 1, value + 2, 128))
+        .collect();
+    editor.set_custom_swatches(colors.clone());
+    assert_eq!(editor.custom_swatches().len(), 8);
+    editor.state_mut().set_stroke_color(colors[2]);
+    editor.open_color_popover();
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let _ = access_node(&output, |label| label.starts_with("Custom #"));
+    let _ = access_node(&output, |label| label == "Remove selected custom colour");
+    let (tree, replace, _) =
+        access_node(&output, |label| label == "Replace selected custom colour");
+
+    let (intent, _) = driver.frame(&mut editor, SIZE, vec![activate(tree, replace)]);
+    assert_eq!(intent, Intent::CustomColor);
+    let replacement = Color::rgba(240, 30, 80, 96);
+    editor.remember_custom_color(replacement);
+    let changed = editor
+        .take_custom_swatches_change()
+        .expect("palette persistence update");
+    assert_eq!(changed[0], replacement);
+    assert_eq!(changed.len(), 8);
+    assert!(!changed.contains(&colors[2]));
+}
+
+#[test]
 fn an_open_popover_owns_editor_keyboard_and_canvas_input() {
     let mut driver = Driver::new(true, 1.0);
     let mut editor = editor();
@@ -490,4 +519,61 @@ fn an_open_popover_owns_editor_keyboard_and_canvas_input() {
         count,
         "the dismissing click reached the canvas"
     );
+}
+
+#[test]
+fn arrow_inspector_exposes_styles_bend_and_named_thickness_accessibly() {
+    let mut driver = Driver::new(true, 1.0);
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Arrow);
+    editor
+        .state_mut()
+        .pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    editor
+        .state_mut()
+        .pointer_dragged(LogicalPoint::new(100.0, 80.0), false);
+    editor.state_mut().pointer_released();
+    let selected = editor.state().selection().expect("selected arrow");
+    let history = editor.state().undo_depth();
+    editor.open_arrow_popover();
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    for label in ["Bold arrow", "Curved arrow", "Sketch arrow", "Double arrow"] {
+        let _ = access_node(&output, |candidate| candidate == label);
+    }
+    for label in [
+        "Thin thickness",
+        "Regular thickness",
+        "Bold thickness",
+        "Heavy thickness",
+    ] {
+        let _ = access_node(&output, |candidate| candidate.starts_with(label));
+    }
+    let _ = access_node(&output, |candidate| candidate.starts_with("Bend"));
+    let (tree, curved, _) = access_node(&output, |label| label == "Curved arrow");
+
+    let _ = driver.frame(&mut editor, SIZE, vec![activate(tree, curved)]);
+
+    let object = editor.document().get(selected).expect("arrow");
+    assert_eq!(object.style.arrow_style, ArrowStyle::Curved);
+    assert!((object.style.arrow_bend - 0.28).abs() < 0.01);
+    assert_eq!(editor.state().undo_depth(), history + 1);
+    assert!(editor.arrow_popover_is_open());
+}
+
+#[test]
+fn stroke_control_keyboard_steps_through_named_source_unit_widths() {
+    let mut driver = Driver::new(true, 2.0);
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Arrow);
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let (tree, stroke, _) = access_node(&output, |label| label == "Stroke width");
+    assert_eq!(editor.state().stroke_width(), 4.0);
+
+    let _ = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![access_action(tree, stroke, Action::Increment)],
+    );
+
+    assert_eq!(editor.state().stroke_width(), 8.0);
 }

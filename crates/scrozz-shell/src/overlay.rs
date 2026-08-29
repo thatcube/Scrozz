@@ -349,22 +349,15 @@ pub struct StackLayout {
     pub left_margin: f64,
     /// Vertical gap between adjacent cards, in points.
     pub gap: f64,
-    /// Upper bound on slots regardless of how tall the display is.
-    ///
-    /// Six is the target on a 16-inch MacBook Pro and matches the practical
-    /// ceiling of comparable tools; a 4K display in portrait should not grow a
-    /// twenty-card pile.
-    pub max_slots: usize,
 }
 
 impl Default for StackLayout {
     fn default() -> Self {
         Self {
-            card: LogicalSize::new(210.0, 150.0),
+            card: LogicalSize::new(288.0, 180.0),
             margin: 2.0,
             left_margin: 40.0,
             gap: 8.0,
-            max_slots: 6,
         }
     }
 }
@@ -373,21 +366,13 @@ impl StackLayout {
     /// How many slots fit in this work area.
     ///
     /// Derived from available height rather than hard-coded, per D28, and
-    /// clamped to [`Self::max_slots`]. Always at least one: a capture that
-    /// produced no visible card at all would read as the app having failed,
-    /// which is worse than a card that crowds the margin on a very short
-    /// display.
+    /// Always at least one: a capture that produced no visible card at all would
+    /// read as the app having failed, which is worse than a card that crowds the
+    /// margin on a very short display.
     #[must_use]
     pub fn capacity(&self, work_area: LogicalRect) -> usize {
         let usable = work_area.size.height - 2.0 * self.margin;
-        let pitch = self.card.height + self.gap;
-        if usable < self.card.height || pitch <= 0.0 {
-            return 1;
-        }
-        // n cards occupy n*card + (n-1)*gap, so n = (usable + gap) / pitch.
-        let fits = ((usable + self.gap) / pitch).floor().max(1.0);
-        let fits = if fits.is_finite() { fits as usize } else { 1 };
-        fits.clamp(1, self.max_slots.max(1))
+        scrozz_core::layout::vertical_capacity(usable, self.card.height, self.gap)
     }
 
     /// The frame of one slot, in Scrozz's top-left logical space.
@@ -401,7 +386,7 @@ impl StackLayout {
         // origin.y + height, and moving *up* a slot means *subtracting* from y.
         let bottom = work_area.origin.y + work_area.size.height - self.margin;
         let pitch = self.card.height + self.gap;
-        // Slot indices are single digits; f64 is exact far past `max_slots`.
+        // Realistic slot indices remain exactly representable in f64.
         #[allow(clippy::cast_precision_loss)]
         let offset = slot as f64 * pitch;
         LogicalRect::new(

@@ -51,6 +51,8 @@ pub enum DockPhase {
     Open,
     /// Cards are travelling down into the dock.
     Collapsing(Timeline),
+    /// A live downward gesture is scrubbing the collective preview.
+    Scrubbing(f32),
     /// The pile is stowed; only the dock is on screen.
     Collapsed,
     /// Cards are travelling back up out of the dock.
@@ -129,7 +131,10 @@ impl Dock {
     /// the animation finishes.
     #[must_use]
     pub fn is_stowing(&self) -> bool {
-        matches!(self.phase, DockPhase::Collapsed | DockPhase::Collapsing(_))
+        matches!(
+            self.phase,
+            DockPhase::Collapsed | DockPhase::Collapsing(_) | DockPhase::Scrubbing(_)
+        )
     }
 
     /// Whether the collapse has finished.
@@ -150,6 +155,7 @@ impl Dock {
             DockPhase::Open => 0.0,
             DockPhase::Collapsed => 1.0,
             DockPhase::Collapsing(t) => t.value(m).clamp(0.0, 1.0),
+            DockPhase::Scrubbing(progress) => progress.clamp(0.0, 1.0),
             DockPhase::Expanding(t) => 1.0 - t.value(m).clamp(0.0, 1.0),
         }
     }
@@ -178,6 +184,7 @@ impl Dock {
         match self.phase {
             DockPhase::Open | DockPhase::Collapsed => Activity::IDLE,
             DockPhase::Collapsing(t) | DockPhase::Expanding(t) => t.activity(m),
+            DockPhase::Scrubbing(_) => Activity::animating(),
         }
     }
 
@@ -188,7 +195,7 @@ impl Dock {
     /// timeline's start is what buys that, and it keeps the whole thing a pure
     /// function of the instant rather than a value that has to be stepped.
     pub fn collapse(&mut self, m: &Motion) {
-        if self.is_stowing() {
+        if matches!(self.phase, DockPhase::Collapsed | DockPhase::Collapsing(_)) {
             return;
         }
         let done = self.collapse_progress(m);
@@ -204,6 +211,13 @@ impl Dock {
         let done = 1.0 - self.collapse_progress(m);
         self.phase = DockPhase::Expanding(back_dated(m, done, self.expand, self.ease));
         self.advance(m);
+    }
+
+    /// Scrubs every card toward the dock from a live downward gesture.
+    pub fn scrub(&mut self, progress: f32) {
+        if !matches!(self.phase, DockPhase::Collapsed | DockPhase::Collapsing(_)) {
+            self.phase = DockPhase::Scrubbing(progress.clamp(0.0, 1.0));
+        }
     }
 
     /// Collapses if open, expands if stowed. This is what the chevron does.

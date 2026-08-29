@@ -16,7 +16,7 @@
 //! construction rather than by discipline.
 
 use egui::{Color32, CursorIcon, Painter, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use scrozz_annotate::{Annotation, SkiaRenderer, font};
+use scrozz_annotate::{Annotation, ArrowStyle, SkiaRenderer, font};
 use scrozz_core::{
     ColorSpace, LogicalPoint, LogicalRect, LogicalSize, PixelFormat, ScaleFactor,
     Transform as ColorTransform,
@@ -547,6 +547,38 @@ fn draw_selection(
             painter.circle_filled(at, r + 1.0, Color32::WHITE);
             painter.circle_filled(at, r - 0.5, palette.accent);
             painter.circle_stroke(at, r - 0.5, Stroke::new(1.0, palette.accent_press));
+        }
+        if let Some(position) = state.arrow_bend_handle() {
+            let at = super::to_screen(position, view.image, view.content);
+            let near = painter
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|pointer| pointer.distance(at) <= 18.0);
+            if state.arrow_style() == ArrowStyle::Curved || state.is_dragging_arrow_bend() || near {
+                let diamond = |radius: f32| {
+                    vec![
+                        at + vec2(0.0, -radius),
+                        at + vec2(radius, 0.0),
+                        at + vec2(0.0, radius),
+                        at + vec2(-radius, 0.0),
+                    ]
+                };
+                painter.add(egui::Shape::convex_polygon(
+                    diamond(r + 2.0),
+                    Color32::from_black_alpha(110),
+                    Stroke::NONE,
+                ));
+                painter.add(egui::Shape::convex_polygon(
+                    diamond(r + 1.0),
+                    Color32::WHITE,
+                    Stroke::NONE,
+                ));
+                painter.add(egui::Shape::convex_polygon(
+                    diamond(r - 0.5),
+                    palette.accent,
+                    Stroke::new(1.0, palette.accent_press),
+                ));
+            }
         }
         return;
     }

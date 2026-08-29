@@ -259,6 +259,20 @@ impl Host for Windowed {
             Box::new(move |cc| {
                 let overlay = OverlayApp::new(cc, handle, options);
                 native.set_frame(logical_frame(geometry));
+                let (color_swatch_store, custom_swatches) =
+                    match crate::color_swatches::CustomSwatchStore::default_location() {
+                        Ok(store) => match store.load() {
+                            Ok(colors) => (Some(store), colors),
+                            Err(error) => {
+                                tracing::warn!(%error, "custom colours could not be loaded");
+                                (Some(store), Vec::new())
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "custom colours cannot be persisted");
+                            (None, Vec::new())
+                        }
+                    };
                 Ok(Box::new(Driver {
                     app,
                     overlay,
@@ -271,6 +285,8 @@ impl Host for Windowed {
                     editing: None,
                     color_picker: scrozz_shell::SystemColorPicker::default(),
                     color_picker_generation: None,
+                    color_swatch_store,
+                    custom_swatches,
                     native,
                     display_id,
                     pointer_geometry,
@@ -458,6 +474,8 @@ struct Driver {
     color_picker: scrozz_shell::SystemColorPicker,
     /// Editor generation that opened the modeless system colour panel.
     color_picker_generation: Option<u64>,
+    color_swatch_store: Option<crate::color_swatches::CustomSwatchStore>,
+    custom_swatches: Vec<scrozz_annotate::Color>,
     native: BehaviorController,
     display_id: Option<DisplayId>,
     pointer_geometry: SharedGeometry,
@@ -527,6 +545,7 @@ impl Driver {
                         if changed {
                             editor.apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
                         }
+                        editor.remember_custom_color(scrozz_annotate::Color::rgba(r, g, b, a));
                         self.editor.request_foreground();
                     }
                     self.color_picker_generation = None;
@@ -573,6 +592,14 @@ impl Driver {
 
         self.app
             .prepare_editor(EditorSnapshot::new(card, generation, editor));
+        if let Some(colors) = editor.take_custom_swatches_change() {
+            if let Some(store) = &self.color_swatch_store
+                && let Err(error) = store.save(&colors)
+            {
+                tracing::warn!(%error, "custom colours could not be saved");
+            }
+            self.custom_swatches = colors;
+        }
         if self.color_picker.is_open() {
             ctx.request_repaint_after(IDLE);
         }
@@ -709,12 +736,13 @@ impl eframe::App for Driver {
             }
             self.color_picker_generation = None;
             let title = format!("{}", request.card);
+            let mut editor =
+                scrozz_ui::editor::EditorUi::new(scrozz_annotate::Document::new(request.capture));
+            editor.set_custom_swatches(self.custom_swatches.clone());
             self.editing = Some(Editing {
                 card: request.card,
                 generation: request.generation,
-                editor: scrozz_ui::editor::EditorUi::new(scrozz_annotate::Document::new(
-                    request.capture,
-                )),
+                editor,
             });
             let _ = self.editor.open(title);
         }
