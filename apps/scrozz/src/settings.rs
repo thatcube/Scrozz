@@ -355,6 +355,12 @@ pub const SETTINGS: &[Setting] = &[
         description: "Disk budget for stored source images. Pinned captures are never evicted.",
     },
     Setting {
+        key: "history.max-image-age",
+        kind: Kind::Choice(&["forever", "1-month", "1-week", "3-days", "1-day"]),
+        default: "forever",
+        description: "Maximum age of unpinned source images. Capture documents and edits are kept.",
+    },
+    Setting {
         key: "hotkey.capture-all-in-one",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureAllInOne.default_accelerator_setting(),
@@ -668,6 +674,22 @@ mod tests {
         assert_eq!(
             setting.default.parse::<u64>().unwrap(),
             scrozz_store::RetentionPolicy::default().max_image_bytes
+        );
+
+        let age = lookup("history.max-image-age").unwrap();
+        assert_eq!(
+            scrozz_store::RetentionWindow::from_token(age.default).unwrap(),
+            scrozz_store::RetentionPolicy::default().max_image_age
+        );
+        let Kind::Choice(options) = age.kind else {
+            panic!("history.max-image-age should be a choice")
+        };
+        assert_eq!(
+            options,
+            scrozz_store::RetentionWindow::all()
+                .iter()
+                .map(|window| window.as_token())
+                .collect::<Vec<_>>()
         );
     }
 

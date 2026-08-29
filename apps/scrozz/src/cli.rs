@@ -33,6 +33,7 @@ use scrozz_core::{
     AspectLock, CrosshairMode, LogicalPoint, LogicalRect, LogicalSize, SelectionMode,
     SelectionOptions, SizeConstraint,
 };
+use scrozz_store::MediaKind;
 
 use crate::{
     build_info::VERSION,
@@ -1040,12 +1041,50 @@ pub enum HistoryCommand {
     /// List stored captures, newest first.
     List {
         /// Show at most this many.
-        #[arg(long, value_name = "N")]
-        limit: Option<usize>,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_name = "N",
+            value_parser = clap::value_parser!(u32).range(1..=1000)
+        )]
+        limit: u32,
+
+        /// Skip this many matching captures.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        offset: u32,
+
+        /// Show one media kind.
+        #[arg(
+            long,
+            visible_alias = "media-kind",
+            value_name = "screenshot|video|gif",
+            value_parser = parse_media_kind
+        )]
+        kind: Option<MediaKind>,
+
+        /// Search application names, window titles, and recognised text.
+        #[arg(long, visible_alias = "text", value_name = "TEXT")]
+        search: Option<String>,
+
+        /// Show captures from this application.
+        #[arg(long, value_name = "APP")]
+        app: Option<String>,
+
+        /// Show captures taken at or after this UTC date, timestamp, or Unix time.
+        #[arg(long, value_name = "DATE|TIMESTAMP", value_parser = parse_history_after)]
+        after: Option<i64>,
+
+        /// Show captures taken at or before this UTC date, timestamp, or Unix time.
+        #[arg(long, value_name = "DATE|TIMESTAMP", value_parser = parse_history_before)]
+        before: Option<i64>,
 
         /// Show only pinned captures.
         #[arg(long)]
         pinned: bool,
+
+        /// Hide records whose source pixels were evicted.
+        #[arg(long)]
+        images_only: bool,
     },
 
     /// Write a stored capture's image out.
@@ -1081,6 +1120,202 @@ pub enum HistoryCommand {
 
     /// Unlock every on-screen pin without needing its capture id.
     UnlockPins,
+}
+
+fn parse_media_kind(value: &str) -> Result<MediaKind, String> {
+    MediaKind::from_token(value).map_err(|err| err.to_string())
+}
+
+fn parse_history_after(value: &str) -> Result<i64, String> {
+    parse_history_timestamp(value, false)
+}
+
+fn parse_history_before(value: &str) -> Result<i64, String> {
+    parse_history_timestamp(value, true)
+}
+
+/// Parses an ISO-8601 date/time or Unix seconds/milliseconds into epoch millis.
+///
+/// A date-only upper bound means the end of that UTC day; a lower bound means
+/// its beginning. Timestamps without an explicit offset are interpreted as UTC.
+fn parse_history_timestamp(value: &str, end_of_date: bool) -> Result<i64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("a history date cannot be empty".to_owned());
+    }
+
+    if let Ok(integer) = value.parse::<i64>() {
+        return if integer.unsigned_abs() < 100_000_000_000 {
+            integer
+                .checked_mul(1_000)
+                .ok_or_else(|| format!("Unix time {value:?} is out of range"))
+        } else {
+            Ok(integer)
+        };
+    }
+
+    let (date, rest) = if let Some((date, time)) = value.split_once('T') {
+        (date, Some(time))
+    } else if let Some((date, time)) = value.split_once(' ') {
+        (date, Some(time))
+    } else {
+        (value, None)
+    };
+    let (year, month, day) = parse_date(date)?;
+    let days = days_from_civil(year, month, day)
+        .ok_or_else(|| format!("invalid UTC date {date:?}; expected YYYY-MM-DD"))?;
+
+    let Some(rest) = rest else {
+        let base = days
+            .checked_mul(86_400_000)
+            .ok_or_else(|| format!("date {value:?} is out of range"))?;
+        return Ok(if end_of_date {
+            base.saturating_add(86_399_999)
+        } else {
+            base
+        });
+    };
+
+    let (clock, offset_seconds) = split_utc_offset(rest)?;
+    let (hour, minute, second, millis) = parse_clock(clock)?;
+    let local_millis = days
+        .checked_mul(86_400_000)
+        .and_then(|base| base.checked_add(i64::from(hour) * 3_600_000))
+        .and_then(|base| base.checked_add(i64::from(minute) * 60_000))
+        .and_then(|base| base.checked_add(i64::from(second) * 1_000))
+        .and_then(|base| base.checked_add(i64::from(millis)))
+        .ok_or_else(|| format!("timestamp {value:?} is out of range"))?;
+    local_millis
+        .checked_sub(i64::from(offset_seconds) * 1_000)
+        .ok_or_else(|| format!("timestamp {value:?} is out of range"))
+}
+
+fn parse_date(value: &str) -> Result<(i64, u32, u32), String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..].iter().all(u8::is_ascii_digit)
+    {
+        return Err(format!(
+            "invalid UTC date {value:?}; expected YYYY-MM-DD or an RFC 3339 timestamp"
+        ));
+    }
+    let year = value[..4]
+        .parse::<i64>()
+        .map_err(|_| format!("invalid year in {value:?}"))?;
+    let month = value[5..7]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid month in {value:?}"))?;
+    let day = value[8..]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid day in {value:?}"))?;
+    Ok((year, month, day))
+}
+
+fn parse_clock(value: &str) -> Result<(u32, u32, u32, u32), String> {
+    let mut parts = value.split(':');
+    let hour = parse_clock_part(parts.next(), "hour", value)?;
+    let minute = parse_clock_part(parts.next(), "minute", value)?;
+    let seconds = parts
+        .next()
+        .ok_or_else(|| format!("invalid UTC time {value:?}; expected HH:MM:SS"))?;
+    if parts.next().is_some() {
+        return Err(format!("invalid UTC time {value:?}; expected HH:MM:SS"));
+    }
+    let (seconds, fraction) = seconds
+        .split_once('.')
+        .map_or((seconds, None), |(whole, fraction)| (whole, Some(fraction)));
+    let second = seconds
+        .parse::<u32>()
+        .map_err(|_| format!("invalid second in {value:?}"))?;
+    let millis = fraction.map_or(Ok(0), parse_millis)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("invalid UTC time {value:?}"));
+    }
+    Ok((hour, minute, second, millis))
+}
+
+fn parse_clock_part(value: Option<&str>, name: &str, full: &str) -> Result<u32, String> {
+    value
+        .ok_or_else(|| format!("missing {name} in {full:?}"))?
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {name} in {full:?}"))
+}
+
+fn parse_millis(value: &str) -> Result<u32, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid fractional second {value:?}"));
+    }
+    let mut millis = 0;
+    for byte in value.bytes().take(3) {
+        millis = millis * 10 + u32::from(byte - b'0');
+    }
+    for _ in value.len().min(3)..3 {
+        millis *= 10;
+    }
+    Ok(millis)
+}
+
+fn split_utc_offset(value: &str) -> Result<(&str, i32), String> {
+    if let Some(clock) = value.strip_suffix('Z').or_else(|| value.strip_suffix('z')) {
+        return Ok((clock, 0));
+    }
+    let Some(index) = value
+        .char_indices()
+        .rfind(|(_, ch)| matches!(ch, '+' | '-'))
+        .map(|(index, _)| index)
+    else {
+        return Ok((value, 0));
+    };
+    let (clock, offset) = value.split_at(index);
+    let bytes = offset.as_bytes();
+    if bytes.len() != 6
+        || bytes[3] != b':'
+        || !bytes[1..3].iter().all(u8::is_ascii_digit)
+        || !bytes[4..].iter().all(u8::is_ascii_digit)
+    {
+        return Err(format!(
+            "invalid UTC offset {offset:?}; expected Z or +HH:MM"
+        ));
+    }
+    let hours = offset[1..3]
+        .parse::<i32>()
+        .map_err(|_| format!("invalid UTC offset {offset:?}"))?;
+    let minutes = offset[4..]
+        .parse::<i32>()
+        .map_err(|_| format!("invalid UTC offset {offset:?}"))?;
+    if hours > 23 || minutes > 59 {
+        return Err(format!("invalid UTC offset {offset:?}"));
+    }
+    let sign = if offset.starts_with('-') { -1 } else { 1 };
+    Ok((clock, sign * (hours * 3_600 + minutes * 60)))
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > days_in_month {
+        return None;
+    }
+
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
 }
 
 // ---------------------------------------------------------------------------
@@ -2165,11 +2400,97 @@ mod tests {
         else {
             panic!("expected history")
         };
-        let HistoryCommand::List { limit, pinned } = args.command else {
+        let HistoryCommand::List { limit, pinned, .. } = args.command else {
             panic!("expected list")
         };
-        assert_eq!(limit, Some(5));
+        assert_eq!(limit, 5);
         assert!(pinned);
+    }
+
+    #[test]
+    fn history_list_parses_pagination_and_every_filter() {
+        let Some(Command::History(args)) = parse(&[
+            "scrozz",
+            "history",
+            "list",
+            "--limit",
+            "25",
+            "--offset",
+            "50",
+            "--kind",
+            "screenshots",
+            "--search",
+            "invoice",
+            "--app",
+            "Preview",
+            "--after",
+            "2025-01-01",
+            "--before",
+            "2025-01-31",
+            "--images-only",
+        ])
+        .command
+        else {
+            panic!("expected history")
+        };
+        let HistoryCommand::List {
+            limit,
+            offset,
+            kind,
+            search,
+            app,
+            after,
+            before,
+            images_only,
+            ..
+        } = args.command
+        else {
+            panic!("expected list")
+        };
+        assert_eq!(limit, 25);
+        assert_eq!(offset, 50);
+        assert_eq!(kind, Some(MediaKind::Screenshot));
+        assert_eq!(search.as_deref(), Some("invoice"));
+        assert_eq!(app.as_deref(), Some("Preview"));
+        assert_eq!(after, Some(1_735_689_600_000));
+        assert_eq!(before, Some(1_738_367_999_999));
+        assert!(images_only);
+    }
+
+    #[test]
+    fn history_dates_accept_rfc3339_offsets_and_unix_times() {
+        assert_eq!(
+            parse_history_timestamp("2025-01-01T01:30:00+01:30", false).unwrap(),
+            1_735_689_600_000
+        );
+        assert_eq!(
+            parse_history_timestamp("2025-01-01T00:00:00.123Z", false).unwrap(),
+            1_735_689_600_123
+        );
+        assert_eq!(
+            parse_history_timestamp("1735689600", false).unwrap(),
+            1_735_689_600_000
+        );
+        assert_eq!(
+            parse_history_timestamp("1735689600123", false).unwrap(),
+            1_735_689_600_123
+        );
+    }
+
+    #[test]
+    fn history_dates_reject_impossible_or_malformed_values() {
+        for value in [
+            "2025-02-29",
+            "2025-01-01T25:00:00Z",
+            "2025-01-01T00:00Z",
+            "not-a-date",
+            "🦀-01-01",
+        ] {
+            assert!(
+                parse_history_timestamp(value, false).is_err(),
+                "{value:?} should fail"
+            );
+        }
     }
 
     #[test]
