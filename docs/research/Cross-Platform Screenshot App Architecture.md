@@ -24,7 +24,9 @@ Cross-reference: docs/feature-audit.md is the authoritative feature inventory,
 derived directly from cleanshot.com/features.
 -->
 
-# **Technical Architecture and Implementation Blueprint for Scrozz: Engineering a Cross-Platform CleanShot X Parity System**
+# Cross-Platform Screenshot App Architecture
+
+## Technical Architecture and Implementation Blueprint for Scrozz
 
 The desktop productivity ecosystem exhibits a pronounced platform disparity in screen capture and media recording utilities. While macOS benefits from polished commercial tools such as CleanShot X and open-source implementations like Capso, Windows and Linux environments remain fragmented across legacy utilities, unmaintained projects, and web-based wrappers with unoptimized graphical performance1. Developing Scrozz as a high-performance, open-source, multi-platform utility that achieves feature parity with CleanShot X requires an architectural approach that balances cross-platform code reuse with the low-latency graphical demands of native operating system compositors1.
 

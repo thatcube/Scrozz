@@ -459,11 +459,15 @@ repository at `~/.copilot/scrozz-ui-reference/`, indexed by `INDEX.md`. A small,
 user-supplied image may be committed under `docs/reference/` only when it is
 needed to explain a specific audited behavior. It must remain in research
 documentation, be attributed as competitor UI, and never become a product asset,
-fixture, icon source, or implementation input.
+fixture, icon source, pixel template, or source of copied measurements.
 
 Agents may study references to calibrate the *quality bar* and enumerate
-behavior. They may **not** copy designs, icons, colour values, or layouts.
-Scrozz's visual design remains original and uses Tabler Icons (MIT).
+behavior. Every equivalent UI task begins by translating relevant references
+into a Scrozz behavior and information-hierarchy contract, then validating an
+original implementation through generated goldens. Agents may **not** copy
+designs, icons, colour values, exact measurements, or layouts. Scrozz's visual
+design remains original and uses Tabler Icons (MIT). The operational process is
+documented in [`reference-workflow.md`](reference-workflow.md).
 
 **Why.** Keeping the full library outside the worktree avoids turning
 copyrighted product UI into project assets. The narrow documentation exception
