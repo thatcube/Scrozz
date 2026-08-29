@@ -21,6 +21,7 @@ mod appkit;
 mod display;
 mod error;
 mod image;
+mod picker;
 mod sck;
 mod window;
 
@@ -38,6 +39,16 @@ use scrozz_core::{
 /// ScreenCaptureKit-backed still capture.
 #[derive(Debug, Default)]
 pub struct ScreenCaptureKitBackend;
+
+pub use picker::{
+    AppleContentPicker, ApplePickerAvailability, ApplePickerEvent, ApplePickerMode, PickerCapture,
+};
+
+/// Whether the running macOS has Scrozz's public still-capture API.
+#[must_use]
+pub fn still_capture_available() -> bool {
+    sck::supports_still_capture()
+}
 
 impl ScreenCaptureKitBackend {
     /// Creates the backend.
@@ -302,6 +313,9 @@ fn configure(
         // Decision D9 again: the shadow is the window's own, drawn by the
         // compositor. This only chooses whether to ask for it.
         config.setIgnoreShadowsSingleWindow(!request.include_window_shadow);
+        config.setIgnoreShadowsDisplay(false);
+        config.setIgnoreGlobalClipSingleWindow(true);
+        config.setShouldBeOpaque(false);
 
         // `colorSpaceName` is deliberately left untouched. Setting it would
         // convert the capture into that space; leaving it lets ScreenCaptureKit

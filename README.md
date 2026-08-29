@@ -111,11 +111,13 @@ tools/make-app-bundle.sh          # builds and installs /Applications/Scrozz.app
 open /Applications/Scrozz.app
 ```
 
-The bundle is not a convenience. macOS attaches a Screen Recording permission to
-a *bundle identity*, so a bare binary run from a terminal has the grant land on
-the terminal instead and capture is refused no matter how many times you approve
-it. Build the app, approve it once in **System Settings → Privacy & Security →
-Screen Recording**, and the grant sticks across rebuilds.
+The bundle is not a convenience. macOS attaches Screen & System Audio Recording
+access to a *bundle identity*, so a bare binary run from a terminal has the grant
+land on the terminal instead. Scrozz does not request access at launch. The first
+capture that needs it explains why before macOS asks; if direct access is not
+granted, supported Window and Screen captures can use Apple's limited content
+picker instead. The picker replaces Scrozz's custom selector and cannot provide
+custom Area, All Displays, unattended global capture, or system-audio recording.
 
 Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.
@@ -148,9 +150,10 @@ than pretending — `history`, for instance, currently reports that it is not
 implemented. Exit codes are part of the contract, so scripts can tell "no such
 window" apart from "not implemented" apart from "permission denied".
 
-Capture from the development binary will be refused on macOS until you have
-built and approved the app bundle above, for the permission reason described
-there. That refusal is deliberate and tells you exactly which setting to change.
+Capture from the development binary may be refused on macOS because its grant
+belongs to the terminal rather than to Scrozz. That refusal is deliberate and
+tells you exactly which setting to change; the packaged app owns the just-in-time
+permission and Apple-picker flow described above.
 
 ## Contributing & development
 

@@ -38,7 +38,10 @@ pub use linux::session::{
     detect_session as detect_linux_session,
 };
 #[cfg(target_os = "macos")]
-pub use macos::ScreenCaptureKitBackend;
+pub use macos::{
+    AppleContentPicker, ApplePickerAvailability, ApplePickerEvent, ApplePickerMode, PickerCapture,
+    ScreenCaptureKitBackend, still_capture_available,
+};
 
 use scrozz_core::{CaptureBackend, Result};
 

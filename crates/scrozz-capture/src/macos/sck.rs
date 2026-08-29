@@ -19,7 +19,7 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::AnyClass;
 use objc2::{AnyThread, Message, sel};
 use objc2_core_foundation::CGRect;
-use objc2_core_graphics::{CGImage, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
+use objc2_core_graphics::{CGImage, CGPreflightScreenCaptureAccess};
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
@@ -35,26 +35,16 @@ const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// which on a large multi-display setup is not instant.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Checks — and, on first run, requests — Screen Recording permission.
+/// Checks Screen Recording permission without requesting it.
 ///
-/// Per decision D15 the absence of this permission is the expected state on a
-/// fresh install, so this asks for it rather than treating it as a fault. The
-/// request itself is non-blocking: macOS shows its own prompt and returns
-/// immediately, having granted nothing yet. The grant only takes effect for a
-/// *future* launch, which is why the remedy string says to relaunch.
+/// The app owns the just-in-time preflight and is the only code allowed to invoke
+/// macOS's alarming system prompt. A backend call can race with revocation, so it
+/// still checks immediately before reading pixels and reports denial rather than
+/// silently returning wallpaper.
 pub(crate) fn ensure_permission() -> Result<()> {
     if CGPreflightScreenCaptureAccess() {
         return Ok(());
     }
-
-    // The return value is deliberately ignored — a `true` here does not mean
-    // this process can capture yet.
-    let _ = CGRequestScreenCaptureAccess();
-
-    if CGPreflightScreenCaptureAccess() {
-        return Ok(());
-    }
-
     Err(error::permission_denied())
 }
 
@@ -116,6 +106,56 @@ pub(crate) fn capture_image(
     })
 }
 
+/// Starts one screenshot without moving its filter off the calling thread.
+///
+/// Apple's picker does not document `SCContentFilter` as thread-safe. Its
+/// observer therefore calls this immediately with the borrowed callback filter;
+/// only the resulting `CGImage` crosses into Scrozz's worker.
+pub(crate) fn capture_image_async(
+    filter: &SCContentFilter,
+    config: &SCStreamConfiguration,
+    completion: impl FnOnce(Result<Retained<CGImage>>) + Send + 'static,
+) -> Result<()> {
+    let manager = screenshot_manager()?;
+    let selector = sel!(captureImageWithFilter:configuration:completionHandler:);
+    if !manager.metaclass().responds_to(selector) {
+        return Err(error::unsupported(
+            "still capture",
+            "this macOS is too old for +[SCScreenshotManager captureImageWithFilter:…]; \
+             macOS 14 or later is required",
+        ));
+    }
+
+    let completion = Arc::new(Mutex::new(Some(completion)));
+    let handler = {
+        let completion = Arc::clone(&completion);
+        RcBlock::new(move |value: *mut CGImage, error: *mut NSError| {
+            // SAFETY: ScreenCaptureKit passes null or live callback objects. The
+            // retained CGImage is Send + Sync in objc2-core-graphics.
+            let delivery = unsafe { Delivery::adopt(value, error) };
+            let finish = completion
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(finish) = finish {
+                finish(delivery.into_result("taking an Apple picker screenshot"));
+            }
+        })
+    };
+
+    // SAFETY: all arguments match the generated selector. The system picker owns
+    // its current filter, and ScreenCaptureKit copies the completion block for
+    // the asynchronous operation; Scrozz neither retains nor moves the filter.
+    unsafe {
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+            filter,
+            config,
+            Some(&handler),
+        );
+    }
+    Ok(())
+}
+
 /// Whether `+[SCScreenshotManager captureImageInRect:completionHandler:]` exists.
 ///
 /// It arrived after the rest of `SCScreenshotManager`, and it is the only API
@@ -127,6 +167,12 @@ pub(crate) fn supports_capture_in_rect() -> bool {
             .metaclass()
             .responds_to(sel!(captureImageInRect:completionHandler:))
     })
+}
+
+/// Whether this OS exposes the still-capture manager used by every Scrozz
+/// screenshot path.
+pub(crate) fn supports_still_capture() -> bool {
+    screenshot_manager().is_ok()
 }
 
 /// Captures a rectangle given in global display points.

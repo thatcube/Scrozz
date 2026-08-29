@@ -67,6 +67,7 @@ pub mod drag;
 pub mod host;
 pub mod overlay;
 pub mod panel;
+pub mod permission;
 pub mod pipeline;
 pub mod selection;
 pub mod server;
@@ -115,7 +116,12 @@ pub fn run(cli: &Cli) -> CliResult<Report> {
     });
 
     let host = host::for_platform(&config, emit)?;
-    let app = App::new(config, host.surface(), host.selector())?;
+    let app = App::new(
+        config,
+        host.surface(),
+        host.selector(),
+        host.supports_permission_ui(),
+    )?;
     host.run(app)
 }
 

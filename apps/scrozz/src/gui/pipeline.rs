@@ -86,6 +86,20 @@ pub enum Job {
         /// The persisted GUI policy snapshotted when this capture was requested.
         policy: AfterCaptureSettings,
     },
+    /// Process pixels from the exact one-shot filter returned by Apple's limited picker.
+    #[cfg(target_os = "macos")]
+    ApplePickerCapture {
+        /// The action whose fallback produced the filter.
+        kind: CaptureKind,
+        /// The original user-action source.
+        origin: CaptureOrigin,
+        /// The card identity allocated only after Apple returned a selection.
+        card: CardId,
+        /// Pixels captured from the least-privilege filter.
+        capture: scrozz_capture::PickerCapture,
+        /// The persisted GUI policy snapshotted when this capture was requested.
+        policy: AfterCaptureSettings,
+    },
     /// Decode a card's capture so the annotation editor can open on it.
     ///
     /// The decode is the whole reason this is a job: a 6K PNG takes tens of
@@ -167,6 +181,10 @@ pub enum Outcome {
     Failed {
         /// Which card was expected.
         card: CardId,
+        /// Which action may be retried after a permission change.
+        kind: CaptureKind,
+        /// The original user-action source.
+        origin: CaptureOrigin,
         /// Why it will not arrive.
         error: CliError,
     },
@@ -617,6 +635,14 @@ impl Worker {
                     origin,
                     policy,
                 } => self.capture(kind, card, origin, &policy),
+                #[cfg(target_os = "macos")]
+                Job::ApplePickerCapture {
+                    kind,
+                    origin,
+                    card,
+                    capture,
+                    policy,
+                } => self.capture_apple_picker(kind, origin, card, capture, &policy),
                 Job::Open(card) => self.open(card),
                 Job::PrepareImage {
                     card,
@@ -659,7 +685,45 @@ impl Worker {
             }
             Err(error) => {
                 tracing::warn!(%card, origin = origin.label(), "capture failed: {error}");
-                let _ = self.outcomes.send(Outcome::Failed { card, error });
+                let _ = self.outcomes.send(Outcome::Failed {
+                    card,
+                    kind,
+                    origin,
+                    error,
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_apple_picker(
+        &mut self,
+        kind: CaptureKind,
+        origin: CaptureOrigin,
+        card: CardId,
+        picker_capture: scrozz_capture::PickerCapture,
+        policy: &AfterCaptureSettings,
+    ) {
+        let result = picker_capture
+            .into_capture()
+            .map_err(CliError::Core)
+            .and_then(|capture| self.finish_capture(kind, card, capture, policy));
+
+        match result {
+            Ok(card) => {
+                let _ = self.outcomes.send(Outcome::Ready(Box::new(card)));
+            }
+            Err(error) if error.is_cancellation() => {
+                tracing::debug!(%card, "Apple picker capture cancelled");
+            }
+            Err(error) => {
+                tracing::warn!(%card, origin = origin.label(), "Apple picker capture failed: {error}");
+                let _ = self.outcomes.send(Outcome::Failed {
+                    card,
+                    kind,
+                    origin,
+                    error,
+                });
             }
         }
     }
@@ -740,6 +804,16 @@ impl Worker {
         {
             tracing::warn!("the capture succeeded but its region could not be remembered: {error}");
         }
+        self.finish_capture(kind, card, capture, policy)
+    }
+
+    fn finish_capture(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        capture: Capture,
+        policy: &AfterCaptureSettings,
+    ) -> CliResult<ReadyCapture> {
         let bytes = Arc::new(FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?);
 
         // Finalized bytes and metadata exist before any action runs. Copy is

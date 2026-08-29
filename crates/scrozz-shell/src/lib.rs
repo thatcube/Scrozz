@@ -149,7 +149,10 @@ pub trait Permissions {
     /// Whether a capability is currently granted.
     fn is_granted(&self, capability: Capability) -> bool;
 
-    /// Prompts for a capability, or opens the relevant settings pane.
+    /// Prompts for a capability.
+    ///
+    /// Screen Recording never opens Settings implicitly; callers expose that as
+    /// a separate user choice.
     ///
     /// # Errors
     ///
