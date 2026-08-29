@@ -753,15 +753,20 @@ impl Driver {
             RootSurfaceMode::Cards => {
                 self.startup_rehide = false;
                 let geometry = self.overlay.geometry();
+                self.native
+                    .apply(&scrozz_shell::OverlayBehavior::capture_card());
                 self.native.set_frame(logical_frame(geometry));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
                 self.native.set_visible(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
             }
             RootSurfaceMode::Parked => {
                 self.startup_rehide = false;
+                self.native
+                    .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 let frame = scrozz_core::LogicalRect::new(
                     scrozz_core::LogicalPoint::new(
                         f64::from(PARKED_ROOT_ORIGIN),
@@ -1569,6 +1574,45 @@ mod tests {
             RootSurfaceMode::Parked,
             "an auxiliary child gets an off-screen parent without exposing it"
         );
+    }
+
+    #[test]
+    fn first_card_restores_native_input_before_the_root_is_ordered_front() {
+        let source = include_str!("host.rs");
+        let cards = source
+            .split("RootSurfaceMode::Cards => {")
+            .nth(1)
+            .and_then(|body| body.split_once("RootSurfaceMode::Parked => {"))
+            .map(|(body, _)| body)
+            .expect("cards root transition");
+        let behavior = cards
+            .find("OverlayBehavior::capture_card()")
+            .expect("card behavior is restored");
+        let passthrough = cards
+            .find("MousePassthrough(false)")
+            .expect("eframe input is restored");
+        let visible = cards
+            .find("self.native.set_visible(true)")
+            .expect("native root is ordered front");
+
+        assert!(behavior < visible);
+        assert!(passthrough < visible);
+    }
+
+    #[test]
+    fn auxiliary_children_park_the_root_without_controlling_card_input() {
+        let source = include_str!("host.rs");
+        let visibility = source
+            .split("fn sync_root_visibility")
+            .nth(1)
+            .and_then(|body| body.split_once("fn sync_card_geometry"))
+            .map(|(body, _)| body)
+            .expect("root visibility synchronizer");
+
+        assert!(visibility.contains("self.settings.is_open()"));
+        assert!(visibility.contains("self.editor.is_open()"));
+        assert!(visibility.contains("self.app.permission_prompt().is_some()"));
+        assert!(visibility.contains("OverlayBehavior::capture_card()"));
     }
 
     #[test]
