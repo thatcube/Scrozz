@@ -57,8 +57,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(document.duration())
         .min(document.duration());
     plan.trim = TrimRange::new(trim_start, trim_end, document.duration())?;
+    if std::env::var("SCROZZ_EXPORT_SMOKE_MUTE").as_deref() == Ok("1") {
+        plan.audio.mute = true;
+    }
+    if std::env::var("SCROZZ_EXPORT_SMOKE_TRACE_SAMPLES").as_deref() == Ok("1") {
+        let media = NativeMediaSource::open(Recording::native(
+            &source,
+            document.duration().as_secs_f64(),
+            "native export sample-order probe",
+        )?)?;
+        let mut decoder = media.decoder(plan.trim)?;
+        for index in 0..160 {
+            let Some(sample) = decoder.next_sample()? else {
+                break;
+            };
+            let timestamp = sample.timestamp();
+            let (kind, duration) = match sample {
+                scrozz_record::media::DecodedMediaSample::Video(frame) => ("video", frame.duration),
+                scrozz_record::media::DecodedMediaSample::Audio(chunk) => ("audio", chunk.duration),
+            };
+            println!(
+                "sample {index:03}: {kind} {:.6} +{:.6}",
+                timestamp.as_secs_f64(),
+                duration.as_secs_f64()
+            );
+        }
+        decoder.cancel();
+        if std::env::var("SCROZZ_EXPORT_SMOKE_TRACE_ONLY").as_deref() == Ok("1") {
+            return Ok(());
+        }
+    }
     let mut job = NativeTranscoder::new().start(&document, &plan, output)?;
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_progress = 0.0_f32;
     loop {
         if Instant::now() >= deadline {
             job.cancel()?;
@@ -109,7 +140,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(TranscodeEvent::Cancelled(_)) => {
                 return Err("native export smoke was cancelled".into());
             }
-            Some(TranscodeEvent::Progress(_)) | None => {
+            Some(TranscodeEvent::Progress(progress)) => {
+                if progress - last_progress >= 0.1 {
+                    println!("export progress: {:.0}%", progress * 100.0);
+                    last_progress = progress;
+                }
+            }
+            None => {
                 thread::sleep(Duration::from_millis(5));
             }
         }

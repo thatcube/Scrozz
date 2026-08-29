@@ -1955,7 +1955,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::{
         sync::atomic::AtomicBool,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
     use crate::{
@@ -1966,6 +1966,7 @@ mod tests {
     use crate::{
         edit::{ChannelBehavior, TrimRange},
         media::{DecodedAudioChunk, DecodedMediaSample, DecodedVideoFrame, NativeMediaSource},
+        storyboard::{NativeStoryboard, STORYBOARD_SLOTS},
     };
     use image::{AnimationDecoder, codecs::gif::GifDecoder};
     use scrozz_export::RgbaImage;
@@ -2414,6 +2415,7 @@ mod tests {
                     assert_eq!(frame.image.data.len(), 96 * 64 * 4);
                     saw_video = true;
                 }
+
                 Some(DecodedMediaSample::Audio(chunk)) => {
                     assert_eq!(chunk.channels, 2);
                     assert!(!chunk.samples.is_empty());
@@ -2426,6 +2428,42 @@ mod tests {
             }
         }
         assert!(saw_video && saw_audio);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_storyboard_incrementally_decodes_bounded_video_and_audio() {
+        let directory = TestDirectory::new("storyboard");
+        let recording = write_native_fixture(&directory.path.join("source.mp4"));
+        let document = VideoDocument::open_native(recording).unwrap();
+        let mut storyboard = NativeStoryboard::start(&document).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let snapshot = loop {
+            let snapshot = storyboard.snapshot();
+            if snapshot.complete {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native storyboard did not settle in ten seconds"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(snapshot.frames.len(), STORYBOARD_SLOTS);
+        assert!(snapshot.frames.iter().all(Option::is_some));
+        assert!(snapshot.frames.windows(2).all(|frames| {
+            frames[0].as_ref().unwrap().frame.timestamp
+                <= frames[1].as_ref().unwrap().frame.timestamp
+        }));
+        assert!(snapshot.frames.iter().flatten().all(|slot| {
+            slot.frame.image.width <= crate::storyboard::MAX_STORYBOARD_EDGE
+                && slot.frame.image.height <= crate::storyboard::MAX_STORYBOARD_EDGE
+        }));
+        let waveform = snapshot.waveform.expect("audio source has a waveform");
+        assert!(waveform.iter().all(Option::is_some));
+        storyboard.shutdown().unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -2490,6 +2528,8 @@ mod tests {
         .unwrap();
         muted_plan.quality = crate::Quality::Low;
         muted_plan.audio.mute = true;
+        muted_plan.custom_dimensions =
+            Some(crate::edit::OutputDimensions::from_width(64, document.metadata()).unwrap());
         let muted_path = directory.path.join("muted.mp4");
         finished_output(
             transcoder
@@ -2501,6 +2541,7 @@ mod tests {
         )
         .expect("inspect muted video");
         assert_eq!(muted.metadata().audio_channels, 0);
+        assert_eq!((muted.metadata().width, muted.metadata().height), (64, 42));
 
         let mut gif_plan = EditPlan::gif(&document).unwrap();
         gif_plan.trim = TrimRange::new(

@@ -42,6 +42,7 @@ pub mod playback;
 pub mod selection;
 pub mod settings;
 mod state;
+pub mod storyboard;
 mod timeline;
 pub mod transcode;
 #[cfg(target_os = "windows")]
@@ -53,7 +54,7 @@ pub use engine::{
 pub use machine::{
     ClockDrift, MachineEvent, MachineFailure, RecordingMachine, RecordingPhase, format_status_label,
 };
-pub use settings::{Quality, RecordingSettings, ResolutionCap};
+pub use settings::{AfterCaptureSettings, Quality, RecordingSettings, ResolutionCap};
 
 /// Hardware video encoder requested for a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

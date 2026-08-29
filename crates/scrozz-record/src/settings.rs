@@ -983,6 +983,24 @@ impl Default for VideoSettings {
 // The whole thing
 // ===========================================================================
 
+/// Independent actions performed after a recording finalizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfterCaptureSettings {
+    /// Add completed video to the Recent Captures Overlay.
+    pub recent_captures_overlay: bool,
+    /// Open the Video Editor as a normal foreground window.
+    pub open_editor: bool,
+}
+
+impl Default for AfterCaptureSettings {
+    fn default() -> Self {
+        Self {
+            recent_captures_overlay: true,
+            open_editor: false,
+        }
+    }
+}
+
 /// Every recording preference, in one value.
 ///
 /// This is what the settings session hands to the recording session: one struct,
@@ -992,6 +1010,8 @@ impl Default for VideoSettings {
 /// ignored in another.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RecordingSettings {
+    /// Independent actions performed after finalization.
+    pub after_capture: AfterCaptureSettings,
     /// Countdown before the first frame (NEW-17).
     pub countdown: CountdownSettings,
     /// Dimming outside the recorded region (NEW-16).
@@ -1249,6 +1269,8 @@ mod tests {
         assert!(!s.needs_camera());
         assert!(!s.needs_microphone());
         assert!(s.remember_last_selection);
+        assert!(s.after_capture.recent_captures_overlay);
+        assert!(!s.after_capture.open_editor);
         s.validate().expect("shipped defaults must be valid");
     }
 

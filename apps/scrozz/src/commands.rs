@@ -1874,13 +1874,16 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str, engine: &str) -> R
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
     match command {
         SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json())]),
-            settings::all_human(),
+            Json::obj([("settings", settings::resolved_all_json()?)]),
+            settings::resolved_all_human()?,
         )),
 
         SettingsCommand::Get { key: Some(key) } => {
             let setting = settings::lookup(key)?;
-            Ok(Report::new(setting.to_json(), setting.default.to_string()))
+            Ok(Report::new(
+                settings::resolved_json(*setting)?,
+                settings::value(setting)?,
+            ))
         }
 
         SettingsCommand::Set { key, value } => {
@@ -1890,6 +1893,12 @@ fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
             // one even while the second is true.
             let setting = settings::lookup(key)?;
             setting.validate(value)?;
+            if settings::persist(setting, value)? {
+                return Ok(Report::new(
+                    settings::resolved_json(*setting)?,
+                    format!("{key}={value}"),
+                ));
+            }
             Err(CliError::not_implemented(
                 format!("saving {key}"),
                 "scrozz-store (settings persistence)",

@@ -396,6 +396,123 @@ impl EditOutput {
     }
 }
 
+/// Aspect-preserving custom output geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputDimensions {
+    /// Even encoded width.
+    pub width: u32,
+    /// Even encoded height.
+    pub height: u32,
+}
+
+impl OutputDimensions {
+    /// Creates an aspect-preserving custom size from a requested width.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the width would upscale or cannot produce a
+    /// hardware-encoder-compatible frame.
+    pub fn from_width(width: u32, source: SourceMetadata) -> Result<Self> {
+        source.validate()?;
+        if width < 2 || width > source.width {
+            return Err(Error::InvalidRequest(format!(
+                "custom width {width} must be between 2 and source width {}",
+                source.width
+            )));
+        }
+        let width = nearest_even_bounded(f64::from(width), source.width).ok_or_else(|| {
+            Error::InvalidRequest(
+                "custom width cannot produce an even hardware-encoder dimension".to_owned(),
+            )
+        })?;
+        let height = scaled_even(width, source.width, source.height)?;
+        Self::new(width, height, source)
+    }
+
+    /// Creates an aspect-preserving custom size from a requested height.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the height would upscale or cannot produce a
+    /// hardware-encoder-compatible frame.
+    pub fn from_height(height: u32, source: SourceMetadata) -> Result<Self> {
+        source.validate()?;
+        if height < 2 || height > source.height {
+            return Err(Error::InvalidRequest(format!(
+                "custom height {height} must be between 2 and source height {}",
+                source.height
+            )));
+        }
+        let height = nearest_even_bounded(f64::from(height), source.height).ok_or_else(|| {
+            Error::InvalidRequest(
+                "custom height cannot produce an even hardware-encoder dimension".to_owned(),
+            )
+        })?;
+        let width = scaled_even(height, source.height, source.width)?;
+        Self::new(width, height, source)
+    }
+
+    /// Validates a custom encoded size against its source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for odd/empty/upscaled dimensions or aspect distortion.
+    pub fn new(width: u32, height: u32, source: SourceMetadata) -> Result<Self> {
+        source.validate()?;
+        if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(Error::InvalidRequest(format!(
+                "custom output {width}x{height} must use even dimensions of at least 2x2"
+            )));
+        }
+        if width > source.width || height > source.height {
+            return Err(Error::InvalidRequest(format!(
+                "custom output {width}x{height} cannot upscale source {}x{}",
+                source.width, source.height
+            )));
+        }
+        let source_aspect = f64::from(source.width) / f64::from(source.height);
+        let output_aspect = f64::from(width) / f64::from(height);
+        let relative_error = ((output_aspect / source_aspect) - 1.0).abs();
+        if relative_error > 0.02 {
+            return Err(Error::InvalidRequest(format!(
+                "custom output {width}x{height} must preserve source aspect ratio {}x{}",
+                source.width, source.height
+            )));
+        }
+        Ok(Self { width, height })
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn nearest_even_bounded(value: f64, maximum: u32) -> Option<u32> {
+    let maximum = maximum & !1;
+    if !value.is_finite() || value < 2.0 || maximum < 2 {
+        return None;
+    }
+    let lower = ((value.floor() as u32) & !1).max(2).min(maximum);
+    let upper = lower.saturating_add(2).min(maximum & !1);
+    if (value - f64::from(lower)).abs() <= (value - f64::from(upper)).abs() {
+        Some(lower)
+    } else {
+        Some(upper)
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn scaled_even(value: u32, source_axis: u32, other_axis: u32) -> Result<u32> {
+    let scaled = f64::from(value) * f64::from(other_axis) / f64::from(source_axis);
+    if !scaled.is_finite() || scaled < 2.0 || scaled > f64::from(u32::MAX) {
+        return Err(Error::InvalidRequest(
+            "custom output dimensions cannot preserve this source aspect ratio".to_owned(),
+        ));
+    }
+    nearest_even_bounded(scaled, other_axis).ok_or_else(|| {
+        Error::InvalidRequest(
+            "custom output dimensions cannot produce an even hardware-encoder frame".to_owned(),
+        )
+    })
+}
+
 /// Non-destructive operations applied by a transcoder.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EditPlan {
@@ -405,6 +522,8 @@ pub struct EditPlan {
     pub quality: Quality,
     /// Output dimension ceiling.
     pub resolution: ResolutionCap,
+    /// Explicit aspect-preserving dimensions, overriding the named ceiling.
+    pub custom_dimensions: Option<OutputDimensions>,
     /// Audio gain/mute/channel behavior.
     pub audio: AudioEdit,
     /// Video or animation output.
@@ -422,6 +541,7 @@ impl EditPlan {
             trim: TrimRange::full(document.duration)?,
             quality: Quality::Balanced,
             resolution: ResolutionCap::Native,
+            custom_dimensions: None,
             audio: AudioEdit::default(),
             output: EditOutput::Video,
         })
@@ -449,6 +569,9 @@ impl EditPlan {
         metadata.validate()?;
         TrimRange::new(self.trim.start, self.trim.end, source_duration)?;
         self.audio.validate()?;
+        if let Some(dimensions) = self.custom_dimensions {
+            OutputDimensions::new(dimensions.width, dimensions.height, metadata)?;
+        }
         if !self.output.supports_audio() && metadata.audio_channels > 0 && !self.audio.mute {
             return Err(Error::InvalidRequest(
                 "GIF output cannot carry audio; set the edit plan to mute".to_owned(),
@@ -460,7 +583,10 @@ impl EditPlan {
     /// Output dimensions after applying the resolution cap.
     #[must_use]
     pub fn output_dimensions(self, metadata: SourceMetadata) -> (u32, u32) {
-        self.resolution.apply(metadata.width, metadata.height)
+        self.custom_dimensions.map_or_else(
+            || self.resolution.apply(metadata.width, metadata.height),
+            |dimensions| (dimensions.width, dimensions.height),
+        )
     }
 
     /// Output audio channel count. Animation formats always return zero.
@@ -564,6 +690,53 @@ mod tests {
         assert_eq!(plan.output_dimensions(metadata()), (1920, 1080));
         assert_eq!(plan.output_audio_channels(metadata()), 1);
         assert_eq!(plan.audio.effective_gain(), 1.5);
+    }
+
+    #[test]
+    fn custom_dimensions_preserve_aspect_and_never_upscale() {
+        let source = metadata();
+        assert_eq!(
+            OutputDimensions::from_width(1920, source).unwrap(),
+            OutputDimensions {
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(
+            OutputDimensions::from_height(720, source).unwrap(),
+            OutputDimensions {
+                width: 1280,
+                height: 720
+            }
+        );
+        assert_eq!(
+            OutputDimensions::from_width(70, source).unwrap(),
+            OutputDimensions {
+                width: 70,
+                height: 40
+            }
+        );
+        assert!(OutputDimensions::from_width(4_000, source).is_err());
+        assert!(OutputDimensions::new(1281, 720, source).is_err());
+        assert!(OutputDimensions::new(1280, 700, source).is_err());
+        assert!(
+            OutputDimensions::from_width(
+                6,
+                SourceMetadata {
+                    width: 1920,
+                    height: 1080,
+                    fps: 30.0,
+                    audio_channels: 0,
+                }
+            )
+            .is_err()
+        );
+
+        let document = fixture();
+        let mut plan = EditPlan::video(&document).unwrap();
+        plan.custom_dimensions = Some(OutputDimensions::from_width(1920, source).unwrap());
+        assert_eq!(plan.output_dimensions(source), (1920, 1080));
+        document.validate_plan(&plan).unwrap();
     }
 
     #[test]

@@ -1,17 +1,11 @@
-//! The settings schema.
+//! The settings schema and the small durable after-capture policy.
 //!
 //! # Why the schema lives here and not in the store
 //!
-//! Nothing persists settings yet. That could mean `scrozz settings` waits for a
-//! store, but it should not: the *schema* is the interesting part and the part
-//! everything else depends on. A key's name, type and default are what the GUI
-//! renders, what `--json` reports, and what a user's dotfiles refer to. Getting
-//! them wrong is expensive to undo; getting them right costs nothing today.
-//!
-//! So `settings get` works now, reporting defaults and saying so, and
-//! `settings set` validates fully before reporting that persistence is missing.
-//! A typo in a key or a value is caught immediately rather than being written
-//! somewhere and silently ignored later.
+//! Most settings are still schema-only. The independent Recording after-capture
+//! actions are persisted now because both the GUI startup path and the CLI need
+//! one authoritative policy. Unknown or malformed state is an error rather than
+//! a reason to silently open a window the user disabled.
 //!
 //! # Naming
 //!
@@ -24,6 +18,434 @@ use crate::{
     hotkey_config::Accelerator,
     json::Json,
 };
+use fs2::FileExt as _;
+use scrozz_core::{Error, Result};
+use scrozz_record::AfterCaptureSettings;
+use serde_json::{Value, json};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read as _, Write as _},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+const SETTINGS_VERSION: u64 = 2;
+const LEGACY_SETTINGS_VERSION: u64 = 1;
+const APP_DIR: &str = "Scrozz";
+const SETTINGS_FILE: &str = "settings.json";
+const SETTINGS_LOCK_FILE: &str = ".settings.lock";
+const SETTINGS_FILE_ENV: &str = "SCROZZ_SETTINGS_FILE";
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+const RECORDING_OVERLAY_KEY: &str = "record.show-recent-captures-overlay";
+const RECORDING_EDITOR_KEY: &str = "record.open-editor";
+const RECORDING_OVERLAY_FIELD: &str = "show-recent-captures-overlay";
+const RECORDING_EDITOR_FIELD: &str = "open-editor";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct LoadedSettings {
+    actions: AfterCaptureSettings,
+    persisted: bool,
+    document: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AfterCaptureStore {
+    path: PathBuf,
+}
+
+impl AfterCaptureStore {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    fn default_location() -> Result<Self> {
+        if let Ok(path) = std::env::var(SETTINGS_FILE_ENV)
+            && !path.trim().is_empty()
+        {
+            return Ok(Self::new(path));
+        }
+        let base = dirs::config_dir().or_else(dirs::data_dir).ok_or_else(|| {
+            Error::Storage(
+                "no platform configuration directory is available for after-capture settings"
+                    .to_owned(),
+            )
+        })?;
+        Ok(Self::new(base.join(APP_DIR).join(SETTINGS_FILE)))
+    }
+
+    fn load(&self) -> Result<(AfterCaptureSettings, bool)> {
+        self.with_lock(|| {
+            let loaded = self.load_unlocked()?;
+            Ok((loaded.actions, loaded.persisted))
+        })
+    }
+
+    fn load_unlocked(&self) -> Result<LoadedSettings> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadedSettings {
+                    actions: AfterCaptureSettings::default(),
+                    persisted: false,
+                    document: default_settings_document(),
+                });
+            }
+            Err(error) => {
+                return Err(Error::Storage(format!(
+                    "could not open after-capture settings {}: {error}",
+                    self.path.display()
+                )));
+            }
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_SETTINGS_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                Error::Storage(format!(
+                    "could not read after-capture settings {}: {error}",
+                    self.path.display()
+                ))
+            })?;
+        if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(Error::Storage(format!(
+                "after-capture settings {} exceed the {} byte limit",
+                self.path.display(),
+                MAX_SETTINGS_BYTES
+            )));
+        }
+        let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            Error::Storage(format!(
+                "could not decode after-capture settings {}: {error}",
+                self.path.display()
+            ))
+        })?;
+        let version = document
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                Error::Storage(format!(
+                    "after-capture settings {} have no numeric version",
+                    self.path.display()
+                ))
+            })?;
+        let actions = match version {
+            SETTINGS_VERSION => read_modern_actions(&document, &self.path)?,
+            LEGACY_SETTINGS_VERSION => read_legacy_actions(&document, &self.path)?,
+            version => {
+                return Err(Error::Storage(format!(
+                    "after-capture settings {} use unsupported version {version}",
+                    self.path.display()
+                )));
+            }
+        };
+        Ok(LoadedSettings {
+            actions,
+            persisted: true,
+            document: if version == SETTINGS_VERSION {
+                document
+            } else {
+                default_settings_document()
+            },
+        })
+    }
+
+    fn update(
+        &self,
+        change: impl FnOnce(&mut AfterCaptureSettings),
+    ) -> Result<AfterCaptureSettings> {
+        self.with_lock(|| {
+            let mut loaded = self.load_unlocked()?;
+            change(&mut loaded.actions);
+            write_actions(&mut loaded.document, loaded.actions)?;
+            self.save_document_unlocked(&loaded.document)?;
+            Ok(loaded.actions)
+        })
+    }
+
+    fn save_document_unlocked(&self, document: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec_pretty(document).map_err(|error| {
+            Error::Storage(format!("could not encode after-capture settings: {error}"))
+        })?;
+        bytes.push(b'\n');
+        if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(Error::Storage(format!(
+                "updated after-capture settings would exceed the {MAX_SETTINGS_BYTES} byte limit"
+            )));
+        }
+
+        let parent = self.path.parent().ok_or_else(|| {
+            Error::Storage(format!(
+                "after-capture settings path {} has no parent directory",
+                self.path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            Error::Storage(format!(
+                "could not create settings directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".{SETTINGS_FILE}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let result = write_and_replace(&temp, &self.path, &bytes);
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn with_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let parent = self.path.parent().ok_or_else(|| {
+            Error::Storage(format!(
+                "after-capture settings path {} has no parent directory",
+                self.path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            Error::Storage(format!(
+                "could not create settings directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let lock_path = parent.join(SETTINGS_LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                Error::Storage(format!(
+                    "could not open settings lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        lock.lock_exclusive().map_err(|error| {
+            Error::Storage(format!(
+                "could not lock after-capture settings {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        let result = operation();
+        let unlock = lock.unlock().map_err(|error| {
+            Error::Storage(format!(
+                "could not unlock after-capture settings {}: {error}",
+                lock_path.display()
+            ))
+        });
+        match (result, unlock) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(primary), Err(unlock)) => {
+                Err(Error::Storage(format!("{primary}; additionally, {unlock}")))
+            }
+        }
+    }
+}
+
+fn read_modern_actions(document: &Value, path: &Path) -> Result<AfterCaptureSettings> {
+    let recording = document
+        .get("after_capture")
+        .and_then(|value| value.get("recording"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::Storage(format!(
+                "after-capture settings {} have no after_capture.recording object",
+                path.display()
+            ))
+        })?;
+    Ok(AfterCaptureSettings {
+        recent_captures_overlay: bool_field(recording, RECORDING_OVERLAY_FIELD, path)?,
+        open_editor: bool_field(recording, RECORDING_EDITOR_FIELD, path)?,
+    })
+}
+
+fn read_legacy_actions(document: &Value, path: &Path) -> Result<AfterCaptureSettings> {
+    let actions = document
+        .get("after_capture")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::Storage(format!(
+                "legacy after-capture settings {} have no after_capture object",
+                path.display()
+            ))
+        })?;
+    Ok(AfterCaptureSettings {
+        recent_captures_overlay: bool_field(actions, "recording_overlay", path)?,
+        open_editor: bool_field(actions, "recording_open_editor", path)?,
+    })
+}
+
+fn bool_field(object: &serde_json::Map<String, Value>, field: &str, path: &Path) -> Result<bool> {
+    object.get(field).and_then(Value::as_bool).ok_or_else(|| {
+        Error::Storage(format!(
+            "after-capture settings {} require boolean field {field:?}",
+            path.display()
+        ))
+    })
+}
+
+fn write_actions(document: &mut Value, actions: AfterCaptureSettings) -> Result<()> {
+    let recording = document
+        .get_mut("after_capture")
+        .and_then(|value| value.get_mut("recording"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            Error::Storage(
+                "settings document has no writable after_capture.recording object".to_owned(),
+            )
+        })?;
+    recording.insert(
+        RECORDING_OVERLAY_FIELD.to_owned(),
+        Value::Bool(actions.recent_captures_overlay),
+    );
+    recording.insert(
+        RECORDING_EDITOR_FIELD.to_owned(),
+        Value::Bool(actions.open_editor),
+    );
+    Ok(())
+}
+
+fn default_settings_document() -> Value {
+    json!({
+        "after_capture": {
+            "recording": {
+                "copy-to-clipboard": false,
+                "open-editor": false,
+                "pin-to-screen": false,
+                "save-automatically": false,
+                "show-recent-captures-overlay": true,
+                "upload-and-copy-link": false
+            },
+            "screenshot": {
+                "copy-to-clipboard": true,
+                "open-editor": true,
+                "pin-to-screen": false,
+                "save-automatically": true,
+                "show-recent-captures-overlay": true,
+                "upload-and-copy-link": false
+            }
+        },
+        "values": {},
+        "version": SETTINGS_VERSION
+    })
+}
+
+fn write_and_replace(temp: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = create_private_file(temp)?;
+    file.write_all(bytes).map_err(|error| {
+        Error::Storage(format!(
+            "could not write settings staging file {}: {error}",
+            temp.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        Error::Storage(format!(
+            "could not sync settings staging file {}: {error}",
+            temp.display()
+        ))
+    })?;
+    drop(file);
+    replace_file(temp, destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| {
+            Error::Storage(format!(
+                "could not create settings staging file {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            Error::Storage(format!(
+                "could not create settings staging file {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).map_err(|error| {
+        Error::Storage(format!(
+            "could not publish after-capture settings {}: {error}",
+            destination.display()
+        ))
+    })?;
+    let parent = destination.parent().ok_or_else(|| {
+        Error::Storage(format!(
+            "after-capture settings path {} has no parent directory",
+            destination.display()
+        ))
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            Error::Storage(format!(
+                "could not sync settings directory {}: {error}",
+                parent.display()
+            ))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::{
+        Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        },
+        core::PCWSTR,
+    };
+
+    let destination_label = destination.display().to_string();
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both buffers are NUL-terminated and live for the duration of the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| {
+        Error::Storage(format!(
+            "could not publish after-capture settings {}: {error}",
+            destination_label
+        ))
+    })
+}
 
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,18 +496,19 @@ pub struct Setting {
 }
 
 impl Setting {
-    /// The JSON representation, including the current (always default) value.
+    /// The JSON representation using the shipped default.
     #[must_use]
     pub fn to_json(self) -> Json {
+        self.to_json_with(self.default, "default")
+    }
+
+    fn to_json_with(self, value: &str, source: &str) -> Json {
         let mut fields = vec![
             ("key", Json::str(self.key)),
             ("type", Json::str(self.kind.slug())),
-            ("value", Json::str(self.default)),
+            ("value", Json::str(value)),
             ("default", Json::str(self.default)),
-            // Honest about where the value came from. When persistence lands
-            // this becomes "user" for anything overridden, and a script that
-            // already reads it keeps working.
-            ("source", Json::str("default")),
+            ("source", Json::str(source)),
             ("description", Json::str(self.description)),
         ];
         if let Kind::Choice(options) = self.kind {
@@ -158,6 +581,102 @@ impl Setting {
     }
 }
 
+/// Loads the persisted Recording after-capture action matrix.
+///
+/// # Errors
+///
+/// Returns a storage error when the settings file is unreadable, oversized,
+/// malformed, or from an unsupported future schema.
+pub fn load_recording_after_capture() -> Result<AfterCaptureSettings> {
+    AfterCaptureStore::default_location()?
+        .load()
+        .map(|(value, _)| value)
+}
+
+/// Persists one setting when this narrow store owns it.
+///
+/// Returns `false` for settings that remain schema-only.
+///
+/// # Errors
+///
+/// Returns a usage error for an invalid value or a storage error when the
+/// current policy cannot be read or atomically replaced.
+pub fn persist(setting: &Setting, value: &str) -> CliResult<bool> {
+    persist_to(&AfterCaptureStore::default_location()?, setting, value)
+}
+
+fn persist_to(store: &AfterCaptureStore, setting: &Setting, value: &str) -> CliResult<bool> {
+    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+        return Ok(false);
+    }
+    setting.validate(value)?;
+    let enabled = value == "true";
+    store.update(|actions| match setting.key {
+        RECORDING_OVERLAY_KEY => actions.recent_captures_overlay = enabled,
+        RECORDING_EDITOR_KEY => actions.open_editor = enabled,
+        _ => unreachable!("persisted settings were filtered above"),
+    })?;
+    Ok(true)
+}
+
+fn resolved_value(setting: &Setting) -> CliResult<(String, &'static str)> {
+    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+        return Ok((setting.default.to_owned(), "default"));
+    }
+    let store = AfterCaptureStore::default_location()?;
+    resolved_value_from(&store, setting)
+}
+
+fn resolved_value_from(
+    store: &AfterCaptureStore,
+    setting: &Setting,
+) -> CliResult<(String, &'static str)> {
+    if !matches!(setting.key, RECORDING_OVERLAY_KEY | RECORDING_EDITOR_KEY) {
+        return Ok((setting.default.to_owned(), "default"));
+    }
+    let (actions, persisted) = store.load()?;
+    let value = match setting.key {
+        RECORDING_OVERLAY_KEY => actions.recent_captures_overlay,
+        RECORDING_EDITOR_KEY => actions.open_editor,
+        _ => unreachable!("persisted settings were filtered above"),
+    };
+    Ok((
+        value.to_string(),
+        if persisted { "user" } else { "default" },
+    ))
+}
+
+/// One setting as JSON with its current persisted value.
+pub fn resolved_json(setting: Setting) -> CliResult<Json> {
+    let (value, source) = resolved_value(&setting)?;
+    Ok(setting.to_json_with(&value, source))
+}
+
+/// One setting's current value.
+pub fn value(setting: &Setting) -> CliResult<String> {
+    resolved_value(setting).map(|(value, _)| value)
+}
+
+/// Every setting as JSON with persisted values resolved.
+pub fn resolved_all_json() -> CliResult<Json> {
+    SETTINGS
+        .iter()
+        .copied()
+        .map(resolved_json)
+        .collect::<CliResult<Vec<_>>>()
+        .map(Json::arr)
+}
+
+/// Every setting as aligned text with persisted values resolved.
+pub fn resolved_all_human() -> CliResult<String> {
+    let width = SETTINGS.iter().map(|s| s.key.len()).max().unwrap_or(0);
+    SETTINGS
+        .iter()
+        .map(|setting| value(setting).map(|value| format!("{:width$}  {value}", setting.key)))
+        .collect::<CliResult<Vec<_>>>()
+        .map(|lines| lines.join("\n"))
+}
+
 /// Every setting, in the order `settings get` reports them.
 ///
 /// Grouped by area and stable: a script that diffs this output should see a
@@ -216,6 +735,18 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "false",
         description: "Record system audio output.",
+    },
+    Setting {
+        key: RECORDING_OVERLAY_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Add completed recordings to the Recent Captures Overlay.",
+    },
+    Setting {
+        key: RECORDING_EDITOR_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Open the Video Editor after a recording completes.",
     },
     Setting {
         key: "history.max-image-bytes",
@@ -333,6 +864,220 @@ pub fn all_human() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "scrozz-after-capture-{name}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_after_capture_settings_use_overlay_only_defaults() {
+        let root = scratch("missing");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join(SETTINGS_FILE));
+
+        let (actions, persisted) = store.load().unwrap();
+
+        assert_eq!(actions, AfterCaptureSettings::default());
+        assert!(actions.recent_captures_overlay);
+        assert!(!actions.open_editor);
+        assert!(!persisted);
+    }
+
+    #[test]
+    fn recording_after_capture_actions_persist_independently() {
+        let root = scratch("matrix");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join(SETTINGS_FILE));
+        let overlay = lookup(RECORDING_OVERLAY_KEY).unwrap();
+        let editor = lookup(RECORDING_EDITOR_KEY).unwrap();
+
+        assert!(persist_to(&store, editor, "true").unwrap());
+        let (actions, persisted) = store.load().unwrap();
+        assert!(persisted);
+        assert!(actions.recent_captures_overlay);
+        assert!(actions.open_editor);
+
+        assert!(persist_to(&store, overlay, "false").unwrap());
+        let (actions, _) = store.load().unwrap();
+        assert!(!actions.recent_captures_overlay);
+        assert!(actions.open_editor);
+        assert_eq!(
+            resolved_value_from(&store, overlay).unwrap(),
+            ("false".to_owned(), "user")
+        );
+    }
+
+    #[test]
+    fn modern_settings_updates_preserve_every_unowned_value() {
+        let root = scratch("preserve-modern");
+        let _cleanup = Scratch(root.clone());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(SETTINGS_FILE);
+        let store = AfterCaptureStore::new(&path);
+        let mut document = default_settings_document();
+        document["future-root"] = json!({"keep": 7});
+        document["after_capture"]["future-media"] = json!({"keep": true});
+        document["after_capture"]["recording"]["future-action"] = json!("keep");
+        document["values"] = json!({"capture.folder": "/Volumes/Archive"});
+        let expected_screenshot = document["after_capture"]["screenshot"].clone();
+        fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        persist_to(&store, lookup(RECORDING_EDITOR_KEY).unwrap(), "true").unwrap();
+
+        let updated: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(updated["future-root"], json!({"keep": 7}));
+        assert_eq!(
+            updated["after_capture"]["future-media"],
+            json!({"keep": true})
+        );
+        assert_eq!(
+            updated["after_capture"]["recording"]["future-action"],
+            json!("keep")
+        );
+        assert_eq!(
+            updated["values"],
+            json!({"capture.folder": "/Volumes/Archive"})
+        );
+        assert_eq!(updated["after_capture"]["screenshot"], expected_screenshot);
+        assert_eq!(
+            updated["after_capture"]["recording"][RECORDING_EDITOR_FIELD],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_an_independent_action() {
+        let root = scratch("concurrent");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join(SETTINGS_FILE));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let overlay_store = store.clone();
+        let overlay_barrier = std::sync::Arc::clone(&barrier);
+        let overlay = std::thread::spawn(move || {
+            overlay_barrier.wait();
+            persist_to(
+                &overlay_store,
+                lookup(RECORDING_OVERLAY_KEY).unwrap(),
+                "false",
+            )
+            .unwrap();
+        });
+        let editor_store = store.clone();
+        let editor_barrier = std::sync::Arc::clone(&barrier);
+        let editor = std::thread::spawn(move || {
+            editor_barrier.wait();
+            persist_to(&editor_store, lookup(RECORDING_EDITOR_KEY).unwrap(), "true").unwrap();
+        });
+        barrier.wait();
+        overlay.join().unwrap();
+        editor.join().unwrap();
+
+        let (actions, _) = store.load().unwrap();
+        assert!(!actions.recent_captures_overlay);
+        assert!(actions.open_editor);
+    }
+
+    #[test]
+    fn expanding_unknown_json_cannot_publish_an_unreadable_document() {
+        let root = scratch("serialized-limit");
+        let _cleanup = Scratch(root.clone());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(SETTINGS_FILE);
+        let store = AfterCaptureStore::new(&path);
+        let mut document = default_settings_document();
+        document["future"] = Value::Array(vec![Value::Bool(false); 8_000]);
+        let compact = serde_json::to_vec(&document).unwrap();
+        assert!(compact.len() as u64 <= MAX_SETTINGS_BYTES);
+        fs::write(&path, &compact).unwrap();
+
+        let error = persist_to(&store, lookup(RECORDING_EDITOR_KEY).unwrap(), "true")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("byte limit"), "{error}");
+        let (actions, _) = store.load().unwrap();
+        assert!(!actions.open_editor);
+        assert_eq!(fs::read(path).unwrap(), compact);
+    }
+
+    #[test]
+    fn temporary_version_one_state_migrates_into_the_modern_matrix() {
+        let root = scratch("migrate-v1");
+        let _cleanup = Scratch(root.clone());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(SETTINGS_FILE);
+        let store = AfterCaptureStore::new(&path);
+        fs::write(
+            &path,
+            br#"{"version":1,"after_capture":{"recording_overlay":false,"recording_open_editor":true}}"#,
+        )
+        .unwrap();
+
+        let (actions, persisted) = store.load().unwrap();
+        assert!(persisted);
+        assert!(!actions.recent_captures_overlay);
+        assert!(actions.open_editor);
+        persist_to(&store, lookup(RECORDING_OVERLAY_KEY).unwrap(), "true").unwrap();
+
+        let migrated: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(migrated["version"], SETTINGS_VERSION);
+        assert_eq!(
+            migrated["after_capture"]["recording"][RECORDING_OVERLAY_FIELD],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            migrated["after_capture"]["recording"][RECORDING_EDITOR_FIELD],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_after_capture_state_is_not_silently_accepted() {
+        let root = scratch("invalid");
+        let _cleanup = Scratch(root.clone());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(SETTINGS_FILE);
+        let store = AfterCaptureStore::new(&path);
+
+        fs::write(&path, br#"{"version":1,"after_capture":"truncated"#).unwrap();
+        assert!(matches!(store.load(), Err(Error::Storage(_))));
+
+        fs::write(&path, vec![b'x'; MAX_SETTINGS_BYTES as usize + 1]).unwrap();
+        let error = store.load().unwrap_err().to_string();
+        assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
+    fn failed_publish_removes_owned_settings_staging_file() {
+        let root = scratch("cleanup");
+        let _cleanup = Scratch(root.clone());
+        let destination = root.join(SETTINGS_FILE);
+        fs::create_dir_all(&destination).unwrap();
+        let store = AfterCaptureStore::new(&destination);
+
+        assert!(
+            store
+                .save_document_unlocked(&default_settings_document())
+                .is_err()
+        );
+        let entries = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [SETTINGS_FILE]);
+    }
 
     #[test]
     fn every_key_is_unique() {

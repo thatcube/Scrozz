@@ -7,7 +7,7 @@ use std::{
         Arc, Condvar, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use block2::RcBlock;
@@ -41,8 +41,10 @@ use crate::{
 };
 
 const FINISH_TIMEOUT: Duration = Duration::from_secs(30);
+const APPEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 const MAX_ENCODER_RATE_HINT: f64 = 60.0;
+const AUDIO_ENCODER_CHUNK_FRAMES: usize = 1_024;
 
 pub(super) const TRANSCODER_NAME: &str = "macOS AVFoundation + VideoToolbox";
 
@@ -118,7 +120,11 @@ impl VideoWriter {
             )
         };
         unsafe {
-            video.setExpectsMediaDataInRealTime(false);
+            // This encoder is fed by our push loop. With audio and video inputs,
+            // AVAssetWriter's offline interleaving policy can hold both tracks
+            // above their high-water marks indefinitely. Real-time readiness
+            // keeps backpressure local; `wait_until_ready` still prevents drops.
+            video.setExpectsMediaDataInRealTime(true);
             if !asset.canAddInput(&video) {
                 return Err(Error::Codec(
                     "AVAssetWriter refused the transcoded video input".to_owned(),
@@ -140,7 +146,7 @@ impl VideoWriter {
             Some(add_audio(&asset, audio_channels)?)
         };
         unsafe {
-            asset.setShouldOptimizeForNetworkUse(true);
+            asset.setShouldOptimizeForNetworkUse(false);
             if !asset.startWriting() {
                 return Err(writer_failure(&asset, "starting hardware video export"));
             }
@@ -169,7 +175,7 @@ impl VideoWriter {
         source_origin: Duration,
         cancelled: &AtomicBool,
     ) -> Result<()> {
-        if let Err(error) = wait_until_ready(&self.asset, &self.video, cancelled) {
+        if let Err(error) = wait_until_ready(&self.asset, &self.video, cancelled, "video encoder") {
             return if error.is_cancellation() {
                 Err(error)
             } else {
@@ -244,22 +250,43 @@ impl VideoWriter {
         for sample in &mut normalized.samples {
             *sample = (*sample * gain).clamp(-1.0, 1.0);
         }
-        let duration =
-            Duration::try_from_secs_f64(normalized.frames() as f64 / f64::from(MIX_SAMPLE_RATE))
-                .map_err(|_| {
-                    Error::Codec("transcoded audio duration is not representable".to_owned())
+        let total_frames = normalized.frames();
+        let duration = Duration::try_from_secs_f64(
+            total_frames as f64 / f64::from(MIX_SAMPLE_RATE),
+        )
+        .map_err(|_| Error::Codec("transcoded audio duration is not representable".to_owned()))?;
+        let channels = usize::from(normalized.channels);
+        for frame_offset in (0..total_frames).step_by(AUDIO_ENCODER_CHUNK_FRAMES) {
+            let frames = (total_frames - frame_offset).min(AUDIO_ENCODER_CHUNK_FRAMES);
+            let sample_start = frame_offset.checked_mul(channels).ok_or_else(|| {
+                Error::Codec("transcoded audio sample offset overflowed".to_owned())
+            })?;
+            let sample_end = frames
+                .checked_mul(channels)
+                .and_then(|count| sample_start.checked_add(count))
+                .ok_or_else(|| {
+                    Error::Codec("transcoded audio sample range overflowed".to_owned())
                 })?;
-        let sample = pcm::encode_normalized(&normalized)?;
-        if let Err(error) = wait_until_ready(&self.asset, input, cancelled) {
-            return if error.is_cancellation() {
-                Err(error)
-            } else {
-                Err(self.abort_with(error))
+            let frame_offset = i64::try_from(frame_offset)
+                .map_err(|_| Error::Codec("transcoded audio frame offset overflowed".to_owned()))?;
+            let chunk = PcmChunk {
+                start_frame: normalized.start_frame.saturating_add(frame_offset),
+                sample_rate: normalized.sample_rate,
+                channels: normalized.channels,
+                samples: normalized.samples[sample_start..sample_end].to_vec(),
             };
-        }
-        if !unsafe { input.appendSampleBuffer(&sample) } {
-            let error = writer_failure(&self.asset, "encoding an audio chunk");
-            return Err(self.abort_with(error));
+            let sample = pcm::encode_normalized(&chunk)?;
+            if let Err(error) = wait_until_ready(&self.asset, input, cancelled, "audio encoder") {
+                return if error.is_cancellation() {
+                    Err(error)
+                } else {
+                    Err(self.abort_with(error))
+                };
+            }
+            if !unsafe { input.appendSampleBuffer(&sample) } {
+                let error = writer_failure(&self.asset, "encoding an audio chunk");
+                return Err(self.abort_with(error));
+            }
         }
         self.media_end = self.media_end.max(relative.saturating_add(duration));
         Ok(())
@@ -352,7 +379,9 @@ fn add_audio(asset: &AVAssetWriter, channels: u16) -> Result<Retained<AVAssetWri
         )
     };
     unsafe {
-        input.setExpectsMediaDataInRealTime(false);
+        // Keep both tracks on the same readiness policy. Mixing offline and
+        // real-time inputs recreates the cross-track high-water deadlock.
+        input.setExpectsMediaDataInRealTime(true);
         if !asset.canAddInput(&input) {
             return Err(Error::Codec(
                 "AVAssetWriter refused the transcoded audio input".to_owned(),
@@ -630,7 +659,9 @@ fn wait_until_ready(
     asset: &AVAssetWriter,
     input: &AVAssetWriterInput,
     cancelled: &AtomicBool,
+    component: &str,
 ) -> Result<()> {
+    let deadline = Instant::now() + APPEND_READY_TIMEOUT;
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
@@ -639,7 +670,16 @@ fn wait_until_ready(
             return Ok(());
         }
         if unsafe { asset.status() } != AVAssetWriterStatus::Writing {
-            return Err(writer_failure(asset, "waiting for video encoder capacity"));
+            return Err(writer_failure(
+                asset,
+                &format!("waiting for {component} capacity"),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Codec(format!(
+                "{component} remained backpressured for {} seconds",
+                APPEND_READY_TIMEOUT.as_secs()
+            )));
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -932,6 +972,26 @@ mod tests {
         assert_eq!(encoder_rate_hint(120.0), 60);
         assert_eq!(bitrate_rate(120.0), 120);
         assert_eq!(bitrate_rate(240.0), 240);
+    }
+
+    #[test]
+    fn multi_track_push_writer_uses_non_interleaving_readiness_policy() {
+        let path = std::env::temp_dir().join(format!(
+            "scrozz-writer-readiness-{}.mp4",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let writer = VideoWriter::new(&path, (96, 64), 30.0, Quality::Balanced, 2).unwrap();
+        assert!(unsafe { writer.video.expectsMediaDataInRealTime() });
+        assert!(unsafe {
+            writer
+                .audio
+                .as_ref()
+                .expect("audio input")
+                .expectsMediaDataInRealTime()
+        });
+        drop(writer);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

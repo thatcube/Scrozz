@@ -2,7 +2,10 @@
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::{path::Path, time::Duration};
+    use std::{
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use scrozz_record::{
         Recording,
@@ -15,13 +18,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("preview-av.mp4");
-    let recording = Recording::native(&source, 2.0, "native playback smoke fixture")?;
+    let source = std::env::args_os().nth(1).map_or_else(
+        || {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("preview-av.mp4")
+        },
+        PathBuf::from,
+    );
+    let recording = Recording::native(&source, 1.0, "native playback smoke source")?;
     let document = VideoDocument::open_native(recording)?;
     let mut plan = EditPlan::video(&document)?;
+    if let Some(seek) = std::env::var("SCROZZ_PLAYBACK_SMOKE_SEEK_SECONDS")
+        .ok()
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .map(Duration::try_from_secs_f64)
+        .transpose()?
+    {
+        let mut playback = NativePlayback::open(&document, plan)?;
+        playback.seek(seek)?;
+        let decoded = wait_for(&mut playback, Duration::from_secs(10), |snapshot| {
+            snapshot
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.frame.timestamp <= seek && frame.display_until >= seek)
+        })?;
+        playback.play()?;
+        wait_for(&mut playback, Duration::from_secs(10), |snapshot| {
+            snapshot.position >= seek.saturating_add(Duration::from_millis(250))
+        })?;
+        playback.shutdown()?;
+        println!(
+            "native playback arbitrary seek passed at {:.3}s with frame {:?}",
+            seek.as_secs_f64(),
+            decoded.frame.as_ref().map(|frame| frame.frame.timestamp)
+        );
+        return Ok(());
+    }
     plan.trim = TrimRange::new(
         Duration::from_millis(200),
         Duration::from_millis(1_200),

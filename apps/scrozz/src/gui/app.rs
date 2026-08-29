@@ -39,6 +39,7 @@ use scrozz_record::{
     edit::{EditOutput, EditPlan, VideoDocument},
     handoff::FinalizedMediaHandoff,
     playback::{NativePlayback, sync_document},
+    storyboard::NativeStoryboard,
     transcode::{
         NativeTranscoder, TranscodeEvent, TranscodeFailure, TranscodeJob, TranscodeOutput,
         TranscodeStatus, Transcoder as _,
@@ -68,11 +69,27 @@ use crate::{
     json::Json,
     platform,
     report::Report,
+    settings,
 };
 
 struct FinalisedRecording {
     result: scrozz_core::Result<Recording>,
     handoff: scrozz_core::Result<Option<FinalizedMediaHandoff>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CompletionActions {
+    recent_captures_overlay: bool,
+    open_editor: bool,
+}
+
+impl CompletionActions {
+    fn from_settings(settings: &RecordingSettings) -> Self {
+        Self {
+            recent_captures_overlay: settings.after_capture.recent_captures_overlay,
+            open_editor: settings.after_capture.open_editor,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -85,6 +102,7 @@ struct ActiveVideoEditor {
     document: VideoDocument,
     plan: EditPlan,
     playback: NativePlayback,
+    storyboard: NativeStoryboard,
     transcode_job: Option<Box<dyn TranscodeJob>>,
     transcode_status: Option<TranscodeStatus>,
     transcode_progress: f32,
@@ -165,6 +183,8 @@ pub struct Config {
     pub capture_on_start: Option<CaptureKind>,
     /// Persist and restore the most recent interactive recording region.
     pub remember_recording_selection: bool,
+    /// Read persisted settings at startup and before each recording.
+    pub persisted_settings: bool,
 }
 
 impl Default for Config {
@@ -179,6 +199,7 @@ impl Default for Config {
             deadline: None,
             capture_on_start: None,
             remember_recording_selection: true,
+            persisted_settings: true,
         }
     }
 }
@@ -237,6 +258,7 @@ impl Config {
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
             remember_recording_selection: false,
+            persisted_settings: false,
         }
     }
 }
@@ -312,7 +334,16 @@ impl App {
     ) -> CliResult<Self> {
         let pipeline = Pipeline::start(Arc::clone(&selector))?;
         let mut notes = Vec::new();
-        let recording = match RecordingMachine::native(RecordingSettings::shipped()) {
+        let mut recording_settings = RecordingSettings::shipped();
+        if config.persisted_settings {
+            match settings::load_recording_after_capture() {
+                Ok(after_capture) => recording_settings.after_capture = after_capture,
+                Err(error) => notes.push(format!(
+                    "Could not load after-capture settings; using safe defaults: {error}"
+                )),
+            }
+        }
+        let recording = match RecordingMachine::native(recording_settings) {
             Ok(machine) => {
                 notes.push(format!(
                     "recording engine ready with capabilities {:?}",
@@ -788,7 +819,7 @@ impl App {
             }
         }
 
-        self.recording_editor = None;
+        self.release_video_editor();
         self.recording_preflight = None;
         self.recording_tick = Instant::now();
         self.recording_completion = None;
@@ -992,20 +1023,53 @@ impl App {
             .pending_recording_start
             .take()
             .expect("readiness came from the pending start");
+        if self.recording_editor.is_some() {
+            self.recording_completion = Some(GuiRecordingCompletion::Failed(CliError::Core(
+                CoreError::InvalidRequest(
+                    "close the video editor before starting a recording".to_owned(),
+                ),
+            )));
+            self.present_recording_error(CliError::Core(CoreError::InvalidRequest(
+                "close the video editor before starting a recording".to_owned(),
+            )));
+            self.reply_recording_waiters();
+            return;
+        }
+        let after_capture = if self.config.persisted_settings {
+            match settings::load_recording_after_capture() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    let error = CliError::Core(error);
+                    self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
+                    self.present_recording_error(error);
+                    self.reply_recording_waiters();
+                    return;
+                }
+            }
+        } else {
+            self.recording
+                .as_ref()
+                .expect("a pending start requires a recording machine")
+                .settings()
+                .after_capture
+        };
+        let machine = self
+            .recording
+            .as_mut()
+            .expect("a pending start requires a recording machine");
+        if let Err(error) = machine.set_after_capture_settings(after_capture) {
+            let error = CliError::Core(error);
+            self.recording_completion = Some(GuiRecordingCompletion::Failed(error.clone()));
+            self.present_recording_error(error);
+            self.reply_recording_waiters();
+            return;
+        }
         let result = match pending.start {
             PendingRecordingStart::Settings {
                 target,
                 destination,
-            } => self
-                .recording
-                .as_mut()
-                .expect("a pending settings start requires a recording machine")
-                .begin_with_destination(target, destination),
-            PendingRecordingStart::Request(request) => self
-                .recording
-                .as_mut()
-                .expect("a pending configured start requires a recording machine")
-                .begin_request(request),
+            } => machine.begin_with_destination(target, destination),
+            PendingRecordingStart::Request(request) => machine.begin_request(request),
         };
         if let Err(error) = result {
             let error = CliError::Core(error);
@@ -1150,7 +1214,7 @@ impl App {
             )));
         }
 
-        self.recording_editor = None;
+        self.release_video_editor();
         self.recording_tick = Instant::now();
         self.recording_completion = None;
         let requested = commands::recording_target_spec(args)?;
@@ -1204,6 +1268,11 @@ impl App {
             self.reply_recording_waiters();
             return;
         }
+        let completion_actions = self
+            .recording
+            .as_ref()
+            .map(|machine| CompletionActions::from_settings(machine.settings()))
+            .unwrap_or_default();
         let result = self
             .recording
             .as_mut()
@@ -1237,7 +1306,9 @@ impl App {
                 ))
             });
             let handoff = match result.as_ref() {
-                Ok(output) if !output.is_partial() => {
+                Ok(output)
+                    if completion_actions.recent_captures_overlay && !output.is_partial() =>
+                {
                     FinalizedMediaHandoff::from_completed(output).map(Some)
                 }
                 Ok(_) | Err(_) => Ok(None),
@@ -1367,12 +1438,21 @@ impl App {
             .as_ref()
             .and_then(RecordingMachine::request)
             .map(|request| request.fps);
-        self.recording_editor = None;
-        match active_video_editor(&output, requested_fps) {
-            Ok(editor) => self.recording_editor = editor,
-            Err(error) => self.note(format!(
-                "recording was saved but could not be opened in the video editor: {error}"
-            )),
+        let completion_actions = self
+            .recording
+            .as_ref()
+            .map(|machine| CompletionActions::from_settings(machine.settings()))
+            .unwrap_or_default();
+        self.release_video_editor();
+        if completion_actions.open_editor {
+            match active_video_editor(&output, requested_fps) {
+                Ok(editor) => self.recording_editor = editor,
+                Err(error) => self.note(format!(
+                    "recording was saved but could not be opened in the video editor: {error}"
+                )),
+            }
+        } else {
+            self.note("recording was saved without opening the video editor");
         }
         match commands::finish_recording_report(output, fallback_target) {
             Ok(report) => {
@@ -1636,6 +1716,7 @@ impl App {
                 document: editor.document.clone(),
                 plan: editor.plan,
                 playback: editor.playback.snapshot().clone(),
+                storyboard: editor.storyboard.snapshot(),
                 transcode_status: editor.transcode_status,
                 transcode_progress: editor.transcode_progress,
                 transcode_output: editor.transcode_output.clone(),
@@ -1686,7 +1767,7 @@ impl App {
                     self.note("recording error dismissed");
                     return;
                 }
-                self.recording_editor = None;
+                self.release_video_editor();
                 let result = self.recording.as_mut().ok_or_else(|| {
                     CoreError::InvalidRequest("no recording state is available".into())
                 });
@@ -1740,13 +1821,7 @@ impl App {
                 self.note("cancel the active export before closing the video editor");
                 return;
             }
-            if let Some(mut editor) = self.recording_editor.take()
-                && let Err(error) = editor.playback.shutdown()
-            {
-                self.note(format!(
-                    "could not close recording preview cleanly: {error}"
-                ));
-            }
+            self.release_video_editor();
             if let Some(machine) = self.recording.as_mut()
                 && matches!(
                     machine.phase(),
@@ -1926,11 +2001,7 @@ impl App {
     pub fn shut_down(&mut self) {
         self.settle_video_export_before_shutdown();
         self.finalise_recording_before_shutdown();
-        if let Some(editor) = &mut self.recording_editor
-            && let Err(error) = editor.playback.shutdown()
-        {
-            self.note(format!("recording preview shutdown failed: {error}"));
-        }
+        self.release_video_editor();
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
@@ -1941,6 +2012,20 @@ impl App {
             forwarder.stop();
         }
         self.pipeline.stop();
+    }
+
+    fn release_video_editor(&mut self) {
+        let Some(mut editor) = self.recording_editor.take() else {
+            return;
+        };
+        let preview_error = editor.playback.shutdown().err();
+        let storyboard_error = editor.storyboard.shutdown().err();
+        if let Some(error) = preview_error {
+            self.note(format!("recording preview shutdown failed: {error}"));
+        }
+        if let Some(error) = storyboard_error {
+            self.note(format!("recording timeline shutdown failed: {error}"));
+        }
     }
 
     fn settle_video_export_before_shutdown(&mut self) {
@@ -2083,10 +2168,12 @@ fn active_video_editor(
     let document = VideoDocument::open_native(output.clone())?;
     let plan = EditPlan::video(&document)?;
     let playback = NativePlayback::open(&document, plan)?;
+    let storyboard = NativeStoryboard::start(&document)?;
     Ok(Some(ActiveVideoEditor {
         document,
         plan,
         playback,
+        storyboard,
         transcode_job: None,
         transcode_status: None,
         transcode_progress: 0.0,
@@ -2234,6 +2321,57 @@ mod tests {
         assert!(app.tray.is_none(), "no menu-bar item");
         assert!(app.server.is_none(), "no socket");
         assert_eq!(app.config.bindings.len(), 0, "no keyboard registration");
+        assert!(
+            !app.config.persisted_settings,
+            "sealed runs must not touch user settings"
+        );
+    }
+
+    #[test]
+    fn overlay_only_after_capture_never_constructs_the_video_editor() {
+        let (mut app, _) = app();
+        let mut settings = RecordingSettings::shipped();
+        settings.after_capture.recent_captures_overlay = true;
+        settings.after_capture.open_editor = false;
+        app.recording = Some(
+            RecordingMachine::native(settings)
+                .expect("native machine construction is side-effect free"),
+        );
+        let output =
+            scrozz_record::Recording::synthetic("missing-editor-source.mp4", 3.0, "policy test")
+                .unwrap();
+
+        app.retain_recording_completion(output, None);
+
+        assert!(app.recording_editor.is_none());
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note == "recording was saved without opening the video editor")
+        );
+        assert!(
+            app.notes()
+                .iter()
+                .all(|note| !note.contains("could not be opened in the video editor"))
+        );
+    }
+
+    #[test]
+    fn after_capture_actions_are_an_independent_four_way_matrix() {
+        for recent_captures_overlay in [false, true] {
+            for open_editor in [false, true] {
+                let mut settings = RecordingSettings::shipped();
+                settings.after_capture.recent_captures_overlay = recent_captures_overlay;
+                settings.after_capture.open_editor = open_editor;
+                assert_eq!(
+                    CompletionActions::from_settings(&settings),
+                    CompletionActions {
+                        recent_captures_overlay,
+                        open_editor,
+                    }
+                );
+            }
+        }
     }
 
     #[test]

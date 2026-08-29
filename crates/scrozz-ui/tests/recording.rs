@@ -32,10 +32,19 @@ fn new_context() -> egui::Context {
 fn run_ui<T>(
     context: &egui::Context,
     events: Vec<Event>,
+    draw: impl FnMut(&mut egui::Ui) -> T,
+) -> T {
+    run_ui_at_size(context, vec2(1200.0, 900.0), events, draw)
+}
+
+fn run_ui_at_size<T>(
+    context: &egui::Context,
+    size: egui::Vec2,
+    events: Vec<Event>,
     mut draw: impl FnMut(&mut egui::Ui) -> T,
 ) -> T {
     let input = RawInput {
-        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 900.0))),
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
         focused: true,
         events,
         ..Default::default()
@@ -44,6 +53,16 @@ fn run_ui<T>(
     let mut output = context.run_ui(input, |ui| result = Some(draw(ui)));
     output.textures_delta.clear();
     result.expect("headless draw ran")
+}
+
+fn key(key: egui::Key, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
 }
 
 fn click<T>(context: &egui::Context, point: Pos2, mut draw: impl FnMut(&mut egui::Ui) -> T) -> T {
@@ -327,6 +346,11 @@ fn video_editor_actions_and_enabled_state_are_headless() {
     assert!(initial.controls.audio_enabled);
     assert!(initial.controls.mono_enabled);
     assert!(initial.controls.export_enabled);
+    assert!(
+        initial.actions.is_empty(),
+        "idle editor emitted actions without input: {:?}",
+        initial.actions
+    );
 
     let closed = click(&context, initial.close_response.rect.center(), draw);
     assert!(closed.actions.contains(&VideoEditorAction::Close));
@@ -420,7 +444,10 @@ fn video_editor_sets_trim_boundaries_to_the_playhead() {
     assert!(
         set_in
             .actions
-            .contains(&VideoEditorAction::PlanChanged(expected_in))
+            .contains(&VideoEditorAction::PlanChanged(expected_in)),
+        "set-in emitted {:?} from {:?}",
+        set_in.actions,
+        initial.set_in_response.rect
     );
 
     let context = new_context();
@@ -477,25 +504,155 @@ fn video_editor_disables_inapplicable_audio_and_invalid_trim() {
     assert!(response.plan.audio.mute);
 
     let mut invalid = EditPlan::video(&with_audio).unwrap();
-    invalid.trim = TrimRange {
-        start: Duration::from_secs(8),
-        end: Duration::from_secs(8),
-    };
-    let response = run_ui(&context, Vec::new(), |ui| {
+    for (start, end) in [(8, 8), (9, 8)] {
+        invalid.trim = TrimRange {
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(end),
+        };
+        let response = run_ui(&context, Vec::new(), |ui| {
+            VideoEditor::new(
+                VideoEditorModel {
+                    document: &with_audio,
+                    plan: invalid,
+                    preview: VideoPreview::default(),
+                    transcode: TranscodeView::Idle,
+                },
+                &theme,
+            )
+            .show(ui)
+        });
+        assert!(!response.controls.export_enabled);
+        assert!(response.controls.validation_error.is_some());
+        assert!(!response.export_response.enabled());
+    }
+}
+
+#[test]
+fn video_editor_keyboard_and_responsive_contracts_are_semantic() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let mut document = document(2);
+    document.seek(Duration::from_secs(5)).unwrap();
+    let plan = EditPlan::video(&document).unwrap();
+    let draw = |ui: &mut egui::Ui| {
         VideoEditor::new(
             VideoEditorModel {
-                document: &with_audio,
-                plan: invalid,
+                document: &document,
+                plan,
                 preview: VideoPreview::default(),
                 transcode: TranscodeView::Idle,
             },
             &theme,
         )
         .show(ui)
+    };
+
+    let space = run_ui(&context, vec![key(egui::Key::Space, Modifiers::NONE)], draw);
+    assert!(space.actions.contains(&VideoEditorAction::Play));
+
+    let context = new_context();
+    let right = run_ui(
+        &context,
+        vec![key(egui::Key::ArrowRight, Modifiers::NONE)],
+        draw,
+    );
+    assert!(
+        right
+            .actions
+            .contains(&VideoEditorAction::Seek(Duration::from_secs(10)))
+    );
+
+    let context = new_context();
+    let trim_in = run_ui(&context, vec![key(egui::Key::I, Modifiers::NONE)], draw);
+    let mut expected = plan;
+    expected.trim.start = Duration::from_secs(5);
+    assert!(
+        trim_in
+            .actions
+            .contains(&VideoEditorAction::PlanChanged(expected))
+    );
+
+    let command = Modifiers {
+        command: true,
+        mac_cmd: cfg!(target_os = "macos"),
+        ctrl: !cfg!(target_os = "macos"),
+        ..Modifiers::NONE
+    };
+    let context = new_context();
+    let export = run_ui(
+        &context,
+        vec![Event::ModifiersChanged(command), key(egui::Key::E, command)],
+        draw,
+    );
+    assert!(
+        export.actions.contains(&VideoEditorAction::Export(plan)),
+        "command-E emitted {:?}",
+        export.actions
+    );
+
+    let context = new_context();
+    let narrow = run_ui_at_size(&context, vec2(760.0, 820.0), Vec::new(), draw);
+    assert_eq!(
+        narrow.controls.layout,
+        scrozz_ui::VideoEditorLayout::Stacked
+    );
+    assert_eq!(
+        scrozz_ui::VideoEditorLayout::for_width(1200.0),
+        scrozz_ui::VideoEditorLayout::Wide
+    );
+}
+
+#[test]
+fn filmstrip_timeline_drag_updates_trim_without_overwriting_source_state() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let document = document(2);
+    let plan = EditPlan::video(&document).unwrap();
+    let draw = |ui: &mut egui::Ui| {
+        VideoEditor::new(
+            VideoEditorModel {
+                document: &document,
+                plan,
+                preview: VideoPreview::default(),
+                transcode: TranscodeView::Idle,
+            },
+            &theme,
+        )
+        .show(ui)
+    };
+    let initial = run_ui(&context, Vec::new(), draw);
+    let timeline = initial.timeline_response.rect;
+    let start = Pos2::new(timeline.left() + 4.0, timeline.center().y);
+    let target = Pos2::new(
+        timeline.left() + timeline.width() * 0.25,
+        timeline.center().y,
+    );
+    let pointer = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    let _ = run_ui(
+        &context,
+        vec![Event::PointerMoved(start), pointer(start, true)],
+        draw,
+    );
+    let dragged = run_ui(&context, vec![Event::PointerMoved(target)], draw);
+    let _ = run_ui(
+        &context,
+        vec![Event::PointerMoved(target), pointer(target, false)],
+        draw,
+    );
+
+    let changed = dragged.actions.iter().find_map(|action| match action {
+        VideoEditorAction::PlanChanged(plan) => Some(*plan),
+        _ => None,
     });
-    assert!(!response.controls.export_enabled);
-    assert!(response.controls.validation_error.is_some());
-    assert!(!response.export_response.enabled());
+    let changed = changed.expect("dragging the in handle changes the plan");
+    assert_eq!(changed.trim.start, Duration::from_secs(5));
+    assert_eq!(changed.trim.end, document.duration());
+    assert_eq!(changed.output, plan.output);
 }
 
 const RECORDING_SCENARIOS: &[Scenario] = &[
@@ -543,7 +700,10 @@ fn every_recording_scenario_has_real_deterministic_scene_and_fixture() {
     let placeholders = registry.placeholder_scenarios();
     let renderer = SoftwareRenderer::production();
 
-    for &scenario in RECORDING_SCENARIOS {
+    for &scenario in RECORDING_SCENARIOS
+        .iter()
+        .chain(std::iter::once(&Scenario::VideoEditingNarrow))
+    {
         assert!(
             !placeholders.contains(&scenario),
             "{} still uses a placeholder",

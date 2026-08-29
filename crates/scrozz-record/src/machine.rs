@@ -786,6 +786,29 @@ impl RecordingMachine {
         &self.settings
     }
 
+    /// Replaces the after-capture policy before a recording starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] once selection, countdown, capture, or
+    /// finalisation owns this machine. An active recording keeps the policy it
+    /// started with even if persisted preferences change concurrently.
+    pub fn set_after_capture_settings(
+        &mut self,
+        settings: crate::settings::AfterCaptureSettings,
+    ) -> Result<()> {
+        if !matches!(
+            self.phase,
+            RecordingPhase::Idle | RecordingPhase::Finished | RecordingPhase::Failed
+        ) {
+            return Err(Error::InvalidRequest(
+                "after-capture settings cannot change after recording selection begins".to_owned(),
+            ));
+        }
+        self.settings.after_capture = settings;
+        Ok(())
+    }
+
     /// Current or pending platform request.
     #[must_use]
     pub const fn request(&self) -> Option<&RecordingRequest> {
@@ -1024,6 +1047,30 @@ mod tests {
             Some(std::path::Path::new("durable.mp4"))
         );
         assert_eq!(request.fps, 48);
+    }
+
+    #[test]
+    fn after_capture_policy_can_refresh_only_before_a_recording_starts() {
+        let plan = MockSessionPlan::complete("out.mp4", 1.0).unwrap();
+        let mut machine = RecordingMachine::with_engine(
+            Box::new(MockEngine::fully_capable(plan)),
+            settings_without_countdown(),
+        )
+        .unwrap();
+        let after_capture = crate::AfterCaptureSettings {
+            recent_captures_overlay: false,
+            open_editor: true,
+        };
+        machine.set_after_capture_settings(after_capture).unwrap();
+        assert_eq!(machine.settings().after_capture, after_capture);
+
+        machine.begin(target()).unwrap();
+        assert!(
+            machine
+                .set_after_capture_settings(Default::default())
+                .is_err()
+        );
+        assert_eq!(machine.settings().after_capture, after_capture);
     }
 
     #[test]

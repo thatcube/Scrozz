@@ -306,6 +306,8 @@ pub enum Scenario {
     SelectorAllInOne,
     /// The selector overlay spanning mixed-DPI displays without crossing scales.
     SelectorMixedDpi,
+    /// The editor collapsed into its narrow stacked arrangement.
+    VideoEditingNarrow,
 }
 
 impl Scenario {
@@ -337,6 +339,7 @@ impl Scenario {
         Self::SelectorMagnifier,
         Self::SelectorAllInOne,
         Self::SelectorMixedDpi,
+        Self::VideoEditingNarrow,
     ];
 
     /// Every scenario, in stable declaration order.
@@ -368,6 +371,7 @@ impl Scenario {
             Self::RecordingPaused => "recording-paused",
             Self::RecordingFailedPartial => "recording-failed-partial",
             Self::VideoEditing => "video-editing",
+            Self::VideoEditingNarrow => "video-editing-narrow",
             Self::VideoExporting => "video-exporting",
             Self::VideoExportFailedPartial => "video-export-failed-partial",
             Self::SelectorIdle => "selector-idle",
@@ -999,7 +1003,7 @@ impl Fixture {
                     None,
                     Some(Self::hud_fixture(RecordingPhase::Failed)),
                 ),
-                Scenario::VideoEditing => (
+                Scenario::VideoEditing | Scenario::VideoEditingNarrow => (
                     Vec::new(),
                     Gesture::None,
                     false,
@@ -1132,7 +1136,8 @@ impl Fixture {
             Scenario::RecordingCountdown => (720.0, 480.0),
             Scenario::VideoEditing
             | Scenario::VideoExporting
-            | Scenario::VideoExportFailedPartial => (940.0, 940.0),
+            | Scenario::VideoExportFailedPartial => (1180.0, 820.0),
+            Scenario::VideoEditingNarrow => (760.0, 900.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
             | Scenario::SelectorRemembered
@@ -1274,7 +1279,7 @@ impl Fixture {
         plan.audio.channels = ChannelBehavior::StereoToMono;
 
         let export = match scenario {
-            Scenario::VideoEditing => EditorExportFixture::Idle,
+            Scenario::VideoEditing | Scenario::VideoEditingNarrow => EditorExportFixture::Idle,
             Scenario::VideoExporting => {
                 plan = EditPlan::gif(&document).expect("the fixed GIF plan is valid");
                 plan.trim = TrimRange::new(
@@ -2431,6 +2436,7 @@ impl SceneRegistry {
         );
         for scenario in [
             Scenario::VideoEditing,
+            Scenario::VideoEditingNarrow,
             Scenario::VideoExporting,
             Scenario::VideoExportFailedPartial,
         ] {
@@ -4227,6 +4233,8 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::VideoEditing,
+        Scenario::VideoEditingNarrow,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),
@@ -4238,6 +4246,15 @@ pub fn golden_plan() -> Vec<GoldenCase> {
             ),
         });
     }
+
+    cases.push(GoldenCase {
+        name: "video-editing--reduce-motion".to_owned(),
+        spec: RenderSpec::golden(Scenario::VideoEditing, VirtualClock::ZERO)
+            .with_reduce_motion(true),
+        expectation:
+            "the complete editor remains usable with all movement disabled and no control hidden"
+                .to_owned(),
+    });
 
     // A 1x render, because grayscale text AA (D22 cost 4) is at its worst at 1x
     // and that is precisely where a font or gamma regression will first show.
